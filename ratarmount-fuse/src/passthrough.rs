@@ -156,11 +156,13 @@ pub(super) mod linux {
 
     impl CopyBudget {
         fn reserve(self: &Arc<Self>, bytes: u64) -> Option<CopyReservation> {
-            self.used
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                    used.checked_add(bytes).filter(|&next| next <= self.limit)
-                })
-                .ok()?;
+            ratarmount_core::try_update_u64(
+                &self.used,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |used| used.checked_add(bytes).filter(|&next| next <= self.limit),
+            )
+            .ok()?;
             Some(CopyReservation {
                 budget: self.clone(),
                 bytes,

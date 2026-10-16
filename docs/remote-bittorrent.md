@@ -2,19 +2,50 @@
 
 The `bittorrent` feature mounts `magnet:?xt=…`, local `.torrent` files, and
 HTTP(S) URLs whose path ends in `.torrent`. Quote magnets so the shell does
-not interpret `&`. The feature is enabled in the CLI and Linux/macOS package
-builds; `ratarmount-remote` and `ratarmount-session` require an explicit opt-in.
+not interpret `&`. The feature is enabled in the three Linux/macOS release scripts listed in
+[packaging](packaging.md). Cargo builds of the CLI
+and library crates require `--features bittorrent`; default CI does not build librqbit.
+With the feature off, local `.torrent` files and HTTP URLs keep their ordinary
+file/HTTP behavior. Directories named `*.torrent` are always directories.
 
 ```sh
 ratarmount ./dataset.torrent mnt/
 ratarmount -r --readahead 8M 'https://example.org/dataset.torrent' mnt/
 ratarmount 'magnet:?xt=urn:btih:…&tr=…&ws=…' mnt/
-cargo build -p ratarmount --no-default-features       # no BitTorrent dependency
+cargo build -p ratarmount                           # no BitTorrent dependency
+cargo build -p ratarmount --features bittorrent
 cargo build -p ratarmount-session --features bittorrent
 ```
 
 Check the company network policy before running BitTorrent at work. Firewalls
 may block or flag the protocol regardless of the content being transferred.
+
+**Network policy: `--torrent-swarm auto|always|never` defaults to `auto`.**
+
+* `auto` starts the swarm only if metadata cannot be obtained from the cache,
+  `xs` or metainfo file, or if no web seed can supply a verified requested piece.
+  Available metadata plus a working web seed means **no DHT socket, tracker
+  announce, or peer connection**. Checksum discovery can still use HTTPS APIs.
+* `never` allows cache and web seeds only. Missing metadata or a piece that
+  cannot be obtained and verified fails with a `--torrent-swarm never` error.
+* `always` creates the swarm runtime at mount time, including DHT when enabled.
+  Torrent peer streaming and tracker requests begin when the swarm is used.
+
+At first swarm activation per mount, an info-level log says:
+`BitTorrent swarm enabled for <infohash>: your IP is visible to trackers/DHT peers`.
+It uses normal log filtering; it does not bypass quiet logging. Disabling uploads
+or TCP listening does **not** prevent tracker announcements or IP disclosure.
+On Unix the DHT uses librqbit's interface binding on the kernel-selected IPv4
+route interface (determined without sending a packet); failure to determine or
+bind that interface fails swarm startup. On non-Unix platforms this build cannot
+determine the default interface: librqbit binds DHT on all interfaces. Use `never`
+if that is unacceptable. LSD and UPnP listening remain disabled.
+
+```sh
+ratarmount --torrent-swarm never ./dataset.torrent mnt/
+ratarmount --torrent-swarm auto --torrent-scratch-limit 2GiB ./dataset.torrent mnt/
+```
+
 
 ## Metadata and lazy reads
 
@@ -34,7 +65,9 @@ by default; library users can configure `TorrentOptions.swarm.timeout` and
 explicit peers or disable DHT/trackers. HTTP metadata requests also have that
 timeout. Cached metainfo retains the exact info bytes, v2 piece layers, web
 seeds and trackers, and is rehashed on every remount. A cached magnet can list
-its tree offline. Payload reads offline still need the verified pieces.
+its tree offline. Payload reads offline still need the verified pieces. Explicit
+`ws` parameters replace the cached web-seed list, so a prior magnet cannot
+carry a different repository’s checksum context into the new mount.
 
 A normal BEP 19 `ws` URL identifies payload files, **not** a metainfo endpoint.
 It cannot reconstruct the piece hashes. A magnet with only `ws`, no reachable
@@ -49,7 +82,11 @@ must first match the roots inside the hashed info dictionary. Hybrids use v2
 verification when available and retain the v1 mapping for swarm fallback.
 V1 metadata exchange omits the external v2 piece layers; a hybrid received this
 way uses its authenticated v1 piece hashes until full metainfo is supplied.
-Supplied layers that fail validation are always rejected.
+Supplied layers that fail validation are always rejected. Hybrid file paths,
+lengths, alignment and independent SHA-256 fields must agree. BEP 47 padding
+entries (including repeated `.pad/<size>` names) are omitted from path collision
+checks and the mounted tree. Non-Unix builds also reject Windows device names,
+unsafe trailing characters and case-insensitive duplicate file paths.
 
 BEP 19 HTTP(S) web seeds are tried in order through the shared HTTP connection
 pool. Multi-file paths are `base/name/path`, with each path component URL
@@ -58,29 +95,46 @@ cache is disabled for this path. Only after SHA-1 (v1) or the SHA-256 Merkle
 check (v2) succeeds does the torrent layer publish bytes into `range-v1`, under
 `TorrentPiece { infohash, file, piece, size }`. Cache hits are checked again
 against the torrent hashes. A corrupt piece is never returned or published;
-the next seed, then the swarm, is tried instead.
+the next seed, then the policy-permitted swarm, is tried instead. An HTTP server
+ignoring Range is refused for offsets beyond 1 MiB instead of streaming a large
+prefix; another seed or the swarm can serve that piece.
 
 `--readahead` reaches the torrent backend through `OpenOptions.readahead_bytes`.
-One background worker per source fetches following pieces, bounded to 64 MiB;
-seeks cancel the previous window between pieces. The demanded piece is fetched
+Each reader can prefetch following pieces, bounded to 64 MiB per window;
+seeks cancel only that reader’s previous window between pieces. The demanded piece is fetched
 before that window is scheduled. The range cache shares the existing
 `RATARMOUNT_PAYLOAD_CACHE_BYTES` budget with other remote/payload reads; `0`
-disables persistent pieces and HTTP prefetch. A reader still holds at most one
-recent piece in the source's small memory cache.
+disables persistent pieces and HTTP prefetch. A shared LRU holds at most four
+verified pieces / 256 MiB; concurrent misses for a piece share one fetch. This
+branch has no core memory-budget API. Active readers and in-flight requests may
+hold additional piece buffers.
 
 ## Swarm behavior and current limits
 
 librqbit 9.0.1 runs on a dedicated thread with a private Tokio runtime and a
-bounded request channel. It is created for metadata exchange or on the first
-failed/absent web seed, not for a successful web-seed-only read. No files are
+bounded request channel. In `auto` it is created for metadata exchange or on the first
+failed/absent web seed, never for a successful web-seed-only read. No files are
 selected for background downloading; active file streams request pieces. The
 bridge registers a stream while paused before starting peers, and retains the
 current stream between pieces. This avoids rqbit's idle-peer reconnect race
 when uploads are disabled and no files are selected.
 Unverified protocol blocks use a temporary scratch directory under
 `torrent-v1/scratch/`, separate from the verified range cache, removed on normal
-shutdown. A crash can leave that scratch directory; it is safe to remove when
-no torrent mount is running. Reader-capable nested formats, including TAR,
+shutdown. `--torrent-scratch-limit` defaults to 2 GiB per swarm session;
+compact 16 KiB slots count both demanded and speculative protocol writes.
+Large logical file offsets do not allocate large sparse files. At quota
+exhaustion further writes are refused; this implementation does not evict
+rqbit pieces behind its completion bitmap. Increase the quota or use web seeds
+for longer swarm-only sessions. This quota is separate from the range-cache
+budget, and several simultaneous mounts each have a quota.
+
+At swarm startup, owned `swarm-*` directories older than 24 hours are swept
+only when their owner lock is free; foreign and live directories are retained.
+Unmarked directories from older builds are retained; remove those only after
+stopping the old torrent mounts. A crash can leave a marked directory until the
+sweep. Unmount never joins an unfinished
+network request: detached shutdown keeps its owner lock and cleans up when its
+request timeout expires. Reader-capable nested formats, including TAR,
 do not need an archive-body spool; formats requiring a path keep their existing
 temporary-file fallback.
 
@@ -124,7 +178,7 @@ Read-only inspection on 2026-10-16 found this concrete Pirate Face format:
   `files: [{ "path": "…", "sha256": "…" }]`. The response included hashes for
   small files as well as weights. The backend recognizes the proxy's pinned
   repository identity and, when the Hub has no LFS hash, accepts this API's
-  checksums only when repository, revision and v1 infohash all match.
+  checksums only when repository, revision and an explicit torrent infohash all match.
 * No public swarm was joined and no weight payload was downloaded for this
   inspection. The public API does not establish that every metainfo file embeds
   a SHA-256 extension, nor that Pirate Face supplies v2 torrents. The verified
@@ -136,24 +190,35 @@ hash and web-seed availability; the roadmap's blanket claim that every torrent
 has both is not relied upon. Its [client source](https://github.com/pirateface/pirateface_hub/blob/main/src/pirateface/client/api.py)
 uses the same read-only torrent lookup endpoint.
 
-Coverage is tracked across seeks and concurrent handles. When all file bytes
-have been read, a bounded piece-by-piece pass computes SHA-256. The completing
-read fails with EIO on mismatch, the file is marked bad for the mount lifetime,
-subsequent reads fail, and an error is logged. Earlier partial reads cannot be
-retracted; they already passed piece verification. This final pass can refetch
-pieces if caching is disabled or pieces have been evicted. Independent checksum
-observations are cached next to metainfo for offline remounts.
+Coverage is tracked across seeks and concurrent handles. A background worker
+incrementally hashes verified pieces produced in file order, retaining a streaming
+hasher and next offset. Out-of-order coverage, or pieces evicted before the worker
+can observe them, triggers a background pass through the cache/verified HTTP path.
+Hashing, API lookups and refetching never hold the reader's verification mutex.
+Readers do not wait for whole-file SHA-256 verification. A detected mismatch logs
+an error, marks the file bad for the mount lifetime, and makes later reads fail
+with EIO. Already returned bytes passed piece verification but cannot be retracted.
+
+Hub tree and Pirate Face hash discovery runs in the background from mount time;
+verification can complete after the checksum arrives. Independent checksums are
+cached by **infohash, source repository and pinned revision**, and partial caches
+are refilled. Legacy per-infohash `.sha256.json` entries are ignored because they
+lack source provenance. Pirate manifests require an explicit matching infohash, including
+v2-only torrents; a missing identity never matches. Missing hashes do not disable
+piece verification or claim whole-file verification.
 
 `TorrentMountSource::verified_file_sha256(path)` is the AI-BT2 publication hook:
-it returns a digest only after the full-file check succeeds. AI-BT1 does not
-publish Hub blobs or claim that `hf://` already shares completed files.
+it returns a digest only after the full-file check succeeds. Publishing completed
+torrent files into the Hub cache remains AI-BT2 work. The existing `hf://` and
+`hf-cache://` sharing support is independent of this torrent hook.
 
 ## Nested archives and indexes
 
 With `-r`, TAR shards and the existing nested archive formats open through
 seekable torrent readers and the normal session machinery. An uncompressed
 `shard.tar.index.ptr` names `shard.tar.index.<sha256>.sqlite`; a well-known
-`shard.tar.index.sqlite` is the fallback. The pointer's digest and the index's
+`shard.tar.index.sqlite` is the fallback. Sibling SQLite blobs are spooled under
+the platform cache’s `torrent-v1/indexes/` and kept until SQLite closes. The pointer's digest and the index's
 archive size/content fingerprint must match before a TAR sidecar is reused.
 Only the SQLite metadata is materialized. Missing or invalid sidecars fall back
 to the existing nested parser. Automatic sibling-index reuse currently covers
@@ -170,6 +235,9 @@ used by the default test suite.
 cargo test -p ratarmount-remote --features bittorrent --lib torrent
 cargo test -p ratarmount-session --features bittorrent --lib regression_torrent
 cargo test -p ratarmount-session --lib regression_built_without_bittorrent
+cargo test -p ratarmount-remote --lib regression_torrent_remote_dispatch
+cargo test -p ratarmount --features bittorrent --bin ratarmount torrent_policy_tests
+cargo test -p ratarmount --bin ratarmount torrent_policy_tests
 ./packaging/test-bittorrent-features.sh
 ```
 
@@ -183,6 +251,6 @@ this comparison. Stripping used `strip --strip-all` on copies of each binary.
 
 | Build | Unstripped bytes | Stripped bytes |
 |-------|-----------------:|---------------:|
-| Without `bittorrent` | 44,031,248 | 34,903,376 |
-| With `bittorrent` | 56,395,904 | 43,734,712 |
-| Increase | 12,364,656 (28.08%) | 8,831,336 (25.30%; 8.42 MiB) |
+| Without `bittorrent` | 45,698,264 | 36,132,304 |
+| With `bittorrent` | 58,184,128 | 45,062,968 |
+| Increase | 12,485,864 (27.32%) | 8,930,664 (24.72%; 8.52 MiB) |

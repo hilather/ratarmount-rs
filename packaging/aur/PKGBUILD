@@ -1,0 +1,30 @@
+# Maintainer: ratarmount-rs maintainers
+pkgname=ratarmount-rs-bin
+pkgver=0.1.34
+pkgrel=1
+pkgdesc='Mount archives as a filesystem with random access (portable release binary)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/hilather/ratarmount-rs'
+license=('MIT')
+options=(!debug)
+depends=('fuse3' 'glibc')
+provides=('ratarmount')
+conflicts=('ratarmount')
+source_x86_64=("ratarmount-${pkgver}-portable-glibc2.31-x86_64.tar.gz::${url}/releases/download/v${pkgver}/ratarmount-${pkgver}-portable-glibc2.31-x86_64.tar.gz")
+source_aarch64=("ratarmount-${pkgver}-portable-glibc2.31-aarch64.tar.gz::${url}/releases/download/v${pkgver}/ratarmount-${pkgver}-portable-glibc2.31-aarch64.tar.gz")
+source=("ratarmount-rs-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+sha256sums_x86_64=('e699271fd9291920b3fa541c768946ccd323999ea52bf0c9ebd85e87ba98bfa4')
+sha256sums_aarch64=('8fb3a74d8b79646c61eabe550c86302fb05537005c42826c72aaef9c11ae3fc0')
+
+package() {
+  local archive_dir="${srcdir}/ratarmount-rs-${pkgver}"
+  install -Dm755 "${srcdir}/ratarmount-${pkgver}-portable-glibc2.31-${CARCH}.tar.gz" "${srcdir}/portable.tar.gz"
+  install -d "${pkgdir}/usr/bin"
+  tar -xzf "${srcdir}/portable.tar.gz" -C "${srcdir}"
+  install -Dm755 "${srcdir}/ratarmount" "${pkgdir}/usr/bin/ratarmount"
+  install -Dm755 "${archive_dir}/packaging/mount.fuse.ratarmount" "${pkgdir}/usr/bin/mount.fuse.ratarmount"
+  install -Dm644 "${archive_dir}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "${archive_dir}/docs/packaging.md" "${pkgdir}/usr/share/doc/${pkgname}/packaging.md"
+  install -Dm644 "${archive_dir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

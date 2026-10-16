@@ -7,7 +7,7 @@ mod passthrough;
 pub use passthrough::{PassthroughMode, PassthroughOptions};
 use ratarmount_core::AttributeMapping;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -269,6 +269,22 @@ fn readahead_fill(
             state.last_end = Some(offset.saturating_add(out.len() as u64));
             return Ok(out);
         }
+        // Growing kernel requests may straddle a sequential window. Preserve
+        // its tail and continue at the underlying cursor instead of seeking
+        // backward, which would cancel the codec's in-flight decode-ahead.
+        let end = w.end_offset();
+        if state.last_end == Some(offset) && offset >= w.start && offset < end {
+            let mut out = w.data[(offset - w.start) as usize..].to_vec();
+            state.last_end = Some(end);
+            out.extend(readahead_fill(
+                reader,
+                state,
+                readahead_bytes,
+                end,
+                size - out.len(),
+            )?);
+            return Ok(out);
+        }
     }
 
     let sequential = state.is_sequential_miss(offset);
@@ -280,7 +296,7 @@ fn readahead_fill(
     };
 
     // Skip seek when the prior fill left the cursor at this offset (sequential
-    // walk past the window end). Random misses and mid-window straddles seek.
+    // walk past the window end). Random misses still seek.
     if state.cursor != Some(offset) {
         reader.seek(std::io::SeekFrom::Start(offset))?;
         state.cursor = Some(offset);
@@ -302,6 +318,56 @@ fn readahead_fill(
     Ok(out)
 }
 
+struct ArchiveAdvice {
+    extent: ratarmount_core::BackingExtent,
+    end: Option<u64>,
+    progress: u64,
+}
+
+impl ArchiveAdvice {
+    fn new(extent: ratarmount_core::BackingExtent) -> Self {
+        Self {
+            extent,
+            end: None,
+            progress: 0,
+        }
+    }
+
+    fn consumed(&mut self, offset: u64, len: u64) {
+        if self.end != Some(offset) {
+            self.progress = 0;
+        }
+        let previous = self.progress;
+        self.progress = self.progress.saturating_add(len);
+        self.end = offset.checked_add(len);
+        #[cfg(target_os = "linux")]
+        {
+            let fd = self.extent.file.as_raw_fd();
+            if previous < 128 * 1024 && self.progress >= 128 * 1024 {
+                // SAFETY: the extent owns this descriptor for the entire call.
+                unsafe {
+                    libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+                }
+            }
+            let len = len.min(self.extent.len.saturating_sub(offset));
+            if let Some(start) = self.extent.offset.checked_add(offset) {
+                if let (Ok(start), Ok(len)) =
+                    (libc::off_t::try_from(start), libc::off_t::try_from(len))
+                {
+                    if len != 0 {
+                        // Never pass len=0 (which would advise the remainder of the archive).
+                        unsafe {
+                            libc::posix_fadvise(fd, start, len, libc::POSIX_FADV_DONTNEED);
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (previous, &self.extent);
+    }
+}
+
 /// Per-open archive reader + optional sequential readahead state.
 ///
 /// Held under its own `Mutex` (behind `Arc`) so FUSE `read` can release the
@@ -309,6 +375,7 @@ fn readahead_fill(
 struct SourceReadState {
     reader: Box<dyn ratarmount_core::ArchiveRead>,
     readahead: ReadaheadState,
+    advice_extent: Option<ArchiveAdvice>,
 }
 
 enum OpenBackend {
@@ -375,6 +442,7 @@ struct Detached {
     /// Snapshot taken before the name moved or was removed.
     /// `None` only when neither the park nor a pre-call lookup produced one.
     last_fi: Option<FileInfo>,
+    xattrs: BTreeMap<String, Vec<u8>>,
     /// Name before detach. Archive `OpenBackend::Source::path` uses this,
     /// not `"\0stale-{ino}"`.
     path: String,
@@ -570,6 +638,11 @@ pub struct RatarmountFs {
     attribute_mapping: AttributeMapping,
     source: Arc<dyn MountSource>,
     overlay: Option<Arc<WriteOverlay>>,
+    direct_io: bool,
+    read_requests: AtomicU64,
+    read_requested_bytes: AtomicU64,
+    read_max_request: AtomicU64,
+    read_service_ns: AtomicU64,
     /// Per-handle sequential readahead size in bytes (`0` = disabled).
     readahead_bytes: usize,
     inodes: Mutex<HashMap<u64, InodeEntry>>,
@@ -609,6 +682,13 @@ pub struct RatarmountFs {
     /// entry increments it. Production builds leave this unset.
     #[cfg(test)]
     park_fd_drops: Mutex<Option<Arc<AtomicUsize>>>,
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn fuse_io_limit(page_size: u32, max_pages_supported: bool) -> u32 {
+    page_size
+        .saturating_mul(if max_pages_supported { 256 } else { 32 })
+        .min(16 * 1024 * 1024)
 }
 
 impl RatarmountFs {
@@ -655,6 +735,11 @@ impl RatarmountFs {
             source,
             overlay,
             readahead_bytes,
+            direct_io: false,
+            read_requests: AtomicU64::new(0),
+            read_requested_bytes: AtomicU64::new(0),
+            read_max_request: AtomicU64::new(0),
+            read_service_ns: AtomicU64::new(0),
             inodes: Mutex::new(inodes),
             path_to_ino: Mutex::new(path_to_ino),
             next_ino: AtomicU64::new(FUSE_ROOT_ID + 1),
@@ -686,6 +771,20 @@ impl RatarmountFs {
 
     fn mapped_file_attr(&self, ino: u64, fi: &FileInfo) -> FileAttr {
         self.mapped_attr(Self::file_attr(ino, fi))
+    }
+
+    /// Bypass the FUSE page cache for source reads. Passthrough is disabled.
+    pub fn with_direct_io(mut self, direct_io: bool) -> Self {
+        self.direct_io = direct_io;
+        self
+    }
+
+    fn source_open_flags(&self) -> u32 {
+        if self.direct_io {
+            FopenFlags::FOPEN_DIRECT_IO.bits()
+        } else {
+            FopenFlags::FOPEN_KEEP_CACHE.bits()
+        }
     }
 
     /// Set passthrough negotiation and optional per-member copying.
@@ -759,7 +858,7 @@ impl RatarmountFs {
         flags: i32,
         reply: &ReplyOpen,
     ) -> Option<Arc<passthrough::linux::RegisteredBacking>> {
-        if !self.passthrough_enabled {
+        if self.direct_io || !self.passthrough_enabled {
             return None;
         }
         self.backing_opens.lock().unwrap().open(ino, fh, || {
@@ -1079,6 +1178,11 @@ impl RatarmountFs {
             self.handles.lock().unwrap().insert(fh, OpenBackend::Empty);
             return Ok(fh);
         }
+        let advice_extent = if self.direct_io {
+            self.source.backing_extent(&fi).map(ArchiveAdvice::new)
+        } else {
+            None
+        };
         let reader = self.source.open(&fi, 0).map_err(|e| io_to_errno(&e))?;
         self.handles.lock().unwrap().insert(
             fh,
@@ -1088,6 +1192,7 @@ impl RatarmountFs {
                 state: Arc::new(Mutex::new(SourceReadState {
                     reader,
                     readahead: ReadaheadState::default(),
+                    advice_extent,
                 })),
                 opened_generation: gen,
                 detached,
@@ -1122,6 +1227,11 @@ impl RatarmountFs {
         let new_backend = if fi.size == 0 {
             OpenBackend::Empty
         } else {
+            let advice_extent = if self.direct_io {
+                self.source.backing_extent(&fi).map(ArchiveAdvice::new)
+            } else {
+                None
+            };
             let reader = self.source.open(&fi, 0).map_err(|e| io_to_errno(&e))?;
             OpenBackend::Source {
                 path: path.clone(),
@@ -1129,6 +1239,7 @@ impl RatarmountFs {
                 state: Arc::new(Mutex::new(SourceReadState {
                     reader,
                     readahead: ReadaheadState::default(),
+                    advice_extent,
                 })),
                 opened_generation: gen,
                 detached: false,
@@ -1184,7 +1295,11 @@ impl RatarmountFs {
             }
             ReadTarget::Source { path, state } => {
                 let mut g = state.lock().unwrap();
-                let SourceReadState { reader, readahead } = &mut *g;
+                let SourceReadState {
+                    reader,
+                    readahead,
+                    advice_extent,
+                } = &mut *g;
                 let off = offset.max(0) as u64;
                 match readahead_fill(
                     reader.as_mut(),
@@ -1193,7 +1308,12 @@ impl RatarmountFs {
                     off,
                     size as usize,
                 ) {
-                    Ok(buf) => Ok(buf),
+                    Ok(buf) => {
+                        if let Some(extent) = advice_extent {
+                            extent.consumed(off, buf.len() as u64);
+                        }
+                        Ok(buf)
+                    }
                     Err(e) => {
                         debug!(
                             "read error path={path} offset={offset} size={size} kind={:?}: {e}",
@@ -1312,6 +1432,7 @@ impl RatarmountFs {
         // Snapshot before unlink: afterwards the name is a tombstone.
         let ino = self.existing_ino(&path);
         let snap = ino.and_then(|ino| self.snapshot_file_info(ino, &path));
+        let xattrs = self.snapshot_xattrs(snap.as_ref());
         // FUSE-only (#88). Other frontends call `unlink` and never open the file.
         let parked = ov.unlink_parked(&path).map_err(|e| {
             debug!("unlink: {e}");
@@ -1321,7 +1442,7 @@ impl RatarmountFs {
         // While path_to_ino still maps the name, so a 60s member still gets
         // its Entry + Inode from attr_advertised.
         self.note_dir_changed(parent, &name);
-        self.detach_unlinked(&path, ino, parked, snap);
+        self.detach_unlinked(&path, ino, parked, snap, xattrs);
         self.mark_source_handles_detached(&path);
         Ok(())
     }
@@ -1363,6 +1484,7 @@ impl RatarmountFs {
         let src_ino = self.existing_ino(&from);
         let replaced = self.existing_ino(&to).filter(|ino| Some(*ino) != src_ino);
         let snap = replaced.and_then(|ino| self.snapshot_file_info(ino, &to));
+        let xattrs = self.snapshot_xattrs(snap.as_ref());
         // FUSE-only (#88). Other frontends call `rename` and never open the target.
         // The park open runs inside rename_parked, before rename(2).
         let parked = match ov.rename_parked(&from, &to) {
@@ -1409,7 +1531,7 @@ impl RatarmountFs {
         if newparent != parent {
             self.drop_stable_attr(newparent);
         }
-        self.rebind_after_rename(&from, &to, parked, snap);
+        self.rebind_after_rename(&from, &to, parked, snap, xattrs);
         // Handles only, after both inode maps are released.
         self.mark_source_handles_detached(&from);
         self.mark_source_handles_detached(&to);
@@ -1454,6 +1576,7 @@ impl RatarmountFs {
         to: &str,
         mut parked: Option<Parked>,
         mut snap: Option<FileInfo>,
+        mut xattrs: BTreeMap<String, Vec<u8>>,
     ) {
         // Clone the test counter before either map lock. `build_detached` is
         // a free function and must not borrow `self` under `inodes`.
@@ -1478,6 +1601,7 @@ impl RatarmountFs {
                         snap.take(),
                         drops.take(),
                         self.overlay.clone(),
+                        std::mem::take(&mut xattrs),
                     );
                     doomed = install_detached(&mut inodes, old_dest, detached);
                 }
@@ -1510,6 +1634,7 @@ impl RatarmountFs {
         ino: Option<u64>,
         mut parked: Option<Parked>,
         mut snap: Option<FileInfo>,
+        mut xattrs: BTreeMap<String, Vec<u8>>,
     ) {
         let mut drops = self.park_drop_counter();
         let doomed = {
@@ -1528,6 +1653,7 @@ impl RatarmountFs {
                     snap.take(),
                     drops.take(),
                     self.overlay.clone(),
+                    std::mem::take(&mut xattrs),
                 );
                 install_detached(&mut inodes, ino, detached)
             } else {
@@ -1992,7 +2118,7 @@ impl RatarmountFs {
 
         let fi = self.file_info_for_open(ino, &path).ok_or(ENOENT)?;
         let fh = self.open_source_backend(path, fi, false)?;
-        Ok((fh, FopenFlags::FOPEN_KEEP_CACHE.bits()))
+        Ok((fh, self.source_open_flags()))
     }
 
     fn inode_is_detached(&self, ino: u64) -> bool {
@@ -2052,7 +2178,7 @@ impl RatarmountFs {
             }
             Kind::Archive { path, fi } => {
                 let fh = self.open_source_backend(path, fi, true)?;
-                Ok((fh, FopenFlags::FOPEN_KEEP_CACHE.bits()))
+                Ok((fh, self.source_open_flags()))
             }
             Kind::Meta => Err(EACCES),
             Kind::Missing => {
@@ -2186,15 +2312,56 @@ impl RatarmountFs {
         })
     }
 
+    fn snapshot_xattrs(&self, fi: Option<&FileInfo>) -> BTreeMap<String, Vec<u8>> {
+        fi.map(|fi| {
+            self.source
+                .list_xattr(fi)
+                .into_iter()
+                .filter_map(|name| self.source.get_xattr(fi, &name).map(|value| (name, value)))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     /// `GETXATTR` body. `Ok(None)` is ENODATA / ENOATTR.
     fn xattr_value(&self, ino: u64, key: &str) -> Result<Option<Vec<u8>>, i32> {
+        if let Some(detached) = self
+            .inodes
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .and_then(|entry| entry.detached.as_ref())
+        {
+            return Ok(detached.xattrs.get(key).cloned());
+        }
         let fi = self.file_info_for_ino(ino).ok_or(ENOENT)?;
+        if let (Some(overlay), Some(path)) = (&self.overlay, self.path_for_ino(ino)) {
+            return overlay
+                .xattrs_for_path(&path)
+                .map(|mut attrs| attrs.remove(key))
+                .map_err(|e| overlay_errno(&e));
+        }
         Ok(self.source.get_xattr(&fi, key))
     }
 
     /// `LISTXATTR` body.
     fn xattr_list(&self, ino: u64) -> Result<Vec<String>, i32> {
+        if let Some(detached) = self
+            .inodes
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .and_then(|entry| entry.detached.as_ref())
+        {
+            return Ok(detached.xattrs.keys().cloned().collect());
+        }
         let fi = self.file_info_for_ino(ino).ok_or(ENOENT)?;
+        if let (Some(overlay), Some(path)) = (&self.overlay, self.path_for_ino(ino)) {
+            return overlay
+                .xattrs_for_path(&path)
+                .map(|attrs| attrs.into_keys().collect())
+                .map_err(|e| overlay_errno(&e));
+        }
         Ok(self.source.list_xattr(&fi))
     }
 
@@ -2332,6 +2499,7 @@ fn build_detached(
     snap: Option<FileInfo>,
     drops: Option<Arc<AtomicUsize>>,
     overlay: Option<Arc<WriteOverlay>>,
+    xattrs: BTreeMap<String, Vec<u8>>,
 ) -> Detached {
     let (last_fi, raw_fd) = match parked {
         Some(parked) => {
@@ -2357,6 +2525,7 @@ fn build_detached(
         }
     });
     Detached {
+        xattrs,
         fd,
         last_fi,
         path: pre_path,
@@ -2506,6 +2675,16 @@ fn raise_nofile_soft_to_hard() {
 impl Filesystem for RatarmountFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         raise_nofile_soft_to_hard();
+        if self.direct_io {
+            self.passthrough.mode = PassthroughMode::Off;
+            #[cfg(target_os = "linux")]
+            if config
+                .capabilities()
+                .contains(fuser::InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP)
+            {
+                let _ = config.add_capabilities(fuser::InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP);
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             let supported = config.kernel_abi() >= fuser::Version(7, 40)
@@ -2540,19 +2719,38 @@ impl Filesystem for RatarmountFs {
                 "daemon (passthrough off, unavailable, unprivileged, or no eligible source)"
             }
         );
-        // ABI 7.12 left Linux's 32-page I/O cap and 12/9 background limits
-        // in effect. 0.18 negotiates MAX_PAGES by default; keep those bounds.
+        // fuser derives max_pages from max(max_write, max_readahead). Linux
+        // kernels advertising MAX_PAGES can accept 256-page requests (1 MiB on
+        // 4 KiB systems). Keep the former 32-page cap on older kernels.
         #[cfg(not(target_os = "macos"))]
         {
             let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            let max_io = 32 * u32::try_from(page_size).unwrap_or(4096);
+            let large = cfg!(target_os = "linux")
+                && config
+                    .capabilities()
+                    .contains(fuser::InitFlags::FUSE_MAX_PAGES);
+            let max_io = fuse_io_limit(u32::try_from(page_size).unwrap_or(4096), large);
             let _ = config.set_max_write(max_io);
-            // An error means the kernel offered a smaller limit; keep it.
-            let _ = config.set_max_readahead(max_io);
+            // Preserve the offered readahead when the kernel's cap is smaller.
+            let readahead = match config.set_max_readahead(max_io) {
+                Ok(_) => max_io,
+                Err(offered) => offered,
+            };
+            info!("fuse-io-limits max_write={max_io} max_readahead={readahead} max_pages_supported={large}");
         }
         let _ = config.set_max_background(12);
         let _ = config.set_congestion_threshold(9);
         Ok(())
+    }
+
+    fn destroy(&mut self) {
+        info!(
+            "fuse-read-summary requests={} requested_bytes={} max_request={} service_ns={}",
+            self.read_requests.load(Ordering::Relaxed),
+            self.read_requested_bytes.load(Ordering::Relaxed),
+            self.read_max_request.load(Ordering::Relaxed),
+            self.read_service_ns.load(Ordering::Relaxed)
+        );
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
@@ -2679,10 +2877,18 @@ impl Filesystem for RatarmountFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        self.read_requests.fetch_add(1, Ordering::Relaxed);
+        self.read_requested_bytes
+            .fetch_add(u64::from(size), Ordering::Relaxed);
+        self.read_max_request
+            .fetch_max(u64::from(size), Ordering::Relaxed);
+        let start = std::time::Instant::now();
         match self.read_handle(fh.0, (offset as i64).max(0), size) {
             Ok(buf) => reply.data(&buf),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
+        self.read_service_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn write(
@@ -2851,6 +3057,65 @@ impl Filesystem for RatarmountFs {
             return;
         };
         reply.data(fi.linkname.as_bytes());
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let result = (|| {
+            if position != 0 {
+                return Err(EINVAL);
+            }
+            let overlay = self.overlay.as_ref().ok_or(EROFS)?;
+            let path = self.path_for_ino(ino.0).ok_or(EACCES)?;
+            let name = name.to_str().ok_or(EINVAL)?;
+            // macFUSE passes the native CREATE=2/REPLACE=4 bits; the storage API
+            // uses the Linux CREATE=1/REPLACE=2 encoding on every platform.
+            #[cfg(target_os = "macos")]
+            let flags = match flags {
+                0 => 0,
+                libc::XATTR_CREATE => 1,
+                libc::XATTR_REPLACE => 2,
+                _ => return Err(EINVAL),
+            };
+            overlay
+                .set_xattr(&path, name, value, flags)
+                .map_err(|e| match &e {
+                    ratarmount_compositing::OverlayError::Io(e) => {
+                        e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
+                    }
+                    _ => EIO,
+                })
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let result = (|| {
+            let overlay = self.overlay.as_ref().ok_or(EROFS)?;
+            let path = self.path_for_ino(ino.0).ok_or(EACCES)?;
+            let name = name.to_str().ok_or(EINVAL)?;
+            overlay.remove_xattr(&path, name).map_err(|e| match &e {
+                ratarmount_compositing::OverlayError::Io(e) => {
+                    e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
+                }
+                _ => EIO,
+            })
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
@@ -3092,6 +3357,35 @@ pub fn mount_blocking_with_passthrough(
     readahead: u64,
     passthrough: PassthroughOptions,
 ) -> std::io::Result<()> {
+    mount_blocking_with_io_options(
+        source,
+        mountpoint,
+        foreground,
+        writable,
+        overlay,
+        extra_fuse_opts,
+        readahead,
+        passthrough,
+        false,
+    )
+}
+
+/// Like [`mount_blocking_with_passthrough`], with an opt-in direct-I/O policy.
+#[allow(clippy::too_many_arguments)]
+pub fn mount_blocking_with_io_options(
+    source: Arc<dyn MountSource>,
+    mountpoint: impl AsRef<Path>,
+    foreground: bool,
+    writable: bool,
+    overlay: Option<Arc<WriteOverlay>>,
+    extra_fuse_opts: &str,
+    readahead: u64,
+    mut passthrough: PassthroughOptions,
+    direct_io: bool,
+) -> std::io::Result<()> {
+    if direct_io {
+        passthrough.mode = PassthroughMode::Off;
+    }
     let mapping = AttributeMapping::parse(extra_fuse_opts)
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     validate_allow_other(extra_fuse_opts)?;
@@ -3101,7 +3395,8 @@ pub fn mount_blocking_with_passthrough(
     raise_nofile_soft_to_hard();
     let mut fs = RatarmountFs::with_readahead(source, overlay, readahead)
         .with_passthrough(passthrough)
-        .with_attribute_mapping(mapping);
+        .with_attribute_mapping(mapping)
+        .with_direct_io(direct_io);
     fs.passthrough_readonly_mount = config.mount_options.contains(&MountOption::RO);
     // `mount` does not hand back `Session::notifier`. The notifier thread
     // must exist before `run` so a shadowed archive member can drop a 60s
@@ -4295,6 +4590,40 @@ mod tests {
         );
     }
 
+    /// Regression: retaining the legacy 32-page cap splits large sequential reads.
+    #[test]
+    fn regression_sequential_reads_negotiate_large_pages_with_legacy_fallback() {
+        assert_eq!(fuse_io_limit(4096, true), 1024 * 1024);
+        assert_eq!(fuse_io_limit(4096, false), 128 * 1024);
+        assert_eq!(fuse_io_limit(65536, true), 16 * 1024 * 1024);
+        assert_eq!(fuse_io_limit(65536, false), 2 * 1024 * 1024);
+    }
+
+    /// Regression: direct I/O applies to source members, never writable overlay fds.
+    #[test]
+    fn regression_direct_io_member_flags_leave_overlay_cached() {
+        let source = OffsetShiftSource::two_members(b"archive", b"other");
+        let dir = tempfile::tempdir().unwrap();
+        let ov = Arc::new(WriteOverlay::new(source, dir.path()).unwrap());
+        let fs = RatarmountFs::new(ov.clone(), Some(ov.clone())).with_direct_io(true);
+        let ino = fs.ino_for_path("/a.txt");
+        let (fh, flags) = fs.open_inode(ino, libc::O_RDONLY).unwrap();
+        assert_eq!(flags, FopenFlags::FOPEN_DIRECT_IO.bits());
+        assert_eq!(fs.read_handle(fh, 0, 7).unwrap(), b"archive");
+        assert_eq!(fs.source_open_flags(), FopenFlags::FOPEN_DIRECT_IO.bits());
+        overlay_write_new(&ov, "/file", b"overlay");
+        let ino = fs.ino_for_path("/file");
+        let (fh, flags) = fs.open_inode(ino, libc::O_RDONLY).unwrap();
+        assert_eq!(flags, 0);
+        assert!(fs.test_fh_is_overlay_fd(fh));
+        assert_eq!(fs.read_handle(fh, 0, 7).unwrap(), b"overlay");
+        let serial = RatarmountFs::new(Arc::new(EmptyBase), None);
+        assert_eq!(
+            serial.source_open_flags(),
+            FopenFlags::FOPEN_KEEP_CACHE.bits()
+        );
+    }
+
     fn overlay_fs_for_rename() -> (tempfile::TempDir, Arc<WriteOverlay>, RatarmountFs) {
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
@@ -5172,6 +5501,34 @@ mod tests {
             spy.seeks > seeks,
             "straddle of non-EOF window must refill, not return false short read"
         );
+    }
+
+    /// Regression: increasing 128 KiB -> 1 MiB FUSE requests must not rewind
+    /// at readahead-window boundaries and cancel queued zstd frames.
+    #[test]
+    fn regression_readahead_growing_requests_do_not_cancel_decode_ahead() {
+        let payload: Vec<u8> = (0..5 * 1024 * 1024 + 713)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut spy = SpyReader::with_short_reads(payload.clone(), 128 * 1024);
+        let mut state = ReadaheadState::default();
+        let mut offset = 0;
+        let mut size = 128 * 1024;
+        while offset < payload.len() {
+            let got =
+                readahead_fill(&mut spy, &mut state, 1024 * 1024, offset as u64, size).unwrap();
+            assert!(!got.is_empty());
+            assert_eq!(got, payload[offset..offset + got.len()]);
+            offset += got.len();
+            size = (size * 2).min(1024 * 1024);
+        }
+        assert!(
+            readahead_fill(&mut spy, &mut state, 1024 * 1024, offset as u64, size)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(spy.seeks, 1, "only the initial seek is needed");
+        assert_eq!(spy.bytes_read, payload.len(), "no overlapping refills");
     }
 
     /// Regression: sequential cat over a short-read source (gzip/rapidgzip-style
@@ -6838,7 +7195,10 @@ mod tests {
         );
         assert_eq!(fs.xattr_list(reg).unwrap(), vec!["user.demo".to_string()]);
         let live = fs.source.lookup("/reg", 0).expect("replaced name");
-        assert!(fs.source.get_xattr(&live, "user.demo").is_none());
+        assert_eq!(
+            fs.source.get_xattr(&live, "user.demo"),
+            Some(b"new-reg".to_vec())
+        );
         assert_eq!(
             fs.xattr_value(lnk, "user.demo").unwrap().as_deref(),
             Some(b"old-link".as_slice())

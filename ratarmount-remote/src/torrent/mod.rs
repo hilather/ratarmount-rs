@@ -3,13 +3,16 @@
 mod checksums;
 mod metadata;
 mod metainfo;
+mod pieces;
+mod scratch;
 mod swarm;
+mod verification;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex};
 
 use ratarmount_core::{
     create_root_file_info, normpath, ArchiveRead, CheapDirent, FileInfo, ListResult, MountSource,
@@ -17,11 +20,14 @@ use ratarmount_core::{
 };
 use ratarmount_index::{ContentToken, RangeCache};
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+#[cfg(test)]
+use sha2::Sha256;
 use url::Url;
 
 use crate::{HfRepo, HttpAuthOptions, HttpLocation, HttpRangeSource};
 use metainfo::{invalid, piece_root, Metainfo, BLOCK};
+pub use ratarmount_core::TorrentSwarmPolicy;
 use swarm::Swarm;
 pub use swarm::SwarmOptions;
 
@@ -46,7 +52,7 @@ impl Default for TorrentOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Piece {
     file: Option<usize>,
     index: u64,
@@ -55,7 +61,7 @@ struct Piece {
 #[derive(Default)]
 struct Verification {
     expected: Option<[u8; 32]>,
-    loaded: bool,
+    notified: bool,
     bad: bool,
     complete: bool,
     // Covered byte intervals merge immediately, including reads from other handles.
@@ -88,11 +94,9 @@ struct Data {
     options: TorrentOptions,
     swarm: Mutex<Option<Arc<Swarm>>>,
     sources: Mutex<HttpSources>,
-    last: Mutex<Option<(Piece, Arc<Vec<u8>>)>>,
+    pieces: Mutex<pieces::Pieces>,
     verification: Vec<Mutex<Verification>>,
-    expected_hashes: OnceLock<BTreeMap<String, [u8; 32]>>,
-    prefetching: AtomicBool,
-    generation: AtomicU64,
+    verify_tx: mpsc::Sender<verification::Event>,
 }
 
 /// A read-only metadata tree; constructing/listing it fetches no payload pieces.
@@ -121,7 +125,6 @@ impl TorrentMountSource {
             .map(|f| {
                 Mutex::new(Verification {
                     expected: f.sha256,
-                    loaded: f.sha256.is_some(),
                     ..Default::default()
                 })
             })
@@ -163,18 +166,22 @@ impl TorrentMountSource {
                     size: fi.size,
                 });
         }
+        let (verify_tx, verify_rx) = mpsc::channel();
+        let data = Arc::new(Data {
+            meta,
+            options,
+            swarm: Mutex::new(None),
+            sources: Mutex::new(BTreeMap::new()),
+            pieces: Mutex::default(),
+            verification,
+            verify_tx,
+        });
+        verification::start(&data, verify_rx)?;
+        if data.options.swarm.policy == TorrentSwarmPolicy::Always {
+            data.start_swarm()?;
+        }
         Ok(Self {
-            data: Arc::new(Data {
-                meta,
-                options,
-                swarm: Mutex::new(None),
-                sources: Mutex::new(BTreeMap::new()),
-                last: Mutex::new(None),
-                verification,
-                expected_hashes: OnceLock::new(),
-                prefetching: AtomicBool::new(false),
-                generation: AtomicU64::new(0),
-            }),
+            data,
             entries,
             children,
         })
@@ -245,6 +252,7 @@ impl MountSource for TorrentMountSource {
             data: self.data.clone(),
             file,
             pos: 0,
+            prefetch: Arc::default(),
         }))
     }
     fn is_immutable(&self) -> bool {
@@ -336,11 +344,42 @@ impl Data {
     }
 
     fn fetch_piece(&self, key: Piece, allow_swarm: bool) -> io::Result<Arc<Vec<u8>>> {
-        if let Some((old, bytes)) = &*self.last.lock().unwrap_or_else(|e| e.into_inner()) {
-            if *old == key {
-                return Ok(bytes.clone());
+        let (flight, owner) = {
+            let mut pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(bytes) = pieces.get(key) {
+                return Ok(bytes);
             }
+            if let Some(flight) = pieces.flights.get(&key) {
+                (flight.clone(), false)
+            } else {
+                let flight = Arc::new(pieces::Flight::new(allow_swarm));
+                pieces.flights.insert(key, flight.clone());
+                (flight, true)
+            }
+        };
+        if !owner {
+            let result = flight.wait();
+            if result.is_err() && allow_swarm && !flight.allow_swarm {
+                return self.fetch_piece(key, true);
+            }
+            return result;
         }
+        let result = self.produce_piece(key, allow_swarm).map(Arc::new);
+        {
+            let mut pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner());
+            if let Ok(bytes) = &result {
+                pieces.insert(key, bytes.clone());
+                let _ = self
+                    .verify_tx
+                    .send(verification::Event::Piece(key, Arc::downgrade(bytes)));
+            }
+            flight.finish(&result);
+            pieces.flights.remove(&key);
+        }
+        result
+    }
+
+    fn produce_piece(&self, key: Piece, allow_swarm: bool) -> io::Result<Vec<u8>> {
         let bytes = if let Some(bytes) = self.cached(key) {
             bytes
         } else {
@@ -370,8 +409,6 @@ impl Data {
             self.store(key, &bytes);
             bytes
         };
-        let bytes = Arc::new(bytes);
-        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, bytes.clone()));
         Ok(bytes)
     }
 
@@ -381,16 +418,11 @@ impl Data {
             return Ok(s.clone());
         }
         let url = web_seed_url(&self.meta, seed, file)?;
-        let mut auth = HttpAuthOptions::default();
-        if let Some((repo_url, _)) = hub_file(&url) {
-            // Credentials belong only to the actual Hub origin, not the Pirate
-            // Face redirect proxy. HttpRangeSource strips them on every redirect.
-            if Url::parse(&url).is_ok_and(|u| u.host_str() == Some("huggingface.co")) {
-                if let Ok(repo) = HfRepo::resolve(&repo_url) {
-                    auth = repo.torrent_http_auth(&url);
-                }
-            }
-        }
+        let auth = if Url::parse(&url).is_ok_and(|u| u.host_str() == Some("huggingface.co")) {
+            HfRepo::torrent_auth_from_env(&url)
+        } else {
+            HttpAuthOptions::default()
+        };
         let source = Arc::new(
             HttpRangeSource::new(
                 HttpLocation {
@@ -400,22 +432,40 @@ impl Data {
                 },
                 auth,
             )
-            .without_range_cache(),
+            .without_range_cache()
+            .with_max_skip_prefix(1024 * 1024),
         );
         sources.insert((seed, file), source.clone());
         Ok(source)
     }
 
+    fn spans(&self, key: Piece) -> Vec<(usize, u64, usize)> {
+        key.file.map_or_else(
+            || self.meta.spans(key.index),
+            |file| {
+                vec![(
+                    file,
+                    key.index * self.meta.piece_len,
+                    self.size(key) as usize,
+                )]
+            },
+        )
+    }
+
+    fn start_swarm(&self) -> io::Result<Arc<Swarm>> {
+        let mut slot = self.swarm.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(Arc::new(Swarm::new(
+                self.options.swarm.clone(),
+                self.options.metadata_dir.join("scratch"),
+                self.meta.identity(),
+            )?));
+        }
+        Ok(slot.as_ref().unwrap().clone())
+    }
+
     fn http_piece(&self, key: Piece, seed: usize) -> io::Result<Vec<u8>> {
-        let spans = if let Some(file) = key.file {
-            vec![(
-                file,
-                key.index * self.meta.piece_len,
-                self.size(key) as usize,
-            )]
-        } else {
-            self.meta.spans(key.index)
-        };
+        let spans = self.spans(key);
         let mut bytes = Vec::new();
         for (file, offset, len) in spans {
             if self.meta.files[file].padding {
@@ -440,16 +490,7 @@ impl Data {
                 "v2 web seeds failed; librqbit 9.0.1 has no v2 swarm support",
             ));
         }
-        let swarm = {
-            let mut slot = self.swarm.lock().unwrap_or_else(|e| e.into_inner());
-            if slot.is_none() {
-                *slot = Some(Arc::new(Swarm::new(
-                    self.options.swarm.clone(),
-                    self.options.metadata_dir.join("scratch"),
-                )?));
-            }
-            slot.as_ref().unwrap().clone()
-        };
+        let swarm = self.start_swarm()?;
         let index = key.file.map_or(key.index, |f| {
             self.meta.files[f].offset / self.meta.piece_len + key.index
         });
@@ -464,17 +505,6 @@ impl Data {
         Ok(bytes[..self.size(key) as usize].to_vec())
     }
 
-    fn expected(&self, file: usize, state: &mut Verification) {
-        if state.loaded {
-            return;
-        }
-        state.loaded = true;
-        let hashes = self
-            .expected_hashes
-            .get_or_init(|| checksums::load(&self.meta, &self.options.metadata_dir));
-        state.expected = hashes.get(&self.meta.files[file].path).copied();
-    }
-
     fn after_read(&self, file: usize, start: u64, end: u64) -> io::Result<()> {
         let mut state = self.verification[file]
             .lock()
@@ -482,42 +512,17 @@ impl Data {
         if state.bad {
             return Err(io::Error::from_raw_os_error(5));
         }
-        self.expected(file, &mut state);
-        let Some(expected) = state.expected else {
-            return Ok(());
-        };
-        if state.complete {
-            return Ok(());
+        if !state.complete && !state.notified {
+            state.cover(start, end);
+            if state.ranges.get(&0) == Some(&self.meta.files[file].len) {
+                state.notified = true;
+                let _ = self.verify_tx.send(verification::Event::Complete(file));
+            }
         }
-        state.cover(start, end);
-        let len = self.meta.files[file].len;
-        if state.ranges.get(&0) != Some(&len) {
-            return Ok(());
-        }
-        let mut hash = Sha256::new();
-        let mut pos = 0;
-        while pos < len {
-            let (key, offset) = self.key(file, pos);
-            let bytes = self.piece(key)?;
-            let n = (len - pos).min((bytes.len() - offset) as u64) as usize;
-            hash.update(&bytes[offset..offset + n]);
-            pos += n as u64;
-        }
-        if hash.finalize().as_slice() != expected {
-            state.bad = true;
-            log::error!(
-                "TORRENT SHA-256 MISMATCH: {} in {}; all further reads refused",
-                self.meta.files[file].path,
-                self.meta.identity()
-            );
-            return Err(io::Error::from_raw_os_error(5));
-        }
-        state.complete = true;
-        state.ranges.clear();
         Ok(())
     }
 
-    fn prefetch(self: &Arc<Self>, file: usize, pos: u64) {
+    fn prefetch(self: &Arc<Self>, file: usize, pos: u64, reader: &Arc<Prefetch>) {
         let limit = self.options.readahead_bytes.min(64 * 1024 * 1024);
         if limit == 0
             || !self
@@ -525,18 +530,19 @@ impl Data {
                 .range_cache
                 .as_ref()
                 .is_some_and(RangeCache::is_enabled)
-            || self.prefetching.swap(true, Ordering::AcqRel)
+            || reader.running.swap(true, Ordering::AcqRel)
         {
             return;
         }
-        let generation = self.generation.load(Ordering::Relaxed);
+        let generation = reader.generation.load(Ordering::Relaxed);
+        let worker = reader.clone();
         let data = self.clone();
         let result = std::thread::Builder::new()
             .name("torrent-readahead".into())
             .spawn(move || {
                 let end = pos.saturating_add(limit).min(data.meta.files[file].len);
                 let mut pos = pos;
-                while pos < end && data.generation.load(Ordering::Relaxed) == generation {
+                while pos < end && worker.generation.load(Ordering::Relaxed) == generation {
                     let (key, offset) = data.key(file, pos);
                     // Speculative HTTP failures must not queue ahead of a demand
                     // request on the swarm bridge. rqbit has its own stream lookahead.
@@ -545,10 +551,10 @@ impl Data {
                         Err(_) => break,
                     }
                 }
-                data.prefetching.store(false, Ordering::Release);
+                worker.running.store(false, Ordering::Release);
             });
         if result.is_err() {
-            self.prefetching.store(false, Ordering::Release);
+            reader.running.store(false, Ordering::Release);
         }
     }
 }
@@ -622,10 +628,22 @@ fn hub_file(url: &str) -> Option<(String, String)> {
     ))
 }
 
+#[derive(Default)]
+struct Prefetch {
+    running: AtomicBool,
+    generation: AtomicU64,
+}
+
 struct TorrentReader {
     data: Arc<Data>,
     file: usize,
     pos: u64,
+    prefetch: Arc<Prefetch>,
+}
+impl Drop for TorrentReader {
+    fn drop(&mut self) {
+        self.prefetch.generation.fetch_add(1, Ordering::Relaxed);
+    }
 }
 impl Read for TorrentReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -652,12 +670,12 @@ impl Read for TorrentReader {
             .len()
             .min(bytes.len() - offset)
             .min((len - self.pos).min(usize::MAX as u64) as usize);
-        // Do not copy the completing read to the caller until whole-file verification succeeds.
+        // Piece integrity is synchronous; the independent whole-file digest is asynchronous.
         self.data
             .after_read(self.file, self.pos, self.pos + n as u64)?;
         buf[..n].copy_from_slice(&bytes[offset..offset + n]);
         self.pos += n as u64;
-        self.data.prefetch(self.file, self.pos);
+        self.data.prefetch(self.file, self.pos, &self.prefetch);
         Ok(n)
     }
 }
@@ -670,7 +688,7 @@ impl Seek for TorrentReader {
         };
         self.pos = u64::try_from(next)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid torrent seek"))?;
-        self.data.generation.fetch_add(1, Ordering::Relaxed);
+        self.prefetch.generation.fetch_add(1, Ordering::Relaxed);
         Ok(self.pos)
     }
 }

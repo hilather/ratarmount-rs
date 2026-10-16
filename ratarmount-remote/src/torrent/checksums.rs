@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use super::metainfo::{invalid, Metainfo};
@@ -22,7 +23,9 @@ fn digest(value: &str) -> Option<[u8; 32]> {
 }
 
 fn pirate_hashes(value: &Value, meta: &Metainfo, repo: &str, revision: &str) -> io::Result<Hashes> {
-    if value["infohash"].as_str() != meta.v1_hash.as_deref()
+    if !value["infohash"]
+        .as_str()
+        .is_some_and(|h| Some(h) == meta.v1_hash.as_deref() || Some(h) == meta.v2_hash.as_deref())
         || value["repoId"].as_str() != Some(repo)
         || value["revision"].as_str() != Some(revision)
     {
@@ -49,31 +52,57 @@ fn pirate_hashes(value: &Value, meta: &Metainfo, repo: &str, revision: &str) -> 
     Ok(hashes)
 }
 
-pub(super) fn load(meta: &Metainfo, dir: &Path) -> Hashes {
-    let path = dir.join(format!("{}.sha256.json", meta.identity()));
-    if let Ok(file) = std::fs::File::open(&path) {
+fn cache_path(meta: &Metainfo, dir: &Path, source: &str) -> std::path::PathBuf {
+    // source includes repository kind, repository ID and pinned revision.
+    let key = hex::encode(Sha256::digest(format!("{}\0{source}", meta.identity())));
+    dir.join(format!("{key}.sha256-v2.json"))
+}
+
+fn cached(meta: &Metainfo, dir: &Path, source: &str) -> Hashes {
+    let read = || -> Option<Hashes> {
+        let file = std::fs::File::open(cache_path(meta, dir, source)).ok()?;
         let mut bytes = Vec::new();
-        if file.take(MAX_HASHES + 1).read_to_end(&mut bytes).is_ok()
-            && bytes.len() as u64 <= MAX_HASHES
-        {
-            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                if value["infohash"].as_str() == Some(meta.identity()) {
-                    if let Some(files) = value["files"].as_object() {
-                        let hashes: Hashes = files
-                            .iter()
-                            .filter_map(|(p, h)| Some((p.clone(), digest(h.as_str()?)?)))
-                            .collect();
-                        if !hashes.is_empty() {
-                            return hashes;
-                        }
-                    }
-                }
-            }
+        file.take(MAX_HASHES + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() as u64 > MAX_HASHES {
+            return None;
         }
+        let value: Value = serde_json::from_slice(&bytes).ok()?;
+        if value["infohash"].as_str() != Some(meta.identity())
+            || value["source"].as_str() != Some(source)
+        {
+            return None;
+        }
+        Some(
+            value["files"]
+                .as_object()?
+                .iter()
+                .filter_map(|(p, h)| Some((p.clone(), digest(h.as_str()?)?)))
+                .collect(),
+        )
+    };
+    read().unwrap_or_default()
+}
+
+fn save(meta: &Metainfo, dir: &Path, source: &str, hashes: &Hashes) -> io::Result<()> {
+    if hashes.is_empty() {
+        return Ok(());
     }
-    let mut hashes = BTreeMap::new();
-    let mut repos = BTreeMap::new();
-    let mut pirate_manifests = BTreeMap::new();
+    std::fs::create_dir_all(dir)?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    let files: BTreeMap<_, _> = hashes.iter().map(|(p, h)| (p, hex::encode(h))).collect();
+    serde_json::to_writer(
+        &mut temp,
+        &json!({"infohash":meta.identity(), "source":source, "files":files}),
+    )?;
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+    temp.persist(cache_path(meta, dir, source))
+        .map_err(|e| e.error)?;
+    Ok(())
+}
+
+fn load_with(meta: &Metainfo, dir: &Path, mut fetch: impl FnMut(&str, bool) -> Hashes) -> Hashes {
+    let mut sources: BTreeMap<String, (bool, Vec<(String, String)>)> = BTreeMap::new();
     for file in 0..meta.files.len() {
         if meta.files[file].padding {
             continue;
@@ -82,60 +111,63 @@ pub(super) fn load(meta: &Metainfo, dir: &Path) -> Hashes {
             let Ok(url) = web_seed_url(meta, seed, file) else {
                 continue;
             };
-            let Some((repo_url, file_path)) = hub_file(&url) else {
+            let Some((source, path)) = hub_file(&url) else {
                 continue;
             };
-            let repo_hashes =
-                repos.entry(repo_url.clone()).or_insert_with(|| {
-                    match HfRepo::resolve(&repo_url).and_then(|repo| repo.torrent_sha256s()) {
-                        Ok(hashes) => hashes,
-                        Err(e) => {
-                            log::warn!("torrent Hub checksum lookup: {e}");
-                            BTreeMap::new()
-                        }
-                    }
-                });
-            if let Some(hash) = repo_hashes.get(&file_path).and_then(|h| digest(h)) {
-                hashes.insert(meta.files[file].path.clone(), hash);
-                break;
+            let entry = sources.entry(source).or_default();
+            entry.0 |= Url::parse(&url).is_ok_and(|u| u.host_str() == Some("pirateface.co"));
+            entry.1.push((meta.files[file].path.clone(), path));
+        }
+    }
+    let mut result = Hashes::new();
+    for (source, (pirate, paths)) in sources {
+        let mut hashes = cached(meta, dir, &source);
+        // A partial observation must not permanently suppress later discoveries.
+        if paths.iter().any(|(_, p)| !hashes.contains_key(p)) {
+            hashes.extend(fetch(&source, pirate));
+            if let Err(e) = save(meta, dir, &source, &hashes) {
+                log::warn!("torrent checksum cache: {e}");
             }
-            if Url::parse(&url).is_ok_and(|u| u.host_str() == Some("pirateface.co")) {
-                let manifest = pirate_manifests.entry(repo_url.clone()).or_insert_with(|| {
-                    let location = crate::parse_hf_url(&repo_url).ok()?;
-                    let mut api = Url::parse("https://pirateface.co/api/torrents").unwrap();
-                    api.query_pairs_mut().append_pair("repo", &location.repo);
-                    let bytes = crate::fetch_http_bytes_capped(api.as_str(), MAX_HASHES).ok()?;
-                    let value = serde_json::from_slice(&bytes).ok()?;
-                    pirate_hashes(&value, meta, &location.repo, &location.revision).ok()
-                });
-                if let Some(manifest) = manifest {
-                    if let Some(hash) = manifest.get(&file_path) {
-                        hashes.insert(meta.files[file].path.clone(), *hash);
-                        break;
-                    }
+        }
+        for (torrent_path, repo_path) in paths {
+            if let Some(hash) = hashes.get(&repo_path) {
+                result.entry(torrent_path).or_insert(*hash);
+            }
+        }
+    }
+    result
+}
+
+pub(super) fn load(meta: &Metainfo, dir: &Path) -> Hashes {
+    load_with(meta, dir, |repo_url, pirate| {
+        let mut hashes: Hashes =
+            match HfRepo::resolve(repo_url).and_then(|repo| repo.torrent_sha256s()) {
+                Ok(hashes) => hashes
+                    .into_iter()
+                    .filter_map(|(p, h)| Some((p, digest(&h)?)))
+                    .collect(),
+                Err(e) => {
+                    log::warn!("torrent Hub checksum lookup: {e}");
+                    Hashes::new()
+                }
+            };
+        if pirate {
+            let fetch = || -> Option<Hashes> {
+                let location = crate::parse_hf_url(repo_url).ok()?;
+                let mut api = Url::parse("https://pirateface.co/api/torrents").unwrap();
+                api.query_pairs_mut().append_pair("repo", &location.repo);
+                let bytes = crate::fetch_http_bytes_capped(api.as_str(), MAX_HASHES).ok()?;
+                let value = serde_json::from_slice(&bytes).ok()?;
+                pirate_hashes(&value, meta, &location.repo, &location.revision).ok()
+            };
+            if let Some(manifest) = fetch() {
+                for (p, h) in manifest {
+                    hashes.entry(p).or_insert(h);
                 }
             }
         }
-    }
-    if !hashes.is_empty() {
-        let save = || -> io::Result<()> {
-            std::fs::create_dir_all(dir)?;
-            let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-            let files: BTreeMap<_, _> = hashes.iter().map(|(p, h)| (p, hex::encode(h))).collect();
-            serde_json::to_writer(
-                &mut temp,
-                &json!({"infohash": meta.identity(), "files": files}),
-            )?;
-            temp.flush()?;
-            temp.as_file().sync_all()?;
-            temp.persist(path).map_err(|e| e.error)?;
-            Ok(())
-        };
-        if let Err(e) = save() {
-            log::warn!("torrent checksum cache: {e}");
-        }
-    }
-    hashes
+        hashes
+    })
 }
 
 #[cfg(test)]
@@ -157,5 +189,62 @@ mod tests {
         let mut wrong = value;
         wrong["infohash"] = json!("0".repeat(40));
         assert!(pirate_hashes(&wrong, &meta, "org/repo", "rev").is_err());
+    }
+    /// Regression: one magnet's ws repository poisoned the per-infohash checksum cache of another.
+    #[test]
+    fn regression_checksum_cache_bound_to_repository_and_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = Metainfo::parse(super::super::tests::single_file_fixture()).unwrap();
+        let source = format!("hf://org/first@{}", "a".repeat(40));
+        save(
+            &meta,
+            dir.path(),
+            &source,
+            &BTreeMap::from([("file".into(), [1; 32])]),
+        )
+        .unwrap();
+        assert_eq!(cached(&meta, dir.path(), &source)["file"], [1; 32]);
+        for other in [
+            format!("hf://org/second@{}", "a".repeat(40)),
+            format!("hf://org/first@{}", "b".repeat(40)),
+        ] {
+            assert!(cached(&meta, dir.path(), &other).is_empty());
+        }
+        meta.web_seeds = vec![format!(
+            "https://huggingface.co/org/first/resolve/{}/file",
+            "a".repeat(40)
+        )];
+        // Partial caches are refilled for paths required by this source.
+        save(
+            &meta,
+            dir.path(),
+            &source,
+            &BTreeMap::from([("other".into(), [2; 32])]),
+        )
+        .unwrap();
+        let mut calls = 0;
+        let hashes = load_with(&meta, dir.path(), |url, _| {
+            assert_eq!(url, source);
+            calls += 1;
+            BTreeMap::from([("file".into(), [3; 32])])
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(hashes["file"], [3; 32]);
+        assert_eq!(
+            load_with(&meta, dir.path(), |_, _| panic!("complete cache refetched")),
+            hashes
+        );
+    }
+
+    /// Regression: absent v1 identity and an absent manifest infohash matched for a v2-only torrent.
+    #[test]
+    fn regression_v2_manifest_requires_explicit_infohash() {
+        let mut meta = Metainfo::parse(super::super::tests::single_file_fixture()).unwrap();
+        meta.v1_hash = None;
+        meta.v2_hash = Some("a".repeat(64));
+        let mut value = json!({"repoId":"org/repo", "revision":"rev", "files":[]});
+        assert!(pirate_hashes(&value, &meta, "org/repo", "rev").is_err());
+        value["infohash"] = json!(meta.v2_hash);
+        assert!(pirate_hashes(&value, &meta, "org/repo", "rev").is_ok());
     }
 }

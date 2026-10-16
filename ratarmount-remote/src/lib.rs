@@ -45,6 +45,8 @@ mod webdav;
 // --- inbound protocol modules (worktree PRs: one `mod` + `pub use` pair only) ---
 mod hf;
 pub use hf::{open_hf_range, parse_hf_url, HfLocation, HfMountSource, HfRepo};
+mod hf_cache;
+pub use hf_cache::HfCacheMountSource;
 mod hf_commit;
 pub use hf_commit::{HfCommitFile, HfCommitResult};
 mod folder;
@@ -472,7 +474,7 @@ pub type Result<T> = std::result::Result<T, RemoteError>;
 const REMOTE_SCHEMES: &[&str] = &[
     "http", "https", "file", "ftp", "ftps", "s3", "gs", "az", "azure", "ssh", "sftp", "scp", "smb",
     "webdav", "webdavs", "dropbox", "oci", "docker", "ghcr", "ipfs", "ipns", "rclone", "restic",
-    "hf", "magnet", "torrent",
+    "hf", "hf-cache", "magnet", "torrent",
 ];
 
 /// ASCII-lowercase remote scheme, including magnets and local torrent metainfo.
@@ -509,15 +511,28 @@ pub fn is_torrent_input(s: &str) -> bool {
     {
         return true;
     }
-    if s.contains("://") {
-        return Url::parse(s).is_ok_and(|u| {
-            matches!(u.scheme(), "http" | "https" | "file")
-                && u.path().to_ascii_lowercase().ends_with(".torrent")
-        });
+    #[cfg(not(feature = "bittorrent"))]
+    {
+        false
     }
-    Path::new(s)
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+    #[cfg(feature = "bittorrent")]
+    {
+        if s.contains("://") {
+            return Url::parse(s).is_ok_and(|u| {
+                u.path().to_ascii_lowercase().ends_with(".torrent")
+                    && match u.scheme() {
+                        "http" | "https" => true,
+                        "file" => u.to_file_path().is_ok_and(|p| p.is_file()),
+                        _ => false,
+                    }
+            });
+        }
+        let path = Path::new(s);
+        path.is_file()
+            && path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+    }
 }
 
 fn is_known_remote_scheme(scheme: &str) -> bool {
@@ -1203,9 +1218,15 @@ impl HttpRangeFile {
         self
     }
 
-    /// A contiguous local file once every remote chunk has been cached.
+    /// A contiguous verified local file. Hub-backed files become available
+    /// after background publication completes; this does not wait for it.
     pub fn complete_file(&self) -> Option<PathBuf> {
         self.source.complete_file(self.size)
+    }
+
+    /// Descriptor verified at open or by background Hub-cache publication.
+    pub fn backing_file(&self) -> Option<std::fs::File> {
+        self.source.backing_file(self.size)
     }
 
     /// Origin URL, with userinfo removed.
@@ -2811,10 +2832,8 @@ mod torrent_dispatch_tests {
     #[cfg(not(feature = "bittorrent"))]
     #[test]
     fn regression_built_without_bittorrent_error() {
-        for input in [
-            "a.torrent",
-            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
-        ] {
+        {
+            let input = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
             assert!(super::resolve_to_local(input)
                 .err()
                 .unwrap()
@@ -2822,19 +2841,31 @@ mod torrent_dispatch_tests {
                 .contains("built without bittorrent"));
         }
     }
-    /// Regression: magnets and metainfo paths bypassed remote dispatch.
+    /// Regression: suffix detection treated torrent directories as remote inputs, even feature-off.
     #[test]
     fn regression_torrent_remote_dispatch() {
-        for input in [
-            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
-            "a.torrent",
-            "/tmp/a.TORRENT",
-            "https://example/a.torrent?token=x",
-            "file:///tmp/a.torrent",
-        ] {
-            assert!(super::is_remote_url(input), "{input}");
-            assert!(super::is_torrent_input(input));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.TORRENT");
+        let mount = dir.path().join("mount.torrent");
+        std::fs::write(&file, b"metadata").unwrap();
+        std::fs::create_dir(&mount).unwrap();
+        assert!(!super::is_torrent_input(mount.to_str().unwrap()));
+        assert!(!super::is_remote_url(mount.to_str().unwrap()));
+        assert!(!super::is_torrent_input("missing.torrent"));
+        for input in [file.to_str().unwrap(), "https://example/a.torrent?token=x"] {
+            assert_eq!(super::is_torrent_input(input), cfg!(feature = "bittorrent"));
         }
+        assert_eq!(
+            super::remote_url_scheme("https://example/a.torrent").as_deref(),
+            Some(if cfg!(feature = "bittorrent") {
+                "torrent"
+            } else {
+                "https"
+            })
+        );
+        assert!(super::is_torrent_input(
+            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
+        ));
         for input in [
             "a.torrent.tar",
             "a.torrent/child",

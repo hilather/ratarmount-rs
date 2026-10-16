@@ -13,6 +13,7 @@ use crate::{
 
 fn member<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
     UstarMember {
+        xattrs: &[],
         path,
         payload: UstarPayload::File { bytes },
         mode: 0o644,
@@ -577,9 +578,9 @@ fn iter_by_offset_page_10000_members_no_duplicates_or_skips() {
     }
 }
 
-/// Regression: parallelization=4 must preserve bytes across zstd frame boundaries.
+/// Regression: serial defaults and parallelization=4 must preserve bytes across zstd frame boundaries.
 #[test]
-fn parallelization_four_reads_multiframe_zstd_tar() {
+fn regression_parallelization_one_and_four_reads_multiframe_zstd_tar() {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("frames.tar.zst");
     let data: Vec<u8> = (0..1024 * 1024 + 317).map(|i| (i % 239) as u8).collect();
@@ -589,13 +590,19 @@ fn parallelization_four_reads_multiframe_zstd_tar() {
         compressed.extend(ratarmount_compress::encode_zstd_frame(chunk, 1).unwrap());
     }
     std::fs::write(&archive, compressed).unwrap();
-    for recreate in [Recreate::IfInvalid, Recreate::Never] {
-        let mut req = request(&archive);
-        req.parallelization = ParallelizationSpec::new(4);
-        req.recreate = recreate;
-        let session = Session::open(req).unwrap();
-        assert_eq!(read_member(&session, "big", data.len() as u64), data);
-        assert_eq!(read_member(&session, "last", 100), b"last frame");
-        assert_eq!(session.member_extent("big").unwrap(), None);
+    assert_eq!(
+        ratarmount_core::OpenOptions::default().threads_for("zstd"),
+        1
+    );
+    for threads in [1, 4] {
+        for recreate in [Recreate::IfInvalid, Recreate::Never] {
+            let mut req = request(&archive);
+            req.parallelization = ParallelizationSpec::new(threads);
+            req.recreate = recreate;
+            let session = Session::open(req).unwrap();
+            assert_eq!(read_member(&session, "big", data.len() as u64), data);
+            assert_eq!(read_member(&session, "last", 100), b"last frame");
+            assert_eq!(session.member_extent("big").unwrap(), None);
+        }
     }
 }

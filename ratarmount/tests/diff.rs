@@ -65,6 +65,7 @@ fn regression_diff_exit_codes_and_clean_stdout() {
     write_ustar_members(
         &mut tar,
         &[UstarMember {
+            xattrs: &[],
             path: "a",
             payload: UstarPayload::File { bytes: b"before\n" },
             mode: 0o644,

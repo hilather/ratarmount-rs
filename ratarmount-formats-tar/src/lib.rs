@@ -3425,6 +3425,7 @@ mod tests {
                 write_ustar_members(
                     &mut f,
                     &[UstarMember {
+                        xattrs: &[],
                         path: "hello.txt",
                         payload: UstarPayload::File {
                             bytes: b"hello world\n",
@@ -3564,6 +3565,7 @@ mod tests {
             write_ustar_members(
                 &mut f,
                 &[UstarMember {
+                    xattrs: &[],
                     path: "big.bin",
                     payload: UstarPayload::File { bytes: &payload },
                     mode: 0o644,
@@ -5315,6 +5317,7 @@ mod tests {
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,

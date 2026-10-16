@@ -79,6 +79,9 @@ struct Web {
 }
 impl Web {
     fn new(files: BTreeMap<String, Vec<u8>>) -> Self {
+        Self::with_ranges(files, true)
+    }
+    fn with_ranges(files: BTreeMap<String, Vec<u8>>, ranges: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let count = Arc::new(AtomicUsize::new(0));
@@ -120,7 +123,7 @@ impl Web {
                     );
                     continue;
                 };
-                if let Some((a, z)) = range {
+                if let Some((a, z)) = range.filter(|_| ranges) {
                     let z = z.min(bytes.len() - 1);
                     let _ = write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{z}/{}\r\nContent-Length: {}\r\nETag: \"untrusted\"\r\nConnection: close\r\n\r\n", bytes.len(), z - a + 1);
                     let _ = stream.write_all(&bytes[a..=z]);
@@ -166,6 +169,7 @@ fn options(dir: &std::path::Path) -> TorrentOptions {
             initial_peers: vec![],
             // Match production: peer retry backoffs and parallel test load can exceed 8s.
             timeout: Duration::from_secs(30),
+            ..Default::default()
         },
         readahead_bytes: 0,
     }
@@ -218,7 +222,8 @@ fn regression_whole_file_sha256_mismatch_eio() {
     let mut reader = source.open(&fi, 0).unwrap();
     let mut buf = [0; 5];
     assert_eq!(reader.read(&mut buf).unwrap(), 4);
-    assert_eq!(reader.read(&mut buf).unwrap_err().raw_os_error(), Some(5));
+    let _ = reader.read(&mut buf);
+    wait_until(|| source.data.verification[0].lock().unwrap().bad);
     assert_eq!(
         source
             .open(&fi, 0)
@@ -254,6 +259,7 @@ fn regression_random_reads_complete_sha256_hook() {
         reader.read_exact(&mut byte).unwrap();
         assert_eq!(byte[0], payload[pos]);
     }
+    wait_until(|| source.verified_file_sha256("/file").is_some());
     assert_eq!(
         source.verified_file_sha256("/file"),
         Some(hex::encode(Sha256::digest(payload)))
@@ -615,7 +621,15 @@ fn regression_torrent_readahead_fills_verified_following_pieces() {
     reader.read_exact(&mut first).unwrap();
     assert_eq!(first[0], payload[0]);
     let start = std::time::Instant::now();
-    while source.data.prefetching.load(Ordering::Acquire) {
+    while web.count.load(Ordering::Relaxed) < 3
+        || source
+            .data
+            .cached(Piece {
+                file: None,
+                index: 2,
+            })
+            .is_none()
+    {
         assert!(start.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -665,8 +679,12 @@ fn regression_empty_file_sha256_and_seek_overflow() {
         };
         let bytes = envelope(v1_info(&[("file", b"")], BLOCK, false, Some(digest)), &[]);
         let source = TorrentMountSource::from_bytes(bytes, options(dir.path())).unwrap();
-        let result = read(&source, "/file");
-        assert_eq!(result.is_ok(), valid);
+        let _ = read(&source, "/file");
+        wait_until(|| {
+            let s = source.data.verification[0].lock().unwrap();
+            s.bad || s.complete
+        });
+        assert_eq!(read(&source, "/file").is_ok(), valid);
         let mut reader = source.open(&source.lookup("/file", 0).unwrap(), 0).unwrap();
         assert!(reader.seek(SeekFrom::Current(-1)).is_err());
         reader.seek(SeekFrom::Start(u64::MAX)).unwrap();
@@ -851,4 +869,361 @@ fn regression_hybrid_magnet_without_piece_layers_uses_verified_v1() {
     assert!(source.data.meta.files[0].v2.is_none());
     assert!(source.data.meta.v2_hash.is_some());
     assert_eq!(read(&source, "/file").unwrap(), payload);
+}
+
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !condition() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "background work did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Regression: repeated BEP 47 .pad/<size> names collided with each other and visible files.
+#[test]
+fn regression_duplicate_padding_paths_are_hidden() {
+    let payload = b"a\0\0b\0\0c";
+    let info = d([
+        ("name", b("bundle")),
+        ("piece length", n(4)),
+        (
+            "pieces",
+            b(payload
+                .chunks(4)
+                .flat_map(|p| Sha1::digest(p).to_vec())
+                .collect::<Vec<_>>()),
+        ),
+        (
+            "files",
+            l([
+                d([("length", n(1)), ("path", l([b(".pad")]))]),
+                d([
+                    ("length", n(2)),
+                    ("path", l([b(".pad"), b("2")])),
+                    ("attr", b("p")),
+                ]),
+                d([("length", n(1)), ("path", l([b("b")]))]),
+                d([
+                    ("length", n(2)),
+                    ("path", l([b(".pad"), b("2")])),
+                    ("attr", b("p")),
+                ]),
+                d([("length", n(1)), ("path", l([b("c")]))]),
+            ]),
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let web = Web::new(BTreeMap::from([
+        ("/bundle/.pad".into(), b"a".to_vec()),
+        ("/bundle/b".into(), b"b".to_vec()),
+        ("/bundle/c".into(), b"c".to_vec()),
+    ]));
+    let source = TorrentMountSource::from_bytes(
+        envelope(info, std::slice::from_ref(&web.url)),
+        options(dir.path()),
+    )
+    .unwrap();
+    assert_eq!(source.list_dirents("/").unwrap().len(), 3);
+    assert!(source.lookup("/.pad/2", 0).is_none());
+    assert_eq!(read(&source, "/b").unwrap(), b"b");
+    assert_eq!(read(&source, "/c").unwrap(), b"c");
+}
+
+/// Regression: concurrent readers fetched the same verified piece twice and thrashed one last slot.
+#[test]
+fn regression_piece_lru_and_single_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = vec![7; BLOCK * 5];
+    let web = Web::new(BTreeMap::from([("/file".into(), payload.clone())]));
+    let mut opts = options(dir.path());
+    opts.range_cache = None;
+    let source = TorrentMountSource::from_bytes(
+        envelope(
+            v1_info(&[("file", &payload)], BLOCK, false, None),
+            &[format!("{}file", web.url)],
+        ),
+        opts,
+    )
+    .unwrap();
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                barrier.wait();
+                assert_eq!(
+                    source
+                        .data
+                        .piece(Piece {
+                            file: None,
+                            index: 0
+                        })
+                        .unwrap()
+                        .len(),
+                    BLOCK
+                );
+            });
+        }
+    });
+    assert_eq!(web.count.load(Ordering::Relaxed), 1);
+    for _ in 0..3 {
+        for index in 0..4 {
+            source.data.piece(Piece { file: None, index }).unwrap();
+        }
+    }
+    assert_eq!(web.count.load(Ordering::Relaxed), 4);
+    source
+        .data
+        .piece(Piece {
+            file: None,
+            index: 4,
+        })
+        .unwrap();
+    source
+        .data
+        .piece(Piece {
+            file: None,
+            index: 0,
+        })
+        .unwrap();
+    assert_eq!(web.count.load(Ordering::Relaxed), 6);
+}
+
+/// Regression: seeking one reader cancelled a different handle's readahead.
+#[test]
+fn regression_prefetch_generation_is_per_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let source =
+        TorrentMountSource::from_bytes(single_file_fixture(), options(dir.path())).unwrap();
+    let make = || TorrentReader {
+        data: source.data.clone(),
+        file: 0,
+        pos: 0,
+        prefetch: Arc::default(),
+    };
+    let mut first = make();
+    let second = make();
+    first.seek(SeekFrom::Start(1)).unwrap();
+    assert_eq!(first.prefetch.generation.load(Ordering::Relaxed), 1);
+    assert_eq!(second.prefetch.generation.load(Ordering::Relaxed), 0);
+}
+
+/// Regression: a successful web seed unnecessarily opened DHT sockets or announced to trackers.
+#[test]
+fn regression_swarm_policy_auto_never_always() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = Web::new(BTreeMap::from([("/file".into(), b"test".to_vec())]));
+    let bytes = envelope(
+        v1_info(&[("file", b"test")], BLOCK, false, None),
+        &[format!("{}file", web.url)],
+    );
+    for policy in [
+        TorrentSwarmPolicy::Auto,
+        TorrentSwarmPolicy::Never,
+        TorrentSwarmPolicy::Always,
+    ] {
+        let mut opts = options(dir.path());
+        opts.swarm.policy = policy;
+        let announced = opts.swarm.announced.clone();
+        let source = TorrentMountSource::from_bytes(bytes.clone(), opts).unwrap();
+        assert_eq!(read(&source, "/file").unwrap(), b"test");
+        assert_eq!(
+            announced.load(Ordering::Relaxed),
+            policy == TorrentSwarmPolicy::Always
+        );
+        assert_eq!(
+            source.data.swarm.lock().unwrap().is_some(),
+            policy == TorrentSwarmPolicy::Always
+        );
+    }
+    let mut opts = options(dir.path());
+    opts.swarm.policy = TorrentSwarmPolicy::Never;
+    opts.range_cache = None;
+    let source = TorrentMountSource::from_bytes(single_file_fixture(), opts.clone()).unwrap();
+    assert!(read(&source, "/file")
+        .unwrap_err()
+        .to_string()
+        .contains("--torrent-swarm never"));
+    assert!(!opts.swarm.announced.load(Ordering::Relaxed));
+    let error = TorrentMountSource::open(
+        "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+        opts,
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("metadata unavailable"));
+}
+
+/// Regression: whole-file completion held the read mutex while re-fetching an evicted prefix.
+#[test]
+fn regression_whole_file_hashing_never_blocks_reader_mutex() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = vec![5; BLOCK * 6];
+    let web = Web::new(BTreeMap::from([("/file".into(), payload.clone())]));
+    let source = TorrentMountSource::from_bytes(
+        envelope(
+            v1_info(
+                &[("file", &payload)],
+                BLOCK,
+                false,
+                Some(Sha256::digest(&payload).into()),
+            ),
+            &[format!("{}file", web.url)],
+        ),
+        options(dir.path()),
+    )
+    .unwrap();
+    // A stalled piece producer stands in for a very slow HTTP refetch. The
+    // verification worker will wait there after the coverage event, not the caller.
+    let key = Piece {
+        file: None,
+        index: 0,
+    };
+    let flight = Arc::new(pieces::Flight::new(true));
+    source
+        .data
+        .pieces
+        .lock()
+        .unwrap()
+        .flights
+        .insert(key, flight.clone());
+    source.data.after_read(0, 0, payload.len() as u64).unwrap();
+    wait_until(|| flight.waiting.load(Ordering::Acquire));
+    let state = source.data.verification[0]
+        .try_lock()
+        .expect("read-path mutex held by verifier");
+    assert!(!state.complete);
+    drop(state);
+    let mut reader = source.open(&source.lookup("/file", 0).unwrap(), 0).unwrap();
+    reader.seek(SeekFrom::Start(BLOCK as u64 * 5)).unwrap();
+    let mut byte = [0];
+    reader.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [5]);
+    // Release the simulated producer and let background verification finish.
+    let bytes = Arc::new(payload[..BLOCK].to_vec());
+    source.data.pieces.lock().unwrap().flights.remove(&key);
+    flight.finish(&Ok(bytes));
+    wait_until(|| source.verified_file_sha256("/file").is_some());
+}
+
+/// Regression: a web seed ignoring Range streamed gigabytes of prefix on a random read.
+#[test]
+fn regression_ignored_range_skips_seed_beyond_prefix_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = vec![42; 2 * 1024 * 1024];
+    let bad = Web::with_ranges(BTreeMap::from([("/file".into(), payload.clone())]), false);
+    let good = Web::new(BTreeMap::from([("/file".into(), payload.clone())]));
+    let mut opts = options(dir.path());
+    opts.swarm.policy = TorrentSwarmPolicy::Never;
+    let source = TorrentMountSource::from_bytes(
+        envelope(
+            v1_info(&[("file", &payload)], BLOCK, false, None),
+            &[format!("{}file", bad.url), format!("{}file", good.url)],
+        ),
+        opts,
+    )
+    .unwrap();
+    let mut reader = source.open(&source.lookup("/file", 0).unwrap(), 0).unwrap();
+    reader
+        .seek(SeekFrom::Start((1024 * 1024 + BLOCK) as u64))
+        .unwrap();
+    let mut byte = [0];
+    reader.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [42]);
+    assert_eq!(bad.count.load(Ordering::Relaxed), 1);
+    assert_eq!(good.count.load(Ordering::Relaxed), 1);
+    assert!(source.data.swarm.lock().unwrap().is_none());
+}
+
+/// Regression: cached metainfo retained a previous magnet's different Hub checksum source.
+#[test]
+fn regression_magnet_ws_replaces_cached_source_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut meta = Metainfo::parse(single_file_fixture()).unwrap();
+    meta.web_seeds = vec![
+        "https://huggingface.co/old/repo/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/file"
+            .into(),
+    ];
+    meta.bytes = metadata::envelope(&meta).unwrap();
+    let mut opts = options(dir.path());
+    opts.swarm.policy = TorrentSwarmPolicy::Never;
+    metadata::save(&meta, &opts.metadata_dir).unwrap();
+    let good =
+        "https://huggingface.co/new/repo/resolve/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/file";
+    let mut magnet = Url::parse(&format!("magnet:?xt=urn:btih:{}", meta.identity())).unwrap();
+    magnet.query_pairs_mut().append_pair("ws", good);
+    let resolved = metadata::resolve(magnet.as_str(), &opts).unwrap();
+    assert_eq!(resolved.web_seeds, vec![good]);
+}
+
+/// Regression: late checksum discovery was coupled to the first read and delayed payload delivery.
+#[test]
+fn regression_checksum_arrives_after_read_without_network_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = Web::new(BTreeMap::from([("/file".into(), b"test".to_vec())]));
+    let source = TorrentMountSource::from_bytes(
+        envelope(
+            v1_info(&[("file", b"test")], BLOCK, false, None),
+            &[format!("{}file", web.url)],
+        ),
+        options(dir.path()),
+    )
+    .unwrap();
+    assert_eq!(read(&source, "/file").unwrap(), b"test");
+    assert!(source.verified_file_sha256("/file").is_none());
+    source
+        .data
+        .verify_tx
+        .send(verification::Event::Hashes(BTreeMap::from([(
+            "file".into(),
+            Sha256::digest(b"test").into(),
+        )])))
+        .unwrap();
+    wait_until(|| source.verified_file_sha256("/file").is_some());
+    assert_eq!(
+        web.count.load(Ordering::Relaxed),
+        1,
+        "ordered streaming digest refetched payload"
+    );
+}
+
+/// Regression: sequential completion re-read every evicted piece instead of retaining a streaming digest.
+#[test]
+fn regression_ordered_sha256_does_not_refetch_evicted_pieces() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = vec![9; BLOCK * 12];
+    let web = Web::new(BTreeMap::from([("/file".into(), payload.clone())]));
+    let mut opts = options(dir.path());
+    opts.range_cache = None;
+    let source = TorrentMountSource::from_bytes(
+        envelope(
+            v1_info(
+                &[("file", &payload)],
+                BLOCK,
+                false,
+                Some(Sha256::digest(&payload).into()),
+            ),
+            &[format!("{}file", web.url)],
+        ),
+        opts,
+    )
+    .unwrap();
+    let mut reader = source.open(&source.lookup("/file", 0).unwrap(), 0).unwrap();
+    let mut block = vec![0; BLOCK];
+    for _ in 0..12 {
+        reader.read_exact(&mut block).unwrap();
+        // Deterministically let the asynchronous hasher observe this piece
+        // before intentionally exceeding the four-piece working set.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        source
+            .data
+            .verify_tx
+            .send(verification::Event::Barrier(tx))
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    wait_until(|| source.verified_file_sha256("/file").is_some());
+    assert_eq!(web.count.load(Ordering::Relaxed), 12);
 }

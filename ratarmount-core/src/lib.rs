@@ -1,7 +1,9 @@
 //! Core types and the `MountSource` trait (mirrors Python `ratarmountcore.mountsource`).
 
+mod atomic_update;
 mod attribute_mapping;
 mod quiet_print;
+pub use atomic_update::{try_update_u64, try_update_usize};
 pub use attribute_mapping::AttributeMapping;
 
 use std::collections::{BTreeMap, HashMap};
@@ -10,6 +12,27 @@ use std::io::{self, Read, Seek};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// When a torrent may contact peers, trackers and the DHT.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TorrentSwarmPolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl std::str::FromStr for TorrentSwarmPolicy {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            _ => Err("expected auto, always or never".into()),
+        }
+    }
+}
 
 /// Whole-sidecar blob cap (bytes).
 ///
@@ -512,6 +535,13 @@ pub struct OpenOptions {
     pub parallelization: ParallelizationSpec,
     /// Remote torrent piece readahead in bytes (zero disables HTTP prefetch).
     pub readahead_bytes: u64,
+    pub torrent_swarm: TorrentSwarmPolicy,
+    /// Maximum scratch bytes written by one torrent swarm session.
+    pub torrent_scratch_bytes: u64,
+    /// Speculative decoded zstd bytes per reader; zero disables decode-ahead.
+    pub zstd_readahead_bytes: u64,
+    /// Drop consumed local archive pages where the backend supports advice.
+    pub direct_io: bool,
     /// Character encoding for TAR (and similar) member names (`-e` / `--encoding`).
     pub encoding: String,
     pub gzip_seek_point_spacing: u64,
@@ -554,6 +584,10 @@ impl Default for OpenOptions {
             gnu_incremental: None,
             parallelization: ParallelizationSpec::default(),
             readahead_bytes: 0,
+            torrent_swarm: TorrentSwarmPolicy::Auto,
+            torrent_scratch_bytes: 2 * 1024 * 1024 * 1024,
+            zstd_readahead_bytes: 16 * 1024 * 1024,
+            direct_io: false,
             encoding: "utf-8".into(),
             gzip_seek_point_spacing: 16 * 1024 * 1024,
             passwords: Vec::new(),
@@ -594,6 +628,8 @@ impl fmt::Debug for OpenOptions {
             .field("gnu_incremental", &self.gnu_incremental)
             .field("parallelization", &self.parallelization)
             .field("readahead_bytes", &self.readahead_bytes)
+            .field("torrent_swarm", &self.torrent_swarm)
+            .field("torrent_scratch_bytes", &self.torrent_scratch_bytes)
             .field("encoding", &self.encoding)
             .field("gzip_seek_point_spacing", &self.gzip_seek_point_spacing)
             .field(

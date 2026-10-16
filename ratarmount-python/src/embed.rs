@@ -350,6 +350,63 @@ fn split_url(url: &str) -> String {
     }
 }
 
+/// Bound pointer readback while filling short remote reads.
+fn read_pointer_bytes(reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 64 * 1024 {
+        return Err(std::io::Error::other("published pointer exceeds 64 KiB"));
+    }
+    Ok(bytes)
+}
+
+/// Read back the published pointer with native credentials, pinning Hub PR commits.
+#[pyfunction]
+#[pyo3(signature = (target, commit=None))]
+fn published_pointer(
+    py: Python<'_>,
+    target: String,
+    commit: Option<String>,
+) -> PyResult<(Vec<u8>, String)> {
+    py.detach(move || -> ratarmount_remote::Result<(Vec<u8>, String)> {
+        let pointer_url = format!("{target}.index.ptr");
+        let (reader, base): (Box<dyn Read>, String) = if target.starts_with("hf://") {
+            let repo = ratarmount_remote::HfRepo::resolve(&target)?;
+            let repo = match commit {
+                Some(commit) => repo.at_revision(&commit)?,
+                None => repo,
+            };
+            let reader = repo.open_file(&format!("{}.index.ptr", repo.location.path))?;
+            let base = repo.resolve_url(&repo.location.path);
+            (Box::new(reader), base)
+        } else if target.starts_with("s3://") {
+            (
+                Box::new(ratarmount_remote::open_s3_range(&pointer_url)?),
+                target,
+            )
+        } else if target.starts_with("gs://") {
+            (
+                Box::new(ratarmount_remote::open_gcs_range(&pointer_url)?),
+                target,
+            )
+        } else if target.starts_with("az://") {
+            (
+                Box::new(ratarmount_remote::open_azure_range(&pointer_url)?),
+                target,
+            )
+        } else {
+            return Err(ratarmount_remote::RemoteError::UnsupportedScheme(
+                "pointer readback requires hf://, s3://, gs:// or az://".into(),
+            ));
+        };
+        let bytes = read_pointer_bytes(reader)?;
+        Ok((bytes, base))
+    })
+    .map_err(|_| {
+        RatarmountError::new_err("publication succeeded but remote pointer readback failed")
+    })
+}
+
 #[pymodule]
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Archive>()?;
@@ -360,6 +417,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("NotMappable", py.get_type::<NotMappable>())?;
     module.add_function(wrap_pyfunction!(open, module)?)?;
     module.add_function(wrap_pyfunction!(split_url, module)?)?;
+    module.add_function(wrap_pyfunction!(published_pointer, module)?)?;
     Ok(())
 }
 
@@ -367,6 +425,41 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
+
+    /// Regression: remote pointer readback must fill short reads and reject oversized JSON.
+    #[test]
+    fn regression_published_pointer_short_reads_and_size_limit() {
+        struct ShortReader(std::io::Cursor<Vec<u8>>);
+        impl Read for ShortReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let len = buffer.len().min(1);
+                self.0.read(&mut buffer[..len])
+            }
+        }
+        let bytes = b"{\"index_id\":\"test\"}";
+        assert_eq!(
+            read_pointer_bytes(ShortReader(std::io::Cursor::new(bytes.to_vec()))).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            read_pointer_bytes(&[b'x'; 64 * 1024][..]).unwrap().len(),
+            64 * 1024
+        );
+        assert!(read_pointer_bytes(&[b'x'; 64 * 1024 + 1][..]).is_err());
+    }
+
+    /// Regression: private remote diagnostics must not disclose the supplied URL credentials.
+    #[test]
+    fn regression_published_pointer_errors_redact_credentials() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error =
+                published_pointer(py, "https://user:secret@host/a.tar".into(), None).unwrap_err();
+            assert!(error.is_instance_of::<RatarmountError>(py));
+            assert!(!error.to_string().contains("secret"));
+            assert!(error.to_string().contains("publication succeeded"));
+        });
+    }
 
     /// Regression: Session errors retain their Python exception families.
     #[test]
@@ -426,6 +519,7 @@ mod tests {
         write_ustar_members(
             &mut file,
             &[UstarMember {
+                xattrs: &[],
                 path: "hello.txt",
                 payload: UstarPayload::File { bytes: b"abcdWXYZ" },
                 mode: 0o644,

@@ -7,13 +7,14 @@ description = "Remote URL fetch (HTTP, S3, SSH/SFTP, WebDAV, SMB, Dropbox) for r
 
 [features]
 default = []
-bittorrent = ["dep:librqbit", "dep:tokio"]
+bittorrent = ["dep:librqbit", "dep:tokio", "dep:anyhow"]
 
 [dependencies]
 ratarmount-core.workspace = true
 ratarmount-index.workspace = true
 thiserror.workspace = true
 log.workspace = true
+libc.workspace = true
 tempfile.workspace = true
 ureq = { version = "2", default-features = true, features = ["tls"] }
 url = "2"
@@ -37,3 +38,5 @@ suppaftp = { version = "=6.2.0", default-features = false, features = ["rustls"]
 jsonwebtoken = "9"
 librqbit = { version = "=9.0.1", optional = true, default-features = false, features = ["rust-tls", "disable-upload"] }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "sync", "time", "io-util"] }
+
+anyhow = { version = "1", optional = true }

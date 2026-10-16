@@ -179,7 +179,7 @@ pub fn spawn_interval_commits(
             }) {
                 Ok(CommitOutcome::DidWork) => log::info!(
                     "interval overlay commit wrote idle files into {}",
-                    archive.display()
+                    overlay.commit_archive_path(&archive).display()
                 ),
                 Ok(CommitOutcome::Nothing) => {
                     log::debug!("interval overlay commit: nothing idle to do")
@@ -224,11 +224,25 @@ pub fn apply_live_commit(
         };
         if did && !remote_publish_patches_sidecar(live_remote_kind(&archive.to_string_lossy())) {
             if let Some(window) = overlay.last_patch_window() {
-                patch_sidecar_if_present(archive, &window, opts).map_err(|e| e.to_string())?;
+                patch_sidecar_if_present(&overlay.commit_archive_path(archive), &window, opts)
+                    .map_err(|e| e.to_string())?;
             }
         }
         Ok(did)
     }
+}
+
+pub fn open_rolling_series(
+    base: &Path,
+    policy: ratarmount_compositing::RollPolicy,
+    opts: &OpenOptions,
+) -> Result<Arc<ratarmount_compositing::RollingMountSource>, String> {
+    let opts = opts.clone();
+    ratarmount_compositing::RollingMountSource::open(base, policy, move |path| {
+        ratarmount_session::factory::open_path(path, &opts, false).map_err(OverlayError::Msg)
+    })
+    .map(Arc::new)
+    .map_err(|e| e.to_string())
 }
 
 fn reopen_live_archive(archive: &Path, opts: &OpenOptions) -> Result<Arc<dyn MountSource>, String> {
@@ -1151,7 +1165,10 @@ pub fn maybe_commit_on_exit(
         return;
     };
     match apply_live_commit(ov, path, false, opts) {
-        Ok(true) => eprintln!("committed write overlay into {}", path.display()),
+        Ok(true) => eprintln!(
+            "committed write overlay into {}",
+            ov.commit_archive_path(path).display()
+        ),
         Ok(false) => log::debug!("on-exit overlay commit: nothing to do"),
         Err(e) => eprintln!("error: on-exit overlay commit failed: {e}"),
     }
@@ -1228,6 +1245,7 @@ mod tests {
     fn write_tiny_tar_zst(path: &std::path::Path) {
         let payload = b"x\n";
         let member = ratarmount_formats_tar::UstarMember {
+            xattrs: &[],
             path: "a.txt",
             payload: ratarmount_formats_tar::UstarPayload::File { bytes: payload },
             mode: 0o644,
@@ -1245,6 +1263,7 @@ mod tests {
     fn write_split_tar_zst(path: &std::path::Path, prefix: &[u8], last: &[u8]) {
         fn member<'a>(path: &'a str, bytes: &'a [u8]) -> ratarmount_formats_tar::UstarMember<'a> {
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path,
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes },
                 mode: 0o644,
@@ -1646,6 +1665,7 @@ mod tests {
         let dropped = b"drop-mount\n";
         let members = [
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "keep.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: keep },
                 mode: 0o644,
@@ -1654,6 +1674,7 @@ mod tests {
                 mtime: 0,
             },
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "drop.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: dropped },
                 mode: 0o644,
@@ -1688,6 +1709,7 @@ mod tests {
         let other = b"different-reget-bytes-not-the-mount\n";
         let spool_members = [
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "keep.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: other },
                 mode: 0o644,
@@ -1696,6 +1718,7 @@ mod tests {
                 mtime: 0,
             },
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "drop.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: other },
                 mode: 0o644,
@@ -1759,6 +1782,7 @@ mod tests {
 
     fn ustar_archive(name: &str, payload: &[u8]) -> Vec<u8> {
         let member = ratarmount_formats_tar::UstarMember {
+            xattrs: &[],
             path: name,
             payload: ratarmount_formats_tar::UstarPayload::File { bytes: payload },
             mode: 0o644,
@@ -1895,5 +1919,59 @@ mod tests {
             "PutObject HTTP 500: body mentions HTTP 412".into(),
         ));
         assert!(matches!(retry, RemotePublishError::Retryable(_)), "{retry}");
+    }
+}
+
+#[cfg(test)]
+mod rolling_tests {
+    use super::*;
+    use ratarmount_compositing::{CommitMode, RollPolicy, SeriesName};
+    use std::fs;
+
+    /// Regression: rolling must build/patch a distinct index and manifest for each generation.
+    #[test]
+    fn rolling_per_archive_sidecars_and_on_exit_patch() {
+        for suffix in ["tar", "tar.zst"] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join(format!("traces.{suffix}"));
+            let opts = OpenOptions {
+                write_index: true,
+                ..Default::default()
+            };
+            let series =
+                open_rolling_series(&base, "1B".parse::<RollPolicy>().unwrap(), &opts).unwrap();
+            let original = series.active_path();
+            let mut overlay =
+                WriteOverlay::new(series.clone(), dir.path().join("overlay")).unwrap();
+            overlay.set_rolling(series.clone());
+            overlay.set_commit_mode(CommitMode::Append);
+            overlay.set_manifest_hashes(Some("new".into()));
+            fs::write(overlay.root().join("one"), b"one").unwrap();
+            assert!(apply_live_commit(&overlay, &original, true, &opts).unwrap());
+            let names = SeriesName::new(&base).unwrap();
+            let first = names.generation(1).unwrap();
+            let first_sidecar = sidecar_path_for_patch(&first, &opts).expect("first index");
+            let first_bytes = fs::read(&first).unwrap();
+            let first_index_bytes = fs::read(&first_sidecar).unwrap();
+            fs::write(overlay.root().join("two"), b"two").unwrap();
+            assert!(apply_live_commit(&overlay, &original, false, &opts).unwrap());
+            let second = names.generation(2).unwrap();
+            assert_eq!(series.active_path(), second);
+            assert_eq!(fs::read(&first).unwrap(), first_bytes);
+            assert_eq!(fs::read(&first_sidecar).unwrap(), first_index_bytes);
+            for path in [&first, &second] {
+                let index = sidecar_path_for_patch(path, &opts).expect("per-archive index");
+                SqliteIndex::open_read_only(&index)
+                    .unwrap()
+                    .check_tarstats_matches_archive(path)
+                    .unwrap();
+                assert!(PathBuf::from(format!("{}.manifest.jsonl", path.display())).is_file());
+            }
+            drop(overlay);
+            drop(series);
+            let remount = open_rolling_series(&base, "1G".parse().unwrap(), &opts).unwrap();
+            assert!(remount.lookup("/one", 0).is_some());
+            assert!(remount.lookup("/two", 0).is_some());
+        }
     }
 }

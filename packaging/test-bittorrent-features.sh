@@ -19,6 +19,6 @@ for crate in ['ratarmount', 'ratarmount-session', 'ratarmount-remote']:
     assert re.search(r'^bittorrent\s*=', features, re.M)
     defaults = re.search(r'^default\s*=\s*\[([^]]*)\]', features, re.M)
     assert defaults
-    assert ('"bittorrent"' in defaults.group(1)) == (crate == 'ratarmount')
-print('PASS: bittorrent enabled in CLI/packages and opt-in for libraries')
+    assert '"bittorrent"' not in defaults.group(1)
+print('PASS: bittorrent enabled in packages and opt-in for CLI/libraries')
 PY

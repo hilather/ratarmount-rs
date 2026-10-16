@@ -18,7 +18,9 @@ select Git mode. Bare repositories and `.git` directories select it automaticall
 A normal working directory without these selectors remains a live folder mount,
 including its original `.git`. `--git-synthetic-head` and `--git-prefix` require
 Git mode; they do not silently convert ordinary folders. Synthetic mode requires
-exactly one input: unions with Git repositories or any other sources are rejected.
+exactly one Git source. Non-Git images or archives can share the union; use
+`--bind /repo=repo.git@REV` to expose synthetic metadata at `/repo/.git`.
+Multiple Git sources remain rejected.
 
 Revisions use libgit2's revision syntax (commit IDs, branches, tags, `HEAD~1`,
 etc.). Quote expressions containing shell metacharacters. An existing literal
@@ -140,6 +142,53 @@ arbitrary access to the host or network. Source symlink targets and committed
 file contents are preserved, including any secrets already in that tree.
 Use process/container isolation to deny the agent access to the source repo,
 host cache, external Git configuration/object-store environment variables,
-other mounted sources, and network fetches. Unions are rejected in synthetic
-mode. A control interface can still add untracked files; the clean-status
+other mounted sources, and network fetches. Other union sources can expose additional content and metadata; inspect
+the assembled tree when choosing an image. A control interface can still add untracked files; the clean-status
 guarantee is for the selected Git tree with its synthetic metadata.
+
+
+## Pinned code corpora
+
+`ratarmount corpus LIST-FILE MOUNTPOINT [options]` mounts many committed trees
+read-only, with no checkout and no synthetic `.git`:
+
+```text
+# corpus.txt: repository paths are relative to this list file
+repos/org/project.git@0123456789abcdef0123456789abcdef01234567
+repos/other/tool.git@89abcdef0123456789abcdef0123456789abcdef tools/tool
+```
+
+```sh
+ratarmount corpus corpus.txt corpus-mnt --corpus-cache-size 64
+```
+
+Each nonblank line is `REPO@SHA [MOUNT/PATH]`. A SHA must be the full 40-digit
+hexadecimal commit ID. Floating branches/tags and abbreviated IDs are rejected.
+The optional path may start with `/`; it cannot contain `.` or `..` components
+or designate the root. The default is the repository's final parent/name pair,
+with `.git` removed (`repos/org/project.git` becomes `/org/project`); a path
+without a parent uses just its name. Blank lines and `#` comments (including
+trailing comments) are accepted. Fields are whitespace-separated; repository
+and mount names containing whitespace or `#` cannot be represented.
+
+The namespace is built without opening repositories. Listing `/`, its synthetic
+ancestor directories, or looking up a mount directory opens none. Listing a
+repository's contents or looking up a file inside it opens that repository on
+first access. Up to `--corpus-cache-size N` idle sources are retained (default
+64, minimum 1); the least recently used is dropped on a cache miss. Metadata
+cookies reopen the exact pinned commit after eviction. Active operations and
+open file readers can retain their data beyond this idle-cache limit, and the
+namespace/list entries themselves scale with the number of repositories. The
+limit bounds retained repository sources, not total process RSS or blob sizes.
+
+Repos must remain available and retain their pinned objects while mounted.
+Missing/corrupt repositories or missing commits are reported on access in the
+daemon log, with missing entries to readers; file opens report an I/O error.
+The parser validates the list at startup but deliberately does not validate
+all repository contents. Revisions are checked against their requested commit
+ID on every reopen. Later list entries win for conflicting files and directories
+merge with the ordinary union policy. Listing all files recursively opens repos
+as it visits them. `-r` archive recursion implicitly uses lazy mode so it does
+not open the corpus during startup. Corpus mode rejects `-w`, `--bind`, Git selectors and
+`--no-mount`; use normal binds for writable rootfs attempts. Standard foreground,
+prefix, and export flags can be used with the required mountpoint.

@@ -89,6 +89,7 @@ mod tests {
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,
@@ -142,8 +143,10 @@ mod tests {
             write_ustar_members(
                 &mut f,
                 &[UstarMember {
+                    xattrs: &[],
                     path: "big.bin",
                     payload: UstarPayload::FileOnDisk {
+                        sha256: None,
                         path: &payload,
                         size: BIG,
                     },

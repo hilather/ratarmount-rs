@@ -10,6 +10,44 @@ use ratarmount_core::{
     ListResult, MountSource,
 };
 
+/// One source mounted at an absolute path inside the union.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceBind {
+    pub mount_path: String,
+    pub source: String,
+}
+
+/// Validate a mount-relative absolute path before any source is opened.
+pub fn validate_mount_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/')
+        || path.contains('\0')
+        || path.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return Err(format!(
+            "invalid mount path {path:?}: expected an absolute path without . or .."
+        ));
+    }
+    Ok(())
+}
+
+impl std::str::FromStr for SourceBind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (mount_path, source) = value
+            .split_once('=')
+            .ok_or("expected --bind /MOUNTPATH=SOURCE")?;
+        validate_mount_path(mount_path)?;
+        if source.is_empty() {
+            return Err("bind source must not be empty".into());
+        }
+        Ok(Self {
+            mount_path: normpath(mount_path),
+            source: source.into(),
+        })
+    }
+}
+
 /// Wrap `inner` so all content is reachable under `prefix`.
 pub struct PrefixMountSource {
     prefix: String,
@@ -19,7 +57,8 @@ pub struct PrefixMountSource {
 impl PrefixMountSource {
     /// `prefix` like `"data"` or `"/data"` → content at `/data/...`.
     pub fn new(prefix: &str, inner: Arc<dyn MountSource>) -> Self {
-        let p = prefix.trim().trim_matches('/');
+        let normalized = normpath(prefix);
+        let p = normalized.trim_matches('/');
         Self {
             prefix: if p.is_empty() {
                 String::new()
@@ -28,6 +67,15 @@ impl PrefixMountSource {
             },
             inner,
         }
+    }
+
+    fn next_component<'a>(&'a self, path: &str) -> Option<&'a str> {
+        let parent = if path == "/" {
+            "/".to_string()
+        } else {
+            format!("{path}/")
+        };
+        self.prefix.strip_prefix(&parent)?.split('/').next()
     }
 
     fn strip(&self, path: &str) -> Option<String> {
@@ -54,23 +102,11 @@ impl MountSource for PrefixMountSource {
         if self.prefix.is_empty() {
             return self.inner.list(&path);
         }
-        if path == "/" {
-            // Single entry: the prefix name
-            let name = self.prefix.trim_start_matches('/').to_string();
-            let mut map = std::collections::BTreeMap::new();
-            map.insert(
-                name,
-                FileInfo {
-                    size: 0,
-                    mtime: 0.0,
-                    mode: ratarmount_core::S_IFDIR | 0o755,
-                    linkname: String::new(),
-                    uid: ratarmount_core::effective_uid(),
-                    gid: ratarmount_core::effective_gid(),
-                    userdata: vec![],
-                },
-            );
-            return Some(ListResult::Infos(map));
+        if let Some(name) = self.next_component(&path) {
+            return Some(ListResult::Infos(std::collections::BTreeMap::from([(
+                name.to_string(),
+                create_root_file_info(),
+            )])));
         }
         let inner_path = self.strip(&path)?;
         self.inner.list(&inner_path)
@@ -81,10 +117,9 @@ impl MountSource for PrefixMountSource {
         if self.prefix.is_empty() {
             return self.inner.list_dirents(&path);
         }
-        if path == "/" {
-            // Synthetic prefix dir; size 0 is correct (it is a directory).
+        if let Some(name) = self.next_component(&path) {
             return Some(vec![CheapDirent {
-                name: self.prefix.trim_start_matches('/').to_string(),
+                name: name.to_string(),
                 mode: ratarmount_core::S_IFDIR | 0o755,
                 size: 0,
             }]);
@@ -115,7 +150,7 @@ impl MountSource for PrefixMountSource {
         if self.prefix.is_empty() {
             return self.inner.lookup(&path, file_version);
         }
-        if path == self.prefix {
+        if path == self.prefix || self.next_component(&path).is_some() {
             return Some(FileInfo {
                 size: 0,
                 mtime: 0.0,
@@ -140,6 +175,9 @@ impl MountSource for PrefixMountSource {
 
     fn versions(&self, path: &str) -> u32 {
         let path = normpath(path);
+        if self.next_component(&path).is_some() {
+            return 1;
+        }
         if let Some(inner) = self.strip(&path) {
             self.inner.versions(&inner)
         } else {
@@ -185,6 +223,40 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
+
+    /// Regression: nested bind prefixes appeared as a single name containing a slash.
+    #[test]
+    fn regression_nested_prefix_lists_each_ancestor() {
+        let (_dir, counted, a, _) = zip_with_two_members();
+        let prefix = PrefixMountSource::new("/org/name", counted);
+        assert_eq!(prefix.list_dirents("/").unwrap()[0].name, "org");
+        assert_eq!(prefix.list_dirents("/org").unwrap()[0].name, "name");
+        assert!(ratarmount_core::is_dir_mode(
+            prefix.lookup("/org", 0).unwrap().mode
+        ));
+        assert!(prefix.lookup("/organization", 0).is_none());
+        assert_eq!(prefix.versions("/org"), 1);
+        let fi = prefix.lookup("/org/name/a.txt", 0).unwrap();
+        assert_eq!(prefix.read(&fi, 100, 0).unwrap(), a);
+        assert!(
+            matches!(prefix.list("/org"), Some(ListResult::Infos(map)) if map.contains_key("name"))
+        );
+    }
+
+    /// Regression: bind syntax must preserve URL equals signs and reject escaping mount paths.
+    #[test]
+    fn regression_bind_validation_rejects_parent_paths() {
+        for value in ["repo=x", "/a/../b=x", "/./a=x", "/a=", "/a", "/a\0=x"] {
+            assert!(value.parse::<SourceBind>().is_err(), "{value:?}");
+        }
+        let bind: SourceBind = "/org/name=https://host/file?x=y".parse().unwrap();
+        assert_eq!(bind.source, "https://host/file?x=y");
+        assert_eq!(bind.mount_path, "/org/name");
+        assert_eq!(
+            "/=repo.git@abc".parse::<SourceBind>().unwrap().mount_path,
+            "/"
+        );
+    }
 
     /// Counts `list()` so we can prove Prefix uses `list_dirents`.
     struct ListCallCounter {

@@ -1,6 +1,7 @@
 //! Write overlay: redirect creates/writes/deletes to a host folder.
 //! Mirrors Python `WritableFolderMountSource` (subset) + `commit_overlay`.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -139,6 +140,12 @@ CREATE TABLE IF NOT EXISTS "files" (
     "uid"     INTEGER,
     "gid"     INTEGER,
     "deleted" BOOL,
+    PRIMARY KEY (path, name)
+);
+CREATE TABLE IF NOT EXISTS xattrs (
+    path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    value BLOB,
     PRIMARY KEY (path, name)
 );
 "#;
@@ -302,7 +309,7 @@ struct SpoolDownloaded {
 struct SpoolSpliced {
     prefix_compressed_bytes: u64,
     etag_at_download: Option<String>,
-    committed: OverlayCommitPlan,
+    committed: Box<OverlayCommitPlan>,
     /// Length, full SHA-256, and edge hashes of the spool **before** `persist_by_format`.
     presplice_len: u64,
     presplice_sha256: String,
@@ -419,6 +426,7 @@ enum PendingFilesOp {
         to: String,
         mode: u32,
         hides_from: bool,
+        xattrs: BTreeMap<String, Vec<u8>>,
     },
     /// Host unlink or rmdir finished.
     Deleted { path: String, hides_base: bool },
@@ -579,6 +587,7 @@ pub struct WriteOverlay {
     #[cfg(test)]
     cow_before_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     base: Arc<dyn MountSource>,
+    rolling: Option<Arc<crate::RollingMountSource>>,
     /// After a live TAR commit, the reopened archive.
     replacement: RwLock<Option<Arc<dyn MountSource>>>,
     root: PathBuf,
@@ -600,6 +609,7 @@ pub struct WriteOverlay {
     /// Writers take a read lock; live commit takes the write lock.
     commit_gate: RwLock<()>,
     commit_mode: CommitMode,
+    manifest_hashes: Option<String>,
     /// Set when persist succeeded but reopen failed (K11). Further interval
     /// ticks must not persist again (overlay still holds the committed names).
     interval_disabled: AtomicBool,
@@ -1067,6 +1077,7 @@ impl WriteOverlay {
             #[cfg(test)]
             cow_before_read_hook: Mutex::new(None),
             base,
+            rolling: None,
             replacement: RwLock::new(None),
             root,
             db: Mutex::new(conn),
@@ -1079,6 +1090,7 @@ impl WriteOverlay {
             encoding: "utf-8".into(),
             last_patch_window: Mutex::new(None),
             commit_mode: CommitMode::Copy,
+            manifest_hashes: None,
             commit_inflight: AtomicBool::new(false),
             commit_wait: Mutex::new(()),
             commit_cv: Condvar::new(),
@@ -1363,6 +1375,32 @@ impl WriteOverlay {
         self.ensure_modifiable_inner(path, None)
     }
 
+    fn remember_base_xattrs(
+        &self,
+        path: &str,
+        base: &dyn MountSource,
+        fi: &FileInfo,
+    ) -> Result<()> {
+        let attrs = source_xattrs(base, fi);
+        if !attrs.is_empty() {
+            let db = self.db.lock().expect("overlay db");
+            let reset: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM xattrs WHERE path=?1 AND name='')",
+                [normpath(path)],
+                |r| r.get(0),
+            )?;
+            if !reset {
+                for (name, value) in attrs {
+                    db.execute(
+                        "INSERT OR IGNORE INTO xattrs(path,name,value) VALUES (?1,?2,?3)",
+                        params![normpath(path), name, value],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_modifiable_inner(&self, path: &str, size: Option<u64>) -> Result<()> {
         if self.policy.is_some() {
             return self.copy_with_reservation(path, size);
@@ -1383,6 +1421,7 @@ impl WriteOverlay {
             // New file: just ensure parent
             return Ok(());
         };
+        self.remember_base_xattrs(path, self.current_base().as_ref(), &fi)?;
         if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             fs::create_dir_all(&real)?;
             return Ok(());
@@ -1428,6 +1467,7 @@ impl WriteOverlay {
             let Some(fi) = base.lookup(&path, 0) else {
                 return Ok(());
             };
+            self.remember_base_xattrs(&path, base.as_ref(), &fi)?;
             if ratarmount_core::is_dir_mode(fi.mode) {
                 fs::create_dir_all(&real)?;
                 return Ok(());
@@ -1564,7 +1604,8 @@ impl WriteOverlay {
         out
     }
 
-    fn load_tombstone_paths(&self) -> HashSet<String> {
+    /// Snapshot live deletions without opening the exclusively locked overlay DB.
+    pub fn load_tombstone_paths(&self) -> HashSet<String> {
         self.tombstones.lock().expect("overlay tombstones").clone()
     }
 
@@ -1963,6 +2004,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
         self.check_mutation(OverlayMutation::Unlink, &[path])?;
+        self.refuse_sealed_delete(path)?;
         let path = normpath(path);
         let real = self.realpath(&path);
         // unlink of a symlink removes the link itself (safe); refuse only when the
@@ -1994,6 +2036,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
         self.check_mutation(OverlayMutation::Rmdir, &[path])?;
+        self.refuse_sealed_delete(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
         // POSIX: refuse non-directories and non-empty dirs in the union view.
@@ -2135,6 +2178,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
         self.check_mutation(OverlayMutation::Rename, &[from, to])?;
+        self.refuse_sealed_delete(from)?;
         let from = normpath(from);
         let to = normpath(to);
         if from == "/" || to == "/" || from == to {
@@ -2188,6 +2232,7 @@ impl WriteOverlay {
         if let Some(parent) = to_real.parent() {
             fs::create_dir_all(parent)?;
         }
+        let xattrs = self.xattrs_for_path(&from)?;
         {
             let _from_account = self.account_path(&from);
             let _to_account = self.account_path(&to);
@@ -2197,7 +2242,7 @@ impl WriteOverlay {
         // Host rename already happened. `persist_files_op` queues on failure
         // and returns success so the client sees the completed rename.
         drop(_policy);
-        self.commit_rename_rows(&from, &to, &to_real, hides_from)?;
+        self.commit_rename_rows(&from, &to, &to_real, hides_from, xattrs)?;
         self.apply_rename_tombstone_memory(&from, &to, hides_from);
         Ok(parked)
     }
@@ -2243,6 +2288,7 @@ impl WriteOverlay {
         to: &str,
         to_real: &Path,
         hides_from: bool,
+        xattrs: BTreeMap<String, Vec<u8>>,
     ) -> Result<()> {
         let mode = match fs::symlink_metadata(to_real) {
             Ok(meta) => metadata_mode(&meta),
@@ -2259,6 +2305,7 @@ impl WriteOverlay {
             to: to.to_string(),
             mode,
             hides_from,
+            xattrs,
         })
     }
 
@@ -2627,8 +2674,185 @@ impl WriteOverlay {
     }
 
     /// Set before sharing the overlay with frontends. Copy is the default.
+    /// Xattr metadata is separate from host files: setting it never copies payload data.
+    /// NULL values mask archive attributes. Xattr bytes have their own caps and are
+    /// excluded from the host-file quota.
+    pub fn set_xattr(&self, path: &str, name: &str, value: &[u8], flags: i32) -> Result<()> {
+        self.change_xattr(path, name, Some(value), flags)
+    }
+
+    pub fn remove_xattr(&self, path: &str, name: &str) -> Result<()> {
+        self.change_xattr(path, name, None, 2)
+    }
+
+    fn change_xattr(&self, path: &str, name: &str, value: Option<&[u8]>, flags: i32) -> Result<()> {
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
+        let _policy = self.policy_lock();
+        let path = normpath(path);
+        self.check_mutation(OverlayMutation::Write, &[&path])?;
+        if self.rolling.is_some() && !self.has_file(&path) {
+            self.refuse_sealed_delete(&path)?;
+        }
+        if path == "/" {
+            return Err(io::Error::from_raw_os_error(libc::EPERM).into());
+        }
+        if !name.starts_with("user.") {
+            return Err(io::Error::from_raw_os_error(libc::EPERM).into());
+        }
+        if name.len() <= 5
+            || name.len() > 255
+            || name.contains(['=', '\0', '\n'])
+            || !matches!(flags, 0..=2)
+        {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL).into());
+        }
+        if value.is_some_and(|v| v.len() > 65536) {
+            return Err(io::Error::from_raw_os_error(libc::E2BIG).into());
+        }
+        self.lookup(&path, 0)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        self.replay_pending_or_refuse_commit()?;
+        let mut attrs = self.base_xattrs(&path);
+        let mut db = self.db.lock().expect("overlay db");
+        merge_xattr_rows(&db, &path, &mut attrs)?;
+        let exists = attrs.contains_key(name);
+        if flags == 1 && exists {
+            return Err(io::Error::from_raw_os_error(libc::EEXIST).into());
+        }
+        if flags == 2 && !exists {
+            return Err(io::Error::from_raw_os_error(missing_xattr_errno()).into());
+        }
+        attrs.remove(name);
+        let total = attrs.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+            + value.map_or(0, |v| name.len() + v.len());
+        let stored: usize = db.query_row(
+            "SELECT COALESCE(SUM(length(CAST(name AS BLOB)) + COALESCE(length(value),0)),0) FROM xattrs WHERE path=?1 AND name<>?2",
+            params![path, name], |r| r.get(0))?;
+        let stored_names: HashSet<String> = db
+            .prepare("SELECT name FROM xattrs WHERE path=?1")?
+            .query_map([&path], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let inherited = attrs
+            .iter()
+            .filter(|(key, _)| !stored_names.contains(*key))
+            .map(|(key, data)| key.len() + data.len())
+            .sum::<usize>();
+        if total > 256 * 1024
+            || stored + inherited + name.len() + value.map_or(0, <[u8]>::len) > 256 * 1024
+        {
+            return Err(io::Error::from_raw_os_error(libc::E2BIG).into());
+        }
+        let tx = db.transaction()?;
+        // Keep index-only inherited metadata (notably user.hash.*) when the
+        // replacement header is built from a fresh TAR scan during commit.
+        for (key, data) in &attrs {
+            tx.execute(
+                "INSERT OR IGNORE INTO xattrs(path,name,value) VALUES (?1,?2,?3)",
+                params![path, key, data],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO xattrs(path,name,value) VALUES (?1,?2,?3)",
+            params![path, name, value],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn base_xattrs(&self, path: &str) -> BTreeMap<String, Vec<u8>> {
+        let base = self.current_base();
+        base.lookup(path, 0)
+            .map(|fi| source_xattrs(base.as_ref(), &fi))
+            .unwrap_or_default()
+    }
+
+    pub fn xattrs_for_path(&self, path: &str) -> Result<BTreeMap<String, Vec<u8>>> {
+        let path = normpath(path);
+        self.lookup(&path, 0)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let mut attrs = self.base_xattrs(&path);
+        // Rename SQL can be queued after the host rename. Observe its metadata
+        // snapshot too, in the same queue-before-database order used by replay.
+        let pending = self.pending_rows.lock().expect("overlay pending rows");
+        merge_xattr_rows(&self.db.lock().expect("overlay db"), &path, &mut attrs)?;
+        for op in pending.iter() {
+            match op {
+                PendingFilesOp::Rename { to, xattrs, .. } if to == &path => attrs = xattrs.clone(),
+                PendingFilesOp::Rename { from, .. } if from == &path => attrs.clear(),
+                PendingFilesOp::Deleted { path: deleted, .. } if deleted == &path => attrs.clear(),
+                _ => {}
+            }
+        }
+        Ok(attrs)
+    }
+
+    /// Enable local TAR commit manifests with all/new/none hash coverage.
+    pub fn set_manifest_hashes(&mut self, hashes: Option<String>) {
+        self.manifest_hashes = hashes;
+    }
+
     pub fn set_commit_mode(&mut self, mode: CommitMode) {
         self.commit_mode = mode;
+    }
+
+    /// Install the series used as this overlay's base before serving requests.
+    pub fn set_rolling(&mut self, rolling: Arc<crate::RollingMountSource>) {
+        self.rolling = Some(rolling);
+    }
+
+    /// Actual active path (the CLI keeps the original generation as its label).
+    pub fn commit_archive_path(&self, archive: &Path) -> PathBuf {
+        self.rolling
+            .as_ref()
+            .map_or_else(|| archive.to_path_buf(), |series| series.active_path())
+    }
+
+    fn refuse_sealed_delete(&self, path: &str) -> Result<()> {
+        if self
+            .rolling
+            .as_ref()
+            .is_some_and(|series| series.sealed_contains(path))
+        {
+            return Err(io::Error::from_raw_os_error(libc::EROFS).into());
+        }
+        Ok(())
+    }
+
+    fn rolling_commit_target(&self, archive: &Path, plan: &OverlayCommitPlan) -> Result<PathBuf> {
+        let Some(series) = &self.rolling else {
+            return Ok(archive.to_path_buf());
+        };
+        let mut defer = false;
+        for path in &plan.deleted_paths {
+            if !plan.append_entries.iter().any(|(p, _)| p == path) {
+                self.refuse_sealed_delete(path)?;
+                defer |= series.active_source().exists(&archive_lookup_path(path));
+            }
+        }
+        for path in plan.xattrs.keys() {
+            if !plan.append_entries.iter().any(|(p, _)| p == path) {
+                self.refuse_sealed_delete(path)?;
+                defer = true;
+            }
+        }
+        series.prepare_commit(defer)
+    }
+
+    fn rolling_persist_plan<'a>(&self, plan: &'a OverlayCommitPlan) -> Cow<'a, OverlayCommitPlan> {
+        let Some(series) = &self.rolling else {
+            return Cow::Borrowed(plan);
+        };
+        let mut plan = plan.clone();
+        // Offsets and deletion names belong to the active archive only.
+        // Overlay cleanup still consumes the original, unfiltered plan.
+        let active = series.active_source();
+        plan.deleted_paths
+            .retain(|p| active.exists(&archive_lookup_path(p)));
+        plan.deletions_nul.clear();
+        for path in &plan.deleted_paths {
+            add_deletion_variants(&mut plan.deletions_nul, path);
+        }
+        Cow::Owned(plan)
     }
 
     /// True when `archive` can be live-committed (uncompressed TAR or `.tar.zst`).
@@ -2642,6 +2866,8 @@ impl WriteOverlay {
             return self.commit_atomic_remote();
         }
         let _gate = self.commit_gate.write().expect("overlay commit gate");
+        let archive_path = self.commit_archive_path(archive);
+        let archive = archive_path.as_path();
         ratarmount_compress::commit_journal::recover(archive)?;
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
@@ -2657,7 +2883,13 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
-        let window = self.persist_by_format(archive, format, &plan)?;
+        let target = self.rolling_commit_target(archive, &plan)?;
+        let archive = target.as_path();
+        let persist_plan = self.rolling_persist_plan(&plan);
+        let window = self.persist_by_format(archive, format, &persist_plan)?;
+        if let Some(series) = &self.rolling {
+            series.committed(None);
+        }
         self.stash_patch_window(window);
         self.commit_generation.fetch_add(1, Ordering::SeqCst);
         Ok(true)
@@ -3050,7 +3282,7 @@ impl WriteOverlay {
         hold.state = SpoolState::Spliced(SpoolSpliced {
             prefix_compressed_bytes: prefix,
             etag_at_download: etag,
-            committed: plan.clone(),
+            committed: Box::new(plan.clone()),
             presplice_len: fp.len,
             presplice_sha256: fp.sha256,
             presplice_prefix512_sha256: fp.prefix512_sha256,
@@ -3089,7 +3321,7 @@ impl WriteOverlay {
     fn take_stashed_plan(&self) -> Result<OverlayCommitPlan> {
         let guard = self.spool.lock().expect("overlay spool");
         match guard.as_ref().map(|h| &h.state) {
-            Some(SpoolState::Spliced(s)) => Ok(s.committed.clone()),
+            Some(SpoolState::Spliced(s)) => Ok((*s.committed).clone()),
             _ => Err(OverlayError::Msg(
                 "s3 commit has no stashed overlay plan".into(),
             )),
@@ -3271,6 +3503,8 @@ impl WriteOverlay {
         reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
     ) -> Result<bool> {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
+        let archive_path = self.commit_archive_path(archive);
+        let archive = archive_path.as_path();
         if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
             self.refuse_base_after_commit_failure();
             return Err(e.into());
@@ -3301,11 +3535,19 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
-        let window = self.persist_by_format(archive, format, &plan)?;
+        let target = self.rolling_commit_target(archive, &plan)?;
+        let archive = target.as_path();
+        let persist_plan = self.rolling_persist_plan(&plan);
+        let window = self.persist_by_format(archive, format, &persist_plan)?;
         self.stash_patch_window(window);
         match reopen(archive) {
             Ok(src) => {
-                *self.replacement.write().expect("overlay replacement") = Some(src);
+                if let Some(series) = &self.rolling {
+                    // The existing base wrappers already refer to this mutable series.
+                    series.committed(Some(src));
+                } else {
+                    *self.replacement.write().expect("overlay replacement") = Some(src);
+                }
                 // Bump before overlay cleanup: readers must drop pre-commit
                 // offsets even if forget/reset fails.
                 self.commit_generation.fetch_add(1, Ordering::SeqCst);
@@ -3319,7 +3561,7 @@ impl WriteOverlay {
                             self.db
                                 .lock()
                                 .expect("overlay db")
-                                .execute(r#"DELETE FROM "files""#, [])?;
+                                .execute_batch("DELETE FROM files; DELETE FROM xattrs;")?;
                             Ok(())
                         });
                         if wiped.is_ok() {
@@ -3376,6 +3618,9 @@ impl WriteOverlay {
         plan: &OverlayCommitPlan,
         dropped_rows: &mut Vec<String>,
     ) -> Result<()> {
+        for path in plan.xattrs.keys() {
+            db.execute("DELETE FROM xattrs WHERE path=?1", [normpath(path)])?;
+        }
         let mut dirs: Vec<&str> = Vec::new();
         for (rel, is_dir) in &plan.append_entries {
             if *is_dir {
@@ -3458,14 +3703,56 @@ impl WriteOverlay {
     ) -> Result<IndexPatchWindow> {
         ratarmount_compress::commit_journal::recover(archive)?;
         self.persist_count.fetch_add(1, Ordering::SeqCst);
-        let (window, prefix) = match format {
-            CompressionFormat::Zstd => {
-                let (window, stats) = self.persist_tar_zst_plan(archive, plan)?;
-                (window, stats.prefix_compressed_bytes)
-            }
-            // Uncompressed TAR stores 0.
-            _ => (self.persist_uncompressed_tar_plan(archive, plan)?, 0),
+        let mut manifest_plan = if self.manifest_hashes.is_some() && !self.remote_enabled() {
+            let mut snapshot = plan.clone();
+            snapshot.known_hashes = known_manifest_hashes(archive)?;
+            Some(snapshot)
+        } else {
+            None
         };
+        let hash_payloads =
+            manifest_plan.is_some() && self.manifest_hashes.as_deref() != Some("none");
+        let (window, prefix) = if plan.has_xattr_changes() || hash_payloads {
+            (
+                persist_provenance_plan(
+                    archive,
+                    &self.root,
+                    plan,
+                    &self.encoding,
+                    self.commit_mode,
+                    if hash_payloads {
+                        manifest_plan.as_mut().map(|p| &mut p.written_hashes)
+                    } else {
+                        None
+                    },
+                )?,
+                0,
+            )
+        } else {
+            match format {
+                CompressionFormat::Zstd => {
+                    let (window, stats) = self.persist_tar_zst_plan(archive, plan)?;
+                    (window, stats.prefix_compressed_bytes)
+                }
+                // Uncompressed TAR stores 0.
+                _ => (self.persist_uncompressed_tar_plan(archive, plan)?, 0),
+            }
+        };
+        if !self.remote_enabled() {
+            if let Some(hashes) = &self.manifest_hashes {
+                if let Err(e) = write_commit_manifest(
+                    archive,
+                    manifest_plan.as_ref().expect("manifest plan"),
+                    &self.encoding,
+                    hashes,
+                ) {
+                    self.refuse_base_after_commit_failure();
+                    return Err(OverlayError::Msg(format!(
+                        "archive committed; manifest failed (remount required): {e}"
+                    )));
+                }
+            }
+        }
         self.stash_publish_plan(LivePublishPlan {
             prefix_compressed_bytes: prefix,
         });
@@ -3612,7 +3899,11 @@ impl WriteOverlay {
         // Record GNU `--append` window from the two-zero EOF **before** tar runs.
         // `metadata().len()` includes EOF padding; parse would start after the
         // appended members.
-        let window = uncompressed_patch_window(archive, self.current_base().as_ref(), plan)?;
+        let classify_base = self
+            .rolling
+            .as_ref()
+            .map_or_else(|| self.current_base(), |series| series.active_source());
+        let window = uncompressed_patch_window(archive, classify_base.as_ref(), plan)?;
         let parent = archive
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -3730,7 +4021,7 @@ impl WriteOverlay {
             let mut pending = self.pending_rows.lock().expect("overlay pending rows");
             pending.clear();
             let db = self.db.lock().expect("overlay db");
-            db.execute(r#"DELETE FROM "files""#, [])?;
+            db.execute_batch("DELETE FROM files; DELETE FROM xattrs;")?;
         }
         self.tombstone_clear();
         Ok(())
@@ -4142,6 +4433,14 @@ impl MountSource for WriteOverlay {
         }
 
         if path == "/" || !map.is_empty() || self.current_base().is_dir(&path) {
+            for (name, fi) in &mut map {
+                if overlay_info_path(fi).is_none() {
+                    fi.userdata.push(UserData::Other(format!(
+                        "overlay-meta:{}",
+                        join(&path, name)
+                    )));
+                }
+            }
             Some(ListResult::Infos(map))
         } else {
             None
@@ -4219,7 +4518,9 @@ impl MountSource for WriteOverlay {
         }
         let path = normpath(path);
         if path == "/" {
-            return Some(create_root_file_info());
+            let mut fi = create_root_file_info();
+            fi.userdata.push(UserData::Other("overlay-meta:/".into()));
+            return Some(fi);
         }
         if self.is_deleted(&path) {
             return None;
@@ -4227,7 +4528,13 @@ impl MountSource for WriteOverlay {
         if let Some(fi) = self.overlay_file_info(&path) {
             return Some(fi);
         }
-        self.current_base().lookup(&path, file_version)
+        self.current_base()
+            .lookup(&path, file_version)
+            .map(|mut fi| {
+                fi.userdata
+                    .push(UserData::Other(format!("overlay-meta:{path}")));
+                fi
+            })
     }
 
     fn open(
@@ -4255,7 +4562,8 @@ impl MountSource for WriteOverlay {
                 }
             }
         }
-        self.current_base().open(file_info, buffering)
+        self.current_base()
+            .open(&without_overlay_meta(file_info), buffering)
     }
 
     fn is_immutable(&self) -> bool {
@@ -4276,30 +4584,497 @@ impl MountSource for WriteOverlay {
                 return true;
             }
         }
-        self.current_base().member_seek_is_cheap(file_info)
+        self.current_base()
+            .member_seek_is_cheap(&without_overlay_meta(file_info))
     }
 
     fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
-        if file_info
-            .userdata
-            .iter()
-            .any(|u| matches!(u, UserData::Other(s) if s.starts_with("overlay:")))
-        {
-            return Vec::new();
+        if let Some(path) = overlay_info_path(file_info) {
+            return self
+                .xattrs_for_path(path)
+                .unwrap_or_default()
+                .into_keys()
+                .collect();
         }
         self.current_base().list_xattr(file_info)
     }
 
     fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
-        if file_info
-            .userdata
-            .iter()
-            .any(|u| matches!(u, UserData::Other(s) if s.starts_with("overlay:")))
-        {
-            return None;
+        if let Some(path) = overlay_info_path(file_info) {
+            return self.xattrs_for_path(path).ok()?.remove(key);
         }
         self.current_base().get_xattr(file_info, key)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_MANIFEST_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Capture reusable hashes before suffix patching removes their old offset rows.
+fn known_manifest_hashes(archive: &Path) -> Result<BTreeMap<String, String>> {
+    let sidecar = ratarmount_index::default_index_path(archive);
+    if !sidecar.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let idx =
+        SqliteIndex::open_read_only(&sidecar).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    if idx.check_tarstats_matches_archive(archive).is_err() {
+        return Ok(BTreeMap::new());
+    }
+    let mut out = BTreeMap::new();
+    let mut cursor: Option<(String, Option<i64>)> = None;
+    loop {
+        let query = ratarmount_index::SearchQuery {
+            include_hashes: true,
+            after: cursor
+                .as_ref()
+                .map(|(path, offset)| ratarmount_index::FindAfter {
+                    fullpath: path,
+                    offsetheader: *offset,
+                }),
+            ..ratarmount_index::SearchQuery::glob("*")
+        };
+        let hits = idx
+            .search_query(&query)
+            .map_err(|e| OverlayError::Msg(e.to_string()))?;
+        let done = hits.len() < DEFAULT_SEARCH_LIMIT;
+        if let Some(last) = hits.last() {
+            cursor = Some((last.path.clone(), last.offsetheader));
+        }
+        for hit in hits {
+            let current = idx
+                .lookup(&hit.path, 0)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            if !current.is_some_and(|fi| {
+                hit.offsetheader
+                    .is_some_and(|oh| tar_offsetheaders_in(&fi).any(|offset| offset == oh as u64))
+            }) {
+                continue;
+            }
+            if let Some((_, hash)) = hit.hashes.into_iter().find(|(name, value)| {
+                name == "user.hash.sha256"
+                    && value.len() == 64
+                    && value.bytes().all(|c| c.is_ascii_hexdigit())
+            }) {
+                out.insert(hit.path, hash);
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn write_commit_manifest(
+    archive: &Path,
+    plan: &OverlayCommitPlan,
+    encoding: &str,
+    hashes: &str,
+) -> Result<()> {
+    if !matches!(hashes, "all" | "new" | "none") {
+        return Err(OverlayError::Msg(
+            "manifest hashes must be all, new, or none".into(),
+        ));
+    }
+    let source = provenance_base(archive, encoding)?;
+    let mut name = archive.as_os_str().to_os_string();
+    name.push(".manifest.jsonl");
+    let dest = PathBuf::from(name);
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_micros() as u64;
+    let previous = match File::open(&dest) {
+        Ok(file) => {
+            use std::io::BufRead;
+            let line = BufReader::new(file).lines().next().transpose()?;
+            line.map(|line| {
+                serde_json::from_str::<serde_json::Value>(&line).map_err(io::Error::other)
+            })
+            .transpose()?
+            .and_then(|v| v["commit_id"].as_u64())
+            .unwrap_or(0)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e.into()),
+    };
+    let commit_id = now.max(previous.saturating_add(1));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut dirs = vec!["/".to_string()];
+    while let Some(dir) = dirs.pop() {
+        let mut entries = source.list_dirents(&dir).unwrap_or_default();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in entries {
+            let path = join(&dir, &entry.name);
+            let fi = source
+                .lookup(&path, 0)
+                .ok_or_else(|| io::Error::other("manifest member disappeared"))?;
+            let mut attrs = source_xattrs(&source, &fi);
+            attrs.retain(|k, _| k.starts_with("user."));
+            let changed = plan
+                .append_entries
+                .iter()
+                .any(|(p, _)| p == path.trim_start_matches('/'));
+            let sha256 = if (fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG)
+                && hashes != "none"
+            {
+                if let Some(hash) = plan.written_hashes.get(&path) {
+                    Some(hash.clone())
+                } else if hashes == "all" || changed {
+                    Some(
+                        ratarmount_index::sha256_hex_stream(&mut source.open(&fi, 0)?)
+                            .map_err(|e| OverlayError::Msg(e.to_string()))?,
+                    )
+                } else {
+                    attrs
+                        .get("user.hash.sha256")
+                        .and_then(|v| std::str::from_utf8(v).ok())
+                        .filter(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+                        .map(str::to_owned)
+                        .or_else(|| plan.known_hashes.get(&path).cloned())
+                }
+            } else {
+                None
+            };
+            // JSON arrays preserve arbitrary bytes, including NUL and invalid UTF-8.
+            let row = serde_json::json!({ "path": path.trim_start_matches('/'), "size": fi.size,
+                "sha256": sha256, "xattrs": attrs, "commit_id": commit_id });
+            serde_json::to_writer(tmp.as_file_mut(), &row).map_err(io::Error::other)?;
+            tmp.write_all(b"\n")?;
+            if ratarmount_core::is_dir_mode(fi.mode) {
+                dirs.push(path);
+            }
+        }
+    }
+    tmp.as_file().sync_all()?;
+    #[cfg(test)]
+    if FAIL_MANIFEST_PUBLISH.replace(false) {
+        return Err(io::Error::other("injected manifest publication failure").into());
+    }
+    tmp.persist(&dest).map_err(|e| OverlayError::Io(e.error))?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn missing_xattr_errno() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        libc::ENODATA
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        libc::ENOATTR
+    }
+}
+
+fn overlay_info_path(fi: &FileInfo) -> Option<&str> {
+    fi.userdata.iter().rev().find_map(|u| match u {
+        UserData::Other(s) => s
+            .strip_prefix("overlay:")
+            .or_else(|| s.strip_prefix("overlay-meta:")),
+        _ => None,
+    })
+}
+
+fn without_overlay_meta(fi: &FileInfo) -> FileInfo {
+    let mut fi = fi.clone();
+    if matches!(fi.userdata.last(), Some(UserData::Other(s)) if s.starts_with("overlay-meta:")) {
+        fi.userdata.pop();
+    }
+    fi
+}
+
+fn source_xattrs(source: &dyn MountSource, fi: &FileInfo) -> BTreeMap<String, Vec<u8>> {
+    source
+        .list_xattr(fi)
+        .into_iter()
+        .filter_map(|name| source.get_xattr(fi, &name).map(|value| (name, value)))
+        .collect()
+}
+
+fn merge_xattr_rows(
+    db: &Connection,
+    path: &str,
+    attrs: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    let mut stmt = db.prepare("SELECT name,value FROM xattrs WHERE path=?1 ORDER BY name")?;
+    for row in stmt.query_map([path], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
+    })? {
+        let (name, value) = row?;
+        if name.is_empty() {
+            attrs.clear();
+        } else if let Some(value) = value {
+            attrs.insert(name, value);
+        } else {
+            attrs.remove(&name);
+        }
+    }
+    Ok(())
+}
+
+fn provenance_base(archive: &Path, encoding: &str) -> Result<SqliteIndexedTar> {
+    if detect_compression(archive).map_err(|e| OverlayError::Msg(e.to_string()))?
+        == CompressionFormat::Zstd
+    {
+        return tar_zst_full_frame_index(archive, encoding);
+    }
+    let opts = OpenOptions {
+        index_in_memory: true,
+        write_index: false,
+        ignore_zeros: true,
+        gnu_incremental: Some(false),
+        encoding: encoding.into(),
+        ..OpenOptions::default()
+    };
+    SqliteIndexedTar::create_index(
+        archive,
+        archive,
+        None,
+        &opts,
+        env!("CARGO_PKG_VERSION"),
+        &mut None,
+    )
+    .map_err(|e| OverlayError::Msg(e.to_string()))
+}
+
+/// Shared replacement path for metadata-only changes. Payload copies live only
+/// for the commit, never in the writable overlay. Unchanged TAR records remain raw.
+fn persist_provenance_plan(
+    archive: &Path,
+    root: &Path,
+    plan: &OverlayCommitPlan,
+    encoding: &str,
+    mode: CommitMode,
+    hash_output: Option<&mut BTreeMap<String, String>>,
+) -> Result<IndexPatchWindow> {
+    live_commit_is_supported(archive)?;
+    let base = provenance_base(archive, encoding)?;
+    let mut pending = collect_ustar_pending_at(root, &plan.append_entries)?;
+    let mut spools = Vec::new();
+    for path in plan.xattrs.keys() {
+        if pending.iter().any(|p| &p.path == path) {
+            continue;
+        }
+        let fi = base
+            .lookup(&archive_lookup_path(path), 0)
+            .ok_or_else(|| OverlayError::Msg(format!("xattr member disappeared: {path}")))?;
+        let (host, kind) = if ratarmount_core::is_dir_mode(fi.mode) {
+            (PathBuf::new(), PendingKind::Directory)
+        } else if ratarmount_core::is_lnk_mode(fi.mode) {
+            (
+                PathBuf::new(),
+                PendingKind::Symlink {
+                    target: fi.linkname.clone(),
+                },
+            )
+        } else if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG {
+            let mut tmp = tempfile::NamedTempFile::new()?;
+            let mut reader = base.open(&fi, 0)?;
+            if io::copy(&mut reader, tmp.as_file_mut())? != fi.size {
+                return Err(
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "short xattr member").into(),
+                );
+            }
+            let host = tmp.path().to_path_buf();
+            spools.push(tmp);
+            (host, PendingKind::FileOnDisk { size: fi.size })
+        } else {
+            return Err(OverlayError::Msg(format!(
+                "xattr commit unsupported member type: {path}"
+            )));
+        };
+        pending.push(PendingUstar {
+            path: path.clone(),
+            host,
+            kind,
+            mode: fi.mode & 0o7777,
+            uid: fi.uid,
+            gid: fi.gid,
+            mtime: fi.mtime.max(0.0) as u64,
+            xattrs: Vec::new(),
+            sha256: None,
+        });
+    }
+    for p in &mut pending {
+        let mut attrs = base
+            .lookup(&archive_lookup_path(&p.path), 0)
+            .map(|fi| source_xattrs(&base, &fi))
+            .unwrap_or_default();
+        if let Some(changes) = plan.xattrs.get(&p.path) {
+            for (name, value) in changes {
+                if name.is_empty() {
+                    attrs.clear();
+                    continue;
+                }
+                if let Some(value) = value {
+                    attrs.insert(name.clone(), value.clone());
+                } else {
+                    attrs.remove(name);
+                }
+            }
+        }
+        // Data replacements invalidate cached content hashes.
+        if plan.append_entries.iter().any(|(path, _)| path == &p.path) {
+            attrs.retain(|k, _| !k.starts_with("user.hash."));
+        }
+        p.xattrs = attrs.into_iter().collect();
+    }
+    let mut deleted = HashSet::new();
+    let mut offsets = Vec::new();
+    for path in plan.deleted_paths.iter().chain(plan.xattrs.keys()) {
+        let ohs = match all_tar_offsetheaders(&base, path) {
+            Ok(ohs) => ohs,
+            Err(_)
+                if base
+                    .lookup(&archive_lookup_path(path), 0)
+                    .is_some_and(|fi| {
+                        ratarmount_core::is_dir_mode(fi.mode)
+                            && tar_offsetheaders_in(&fi).next().is_none()
+                    }) =>
+            {
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
+        if !ohs.is_empty() {
+            deleted.insert(path.clone());
+            offsets.extend(ohs);
+        }
+    }
+    let patch_opts = OpenOptions {
+        encoding: encoding.into(),
+        ignore_zeros: true,
+        index_folders: vec![PathBuf::new()],
+        ..OpenOptions::default()
+    };
+    invalidate_stale_commit_sidecar(archive, &patch_opts)?;
+    if hash_output.is_some() {
+        for member in &mut pending {
+            if plan
+                .append_entries
+                .iter()
+                .any(|(path, _)| path == &member.path)
+            {
+                member.sha256 = Some(Mutex::new(None));
+            }
+        }
+    }
+    let members: Vec<_> = pending.iter().map(PendingUstar::as_member).collect();
+    let rewrite = RewriteTarSuffix {
+        deleted_paths: &deleted,
+        append: &members,
+        encoding,
+    };
+    let persist = || -> Result<IndexPatchWindow> {
+        let format = detect_compression(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
+        if format == CompressionFormat::Zstd {
+            let map =
+                scan_zstd_frames_path(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
+            let from = match offsets.iter().min() {
+                Some(offset) => offline_tar_zst_from_idx(archive, &map, *offset)?,
+                None => find_last_n_tar_window(archive, &map, "provenance")?.0,
+            };
+            let transform = |mut input: &mut dyn ratarmount_compress::SeekRead,
+                             offset,
+                             mut out: &mut dyn Write| {
+                rewrite_tar_suffix(&mut input, offset, &rewrite, &mut out).map(|_| ())
+            };
+            if deleted.is_empty() && map.seek_table.is_some() && mode.may_append(archive)? {
+                if let Err(e) = splice_zstd_last_frames_append(archive, from, transform) {
+                    ratarmount_compress::commit_journal::recover(archive)?;
+                    if mode == CommitMode::Auto {
+                        splice_zstd_last_frames_replace(archive, from, transform)
+                            .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                    } else {
+                        return Err(OverlayError::Msg(e.to_string()));
+                    }
+                }
+            } else {
+                splice_zstd_last_frames_replace(archive, from, transform)
+                    .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            }
+            return Ok(IndexPatchWindow {
+                window_start: map.frames[from].uncompressed_offset,
+                from_frame: Some(from),
+                offsets_shifted: false,
+            });
+        }
+        let parent = archive
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        let mut src = File::open(archive)?;
+        let append_offset = if deleted.is_empty() && mode.may_append(archive)? {
+            uncompressed_append_offset(archive, plan, encoding)?
+        } else {
+            None
+        };
+        if let Some(offset) = append_offset {
+            ratarmount_formats_tar::write_ustar_members(tmp.as_file_mut(), &members)?;
+            ratarmount_formats_tar::write_tar_eof(tmp.as_file_mut())?;
+            let original = src.metadata()?;
+            if let Err(e) = ratarmount_compress::commit_journal::replace_suffix_if_unchanged(
+                archive,
+                offset,
+                tmp.as_file_mut(),
+                &original,
+            ) {
+                ratarmount_compress::commit_journal::recover(archive)?;
+                if mode != CommitMode::Auto {
+                    return Err(e.into());
+                }
+                tmp.as_file_mut().set_len(0)?;
+                tmp.as_file_mut().rewind()?;
+                src.rewind()?;
+                rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
+                tmp.as_file().sync_all()?;
+                tmp.persist(archive)
+                    .map_err(|e| OverlayError::Io(e.error))?;
+                return Ok(IndexPatchWindow {
+                    window_start: 0,
+                    from_frame: None,
+                    offsets_shifted: true,
+                });
+            }
+            Ok(IndexPatchWindow {
+                window_start: offset,
+                from_frame: None,
+                offsets_shifted: false,
+            })
+        } else {
+            rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
+            tmp.as_file().sync_all()?;
+            tmp.persist(archive)
+                .map_err(|e| OverlayError::Io(e.error))?;
+            Ok(IndexPatchWindow {
+                window_start: 0,
+                from_frame: None,
+                offsets_shifted: true,
+            })
+        }
+    };
+    let window = persist()?;
+    if let Some(output) = hash_output {
+        for member in &pending {
+            if let Some(digest) = member
+                .sha256
+                .as_ref()
+                .and_then(|hash| hash.lock().expect("TAR payload digest").clone())
+            {
+                output.insert(archive_lookup_path(&member.path), digest);
+            }
+        }
+    }
+    Ok(window)
 }
 
 fn join(parent: &str, name: &str) -> String {
@@ -4465,6 +5240,8 @@ fn collect_ustar_pending_at(
             uid,
             gid,
             mtime,
+            xattrs: Vec::new(),
+            sha256: None,
         });
     }
     Ok(out)
@@ -4740,6 +5517,7 @@ impl CommitMode {
 #[derive(Clone, Debug)]
 pub struct CommitOverlayOptions {
     pub mode: CommitMode,
+    pub manifest_hashes: Option<String>,
     /// When true, skip interactive "commit" confirmation (for harness / automation).
     pub yes: bool,
     /// Verbosity: 0 = quiet, 1+ = print plan (Python `printDebug`).
@@ -4757,6 +5535,7 @@ impl Default for CommitOverlayOptions {
     fn default() -> Self {
         Self {
             mode: CommitMode::Copy,
+            manifest_hashes: None,
             yes: false,
             debug: 1,
             encoding: "utf-8".into(),
@@ -4808,11 +5587,58 @@ pub fn commit_overlay(
     }
 
     ratarmount_compress::commit_journal::recover(archive_file)?;
+    let mut plan = collect_overlay_commit_plan(write_overlay)?;
+    if opts.manifest_hashes.is_some() {
+        plan.known_hashes = known_manifest_hashes(archive_file)?;
+    }
+    if opts.manifest_hashes.is_some() {
+        live_commit_is_supported(archive_file)?;
+    }
+    let hash_payloads = opts
+        .manifest_hashes
+        .as_deref()
+        .is_some_and(|mode| mode != "none");
+    if plan.has_xattr_changes() || hash_payloads {
+        if plan.is_empty() {
+            return Ok(false);
+        }
+        live_commit_is_supported(archive_file)?;
+        if !confirm_commit(opts)? {
+            return Ok(false);
+        }
+        let mut written_hashes = BTreeMap::new();
+        let window = persist_provenance_plan(
+            archive_file,
+            write_overlay,
+            &plan,
+            &opts.encoding,
+            opts.mode,
+            hash_payloads.then_some(&mut written_hashes),
+        )?;
+        plan.written_hashes = written_hashes;
+        let patch_opts = OpenOptions {
+            encoding: opts.encoding.clone(),
+            ignore_zeros: true,
+            index_folders: vec![PathBuf::new()],
+            ..OpenOptions::default()
+        };
+        patch_sidecar_if_present(archive_file, &window, &patch_opts)?;
+        if let Some(hashes) = &opts.manifest_hashes {
+            write_commit_manifest(archive_file, &plan, &opts.encoding, hashes)?;
+        }
+        return Ok(true);
+    }
     if is_zip_archive(archive_file)? {
         return commit_overlay_zip(write_overlay, archive_file, opts);
     }
 
-    commit_overlay_tar(write_overlay, archive_file, opts)
+    let committed = commit_overlay_tar(write_overlay, archive_file, opts)?;
+    if committed {
+        if let Some(hashes) = &opts.manifest_hashes {
+            write_commit_manifest(archive_file, &plan, &opts.encoding, hashes)?;
+        }
+    }
+    Ok(committed)
 }
 
 /// Overlay changes collected for commit (paths relative to archive root, `/`-separated).
@@ -4826,11 +5652,20 @@ struct OverlayCommitPlan {
     deleted_paths: HashSet<String>,
     /// Overlay entries to add: `(relative path, is_directory)`.
     append_entries: Vec<(String, bool)>,
+    xattrs: BTreeMap<String, BTreeMap<String, Option<Vec<u8>>>>,
+    known_hashes: BTreeMap<String, String>,
+    written_hashes: BTreeMap<String, String>,
 }
 
 impl OverlayCommitPlan {
+    fn has_xattr_changes(&self) -> bool {
+        self.xattrs
+            .values()
+            .any(|attrs| attrs.keys().any(|name| !name.is_empty()))
+    }
+
     fn is_empty(&self) -> bool {
-        self.deleted_paths.is_empty() && self.append_entries.is_empty()
+        self.deleted_paths.is_empty() && self.append_entries.is_empty() && self.xattrs.is_empty()
     }
 }
 
@@ -4998,7 +5833,36 @@ fn collect_overlay_commit_plan_from_conn(
         }
     }
 
+    let mut xattrs = BTreeMap::<String, BTreeMap<String, Option<Vec<u8>>>>::new();
+    if let Some(conn) = conn {
+        let has_xattrs: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='xattrs')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_xattrs {
+            let mut stmt = conn.prepare("SELECT path,name,value FROM xattrs ORDER BY path,name")?;
+            for row in stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            })? {
+                let (path, name, value) = row?;
+                let rel = normalize_archive_rel_path(&path);
+                let removed =
+                    deleted_paths.contains(&rel) && !append_entries.iter().any(|(p, _)| p == &rel);
+                if !removed && !skipped.contains(&rel) && !is_overlay_internal_path(&rel) {
+                    xattrs.entry(rel).or_default().insert(name, value);
+                }
+            }
+        }
+    }
     Ok(OverlayCommitPlan {
+        known_hashes: BTreeMap::new(),
+        written_hashes: BTreeMap::new(),
+        xattrs,
         deletions_nul,
         appends_nul,
         deleted_paths,
@@ -5146,7 +6010,20 @@ fn apply_files_op_sql(conn: &Connection, op: &PendingFilesOp) -> Result<()> {
             to,
             mode,
             hides_from,
+            xattrs,
         } => {
+            conn.execute("DELETE FROM xattrs WHERE path=?1", [to])?;
+            conn.execute("DELETE FROM xattrs WHERE path=?1", [from])?;
+            conn.execute(
+                "INSERT INTO xattrs(path,name,value) VALUES (?1,'',NULL)",
+                [to],
+            )?;
+            for (name, value) in xattrs {
+                conn.execute(
+                    "INSERT INTO xattrs(path,name,value) VALUES (?1,?2,?3)",
+                    params![to, name, value],
+                )?;
+            }
             let (to_folder, to_name) = WriteOverlay::split(to);
             let (from_folder, from_name) = WriteOverlay::split(from);
             conn.execute(
@@ -5170,6 +6047,11 @@ fn apply_files_op_sql(conn: &Connection, op: &PendingFilesOp) -> Result<()> {
             }
         }
         PendingFilesOp::Deleted { path, hides_base } => {
+            conn.execute("DELETE FROM xattrs WHERE path=?1", [path])?;
+            conn.execute(
+                "INSERT INTO xattrs(path,name,value) VALUES (?1,'',NULL)",
+                [path],
+            )?;
             let (folder, name) = WriteOverlay::split(path);
             if *hides_base {
                 conn.execute(
@@ -5282,6 +6164,7 @@ fn tombstone_set_from_conn(conn: &Connection) -> rusqlite::Result<HashSet<String
 }
 
 fn delete_overlay_files_row(db: &Connection, rel: &str) -> Result<()> {
+    db.execute("DELETE FROM xattrs WHERE path=?1", [normpath(rel)])?;
     let (folder, name) = WriteOverlay::split(rel);
     db.execute(
         r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
@@ -6402,6 +7285,8 @@ struct PendingUstar {
     uid: u32,
     gid: u32,
     mtime: u64,
+    xattrs: Vec<(String, Vec<u8>)>,
+    sha256: Option<Mutex<Option<String>>>,
 }
 
 enum PendingKind {
@@ -6413,11 +7298,13 @@ enum PendingKind {
 impl PendingUstar {
     fn as_member(&self) -> UstarMember<'_> {
         UstarMember {
+            xattrs: &self.xattrs,
             path: &self.path,
             payload: match &self.kind {
                 PendingKind::FileOnDisk { size } => UstarPayload::FileOnDisk {
                     path: &self.host,
                     size: *size,
+                    sha256: self.sha256.as_ref(),
                 },
                 PendingKind::Directory => UstarPayload::Directory,
                 PendingKind::Symlink { target } => UstarPayload::Symlink { target },
@@ -7107,6 +7994,9 @@ mod tests {
         ov.write_at(&file, "/file", 0, b"abcd").unwrap();
         ov.finish_owned_write_fd(file);
         let plan = OverlayCommitPlan {
+            known_hashes: BTreeMap::new(),
+            written_hashes: BTreeMap::new(),
+            xattrs: BTreeMap::new(),
             deletions_nul: Vec::new(),
             appends_nul: Vec::new(),
             deleted_paths: HashSet::new(),
@@ -9652,6 +10542,9 @@ mod tests {
         }
 
         let plan = OverlayCommitPlan {
+            known_hashes: BTreeMap::new(),
+            written_hashes: BTreeMap::new(),
+            xattrs: BTreeMap::new(),
             deletions_nul: Vec::new(),
             appends_nul: Vec::new(),
             deleted_paths: ["gone".into()].into_iter().collect(),
@@ -10741,6 +11634,9 @@ mod tests {
         assert!(gone_oh > 0 && gone_oh < eof, "gone_oh={gone_oh} eof={eof}");
 
         let plan = OverlayCommitPlan {
+            known_hashes: BTreeMap::new(),
+            written_hashes: BTreeMap::new(),
+            xattrs: BTreeMap::new(),
             deletions_nul: Vec::new(),
             appends_nul: Vec::new(),
             deleted_paths: ["gone.txt".into()].into_iter().collect(),
@@ -10767,6 +11663,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (archive, eof, gone_oh) = two_member_tar(dir.path());
         let plan = OverlayCommitPlan {
+            known_hashes: BTreeMap::new(),
+            written_hashes: BTreeMap::new(),
+            xattrs: BTreeMap::new(),
             deletions_nul: Vec::new(),
             appends_nul: Vec::new(),
             deleted_paths: ["gone.txt".into()].into_iter().collect(),
@@ -10785,6 +11684,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (archive, eof, _) = two_member_tar(dir.path());
         let plan = OverlayCommitPlan {
+            known_hashes: BTreeMap::new(),
+            written_hashes: BTreeMap::new(),
+            xattrs: BTreeMap::new(),
             deletions_nul: Vec::new(),
             appends_nul: Vec::new(),
             deleted_paths: ["brand-new.txt".into()].into_iter().collect(),
@@ -10883,8 +11785,375 @@ mod tests {
         format!("p-{tag}-{}\n", std::process::id()).into_bytes()
     }
 
+    /// Regression: add-only xattrs must use append and manifests must retain
+    /// pre-patch index hashes while hashing newly committed payloads.
+    #[test]
+    fn regression_provenance_append_manifest_reuses_index_hash() {
+        for compressed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join(if compressed {
+                "base.tar.zst"
+            } else {
+                "base.tar"
+            });
+            let (prefix, _) = append_fixture(&archive, compressed);
+            let sidecar = append_index(&archive, compressed);
+            let expected = ratarmount_index::sha256_hex_stream(&mut &prefix[..]).unwrap();
+            {
+                let idx = SqliteIndex::open_writable(&sidecar).unwrap();
+                let fi = idx.lookup("/prefix", 0).unwrap().unwrap();
+                idx.insert_xattr(
+                    tar_offsetheaders_in(&fi).next().unwrap() as i64,
+                    "user.hash.sha256",
+                    expected.as_bytes(),
+                )
+                .unwrap();
+            }
+            let root = dir.path().join("ov");
+            let ov =
+                WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
+                    .unwrap();
+            let fd = ov.create_file("/new", 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+            fs::write(root.join("new"), b"new payload").unwrap();
+            ov.set_xattr("/new", "user.teacher", b"teacher", 0).unwrap();
+            drop(ov);
+            #[cfg(unix)]
+            let inode = {
+                use std::os::unix::fs::MetadataExt;
+                fs::metadata(&archive).unwrap().ino()
+            };
+            let opts = CommitOverlayOptions {
+                yes: true,
+                debug: 0,
+                mode: CommitMode::Append,
+                manifest_hashes: Some("new".into()),
+                ..Default::default()
+            };
+            assert!(commit_overlay(&root, &archive, &opts).unwrap());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(fs::metadata(&archive).unwrap().ino(), inode);
+            }
+            let manifest =
+                fs::read_to_string(format!("{}.manifest.jsonl", archive.display())).unwrap();
+            let rows: BTreeMap<String, serde_json::Value> = manifest
+                .lines()
+                .map(|line| {
+                    let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                    (row["path"].as_str().unwrap().into(), row)
+                })
+                .collect();
+            assert_eq!(rows["prefix"]["sha256"], expected);
+            assert_eq!(
+                rows["new"]["sha256"],
+                ratarmount_index::sha256_hex_stream(&mut &b"new payload"[..]).unwrap()
+            );
+            assert!(rows["last"]["sha256"].is_null());
+            let base = append_warm_open(&archive, compressed, &sidecar);
+            let fi = base.lookup("/new", 0).unwrap();
+            assert_eq!(
+                base.get_xattr(&fi, "user.teacher"),
+                Some(b"teacher".to_vec())
+            );
+        }
+    }
+
+    /// Regression: queued renames must carry provenance through intermediate names
+    /// even while the host rename has completed and SQLite replay still fails.
+    #[test]
+    fn regression_provenance_queued_rename_keeps_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        provenance_fixture(&archive, false);
+        let ov = WriteOverlay::new(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            dir.path().join("ov"),
+        )
+        .unwrap();
+        ov.set_xattr("/trace", "user.train_ok", b"false", 0)
+            .unwrap();
+        ov.set_rename_tx_failures(100);
+        ov.rename("/trace", "/x").unwrap();
+        assert_eq!(ov.xattrs_for_path("/x").unwrap()["user.train_ok"], b"false");
+        ov.rename("/x", "/y").unwrap();
+        assert_eq!(ov.xattrs_for_path("/y").unwrap()["user.teacher"], b"old");
+        ov.set_rename_tx_failures(0);
+        ov.replay_pending_rows().unwrap();
+        assert_eq!(ov.xattrs_for_path("/y").unwrap()["user.train_ok"], b"false");
+        assert!(ov.lookup("/x", 0).is_none());
+    }
+
+    /// Regression: manifest-only commits must hash payloads in the shared writer
+    /// even when there are no xattrs to trigger the provenance replacement path.
+    #[test]
+    fn regression_provenance_manifest_without_xattrs() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(&archive, pack_tar(&[ustar_file("old", b"old")])).unwrap();
+        let root = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
+            .unwrap();
+        put_overlay_bytes(&ov, "/new", b"new payload");
+        drop(ov);
+        let mut plan = collect_overlay_commit_plan(&root).unwrap();
+        assert!(!plan.has_xattr_changes());
+        let mut hashes = BTreeMap::new();
+        persist_provenance_plan(
+            &archive,
+            &root,
+            &plan,
+            "utf-8",
+            CommitMode::Copy,
+            Some(&mut hashes),
+        )
+        .unwrap();
+        let expected = ratarmount_index::sha256_hex_stream(&mut &b"new payload"[..]).unwrap();
+        assert_eq!(hashes.get("/new"), Some(&expected));
+        plan.written_hashes = hashes;
+        write_commit_manifest(&archive, &plan, "utf-8", "new").unwrap();
+        let manifest = fs::read_to_string(format!("{}.manifest.jsonl", archive.display())).unwrap();
+        assert!(manifest.contains(&expected));
+        let reopened =
+            WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
+                .unwrap();
+        reopened.set_xattr("/new", "user.empty", b"", 1).unwrap();
+        assert_eq!(reopened.xattrs_for_path("/new").unwrap()["user.empty"], b"");
+    }
+
+    fn provenance_fixture(path: &Path, compressed: bool) {
+        let attrs = vec![
+            ("user.teacher".into(), b"old".to_vec()),
+            ("user.binary".into(), vec![0xff, 0, b'\n', b'=']),
+        ];
+        let mut member = ustar_file("trace", b"training payload");
+        member.xattrs = &attrs;
+        if compressed {
+            write_single_frame_tar_zst(path, &[member]);
+        } else {
+            fs::write(path, pack_tar(&[member])).unwrap();
+        }
+    }
+
+    /// Regression: xattr-only edits must not copy archive payloads, lose binary
+    /// values, ignore create/replace flags, or bypass read-only policy.
+    #[test]
+    fn regression_provenance_metadata_only_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        provenance_fixture(&archive, false);
+        let base = Arc::new(provenance_base(&archive, "utf-8").unwrap());
+        let mut ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+        let error = |r: Result<()>| match r.unwrap_err() {
+            OverlayError::Io(e) => e.raw_os_error().unwrap_or_else(|| {
+                assert_eq!(e.kind(), io::ErrorKind::ReadOnlyFilesystem);
+                libc::EROFS
+            }),
+            e => panic!("{e}"),
+        };
+        assert_eq!(
+            error(ov.set_xattr("/trace", "user.teacher", b"x", 1)),
+            libc::EEXIST
+        );
+        assert_eq!(
+            error(ov.set_xattr("/trace", "user.absent", b"x", 2)),
+            missing_xattr_errno()
+        );
+        assert_eq!(
+            error(ov.set_xattr("/trace", "security.label", b"x", 0)),
+            libc::EPERM
+        );
+        assert_eq!(
+            error(ov.set_xattr("/trace", "user.x", b"x", 3)),
+            libc::EINVAL
+        );
+        assert_eq!(
+            error(ov.set_xattr("/trace", "user.x", &vec![0; 65537], 0)),
+            libc::E2BIG
+        );
+        ov.set_xattr("/trace", "user.teacher", b"new", 2).unwrap();
+        ov.set_xattr("/trace", "user.train_ok", b"false", 1)
+            .unwrap();
+        ov.remove_xattr("/trace", "user.binary").unwrap();
+        assert_eq!(
+            error(ov.remove_xattr("/trace", "user.binary")),
+            missing_xattr_errno()
+        );
+        let fi = ov.lookup("/trace", 0).unwrap();
+        assert_eq!(ov.get_xattr(&fi, "user.teacher"), Some(b"new".to_vec()));
+        assert_eq!(ov.list_xattr(&fi), ["user.teacher", "user.train_ok"]);
+        assert_eq!(read_member(&ov, "/trace"), b"training payload");
+        assert!(!ov.has_file("/trace"));
+        for name in ["a", "b", "c"] {
+            ov.set_xattr("/trace", &format!("user.{name}"), &vec![0; 65536], 0)
+                .unwrap();
+        }
+        assert_eq!(
+            error(ov.set_xattr("/trace", "user.d", &vec![0; 65536], 0)),
+            libc::E2BIG
+        );
+        ov.set_policy(Some(Arc::new(
+            crate::ReadOnlyGlobs::new(["trace"]).unwrap(),
+        )));
+        assert_eq!(
+            error(ov.set_xattr("/trace", "user.teacher", b"blocked", 0)),
+            libc::EROFS
+        );
+        assert_eq!(
+            error(ov.remove_xattr("/trace", "user.teacher")),
+            libc::EROFS
+        );
+    }
+
+    /// Regression: opening a legacy overlay adds xattrs without losing deletion rows.
+    #[test]
+    fn regression_provenance_migration_preserves_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        provenance_fixture(&archive, false);
+        let root = dir.path().join("ov");
+        let base = Arc::new(provenance_base(&archive, "utf-8").unwrap());
+        {
+            let ov = WriteOverlay::new(base.clone(), &root).unwrap();
+            ov.unlink("/trace").unwrap();
+        }
+        {
+            let db = Connection::open(root.join(HIDDEN_DB)).unwrap();
+            db.execute("DROP TABLE xattrs", []).unwrap();
+        }
+        let ov = WriteOverlay::new(base, &root).unwrap();
+        assert!(ov.lookup("/trace", 0).is_none());
+        assert!(root.join(OVERLAY_MARKER).exists());
+        let fd = ov.create_file("/new", 0o644).unwrap();
+        ov.close_overlay_fd(fd);
+        ov.set_xattr("/new", "user.test", b"yes", 0).unwrap();
+        drop(ov);
+        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
+            .unwrap();
+        assert_eq!(ov.xattrs_for_path("/new").unwrap()["user.test"], b"yes");
+        assert!(ov.is_deleted("/trace"));
+    }
+
+    /// Regression: metadata-only replacement must survive copy/append-fallback,
+    /// suffix reindex, remount, and binary PAX decoding for TAR and tar.zst.
+    #[test]
+    fn regression_provenance_commit_roundtrip_and_manifest() {
+        for compressed in [false, true] {
+            for mode in [CommitMode::Copy, CommitMode::Append] {
+                let dir = tempfile::tempdir().unwrap();
+                let archive = dir.path().join(if compressed {
+                    "base.tar.zst"
+                } else {
+                    "base.tar"
+                });
+                provenance_fixture(&archive, compressed);
+                let sidecar = append_index(&archive, compressed);
+                let root = dir.path().join("ov");
+                let ov =
+                    WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
+                        .unwrap();
+                ov.set_xattr("/trace", "user.train_ok", b"false", 0)
+                    .unwrap();
+                ov.remove_xattr("/trace", "user.teacher").unwrap();
+                assert!(!root.join("trace").exists());
+                drop(ov);
+                let opts = CommitOverlayOptions {
+                    mode,
+                    yes: true,
+                    debug: 0,
+                    manifest_hashes: Some("all".into()),
+                    ..Default::default()
+                };
+                assert!(commit_overlay(&root, &archive, &opts).unwrap());
+                let base = append_warm_open(&archive, compressed, &sidecar);
+                let fi = base.lookup("/trace", 0).unwrap();
+                assert_eq!(
+                    base.get_xattr(&fi, "user.train_ok"),
+                    Some(b"false".to_vec())
+                );
+                assert_eq!(
+                    base.get_xattr(&fi, "user.binary"),
+                    Some(vec![0xff, 0, b'\n', b'='])
+                );
+                assert_eq!(base.get_xattr(&fi, "user.teacher"), None);
+                assert_eq!(read_member(base.as_ref(), "/trace"), b"training payload");
+                let manifest = PathBuf::from(format!("{}.manifest.jsonl", archive.display()));
+                let rows: Vec<serde_json::Value> = fs::read_to_string(&manifest)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["path"], "trace");
+                assert_eq!(rows[0]["size"], 16);
+                assert_eq!(
+                    rows[0]["sha256"],
+                    ratarmount_index::sha256_hex_stream(&mut &b"training payload"[..]).unwrap()
+                );
+                assert_eq!(
+                    rows[0]["xattrs"]["user.binary"],
+                    serde_json::json!([255, 0, 10, 61])
+                );
+                let old = fs::read(&manifest).unwrap();
+                let plan = collect_overlay_commit_plan(&root).unwrap();
+                assert!(write_commit_manifest(&archive, &plan, "utf-8", "invalid").is_err());
+                assert_eq!(fs::read(&manifest).unwrap(), old);
+                FAIL_MANIFEST_PUBLISH.set(true);
+                assert!(write_commit_manifest(&archive, &plan, "utf-8", "all").is_err());
+                assert_eq!(fs::read(&manifest).unwrap(), old);
+                write_commit_manifest(&archive, &plan, "utf-8", "none").unwrap();
+                let next: serde_json::Value =
+                    serde_json::from_str(fs::read_to_string(&manifest).unwrap().trim()).unwrap();
+                assert!(next["sha256"].is_null());
+                assert!(next["commit_id"].as_u64() > rows[0]["commit_id"].as_u64());
+            }
+        }
+    }
+
+    /// Regression: live cleanup must forget only committed xattr rows and leave
+    /// the archive serving the new metadata and unchanged payload bytes.
+    #[test]
+    fn regression_provenance_live_cleanup_and_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar.zst");
+        provenance_fixture(&archive, true);
+        let root = dir.path().join("ov");
+        let mut ov =
+            WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
+                .unwrap();
+        ov.set_manifest_hashes(Some("new".into()));
+        ov.set_xattr("/trace", "user.train_ok", b"false", 0)
+            .unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| Ok(Arc::new(provenance_base(p, "utf-8")?)))
+            .unwrap());
+        assert!(collect_overlay_commit_plan_from_conn(
+            &root,
+            Some(&ov.db.lock().unwrap()),
+            None,
+            &HashSet::new()
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            ov.xattrs_for_path("/trace").unwrap()["user.train_ok"],
+            b"false"
+        );
+        ov.rename("/trace", "/moved").unwrap();
+        assert_eq!(
+            ov.xattrs_for_path("/moved").unwrap()["user.teacher"],
+            b"old"
+        );
+        ov.unlink("/moved").unwrap();
+        let fd = ov.create_file("/moved", 0o644).unwrap();
+        ov.close_overlay_fd(fd);
+        assert!(ov.xattrs_for_path("/moved").unwrap().is_empty());
+    }
+
     fn ustar_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,
@@ -10896,6 +12165,7 @@ mod tests {
 
     fn ustar_symlink<'a>(path: &'a str, target: &'a str) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::Symlink { target },
             mode: 0o777,
@@ -14420,12 +15690,14 @@ mod tests {
             to: "/x".to_string(),
             mode: ratarmount_core::S_IFREG | 0o644,
             hides_from: true,
+            xattrs: BTreeMap::new(),
         }];
         let newer = PendingFilesOp::Rename {
             from: "/x".to_string(),
             to: "/y".to_string(),
             mode: ratarmount_core::S_IFREG | 0o644,
             hides_from: true,
+            xattrs: BTreeMap::new(),
         };
         let mut queued = vec![newer.clone()];
         restore_pending_front(&mut queued, older.clone());

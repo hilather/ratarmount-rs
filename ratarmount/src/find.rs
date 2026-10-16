@@ -29,6 +29,8 @@ pub struct LocateOptions<'a> {
     pub fill_hashes: &'a [String],
     /// Re-sort today's path-order LIMIT set by `offsetheader` (find `--offset-order`).
     pub offset_order: bool,
+    /// AND predicates: NAME, NAME=VALUE, NAME!=VALUE.
+    pub xattrs: &'a [String],
 }
 
 /// TSV `path\tsize\tmtime` plus optional `key=value` hash columns.
@@ -159,24 +161,85 @@ fn query_index_cli(
     }
     if fts {
         idx.ensure_fts5().map_err(|e| e.to_string())?;
-        let q = SearchQuery {
-            include_hashes: loc.include_hashes,
-            offset_order: loc.offset_order,
-            after: None,
-            limit: DEFAULT_SEARCH_LIMIT,
-            ..SearchQuery::fts(pattern)
-        };
-        query_index(idx, &q)
-    } else {
-        let q = SearchQuery {
-            include_hashes: loc.include_hashes,
-            offset_order: loc.offset_order,
-            after: None,
-            limit: DEFAULT_SEARCH_LIMIT,
-            ..SearchQuery::glob(pattern)
-        };
-        query_index(idx, &q)
     }
+    let predicates = loc
+        .xattrs
+        .iter()
+        .map(|s| parse_xattr_filter(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut hits = Vec::new();
+    let mut cursor: Option<(String, Option<i64>)> = None;
+    loop {
+        let q = SearchQuery {
+            include_hashes: loc.include_hashes,
+            offset_order: false,
+            after: cursor
+                .as_ref()
+                .map(|(path, offset)| ratarmount_index::FindAfter {
+                    fullpath: path,
+                    offsetheader: *offset,
+                }),
+            limit: DEFAULT_SEARCH_LIMIT,
+            ..if fts {
+                SearchQuery::fts(pattern)
+            } else {
+                SearchQuery::glob(pattern)
+            }
+        };
+        let page = query_index(idx, &q)?;
+        let done = page.len() < DEFAULT_SEARCH_LIMIT;
+        if let Some(last) = page.last() {
+            cursor = Some((last.path.clone(), last.offsetheader));
+        }
+        for hit in page {
+            let mut matches = true;
+            for (name, op, expected) in &predicates {
+                let value = match hit.offsetheader {
+                    Some(offset) => idx.get_xattr(offset, name).map_err(|e| e.to_string())?,
+                    None => None,
+                };
+                matches &= match op {
+                    0 => value.is_some(),
+                    1 => value.as_deref() == Some(expected.as_bytes()),
+                    _ => value.is_some_and(|v| v != expected.as_bytes()),
+                };
+            }
+            if matches {
+                hits.push(hit);
+            }
+            if hits.len() == DEFAULT_SEARCH_LIMIT {
+                break;
+            }
+        }
+        if done || hits.len() == DEFAULT_SEARCH_LIMIT {
+            break;
+        }
+    }
+    if loc.offset_order {
+        hits.sort_by(|a, b| {
+            ratarmount_index::cmp_offset_then_name(a.offsetheader, &a.path, b.offsetheader, &b.path)
+        });
+    }
+    Ok(hits)
+}
+
+fn parse_xattr_filter(text: &str) -> Result<(String, u8, String), String> {
+    let (name, op, value) = if let Some((name, value)) = text.split_once("!=") {
+        (name, 2, value)
+    } else if let Some((name, value)) = text.split_once('=') {
+        (name, 1, value)
+    } else {
+        (text, 0, "")
+    };
+    if name.is_empty() || name.contains(['!', '\0', '\n']) {
+        return Err(format!("invalid xattr filter: {text}"));
+    }
+    let name = if name.starts_with("user.") {
+        name.into()
+    } else {
+        format!("user.{name}")
+    };
+    Ok((name, op, value.into()))
 }
 
 fn memory_index_error() -> String {
@@ -312,6 +375,7 @@ mod tests {
 
     fn member<'a>(path: &'a str, bytes: &'a [u8], mtime: u64) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,
@@ -334,6 +398,67 @@ mod tests {
         write_ustar_members(&mut out, &members).unwrap();
         write_tar_eof(&mut out).unwrap();
         std::fs::write(path, out).unwrap();
+    }
+
+    /// Regression: xattr predicates match index bytes and do not treat missing as !=.
+    #[test]
+    fn regression_provenance_find_xattr_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("trace.tar");
+        let attrs = vec![("user.train_ok".into(), b"false".to_vec())];
+        let mut tagged = member("tagged", b"trace", 1);
+        tagged.xattrs = &attrs;
+        let mut out = Vec::new();
+        write_ustar_members(&mut out, &[tagged, member("untagged", b"other", 2)]).unwrap();
+        write_tar_eof(&mut out).unwrap();
+        std::fs::write(&archive, out).unwrap();
+        for (filter, expected) in [
+            ("train_ok", 1),
+            ("train_ok=false", 1),
+            ("user.train_ok!=true", 1),
+            ("train_ok=true", 0),
+            ("train_ok!=false", 0),
+        ] {
+            let filters = vec![filter.into()];
+            let loc = LocateOptions {
+                xattrs: &filters,
+                ..Default::default()
+            };
+            let hits = locate_hits(&archive, "*", &find_opts(dir.path()), &loc).unwrap();
+            assert_eq!(hits.len(), expected, "{filter}");
+            if expected == 1 {
+                assert_eq!(hits[0].path, "/tagged");
+            }
+        }
+    }
+
+    /// Regression: filtering a pre-limited page hides matches beyond the first 10k rows.
+    #[test]
+    fn regression_provenance_find_filters_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("many.tar");
+        let names: Vec<_> = (0..DEFAULT_SEARCH_LIMIT + 1)
+            .map(|i| format!("a{i:05}"))
+            .collect();
+        let mut members: Vec<_> = names.iter().map(|name| member(name, b"", 0)).collect();
+        let attrs = vec![
+            ("user.train_ok".into(), b"false".to_vec()),
+            ("user.teacher".into(), b"model".to_vec()),
+        ];
+        let mut last = member("zz-last", b"", 0);
+        last.xattrs = &attrs;
+        members.push(last);
+        let mut out = Vec::new();
+        write_ustar_members(&mut out, &members).unwrap();
+        write_tar_eof(&mut out).unwrap();
+        std::fs::write(&archive, out).unwrap();
+        let filters = vec!["train_ok=false".into(), "teacher".into()];
+        let loc = LocateOptions {
+            xattrs: &filters,
+            ..Default::default()
+        };
+        let hits = locate_hits(&archive, "*", &find_opts(dir.path()), &loc).unwrap();
+        assert_eq!(hit_paths(&hits), ["/zz-last"]);
     }
 
     fn find_opts(_dir: &Path) -> OpenOptions {

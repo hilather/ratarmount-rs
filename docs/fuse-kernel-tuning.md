@@ -290,3 +290,72 @@ separate unprivileged test checks `auto` daemon mode and forced-on startup denia
 exercise negotiation and registration failure over a socket without `/dev/fuse`,
 copy limits, alignment, tmpfs fallback, and reflinks on btrfs/XFS. Set
 `RATARMOUNT_TEST_REFLINK_DIR` to choose the filesystem for the real clone test.
+
+## One-pass reads with `--direct-io`
+
+`ratarmount --direct-io --parallelization 4 --readahead 16M data.tar.zst mnt/`
+sets `FOPEN_DIRECT_IO` on source-member opens, including reopened detached archive
+inodes. Overlay-file opens keep their existing cached behavior. This bypasses
+the FUSE page cache and kernel readahead for ordinary reads; the daemon's
+`--readahead` window and zstd decode-ahead still work. Repeated reads may therefore
+cost more CPU. This is a FUSE policy, not `O_DIRECT` on the archive: no aligned
+user buffers are required.
+
+Direct I/O disables passthrough for the mount, including an explicit
+`--passthrough on`, so daemon reads can apply the eviction policy. Passthrough's
+backing-file cache would otherwise keep pages outside this policy. Normal mounts
+retain their existing passthrough negotiation.
+
+On Linux, consumed local zstd compressed frames and available plain-file/stored
+TAR backing extents receive best-effort `POSIX_FADV_DONTNEED`. This does not evict
+pages in use elsewhere or guarantee a cold cache. Other codecs, full-decode
+fallbacks and remote/nested compressed streams do not currently expose the
+backing ranges needed for this advice. Non-Linux builds omit `posix_fadvise`.
+
+The [kernel FUSE I/O documentation](https://docs.kernel.org/filesystems/fuse/fuse-io.html)
+describes the mmap distinction: shared mmap is disabled by default with direct
+I/O. fuser 0.18 exposes `FUSE_DIRECT_IO_ALLOW_MMAP`; ratarmount requests it when
+the Linux kernel advertises support (introduced in Linux 6.6). On older kernels,
+shared mmap of direct-I/O members fails. Private mappings are not covered by
+that shared-mmap restriction. Allowing mmap does not make mapped pages bypass
+the page cache, so use `read`/`cat` for one-pass cache-avoidance workloads.
+[Passthrough](https://docs.kernel.org/filesystems/fuse/fuse-passthrough.html)
+also delegates mmap to its backing file; it is disabled here along with reads.
+
+
+## Sequential request sizes and diagnosis
+
+On Linux kernels advertising `FUSE_MAX_PAGES` (Linux 4.20+), ratarmount raises
+the request limit to 256 pages (1 MiB with 4 KiB pages). Older kernels retain
+the AI-0a 32-page limit. macOS keeps fuser's platform defaults. fuser 0.18 has
+no public `set_max_pages`: it derives the field from the larger of
+`set_max_write` and `set_max_readahead`; readahead stays within the kernel's
+offered cap. Background/congestion limits remain 12/9. The negotiated values
+are logged as `fuse-io-limits` at `-d 2`.
+
+This is a ceiling, not a promise that each read becomes 1 MiB. Cached sequential
+reads can use kernel readahead. Direct I/O disables kernel readahead, so a
+128 KiB `cat` read remains a synchronous round trip even with a 1 MiB ceiling.
+A larger caller such as `dd bs=1M` can use larger direct requests. The daemon
+still has one request worker; decode workers parallelize only frame decoding.
+The application `--readahead 16M` window is filled synchronously on misses;
+codec decode-ahead can overlap frames within that fill, but it cannot overlap
+FUSE request handling. Sequential requests that grow across a daemon-window
+boundary retain the cached tail and continue forward; they do not rewind and
+cancel codec prefetch. A small daemon CPU percentage therefore does not by
+itself establish that decoding failed to engage.
+
+The harness compares both FUSE cache modes with `cat` and `dd`, plus Session
+and zstd CLI baselines:
+
+```bash
+SIZE_MIB=256 THREADS=4 WORK_DIR=$PWD/target/ai-perf-data benchmarks/ai/zstd-decode-ahead.sh
+```
+ Set `CACHE=warm` to compare against
+a warm **backing archive**; the default `cold` uses best-effort per-file
+`DONTNEED`, never global `drop_caches`. See
+[zstd-random-access.md](zstd-random-access.md#sequential-decode-ahead) for the
+CSV counters. At unmount `fuse-read-summary` reports `requests`,
+`requested_bytes`, `max_request`, and `service_ns` (wall time including reader
+waits and replies). Compare handler time with end-to-end time and the library
+baseline to distinguish decoder, backing I/O, and request round-trip costs.

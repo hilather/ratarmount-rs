@@ -788,6 +788,7 @@ mod tests {
         write_ustar_members(
             &mut buf,
             &[UstarMember {
+                xattrs: &[],
                 path: "hello.txt",
                 payload: UstarPayload::File {
                     bytes: b"hello 9p\n",

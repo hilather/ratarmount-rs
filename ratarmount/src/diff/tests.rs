@@ -23,6 +23,7 @@ fn base_tar(root: &Path, files: &[(&str, &[u8], u32)]) -> factory::MountBundle {
     let members: Vec<_> = files
         .iter()
         .map(|(path, bytes, mode)| UstarMember {
+            xattrs: &[],
             path,
             payload: if mode & S_IFMT == S_IFLNK {
                 UstarPayload::Symlink {

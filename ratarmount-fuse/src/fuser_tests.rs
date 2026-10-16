@@ -246,6 +246,56 @@ mod protocol {
         }
     }
 
+    /// Regression: writable FUSE xattrs must preserve flags, probes, ERANGE, and removals.
+    #[test]
+    fn regression_provenance_fuser_xattr_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let ov = Arc::new(WriteOverlay::new(Arc::new(Source), dir.path()).unwrap());
+        let fs = RatarmountFs::new(ov.clone(), Some(ov));
+        let mut h = Harness::with_capabilities(
+            mount_config(true, ""),
+            1024,
+            fs,
+            InitFlags::all() & !InitFlags::FUSE_SETXATTR_EXT,
+        );
+        let lookup = h.call(1, 1, b"f\0");
+        let ino = u64_at(&lookup, 0);
+        let set = |name: &str, value: &[u8], flags| {
+            let mut body = words(&[value.len() as u32, flags]);
+            body.extend(name.as_bytes());
+            body.push(0);
+            body.extend(value);
+            body
+        };
+        let get = |name: &str, size| {
+            let mut body = words(&[size, 0]);
+            body.extend(name.as_bytes());
+            body.push(0);
+            body
+        };
+        h.call(21, ino, &set("user.train_ok", b"false", 1));
+        assert_eq!(u32_at(&h.call(22, ino, &get("user.train_ok", 0)), 0), 5);
+        assert_eq!(h.call(22, ino, &get("user.train_ok", 5)), b"false");
+        let uid = unsafe { libc::geteuid() };
+        for (opcode, body, errno) in [
+            (21, set("user.train_ok", b"x", 1), libc::EEXIST),
+            (21, set("user.absent", b"x", 2), libc::ENODATA),
+            (21, set("security.label", b"x", 0), libc::EPERM),
+            (22, get("user.train_ok", 4), libc::ERANGE),
+            (23, words(&[1, 0]), libc::ERANGE),
+        ] {
+            let reply = h.call_as(opcode, ino, uid, &body);
+            assert_eq!(u32_at(&reply, 4) as i32, -errno);
+        }
+        let len = u32_at(&h.call(23, ino, &words(&[0, 0])), 0);
+        let keys = h.call(23, ino, &words(&[len, 0]));
+        assert_eq!(keys, b"user.test\0user.train_ok\0");
+        h.call(24, ino, b"user.test\0");
+        let reply = h.call_as(22, ino, uid, &get("user.test", 0));
+        assert_eq!(u32_at(&reply, 4) as i32, -libc::ENODATA);
+        h.finish();
+    }
+
     fn read_args(fh: u64, offset: u64, size: u32) -> Vec<u8> {
         let mut body = fh.to_ne_bytes().to_vec();
         body.extend(offset.to_ne_bytes());
@@ -351,29 +401,44 @@ mod protocol {
         harness.finish();
     }
 
-    /// Regression: ABI 7.40 availability must not enable passthrough, larger I/O, or caching flags.
+    /// Regression: large sequential I/O requires MAX_PAGES; old kernels keep
+    /// 32 pages, and neither path changes passthrough or background queues.
     #[test]
     fn fuser_init_preserves_io_limits_without_passthrough() {
-        let max_io = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u32 } * 32;
-        for readahead in [0, 4096, max_io, max_io * 2] {
-            let harness = Harness::new(mount_config(false, ""), readahead);
-            let init = &harness.init[16..];
-            assert_eq!(u32_at(init, 0), 7);
-            assert!(u32_at(init, 4) >= 40);
-            assert_eq!(u32_at(init, 8), readahead.min(max_io));
-            let flags = u32_at(init, 12) as u64 | ((u32_at(init, 32) as u64) << 32);
-            assert_eq!(
-                InitFlags::from_bits_retain(flags),
-                InitFlags::FUSE_ASYNC_READ
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u32 };
+        for supported in [false, true] {
+            let pages = if supported { 256 } else { 32 };
+            let max_io = page_size * pages;
+            for readahead in [0, 4096, max_io, max_io * 2] {
+                let caps = if supported {
+                    InitFlags::all()
+                } else {
+                    InitFlags::all() & !InitFlags::FUSE_MAX_PAGES
+                };
+                let harness = Harness::with_capabilities(
+                    mount_config(false, ""),
+                    readahead,
+                    RatarmountFs::new(Arc::new(Source), None),
+                    caps,
+                );
+                let init = &harness.init[16..];
+                assert_eq!(u32_at(init, 0), 7);
+                assert!(u32_at(init, 4) >= 40);
+                assert_eq!(u32_at(init, 8), readahead.min(max_io));
+                let flags = u32_at(init, 12) as u64 | ((u32_at(init, 32) as u64) << 32);
+                let mut expected = InitFlags::FUSE_ASYNC_READ
                     | InitFlags::FUSE_BIG_WRITES
-                    | InitFlags::FUSE_MAX_PAGES
-                    | InitFlags::FUSE_INIT_EXT
-            );
-            assert_eq!(u32_at(init, 16), 12 | (9 << 16));
-            assert_eq!(u32_at(init, 20), max_io);
-            assert_eq!(u32_at(init, 28) & 0xffff, 32);
-            assert_eq!(u32_at(init, 36), 0); // max_stack_depth
-            harness.finish();
+                    | InitFlags::FUSE_INIT_EXT;
+                if supported {
+                    expected |= InitFlags::FUSE_MAX_PAGES;
+                }
+                assert_eq!(InitFlags::from_bits_retain(flags), expected);
+                assert_eq!(u32_at(init, 16), 12 | (9 << 16));
+                assert_eq!(u32_at(init, 20), max_io);
+                assert_eq!(u32_at(init, 28) & 0xffff, pages);
+                assert_eq!(u32_at(init, 36), 0); // max_stack_depth
+                harness.finish();
+            }
         }
     }
 

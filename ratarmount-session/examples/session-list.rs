@@ -24,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_ustar_members(
                 &mut f,
                 &[UstarMember {
+                    xattrs: &[],
                     path: "hello.txt",
                     payload: UstarPayload::File {
                         bytes: b"hello from session-list\n",

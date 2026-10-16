@@ -294,7 +294,7 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | Nested format | No `/tmp`? | Random read? |
 |---------------|:----------:|:------------:|
 | `.tar` in ZIP/TAR/7z/`.tar.gz` | yes | yes |
-| `.tar` in a torrent (`bittorrent`) | yes (index metadata may use a tempfile) | yes, whole verified pieces |
+| `.tar` in a torrent (`bittorrent`) | yes (index metadata uses a cache-local tempfile retained until SQLite closes) | yes, whole verified pieces |
 | `.tar.gz` in ZIP/TAR/7z | yes | yes (gzip seek) |
 | `.zip` / `.7z` in ZIP/TAR/7z | yes | yes* |
 | `.tar.zst` / `.tar.bz2` / `.tar.xz` nested | yes (if TAR body) | yes* |

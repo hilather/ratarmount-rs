@@ -1,9 +1,12 @@
 //! Blocking bridge to a private rqbit runtime. No runtime is entered on a FUSE thread.
 
+use super::{scratch, TorrentSwarmPolicy};
+use librqbit::storage::StorageFactoryExt;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{mpsc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -18,6 +21,10 @@ pub struct SwarmOptions {
     pub trackers: bool,
     pub initial_peers: Vec<SocketAddr>,
     pub timeout: Duration,
+    pub policy: TorrentSwarmPolicy,
+    pub scratch_bytes: u64,
+    /// Shared across metadata resolution and payload sessions for one mount.
+    pub announced: Arc<AtomicBool>,
 }
 
 impl Default for SwarmOptions {
@@ -27,6 +34,9 @@ impl Default for SwarmOptions {
             trackers: true,
             initial_peers: Vec::new(),
             timeout: Duration::from_secs(30),
+            policy: TorrentSwarmPolicy::Auto,
+            scratch_bytes: 2 * 1024 * 1024 * 1024,
+            announced: Arc::default(),
         }
     }
 }
@@ -63,7 +73,16 @@ fn error(e: impl std::fmt::Display) -> io::Error {
 }
 
 impl Swarm {
-    pub fn new(options: SwarmOptions, cache_dir: PathBuf) -> io::Result<Self> {
+    pub fn new(options: SwarmOptions, cache_dir: PathBuf, infohash: &str) -> io::Result<Self> {
+        if options.policy == TorrentSwarmPolicy::Never {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+                "--torrent-swarm never: metadata or a verified piece is unavailable from cache/web seeds"));
+        }
+        if !options.announced.swap(true, Ordering::Relaxed) {
+            log::info!(
+                "BitTorrent swarm enabled for {infohash}: your IP is visible to trackers/DHT peers"
+            );
+        }
         let (tx, rx) = mpsc::sync_channel(8);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
@@ -71,22 +90,33 @@ impl Swarm {
             .spawn(move || {
                 let setup = || -> io::Result<_> {
                     std::fs::create_dir_all(&cache_dir)?;
+                    scratch::sweep(&cache_dir, Duration::from_secs(24 * 60 * 60));
                     let scratch = tempfile::Builder::new()
                         .prefix("swarm-")
                         .tempdir_in(cache_dir)?;
+                    let owner = scratch::mark_owned(scratch.path())?;
                     let rt = tokio::runtime::Builder::new_multi_thread()
                         .worker_threads(2)
                         .enable_all()
                         .build()?;
+                    let mut config = session_options(&options);
+                    if options.dht {
+                        config.bind_device_name = default_device()?;
+                        config.ipv4_only = true;
+                    }
+                    config.default_storage_factory = Some(
+                        scratch::Factory {
+                            dir: scratch.path().to_owned(),
+                            limit: options.scratch_bytes,
+                        }
+                        .boxed(),
+                    );
                     let session = rt
-                        .block_on(Session::new_with_opts(
-                            scratch.path().to_owned(),
-                            session_options(&options),
-                        ))
+                        .block_on(Session::new_with_opts(scratch.path().to_owned(), config))
                         .map_err(error)?;
-                    Ok((scratch, rt, session))
+                    Ok((scratch, owner, rt, session))
                 };
-                let (scratch, rt, session) = match setup() {
+                let (scratch, owner, rt, session) = match setup() {
                     Ok(value) => {
                         let _ = ready_tx.send(Ok(()));
                         value
@@ -205,6 +235,7 @@ impl Swarm {
                 rt.block_on(session.stop());
                 drop(session);
                 rt.shutdown_timeout(Duration::from_secs(2));
+                drop(owner);
                 drop(scratch);
             })?;
         ready_rx.recv().map_err(error)??;
@@ -248,7 +279,76 @@ impl Drop for Swarm {
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
-            let _ = thread.join();
+            // Dropping a JoinHandle detaches an in-flight request. The runtime
+            // retains its locked scratch owner and cleans up after its timeout.
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
         }
+    }
+}
+
+/// Select the kernel's IPv4 default-route interface without sending a packet.
+#[cfg(unix)]
+fn default_device() -> io::Result<Option<String>> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("192.0.2.1:9")?;
+    let std::net::IpAddr::V4(ip) = socket.local_addr()?.ip() else {
+        return Err(error("no IPv4 default route for DHT"));
+    };
+    let mut list = std::ptr::null_mut();
+    // getifaddrs owns the linked list until freeifaddrs; inspect only AF_INET addresses.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut cursor = list;
+        let mut found = None;
+        while !cursor.is_null() {
+            let entry = &*cursor;
+            if !entry.ifa_addr.is_null() && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET {
+                let addr = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                if addr.sin_addr.s_addr.to_ne_bytes() == ip.octets() {
+                    found = Some(
+                        std::ffi::CStr::from_ptr(entry.ifa_name)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    break;
+                }
+            }
+            cursor = entry.ifa_next;
+        }
+        libc::freeifaddrs(list);
+        found
+            .map(Some)
+            .ok_or_else(|| error("cannot identify default-route interface for DHT"))
+    }
+}
+
+#[cfg(not(unix))]
+fn default_device() -> io::Result<Option<String>> {
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Regression: unmount joined a stalled swarm command for its full network timeout.
+    #[test]
+    fn regression_swarm_drop_does_not_wait_for_command_timeout() {
+        let (release, wait) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let swarm = Swarm {
+            tx: Some(tx),
+            thread: Mutex::new(Some(thread)),
+        };
+        let start = std::time::Instant::now();
+        drop(swarm);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
     }
 }

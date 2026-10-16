@@ -492,9 +492,33 @@ impl RangeCache {
         Ok(())
     }
 
+    /// Drop this identity after its verified bytes have moved to an external cache.
+    /// Held readers remain valid on Unix; external blobs do not use this budget.
+    pub fn remove_file(&self, token: &ContentToken) {
+        let Some(base) = self.base(token) else {
+            return;
+        };
+        self.budget.remove(&Self::path(&base, "complete"));
+        for chunk in 0..token.size().div_ceil(self.chunk_size) {
+            self.budget.remove(&Self::path(&base, chunk));
+        }
+    }
+
     /// Returns a contiguous file only when every chunk is present. A caller should
     /// open it promptly: another cache writer may evict this path after return.
     pub fn complete_file(&self, token: &ContentToken) -> Option<PathBuf> {
+        self.complete_with_file(token).map(|(path, _)| path)
+    }
+
+    /// Return the descriptor used to verify completion, avoiding a pathname
+    /// reopen between verification and passthrough. Its cursor starts at zero.
+    pub fn complete_backing_file(&self, token: &ContentToken) -> Option<File> {
+        let (_, mut file) = self.complete_with_file(token)?;
+        file.seek(SeekFrom::Start(0)).ok()?;
+        Some(file)
+    }
+
+    fn complete_with_file(&self, token: &ContentToken) -> Option<(PathBuf, File)> {
         let base = self.base(token)?;
         if token.size() > self.cap {
             return None;
@@ -532,7 +556,7 @@ impl RangeCache {
                     memo.insert(key, stamp);
                 }
                 self.touch(&whole, hdr.len);
-                return Some(whole);
+                return Some((whole, file));
             }
         }
         ensure_private_dir(&self.root).ok()?;
@@ -605,7 +629,7 @@ impl RangeCache {
         self.budget
             .install(&whole, token.size(), self.cap, &chunks)
             .ok()?;
-        Some(whole)
+        Some((whole, file))
     }
 }
 
@@ -1763,5 +1787,61 @@ mod tests {
         range.budget.install(&path, 4, 0, &[]).unwrap();
         assert_eq!(fs::read(&victim).unwrap(), b"keep");
         assert!(range.get(&id, 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod hub_handoff_tests {
+    use super::*;
+
+    /// Regression: reopening a completed cache pathname could hand passthrough an unverified replacement.
+    #[test]
+    fn regression_range_cache_backing_fd_survives_complete_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RangeCache::with_dirs(dir.path().join("range-v1"), dir.path().into(), 1024, 4);
+        let token = ContentToken::Sha256 {
+            sha256: crate::sha256_hex(b"original"),
+            size: 8,
+        };
+        cache.put(&token, 0, b"orig").unwrap();
+        cache.put(&token, 1, b"inal").unwrap();
+        let mut fd = cache.complete_backing_file(&token).unwrap();
+        let path = cache.complete_file(&token).unwrap();
+        fs::rename(&path, dir.path().join("old-complete")).unwrap();
+        fs::write(&path, b"tampered").unwrap();
+        let mut bytes = Vec::new();
+        fd.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+        assert!(cache.complete_backing_file(&token).is_none());
+    }
+
+    /// Regression: handing a whole file to the Hub left chunks and a complete copy under the shared budget.
+    #[test]
+    fn regression_range_cache_hub_handoff_removes_only_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RangeCache::with_dirs(dir.path().join("range-v1"), dir.path().into(), 1024, 4);
+        let id = ContentToken::Sha256 {
+            sha256: crate::sha256_hex(b"abcdefgh"),
+            size: 8,
+        };
+        let other = ContentToken::Sha256 {
+            sha256: crate::sha256_hex(b"ijkl"),
+            size: 4,
+        };
+        cache.put(&id, 0, b"abcd").unwrap();
+        cache.put(&id, 1, b"efgh").unwrap();
+        cache.put(&other, 0, b"ijkl").unwrap();
+        let mut held = File::open(cache.complete_file(&id).unwrap()).unwrap();
+        cache.remove_file(&id);
+        assert!(!cache.contains(&id, 0));
+        assert!(!cache.contains(&id, 1));
+        assert!(cache.complete_file(&id).is_none());
+        assert_eq!(cache.get(&other, 0).unwrap(), b"ijkl");
+        let mut bytes = Vec::new();
+        held.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abcdefgh");
+        cache.put(&id, 0, b"abcd").unwrap();
+        cache.remove_file(&id);
+        assert!(!cache.contains(&id, 0));
     }
 }

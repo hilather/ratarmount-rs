@@ -193,9 +193,18 @@ pub(crate) fn resolve(input: &str, options: &TorrentOptions) -> io::Result<Metai
         let mut meta = match found {
             Some(m) => m,
             None => {
+                if options.swarm.policy == super::TorrentSwarmPolicy::Never {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "--torrent-swarm never: magnet metadata unavailable from cache/xs/web seed",
+                    ));
+                }
                 let swarm_url = magnet.swarm_url()?;
-                let swarm =
-                    Swarm::new(options.swarm.clone(), options.metadata_dir.join("scratch"))?;
+                let swarm = Swarm::new(
+                    options.swarm.clone(),
+                    options.metadata_dir.join("scratch"),
+                    magnet.v1.as_deref().unwrap_or("v2"),
+                )?;
                 let meta = Metainfo::parse(swarm.resolve(swarm_url)?)?;
                 if !magnet.matches(&meta) {
                     return Err(invalid("magnet metadata infohash mismatch"));
@@ -203,10 +212,11 @@ pub(crate) fn resolve(input: &str, options: &TorrentOptions) -> io::Result<Metai
                 meta
             }
         };
-        for seed in magnet.web_seeds {
-            if !meta.web_seeds.contains(&seed) {
-                meta.web_seeds.push(seed);
-            }
+        // Explicit ws belongs to this mount's source context. Never inherit a
+        // previous magnet's repository through a cache entry keyed only by infohash.
+        if !magnet.web_seeds.is_empty() {
+            meta.web_seeds = magnet.web_seeds;
+            meta.web_seeds.dedup();
         }
         for tracker in magnet.trackers {
             if !meta.trackers.contains(&tracker) {
@@ -244,7 +254,7 @@ fn string(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
-fn envelope(meta: &Metainfo) -> io::Result<Vec<u8>> {
+pub(super) fn envelope(meta: &Metainfo) -> io::Result<Vec<u8>> {
     let top = super::metainfo::parse(&meta.bytes)?;
     let mut out = b"d".to_vec();
     if !meta.trackers.is_empty() {

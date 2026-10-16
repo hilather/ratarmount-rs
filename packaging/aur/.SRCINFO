@@ -1,0 +1,21 @@
+pkgbase = ratarmount-rs-bin
+	pkgdesc = Mount archives as a filesystem with random access (portable release binary)
+	pkgver = 0.1.34
+	pkgrel = 1
+	url = https://github.com/hilather/ratarmount-rs
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends = fuse3
+	depends = glibc
+	provides = ratarmount
+	conflicts = ratarmount
+	options = !debug
+	source = ratarmount-rs-0.1.34.tar.gz::https://github.com/hilather/ratarmount-rs/archive/refs/tags/v0.1.34.tar.gz
+	sha256sums = SKIP
+	source_x86_64 = ratarmount-0.1.34-portable-glibc2.31-x86_64.tar.gz::https://github.com/hilather/ratarmount-rs/releases/download/v0.1.34/ratarmount-0.1.34-portable-glibc2.31-x86_64.tar.gz
+	sha256sums_x86_64 = e699271fd9291920b3fa541c768946ccd323999ea52bf0c9ebd85e87ba98bfa4
+	source_aarch64 = ratarmount-0.1.34-portable-glibc2.31-aarch64.tar.gz::https://github.com/hilather/ratarmount-rs/releases/download/v0.1.34/ratarmount-0.1.34-portable-glibc2.31-aarch64.tar.gz
+	sha256sums_aarch64 = 8fb3a74d8b79646c61eabe550c86302fb05537005c42826c72aaef9c11ae3fc0
+
+pkgname = ratarmount-rs-bin

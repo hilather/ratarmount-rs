@@ -203,6 +203,65 @@ pub(crate) fn component(s: &str) -> io::Result<()> {
     if s.is_empty() || matches!(s, "." | "..") || s.contains(['/', '\\', '\0', ':']) {
         return Err(invalid("unsafe torrent path component"));
     }
+    #[cfg(not(unix))]
+    if windows_reserved(s) {
+        return Err(invalid("reserved Windows torrent path"));
+    }
+    Ok(())
+}
+
+#[cfg(any(not(unix), test))]
+fn windows_reserved(s: &str) -> bool {
+    let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
+    s.ends_with(['.', ' '])
+        || s.contains(['<', '>', '"', '|', '?', '*'])
+        || s.chars().any(char::is_control)
+        || matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        )
+        || ["COM", "LPT"].iter().any(|p| {
+            stem.strip_prefix(p).is_some_and(|n| {
+                matches!(
+                    n,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        })
+}
+
+fn validate_paths<'a>(paths: impl Iterator<Item = &'a str>, fold_case: bool) -> io::Result<()> {
+    let paths: Vec<_> = paths.collect();
+    let key = |s: &str| {
+        if fold_case {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    let mut names = BTreeMap::new();
+    for path in &paths {
+        if names.insert(key(path), ()).is_some() {
+            return Err(invalid("duplicate torrent path"));
+        }
+    }
+    let mut spellings = BTreeMap::new();
+    for mut path in paths {
+        loop {
+            if let Some(previous) = spellings.insert(key(path), path) {
+                if previous != path {
+                    return Err(invalid("case-insensitive torrent path collision"));
+                }
+            }
+            let Some((parent, _)) = path.rsplit_once('/') else {
+                break;
+            };
+            if names.contains_key(&key(parent)) {
+                return Err(invalid("torrent file/directory collision"));
+            }
+            path = parent;
+        }
+    }
     Ok(())
 }
 
@@ -379,21 +438,10 @@ impl Metainfo {
         } else {
             files.len() != 1 || files.first().is_some_and(|f| f.path.contains('/'))
         };
-        let mut names = BTreeMap::new();
-        for f in &files {
-            if names.insert(f.path.clone(), ()).is_some() {
-                return Err(invalid("duplicate torrent path"));
-            }
-        }
-        for f in &files {
-            let mut path = f.path.as_str();
-            while let Some((p, _)) = path.rsplit_once('/') {
-                if names.contains_key(p) {
-                    return Err(invalid("torrent file/directory collision"));
-                }
-                path = p;
-            }
-        }
+        validate_paths(
+            files.iter().filter(|f| !f.padding).map(|f| f.path.as_str()),
+            !cfg!(unix),
+        )?;
         let mut web_seeds = Vec::new();
         if let Some(urls) = top.get(b"url-list") {
             match &urls.value {
@@ -537,5 +585,24 @@ impl Metainfo {
                 (a < b).then(|| (i, a - f.offset, (b - a) as usize))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    /// Regression: Windows device names and case-folded duplicate paths could escape file semantics.
+    #[test]
+    fn regression_windows_reserved_torrent_names() {
+        for name in [
+            "CON", "con.txt", "NUL", "com1", "Lpt9.bin", "COM¹", "a.", "a ", "x*y",
+        ] {
+            assert!(windows_reserved(name), "{name}");
+        }
+        assert!(!windows_reserved("weights.bin"));
+        for paths in [["A/B", "a/b"], ["A", "a/b"], ["Dir/a", "dir/b"]] {
+            assert!(validate_paths(paths.into_iter(), true).is_err());
+            assert!(validate_paths(paths.into_iter(), false).is_ok());
+        }
     }
 }

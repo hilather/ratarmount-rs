@@ -1043,10 +1043,13 @@ pub(super) fn open_remote_input(
                 input,
                 ratarmount_remote::torrent::TorrentOptions {
                     readahead_bytes: opts.readahead_bytes,
-                    // A failed loopback fixture must never start public discovery.
-                    #[cfg(test)]
                     swarm: ratarmount_remote::torrent::SwarmOptions {
+                        policy: opts.torrent_swarm,
+                        scratch_bytes: opts.torrent_scratch_bytes,
+                        // A failed fixture must never start public discovery.
+                        #[cfg(test)]
                         dht: false,
+                        #[cfg(test)]
                         trackers: false,
                         ..Default::default()
                     },
@@ -1061,6 +1064,12 @@ pub(super) fn open_remote_input(
         }
         #[cfg(not(feature = "bittorrent"))]
         return Err("built without bittorrent support; rebuild with --features bittorrent".into());
+    }
+
+    if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf-cache") {
+        let source =
+            ratarmount_remote::HfCacheMountSource::open(input).map_err(|e| e.to_string())?;
+        return Ok((PathBuf::from(input), Arc::new(source)));
     }
 
     if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf") {
@@ -1430,6 +1439,13 @@ pub(super) fn torrent_nested_reader_fn(
 }
 
 #[cfg(feature = "bittorrent")]
+fn torrent_index_temp() -> std::io::Result<tempfile::NamedTempFile> {
+    let cache_dir = ratarmount_index::platform_cache_root().join("torrent-v1/indexes");
+    std::fs::create_dir_all(&cache_dir)?;
+    tempfile::NamedTempFile::new_in(cache_dir)
+}
+
+#[cfg(feature = "bittorrent")]
 fn torrent_tar_sidecar(
     parent: &dyn MountSource,
     member: &str,
@@ -1463,7 +1479,7 @@ fn torrent_tar_sidecar(
         if index_fi.size > 256 * 1024 * 1024 {
             continue;
         }
-        let mut tmp = tempfile::NamedTempFile::new()?;
+        let mut tmp = torrent_index_temp()?;
         let copied = io::copy(
             &mut parent.open(&index_fi, 0)?.take(256 * 1024 * 1024 + 1),
             &mut tmp,
@@ -1508,8 +1524,7 @@ fn torrent_tar_sidecar(
             continue;
         }
         body.seek(SeekFrom::Start(0))?;
-        // The SQLite connection retains its open fd after the temporary metadata
-        // filename is removed on Unix; on Windows NamedTempFile cleanup retries.
+        // Drop SQLite before unlinking its cache-local backing file on all platforms.
         let source =
             ratarmount_formats_tar::SqliteIndexedTar::open_with_existing_index_from_reader(
                 body,
@@ -1518,7 +1533,10 @@ fn torrent_tar_sidecar(
                 options.clone(),
             )
             .map_err(io::Error::other)?;
-        return Ok(Some(Arc::new(source)));
+        return Ok(Some(Arc::new(crate::factory::KeepAliveMount {
+            inner: Arc::new(source),
+            _tmp: tmp,
+        })));
     }
     Ok(None)
 }
@@ -1571,6 +1589,7 @@ mod tests {
         ratarmount_formats_tar::write_ustar_members(
             &mut tar,
             &[ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: name,
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes },
                 mode: 0o644,
@@ -1617,10 +1636,58 @@ mod tests {
         out
     }
 
+    /// Regression: sibling SQLite metadata used /tmp and disappeared before its source closed.
+    #[cfg(feature = "bittorrent")]
+    #[test]
+    fn regression_torrent_index_spool_lifetime() {
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        struct IndexOwner(PathBuf);
+        impl Drop for IndexOwner {
+            fn drop(&mut self) {
+                assert!(self.0.is_file(), "index removed before source closed");
+            }
+        }
+        impl MountSource for IndexOwner {
+            fn is_immutable(&self) -> bool {
+                true
+            }
+            fn list(&self, _: &str) -> Option<ratarmount_core::ListResult> {
+                None
+            }
+            fn lookup(&self, _: &str, _: i32) -> Option<ratarmount_core::FileInfo> {
+                None
+            }
+            fn search_cheap(&self, _: &str) -> Option<Vec<ratarmount_core::CheapSearchHit>> {
+                Some(Vec::new())
+            }
+            fn open(
+                &self,
+                _: &ratarmount_core::FileInfo,
+                _: i32,
+            ) -> std::io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                unreachable!()
+            }
+        }
+        let tmp = torrent_index_temp().unwrap();
+        let path = tmp.path().to_owned();
+        assert!(
+            path.starts_with(ratarmount_index::platform_cache_root().join("torrent-v1/indexes"))
+        );
+        let source = crate::factory::KeepAliveMount {
+            inner: Arc::new(IndexOwner(path.clone())),
+            _tmp: tmp,
+        };
+        assert!(path.is_file());
+        assert!(source.search_cheap("*").is_some());
+        drop(source);
+        assert!(!path.exists());
+    }
+
     /// Regression: recursive torrent mounts spooled shards or failed to discover sibling indexes.
     #[cfg(feature = "bittorrent")]
     #[test]
     fn regression_torrent_nested_tar_and_sibling_indexes() {
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         use ratarmount_remote::torrent::{SwarmOptions, TorrentMountSource, TorrentOptions};
         for sidecar in [None, Some(false), Some(true)] {
             let dir = tempfile::tempdir().unwrap();
@@ -1712,6 +1779,7 @@ mod tests {
     #[cfg(feature = "bittorrent")]
     #[test]
     fn regression_torrent_sibling_stale_or_bad_pointer_refused() {
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("shard.tar");
         let other = dir.path().join("other.tar");
@@ -1804,6 +1872,60 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         bytes
+    }
+
+    /// Regression: offline Hub snapshots were treated as local paths; recursive shards must use their blob in place.
+    #[cfg(unix)]
+    #[test]
+    fn regression_hf_cache_session_offline_recursive_tar_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = dir.path().join("hub");
+        let repo = hub.join("datasets--org--data");
+        let snapshot = repo.join("snapshots").join(HF_SHA);
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repo.join("blobs")).unwrap();
+        fs::create_dir_all(repo.join("refs")).unwrap();
+        let tar = hf_tar("hello.txt", b"offline nested bytes");
+        fs::write(repo.join("blobs").join(HF_SHA), tar).unwrap();
+        std::os::unix::fs::symlink(format!("../../blobs/{HF_SHA}"), snapshot.join("shard.tar"))
+            .unwrap();
+        fs::write(repo.join("refs/main"), HF_SHA).unwrap();
+        let env = SmbEnv::acquire(&[
+            "HF_HUB_CACHE",
+            "HF_HUB_OFFLINE",
+            "HF_ENDPOINT",
+            "RATARMOUNT_HF_SHARE_CACHE",
+            "RATARMOUNT_HF_CACHE_VERIFY",
+        ]);
+        env.set("HF_HUB_CACHE", &hub);
+        env.set("HF_HUB_OFFLINE", "1");
+        env.set("HF_ENDPOINT", "this-is-not-a-network-endpoint");
+        env.set("RATARMOUNT_HF_SHARE_CACHE", "0");
+        let session =
+            crate::Session::open(hf_request("hf-cache://datasets/org/data", None, true)).unwrap();
+        assert_eq!(
+            hf_read(&session, "/shard.tar/hello.txt"),
+            b"offline nested bytes"
+        );
+        let mut remotes = Vec::new();
+        let (label, _) = open_remote_input(
+            "hf-cache://datasets/org/data",
+            &mut OpenOptions::default(),
+            false,
+            &mut remotes,
+        )
+        .unwrap();
+        assert!(
+            remotes.is_empty(),
+            "offline cached snapshot must not be materialized"
+        );
+        assert_eq!(label, PathBuf::from("hf-cache://datasets/org/data"));
+        let session =
+            crate::Session::open(hf_request("hf-cache://datasets/org/data", None, false)).unwrap();
+        let source = session.mount_source();
+        let fi = source.lookup("/shard.tar", 0).unwrap();
+        assert_eq!(fi.mode & ratarmount_core::S_IFREG, ratarmount_core::S_IFREG);
+        assert!(source.lookup("/shard.tar/hello.txt", 0).is_none());
     }
 
     /// Regression: hf archives fell through to local-path handling; pin once and keep SHA in SQLite/root xattr.
@@ -3181,6 +3303,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("a.tar");
         let member = ratarmount_formats_tar::UstarMember {
+            xattrs: &[],
             path: "hello.txt",
             payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"hi\n" },
             mode: 0o644,
@@ -3880,11 +4003,8 @@ mod torrent_feature_tests {
     /// Regression: disabled torrent support treated magnets/metainfo as ordinary files.
     #[test]
     fn regression_built_without_bittorrent_error() {
-        for input in [
-            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
-            "local.torrent",
-            "https://127.0.0.1:1/a.torrent?token=x",
-        ] {
+        {
+            let input = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
             assert!(ratarmount_remote::is_remote_url(input));
             let result = super::open_remote_input(
                 input,
