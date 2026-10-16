@@ -2932,6 +2932,7 @@ version = "0.1.34"
 dependencies = [
  "clap",
  "env_logger",
+ "flate2",
  "git2",
  "libc",
  "log",
@@ -2968,6 +2969,7 @@ dependencies = [
  "ratarmount-sftp",
  "ratarmount-smb",
  "rusqlite",
+ "sha1 0.10.7",
  "tempfile",
  "url",
 ]

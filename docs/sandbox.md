@@ -111,3 +111,54 @@ Database files, SQLite sidecars, staging files using the internal database
 prefix, and current/legacy overlay markers are omitted at every depth.
 Statistics do not require or compare against the original archive; additions
 and modifications are consequently reported together.
+
+## diff
+
+Export an attempt's patch offline, without a mount or a Git executable:
+
+```sh
+ratarmount diff --base source.tar attempt-overlay > attempt.diff
+ratarmount diff --base repo.git attempt-overlay --git > attempt.patch
+ratarmount diff --base source.tar attempt-overlay --name-status
+ratarmount diff --base source.tar attempt-overlay --stat
+```
+
+`--base SOURCE` is required to generate an accurate patch: the overlay stores
+changed content and deletion records, but neither the original content nor its
+base location. SOURCE accepts the session factory's archives, committed Git
+repositories, folders and remote URLs. A working Git repository compares against
+its committed tree, including when its working tree has edits. Use the same base
+snapshot used for the attempt. The base and overlay contents remain read-only;
+archive indexes are built in memory. Stop writers first for a consistent view.
+
+The default is a deterministic unified diff with three context lines; `-U N`
+(`--context N`) changes the context. Additions/deletions use `/dev/null`, symlinks
+are compared as link-target text, and missing final newlines are marked.
+Binary data (NUL bytes or invalid UTF-8) prints `Binary files a/x and b/x differ`.
+New, deleted and changed modes are recorded, including mode-only changes.
+
+`--git` emits a [Git patch](https://git-scm.com/docs/diff-format) accepted by
+`git apply --check` / `git apply`: Git headers,
+executable modes, symlinks as mode `120000`, exact-content renames with similarity
+100%, and forward/reverse `GIT binary patch` literals (zlib + base85). Git modes
+record the owner executable bit, not other Unix permission changes. Type changes use
+a delete/add pair. Rename detection pairs deleted paths with new paths of the
+same type and identical bytes, in deterministic path order; other moves remain
+delete/add. Default unified output keeps delete/add records. `--name-status`
+prints `A`, `M`, `D`, `T` or `R100` with paths; `--stat` prints per-file line counts
+(byte sizes for binary changes) and totals. Both summaries detect exact renames
+and replace patch output; they cannot be combined with each other.
+Use `git apply --unidiff-zero` when applying a patch generated with `-U 0`.
+
+Internal database, marker and staging names are excluded using the overlay's
+shared path filter at every depth. `.git` directories, including synthetic-head
+metadata, are omitted by default; `--include-git-dir` includes them. Unchanged
+copy-up files are omitted. Git patches do not represent empty directories or
+directory permission changes. Unsupported special files and non-UTF-8 filenames
+produce an error. Content is held in memory; very large, unrelated text files
+may use a full replacement hunk to bound diff traceback storage.
+
+Exit status is **0** for no changes, **1** for changes, and **2** for an error
+(including missing/corrupt/locked databases or a missing `--base`). Redirecting
+stdout preserves a clean patch; source-opening progress goes to stderr. Harnesses
+should accept both 0 and 1 as successful comparisons.
