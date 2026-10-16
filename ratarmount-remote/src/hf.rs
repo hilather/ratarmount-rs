@@ -378,6 +378,7 @@ pub(crate) fn commit_test_repo(endpoint: &str, token: Option<&str>) -> HfRepo {
         commit: "a".repeat(40),
         config,
         files: Arc::default(),
+        hashes: Arc::default(),
     }
 }
 
