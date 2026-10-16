@@ -102,6 +102,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | VHDX fixed payload maps through BAT / nested no-tmp | `cargo test -p ratarmount-formats-vhd --lib vhdx` · `cargo test -p ratarmount-formats-vhd --lib open_from_reader` |
 | Connectix VHD footer current_size/disk_type +4 vs qemu-img | `cargo test -p ratarmount-formats-vhd --lib parse_footer_spec_offsets` |
 | VHDX non-zero LogGuid mounted without replay | `cargo test -p ratarmount-formats-vhd --lib log_guid` |
+| qemu-img 11 fixed VHDX rejected: packed metadata items and wrong metadata GUIDs | `cargo test -p ratarmount-formats-vhd --lib regression_qemu11_vhdx` · `cargo test -p ratarmount-formats-vhd --lib regression_vhdx_metadata` · `cargo test -p ratarmount-formats-vhd --lib qemu_img_fixed_vhdx_skip_if_missing` |
 | Nested VMDK KDMV sparse no-tmp / descriptor parse (F-8 crate) | `cargo test -p ratarmount-formats-vmdk --lib looks_like` · `cargo test -p ratarmount-formats-vmdk --lib descriptor` · `cargo test -p ratarmount-formats-vmdk --lib sparse` · `cargo test -p ratarmount-formats-vmdk --lib open_from_reader` |
 | VMDK compressed / ESXi grain residual | `cargo test -p ratarmount-formats-vmdk --lib residual` |
 | VMDK sidecar descriptor larger than 1 MiB fails closed | `cargo test -p ratarmount-formats-vmdk --lib oversized_sidecar` |
