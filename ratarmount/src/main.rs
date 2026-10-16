@@ -330,7 +330,8 @@ struct Args {
     /// window if rapidgzip is preferred (`--use-backend rapidgzip` or
     /// `RATARMOUNT_GZIP_BACKEND=rapidgzip`) **or** any mount input looks like a
     /// gzip archive (`.gz` / `.tgz` / `.tar.gz` / `.gzip`). Pass `--readahead 0`
-    /// to keep readahead off.
+    /// to keep readahead off. Torrent mounts also use BYTES for verified HTTP
+    /// piece prefetch; the swarm library has a separate fixed 32 MiB lookahead.
     #[arg(long = "readahead", default_value = "0", value_name = "BYTES")]
     readahead: String,
 
@@ -1309,6 +1310,9 @@ fn main() {
         ignore_zeros: args.ignore_zeros,
         gnu_incremental,
         parallelization,
+        readahead_bytes: parse_byte_size(&args.readahead)
+            .map(clamp_readahead)
+            .unwrap_or(0),
         index_minimum_file_count: args.index_minimum_file_count,
         index_file_path,
         index_in_memory,
@@ -3133,6 +3137,10 @@ fn print_features() {
     println!("  sftp-russh: compiled");
     #[cfg(not(feature = "sftp-russh"))]
     println!("  sftp-russh: not compiled");
+    #[cfg(feature = "bittorrent")]
+    println!("  bittorrent: compiled (magnet/.torrent; web seeds first; uploads disabled)");
+    #[cfg(not(feature = "bittorrent"))]
+    println!("  bittorrent: not compiled");
     println!(
         "  compress: gzip/bzip2/xz/zstd/lz4/lzip/lzo/Z/lzma/zlib seekable bodies; plain single-file materialize"
     );
@@ -3174,6 +3182,8 @@ fn print_oss_attributions(full: bool) {
         "regex / thiserror / anyhow / url / tempfile — utilities",
         "ureq / ssh2 / … — remote backends (http/s3/gs/az/ftp/ssh/oci/ipfs/rclone)",
         "nfsserve / tokio — in-process NFSv3 export (--nfs)",
+        #[cfg(feature = "bittorrent")]
+        "librqbit — torrent metadata and streaming (Apache-2.0; uploads disabled)",
         #[cfg(feature = "nfsv4")]
         "embednfs — in-process NFSv4.1 export (--nfs-vers 4) (MIT)",
         "httparse — HTTP/WebDAV export (--http / --webdav)",

@@ -393,6 +393,35 @@ pub struct HfRepo {
 }
 
 impl HfRepo {
+    /// Torrent verification shares the pinned tree API and Hub credential rules.
+    #[cfg(feature = "bittorrent")]
+    pub(crate) fn torrent_sha256s(&self) -> Result<BTreeMap<String, String>> {
+        let Some(tree) = self.tree()? else {
+            return Ok(BTreeMap::new());
+        };
+        let _ = HfListing::new(self.clone(), &tree)?;
+        Ok(self
+            .hashes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|((commit, _), _)| commit == &self.commit)
+            .map(|((_, path), hash)| (path.clone(), hash.clone()))
+            .collect())
+    }
+
+    #[cfg(feature = "bittorrent")]
+    pub(crate) fn torrent_http_auth(&self, url: &str) -> HttpAuthOptions {
+        let same_origin =
+            Url::parse(url).is_ok_and(|u| u.origin() == self.config.endpoint.origin());
+        HttpAuthOptions {
+            bearer_token: if same_origin {
+                self.config.token.clone()
+            } else {
+                None
+            },
+        }
+    }
     pub fn resolve(input: &str) -> Result<Self> {
         Self::with_config(parse_hf_url(input)?, Config::from_env()?)
     }

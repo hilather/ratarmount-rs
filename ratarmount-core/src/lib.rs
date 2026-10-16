@@ -510,6 +510,8 @@ pub struct OpenOptions {
     pub gnu_incremental: Option<bool>,
     /// Decompression parallelization matrix (Python `-P backend:n` / integer default).
     pub parallelization: ParallelizationSpec,
+    /// Remote torrent piece readahead in bytes (zero disables HTTP prefetch).
+    pub readahead_bytes: u64,
     /// Character encoding for TAR (and similar) member names (`-e` / `--encoding`).
     pub encoding: String,
     pub gzip_seek_point_spacing: u64,
@@ -551,6 +553,7 @@ impl Default for OpenOptions {
             ignore_zeros: false,
             gnu_incremental: None,
             parallelization: ParallelizationSpec::default(),
+            readahead_bytes: 0,
             encoding: "utf-8".into(),
             gzip_seek_point_spacing: 16 * 1024 * 1024,
             passwords: Vec::new(),
@@ -590,6 +593,7 @@ impl fmt::Debug for OpenOptions {
             .field("ignore_zeros", &self.ignore_zeros)
             .field("gnu_incremental", &self.gnu_incremental)
             .field("parallelization", &self.parallelization)
+            .field("readahead_bytes", &self.readahead_bytes)
             .field("encoding", &self.encoding)
             .field("gzip_seek_point_spacing", &self.gzip_seek_point_spacing)
             .field(

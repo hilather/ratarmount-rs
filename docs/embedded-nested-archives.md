@@ -294,6 +294,7 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | Nested format | No `/tmp`? | Random read? |
 |---------------|:----------:|:------------:|
 | `.tar` in ZIP/TAR/7z/`.tar.gz` | yes | yes |
+| `.tar` in a torrent (`bittorrent`) | yes (index metadata may use a tempfile) | yes, whole verified pieces |
 | `.tar.gz` in ZIP/TAR/7z | yes | yes (gzip seek) |
 | `.zip` / `.7z` in ZIP/TAR/7z | yes | yes* |
 | `.tar.zst` / `.tar.bz2` / `.tar.xz` nested | yes (if TAR body) | yes* |
@@ -306,3 +307,16 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | Solid multi-GB 7z outer | no tmp | often costly |
 
 \* Inner ZIP deflate / solid 7z have the usual decompress costs. **xz residual:** open/size is cheap with a Stream Index (footer-first range reads); any byte access still decompresses the covering **block**. Prefer `xz --block-size=…` / pixz for multi‑GiB random access. Default single-block maps stay seekable only when the unit is ≤ the ~256 MiB RAM cap; larger single-block falls through to full decode + temp spill (same cap as other codecs). Nested temp files are still avoided when the reader path succeeds.
+
+### Torrent parents (`bittorrent` feature)
+
+Torrent metadata exposes a lazy parent tree. With `-r`, reader-capable nested formats
+read through the torrent's seekable, piece-verified reader, including TAR shards
+without an archive-body tempfile. A sibling `.tar.index.ptr` or
+`.tar.index.sqlite` can provide the TAR index after pointer and archive
+fingerprint checks; only index metadata is materialized. Swarm transport uses
+separate transient piece scratch storage. See [BitTorrent sources](remote-bittorrent.md)
+for v2 swarm limits, verification, and cache behavior. Formats requiring a path
+keep the existing temporary-file fallback. The session regression
+`regression_torrent_nested_tar_and_sibling_indexes` covers the TAR reader and
+sibling-index paths without FUSE.

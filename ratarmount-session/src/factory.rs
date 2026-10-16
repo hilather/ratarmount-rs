@@ -4026,6 +4026,12 @@ fn apply_compositing(
     if comp.recursive {
         let opener = open_nested_fn(opts.clone());
         let reader_opener = open_nested_reader_fn(opts.clone());
+        #[cfg(feature = "bittorrent")]
+        let reader_opener = if archive_path.to_string_lossy().starts_with("torrent:") {
+            remote_open::torrent_nested_reader_fn(src.clone(), opts.clone())
+        } else {
+            reader_opener
+        };
         let depth = match opts.recursion_depth.unwrap_or(0) {
             d if d < 0 => 0,
             d => d as u32,

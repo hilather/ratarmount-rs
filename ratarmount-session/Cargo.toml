@@ -12,6 +12,7 @@ description = "In-process Session API for ratarmount-rs embedders (no FUSE)"
 # so in-tree nested factory tests still run. Probe order of enabled backends
 # stays DEFAULT_FORMAT_PROBE_ORDER (do not reorder).
 default = ["formats-all"]
+bittorrent = ["ratarmount-remote/bittorrent"]
 # Historical PR1/PR2 name; alias so `default = ["formats"]` still means full L2.
 formats = ["formats-all"]
 formats-all = [

@@ -29,6 +29,14 @@ const TOUCH_INTERVAL_NANOS: u64 = 5_000_000_000;
 /// not branch names. SHA-256 tokens additionally verify the assembled whole file.
 #[derive(Clone, Debug, Serialize)]
 pub enum ContentToken {
+    /// A complete piece verified against metainfo before publication. For v2,
+    /// `file` is the path in the file tree and `piece` is relative to that file.
+    TorrentPiece {
+        infohash: String,
+        file: Option<String>,
+        piece: u64,
+        size: u64,
+    },
     Sha256 {
         sha256: String,
         size: u64,
@@ -62,6 +70,7 @@ impl ContentToken {
         match self {
             Self::VerifiedSha256 { token, .. } => token.size(),
             Self::Sha256 { size, .. }
+            | Self::TorrentPiece { size, .. }
             | Self::HfCommitPath { size, .. }
             | Self::StrongEtag { size, .. }
             | Self::ObjectVersion { size, .. } => *size,
@@ -96,6 +105,7 @@ impl ContentToken {
 
     fn key(&self, chunk_size: u64) -> Option<String> {
         let valid = match self {
+            Self::TorrentPiece { infohash, .. } => is_hex(infohash, 40) || is_hex(infohash, 64),
             Self::VerifiedSha256 { token, sha256 } => {
                 is_hex(sha256, 64) && token.key(chunk_size).is_some()
             }
@@ -1121,6 +1131,28 @@ mod tests {
     }
 
     /// Regression: repeat range reads must survive reopening the disk cache.
+    /// Regression: torrent cache keys aliased different pieces or v2 file paths.
+    #[test]
+    fn regression_torrent_piece_content_token_isolation() {
+        let make = |hash: &str, file: Option<&str>, piece| ContentToken::TorrentPiece {
+            infohash: hash.into(),
+            file: file.map(str::to_owned),
+            piece,
+            size: 7,
+        };
+        let hash = "ab".repeat(20);
+        let key = make(&hash, None, 0).key(4096).unwrap();
+        assert_ne!(key, make(&hash, None, 1).key(4096).unwrap());
+        assert_ne!(key, make(&hash, Some("a"), 0).key(4096).unwrap());
+        assert_ne!(
+            make(&hash, Some("a"), 0).key(4096),
+            make(&hash, Some("b"), 0).key(4096)
+        );
+        assert_ne!(key, make(&"ab".repeat(32), None, 0).key(4096).unwrap());
+        assert!(make("not-an-infohash", None, 0).key(4096).is_none());
+        assert_eq!(make(&hash, None, 0).size(), 7);
+    }
+
     #[test]
     fn regression_range_cache_second_open_and_wrong_token() {
         let dir = tempfile::tempdir().unwrap();

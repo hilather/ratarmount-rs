@@ -327,7 +327,7 @@ impl HttpRangeSource {
             .all(|chunk| cache.contains(&token, chunk))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bittorrent"))]
     pub(crate) fn without_range_cache(mut self) -> Self {
         self.cache = None;
         self
@@ -413,7 +413,7 @@ impl HttpRangeSource {
         Ok(resp)
     }
 
-    fn request_with_timeout(
+    pub(crate) fn request_with_timeout(
         &self,
         method: &str,
         range: Option<(u64, u64)>,
