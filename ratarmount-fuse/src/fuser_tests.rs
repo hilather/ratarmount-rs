@@ -401,29 +401,44 @@ mod protocol {
         harness.finish();
     }
 
-    /// Regression: ABI 7.40 availability must not enable passthrough, larger I/O, or caching flags.
+    /// Regression: large sequential I/O requires MAX_PAGES; old kernels keep
+    /// 32 pages, and neither path changes passthrough or background queues.
     #[test]
     fn fuser_init_preserves_io_limits_without_passthrough() {
-        let max_io = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u32 } * 32;
-        for readahead in [0, 4096, max_io, max_io * 2] {
-            let harness = Harness::new(mount_config(false, ""), readahead);
-            let init = &harness.init[16..];
-            assert_eq!(u32_at(init, 0), 7);
-            assert!(u32_at(init, 4) >= 40);
-            assert_eq!(u32_at(init, 8), readahead.min(max_io));
-            let flags = u32_at(init, 12) as u64 | ((u32_at(init, 32) as u64) << 32);
-            assert_eq!(
-                InitFlags::from_bits_retain(flags),
-                InitFlags::FUSE_ASYNC_READ
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u32 };
+        for supported in [false, true] {
+            let pages = if supported { 256 } else { 32 };
+            let max_io = page_size * pages;
+            for readahead in [0, 4096, max_io, max_io * 2] {
+                let caps = if supported {
+                    InitFlags::all()
+                } else {
+                    InitFlags::all() & !InitFlags::FUSE_MAX_PAGES
+                };
+                let harness = Harness::with_capabilities(
+                    mount_config(false, ""),
+                    readahead,
+                    RatarmountFs::new(Arc::new(Source), None),
+                    caps,
+                );
+                let init = &harness.init[16..];
+                assert_eq!(u32_at(init, 0), 7);
+                assert!(u32_at(init, 4) >= 40);
+                assert_eq!(u32_at(init, 8), readahead.min(max_io));
+                let flags = u32_at(init, 12) as u64 | ((u32_at(init, 32) as u64) << 32);
+                let mut expected = InitFlags::FUSE_ASYNC_READ
                     | InitFlags::FUSE_BIG_WRITES
-                    | InitFlags::FUSE_MAX_PAGES
-                    | InitFlags::FUSE_INIT_EXT
-            );
-            assert_eq!(u32_at(init, 16), 12 | (9 << 16));
-            assert_eq!(u32_at(init, 20), max_io);
-            assert_eq!(u32_at(init, 28) & 0xffff, 32);
-            assert_eq!(u32_at(init, 36), 0); // max_stack_depth
-            harness.finish();
+                    | InitFlags::FUSE_INIT_EXT;
+                if supported {
+                    expected |= InitFlags::FUSE_MAX_PAGES;
+                }
+                assert_eq!(InitFlags::from_bits_retain(flags), expected);
+                assert_eq!(u32_at(init, 16), 12 | (9 << 16));
+                assert_eq!(u32_at(init, 20), max_io);
+                assert_eq!(u32_at(init, 28) & 0xffff, pages);
+                assert_eq!(u32_at(init, 36), 0); // max_stack_depth
+                harness.finish();
+            }
         }
     }
 

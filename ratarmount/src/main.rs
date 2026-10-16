@@ -19,7 +19,7 @@ use ratarmount_compress::{
 };
 use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
 use ratarmount_fuse::{
-    clamp_readahead, mount_blocking_with_passthrough as mount_blocking, parse_byte_size, unmount,
+    clamp_readahead, mount_blocking_with_io_options as mount_blocking, parse_byte_size, unmount,
     PassthroughMode, PassthroughOptions, RECOMMENDED_READAHEAD_BYTES,
 };
 use ratarmount_index::{
@@ -259,11 +259,11 @@ struct Args {
     ignore_zeros: bool,
 
     /// Parallelization matrix for decompressors.
-    /// Examples: `1` (default), `0` (all cores), `4`, `bzip2:4,gzip:2`, `:2,bzip2:4`
+    /// Default: min(available cores, 4). Examples: `1`, `0` (all cores), `4`, `bzip2:4,gzip:2`, `:2,bzip2:4`
     #[arg(
         short = 'P',
         long = "parallelization",
-        default_value = "1",
+        default_value_t = default_cli_parallelization(),
         value_name = "SPEC"
     )]
     parallelization: String,
@@ -332,9 +332,15 @@ struct Args {
     /// window if rapidgzip is preferred (`--use-backend rapidgzip` or
     /// `RATARMOUNT_GZIP_BACKEND=rapidgzip`) **or** any mount input looks like a
     /// gzip archive (`.gz` / `.tgz` / `.tar.gz` / `.gzip`). Pass `--readahead 0`
-    /// to keep readahead off.
+    /// to keep readahead off. For local zstd this flag also bounds speculative
+    /// decoded bytes; when omitted zstd uses a separate 16 MiB decode window.
     #[arg(long = "readahead", default_value = "0", value_name = "BYTES")]
     readahead: String,
+
+    /// Bypass FUSE's page cache for source members; overlay files keep normal caching.
+    /// Disables passthrough and advises eviction of consumed local zstd/TAR pages.
+    #[arg(long)]
+    direct_io: bool,
 
     /// Linux >= 6.9 FUSE passthrough: auto requires privileges and eligible sources; on probes support.
     #[arg(long, default_value = "auto", value_name = "auto|on|off")]
@@ -1376,6 +1382,15 @@ fn main() {
         ignore_zeros: args.ignore_zeros,
         gnu_incremental,
         parallelization,
+        direct_io: args.direct_io,
+        zstd_readahead_bytes: if readahead_flag_on_argv(std::env::args()) {
+            clamp_readahead(parse_byte_size(&args.readahead).unwrap_or_else(|e| {
+                eprintln!("error: invalid --readahead: {e}");
+                std::process::exit(2);
+            }))
+        } else {
+            16 * 1024 * 1024
+        },
         index_minimum_file_count: args.index_minimum_file_count,
         index_file_path,
         index_in_memory,
@@ -2656,6 +2671,7 @@ fn run_exports(
                     fuse_opts,
                     readahead,
                     passthrough,
+                    open_opts.direct_io,
                 );
                 nfs_stop.request_stop();
                 export_stop.request_stop();
@@ -2730,6 +2746,7 @@ fn run_exports(
                         fuse_opts,
                         readahead,
                         passthrough,
+                        open_opts.direct_io,
                     );
                     nfs_stop.request_stop();
                     export_stop.request_stop();
@@ -2888,6 +2905,7 @@ fn run_fuse_and_nfs(
             fuse_opts,
             readahead,
             passthrough,
+            open_opts.direct_io,
         );
         stop.request_stop();
         let _ = handle.join();
@@ -2960,6 +2978,7 @@ fn run_fuse_and_nfs(
                 fuse_opts,
                 readahead,
                 passthrough,
+                open_opts.direct_io,
             );
             stop.request_stop();
             let _ = handle.join();
@@ -3027,6 +3046,7 @@ fn run_fuse_only(
             fuse_opts,
             readahead,
             passthrough,
+            open_opts.direct_io,
         );
         finish_overlay_serve(overlay_arc, None, interval, commit_exit);
         if let Err(e) = mount_err {
@@ -3076,6 +3096,7 @@ fn run_fuse_only(
                 fuse_opts,
                 readahead,
                 passthrough,
+                open_opts.direct_io,
             );
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
@@ -3654,6 +3675,12 @@ fn default_mountpoint(archive: &Path) -> PathBuf {
     PathBuf::from(stem)
 }
 
+fn default_cli_parallelization() -> String {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get().min(4))
+        .to_string()
+}
+
 /// True when the user passed `--readahead` / `--readahead=…` on argv.
 ///
 /// Used to distinguish clap's default `"0"` from an explicit `--readahead 0`
@@ -3760,6 +3787,27 @@ mod mount_probe_tests {
 
 #[cfg(test)]
 mod readahead_auto_cli_tests {
+    /// Regression: direct-I/O is boolean and CLI parallelism is bounded by four CPUs.
+    #[test]
+    fn regression_direct_io_cli_and_parallelism_default() {
+        use clap::Parser;
+        let args =
+            super::Args::try_parse_from(["ratarmount", "--direct-io", "data.tar.zst", "/mnt"])
+                .unwrap();
+        assert!(args.direct_io);
+        assert_eq!(args.paths.len(), 2);
+        let n: usize = args.parallelization.parse().unwrap();
+        assert!((1..=4).contains(&n));
+        let args =
+            super::Args::try_parse_from(["ratarmount", "-P", "1", "data.tar.zst", "/mnt"]).unwrap();
+        assert_eq!(args.parallelization, "1");
+        assert!(!args.direct_io);
+        assert_eq!(
+            ratarmount_core::OpenOptions::default().parallelization,
+            ratarmount_core::ParallelizationSpec::default()
+        );
+    }
+
     use super::{
         name_looks_like_gzip, path_looks_like_gzip_archive, readahead_flag_on_argv,
         should_auto_readahead, RECOMMENDED_READAHEAD_BYTES,

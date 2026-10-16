@@ -24,7 +24,7 @@
 //!
 //! Thread hint (`open_seekable_zstd_with_threads` / Python `-P` zstd backend):
 //! * Multi-frame maps keep **per-frame** random access; frames are independent, so
-//!   concurrent readers already decode different frames without a shared lock.
+//!   sequential readers with `threads > 1` also use a bounded decode-ahead pool.
 //! * When falling back to a full single-buffer decode of multi-frame input and
 //!   `threads > 1`, frames are decompressed in parallel (the public `zstd` crate
 //!   exposes multi-thread **encode** via `zstdmt`/`NbWorkers`; frame-level
@@ -35,16 +35,71 @@
 //! * **Reader-based** — any `Read + Seek + Send` (e.g. HTTP Range / in-memory
 //!   `Cursor`); shared under a mutex so random Range reads drive frame decode.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc, Arc, Mutex,
+};
+
+#[path = "zstd_decode_ahead.rs"]
+mod decode_ahead;
+
+/// Per-reader decode-ahead and backing-page policy. One thread preserves serial reads.
+#[derive(Clone, Copy, Debug)]
+pub struct ZstdReadOptions {
+    pub threads: u32,
+    /// Speculative decoded-byte budget (clamped to 64 MiB); zero disables prefetch.
+    pub readahead_bytes: u64,
+    pub direct_io: bool,
+}
+
+impl Default for ZstdReadOptions {
+    fn default() -> Self {
+        Self {
+            threads: 1,
+            readahead_bytes: 16 * 1024 * 1024,
+            direct_io: false,
+        }
+    }
+}
 use std::thread;
 
 use ratarmount_core::ParallelizationSpec;
 
 use crate::seekable_body::{DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP};
 use crate::{CompressError, Result};
+
+/// Completed-reader counters. Take a difference around a workload after dropping its readers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ZstdDecodeStats {
+    pub prefetched: u64,
+    pub ready: u64,
+    pub waited: u64,
+    pub synchronous: u64,
+    pub synchronous_ns: u64,
+    pub wait_ns: u64,
+    pub reused: u64,
+}
+
+static DECODE_COUNTERS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+pub fn zstd_decode_stats() -> ZstdDecodeStats {
+    let values = DECODE_COUNTERS
+        .each_ref()
+        .map(|v| v.load(Ordering::Relaxed));
+    ZstdDecodeStats {
+        prefetched: values[0],
+        ready: values[1],
+        waited: values[2],
+        synchronous: values[3],
+        synchronous_ns: values[4],
+        wait_ns: values[5],
+        reused: values[6],
+    }
+}
 
 /// Open zstd as a seekable body (multi-frame map, seek table, or full decode).
 pub fn open_seekable_zstd(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
@@ -440,6 +495,7 @@ struct FrameInfo {
 }
 
 /// How compressed bytes are re-opened for independent frame readers.
+#[derive(Clone)]
 enum ZstdBackend {
     /// Local path: each reader opens its own `File`.
     Path(PathBuf),
@@ -475,6 +531,7 @@ pub struct SeekableZstd {
     /// Label for logs / index metadata (filesystem path, URL, or virtual name).
     path: PathBuf,
     backend: ZstdBackend,
+    options: ZstdReadOptions,
     frames: Vec<FrameInfo>,
     uncompressed_size: u64,
     /// When only one large frame (or scan failed), fall back to full decode.
@@ -496,8 +553,22 @@ impl SeekableZstd {
         path: impl AsRef<Path>,
         threads: u32,
     ) -> Result<Arc<dyn SeekableBody>> {
+        Self::open_with_options(
+            path,
+            ZstdReadOptions {
+                threads,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        options: ZstdReadOptions,
+    ) -> Result<Arc<dyn SeekableBody>> {
         let path = path.as_ref().to_path_buf();
-        let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        let threads = ParallelizationSpec::resolve_zero(options.threads).max(1);
+        let options = ZstdReadOptions { threads, ..options };
         let mut file = File::open(&path)?;
         match classify_zstd(&mut file, threads)? {
             ZstdPlan::Mapped {
@@ -507,6 +578,7 @@ impl SeekableZstd {
             } => Ok(Arc::new(Self {
                 path: path.clone(),
                 backend: ZstdBackend::Path(path),
+                options,
                 frames,
                 uncompressed_size,
                 fallback: None,
@@ -550,6 +622,10 @@ impl SeekableZstd {
                 Ok(Arc::new(Self {
                     path,
                     backend: ZstdBackend::Shared(shared),
+                    options: ZstdReadOptions {
+                        threads,
+                        ..Default::default()
+                    },
                     frames,
                     uncompressed_size,
                     fallback: None,
@@ -564,15 +640,33 @@ impl SeekableZstd {
     ///
     /// `blocks` are `(blockoffset, dataoffset)` = `(compressed_offset, uncompressed_offset)`
     /// pairs; the last entry is the EOF sentinel (totals). See module docs.
-    /// `threads` is accepted for API parity with other openers (`0` → CPU count);
+    /// `threads > 1` enables bounded sequential decode-ahead (`0` → CPU count);
     /// random access remains per-frame.
     pub fn open_with_zstd_blocks(
         path: impl AsRef<Path>,
         threads: u32,
         blocks: &[(u64, u64)],
     ) -> Result<Arc<Self>> {
+        Self::open_with_zstd_blocks_options(
+            path,
+            ZstdReadOptions {
+                threads,
+                ..Default::default()
+            },
+            blocks,
+        )
+    }
+
+    pub fn open_with_zstd_blocks_options(
+        path: impl AsRef<Path>,
+        options: ZstdReadOptions,
+        blocks: &[(u64, u64)],
+    ) -> Result<Arc<Self>> {
         let path = path.as_ref().to_path_buf();
-        let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        let options = ZstdReadOptions {
+            threads: ParallelizationSpec::resolve_zero(options.threads).max(1),
+            ..options
+        };
         let (frames, uncompressed_size) = frames_from_zstd_blocks(blocks)?;
         // Best-effort bounds check against file length when available.
         if let Ok(meta) = std::fs::metadata(&path) {
@@ -589,6 +683,7 @@ impl SeekableZstd {
         Ok(Arc::new(Self {
             path: path.clone(),
             backend: ZstdBackend::Path(path),
+            options,
             frames,
             uncompressed_size,
             fallback: None,
@@ -609,12 +704,16 @@ impl SeekableZstd {
         R: Read + Seek + Send + 'static,
     {
         let path = archive_label.as_ref().to_path_buf();
-        let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        let threads = ParallelizationSpec::resolve_zero(threads).max(1);
         let (frames, uncompressed_size) = frames_from_zstd_blocks(blocks)?;
         let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
         Ok(Arc::new(Self {
             path,
             backend: ZstdBackend::Shared(shared),
+            options: ZstdReadOptions {
+                threads,
+                ..Default::default()
+            },
             frames,
             uncompressed_size,
             fallback: None,
@@ -963,41 +1062,295 @@ impl Seek for CompressedHandle {
     }
 }
 
+#[derive(Debug)]
+struct Reservation {
+    used: Arc<AtomicU64>,
+    slots: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.slots.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct PendingFrame {
+    index: usize,
+    result: mpsc::Receiver<(io::Result<Vec<u8>>, Reservation)>,
+}
+
 struct ZstdFrameReader {
     backend: ZstdBackend,
     frames: Vec<FrameInfo>,
+    options: ZstdReadOptions,
     size: u64,
     pos: u64,
-    /// Cached decompressed frame.
     frame_idx: Option<usize>,
     frame_data: Vec<u8>,
     frame_start: u64,
+    progress: u64,
+    bytes_read: u64,
+    stats: ZstdDecodeStats,
+    pending: VecDeque<PendingFrame>,
+    cancelled: Arc<AtomicBool>,
+    reserved: Arc<AtomicU64>,
+    reserved_slots: Arc<AtomicU64>,
+    #[cfg(test)]
+    decode_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl ZstdBackend {
+    fn open_compressed(&self) -> io::Result<CompressedHandle> {
+        match self {
+            Self::Path(p) => Ok(CompressedHandle::File(File::open(p)?)),
+            Self::Shared(shared) => Ok(CompressedHandle::Shared {
+                inner: Arc::clone(shared),
+                pos: 0,
+            }),
+        }
+    }
+}
+
+/// Advisory only: unsupported descriptors/platforms leave reads unchanged.
+fn advise(file: &CompressedHandle, offset: u64, len: u64, sequential: bool) {
+    #[cfg(target_os = "linux")]
+    if let CompressedHandle::File(file) = file {
+        use std::os::fd::AsRawFd;
+        if let (Ok(offset), Ok(len)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len)) {
+            // SAFETY: this File owns a live descriptor; advice never changes file contents.
+            unsafe {
+                libc::posix_fadvise(
+                    file.as_raw_fd(),
+                    offset,
+                    len,
+                    if sequential {
+                        libc::POSIX_FADV_SEQUENTIAL
+                    } else {
+                        libc::POSIX_FADV_DONTNEED
+                    },
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, offset, len, sequential);
+}
+
+fn decode_frame(
+    backend: &ZstdBackend,
+    info: &FrameInfo,
+    expected: u64,
+    sequential: bool,
+    direct_io: bool,
+    mut data: Vec<u8>,
+) -> io::Result<Vec<u8>> {
+    let mut file = backend.open_compressed()?;
+    if sequential {
+        advise(&file, 0, 0, true);
+    }
+    file.seek(SeekFrom::Start(info.compressed_offset))?;
+    // Streaming input avoids retaining a second frame-sized compressed buffer.
+    let input = (&mut file).take(info.compressed_size.unwrap_or(u64::MAX));
+    let mut decoder = zstd::stream::read::Decoder::new(input)?.single_frame();
+    let len = usize::try_from(expected).map_err(|_| io::Error::other("zstd frame too large"))?;
+    if data.capacity() < len {
+        data.try_reserve_exact(len - data.len())
+            .map_err(io::Error::other)?;
+    }
+    data.resize(len, 0);
+    decoder.read_exact(&mut data)?;
+    if decoder.read(&mut [0u8; 1])? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zstd frame size differs from frame map",
+        ));
+    }
+    if direct_io {
+        if let Some(len) = info.compressed_size {
+            if len != 0 {
+                advise(&file, info.compressed_offset, len, false);
+            }
+        }
+    }
+    Ok(data)
 }
 
 impl ZstdFrameReader {
     fn open(z: &SeekableZstd) -> io::Result<Self> {
-        let backend = match &z.backend {
-            ZstdBackend::Path(p) => ZstdBackend::Path(p.clone()),
-            ZstdBackend::Shared(shared) => ZstdBackend::Shared(Arc::clone(shared)),
-        };
         Ok(Self {
-            backend,
+            backend: z.backend.clone(),
             frames: z.frames.clone(),
+            options: z.options,
             size: z.uncompressed_size,
             pos: 0,
             frame_idx: None,
             frame_data: Vec::new(),
             frame_start: 0,
+            progress: 0,
+            bytes_read: 0,
+            stats: ZstdDecodeStats::default(),
+            pending: VecDeque::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            reserved: Arc::new(AtomicU64::new(0)),
+            reserved_slots: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            decode_hook: None,
         })
     }
 
-    fn open_compressed(&self) -> io::Result<CompressedHandle> {
-        match &self.backend {
-            ZstdBackend::Path(p) => Ok(CompressedHandle::File(File::open(p)?)),
-            ZstdBackend::Shared(shared) => Ok(CompressedHandle::Shared {
-                inner: Arc::clone(shared),
-                pos: 0,
-            }),
+    fn frame_size(&self, index: usize) -> u64 {
+        self.frames
+            .get(index + 1)
+            .map_or(self.size, |f| f.uncompressed_offset)
+            - self.frames[index].uncompressed_offset
+    }
+
+    fn cancel(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.pending.clear();
+        self.cancelled = Arc::new(AtomicBool::new(false));
+        self.progress = 0;
+    }
+
+    fn reserve_frame(&self, bytes: u64, budget: u64) -> Option<Reservation> {
+        self.reserved_slots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
+                (slots < u64::from(self.options.threads.min(16))).then_some(slots + 1)
+            })
+            .ok()?;
+        if self
+            .reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|&total| total <= budget)
+            })
+            .is_err()
+        {
+            self.reserved_slots.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Reservation {
+            used: Arc::clone(&self.reserved),
+            slots: Arc::clone(&self.reserved_slots),
+            bytes,
+        })
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn compressed_prefetch_range(&self, next: usize, budget: u64) -> Option<(u64, u64)> {
+        let slots = u64::from(self.options.threads.min(16))
+            .saturating_sub(self.reserved_slots.load(Ordering::Acquire))
+            as usize;
+        let mut remaining = budget.saturating_sub(self.reserved.load(Ordering::Acquire));
+        let start = self.frames.get(next)?.compressed_offset;
+        let mut end = start;
+        for index in next..self.frames.len().min(next + slots) {
+            let size = self.frame_size(index);
+            if size == 0 || size > remaining {
+                break;
+            }
+            let Some(frame_end) = self.frames[index]
+                .compressed_size
+                .and_then(|size| self.frames[index].compressed_offset.checked_add(size))
+            else {
+                break;
+            };
+            remaining -= size;
+            end = frame_end;
+        }
+        let len = end.saturating_sub(start).min(64 * 1024 * 1024);
+        (len != 0).then_some((start, len))
+    }
+
+    fn prefetch(&mut self, mut reusable: Vec<u8>) {
+        if self.options.threads <= 1
+            || self.options.readahead_bytes == 0
+            || self.progress < 128 * 1024
+        {
+            return;
+        }
+        let Some(current) = self.frame_idx else {
+            return;
+        };
+        let budget = self.options.readahead_bytes.min(64 * 1024 * 1024);
+        let mut next = self.pending.back().map_or(current + 1, |p| p.index + 1);
+        // Queue contiguous disk I/O before workers race to decode independent
+        // frames. Independent FD readahead otherwise follows worker order,
+        // causing cold sequential reads to behave like scattered small reads.
+        #[cfg(target_os = "linux")]
+        if let ZstdBackend::Path(path) = &self.backend {
+            if let Some((offset, len)) = self.compressed_prefetch_range(next, budget) {
+                if let (Ok(file), Ok(offset), Ok(len)) = (
+                    File::open(path),
+                    libc::off_t::try_from(offset),
+                    libc::off_t::try_from(len),
+                ) {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: owned live fd and checked nonnegative range.
+                    unsafe {
+                        libc::posix_fadvise(
+                            file.as_raw_fd(),
+                            offset,
+                            len,
+                            libc::POSIX_FADV_WILLNEED,
+                        );
+                    }
+                }
+            }
+        }
+        while next < self.frames.len()
+            && self.pending.len() < (self.options.threads as usize).min(16)
+        {
+            let bytes = self.frame_size(next);
+            // A frame larger than the budget stays on the synchronous path.
+            if bytes == 0 || bytes > budget {
+                break;
+            }
+            let Some(reservation) = self.reserve_frame(bytes, budget) else {
+                break;
+            };
+            // Hand the consumed buffer back to a decoder. Repeated allocation,
+            // zero-fill and cross-thread frees otherwise cost more than decoding
+            // cheap frames. Oversized buffers cannot escape the reservation cap.
+            let buffer = if reusable.capacity() as u64 == bytes {
+                self.stats.reused += 1;
+                std::mem::take(&mut reusable)
+            } else {
+                Vec::new()
+            };
+            let (tx, result) = mpsc::channel();
+            let backend = self.backend.clone();
+            let info = self.frames[next].clone();
+            let cancelled = Arc::clone(&self.cancelled);
+            let direct_io = self.options.direct_io;
+            #[cfg(test)]
+            let hook = self.decode_hook.clone();
+            if !decode_ahead::submit(
+                self.options.threads,
+                Box::new(move || {
+                    if cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                    if cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let data = decode_frame(&backend, &info, bytes, true, direct_io, buffer);
+                    let _ = tx.send((data, reservation));
+                }),
+            ) {
+                break;
+            }
+            self.stats.prefetched += 1;
+            self.pending.push_back(PendingFrame {
+                index: next,
+                result,
+            });
+            next += 1;
         }
     }
 
@@ -1005,45 +1358,84 @@ impl ZstdFrameReader {
         if target >= self.size {
             return Ok(());
         }
-        // Already have covering frame?
-        if let Some(_i) = self.frame_idx {
-            let start = self.frame_start;
-            let end = start + self.frame_data.len() as u64;
-            if target >= start && target < end {
-                return Ok(());
-            }
+        if self.frame_idx.is_some()
+            && target >= self.frame_start
+            && target < self.frame_start + self.frame_data.len() as u64
+        {
+            return Ok(());
         }
-        let mut best = 0usize;
-        for (i, f) in self.frames.iter().enumerate() {
-            if f.uncompressed_offset <= target {
-                best = i;
-            } else {
-                break;
-            }
-        }
-        let info = &self.frames[best];
-        let mut file = self.open_compressed()?;
-        file.seek(SeekFrom::Start(info.compressed_offset))?;
-        // Limit reader to this frame's compressed bytes when known — never decode the whole file.
-        let mut data = Vec::new();
-        if let Some(csz) = info.compressed_size {
-            // Copy compressed frame under the (optional) shared lock, then decode.
-            let mut compressed = vec![0u8; csz as usize];
-            file.read_exact(&mut compressed)?;
-            drop(file);
-            let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            decoder.read_to_end(&mut data)?;
+        let best = self
+            .frames
+            .partition_point(|f| f.uncompressed_offset <= target)
+            .saturating_sub(1);
+        let prefetched = if self.pending.front().is_some_and(|p| p.index == best) {
+            // Only the frame at the requested offset can deliver an error. Retry a
+            // failed speculative decode synchronously (transient I/O may recover).
+            let pending = self.pending.pop_front().unwrap();
+            let result = match pending.result.try_recv() {
+                Ok(value) => {
+                    self.stats.ready += 1;
+                    Some(value)
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.stats.waited += 1;
+                    let start = std::time::Instant::now();
+                    let value = pending.result.recv().ok();
+                    self.stats.wait_ns += start.elapsed().as_nanos() as u64;
+                    value
+                }
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            };
+            result.and_then(|(data, _reservation)| data.ok())
         } else {
-            let mut decoder = zstd::stream::read::Decoder::new(file)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                .single_frame();
-            decoder.read_to_end(&mut data)?;
-        }
+            None
+        };
+        let mut reusable = std::mem::take(&mut self.frame_data);
+        self.frame_data = match prefetched {
+            Some(data) => data,
+            None => {
+                self.stats.synchronous += 1;
+                let start = std::time::Instant::now();
+                let result = decode_frame(
+                    &self.backend,
+                    &self.frames[best],
+                    self.frame_size(best),
+                    self.options.threads > 1
+                        && self.options.readahead_bytes > 0
+                        && self.progress >= 128 * 1024,
+                    self.options.direct_io,
+                    std::mem::take(&mut reusable),
+                );
+                self.stats.synchronous_ns += start.elapsed().as_nanos() as u64;
+                result?
+            }
+        };
         self.frame_idx = Some(best);
-        self.frame_start = info.uncompressed_offset;
-        self.frame_data = data;
+        self.frame_start = self.frames[best].uncompressed_offset;
+        self.prefetch(reusable);
         Ok(())
+    }
+}
+
+impl Drop for ZstdFrameReader {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        let stats = self.stats;
+        for (counter, value) in DECODE_COUNTERS.iter().zip([
+            stats.prefetched,
+            stats.ready,
+            stats.waited,
+            stats.synchronous,
+            stats.synchronous_ns,
+            stats.wait_ns,
+            stats.reused,
+        ]) {
+            counter.fetch_add(value, Ordering::Relaxed);
+        }
+        if self.bytes_read != 0 {
+            log::info!("zstd-read-summary bytes={} prefetched={} ready={} waited={} synchronous={} synchronous_ns={} wait_ns={} reused={}",
+                self.bytes_read, stats.prefetched, stats.ready, stats.waited, stats.synchronous, stats.synchronous_ns, stats.wait_ns, stats.reused);
+        }
     }
 }
 
@@ -1054,12 +1446,12 @@ impl Read for ZstdFrameReader {
         }
         self.ensure_frame(self.pos)?;
         let into = (self.pos - self.frame_start) as usize;
-        if into >= self.frame_data.len() {
-            return Ok(0);
-        }
         let n = (self.frame_data.len() - into).min(buf.len());
         buf[..n].copy_from_slice(&self.frame_data[into..into + n]);
         self.pos += n as u64;
+        self.progress = self.progress.saturating_add(n as u64);
+        self.bytes_read += n as u64;
+        self.prefetch(Vec::new());
         Ok(n)
     }
 }
@@ -1067,17 +1459,21 @@ impl Read for ZstdFrameReader {
 impl Seek for ZstdFrameReader {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let new = match pos {
-            SeekFrom::Start(o) => o as i64,
-            SeekFrom::End(o) => self.size as i64 + o,
-            SeekFrom::Current(o) => self.pos as i64 + o,
-        };
-        if new < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek before start",
-            ));
+            SeekFrom::Start(o) => Some(o),
+            SeekFrom::End(o) => self.size.checked_add_signed(o),
+            SeekFrom::Current(o) => self.pos.checked_add_signed(o),
         }
-        self.pos = new as u64;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek outside stream address range",
+            )
+        })?;
+        // StenciledFile seeks to the current offset before every read.
+        if new != self.pos {
+            self.cancel();
+        }
+        self.pos = new;
         Ok(self.pos)
     }
 }
@@ -1329,6 +1725,331 @@ mod tests {
         let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
         enc.write_all(part).unwrap();
         enc.finish().unwrap()
+    }
+
+    fn ahead_fixture(threads: u32, budget: u64) -> (tempfile::TempDir, ZstdFrameReader, Vec<u8>) {
+        ahead_fixture_with_frame_size(threads, budget, 128 * 1024)
+    }
+
+    fn ahead_fixture_with_frame_size(
+        threads: u32,
+        budget: u64,
+        frame_size: usize,
+    ) -> (tempfile::TempDir, ZstdFrameReader, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ahead.zst");
+        let data: Vec<u8> = (0..2 * 1024 * 1024)
+            .map(|i| ((i * 31 + i / 997) % 251) as u8)
+            .collect();
+        let mut file = File::create(&path).unwrap();
+        let mut blocks = Vec::new();
+        let mut compressed_offset = 0;
+        for (i, part) in data.chunks(frame_size).enumerate() {
+            blocks.push((compressed_offset, (i * frame_size) as u64));
+            let compressed = encode_frame(part);
+            file.write_all(&compressed).unwrap();
+            compressed_offset += compressed.len() as u64;
+        }
+        blocks.push((compressed_offset, data.len() as u64));
+        let body = SeekableZstd::open_with_zstd_blocks_options(
+            &path,
+            ZstdReadOptions {
+                threads,
+                readahead_bytes: budget,
+                direct_io: true,
+            },
+            &blocks,
+        )
+        .unwrap();
+        (dir, ZstdFrameReader::open(&body).unwrap(), data)
+    }
+
+    /// Regression: sequential parallel reads must recycle consumed frame buffers
+    /// instead of allocating/zeroing and freeing a frame on every handoff.
+    #[test]
+    fn regression_decode_ahead_recycles_consumed_buffers() {
+        let (_dir, mut reader, data) = ahead_fixture(4, 512 * 1024);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+        assert!(reader.stats.reused >= 10, "{:?}", reader.stats);
+        assert!(reader.reserved.load(Ordering::Acquire) <= 512 * 1024);
+    }
+
+    /// Regression: cold parallel reads must request contiguous backing ranges
+    /// within the available window, never an unbounded len=0 (through EOF) hint.
+    #[test]
+    fn regression_decode_ahead_cold_io_hints_follow_bounded_frame_order() {
+        let (_dir, reader, _) = ahead_fixture(4, 256 * 1024);
+        assert_eq!(
+            reader.compressed_prefetch_range(1, 256 * 1024),
+            Some((
+                reader.frames[1].compressed_offset,
+                reader.frames[3].compressed_offset - reader.frames[1].compressed_offset
+            ))
+        );
+        let reservation = reader.reserve_frame(128 * 1024, 256 * 1024).unwrap();
+        assert_eq!(
+            reader.compressed_prefetch_range(1, 256 * 1024),
+            Some((
+                reader.frames[1].compressed_offset,
+                reader.frames[1].compressed_size.unwrap()
+            ))
+        );
+        assert_eq!(reader.compressed_prefetch_range(1, 0), None);
+        assert_eq!(
+            reader.compressed_prefetch_range(reader.frames.len(), 256 * 1024),
+            None
+        );
+        drop(reservation);
+        let mut reader = reader;
+        reader.frames[1].compressed_size = Some(0);
+        assert_eq!(reader.compressed_prefetch_range(1, 128 * 1024), None);
+    }
+
+    /// Regression: FUSE's 128 KiB reads and same-position seeks must keep
+    /// decode-ahead active, with completed frames consumed without waiting.
+    #[test]
+    fn regression_decode_ahead_128k_requests_keep_ready_frames() {
+        let (_dir, mut reader, data) =
+            ahead_fixture_with_frame_size(4, 4 * 1024 * 1024, 1024 * 1024);
+        let mut buffer = vec![0; 128 * 1024];
+        reader.read_exact(&mut buffer).unwrap();
+        assert_eq!(buffer, data[..buffer.len()]);
+        assert_eq!(reader.stats.prefetched, 1);
+        // Choose a deterministic consumer schedule: let the real worker finish
+        // while the consumer is still inside frame 0. Requeue its result so the
+        // normal try_recv path, rather than wall-clock timing, is asserted.
+        let result = reader.pending[0]
+            .result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
+        reader.pending[0].result = rx;
+        for offset in (buffer.len()..data.len()).step_by(buffer.len()) {
+            reader.seek(SeekFrom::Start(offset as u64)).unwrap();
+            assert!(!reader.cancelled.load(Ordering::Acquire));
+            reader.read_exact(&mut buffer).unwrap();
+            assert_eq!(buffer, data[offset..offset + buffer.len()]);
+        }
+        assert_eq!(reader.stats.synchronous, 1);
+        assert_eq!(reader.stats.ready, 1);
+        assert_eq!(reader.stats.waited, 0);
+        assert_eq!(reader.read(&mut buffer).unwrap(), 0);
+    }
+
+    /// Regression: decode-ahead must preserve bytes across frames, nontrivial seeks and EOF.
+    #[test]
+    fn regression_decode_ahead_seek_boundaries_and_eof() {
+        let (_dir, mut reader, data) = ahead_fixture(4, 512 * 1024);
+        let mut prefix = vec![0; 700_001];
+        reader.read_exact(&mut prefix).unwrap();
+        assert_eq!(prefix, data[..prefix.len()]);
+        for offset in [17, 1_111_117, 900_013, 0] {
+            reader.seek(SeekFrom::Start(offset)).unwrap();
+            let mut got = vec![0; 300_007];
+            reader.read_exact(&mut got).unwrap();
+            assert_eq!(got, data[offset as usize..offset as usize + got.len()]);
+        }
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, data[300_007..]);
+        assert_eq!(reader.read(&mut [0; 10]).unwrap(), 0);
+        reader.seek(SeekFrom::End(99)).unwrap();
+        assert_eq!(reader.read(&mut [0; 10]).unwrap(), 0);
+    }
+
+    /// Regression: overflowing relative seeks must return an error, not panic or wrap.
+    #[test]
+    fn regression_decode_ahead_seek_overflow_returns_error() {
+        let (_dir, mut reader, _) = ahead_fixture(4, 512 * 1024);
+        assert_eq!(reader.seek(SeekFrom::Start(u64::MAX)).unwrap(), u64::MAX);
+        assert!(reader.seek(SeekFrom::Current(1)).is_err());
+        assert_eq!(reader.pos, u64::MAX);
+        assert!(reader.seek(SeekFrom::End(i64::MIN)).is_err());
+    }
+
+    /// Regression: a forged frame size must not grow a speculative output past its reservation.
+    #[test]
+    fn regression_decode_ahead_wrong_frame_size_returns_error() {
+        let (_dir, mut reader, _) = ahead_fixture(4, 512 * 1024);
+        reader.frames[1].uncompressed_offset -= 1;
+        assert_eq!(
+            reader.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(reader.pos, 0);
+    }
+
+    /// Regression: cold scanned maps and shared-reader maps must also use correct decode-ahead bytes.
+    #[test]
+    fn regression_decode_ahead_scanned_and_shared_maps() {
+        let (dir, _reader, data) = ahead_fixture(4, 512 * 1024);
+        let path = dir.path().join("ahead.zst");
+        let body = SeekableZstd::open_with_options(
+            &path,
+            ZstdReadOptions {
+                threads: 4,
+                readahead_bytes: 512 * 1024,
+                direct_io: true,
+            },
+        )
+        .unwrap();
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+        let body = SeekableZstd::open_with_threads_from_reader(
+            std::io::Cursor::new(std::fs::read(path).unwrap()),
+            4,
+            "shared.zst",
+        )
+        .unwrap();
+        got.clear();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+    }
+
+    /// Regression: serial library defaults and random reads must not submit work.
+    #[test]
+    fn regression_decode_ahead_serial_and_random_no_workers() {
+        let (_dir, mut serial, data) = ahead_fixture(1, 512 * 1024);
+        serial.decode_hook = Some(Arc::new(|| panic!("serial reader scheduled a worker")));
+        let mut got = Vec::new();
+        serial.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+        assert!(serial.pending.is_empty());
+        assert_eq!(serial.reserved.load(Ordering::Acquire), 0);
+        assert_eq!(ZstdReadOptions::default().threads, 1);
+        let (_dir2, mut random, _) = ahead_fixture(4, 512 * 1024);
+        for offset in [0, 500_000, 7, 800_000] {
+            random.seek(SeekFrom::Start(offset)).unwrap();
+            random.read_exact(&mut [0; 4096]).unwrap();
+            assert!(random.pending.is_empty());
+        }
+        random.options.readahead_bytes = 0;
+        random.read_to_end(&mut Vec::new()).unwrap();
+        assert!(random.pending.is_empty());
+    }
+
+    /// Regression: workers must overlap; seek cannot join blocked decoders or reset their budget.
+    #[test]
+    fn regression_decode_ahead_concurrent_cancel_and_memory_bound() {
+        use std::sync::Condvar;
+        use std::time::{Duration, Instant};
+        let (_dir, mut reader, _) = ahead_fixture(4, 256 * 1024);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (tx, rx) = mpsc::channel();
+        let active = Arc::new(AtomicU64::new(0));
+        let peak = Arc::new(AtomicU64::new(0));
+        let g = Arc::clone(&gate);
+        let a = Arc::clone(&active);
+        let p = Arc::clone(&peak);
+        reader.decode_hook = Some(Arc::new(move || {
+            let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+            p.fetch_max(now, Ordering::SeqCst);
+            tx.send(()).unwrap();
+            let (lock, cv) = &*g;
+            let _guard = cv
+                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |released| {
+                    !*released
+                })
+                .unwrap();
+            a.fetch_sub(1, Ordering::SeqCst);
+        }));
+        reader.read_exact(&mut vec![0; 128 * 1024]).unwrap();
+        let first = rx.recv_timeout(Duration::from_secs(5));
+        let second = rx.recv_timeout(Duration::from_secs(5));
+        let before = Instant::now();
+        reader.seek(SeekFrom::Start(7)).unwrap();
+        let elapsed = before.elapsed();
+        let held = reader.reserved.load(Ordering::Acquire);
+        // A new sequential run cannot allocate over reservations held by cancelled jobs.
+        reader.read_exact(&mut vec![0; 128 * 1024]).unwrap();
+        let after = reader.reserved.load(Ordering::Acquire);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(first.is_ok() && second.is_ok(), "two workers did not start");
+        assert!(peak.load(Ordering::SeqCst) >= 2);
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "seek waited {elapsed:?}"
+        );
+        assert_eq!(held, 256 * 1024);
+        assert!(after <= 256 * 1024);
+        assert!(reader.pending.is_empty());
+    }
+
+    /// Regression: variable-size frames and cancelled generations share byte/slot limits.
+    #[test]
+    fn regression_decode_ahead_variable_sizes_and_sixteen_slot_limit() {
+        let (_dir, mut reader, _) = ahead_fixture(32, 1024);
+        let a = reader.reserve_frame(700, 1024).unwrap();
+        assert!(reader.reserve_frame(400, 1024).is_none());
+        let b = reader.reserve_frame(324, 1024).unwrap();
+        reader.cancel();
+        assert!(reader.reserve_frame(1, 1024).is_none());
+        assert_eq!(reader.reserved_slots.load(Ordering::Acquire), 2);
+        drop((a, b));
+        let held: Vec<_> = (0..16)
+            .map(|_| reader.reserve_frame(1, 1024).unwrap())
+            .collect();
+        assert!(reader.reserve_frame(1, 1024).is_none());
+        drop(held);
+        assert_eq!(reader.reserved.load(Ordering::Acquire), 0);
+        assert_eq!(reader.reserved_slots.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression: a frame larger than the window must not exceed the speculative budget.
+    #[test]
+    fn regression_decode_ahead_oversize_frame_stays_serial() {
+        let (_dir, mut reader, data) = ahead_fixture(4, 64 * 1024);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+        assert!(reader.pending.is_empty());
+        assert_eq!(reader.reserved.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression: speculative failures surface only at their frame and retry synchronously.
+    #[test]
+    fn regression_decode_ahead_error_at_requested_offset_and_retry() {
+        let (_dir, mut reader, data) = ahead_fixture(4, 512 * 1024);
+        reader.read_exact(&mut vec![0; 128 * 1024]).unwrap();
+        for pending in reader.pending.drain(..) {
+            drop(pending.result.recv().unwrap());
+        }
+        reader.cancel();
+        let (tx, result) = mpsc::channel();
+        reader.reserved.store(1, Ordering::Release);
+        reader.reserved_slots.store(1, Ordering::Release);
+        tx.send((
+            Err(io::Error::other("transient prefetch error")),
+            Reservation {
+                used: reader.reserved.clone(),
+                slots: reader.reserved_slots.clone(),
+                bytes: 1,
+            },
+        ))
+        .unwrap();
+        reader.pending.push_back(PendingFrame { index: 1, result });
+        let mut got = vec![0; 128 * 1024];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, data[128 * 1024..256 * 1024]);
+        reader.cancel();
+        // Corrupt a later frame on disk; earlier valid bytes must still be returned.
+        let ZstdBackend::Path(path) = &reader.backend else {
+            unreachable!()
+        };
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(reader.frames[3].compressed_offset))
+            .unwrap();
+        file.write_all(&[0; 4]).unwrap();
+        reader.seek(SeekFrom::Start(256 * 1024)).unwrap();
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, data[256 * 1024..384 * 1024]);
+        assert!(reader.read(&mut got).is_err());
+        assert_eq!(reader.pos, 384 * 1024);
     }
 
     #[test]

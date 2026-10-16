@@ -107,7 +107,7 @@ pub use zstd_seek::{
     open_seekable_zstd_from_reader, open_seekable_zstd_with_threads,
     open_seekable_zstd_with_threads_from_reader, open_seekable_zstd_with_zstd_blocks,
     open_seekable_zstd_with_zstd_blocks_from_reader, scan_zstd_frames, scan_zstd_frames_path,
-    SeekableZstd, ZstdFrameInfo, ZstdFrameMap,
+    zstd_decode_stats, SeekableZstd, ZstdDecodeStats, ZstdFrameInfo, ZstdFrameMap, ZstdReadOptions,
 };
 pub use zstd_splice::{
     splice_zstd_last_frames, splice_zstd_last_frames_append, splice_zstd_last_frames_replace,

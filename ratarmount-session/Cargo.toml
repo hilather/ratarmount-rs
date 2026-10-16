@@ -122,3 +122,7 @@ git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
 url = "2"
 rusqlite.workspace = true
 libc.workspace = true
+
+[[example]]
+name = "ai-zstd-read"
+path = "../benchmarks/ai/session-read.rs"

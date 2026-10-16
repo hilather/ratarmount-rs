@@ -18,8 +18,7 @@ use ratarmount_compress::{
     open_seekable_lz4_with_threads, open_seekable_lzip_with_threads,
     open_seekable_lzma_with_threads, open_seekable_lzo_with_threads, open_seekable_xz_with_threads,
     open_seekable_xz_with_threads_from_reader, open_seekable_zlib_with_threads,
-    open_seekable_zstd_with_threads, open_seekable_zstd_with_threads_from_reader,
-    open_seekable_zstd_with_zstd_blocks, open_seekable_zstd_with_zstd_blocks_from_reader,
+    open_seekable_zstd_with_threads_from_reader, open_seekable_zstd_with_zstd_blocks_from_reader,
     strip_compression_suffix, CompressionFormat, SeekableBody, SharedSeekableGzip,
     GZIP_SEEK_INDEX_MAGIC, INDEXED_GZIP_INDEX_MAGIC,
 };
@@ -3162,12 +3161,15 @@ fn persist_zstd_blocks_from_path(path: &Path, index_path: Option<&Path>, options
 /// Returns `(body, true)` when the side-table map was used (caller may skip re-export).
 fn open_seekable_zstd_prefer_blocks(
     path: &Path,
-    threads: u32,
+    options: ratarmount_compress::ZstdReadOptions,
     index_path: Option<&Path>,
     recreate: bool,
 ) -> Result<(Arc<dyn SeekableBody>, bool), String> {
+    let threads = options.threads;
     if let Some(blocks) = try_load_zstd_blocks(index_path, Some(path), recreate) {
-        match open_seekable_zstd_with_zstd_blocks(path, threads, &blocks) {
+        match ratarmount_compress::SeekableZstd::open_with_zstd_blocks_options(
+            path, options, &blocks,
+        ) {
             Ok(body) => {
                 eprintln!(
                     "seekable zstd (imported zstdblocks): {} ({} uncompressed bytes, {} checkpoints, -P zstd:{})",
@@ -3183,7 +3185,7 @@ fn open_seekable_zstd_prefer_blocks(
             }
         }
     }
-    open_seekable_zstd_with_threads(path, threads)
+    ratarmount_compress::SeekableZstd::open_with_options(path, options)
         .map(|body| (body, false))
         .map_err(|e| e.to_string())
 }
@@ -3234,8 +3236,16 @@ fn open_zstd(
     recreate: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
     let threads = options.threads_for("zstd");
-    let (body, used_blocks) =
-        open_seekable_zstd_prefer_blocks(path, threads, index_path, recreate)?;
+    let (body, used_blocks) = open_seekable_zstd_prefer_blocks(
+        path,
+        ratarmount_compress::ZstdReadOptions {
+            threads,
+            readahead_bytes: options.zstd_readahead_bytes,
+            direct_io: options.direct_io,
+        },
+        index_path,
+        recreate,
+    )?;
     let src = open_from_seekable_body(path, body, index_path, options, recreate, "zstd")?;
     // Index is now on disk (or memory); side-table write only when path exists
     // and we rebuilt the frame map (cold open / import miss / import failure).
