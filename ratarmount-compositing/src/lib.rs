@@ -13,6 +13,7 @@ mod overlay_policy;
 mod path_intern;
 mod payload;
 mod prefix;
+mod rolling;
 mod transform;
 mod union;
 mod versioning;
@@ -42,6 +43,7 @@ pub use overlay_policy::{
 };
 pub use payload::{maybe_wrap_payload_cache, PayloadCacheLayer};
 pub use prefix::{validate_mount_path, PrefixMountSource, SourceBind};
+pub use rolling::{RollPolicy, RollingMountSource, SeriesName};
 pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};
 pub use versioning::FileVersionLayer;

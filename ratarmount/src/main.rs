@@ -496,6 +496,12 @@ struct Args {
     #[arg(long = "commit-overlay-mode", default_value = "copy", value_parser = ["copy", "append", "auto"])]
     commit_overlay_mode: String,
 
+    /// Roll a numbered .tar/.tar.zst series before a commit reaches a new UTC
+    /// time bucket or after its active archive reaches SIZE (1d, 6h, 20G, 1d,20G).
+    /// Implies --commit-overlay-on-exit; use --commit-overlay-interval for live rolls.
+    #[arg(long, value_name = "DURATION|SIZE", value_parser = clap::value_parser!(ratarmount_compositing::RollPolicy), requires = "write_overlay", conflicts_with_all = ["commit_overlay", "repack_seekable", "publish_index", "publish_index_to", "index_id", "disable_union_mount"])]
+    roll_every: Option<ratarmount_compositing::RollPolicy>,
+
     /// Write an atomic <archive>.manifest.jsonl after a successful TAR commit.
     #[arg(long)]
     commit_manifest: bool,
@@ -713,6 +719,19 @@ where
         (stripped, false, false, false)
     };
     let mut args = Args::try_parse_from(stripped)?;
+    if args.roll_every.is_some() {
+        if find
+            || !args.source_binds.is_empty()
+            || args.recursive
+            || args.recursion_depth != 0
+            || !args.prefix.is_empty()
+            || args.transform.is_some()
+        {
+            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
+                "--roll-every requires an untransformed archive series without find, --bind, --prefix or recursion"));
+        }
+        args.commit_overlay_on_exit = true;
+    }
     expand_sandbox(&mut args, caller_ids())
         .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
     if !args.overlay_readonly.is_empty() {
@@ -1299,7 +1318,11 @@ fn main() {
             }
         }
     }
-    if args.write_overlay.is_some() && inputs.len() == 1 && args.source_binds.is_empty() {
+    if args.roll_every.is_none()
+        && args.write_overlay.is_some()
+        && inputs.len() == 1
+        && args.source_binds.is_empty()
+    {
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
             &inputs[0],
             overlay_commit::CreateMissingContext::Mount,
@@ -1441,12 +1464,46 @@ fn main() {
         std::process::exit(find::run(archive, &pattern, &open_opts, &loc));
     }
 
+    let rolling = if let Some(policy) = &args.roll_every {
+        if inputs.len() != 1
+            || !args.source_binds.is_empty()
+            || args.corpus_list.is_some()
+            || args.find
+        {
+            eprintln!(
+                "error: --roll-every requires one local series base without --bind/corpus/find"
+            );
+            std::process::exit(2);
+        }
+        if open_opts.index_file_path.is_some() && !open_opts.index_in_memory {
+            eprintln!("error: --roll-every needs per-archive sidecars; use the default index path or :memory:");
+            std::process::exit(2);
+        }
+        match overlay_commit::open_rolling_series(&inputs[0], policy.clone(), &open_opts) {
+            Ok(series) => {
+                inputs[0] = series.active_path();
+                Some(series)
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
     let file_versions = !args.no_file_versions;
 
     let mut bindings = factory::SourceBindings {
         binds: args.source_binds.clone(),
         ..Default::default()
     };
+    if let Some(series) = &rolling {
+        bindings
+            .sources
+            .push(series.clone() as Arc<dyn MountSource>);
+    }
     if let Some(list) = &args.corpus_list {
         match corpus::open(list, args.corpus_cache_size as usize) {
             Ok(source) => bindings.sources.push(source),
@@ -1457,7 +1514,7 @@ fn main() {
         }
     }
     let mut bundle = match factory::build_mount_source_with_bindings(
-        if args.corpus_list.is_some() {
+        if args.corpus_list.is_some() || rolling.is_some() {
             &[]
         } else {
             &source_paths
@@ -1630,6 +1687,9 @@ fn main() {
         };
         match WriteOverlay::new(Arc::clone(&bundle.source), &overlay_path) {
             Ok(mut ov) => {
+                if let Some(series) = &rolling {
+                    ov.set_rolling(series.clone());
+                }
                 ov.set_encoding(&args.encoding);
                 ov.set_manifest_hashes(args.commit_manifest.then(|| args.manifest_hashes.clone()));
                 ov.set_commit_mode(args.commit_overlay_mode.parse().expect("clap commit mode"));
@@ -6652,5 +6712,72 @@ mod corpus_cli_tests {
         ] {
             assert!(parse_args_from(argv).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod rolling_cli_tests {
+    use super::*;
+
+    /// Regression: --roll-every consumes exactly its policy and preserves both positional paths.
+    #[test]
+    fn rolling_flag_preserves_paths_and_flushes_on_exit() {
+        let args = parse_args_from(
+            [
+                "ratarmount",
+                "-w",
+                "overlay",
+                "--roll-every",
+                "1d,20G",
+                "traces.tar.zst",
+                "mnt",
+            ]
+            .map(OsString::from)
+            .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            args.paths,
+            [PathBuf::from("traces.tar.zst"), PathBuf::from("mnt")]
+        );
+        assert!(args.commit_overlay_on_exit);
+        assert!(args.roll_every.is_some());
+        for extra in [
+            vec!["--recursive"],
+            vec!["--prefix", "inner"],
+            vec!["--index-id", "abcd"],
+        ] {
+            let mut argv = vec![
+                "ratarmount",
+                "-w",
+                "overlay",
+                "--roll-every",
+                "1d",
+                "traces.tar",
+                "mnt",
+            ];
+            argv.extend(extra);
+            assert!(parse_args_from(argv).is_err());
+        }
+        assert!(Args::try_parse_from(["ratarmount", "--roll-every", "1d", "traces.tar"]).is_err());
+        assert!(Args::try_parse_from([
+            "ratarmount",
+            "-w",
+            "overlay",
+            "--roll-every",
+            "0B",
+            "traces.tar"
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "ratarmount",
+            "-w",
+            "overlay",
+            "--roll-every",
+            "1G",
+            "--commit-overlay",
+            "traces.tar"
+        ])
+        .is_err());
     }
 }
