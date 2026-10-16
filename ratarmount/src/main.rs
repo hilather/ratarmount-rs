@@ -452,6 +452,11 @@ struct Args {
     #[arg(long = "commit-overlay", action = ArgAction::SetTrue)]
     commit_overlay: bool,
 
+    /// Archive persistence: copy (default), append (adds-only, mutates the inode),
+    /// or auto (append eligible plans only when the archive has one hard link).
+    #[arg(long = "commit-overlay-mode", default_value = "copy", value_parser = ["copy", "append", "auto"])]
+    commit_overlay_mode: String,
+
     /// Skip interactive confirmation for `--commit-overlay` (type "commit" otherwise).
     #[arg(long = "yes", action = ArgAction::SetTrue)]
     yes: bool,
@@ -926,6 +931,10 @@ fn main() {
             eprintln!("error: {msg}");
             std::process::exit(2);
         }
+        if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
+            eprintln!("error: commit recovery for {}: {e}", archive.display());
+            std::process::exit(2);
+        }
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
             archive,
             overlay_commit::CreateMissingContext::OfflineCommit,
@@ -934,6 +943,7 @@ fn main() {
             std::process::exit(2);
         }
         let opts = CommitOverlayOptions {
+            mode: args.commit_overlay_mode.parse().expect("clap commit mode"),
             yes: args.yes,
             debug: args.debug,
             encoding: args.encoding.clone(),
@@ -965,6 +975,16 @@ fn main() {
 
     let (inputs, mountpoint) = split_inputs_mountpoint(&args.paths, args.no_mount);
 
+    {
+        for input in &inputs {
+            if !ratarmount_remote::is_remote_url(&input.to_string_lossy()) {
+                if let Err(e) = ratarmount_compress::commit_journal::recover(input) {
+                    eprintln!("error: commit recovery for {}: {e}", input.display());
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
     if args.write_overlay.is_some() && inputs.len() == 1 {
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
             &inputs[0],
@@ -1264,6 +1284,7 @@ fn main() {
         match WriteOverlay::new(Arc::clone(&bundle.source), &overlay_path) {
             Ok(mut ov) => {
                 ov.set_encoding(&args.encoding);
+                ov.set_commit_mode(args.commit_overlay_mode.parse().expect("clap commit mode"));
                 if !args.overlay_readonly.is_empty()
                     || args.overlay_quota.is_some()
                     || args.overlay_quota_files.is_some()
@@ -3600,6 +3621,36 @@ mod nfs_cli_tests {
         assert_eq!(a.encoding, "latin1");
         assert!(a.ignore_zeros);
         assert_eq!(a.paths, vec![PathBuf::from("a.tar.zst")]);
+    }
+
+    /// Regression: commit mode must consume only its value and default to copy.
+    #[test]
+    fn live_commit_mode_parse_and_default() {
+        let args = Args::try_parse_from(["ratarmount", "a.tar", "mnt"]).unwrap();
+        assert_eq!(args.commit_overlay_mode, "copy");
+        for mode in ["append", "copy", "auto"] {
+            let args = Args::try_parse_from([
+                "ratarmount",
+                "--commit-overlay-mode",
+                mode,
+                "-w",
+                "ov",
+                "--commit-overlay-interval",
+                "2s",
+                "a.tar",
+                "mnt",
+            ])
+            .unwrap();
+            assert_eq!(args.commit_overlay_mode, mode);
+            assert_eq!(
+                args.paths,
+                vec![PathBuf::from("a.tar"), PathBuf::from("mnt")]
+            );
+        }
+        assert!(
+            Args::try_parse_from(["ratarmount", "--commit-overlay-mode", "unsafe", "a.tar"])
+                .is_err()
+        );
     }
 
     #[test]

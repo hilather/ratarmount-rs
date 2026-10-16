@@ -143,9 +143,9 @@ pub type Result<T> = std::result::Result<T, TarError>;
 mod write;
 pub use write::{
     find_first_valid_header_from, find_last_tar_eof, normalize_archive_rel_path,
-    rewrite_tar_suffix, window_has_member_boundary, write_tar_eof, write_ustar_members,
-    RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor, TarRawMember, UstarMember,
-    UstarPayload,
+    rewrite_tar_suffix, tar_append_offset, window_has_member_boundary, write_tar_eof,
+    write_ustar_members, RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor, TarRawMember,
+    UstarMember, UstarPayload,
 };
 
 /// File reader with a private logical cursor and no shared seek state or lock.

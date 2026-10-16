@@ -2259,6 +2259,9 @@ fn open_path_impl(
             return Ok(Arc::new(git));
         }
     }
+    if !ratarmount_index::looks_like_url_archive(path) {
+        ratarmount_compress::commit_journal::recover(path).map_err(|e| e.to_string())?;
+    }
     if options.git_synthetic_head || options.git_prefix.is_some() {
         return Err("--git-synthetic-head and --git-prefix require Git mode (--git, --git-ref, repo@REV, a bare repo, or RATARMOUNT_FORCE_GIT)".into());
     }

@@ -26,7 +26,9 @@
 //! * [`ParallelizationSpec`] parses Python-style `-P` backend matrices.
 
 mod bzip2_seek;
+pub mod commit_journal;
 mod compress_z_seek;
+pub mod fastcopy;
 #[cfg(feature = "gzip-rapidgzip")]
 mod gzip_rapidgzip;
 mod gzip_seek;
@@ -107,7 +109,10 @@ pub use zstd_seek::{
     open_seekable_zstd_with_zstd_blocks_from_reader, scan_zstd_frames, scan_zstd_frames_path,
     SeekableZstd, ZstdFrameInfo, ZstdFrameMap,
 };
-pub use zstd_splice::{splice_zstd_last_frames, splice_zstd_last_frames_replace, SpliceStats};
+pub use zstd_splice::{
+    splice_zstd_last_frames, splice_zstd_last_frames_append, splice_zstd_last_frames_replace,
+    write_zstd_splice_suffix, SpliceStats,
+};
 
 use std::fs::File;
 use std::io::{self, copy, BufReader, Read, Seek, SeekFrom, Write};
