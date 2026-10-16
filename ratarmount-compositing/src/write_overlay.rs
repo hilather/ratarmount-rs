@@ -385,11 +385,13 @@ impl std::fmt::Display for RemotePublishError {
 
 type RemotePublishHook =
     Box<dyn FnMut(&RemotePublishRequest) -> std::result::Result<(), RemotePublishError> + Send>;
+type RemoteReopenHook = Box<dyn Fn() -> Result<Arc<dyn MountSource>> + Send>;
 
 struct RemoteLive {
     head: Box<dyn FnMut() -> Result<RemoteObjectHead> + Send>,
     download: Box<dyn FnMut() -> Result<RemoteDownload> + Send>,
     publish: RemotePublishHook,
+    reopen: Option<RemoteReopenHook>,
     on_exit_extra_wait: Duration,
     /// `s3://…` or `gs://…`. Failure text uses the scheme, not a hard-coded `s3`.
     archive_url: String,
@@ -1146,9 +1148,25 @@ impl WriteOverlay {
             head,
             download,
             publish,
+            reopen: None,
             on_exit_extra_wait,
             archive_url: archive_url.to_string(),
         });
+    }
+
+    /// Reopen at the exact identity returned by an atomic remote publication.
+    pub fn install_remote_reopen(&self, reopen: RemoteReopenHook) {
+        if let Some(remote) = self.remote.lock().expect("overlay remote").as_mut() {
+            remote.reopen = Some(reopen);
+        }
+    }
+
+    /// Invoke the installed callback after publication, before forgetting committed overlay files.
+    pub fn reopen_remote_live_commit(&self) -> Result<Arc<dyn MountSource>> {
+        self.with_remote_mut(|remote| match &remote.reopen {
+            Some(reopen) => reopen(),
+            None => Err(OverlayError::Msg("remote reopen is not installed".into())),
+        })?
     }
 
     fn remote_scheme_label(&self) -> String {

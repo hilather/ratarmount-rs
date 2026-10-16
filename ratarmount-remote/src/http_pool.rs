@@ -88,6 +88,27 @@ impl HttpRequest {
         self.send(Some(body))
     }
 
+    /// LFS action URLs are final storage URLs. Stream once; never replay an upload on redirect.
+    pub(crate) fn send_reader(self, body: impl Read) -> Result<ureq::Response, ureq::Error> {
+        let mut req = agent().request(&self.method, &self.url);
+        for (name, value) in &self.headers {
+            req = req.set(name, value);
+        }
+        if let Some(timeout) = self.timeout {
+            req = req.timeout(timeout);
+        }
+        let response = req.send(body).map_err(|e| match e {
+            ureq::Error::Transport(_) => {
+                ureq::Error::from(io::Error::other("HTTP upload transport failed"))
+            }
+            other => other,
+        })?;
+        if !(200..300).contains(&response.status()) {
+            return Err(io::Error::other("HTTP upload requires a final storage URL").into());
+        }
+        Ok(response)
+    }
+
     pub(crate) fn send_string(mut self, body: &str) -> Result<ureq::Response, ureq::Error> {
         if !self
             .headers

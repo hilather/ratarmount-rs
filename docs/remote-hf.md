@@ -171,6 +171,72 @@ See the [dataset-author recipe](recipes/publish-hf-index.md) for a complete
 “run once, every downloader gets a zero-scan mount” workflow. Fingerprint checks
 still read archive byte ranges even when no indexing scan is needed.
 
+## Writing archive changes back to the Hub
+
+```sh
+ratarmount -w ./outputs-overlay --commit-overlay-interval 30s \
+  --commit-overlay-on-exit \
+  'hf://datasets/org/name@main/outputs/archive.tar.zst' outputs/
+# Open one PR, then continue subsequent intervals on that PR's refs/pr/N:
+ratarmount -w ./review-overlay --commit-overlay-interval 30s --create-pr \
+  'hf://datasets/org/name@main/outputs/archive.tar.zst' review/
+```
+
+Live overlay commits support existing uncompressed TAR and `.tar.zst` archives
+(including `.tzst` and `.tar.zstd`). The token needs repository **write scope**;
+the read backend's token lookup and `HF_ENDPOINT` apply. The URL must select an
+existing branch. Commit SHAs and tags are refused explicitly. The target stays
+on the mount's branch; `--publish-revision` is for index publication and cannot
+redirect live archive writes. Whole-repository mounts and other archive formats
+do not support live write-back.
+
+Each commit downloads the pinned archive to a temporary spool outside the overlay,
+uses the existing TAR rewrite or zstd splice, and builds a fresh SQLite index
+from the resulting archive. The archive streams through LFS basic or multipart
+upload without loading it all into memory. The archive, immutable
+`{archive}.index.<sha256>.sqlite`, and `{archive}.index.ptr` are then published in
+**one atomic Hub commit**. Readers resolving a commit see matching archive and
+index bytes. Live pointers bind archive bytes through tarstats fingerprints;
+they do not embed the new commit SHA, which the Hub assigns during publication.
+Even mounts using `--index-file :memory:` publish all three files.
+The sidecar limit is 64 MiB; exceeding it refuses the entire publication, leaving
+the remote archive unchanged. Archive size is bounded by spool disk space and
+the Hub's upload limits, rather than the index publication limit. Each interval
+currently rebuilds the full file table and reopens the committed archive; it
+does not incrementally patch the mount's existing index.
+
+The commit header's `parentCommit` equals the SHA pinned when the mount opened,
+or its last successful commit. The branch is checked before downloading, and
+the Hub precondition protects changes during upload. A concurrent push fails
+without overwriting the other writer. Conflicts and upload/commit errors stop
+further publication for this mount and log that a remount is required; the
+overlay is retained. A lost response may conceal a successful commit, so inspect
+the branch and reconcile retained changes before retrying on a new mount.
+Successful interval commits reopen the exact returned SHA, update
+`user.hf.commit`, remove the committed overlay files, and keep serving new bytes.
+An on-exit commit publishes remaining changes through the same queue.
+
+`--create-pr` creates one PR on the first successful publication, then directs
+later commits to `refs/pr/N` with the last committed SHA as parent. The original
+branch remains unchanged. As documented by the
+[Hub commit API](https://huggingface.co/docs/huggingface_hub/package_reference/hf_api#huggingface_hub.HfApi.create_commit),
+PR creation uses the supplied parent as its starting commit; subsequent writes
+to the PR use the usual parent precondition. The PR is not merged automatically.
+Native Xet uploads remain unsupported; LFS-compatible uploads are required.
+Tokens and storage response bodies are omitted from publication diagnostics.
+
+Offline `--commit-overlay hf://...` exits **2**, matching object-store URLs:
+use `--commit-overlay-on-exit` or `--commit-overlay-interval` instead.
+
+Normal regressions use a local mock Hub and need no FUSE mount. This ignored
+test writes a unique archive and sidecars into a private test dataset and leaves
+them there; run it only when those writes are authorized:
+
+```sh
+RATARMOUNT_TEST_HF_REPO=your-name/private-test-repo HF_TOKEN=hf_... \
+  cargo test -p ratarmount --bin ratarmount regression_hf_live_private_repo_writeback -- --ignored --nocapture
+```
+
 The ignored write test additionally requires explicit approval and both a test
 repository and an environment token; it leaves test artifacts in that repository:
 
@@ -383,9 +449,9 @@ before network access; use `hf-cache://` to browse offline. Legacy
 `HF_HUB_OFFLINE=0` overrides it. The separate ratarmount tree cache stores only
 listing metadata and is not itself an offline snapshot.
 
-Hub sources remain read-only. `--commit-overlay` and live overlay commit do not
-write archive changes back to Hub repositories. Index publication is supported
-as described above; archive publication is a separate capability.
+Hub base sources remain immutable snapshots. Live overlays can publish archive
+changes through `hf://` as described above. `hf-cache://` remains a local,
+read-only snapshot browser; it does not publish writes.
 
 Persistent range data uses the [shared body cache](phase10-remote.md#persistent-remote-range-cache-ai-rc).
 Every source carries endpoint, repository kind/name, pinned commit and path as
