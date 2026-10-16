@@ -1,6 +1,6 @@
 # Beyond-parity roadmap (protocols, features, product bets)
 
-**Date:** 2026-08-23 (leftover close-out 2026-08-24)  
+**Date:** 2026-08-23 (Local AI status refresh 2026-10-16)
 **Status:** living checklist — not Python parity. Prefer implementing here when it multiplies `MountSource` + SQLite 0.7.x + FUSE/NFS.  
 **Legend:** `todo` · `partial` · `done` · `defer`
 
@@ -8,7 +8,7 @@ The [Local AI roadmap](plans/local-ai-roadmap.md) tracks current implementation 
 
 Parity leftovers stay in [`parity-todo.md`](../parity-todo.md) and [`upstream-feature-requests.md`](upstream-feature-requests.md). This file is **new surface**: more ways in, more ways out, and making the index do more than open a mount.
 
-Protocol inbound/outbound batch (**P-1–P-10**, **F-1**, **F-4**, **G-1** booleans) landed 2026-08-23 (factory/CLI in PR-12; living tables in PR-14). Leftover close-out 2026-08-24: **P-6** / **P-10** `done`; **P-2** `done` (signing + 3.1.1 preauth/optional encrypt + leases/create contexts; Finder not CI). Inbound HMAC / FTP LIST / `rclone+` residuals dropped. Remaining first bets after F-2 / F-3 / G-2: F-5..F-10, G-3..G-5. gzip/rapidgzip thruput and Phase 12 announce stay residual / ops — not this table.
+Protocol inbound/outbound batch (**P-1–P-10**, **F-1**, **F-4**, **G-1** booleans) landed 2026-08-23 (factory/CLI in PR-12; living tables in PR-14). Leftover close-out 2026-08-24: **P-6** / **P-10** `done`; **P-2** `done` (signing + 3.1.1 preauth/optional encrypt + leases/create contexts; Finder not CI). Inbound HMAC / FTP LIST / `rclone+` residuals dropped. Local AI additions and remaining publication/validation work are summarized below; partial rows retain their named residuals. gzip/rapidgzip thruput and Phase 12 announce stay residual / ops — not this table.
 
 ---
 
@@ -120,10 +120,10 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-4 | **OCI image mount** (layer union; product on P-1) | `done` | L | compositing `OciImageMountSource` + remote fetch + factory |
 | F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `partial` | L | fuse + packaging |
 | F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `partial` | M | In-tree SMB 2.0.2 codec, Range + folders wired; file dialect still falls back to `smbclient`; SMB 3.x/Kerberos/DFS residual |
-| F-7 | **Write-through / commit-to-remote** | `partial` | L | Live `-w` commit to S3, GCS (`gs://`) and Azure (`az://`) exists; offline remote commit unsupported |
+| F-7 | **Write-through / commit-to-remote** | `partial` | L | Live `-w` commit to S3/GCS/Azure and Hugging Face; remote index publication; offline remote commit unsupported |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | Factory and crates cover listed formats; HFS+/APFS, codec/features, differencing and advanced volume residuals remain |
 | F-9 | **Producer: `--repack-seekable`** | `done` | M | compress engine + CLI; ZIP/7z/bzip2/xz residual |
-| F-10 | **Library / FFI / `ratar://` replacement** | `partial` | L | session landed; L0 dry-run only (Q5=a); PyO3 residual |
+| F-10 | **Library / FFI / `ratar://` replacement** | `partial` | L | Session + PyO3 Python package, fsspec/torch/WebDataset, mount/publish APIs landed; PyPI and crates.io publication pending |
 
 ### F-1 — Remote directory mounts — `done`
 
@@ -141,7 +141,7 @@ Last-frame `.tar.zst` splice and uncompressed GNU `tar --append` **patch the on-
 
 Acceptance: remount after last-frame splice does **not** rescan prefix frames; patched `files` equals a full `create_index_body`; `check_tarstats` still detects a replaced archive.
 
-**Residual:** mid-member opaque prefix with no valid header (persist fail-closed); GNU incremental dumpdir across the window; prefix global PAX `g`; single-frame `.tar.zst` = full rebuild; `:memory:` / discarded sidecar → full rebuild (no `copy_prefix_from`); persist still **copies** the compressed prefix; ZIP incremental commit still full rebuild. Live interval vs on-exit splices are coalesced (V-4 `enqueue_commit`; second interval tick `Coalesced`; on-exit waits for inflight then one `commit_atomic` of remaining files; timeout does not splice while interval is still inflight). Live prefix-frame mutate stays fail-closed; offline `--commit-overlay` remains the prefix-rewrite escape hatch (not a live-queue job). F-7 write-through should reuse that live queue.
+**Residual:** mid-member opaque prefix with no valid header (persist fail-closed); GNU incremental dumpdir across the window; prefix global PAX `g`; single-frame `.tar.zst` = full rebuild; `:memory:` / discarded sidecar → full rebuild (no `copy_prefix_from`); default copy mode accelerates prefix copying with reflink / `copy_file_range`; eligible add-only commits can use journaled append; ZIP incremental commit still full rebuild. Live interval vs on-exit splices are coalesced (V-4 `enqueue_commit`; second interval tick `Coalesced`; on-exit waits for inflight then one `commit_atomic` of remaining files; timeout does not splice while interval is still inflight). Live prefix-frame mutate stays fail-closed; offline `--commit-overlay` remains the prefix-rewrite escape hatch (not a live-queue job). F-7 write-through should reuse that live queue.
 
 ### F-3 — SQLite FTS5 / locate — `done`
 
@@ -163,7 +163,7 @@ Upstream Python wishlist is locate/Tracker for disconnected media. Do not invent
 
 ### F-5 — Windows (WinFsp) + Homebrew + macOS Intel — `partial`
 
-Homebrew **tap cask** shipped: unpacks the signed `macos-arm64` GitHub Release tarball ([`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb)) with caveats for macFUSE/FUSE-T and runtime `libarchive`. Not a source formula; no `PKG_CONFIG_PATH`; Homebrew-core is out of v1. Audit: [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh).
+Homebrew **tap cask** shipped: unpacks the signed `macos-arm64` GitHub Release tarball ([`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb)) with caveats for macFUSE/FUSE-T and runtime `libarchive`. Not a source formula; no `PKG_CONFIG_PATH`; A Linux Homebrew core formula draft is prepared but unpublished; AUR, Nix and conda drafts are also in-tree ([packaging](../packaging.md#additional-package-drafts)). Audit: [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh).
 
 **Residual:** WinFsp product FUSE; Intel tarball (no GHA Intel runner — do not re-add `macos-13`); Homebrew-core merge. `done` only if WinFsp + Intel also ship.
 
@@ -177,7 +177,7 @@ Homebrew **tap cask** shipped: unpacks the signed `macos-arm64` GitHub Release t
 
 ### F-7 — Write-through / commit-to-remote — `partial`
 
-Live `-w` commit for S3, GCS (`gs://`) and Azure (`az://`) multipart-uploads the spliced archive and index siblings through the V-4 queue. Offline `--commit-overlay` for `s3://` exits 2. Anonymous / missing credentials exit 2 before mount. CLI `--publish-index` copies the sidecar to a local path only; remote index PUT exists only inside live overlay commit via `put_s3_index_siblings`.
+Live `-w` commits upload archives and index siblings to S3, GCS (`gs://`) and Azure (`az://`) through the V-4 queue. Hugging Face write-back now supports existing TAR / `.tar.zst` files on branches: archive, fresh index blob and pointer publish in one atomic Hub commit guarded by the previous SHA. Successful intervals reopen the new commit; conflicts stop publication and retain the overlay. Hub write-back currently spools the archive and rebuilds its full index each interval. Native Xet uploads remain unsupported (LFS-compatible upload required). CLI `--publish-index` supports local paths and `hf://`, `s3://`, `gs://`, `az://`; offline remote `--commit-overlay` exits 2. See [Hub read/write guide](../remote-hf.md).
 
 **Residual:** offline `s3://` commit; create-if-missing on remote URLs (K16 Unchanged).
 
@@ -187,12 +187,7 @@ We already do EXT4 + FAT + ISO + SquashFS. Next users: mount this VM disk / Wind
 
 Suggested order inside the family: exFAT, then NTFS (read-only), then UDF, then DMG, then WIM, then QCOW2/VHD/VMDK (block layer then partition + existing FAT/EXT4).
 
-**Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. `ratarmount-formats-dmg` parses UDIF `koly` + raw/ADC/zlib/bzip2 chunks and mounts inner FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR via those crates’ public APIs (nested `open_from_reader` is no-tmp). **Residual:** HFS+, APFS, encrypted DMG, LZFSE/LZMA; LVM, RAID, Btrfs; UDF/WIM/QCOW2/VHD/VMDK crates; factory `FormatBackend::Dmg` / `Block` (orchestrator PR). Do not claim HFS+ via an existing path.
-**Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. `ratarmount-formats-wim` mounts the first image (uncompressed + XPRESS; nested `open_from_reader` is no-tmp). **Residual:** LVM, RAID, Btrfs; UDF/DMG/QCOW2/VHD/VMDK crates; WIM LZX/LZMS, WIMBoot, delta, later images; factory `FormatBackend::Block` / `Wim` (orchestrator PR).
-**Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. `ratarmount-formats-qcow2` maps QCOW2 v2/v3 guest clusters (uncompressed + zlib) then wraps the block crate; local backing files only. **Residual:** LVM, RAID, Btrfs; QCOW2 zstd clusters and HTTP/NBD backing; UDF/DMG/WIM/VHD/VMDK crates; factory `FormatBackend::Block` / `Qcow2` (orchestrator PR).
-**Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. `ratarmount-formats-vhd` wraps that block API for fixed/dynamic VHD and fixed VHDX (nested no-tmp; differencing/encrypted residual). **Residual:** LVM, RAID, Btrfs; UDF/DMG/WIM/QCOW2/VMDK crates; factory `FormatBackend::Block` / `Vhd` (orchestrator PR).
-**Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. `ratarmount-formats-vmdk` wraps that block layer for hosted **KDMV sparse** (`monolithicSparse` / descriptor + sibling extent); nested `open_from_reader` is no-tmp. **Residual:** LVM, RAID, Btrfs; compressed `streamOptimized` / ESXi COWD·VMFSSPARSE·SESparse / delta `parentCID`; UDF/DMG/WIM/QCOW2/VHD crates; factory `FormatBackend::Block` / `Vmdk` (orchestrator PR).
-**Landed:** Session factory `FormatBackend` + `formats-all` (K7b): `Udf` immediately before `Iso`; `Exfat`/`Ntfs`/`Dmg`/`Wim`/`Block`/`Qcow2`/`Vhd`/`Vmdk` after `Fat`; nested `open_from_reader` in `open_nested_reader_fn` and `try_open_formats_from_seekable_body`. Crates: GPT/MBR `p1/`… (FAT/EXT4 offset), exFAT, NTFS, UDF, UDIF DMG (inner FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR), WIM (first image, uncompressed + XPRESS), QCOW2 v2/v3 zlib + local backing, VHD/VHDX (no parent), VMDK KDMV sparse.
+**Landed:** Session factory `FormatBackend` + `formats-all` (K7b): `Udf` immediately before `Iso`; `Exfat`/`Ntfs`/`Dmg`/`Wim`/`Block`/`Qcow2`/`Vhd`/`Vmdk` after `Fat`; nested `open_from_reader` in `open_nested_reader_fn` and `try_open_formats_from_seekable_body`. Crates: GPT/MBR `p1/`… (FAT/EXT4 offset), exFAT, NTFS, UDF, UDIF DMG (inner FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR), WIM (first image, uncompressed + XPRESS), QCOW2 v2/v3 zlib + local backing, VHD/VHDX (no parent, including qemu-img 11 packed metadata), VMDK KDMV sparse.
 
 **Residual:** HFS+, APFS, encrypted DMG, LZFSE/LZMA; WIM LZX/LZMS, WIMBoot, delta, later images; LVM, RAID, Btrfs; QCOW2 zstd clusters and HTTP/NBD backing; VHD/VHDX differencing / encrypted / log replay; compressed VMDK `streamOptimized` / ESXi COWD·VMFSSPARSE·SESparse / delta `parentCID`; NTFS LZNT1/EFS; UDF 2.50 metadata partition. Do not claim HFS+ via an existing path.
 
@@ -206,7 +201,7 @@ CLI: `ratarmount --repack-seekable IN OUT` (`num_args = 2`; exclusive with expor
 
 `ratarmount-session` G0–G7 is the embedder API (no FUSE). crates.io first-publish is **Q5=(a) dry-run only**: [`packaging/test-crates-io-dry-run.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-crates-io-dry-run.sh) runs `cargo publish -p ratarmount-core --dry-run` (and index). No live upload. L3.5 session stays path-depend until a freeze review. Dual-run does **not** wait: [`phase12-dual-run.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase12-dual-run.md). Policy: [`crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md). G7.3 keep-green: `cargo test -p ratarmount-session --lib index_job_sidecar_python_07` · [`test-harness/run-indexjob-python-interop.sh`](https://github.com/hilather/ratarmount-rs/blob/main/test-harness/run-indexjob-python-interop.sh).
 
-Python still wins on fsspec. A `cdylib` + PyO3 `ratarmountcore` that registers `ratar://` is **Q2 residual** (must not land in session default features).
+The optional PyO3/maturin distribution **`ratarmount-rs`** imports as `ratarmount_rs`: library reads, stored-member mmap, paged iteration, fsspec `ratar`/chained URLs, torch Dataset, WebDataset iterator, supervised `mount()` and `index.publish()` are implemented. Wheel CI builds artifacts; **PyPI publication remains pending**. The Python crate stays outside default workspace members and Session dependencies. See [Python guide](../python.md). The crates.io dry-run now checks the workspace MSRV (1.90), including normalized package metadata.
 
 ### Close-the-residual (do not let these eat this roadmap)
 
@@ -235,25 +230,25 @@ Larger than a protocol or a feature; still concrete enough to implement. Items 6
 
 | ID | Work | Status | Effort | Depends |
 |----|------|--------|--------|---------|
-| G-1 | **`ratarmount serve`** — one binary, several exports on the same tree | `done` | L | P-2 / P-5 / P-6 (NFS already); **booleans**, no `serve` subcommand |
+| G-1 | **`ratarmount serve`** — one binary, several exports on the same tree | `done` | L | P-2 / P-5 / P-6 (NFS already); export booleans + optional `serve` sugar |
 | G-2 | **Index as a portable artifact** (sidecar + OCI referrer / HTTP `Link:`) | `done` | M | index; pairs with P-1 |
-| G-3 | **Content-addressed member cache** (hash to decompressed member) | `partial` | L | `payload-v1/` caches whole decompressed members; no remote range/chunk cache |
+| G-3 | **Content-addressed member cache** (hash to decompressed member) | `partial` | L | `payload-v1/` + HTTP `range-v1/` share a cap; optional Hub cache sharing and offline snapshots; CDC residual |
 | G-4 | **Snapshot browser:** restic / borg / kopia / ZFS send | `partial` | L | restic reader exists; borg, kopia and ZFS send readers absent |
-| G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `partial` | L | systemd/autofs helper examples shipped; CSI remains spec-only |
+| G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `partial` | L | systemd/autofs + in-tree CSI node driver and Docker/Podman plugin; privileged kind/csi-sanity validation pending |
 
-### G-1 — `ratarmount serve` — `done` (booleans)
+### G-1 — `ratarmount serve` — `done`
 
 `--nfs --http --webdav --smb --ninep --sftp` on the same tree (FUSE remains “mountpoint present”; there is **no** `--fuse` flag). Boolean flags + required-value binds (`num_args = 1`) on the existing mount CLI. Combine in one process (`ratarmount --nfs --http archive.tar.gz`). Export-only is allowed without a FUSE mountpoint. SIGINT/SIGTERM stops every export.
 
-A `ratarmount serve` **subcommand was not shipped** (clap positionals steal the archive path). Booleans are the product. Residual: control-plane redesign, IP allowlists.
+Optional `ratarmount serve --nfs --http ARCHIVE` sugar now dispatches to these booleans, requires at least one export, and rejects `--no-mount`. Residual: control-plane redesign, IP allowlists.
 
 ### G-2 — Index as a portable artifact — `done`
 
 Media type `application/vnd.ratarmount.index.v1+sqlite` names this SQLite **blob family** (`v1`). Inner `INDEX_VERSION` stays `0.7.0` (`files` schema). Not SOCI / eStargz / nydus zTOC.
 
-Discovery (fail-open): explicit `--index-file` (CLI `--index-id HEX` pre-resolves to this path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known sibling GET → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Pointer/blob/tarstats failure continues (additional candidate, not terminal). After a remote fetch, `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Object-store sibling **GET** of pointer then blob then well-known is in. Remote index PUT exists only inside live overlay commit via `put_s3_index_siblings`; `put_s3_file` / `publish_index_to_s3` do not exist. CLI `--publish-index` is local only.
+Discovery (fail-open): explicit `--index-file` (CLI `--index-id HEX` pre-resolves to this path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known sibling GET → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Pointer/blob/tarstats failure continues (additional candidate, not terminal). After a remote fetch, `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Object-store sibling **GET** of pointer then blob then well-known is in. CLI `--publish-index` now publishes index blobs and pointers to `hf://`, `s3://`, `gs://`, and `az://`, as well as local paths. Hub publication uses an atomic commit; object stores upload the blob before the pointer.
 
-Publish: `--publish-index` copies the sidecar next to the archive; `--publish-index-to PATH` is a required value. Both always write `{archive}.index.ptr` (`ratarmount.index.pointer.v1`; `index_id` = sha256 of the blob, 64 hex), including dest==sidecar. Keep-last-K=2 local snapshots (`{archive}.index.{old_id}.sqlite`) when a pointer is written. HTTP export `GET /.ratarmount-control/index.sqlite` is HTTP-only (not a FUSE control file) with that Content-Type. `--http` still serves the **indexed tree**, not host archive bytes. Inbound clients consume `Link` on the archive HEAD, not on `--http` tree export.
+Publish: `--publish-index` publishes next to the archive; `--publish-index-to PATH_OR_URL` takes a required destination value. Both always write `{archive}.index.ptr` (`ratarmount.index.pointer.v1`; `index_id` = sha256 of the blob, 64 hex), including dest==sidecar. Keep-last-K=2 local snapshots (`{archive}.index.{old_id}.sqlite`) when a pointer is written. HTTP export `GET /.ratarmount-control/index.sqlite` is HTTP-only (not a FUSE control file) with that Content-Type. `--http` still serves the **indexed tree**, not host archive bytes. Inbound clients consume `Link` on the archive HEAD, not on `--http` tree export.
 
 **Residual:** SOCI / eStargz / nydus zTOC converter; offline `s3://` `--commit-overlay`; FUSE/NFS exposure of the SQLite blob; Docker Hub Referrers matrix; tag-convention fallback.
 
@@ -265,6 +260,8 @@ Hash members (`--hashes sha256` on TAR/ZIP/7z). Cache decompressed **member bodi
 
 **Remote ranges (AI-RC):** HTTP foreground/prefetch reads now cache aligned 4 MiB chunks under `range-v1/`, keyed by verified content tokens. A strong resource-scoped ETag plus size enables plain HTTP caching; backends can supply a pinned Hub commit/path or SHA-256. LRU eviction spans both body caches, with periodic reconciliation rather than a directory scan on every install. Completed files are assembled contiguously on consumer request for passthrough/Hub-cache use; multi-chunk reads do not trigger a copy. Range data stays inside the payload cache root, at `payload-v1/range-v1/`. See [remote cache configuration](../phase10-remote.md#persistent-remote-range-cache-ai-rc).
 
+**Hub cache sharing (AI-HF3):** configured sharing checks existing `huggingface_hub` blobs before network reads and atomically installs only completed, verified files in the standard blobs/snapshots/refs layout. `hf-cache://` mounts local snapshots without networking. The external Hub cache has its own lifecycle; the ratarmount payload/range cap does not bound it. See [cache settings and offline mounts](../remote-hf.md#offline-snapshots-hf-cache).
+
 **Residual:** CDC / nydus-like chunking of decompressed members larger than 64 MiB (would need a chunk table; do not put it in SQLite `files`); object-store transports need separate wiring to the shared range cache.
 
 ### G-4 — Snapshot browser — `partial` (restic done; borg / kopia / ZFS residual)
@@ -273,11 +270,39 @@ restic / borg / kopia / ZFS send already store trees of archives or content-addr
 
 **restic (done):** `restic:/abs/path` (scheme-prefix, not WHATWG) opens `ResticMountSource` via session `open_remote_input` only — not `open_path` / factory FormatBackend. Presentation: `/snapshots/<short-id>/…`, `/latest` symlink, `/ids/<full-id>/`. Password: `RESTIC_PASSWORD` / `RESTIC_PASSWORD_FILE` (never logged). Local `data/` pack `Read+Seek`; restic v1/v2 JSON indexes. Guide: [`docs/restic.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/restic.md).
 
+`ratarmount snapshot add|list` also wraps the external restic CLI for creating and listing task snapshots ([recipe](../recipes/dedup-snapshots.md)).
+
 **Residual:** S3 restic repos (`restic://s3://…` errors; use a local cache copy); borg; kopia; ZFS send.
 
 ### G-5 — Kubernetes CSI / systemd / autofs — `partial`
 
-v1 shipped: `packaging/mount.fuse.ratarmount` (`Type=fuse.ratarmount`, installed as `/usr/sbin/mount.fuse.ratarmount` in `.deb`/`.rpm`), example systemd `.mount` + autofs map, operator docs ([`systemd-mount.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/systemd-mount.md)). Helper argv has **no** secrets (env / `EnvironmentFile=` only). CSI is **spec-only** ([`csi.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/csi.md)); the driver is a **separate repo** that execs the packaged binary — **no kube crate** in this workspace. Residual: CSI node plugin implementation, `-w` overlay StorageClass (needs F-7), SELinux / AppArmor, Windows CSI.
+The systemd/autofs helper (`Type=fuse.ratarmount`) and operator examples remain available ([systemd guide](../systemd-mount.md)); credentials use env / `EnvironmentFile=`.
+
+**Implemented:** in-tree `ratarmount-csi` gRPC Identity + Node plugin, supervised mount children, persisted lifecycle journal, secrets via environment, per-pod overlays and deployment manifests. It is a separate binary outside default packages. `ratarmount-volume-plugin` implements Docker/Podman volume API v1 with supervised mounts and per-volume overlays. See [CSI guide](../csi.md) and [Docker/Podman plugin](../docker-volume-plugin.md).
+
+**Residual:** privileged kind / csi-sanity and real container-runtime validation are pending on a capable host; SELinux/AppArmor and Windows CSI remain open.
+
+---
+
+## Local AI
+
+Implemented surfaces below use the stable AI task IDs from the
+[Local AI plan](plans/local-ai-roadmap.md); P/F/G columns link them to this
+roadmap without allocating duplicate IDs. User recipes start at the
+[Local AI guide](../local-ai/index.md).
+
+| Area | Implemented additions | Limits / next validation |
+|---|---|---|
+| Protocols / F-1 / F-7 (AI-HF1/HF2/HF3/HFW, AI-0b) | Commit-pinned `hf://`, paginated trees, token rules, Xet Range reads, offline `hf-cache://`, pooled HTTP/Bearer/prefetch, remote index publishing and Hub live write-back — [Hub](../remote-hf.md) | Native Xet upload and offline remote commit unsupported |
+| Features (AI-GIT, AI-UN, AI-SB1–SB4) | Git refs/prefix/synthetic head, corpus, per-source binds, overlay policy/quotas, diff/stats, ownership mapping, tmpfs and supervisor + Python client — [Git](../git-mounts.md) · [sandbox](../sandbox.md) | Supervisor is Linux; FUSE fleet validation needs `/dev/fuse` |
+| Features (AI-ST, AI-SH) | safetensors/GGUF byte-range plugin; reproducible shards and Parquet/JSONL/CSV export — [tensors](../formats-tensors.md) · [shards](../shards.md) | GGUF little-endian v2–v3; Parquet via default `export-parquet` feature |
+| F-2 / F-9 (AI-CM1/CM2, AI-PV) | Reflink/kernel-copy commit acceleration, journaled append, rolling series, `user.*` provenance and opt-in manifests — [zstd](../zstd-random-access.md) · [rolling](../rolling-archives.md) · [provenance](../provenance.md) | Append only for eligible adds; manifests are separate atomic replacements |
+| F-10 / G-3 (AI-PY1–PY3, AI-RC) | Python library/integrations/mount/publish, shared payload/range budget and Hub cache reuse — [Python](../python.md) · [cache](../phase10-remote.md#persistent-remote-range-cache-ai-rc) | PyPI publication and non-HTTP range-cache wiring pending |
+| Performance (AI-PT, AI-PERF, AI-MEM) | Negotiated FUSE passthrough, 1 MiB request ceiling on 4 KiB pages, zstd decode-ahead, direct I/O, managed memory budget — [tuning](../fuse-kernel-tuning.md) · [budget](../memory-budget.md) | Passthrough needs kernel support + initial-namespace CAP_SYS_ADMIN; kernel pages excluded from RAM cap |
+| G-4 / G-5 (AI-SNAP, AI-DK, AI-CSI) | restic snapshot wrapper, Docker/Podman plugin, in-tree CSI node driver | External restic required; privileged container/CSI validation pending |
+| Packaging / recipes (AI-PKG, AI-BENCH, AI-DOCS) | AUR/Nix/conda/Homebrew-core drafts, portable vendored OpenSSL, AI recipes/benchmark scripts — [packaging](../packaging.md) · [recipes](../local-ai/index.md) | Registry submissions/publication pending; GB10/M5/two-box measurements need hardware |
+
+**Correctness fixes:** concurrent file-backed TAR member reads now use independent positional I/O (AI-FIX-NESTPAR); the VHDX parser accepts qemu-img 11 packed metadata and the logical-sector GUID (AI-FIX-VHDX); crates.io dry-run MSRV checks match the workspace's Rust 1.90 declaration.
 
 ---
 
@@ -292,14 +317,9 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 5. ~~**P-1 + F-4** OCI~~, ~~**P-3** GCS/Azure~~, ~~**P-9** rclone~~, ~~**P-10** SFTP~~ — done (`sftp-russh` is a feature note).
 6. ~~**F-3** FTS5/locate~~ — done (`ratarmount find`, read-only `search/<pattern>`, socket `search`; FTS5 table only via `ensure_fts5`).
 7. ~~**F-9** `--repack-seekable`~~ — done (engine + CLI; ZIP/7z/bzip2/xz residual).
-8. ~~**G-1** booleans~~ — done (`--http --nfs ARCHIVE`; no `serve` subcommand).
-9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known; S3 PUT blob-then-pointer + live `s3://` overlay commit). Residual SOCI / GCS/Azure PUT / offline `s3://` commit / FUSE blob / Hub referrers.
-10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, ~~G-3 cache~~, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
-9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / object-store PUT (F-7) / FUSE blob / Hub referrers.
-10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI driver (systemd/autofs helper shipped); P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
-10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 live L0/PyO3 (dry-run landed), G-3 cache, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
-10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI; P-2 Finder/leases, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
-10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI; SMB Kerberos/WAN, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
+8. ~~**G-1** booleans~~ — done (`--http --nfs ARCHIVE`; optional `serve` sugar).
+9. ~~**G-2** portable index~~ — done (discovery + local/Hub/S3/GCS/Azure publication). Residual SOCI / offline remote commit / FUSE blob / Hub referrers.
+10. Follow the named residuals in F-5–F-10 and G-3–G-5: publication, missing format/protocol features and privileged validation. Local AI implementation is summarized above; Python and CSI are no longer missing implementations.
 
 ---
 
