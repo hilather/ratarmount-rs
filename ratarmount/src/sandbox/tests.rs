@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 fn private_tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir()
+        // Leave room for attempts/ID/inspect.sock within Darwin's 104-byte sun_path.
+        .tempdir_in("/tmp")
         .unwrap()
 }
 
@@ -691,4 +692,29 @@ fn regression_unicode_sources_normalized_without_panics() {
             assert_eq!(result["source"], source);
         }
     }
+}
+
+/// Regression: long macOS temp paths must report the native Unix socket byte limit.
+#[test]
+fn regression_sandbox_socket_path_reports_platform_limit() {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: all-zero sockaddr_un is valid; only the path array length is used.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let limit = address.sun_path.len();
+    let valid = "x".repeat(limit - 1);
+    super::inspection::validate_socket_path(Path::new(&valid)).unwrap();
+    let too_long = PathBuf::from("x".repeat(limit));
+    let error = super::inspection::validate_socket_path(&too_long).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error
+        .to_string()
+        .contains(&format!("shorter than {limit} bytes")));
+    assert!(error.to_string().contains("--state-dir"));
+    assert!(SocketGuard::bind(&too_long)
+        .err()
+        .unwrap()
+        .message
+        .contains(&format!("shorter than {limit} bytes")));
+    let nul = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/a\0b"));
+    assert!(super::inspection::validate_socket_path(nul).is_err());
 }

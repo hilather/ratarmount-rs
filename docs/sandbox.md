@@ -418,7 +418,11 @@ the overlay database's exclusive lock (including deletions awaiting SQL retry).
 The supervisor renders the patch and scans usage in-process. For a crashed
 attempt, diff/stats use its offline database; an unrecoverable database returns
 a structured error. State paths must leave room within the platform's Unix
-socket path limit for `attempts/ID/inspect.sock`.
+socket path limit for `attempts/ID/inspect.sock`: the full path must be shorter
+than 104 bytes on macOS or 108 bytes on Linux. Overlong paths return an error
+with the native limit and the offending path. Use a short private state directory
+under `$XDG_RUNTIME_DIR` or `/tmp` when the usual state/temp directory is too long;
+socket addresses are not relocated automatically.
 
 A failed/timed-out batch rolls back its own children and directories without
 affecting previous attempts. If unmount fails, directories and attempt records

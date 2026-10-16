@@ -7,6 +7,14 @@ use nfsserve::nfs::nfsstat3;
 /// Password / permission failures must not collapse to generic I/O — that is
 /// what users see when opening encrypted nested 7z without `--password`.
 pub fn io_to_nfsstat3(err: &std::io::Error) -> nfsstat3 {
+    // Rust does not classify both Darwin unsupported-operation errnos as Unsupported.
+    // A predicate also handles platforms where these constants are aliases.
+    if err
+        .raw_os_error()
+        .is_some_and(|raw| raw == libc::ENOTSUP || raw == libc::EOPNOTSUPP)
+    {
+        return nfsstat3::NFS3ERR_NOTSUPP;
+    }
     match err.kind() {
         ErrorKind::ReadOnlyFilesystem => nfsstat3::NFS3ERR_ROFS,
         ErrorKind::QuotaExceeded => nfsstat3::NFS3ERR_DQUOT,
@@ -26,7 +34,7 @@ pub fn io_to_nfsstat3(err: &std::io::Error) -> nfsstat3 {
 
 #[cfg(test)]
 mod tests {
-    /// Regression: raw permission/unsupported and unknown errors keep their old statuses.
+    /// Regression: raw permission/unsupported (including Darwin ENOTSUP) and unknown errors keep their old statuses.
     #[test]
     fn regression_nfs_preserves_legacy_raw_errors() {
         for (raw, expected) in [
