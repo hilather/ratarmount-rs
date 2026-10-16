@@ -166,6 +166,9 @@ pub fn spawn_interval_commits(
                     LiveRemote::S3 => reopen_s3_mount(&remote_url, &opts),
                     LiveRemote::Gcs => reopen_gcs_mount(&remote_url, &opts),
                     LiveRemote::Azure => reopen_azure_mount(&remote_url, &opts),
+                    LiveRemote::Hf => Err(OverlayError::Msg(
+                        "hf:// is not supported for commit".into(),
+                    )),
                     LiveRemote::Local => {
                         if let Some(window) = ov.last_patch_window() {
                             patch_sidecar_if_present(p, &window, &opts)?;
@@ -383,6 +386,9 @@ pub fn validate_live_commit_args(
     }
     let archive = inputs[0].clone();
     let shown = archive.to_string_lossy();
+    if live_remote_kind(&shown) == LiveRemote::Hf {
+        return Err("hf:// is not supported for commit; Hub mounts are read-only".into());
+    }
     if matches!(
         live_remote_kind(&shown),
         LiveRemote::S3 | LiveRemote::Gcs | LiveRemote::Azure
@@ -410,7 +416,9 @@ pub fn validate_live_commit_args(
 /// Offline `--commit-overlay` on an object-store URL. Not a live-queue job.
 pub fn offline_remote_commit_error(archive: &Path) -> Option<&'static str> {
     let s = archive.to_string_lossy();
-    if ratarmount_remote::is_object_store_archive_url(&s) {
+    if live_remote_kind(&s) == LiveRemote::Hf {
+        Some("hf:// is not supported for commit; Hub mounts are read-only")
+    } else if ratarmount_remote::is_object_store_archive_url(&s) {
         Some(
             "offline --commit-overlay does not upload; use --commit-overlay-on-exit or --commit-overlay-interval",
         )
@@ -422,13 +430,16 @@ pub fn offline_remote_commit_error(archive: &Path) -> Option<&'static str> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LiveRemote {
     Local,
+    Hf,
     S3,
     Gcs,
     Azure,
 }
 
 fn live_remote_kind(url: &str) -> LiveRemote {
-    if url.starts_with("s3://") {
+    if ratarmount_remote::remote_url_scheme(url).as_deref() == Some("hf") {
+        LiveRemote::Hf
+    } else if url.starts_with("s3://") {
         LiveRemote::S3
     } else if url.starts_with("gs://") {
         LiveRemote::Gcs
@@ -490,7 +501,7 @@ pub fn install_object_store_live_commit(
 ) {
     let url = archive.to_string_lossy().into_owned();
     match live_remote_kind(&url) {
-        LiveRemote::Local => {}
+        LiveRemote::Local | LiveRemote::Hf => {}
         LiveRemote::S3 => install_s3_live_commit(overlay, archive, opts),
         LiveRemote::Gcs => {
             let url_head = url.clone();
@@ -1161,6 +1172,21 @@ pub(crate) fn term_flag_test_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: hf commit URLs must not be stat-ed as local filenames.
+    #[test]
+    fn regression_hf_commit_reports_unsupported() {
+        let archive = std::path::PathBuf::from("hf://datasets/org/data/a.tar.zst");
+        let err = super::validate_live_commit_args(
+            Some(std::path::Path::new("overlay")),
+            std::slice::from_ref(&archive),
+        )
+        .unwrap_err();
+        assert!(err.contains("hf:// is not supported for commit"), "{err}");
+        assert!(super::offline_remote_commit_error(&archive)
+            .unwrap()
+            .contains("not supported for commit"));
+    }
 
     #[test]
     fn parse_interval_off() {

@@ -620,8 +620,9 @@ pub fn is_index_url(s: &str) -> bool {
 
 /// Sibling index URL convention for a remote archive: `archive_url + ".index.sqlite"`.
 ///
-/// Returns `None` when `archive_url` is not `http(s)://`. Object-store well-known
-/// keys use [`object_store_sibling_index_candidates`]. Compressed suffixes are
+/// Returns `None` when `archive_url` is not `http(s)://`.
+/// Hub URLs are mapped to commit-pinned resolve URLs by the session. Object-store
+/// well-known keys use [`object_store_sibling_index_candidates`]. Compressed suffixes are
 /// listed by [`sibling_index_candidates`].
 pub fn sibling_index_url(archive_url: &str) -> Option<String> {
     let s = archive_url.trim();
@@ -680,7 +681,7 @@ pub fn sibling_index_id_candidates(archive_url: &str, index_id: &str) -> Vec<Str
     }
 }
 
-/// http(s) sibling index URLs: uncompressed [`sibling_index_url`] then `.gz` /
+/// HTTP(S) sibling index URLs: uncompressed [`sibling_index_url`] then `.gz` /
 /// `.zst` / `.xz` / `.bz2`. Empty for `s3://`, `file://`, and local paths.
 pub fn sibling_index_candidates(archive_url: &str) -> Vec<String> {
     let Some(base) = sibling_index_url(archive_url) else {
@@ -1438,6 +1439,33 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    /// Regression: branch-relative hf siblings could escape commit pinning.
+    #[test]
+    fn regression_hf_siblings_require_pinned_resolve_urls() {
+        let id = "a".repeat(64);
+        for url in [
+            "hf://datasets/org/data@main/a.tar.zst",
+            "hf://org/data/a.tar",
+        ] {
+            assert!(sibling_index_pointer_url(url).is_none());
+            assert!(sibling_index_candidates(url).is_empty());
+            assert!(sibling_index_id_candidates(url, &id).is_empty());
+        }
+        let url = "https://huggingface.co/datasets/org/data/resolve/0123456789abcdef0123456789abcdef01234567/a.tar.zst";
+        assert_eq!(
+            sibling_index_pointer_url(url).unwrap(),
+            format!("{url}.index.ptr")
+        );
+        assert_eq!(
+            sibling_index_candidates(url)[0],
+            format!("{url}.index.sqlite")
+        );
+        assert_eq!(
+            sibling_index_id_candidates(url, &id)[0],
+            format!("{url}.index.{id}.sqlite")
+        );
+    }
 
     #[test]
     fn home_dir_prefers_home_then_userprofile_then_homedrive_path() {

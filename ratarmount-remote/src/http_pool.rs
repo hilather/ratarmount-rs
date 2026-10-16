@@ -12,6 +12,17 @@ use secrecy::ExposeSecret;
 
 use crate::{apply_http_auth, HttpAuthOptions, HttpLocation, HTTP_RANGE_CHUNK, USER_AGENT};
 
+pub(crate) fn redacted_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return "[invalid URL]".into();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 pub(crate) fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
@@ -32,6 +43,7 @@ pub(crate) struct HttpRequest {
     url: String,
     headers: Vec<(String, String)>,
     timeout: Option<Duration>,
+    linked_sha256: Option<Arc<Mutex<Option<String>>>>,
 }
 
 pub(crate) fn request(method: &str, url: &str) -> HttpRequest {
@@ -40,6 +52,7 @@ pub(crate) fn request(method: &str, url: &str) -> HttpRequest {
         url: url.into(),
         headers: vec![],
         timeout: None,
+        linked_sha256: None,
     }
 }
 
@@ -107,7 +120,31 @@ impl HttpRequest {
             let resp = match body {
                 Some(bytes) => req.send_bytes(bytes),
                 None => req.call(),
-            }?;
+            }
+            .map_err(|e| match e {
+                // Other protocol backends also display these errors directly. Drop
+                // the transport's URL-bearing source chain before it can be logged.
+                ureq::Error::Transport(err) => ureq::Error::from(io::Error::other(format!(
+                    "HTTP {:?} for {}",
+                    err.kind(),
+                    redacted_url(&self.url)
+                ))),
+                status => status,
+            })?;
+            if let (Some(capture), Some(value)) =
+                (&self.linked_sha256, resp.header("X-Linked-Etag"))
+            {
+                let value = value
+                    .trim_matches('"')
+                    .strip_prefix("sha256:")
+                    .unwrap_or(value.trim_matches('"'));
+                if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    capture
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(|| value.to_ascii_lowercase());
+                }
+            }
             let status = resp.status();
             let redirect = matches!(status, 301..=303)
                 || (matches!(status, 307 | 308)
@@ -167,13 +204,22 @@ struct Target {
     redirected: bool,
 }
 
+#[derive(Default)]
+struct CacheIdentity {
+    token: Option<ContentToken>,
+    etag: Option<String>,
+    disabled: bool,
+}
+
 /// Shared HTTP transport with verified persistent range caching.
 pub struct HttpRangeSource {
     pub(crate) location: HttpLocation,
     pub(crate) options: HttpAuthOptions,
     target: Mutex<Option<Target>>,
-    content_token: Mutex<Option<ContentToken>>,
+    content_token: Mutex<CacheIdentity>,
     cache: Option<RangeCache>,
+    hub_repo: Option<String>,
+    linked_sha256: Arc<Mutex<Option<String>>>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -183,9 +229,16 @@ impl HttpRangeSource {
             location,
             options,
             target: Mutex::new(None),
-            content_token: Mutex::new(None),
+            content_token: Mutex::new(CacheIdentity::default()),
             cache: RangeCache::from_env(),
+            hub_repo: None,
+            linked_sha256: Arc::default(),
         }
+    }
+
+    pub(crate) fn with_hub_repo(mut self, repo: String) -> Self {
+        self.hub_repo = Some(repo);
+        self
     }
 
     pub fn url(&self) -> &str {
@@ -201,18 +254,29 @@ impl HttpRangeSource {
     }
 
     pub(crate) fn set_content_token(&self, token: ContentToken) {
-        *self.content_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
+        let mut identity = self.content_token.lock().unwrap_or_else(|e| e.into_inner());
+        if let ContentToken::StrongEtag { etag, .. } = &token {
+            if identity.etag.as_ref().is_some_and(|first| first != etag) {
+                identity.disabled = true;
+            } else {
+                identity.etag = Some(etag.clone());
+            }
+        }
+        identity.token = Some(token);
     }
 
     fn token(&self, size: u64) -> Option<ContentToken> {
-        self.content_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .filter(|t| t.size() == size)
+        let identity = self.content_token.lock().unwrap_or_else(|e| e.into_inner());
+        if identity.disabled {
+            return None;
+        }
+        identity.token.clone().filter(|t| t.size() == size)
     }
 
     pub(crate) fn observe_identity(&self, resp: &ureq::Response, size: u64) {
+        if !self.cache.as_ref().is_some_and(|cache| cache.is_enabled()) {
+            return;
+        }
         let Some(etag) = resp
             .header("ETag")
             .filter(|v| ContentToken::is_strong_etag(v))
@@ -220,13 +284,28 @@ impl HttpRangeSource {
             return;
         };
         let mut identity = self.content_token.lock().unwrap_or_else(|e| e.into_inner());
-        if identity.is_none() {
-            *identity = Some(ContentToken::StrongEtag {
+        if identity.disabled {
+            return;
+        }
+        if identity.etag.as_ref().is_some_and(|first| first != etag) {
+            // Cache validators are advisory. Edge-specific ETags must never fail I/O.
+            identity.disabled = true;
+            return;
+        }
+        identity.etag = Some(etag.into());
+        if identity.token.is_none() {
+            identity.token = Some(ContentToken::StrongEtag {
                 resource: self.url().into(),
                 etag: etag.into(),
                 size,
             });
         }
+    }
+
+    /// Use an explicit disk cache (useful to embedders and isolated mounts).
+    pub fn with_range_cache(mut self, cache: RangeCache) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Contiguous completed cache file for passthrough/Hub-cache consumers.
@@ -248,6 +327,19 @@ impl HttpRangeSource {
             .all(|chunk| cache.contains(&token, chunk))
     }
 
+    #[cfg(test)]
+    pub(crate) fn without_range_cache(mut self) -> Self {
+        self.cache = None;
+        self
+    }
+
+    pub(crate) fn linked_sha256(&self) -> Option<String> {
+        self.linked_sha256
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn call(
         &self,
         url: &str,
@@ -259,6 +351,9 @@ impl HttpRangeSource {
         let mut req = request(method, url)
             .set("User-Agent", USER_AGENT)
             .set("Accept-Encoding", "identity");
+        if self.hub_repo.is_some() {
+            req.linked_sha256 = Some(Arc::clone(&self.linked_sha256));
+        }
         if let Some((start, end)) = range {
             req = req.set("Range", &format!("bytes={start}-{end}"));
         }
@@ -369,7 +464,12 @@ impl HttpRangeSource {
         let timeout = cancelled.map(|_| Duration::from_secs(60));
         let resp = self
             .request_with_timeout("GET", Some((start, end)), timeout)
-            .map_err(|e| io::Error::other(crate::map_ureq_http_error(e, self.url())))?;
+            .map_err(|e| {
+                io::Error::other(match &self.hub_repo {
+                    Some(repo) => crate::hf::map_http_error(repo, e),
+                    None => crate::map_ureq_http_error(e, self.url()),
+                })
+            })?;
         let status = resp.status();
         if status == 206 {
             validate_content_range(&resp, start, end, Some(size))?;
@@ -381,15 +481,14 @@ impl HttpRangeSource {
             self.observe_identity(&resp, size);
             cache_token = self.token(size);
             if let Some(ContentToken::StrongEtag { etag, .. }) = &cache_token {
-                match resp.header("ETag") {
-                    Some(actual) if actual != etag => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "HTTP content ETag changed during range reads",
-                        ))
-                    }
-                    None => cache_token = None,
-                    _ => {}
+                if resp.header("ETag") != Some(etag.as_str()) {
+                    // Weak or absent GET validators cannot verify the strong
+                    // identity learned from HEAD. Keep the read, bypass cache.
+                    self.content_token
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .disabled = true;
+                    cache_token = None;
                 }
             }
         }
@@ -412,12 +511,25 @@ impl HttpRangeSource {
 
     // Cache hits borrow the caller's storage. Verified misses fetch a reusable
     // aligned chunk; sources without verified identity retain the direct path.
-    pub(crate) fn read_into(&self, start: u64, size: u64, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn read_into(&self, start: u64, size: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_into_with_pattern(start, size, buf, false)
+    }
+
+    pub(crate) fn read_into_with_pattern(
+        &self,
+        start: u64,
+        size: u64,
+        buf: &mut [u8],
+        sequential: bool,
+    ) -> io::Result<usize> {
         let len = (buf.len() as u64).min(self.window_len(start, size)) as usize;
         if let Some(n) = self.read_cached_into(start, size, &mut buf[..len]) {
             return Ok(n);
         }
-        if self.cache.as_ref().is_some_and(|c| c.is_enabled()) && self.token(size).is_some() {
+        if (sequential || len >= 256 * 1024)
+            && self.cache.as_ref().is_some_and(|c| c.is_enabled())
+            && self.token(size).is_some()
+        {
             let data = self.fetch(start, start + len as u64 - 1, size, None)?;
             buf[..data.len()].copy_from_slice(&data);
             return Ok(data.len());
@@ -431,10 +543,6 @@ impl HttpRangeSource {
                 && len as u64 == cache.chunk_size().min(size - start)
             {
                 let _ = cache.put(&token, start / cache.chunk_size(), &buf[..len]);
-            } else {
-                // An unprobed reader only learned its strong identity from this
-                // partial response. Fill the aligned window for subsequent opens.
-                let _ = self.fetch(start, start + len as u64 - 1, size, None);
             }
         }
         Ok(len)
@@ -684,6 +792,7 @@ pub(crate) struct Prefetch {
     source: Arc<HttpRangeSource>,
     size: u64,
     next: u64,
+    position: u64,
     parallel: usize,
     window: usize,
     budget: Arc<PrefetchBudget>,
@@ -712,6 +821,7 @@ impl Prefetch {
             source,
             size,
             next: start,
+            position: start,
             parallel,
             window: 1,
             budget,
@@ -721,11 +831,16 @@ impl Prefetch {
     }
 
     fn fill(&mut self) -> io::Result<()> {
-        while self.pending.len() < self.window && self.next < self.size {
+        let horizon = self
+            .position
+            .saturating_add(HTTP_RANGE_CHUNK * self.parallel as u64)
+            .min(self.size);
+        while self.pending.len() < self.window && self.next < horizon {
             let start = self.next;
             let end = start + self.source.window_len(start, self.size) - 1;
             if self.source.cache_available(start, end, self.size) {
-                break;
+                self.next = end + 1;
+                continue;
             }
             let Some(permit) = self.budget.try_acquire() else {
                 break;
@@ -754,9 +869,12 @@ impl Prefetch {
 
     // None means capacity is occupied elsewhere; the caller can read synchronously.
     pub(crate) fn read(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        if self.pending.is_empty() {
+        self.position = pos;
+        if self.pending.front().is_none_or(|range| pos < range.start) {
             if let Some(n) = self.source.read_cached_into(pos, self.size, buf) {
-                self.next = pos + n as u64;
+                self.position = pos + n as u64;
+                self.next = self.next.max(self.position);
+                self.fill()?;
                 return Ok(Some(n));
             }
         }
@@ -764,6 +882,16 @@ impl Prefetch {
         let Some(front) = self.pending.front_mut() else {
             return Ok(None);
         };
+        if pos < front.start {
+            // The skipped disk window was evicted after scheduling. Read just
+            // that gap synchronously while preserving the later queued workers.
+            let n = buf.len().min((front.start - pos) as usize);
+            let n = self
+                .source
+                .read_into_with_pattern(pos, self.size, &mut buf[..n], true)?;
+            self.position = pos + n as u64;
+            return Ok(Some(n));
+        }
         if let Some(worker) = front.worker.take() {
             // Move the original io::Error out, preserving its source and raw errno.
             front.data = Some(
@@ -776,6 +904,7 @@ impl Prefetch {
         let offset = (pos - front.start) as usize;
         let n = buf.len().min(data.len() - offset);
         buf[..n].copy_from_slice(&data[offset..offset + n]);
+        self.position = pos + n as u64;
         if offset + n == data.len() {
             self.pending.pop_front();
             self.window = (self.window * 2).min(self.parallel);

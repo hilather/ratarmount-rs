@@ -1091,7 +1091,7 @@ fn regression_http_full_get_fallback_rejects_non_success_status() {
 
 fn range_cache_in(dir: &std::path::Path, cap: u64) -> RangeCache {
     RangeCache::with_dirs(
-        dir.join("range-v1"),
+        dir.join("payload-v1/range-v1"),
         dir.join("payload-v1"),
         cap,
         HTTP_RANGE_CHUNK,
@@ -1265,7 +1265,7 @@ fn regression_http_range_cache_rejects_short_mismatched_or_unverified_response()
         let mut file = file_with_cache(&server, cache.clone());
         let mut buf = [0; 16];
         let result = file.read_exact(&mut buf);
-        if ["short", "range", "etag"].contains(&mode) {
+        if ["short", "range"].contains(&mode) {
             assert!(result.is_err(), "{mode}");
         }
         assert!(
@@ -1374,7 +1374,7 @@ fn regression_http_range_cache_get_probe_captures_identity() {
 
 /// Regression: an unprobed reader must persist its first partial range once a strong ETag arrives.
 #[test]
-fn regression_http_range_cache_unprobed_first_partial_read() {
+fn regression_http_range_cache_unprobed_partial_read_does_not_refetch_aligned_chunk() {
     let dir = tempfile::tempdir().unwrap();
     let cache = range_cache_in(dir.path(), 1024);
     let gets = Arc::new(AtomicUsize::new(0));
@@ -1401,10 +1401,166 @@ fn regression_http_range_cache_unprobed_first_partial_read() {
     first.seek(SeekFrom::Start(7)).unwrap();
     first.read_exact(&mut buf).unwrap();
     assert_eq!(buf.as_slice(), pattern(7, 3));
-    assert_eq!(gets.load(Ordering::Relaxed), 2);
+    assert_eq!(gets.load(Ordering::Relaxed), 1);
     let mut second = file_with_cache(&server, cache);
     let mut all = [0; 128];
     second.read_exact(&mut all).unwrap();
     assert_eq!(all.as_slice(), pattern(0, 128));
     assert_eq!(gets.load(Ordering::Relaxed), 2);
+}
+
+/// Regression: HEAD/GET ETag differences failed reads, including when disk caching was disabled.
+#[test]
+fn regression_http_range_cache_etag_changes_bypass_without_failing_reads() {
+    for (cap, get_etag) in [(0, "\"get\""), (1024, "\"get\""), (1024, "W/\"head\"")] {
+        let temp = tempfile::tempdir().unwrap();
+        let server = Server::spawn(move |req| {
+            let etag = if req.method == "HEAD" {
+                "\"head\""
+            } else {
+                get_etag
+            };
+            let mut response = Response::ranged(&req, 16);
+            response.headers.push(("ETag".into(), etag.into()));
+            response
+        });
+        let mut file = file_with_cache(&server, range_cache_in(temp.path(), cap));
+        let mut bytes = [0; 16];
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes.as_slice(), pattern(0, 16));
+        assert!(file.complete_file().is_none());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes.as_slice(), pattern(0, 16));
+    }
+}
+
+/// Regression: explicit commit/hash tokens did not pin the first observed strong CDN ETag.
+#[test]
+fn regression_http_range_cache_explicit_token_etag_change_disables_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let version = Arc::new(AtomicUsize::new(1));
+    let current = version.clone();
+    let server = Server::spawn(move |req| {
+        let mut response = Response::ranged(&req, 16);
+        response.headers.push((
+            "ETag".into(),
+            format!("\"v{}\"", current.load(Ordering::Relaxed)),
+        ));
+        response
+    });
+    let mut file = file_with_cache(&server, range_cache_in(temp.path(), 1024)).with_content_token(
+        ContentToken::HfCommitPath {
+            endpoint: "https://huggingface.co".into(),
+            repo_kind: "models".into(),
+            repo: "org/model".into(),
+            commit: "a".repeat(40),
+            path: "f".into(),
+            size: 16,
+        },
+    );
+    version.store(2, Ordering::Relaxed);
+    let mut bytes = [0; 16];
+    file.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes.as_slice(), pattern(0, 16));
+    assert!(file.source.token(16).is_none());
+    assert!(file.complete_file().is_none());
+}
+
+/// Regression: sparse TAR header reads fetched 4 MiB per 512-byte header with a strong ETag.
+#[test]
+fn regression_http_range_cache_small_random_headers_do_not_overfetch() {
+    let temp = tempfile::tempdir().unwrap();
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let requests = requested.clone();
+    let server = Server::spawn(move |req| {
+        if req.method == "GET" {
+            requests.lock().unwrap().push(req.range());
+        }
+        let mut response = Response::ranged(&req, 32 * HTTP_RANGE_CHUNK);
+        response.headers.push(("ETag".into(), "\"v1\"".into()));
+        response
+    });
+    let mut file = file_with_cache(&server, range_cache_in(temp.path(), 64 * HTTP_RANGE_CHUNK));
+    for offset in [0, HTTP_RANGE_CHUNK * 3, HTTP_RANGE_CHUNK * 7] {
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut bytes = [0; 512];
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes.as_slice(), pattern(offset, 512));
+    }
+    assert_eq!(
+        requested.lock().unwrap().as_slice(),
+        &[
+            (0, 511),
+            (HTTP_RANGE_CHUNK * 3, HTTP_RANGE_CHUNK * 3 + 511),
+            (HTTP_RANGE_CHUNK * 7, HTTP_RANGE_CHUNK * 7 + 511)
+        ]
+    );
+}
+
+/// Regression: prefetch stopped at cached windows and never scheduled the later cold shard pages.
+#[test]
+fn regression_http_range_cache_prefetch_skips_cached_windows() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = RangeCache::with_dirs(
+        temp.path().join("payload-v1/range-v1"),
+        temp.path().join("payload-v1"),
+        128,
+        4,
+    );
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let ranges = requests.clone();
+    let server = Server::spawn(move |req| {
+        if req.method == "GET" {
+            ranges.lock().unwrap().push(req.range());
+        }
+        let mut response = Response::ranged(&req, 12);
+        response.headers.push(("ETag".into(), "\"v1\"".into()));
+        response
+    });
+    let file = file_with_cache(&server, cache.clone());
+    cache
+        .put(&file.source.token(12).unwrap(), 0, &pattern(0, 4))
+        .unwrap();
+    let budget = Arc::new(PrefetchBudget::new(1));
+    let mut prefetch = Prefetch::with_budget(file.source, 0, 12, 8, budget);
+    prefetch.fill().unwrap();
+    assert_eq!(prefetch.pending.front().unwrap().start, 4);
+    let mut bytes = [0; 4];
+    assert_eq!(prefetch.read(0, &mut bytes).unwrap(), Some(4));
+    assert_eq!(bytes.as_slice(), pattern(0, 4));
+    assert_eq!(prefetch.read(4, &mut bytes).unwrap(), Some(4));
+    assert_eq!(bytes.as_slice(), pattern(4, 4));
+    assert_eq!(requests.lock().unwrap().as_slice(), &[(4, 7)]);
+}
+
+/// Regression: an explicit strong ETag also has to match the first GET on an unprobed reader.
+#[test]
+fn regression_http_range_cache_explicit_strong_etag_mismatch_bypasses() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::spawn(|req| {
+        let mut response = Response::ranged(&req, 16);
+        response.headers.push(("ETag".into(), "\"actual\"".into()));
+        response
+    });
+    let source = HttpRangeSource::new(
+        HttpLocation {
+            url: server.url.clone(),
+            auth: None,
+            cookie: None,
+        },
+        HttpAuthOptions::default(),
+    )
+    .with_range_cache(range_cache_in(temp.path(), 1024))
+    .with_content_token(ContentToken::StrongEtag {
+        resource: server.url.clone(),
+        etag: "\"expected\"".into(),
+        size: 16,
+    });
+    let mut file = HttpRangeFile::from_source(Arc::new(source), 16, None);
+    let mut bytes = [0; 16];
+    file.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes.as_slice(), pattern(0, 16));
+    assert!(file.source.token(16).is_none());
+    assert!(file.complete_file().is_none());
 }

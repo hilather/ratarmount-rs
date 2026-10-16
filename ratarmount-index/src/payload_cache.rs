@@ -13,7 +13,9 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::range_cache::{ensure_private_dir, open_regular, temporary, timestamp, SharedBudget};
+use crate::range_cache::{
+    check_private_dir, ensure_private_dir, open_regular, temporary, timestamp, SharedBudget,
+};
 use crate::HASH_STREAM_CHUNK;
 
 /// Shared payload-v1 + range-v1 byte cap. `0` disables both. Default [`PAYLOAD_CACHE_BYTES_DEFAULT`].
@@ -93,15 +95,18 @@ impl PayloadCache {
         self.budget.is_some() && self.member_max > 0
     }
 
-    /// Existing `{hh}/{sha256}` whose header length matches the blob.
+    /// Open `{hh}/{sha256}` whose header length matches the blob. The owned fd
+    /// remains readable after another installer unlinks its cache path.
     ///
     /// A missing header or blob is a miss, not corruption: install writes the
     /// header then renames the tmp, so a concurrent lookup must not unlink a
     /// just-published (or about-to-be-renamed) file.
-    pub fn lookup(&self, sha256: &str) -> Option<PathBuf> {
+    pub fn lookup(&self, sha256: &str) -> Option<File> {
         self.budget?;
         let key = normalize_sha256(sha256)?;
         let blob = self.blob_path(&key);
+        check_private_dir(&self.dir).ok()?;
+        check_private_dir(&self.fanout_dir(&key)).ok()?;
         let hdr = match self.read_header(&key) {
             Ok(h) if h.schema == PAYLOAD_SCHEMA => h,
             _ => return None,
@@ -117,10 +122,8 @@ impl PayloadCache {
         {
             return None;
         }
-        let meta = match open_regular(&blob).and_then(|f| f.metadata()) {
-            Ok(m) if m.is_file() => m,
-            _ => return None,
-        };
+        let file = open_regular(&blob).ok()?;
+        let meta = file.metadata().ok()?;
         if meta.len() != hdr.len || hdr.len == 0 {
             debug!("payload-v1 corrupt {key} (len mismatch or empty)");
             self.invalidate_key(&key);
@@ -128,7 +131,7 @@ impl PayloadCache {
         }
         self.touch(&key, &hdr);
         debug!("payload-v1 hit {key} -> {}", blob.display());
-        Some(blob)
+        Some(file)
     }
 
     /// Copy `reader` to `{sha256}.tmp.{pid}` + rename. Fail-closed on short/hash mismatch.
@@ -138,6 +141,16 @@ impl PayloadCache {
         expected_len: u64,
         reader: &mut R,
     ) -> io::Result<PathBuf> {
+        self.install_open(sha256, expected_len, reader)
+            .map(|(path, _)| path)
+    }
+
+    fn install_open<R: Read>(
+        &self,
+        sha256: &str,
+        expected_len: u64,
+        reader: &mut R,
+    ) -> io::Result<(PathBuf, File)> {
         let Some(budget) = self.budget else {
             return Err(io::Error::other(
                 "RATARMOUNT_PAYLOAD_CACHE_BYTES=0 disables payload-v1; not meta-v3",
@@ -155,8 +168,8 @@ impl PayloadCache {
             ));
         }
         if let Some(existing) = self.lookup(&key) {
-            if fs::metadata(&existing).map(|m| m.len()).unwrap_or(0) == expected_len {
-                return Ok(existing);
+            if existing.metadata().map(|m| m.len()).unwrap_or(0) == expected_len {
+                return Ok((self.blob_path(&key), existing));
             }
         }
         self.ensure_fanout(&key)?;
@@ -194,33 +207,43 @@ impl PayloadCache {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
+        let file = match open_regular(&tmp) {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
         if let Err(e) = fs::rename(&tmp, &dest) {
             let _ = fs::remove_file(&tmp);
             self.invalidate_key(&key);
             return Err(e);
         }
-        self.shared_budget
-            .install(&dest, expected_len, budget, &[])?;
+        if let Err(e) = self.shared_budget.install(&dest, expected_len, budget, &[]) {
+            log::warn!("payload-v1 published; cache maintenance failed: {e}");
+        }
         debug!(
             "payload-v1 store {key} -> {} ({expected_len} bytes)",
             dest.display()
         );
-        Ok(dest)
+        Ok((dest, file))
     }
 
-    /// Hit or fill. `fill` is not called on a valid lookup (second open skips the archive).
-    pub fn get_or_fill<R, F>(&self, sha256: &str, expected_len: u64, fill: F) -> io::Result<PathBuf>
+    /// Hit or fill, returning an owned read fd immune to path eviction races.
+    /// `fill` is not called on a valid lookup (second open skips the archive).
+    pub fn get_or_fill<R, F>(&self, sha256: &str, expected_len: u64, fill: F) -> io::Result<File>
     where
         R: Read,
         F: FnOnce() -> io::Result<R>,
     {
         if let Some(path) = self.lookup(sha256) {
-            if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == expected_len {
+            if path.metadata().map(|m| m.len()).unwrap_or(0) == expected_len {
                 return Ok(path);
             }
         }
         let mut reader = fill()?;
-        self.install_from_reader(sha256, expected_len, &mut reader)
+        self.install_open(sha256, expected_len, &mut reader)
+            .map(|(_, file)| file)
     }
 
     fn blob_path(&self, key: &str) -> PathBuf {
@@ -264,7 +287,7 @@ impl PayloadCache {
         next.last_hit = timestamp().max(hdr.last_hit.saturating_add(1));
         self.shared_budget
             .touch(&self.blob_path(key), hdr.len, next.last_hit);
-        let _ = self.write_header(key, &next);
+        // Persist recency in batches during shared cache maintenance.
     }
 
     fn invalidate_key(&self, key: &str) {
@@ -429,11 +452,16 @@ mod tests {
             fills.fetch_add(1, Ordering::SeqCst);
             Ok::<_, io::Error>(Cursor::new(body.to_vec()))
         };
-        let p1 = cache.get_or_fill(&sha, body.len() as u64, fill).unwrap();
-        assert_eq!(fs::read(&p1).unwrap(), body);
+        let mut first = cache.get_or_fill(&sha, body.len() as u64, fill).unwrap();
+        let mut bytes = Vec::new();
+        first.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, body);
+        let p1 = cache.blob_path(&sha);
         assert_eq!(fills.load(Ordering::SeqCst), 1);
-        let p2 = cache.get_or_fill(&sha, body.len() as u64, fill).unwrap();
-        assert_eq!(p2, p1);
+        let mut second = cache.get_or_fill(&sha, body.len() as u64, fill).unwrap();
+        let mut bytes = Vec::new();
+        second.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, body);
         assert_eq!(fills.load(Ordering::SeqCst), 1);
         let rel = p1.strip_prefix(&cache.dir).unwrap();
         let comps: Vec<_> = rel

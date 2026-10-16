@@ -733,6 +733,16 @@ mod tests {
     /// Regression: NFSv4 policy failures retain ROFS and the supported NOSPC fallback.
     #[test]
     fn regression_overlay_policy_denials() {
+        overlay_policy_denials(false);
+    }
+
+    /// Regression: real sandbox globs and quotas retain protocol EROFS/EDQUOT errors.
+    #[test]
+    fn regression_sandbox_policy_denials() {
+        overlay_policy_denials(true);
+    }
+
+    fn overlay_policy_denials(real: bool) {
         let td = tempfile::tempdir().unwrap();
         let mut ov = WriteOverlay::new(Arc::new(Synth::new()), td.path()).unwrap();
         ov.mkdir("/locked", 0o755).unwrap();
@@ -741,7 +751,20 @@ mod tests {
             let fd = ov.create_file(path, 0o644).unwrap();
             ov.close_overlay_fd(fd);
         }
-        ov.set_policy(Some(Arc::new(TestPolicy)));
+        if real {
+            use ratarmount_compositing::{CompositeOverlayPolicy, OverlayQuota, ReadOnlyGlobs};
+            ov.set_policy(Some(Arc::new(CompositeOverlayPolicy(vec![
+                Arc::new(
+                    ReadOnlyGlobs::new(["locked/**"])
+                        .unwrap()
+                        .with_overlay_root(td.path())
+                        .unwrap(),
+                ),
+                Arc::new(OverlayQuota::new(td.path(), Some(2), None).unwrap()),
+            ]))));
+        } else {
+            ov.set_policy(Some(Arc::new(TestPolicy)));
+        }
         let ov = Arc::new(ov);
 
         let nfs = RatarmountNfs4::with_overlay(ov.clone(), 0, Some(ov));

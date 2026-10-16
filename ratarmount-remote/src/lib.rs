@@ -43,6 +43,8 @@ mod ssh;
 mod webdav;
 
 // --- inbound protocol modules (worktree PRs: one `mod` + `pub use` pair only) ---
+mod hf;
+pub use hf::{open_hf_range, parse_hf_url, HfLocation, HfMountSource, HfRepo};
 mod folder;
 pub use folder::{try_open_remote_folder, RemoteDirent, RemoteFolderMountSource, RemoteListing};
 mod ftp;
@@ -382,6 +384,7 @@ fn apply_http_auth(
 }
 
 fn http_unauthorized(url: &str) -> RemoteError {
+    let url = http_pool::redacted_url(url);
     RemoteError::Http(format!(
         "HTTP 401 Unauthorized for {url}; provide credentials via URL userinfo \
          (https://user:pass@host/...), {HTTP_USER_ENV}/{HTTP_PASSWORD_ENV}, \
@@ -393,15 +396,23 @@ fn http_status_err(status: u16, url: &str) -> RemoteError {
     if status == 401 {
         http_unauthorized(url)
     } else {
-        RemoteError::Http(format!("HTTP {status} for {url}"))
+        RemoteError::Http(format!(
+            "HTTP {status} for {}",
+            http_pool::redacted_url(url)
+        ))
     }
 }
 
 fn map_ureq_http_error(err: ureq::Error, url: &str) -> RemoteError {
     match err {
         ureq::Error::Status(401, _) => http_unauthorized(url),
-        ureq::Error::Status(code, _) => RemoteError::Http(format!("HTTP {code} for {url}")),
-        other => RemoteError::Http(other.to_string()),
+        ureq::Error::Status(code, _) => http_status_err(code, url),
+        // Transport Display (and its source chain) may contain a signed CDN URL.
+        ureq::Error::Transport(err) => RemoteError::Http(format!(
+            "HTTP {:?} for {}",
+            err.kind(),
+            http_pool::redacted_url(url)
+        )),
     }
 }
 
@@ -411,6 +422,14 @@ pub enum RemoteError {
     Io(#[from] io::Error),
     #[error("url: {0}")]
     Url(String),
+    #[error("hf: {0}")]
+    Hf(String),
+    #[error("hf: {message}")]
+    HfStatus {
+        status: u16,
+        code: Option<String>,
+        message: String,
+    },
     #[error("http: {0}")]
     Http(String),
     #[error("s3: {0}")]
@@ -449,6 +468,7 @@ pub type Result<T> = std::result::Result<T, RemoteError>;
 const REMOTE_SCHEMES: &[&str] = &[
     "http", "https", "file", "ftp", "ftps", "s3", "gs", "az", "azure", "ssh", "sftp", "scp", "smb",
     "webdav", "webdavs", "dropbox", "oci", "docker", "ghcr", "ipfs", "ipns", "rclone", "restic",
+    "hf",
 ];
 
 /// ASCII-lowercase scheme before the first `://`, if any.
@@ -500,6 +520,7 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
     }
     let scheme = remote_url_scheme(input).unwrap_or_default();
     match scheme.as_str() {
+        "hf" => keep_from_reader(input, open_hf_range(input)?),
         "file" => {
             let url = Url::parse(input).map_err(|e| RemoteError::Url(e.to_string()))?;
             let path = url
@@ -581,7 +602,11 @@ fn keep_fetched(input: &str, tmp: NamedTempFile, size: u64) -> Result<RemoteLoca
         .into_temp_path()
         .keep()
         .map_err(|e| RemoteError::Io(e.error))?;
-    debug!("fetched {input} -> {} ({size} bytes)", path.display());
+    debug!(
+        "fetched {} -> {} ({size} bytes)",
+        http_pool::redacted_url(input),
+        path.display()
+    );
     Ok(RemoteLocal::Fetched { path, size })
 }
 
@@ -730,13 +755,20 @@ fn probe_http_source(source: &HttpRangeSource) -> Result<HttpProbe> {
             return Err(http_unauthorized(url));
         }
         Ok(resp) => {
-            debug!("HEAD {url} -> {}, probing with Range GET", resp.status());
+            debug!(
+                "HEAD {} -> {}, probing with Range GET",
+                http_pool::redacted_url(url),
+                resp.status()
+            );
         }
         Err(ureq::Error::Status(401, _)) => {
             return Err(http_unauthorized(url));
         }
         Err(e) => {
-            debug!("HEAD {url} failed: {e}, probing with Range GET");
+            debug!(
+                "HEAD failed: {}, probing with Range GET",
+                map_ureq_http_error(e, url)
+            );
         }
     }
 
@@ -764,7 +796,7 @@ fn probe_range_size(source: &HttpRangeSource) -> Result<Option<HttpProbe>> {
             return Err(http_unauthorized(url));
         }
         Err(e) => {
-            debug!("Range probe {url} failed: {e}");
+            debug!("Range probe failed: {}", map_ureq_http_error(e, url));
             return Ok(None);
         }
     };
@@ -805,7 +837,10 @@ fn probe_range_size(source: &HttpRangeSource) -> Result<Option<HttpProbe>> {
             link: None,
         }));
     }
-    debug!("Range probe {url} -> HTTP {status}");
+    debug!(
+        "Range probe {} -> HTTP {status}",
+        http_pool::redacted_url(url)
+    );
     Ok(None)
 }
 
@@ -930,7 +965,8 @@ pub fn fetch_http_to_temp_prefer_range(url: &str) -> Result<(NamedTempFile, u64)
         if let Some(size) = probe.content_length {
             debug!(
                 "HTTP prefer-range: downloading {} ({size} bytes) in {}-byte chunks",
-                loc.url, HTTP_RANGE_CHUNK
+                http_pool::redacted_url(&loc.url),
+                HTTP_RANGE_CHUNK
             );
             match fetch_http_via_ranges(&loc, size) {
                 Ok(v) => return Ok(v),
@@ -941,7 +977,7 @@ pub fn fetch_http_to_temp_prefer_range(url: &str) -> Result<(NamedTempFile, u64)
                     }
                     debug!(
                         "HTTP range download failed for {}: {e}; falling back to full GET",
-                        loc.url
+                        http_pool::redacted_url(&loc.url)
                     );
                 }
             }
@@ -949,7 +985,7 @@ pub fn fetch_http_to_temp_prefer_range(url: &str) -> Result<(NamedTempFile, u64)
     }
     debug!(
         "HTTP full GET for {} (ranges unavailable or incomplete probe)",
-        loc.url
+        http_pool::redacted_url(&loc.url)
     );
     fetch_http_full_get(&loc)
 }
@@ -1038,7 +1074,7 @@ pub struct HttpRangeFile {
     size: u64,
     pos: u64,
     /// Optional fully buffered body if ranges unavailable.
-    buffered: Option<Vec<u8>>,
+    buffered: Option<Arc<[u8]>>,
     last_read_end: Option<u64>,
     sequential_bytes: u64,
     last_read_size: usize,
@@ -1084,10 +1120,14 @@ impl HttpRangeFile {
         }
         let mut buf = Vec::new();
         resp.into_reader().read_to_end(&mut buf)?;
-        Ok(Self::from_source(source, buf.len() as u64, Some(buf)))
+        Ok(Self::from_source(
+            source,
+            buf.len() as u64,
+            Some(buf.into()),
+        ))
     }
 
-    fn from_source(source: Arc<HttpRangeSource>, size: u64, buffered: Option<Vec<u8>>) -> Self {
+    fn from_source(source: Arc<HttpRangeSource>, size: u64, buffered: Option<Arc<[u8]>>) -> Self {
         Self {
             source,
             size,
@@ -1223,7 +1263,10 @@ pub fn resolve_http(url: &str) -> Result<RemoteHttp> {
     let probe = probe_http_source(&source)?;
     if probe.accept_ranges {
         if let Some(size) = probe.content_length {
-            debug!("HTTP live Range for {} ({size} bytes)", loc.url);
+            debug!(
+                "HTTP live Range for {} ({size} bytes)",
+                http_pool::redacted_url(&loc.url)
+            );
             return Ok(RemoteHttp::Range(HttpRangeFile::from_source(
                 source, size, None,
             )));
@@ -1231,7 +1274,7 @@ pub fn resolve_http(url: &str) -> Result<RemoteHttp> {
     }
     debug!(
         "HTTP materialize for {} (ranges unavailable or size unknown)",
-        loc.url
+        http_pool::redacted_url(&loc.url)
     );
     let (tmp, size) = fetch_http_full_get(&loc)?;
     Ok(RemoteHttp::Materialized(keep_fetched(url, tmp, size)?))
@@ -1321,7 +1364,14 @@ impl Read for HttpRangeFile {
                 Some(n) => n,
                 None => {
                     self.prefetch = None;
-                    self.source.read_into(self.pos, self.size, buf)?
+                    self.source.read_into_with_pattern(
+                        self.pos,
+                        self.size,
+                        buf,
+                        self.last_read_end == Some(self.pos)
+                            && (self.sequential_bytes >= 1024 * 1024
+                                || self.last_read_size >= 64 * 1024),
+                    )?
                 }
             }
         };
