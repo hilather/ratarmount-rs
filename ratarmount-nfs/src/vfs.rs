@@ -1,6 +1,6 @@
 //! `NFSFileSystem` on `MountSource`, with optional write overlay.
 
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 
@@ -334,10 +334,8 @@ impl RatarmountNfs {
         let path = self.inodes.path_for_id(id).ok_or(nfsstat3::NFS3ERR_STALE)?;
         let flags = libc::O_RDWR | libc::O_CREAT;
         let fd = ov.open_overlay_fd(&path, flags).map_err(overlay_to_nfs)?;
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let wrote = file
-            .seek(SeekFrom::Start(offset))
-            .and_then(|_| file.write_all(data));
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let wrote = ov.write_all_at(&file, &path, offset, data);
         ov.finish_owned_write_fd(file);
         wrote.map_err(|e| crate::io_to_nfsstat3(&e))?;
         self.bump_after_mutate(id);
@@ -681,6 +679,114 @@ mod tests {
     use std::io::{self, Cursor};
 
     use ratarmount_core::{CheapDirent, FileInfo, ListResult, UserData, S_IFDIR, S_IFLNK, S_IFREG};
+
+    struct TestPolicy;
+    impl ratarmount_compositing::OverlayPolicy for TestPolicy {
+        fn check_mutation(
+            &self,
+            _: ratarmount_compositing::OverlayMutation,
+            paths: &[&str],
+        ) -> io::Result<()> {
+            if paths
+                .iter()
+                .any(|p| *p == "/locked" || p.starts_with("/locked/"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ReadOnlyFilesystem,
+                    "policy read-only path",
+                ));
+            }
+            Ok(())
+        }
+        fn check_write(
+            &self,
+            path: &str,
+            offset: u64,
+            len: u64,
+            current_size: u64,
+        ) -> io::Result<()> {
+            if path == "/quota" && offset.saturating_add(len) > current_size.max(2) {
+                return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "policy quota"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression: NFSv3 policy failures retain ROFS/DQUOT on every mutator.
+    #[test]
+    fn regression_overlay_policy_denials() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(Arc::new(Synth::new()), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        ov.mkdir("/locked/empty", 0o755).unwrap();
+        for path in ["/locked/file", "/outside", "/quota"] {
+            let fd = ov.create_file(path, 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+        }
+        ov.set_policy(Some(Arc::new(TestPolicy)));
+        let ov = Arc::new(ov);
+
+        let nfs = RatarmountNfs::with_overlay(ov.clone(), 0, Some(ov));
+        let locked = nfs.lookup_sync(1, &name("locked")).unwrap();
+        let file = nfs.lookup_sync(locked, &name("file")).unwrap();
+        let quota = nfs.lookup_sync(1, &name("quota")).unwrap();
+        let ro = nfsstat3::NFS3ERR_ROFS as u32;
+        assert_eq!(nfs.write_sync(file, 0, b"x").unwrap_err() as u32, ro);
+        assert_eq!(
+            nfs.create_sync(locked, &name("new"), sattr3::default())
+                .unwrap_err() as u32,
+            ro
+        );
+        assert_eq!(
+            nfs.setattr_sync(
+                file,
+                sattr3 {
+                    size: set_size3::size(3),
+                    ..sattr3::default()
+                }
+            )
+            .unwrap_err() as u32,
+            ro
+        );
+        assert_eq!(
+            nfs.rename_sync(locked, &name("file"), 1, &name("moved"))
+                .unwrap_err() as u32,
+            ro
+        );
+        assert_eq!(
+            nfs.rename_sync(1, &name("outside"), locked, &name("file"))
+                .unwrap_err() as u32,
+            ro
+        );
+        assert_eq!(
+            nfs.remove_sync(locked, &name("file")).unwrap_err() as u32,
+            ro
+        );
+        assert_eq!(
+            nfs.mkdir_sync(locked, &name("newdir")).unwrap_err() as u32,
+            ro
+        );
+        assert_eq!(
+            nfs.remove_sync(locked, &name("empty")).unwrap_err() as u32,
+            ro
+        );
+        assert_eq!(
+            nfs.symlink_sync(
+                locked,
+                &name("link"),
+                &nfspath3::from(&b"target"[..]),
+                &sattr3::default()
+            )
+            .unwrap_err() as u32,
+            ro
+        );
+        assert_eq!(
+            nfs.write_sync(quota, 0, b"abc").unwrap_err() as u32,
+            nfsstat3::NFS3ERR_DQUOT as u32
+        );
+        nfs.write_sync(quota, 0, b"ab").unwrap();
+        assert_eq!(nfs.read_sync(quota, 0, 8).unwrap().0, b"ab");
+    }
 
     struct Synth {
         files: BTreeMap<String, (FileInfo, Vec<u8>)>,

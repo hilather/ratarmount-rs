@@ -1,5 +1,7 @@
 use super::*;
-use crate::{IndexPolicy, OpenRequest, ReadRequest, Recreate, Session, SourceSpec};
+use crate::{
+    IndexPolicy, OpenRequest, ParallelizationSpec, ReadRequest, Recreate, Session, SourceSpec,
+};
 use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
 use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,6 +54,7 @@ fn open_session(path: &Path, recursive: bool) -> Result<Session, crate::Error> {
         recursion_depth: Some(1),
         parallelization: Default::default(),
         recreate: Recreate::IfInvalid,
+        parallelization: ParallelizationSpec::default(),
     })
 }
 
@@ -185,6 +188,111 @@ fn nested_tensors_inside_tar_reader_opener_never_spools() {
         );
         assert_eq!(reader_calls.load(Ordering::SeqCst), 1);
     }
+}
+
+fn assert_parallel_nested_members_never_spool(
+    members: &[(String, Vec<u8>, Vec<u8>)],
+    inner_path: &str,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let outer = dir.path().join("outer.tar");
+    let files: Vec<_> = members
+        .iter()
+        .map(|(name, bytes, _)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    write_outer_tar(&outer, &files);
+    for _ in 0..32 {
+        // All four members use the real reader dispatcher through
+        // AutoMount's eager parallel path.
+        let options = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let source = open_path(&outer, &options, false).unwrap();
+        let opener = open_nested_reader_fn(options);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reader_calls = Arc::clone(&calls);
+        let barrier = std::sync::Barrier::new(members.len());
+        let checked_reader: OpenNestedReaderFn = Arc::new(move |reader, label, context| {
+            barrier.wait();
+            let source = opener(reader, label, context)?;
+            reader_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(source)
+        });
+        let forbidden_path: OpenNestedFn =
+            Arc::new(|path| panic!("parallel nested open spooled to {}", path.display()));
+        let layer = AutoMountLayer::new_with_openers(
+            source,
+            1,
+            forbidden_path,
+            Some(checked_reader),
+            AutoMountOptions {
+                recursive_extensions: parse_recursive_extensions(".safetensors,.gguf,.ar"),
+                parallel_nested_threads: members.len() as u32,
+                ..AutoMountOptions::default()
+            },
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), members.len());
+        std::thread::scope(|scope| {
+            for (name, _, expected) in members {
+                let layer = &layer;
+                scope.spawn(move || {
+                    for _ in 0..32 {
+                        assert_eq!(
+                            read_tensor(layer, &format!("/{name}{inner_path}")),
+                            *expected
+                        );
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// Regression: parallel safetensors/GGUF opens in one TAR failed probes or read sibling bytes.
+#[test]
+fn regression_parallel_nested_tensors_correct_bytes_without_spool() {
+    let members: Vec<_> = (0..4)
+        .map(|i| {
+            let (suffix, mut bytes) = if i % 2 == 0 {
+                ("safetensors", safetensors_fixture())
+            } else {
+                ("gguf", gguf_fixture())
+            };
+            let payload = vec![b'A' + i; PAYLOAD.len()];
+            let start = bytes.len() - payload.len();
+            bytes[start..].copy_from_slice(&payload);
+            (format!("model-{i}.{suffix}"), bytes, payload)
+        })
+        .collect();
+    assert_parallel_nested_members_never_spool(&members, TENSOR_PATH);
+}
+
+/// Regression: shared parent seek interference also corrupted parallel nested AR opens.
+#[cfg(feature = "ar")]
+#[test]
+fn regression_parallel_nested_ar_correct_bytes_without_spool() {
+    let members: Vec<_> = (0..4)
+        .map(|i| {
+            let payload = vec![b'A' + i; 4096];
+            let mut bytes = b"!<arch>\n".to_vec();
+            bytes.extend_from_slice(
+                format!(
+                    "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                    "payload/",
+                    0,
+                    0,
+                    0,
+                    "100644",
+                    payload.len()
+                )
+                .as_bytes(),
+            );
+            bytes.extend_from_slice(&payload);
+            (format!("inner-{i}.ar"), bytes, payload)
+        })
+        .collect();
+    assert_parallel_nested_members_never_spool(&members, "/payload");
 }
 
 /// Regression: reader dispatch must recognize extensionless tensors without requiring a host path.

@@ -14,7 +14,7 @@ use russh::{Channel, ChannelId};
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
-use russh_sftp::server::Handler;
+use russh_sftp::server::{Handler, StatusReply};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 
@@ -308,14 +308,20 @@ impl SftpSession {
     }
 }
 
-fn map_err(e: i32) -> StatusCode {
-    match e {
+fn map_err(e: i32) -> StatusReply {
+    if e == libc::EDQUOT || e == libc::ENOSPC {
+        // SFTP v3 has no dedicated capacity statuses. Preserve the cause in
+        // the SSH_FXP_STATUS message, including errors from OPEN/COW.
+        return StatusCode::Failure.with_message(io::Error::from_raw_os_error(e).to_string());
+    }
+    let code = match e {
         libc::ENOENT | libc::ESTALE => StatusCode::NoSuchFile,
         libc::EACCES | libc::EPERM | libc::EROFS => StatusCode::PermissionDenied,
         libc::ENOSYS | libc::EOPNOTSUPP => StatusCode::OpUnsupported,
         libc::EINVAL => StatusCode::BadMessage,
         _ => StatusCode::Failure,
-    }
+    };
+    code.into()
 }
 
 fn attrs_from_fi(fi: &FileInfo) -> FileAttributes {
@@ -349,10 +355,10 @@ fn flags_to_mode(pflags: OpenFlags) -> OpenMode {
 }
 
 impl Handler for SftpSession {
-    type Error = StatusCode;
+    type Error = StatusReply;
 
     fn unimplemented(&self) -> Self::Error {
-        StatusCode::OpUnsupported
+        StatusCode::OpUnsupported.into()
     }
 
     async fn init(
@@ -399,7 +405,7 @@ impl Handler for SftpSession {
         let path = self.fs.realpath(&path);
         let fi = self.fs.file_info_at(&path).map_err(map_err)?;
         if !is_dir_mode(fi.mode) {
-            return Err(StatusCode::NoSuchFile);
+            return Err(StatusCode::NoSuchFile.into());
         }
         let handle = self.alloc_handle(SftpHandle::Dir {
             path,
@@ -412,10 +418,10 @@ impl Handler for SftpSession {
         let h = self.handles.get_mut(&handle).ok_or(StatusCode::Failure)?;
         let (path, exhausted) = match h {
             SftpHandle::Dir { path, exhausted } => (path.clone(), *exhausted),
-            SftpHandle::File { .. } => return Err(StatusCode::Failure),
+            SftpHandle::File { .. } => return Err(StatusCode::Failure.into()),
         };
         if exhausted {
-            return Err(StatusCode::Eof);
+            return Err(StatusCode::Eof.into());
         }
         if let SftpHandle::Dir { exhausted, .. } = self.handles.get_mut(&handle).unwrap() {
             *exhausted = true;
@@ -454,11 +460,11 @@ impl Handler for SftpSession {
         let h = self.handles.get(&handle).ok_or(StatusCode::Failure)?;
         let fid = match h {
             SftpHandle::File { id, .. } => *id,
-            SftpHandle::Dir { .. } => return Err(StatusCode::Failure),
+            SftpHandle::Dir { .. } => return Err(StatusCode::Failure.into()),
         };
         let data = self.fs.read(fid, offset, len).map_err(map_err)?;
         if data.is_empty() && len > 0 {
-            return Err(StatusCode::Eof);
+            return Err(StatusCode::Eof.into());
         }
         Ok(Data { id, data })
     }
@@ -474,11 +480,11 @@ impl Handler for SftpSession {
         let fid = match h {
             SftpHandle::File { id, write } => {
                 if !*write {
-                    return Err(StatusCode::PermissionDenied);
+                    return Err(StatusCode::PermissionDenied.into());
                 }
                 *id
             }
-            SftpHandle::Dir { .. } => return Err(StatusCode::Failure),
+            SftpHandle::Dir { .. } => return Err(StatusCode::Failure.into()),
         };
         self.fs.write(fid, offset, &data).map_err(map_err)?;
         Ok(Self::ok(id))
@@ -529,7 +535,7 @@ impl Handler for SftpSession {
         if let Some(size) = attrs.size {
             self.fs.setstat_size(&path, size).map_err(map_err)?;
         } else if !self.fs.writable() {
-            return Err(StatusCode::PermissionDenied);
+            return Err(StatusCode::PermissionDenied.into());
         }
         Ok(Self::ok(id))
     }
@@ -629,4 +635,26 @@ pub fn serve_stdio_russh(source: Arc<dyn MountSource>, opts: SftpOptions) -> io:
         let _ = done_rx.await;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod policy_status_tests {
+    use super::*;
+
+    /// Regression: v3 capacity errors retain a useful message instead of bare Failure.
+    #[test]
+    fn regression_overlay_policy_sftp_status_messages() {
+        assert_eq!(
+            map_err(libc::EROFS).status_code,
+            StatusCode::PermissionDenied
+        );
+        for errno in [libc::EDQUOT, libc::ENOSPC] {
+            let reply = map_err(errno);
+            assert_eq!(reply.status_code, StatusCode::Failure);
+            assert_eq!(
+                reply.error_message.as_deref(),
+                Some(io::Error::from_raw_os_error(errno).to_string().as_str())
+            );
+        }
+    }
 }

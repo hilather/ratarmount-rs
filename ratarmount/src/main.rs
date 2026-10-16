@@ -338,6 +338,19 @@ struct Args {
     #[arg(long = "use-backend", action = ArgAction::Append)]
     use_backend: Vec<String>,
 
+    /// Mount the committed Git tree, including for a normal working directory
+    #[arg(long)]
+    git: bool,
+    /// Git revision to mount (implies --git; invalid revisions are errors)
+    #[arg(long, value_name = "REV")]
+    git_ref: Option<String>,
+    /// Subdirectory of the selected Git tree to mount
+    #[arg(long, value_name = "SUBDIR")]
+    git_prefix: Option<String>,
+    /// Expose a minimal .git with one parentless commit (requires Git mode and one input)
+    #[arg(long)]
+    git_synthetic_head: bool,
+
     /// Newline-separated password file for encrypted archives
     #[arg(long = "password-file")]
     password_file: Option<PathBuf>,
@@ -983,6 +996,10 @@ fn main() {
             .filter(|s| !s.is_empty())
             .collect(),
         force_folder_index: args.force_folder_index,
+        git: args.git,
+        git_ref: args.git_ref.clone(),
+        git_prefix: args.git_prefix.clone(),
+        git_synthetic_head: args.git_synthetic_head,
         hashes: args
             .hashes
             .as_deref()
@@ -5416,5 +5433,46 @@ mod overlay_unmount_drop_tests {
             gone.contains("archive is not mounted"),
             "search after drop: {gone}"
         );
+    }
+}
+
+#[cfg(test)]
+mod git_cli_tests {
+    use super::*;
+
+    /// Regression: Git flags must preserve the repository and mountpoint operands.
+    #[test]
+    fn regression_git_flags_keep_positionals() {
+        let args = Args::try_parse_from([
+            "ratarmount",
+            "--git",
+            "--git-ref",
+            "HEAD~1",
+            "--git-prefix",
+            "src",
+            "--git-synthetic-head",
+            "repo",
+            "mnt",
+        ])
+        .unwrap();
+        assert!(args.git);
+        assert_eq!(args.git_ref.as_deref(), Some("HEAD~1"));
+        assert_eq!(args.git_prefix.as_deref(), Some("src"));
+        assert!(args.git_synthetic_head);
+        assert_eq!(args.paths, [PathBuf::from("repo"), PathBuf::from("mnt")]);
+        let inline = Args::try_parse_from([
+            "ratarmount",
+            "--git-synthetic-head",
+            "repo.git@HEAD~1",
+            "mnt",
+        ])
+        .unwrap();
+        assert!(inline.git_synthetic_head);
+        assert!(inline.git_ref.is_none());
+        assert_eq!(
+            inline.paths,
+            [PathBuf::from("repo.git@HEAD~1"), PathBuf::from("mnt")]
+        );
+        assert!(Args::try_parse_from(["ratarmount", "--git-ref"]).is_err());
     }
 }
