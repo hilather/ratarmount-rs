@@ -266,6 +266,36 @@ where
     Ok(stats)
 }
 
+/// Classify an adds-only plan and locate a safe append boundary without reading
+/// member payloads. Unlike a backwards zero scan, this preserves zero-tail data.
+/// `None` requests the copy path (existing names, sparse/global-PAX layout, or
+/// no complete terminal EOF). Interior EOFs are walked like the commit index.
+pub fn tar_append_offset<R: Read + Seek>(
+    reader: &mut R,
+    touched: &HashSet<String>,
+    encoding: &str,
+) -> io::Result<Option<u64>> {
+    let len = reader.seek(SeekFrom::End(0))?;
+    let mut cursor = TarMemberCursor::new(reader, 0, 0, encoding);
+    while let Some(member) = cursor.next_member()? {
+        if member.raw_end > len || matches!(member.typeflag, b'g' | b'S') {
+            return Ok(None);
+        }
+        if touched.iter().any(|p| {
+            member.logical_path == *p
+                || member
+                    .logical_path
+                    .strip_prefix(p)
+                    .is_some_and(|s| s.starts_with('/'))
+        }) {
+            return Ok(None);
+        }
+    }
+    Ok(cursor
+        .stream_eof_offset()
+        .filter(|off| len.saturating_sub(*off) >= 1024))
+}
+
 /// Read-only walker over last-window TAR headers (no index inserts / sparse maps).
 pub struct TarMemberCursor<R> {
     reader: R,
@@ -1011,6 +1041,50 @@ mod tests {
             uid: 0,
             gid: 0,
             mtime: 0,
+        }
+    }
+
+    /// Regression: append boundary must not eat zero-filled member payloads.
+    #[test]
+    fn append_offset_preserves_zero_tail_payload() {
+        let payload = vec![0; 8192];
+        let bytes = pack(&[member_file("old", &payload)]);
+        let touched = HashSet::from(["new".to_string()]);
+        assert_eq!(
+            tar_append_offset(&mut std::io::Cursor::new(&bytes), &touched, "utf-8").unwrap(),
+            Some(512 + 8192)
+        );
+        let replaced = HashSet::from(["old".to_string()]);
+        assert_eq!(
+            tar_append_offset(&mut std::io::Cursor::new(&bytes), &replaced, "utf-8").unwrap(),
+            None
+        );
+        assert_eq!(
+            tar_append_offset(
+                &mut std::io::Cursor::new(&bytes[..bytes.len() - 1024]),
+                &touched,
+                "utf-8"
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    /// Regression: a name after an interior TAR EOF is a replacement, not an add.
+    #[test]
+    fn append_offset_detects_concatenated_replacement() {
+        let mut bytes = pack(&[member_file("first", b"first")]);
+        bytes.extend(pack(&[member_file("dir/last", b"last")]));
+        for path in ["dir/last", "dir"] {
+            assert_eq!(
+                tar_append_offset(
+                    &mut std::io::Cursor::new(&bytes),
+                    &HashSet::from([path.to_string()]),
+                    "utf-8"
+                )
+                .unwrap(),
+                None
+            );
         }
     }
 

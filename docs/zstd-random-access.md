@@ -234,15 +234,37 @@ and dropped when a frame size exceeds the seekable-format `u32` limit.
 | Step | Cost |
 |------|------|
 | Last-frame rewrite | Decode + encode the last N frames only (no prefix recompress) |
-| Persist | Still **copies** the compressed file to a sibling tmp |
-| Remount / interval reopen | Still **reindexes the whole TAR** (sequential decode + parse) |
+| Persist (`copy`, default) | Reflink / kernel range copy when available, otherwise a byte copy to a sibling tmp |
+| Persist (`append` / eligible `auto`) | Journal and replace only the suffix in place |
+| Remount / interval reopen | F-2 patches a durable sidecar from the changed suffix; without a sidecar, full indexing |
 
-Plan **2× compressed size** disk headroom (tmp + original until `persist`
+With `copy`, plan **2× compressed size** disk headroom on filesystems without reflinks (tmp + original until `persist`
 unlinks the old inode). Single-frame `tar \| zstd` is a full last-frame rewrite
 (same recompress class as offline gzip TAR commit). **Never refuse on size** —
 startup warns when the last-frame uncompressed size exceeds **64 MiB** (a
 brand-new one-frame empty archive does **not** warn), then spills
 decoded/encoded suffix above 256 MiB.
+
+`--commit-overlay-mode copy|append|auto` also applies to uncompressed TAR and
+local offline `--commit-overlay`. The default, `copy`, preserves the existing
+copy/rename semantics. `append` journals and overwrites the old EOF/suffix only
+for adds-only plans (and `.tar.zst` must have a seek table); replacements/deletes
+use copy. `auto` chooses append only when that plan is eligible and the archive
+has one hard link. `append` explicitly permits changing hard-linked archives.
+
+```bash
+ratarmount -w ov --commit-overlay-mode auto --commit-overlay-interval 15m data.tar.zst mnt
+ratarmount --commit-overlay --commit-overlay-mode append --yes -w ov data.tar
+```
+
+Append preserves the inode and needs space for the old and new suffixes plus
+new data. It changes bytes in place: readers in other processes/mounts, and
+reads overlapping the commit on this mount, can observe an incomplete suffix.
+Use `copy` for snapshot-like reader isolation. Successful live commits reopen
+the source and refresh its generation as before. The journal
+`<archive>.ratarmount-commit-journal` is fsynced before mutation and recovered
+before the next write-mount open or commit. Keep it with its archive after a
+crash. See the [crash protocol](tasks/tar-zst-live-commit-design.md#crash-protocol).
 
 **Not supported (live v1):**
 

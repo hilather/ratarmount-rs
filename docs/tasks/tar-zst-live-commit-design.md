@@ -1110,3 +1110,98 @@ Each PR is independently reviewable and mergeable. Library PRs first; CLI last. 
 | 12–15 | PR 5 (CLI + docs + bin test) **∥ PR 6** (NFS test) |
 
 PR 7 (offline `--commit-overlay` for `.tar.zst`) is **done**.
+
+## AI-CM1: accelerated copy and opt-in append persistence
+
+`--commit-overlay-mode copy|append|auto` defaults to **copy**. The mode applies
+both to local offline commits and to live interval/on-exit commits. `append`
+uses in-place suffix replacement for adds-only uncompressed TAR and seek-table
+`.tar.zst`; other plans retain the copy path. `auto` additionally requires the
+archive to have exactly one hard link. Explicit `append` can change all hard
+links to the archive. Remote publication continues to use its staged copy path.
+
+Copy persistence attempts Linux `FICLONERANGE` on the aligned middle, copying
+unaligned head/tail fragments; offsets with different block alignment cannot
+be reflinked. It then tries `copy_file_range` (including short-copy loops), and
+finally exact-length `io::copy`. Whole-file TAR copies on macOS attempt
+`fclonefileat` into a private sibling directory. Partial zstd prefixes on macOS
+use the stream copy. One info message records the method, for example
+`commit: prefix 12.3 GiB via reflink`. See the
+[Linux clone ABI](https://www.man7.org/linux/man-pages/man2/ioctl_ficlone.2.html)
+and [Apple clone API manual](https://keith.github.io/xcode-man-pages/clonefile.2.html).
+
+Append classification reuses the commit plan: overlay files are initially
+represented as delete+append, so a nonempty deletion set alone does not imply
+a replacement. TAR walks member headers (skipping payloads) and checks every
+touched name, including directory descendants and concatenated TARs. The cut
+is the **parsed terminal EOF**, never a backward zero-run cut into payload.
+GNU sparse/global-PAX TAR layouts conservatively use copy. Zstd uses the
+existing full-frame classification, including versions after interior EOFs;
+actual deletes/replacements keep the previous copy behavior and live prefix
+mutation restrictions. Only the affected zstd suffix is staged and journaled;
+its new frame and rebuilt seek table use the existing splice encoder.
+
+### Crash protocol
+
+The archive and its journal must be on a local filesystem with durable file and
+directory fsync and atomic directory operations. Journal and staged suffix are
+sibling files. An exclusive advisory archive lock serializes journal recovery
+and mutation. The prepared suffix also carries a metadata snapshot; a changed
+archive is refused before journal publication. Concurrent independent copy/rename
+writers or writers ignoring the lock remain unsupported.
+
+1. Prepare the entire replacement suffix before changing the archive.
+2. Write a private temporary journal containing a versioned fixed header
+   (archive device/inode, original length, cut offset, original mtime) followed
+   by the original tail bytes. Stream the tail; do not allocate the archive in
+   memory. Fsync the journal, publish it without overwriting an existing journal
+   as `<archive>.ratarmount-commit-journal`, and fsync its parent directory.
+3. Truncate the archive at the cut, write the staged suffix, and fsync the
+   archive. No prefix bytes are rewritten.
+4. Unlink the journal and fsync the parent directory. This is the commit point.
+   There is deliberately **no mutable completion flag** that could tear.
+5. Run the existing F-2 sidecar patch, reopen/swap the mounted source, advance
+   the generation, and clean up the committed overlay entries as before.
+
+Recovery runs before CLI write-mount archive opening and before every commit,
+regardless of the selected mode. Library callers must call
+`ratarmount_compress::commit_journal::recover` **before constructing the base
+MountSource** (the generic `WriteOverlay::new` receives an already-open source,
+not an archive path). Any published journal means rollback: validate the
+archive device/inode and complete header/tail length, restore the tail and
+original file length/mtime, fsync the archive, then unlink the journal and fsync
+the directory. Repeating an interrupted rollback is safe. An identity mismatch
+fails closed and preserves both files for inspection.
+
+Before journal publication a crash leaves the old archive. From publication
+through archive fsync it rolls back to the old archive. A crash during journal
+unlink/directory fsync can leave the journal present or absent: present restores
+the old archive; absent leaves the fully fsynced new archive. Thus each boundary
+recovers to exactly old or new bytes. Unpublished staging files may remain after
+a process crash; they are not interpreted as journals. Injected failures cover
+journal writes/publication/fsync, truncation, each suffix write chunk, archive
+fsync, unlink, and directory fsync, with full archive listing and content hashes.
+
+The pre-commit sidecar remains valid after rollback because original bytes and
+mtime are restored. After a normal success F-2 patches exactly the old suffix
+window; warm open uses that sidecar without full parsing. A crash **after** the
+commit point but before sidecar patching leaves an old sidecar, which normal
+archive fingerprint validation rejects/rebuilds. Recovery does not claim to
+make archive and SQLite publication one transaction.
+
+### Cost and readers
+
+Append preserves the archive inode and needs staging/journal space proportional
+to the replaced suffix plus new data, not a second archive. Zstd still decodes
+and re-encodes the last N frames, and its existing full-frame plan classification
+can scan the TAR; this change does not promise a one-second end-to-end commit on
+all 200 GB inputs. A single-frame archive still has a whole-archive suffix.
+
+Copy/rename keeps existing readers on the old inode. Append mutates the inode:
+other mounts, hard links, and processes can observe a temporarily truncated or
+partially written suffix. Even readers on this mount can overlap that write;
+after a successful commit its normal reopen/generation refresh serves the new
+bytes. Choose copy when readers require a consistent snapshot throughout a
+commit. Append errors disable further live ticks; remount performs recovery.
+This is why **copy remains the default**. Append does not add cross-process
+reader exclusion or change the existing overlay retention after on-exit/crash.

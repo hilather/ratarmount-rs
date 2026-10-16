@@ -2956,6 +2956,7 @@ version = "0.1.34"
 dependencies = [
  "bzip2",
  "flate2",
+ "libc",
  "libloading",
  "log",
  "lz4_flex 0.11.6",
