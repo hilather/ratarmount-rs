@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ratarmount-rs"
+dynamic = ["version"]
+requires-python = ">=3.9"
+description = "Read archives and remote archive URLs through ratarmount-rs"
+license = "MIT"
+
+[tool.maturin]
+python-source = "python"
+module-name = "ratarmount_rs._native"
+features = ["extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

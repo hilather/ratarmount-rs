@@ -5,6 +5,7 @@ members = [
     "ratarmount-core",
     "ratarmount-index",
     "ratarmount-session",
+    "ratarmount-python",
     "ratarmount-fuse",
     "ratarmount-compress",
     "ratarmount-formats-tar",
