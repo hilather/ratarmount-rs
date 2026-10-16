@@ -17,6 +17,8 @@
 #   RUNS=3       timed cold-index samples (median)
 #   CORPUS_MIB=64 uncompressed large blob size
 #   THREADS=8    -P gzip:N / rapidgzip-gzip:N
+#   SKIP_PYTHON=1 skip the Python reference if its optional dependencies are absent
+#   SKIP_FUSE=1  skip mount tests (cold-index measurements only)
 #   OUT_DIR      results dir (default: benchmarks/gzip-backend-results)
 #   COMPARE_KEEP=1 keep workdir
 #   ISAL_INSTALL_PREFIX  optional prefix with lib/libisal.so (default: sibling rapidgzip-rust/.isal-prefix if present)
@@ -338,45 +340,57 @@ run_cold_index "rust-g3" "$ARCH_LARGE_TGZ" \
   env -u RATARMOUNT_GZIP_BACKEND "$RUST_BIN" -P "gzip:${THREADS}"
 run_cold_index "rust-rapidgzip" "$ARCH_LARGE_TGZ" \
   env RATARMOUNT_GZIP_BACKEND=rapidgzip "$RUST_BIN" -P "gzip:${THREADS}" --use-backend rapidgzip
-run_cold_index "python" "$ARCH_LARGE_TGZ" \
-  env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+if [[ "${SKIP_PYTHON:-0}" != "1" ]]; then
+  run_cold_index "python" "$ARCH_LARGE_TGZ" \
+    env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+fi
 
 run_cold_index "rust-g3" "$ARCH_LARGE_GZ" \
   env -u RATARMOUNT_GZIP_BACKEND "$RUST_BIN" -P "gzip:${THREADS}"
 run_cold_index "rust-rapidgzip" "$ARCH_LARGE_GZ" \
   env RATARMOUNT_GZIP_BACKEND=rapidgzip "$RUST_BIN" -P "gzip:${THREADS}" --use-backend rapidgzip
-run_cold_index "python" "$ARCH_LARGE_GZ" \
-  env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+if [[ "${SKIP_PYTHON:-0}" != "1" ]]; then
+  run_cold_index "python" "$ARCH_LARGE_GZ" \
+    env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+fi
 
 run_cold_index "rust-g3" "$ARCH_SMALL_TGZ" \
   env -u RATARMOUNT_GZIP_BACKEND "$RUST_BIN" -P "gzip:${THREADS}"
 run_cold_index "rust-rapidgzip" "$ARCH_SMALL_TGZ" \
   env RATARMOUNT_GZIP_BACKEND=rapidgzip "$RUST_BIN" -P "gzip:${THREADS}" --use-backend rapidgzip
-run_cold_index "python" "$ARCH_SMALL_TGZ" \
-  env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+if [[ "${SKIP_PYTHON:-0}" != "1" ]]; then
+  run_cold_index "python" "$ARCH_SMALL_TGZ" \
+    env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+fi
 
 # FUSE (needs /dev/fuse)
-if [[ -e /dev/fuse ]]; then
+if [[ "${SKIP_FUSE:-0}" != "1" && -e /dev/fuse ]]; then
   measure_fuse "rust-g3" "$ARCH_LARGE_TGZ" "blob.bin" \
     env -u RATARMOUNT_GZIP_BACKEND "$RUST_BIN" -P "gzip:${THREADS}"
   measure_fuse "rust-rapidgzip" "$ARCH_LARGE_TGZ" "blob.bin" \
     env RATARMOUNT_GZIP_BACKEND=rapidgzip "$RUST_BIN" -P "gzip:${THREADS}" --use-backend rapidgzip
-  measure_fuse "python" "$ARCH_LARGE_TGZ" "blob.bin" \
-    env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+  if [[ "${SKIP_PYTHON:-0}" != "1" ]]; then
+    measure_fuse "python" "$ARCH_LARGE_TGZ" "blob.bin" \
+      env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+  fi
 
   measure_fuse "rust-g3" "$ARCH_LARGE_GZ" "large-${CORPUS_MIB}m.bin" \
     env -u RATARMOUNT_GZIP_BACKEND "$RUST_BIN" -P "gzip:${THREADS}"
   measure_fuse "rust-rapidgzip" "$ARCH_LARGE_GZ" "large-${CORPUS_MIB}m.bin" \
     env RATARMOUNT_GZIP_BACKEND=rapidgzip "$RUST_BIN" -P "gzip:${THREADS}" --use-backend rapidgzip
-  measure_fuse "python" "$ARCH_LARGE_GZ" "large-${CORPUS_MIB}m.bin" \
-    env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+  if [[ "${SKIP_PYTHON:-0}" != "1" ]]; then
+    measure_fuse "python" "$ARCH_LARGE_GZ" "large-${CORPUS_MIB}m.bin" \
+      env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+  fi
 
   measure_fuse "rust-g3" "$ARCH_SMALL_TGZ" "f000.bin" \
     env -u RATARMOUNT_GZIP_BACKEND "$RUST_BIN" -P "gzip:${THREADS}"
   measure_fuse "rust-rapidgzip" "$ARCH_SMALL_TGZ" "f000.bin" \
     env RATARMOUNT_GZIP_BACKEND=rapidgzip "$RUST_BIN" -P "gzip:${THREADS}" --use-backend rapidgzip
-  measure_fuse "python" "$ARCH_SMALL_TGZ" "f000.bin" \
-    env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+  if [[ "${SKIP_PYTHON:-0}" != "1" ]]; then
+    measure_fuse "python" "$ARCH_SMALL_TGZ" "f000.bin" \
+      env PY_ROOT="$PY_ROOT" PY_BIN="${PY_BIN:-}" PY_PYTHON="$PY_PYTHON" "$WORKDIR/py-ratarmount" -P "$THREADS"
+  fi
 else
   echoerr "SKIP FUSE suite: /dev/fuse missing"
 fi
