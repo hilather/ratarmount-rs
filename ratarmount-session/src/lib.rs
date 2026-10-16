@@ -23,6 +23,8 @@ pub mod factory;
 #[cfg(feature = "http-export")]
 mod http;
 mod index_job;
+#[cfg(test)]
+mod library_mode_tests;
 mod locate;
 mod read;
 mod resolve;
@@ -34,15 +36,15 @@ pub use error::Error;
 pub use http::{HttpHandle, DEFAULT_HTTP_BIND};
 pub use index_job::IndexJob;
 pub use locate::{query_index, split_fts_pattern, DEFAULT_FIND_PAGE};
-pub use ratarmount_core::{IndexBuildHooks, IndexBuildTick};
+pub use ratarmount_core::{IndexBuildHooks, IndexBuildTick, ParallelizationSpec};
 pub use ratarmount_index::IndexLocation;
 pub use read::RangeReader;
 pub use resolve::resolve_index;
 pub use session::Session;
 pub use types::{
     DirCursor, DirEnt, DirPage, ExtractProgress, ExtractRequest, FindCursor, FindOpts, FindPage,
-    IndexPhase, IndexPolicy, IndexProgress, OpenRequest, Overwrite, ReadRequest, Recreate,
-    SourceSpec,
+    IndexPhase, IndexPolicy, IndexProgress, MemberExtent, OffsetCursor, OffsetPage, OpenRequest,
+    Overwrite, ReadRequest, Recreate, SourceSpec,
 };
 
 #[cfg(test)]
@@ -126,6 +128,7 @@ mod tests {
             password: Some(SecretString::new("secret".into())),
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         };
         assert!(req.password.is_some());

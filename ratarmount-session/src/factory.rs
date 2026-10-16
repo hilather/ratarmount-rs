@@ -624,9 +624,11 @@ fn open_uncompressed_path(
     index_path: Option<&Path>,
     options: &OpenOptions,
     recreate: bool,
+    plain_tar: &mut bool,
 ) -> Result<Arc<dyn MountSource>, String> {
     for backend in ordered_format_backends(&options.use_backends) {
         if let Some(src) = try_open_format_backend(path, backend, index_path, options, recreate)? {
+            *plain_tar = backend == FormatBackend::Tar;
             return Ok(src);
         }
     }
@@ -2152,7 +2154,7 @@ fn open_split_set(
     }
 
     // Archive/compressed stream: open without re-running split detection; keep temp alive.
-    let inner = open_path_impl(&tmp_path, &opts, recreate, false)?;
+    let inner = open_path_impl(&tmp_path, &opts, recreate, false, &mut false)?;
     Ok(Arc::new(KeepAliveMount { inner, _tmp: tmp }))
 }
 
@@ -2206,7 +2208,7 @@ pub fn open_path(
     options: &OpenOptions,
     recreate: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
-    open_path_impl(path, options, recreate, true)
+    open_path_impl(path, options, recreate, true, &mut false)
 }
 
 fn open_path_impl(
@@ -2214,6 +2216,7 @@ fn open_path_impl(
     options: &OpenOptions,
     recreate: bool,
     allow_split: bool,
+    plain_tar: &mut bool,
 ) -> Result<Arc<dyn MountSource>, String> {
     if path.is_dir() {
         // Git: bare repos / `.git` dirs (HEAD+objects, no nested `.git`), or force via env.
@@ -2261,7 +2264,9 @@ fn open_path_impl(
     let source: Arc<dyn MountSource> = match compression {
         // Outer compression still wins (detect_compression first). Format
         // backends are reordered via options.use_backends only for plain files.
-        CompressionFormat::None => open_uncompressed_path(path, index_path, &options, recreate)?,
+        CompressionFormat::None => {
+            open_uncompressed_path(path, index_path, &options, recreate, plain_tar)?
+        }
         CompressionFormat::Gzip => open_gzip(path, index_path, &options, recreate)?,
         CompressionFormat::Bzip2 => open_bzip2(path, index_path, &options, recreate)?,
         CompressionFormat::Xz => {
@@ -3932,6 +3937,9 @@ fn open_tar_body(
 /// Holds remote downloads for process lifetime (deleted on drop).
 pub struct MountBundle {
     pub source: Arc<dyn MountSource>,
+    /// Provenance from the successful local TAR probe, before compositing.
+    /// No remote, split, compressed, recursive, or path-transforming source.
+    pub(crate) plain_tar_file: Option<PathBuf>,
     /// Fetched HTTP bodies etc. must outlive `source`.
     _remotes: Vec<ratarmount_remote::RemoteLocal>,
 }
@@ -4478,6 +4486,7 @@ pub fn build_mount_source_ex(
     };
     let mut sources = Vec::new();
     let mut remotes = Vec::new();
+    let mut plain_tar_file = None;
     // Per-input clone of the CLI options. `read_only_index` may clear write
     // flags on that clone only. A discovered `index_file_path` is copied back
     // onto `options` (the value `spawn_interval_commits` clones). Do not inject
@@ -4514,7 +4523,16 @@ pub fn build_mount_source_ex(
             remote_open::open_remote_input(input.as_ref(), &mut opts, recreate_src, &mut remotes)?
         } else {
             let local_path = p.clone();
-            let src = open_path(&local_path, &opts, recreate_src)?;
+            let mut plain_tar = false;
+            let src = open_path_impl(&local_path, &opts, recreate_src, true, &mut plain_tar)?;
+            if plain_tar
+                && paths.len() == 1
+                && !comp.recursive
+                && comp.transform.is_none()
+                && comp.prefix.as_deref().is_none_or(str::is_empty)
+            {
+                plain_tar_file = std::fs::canonicalize(&local_path).ok();
+            }
             (local_path, src)
         };
         if remote && options.index_file_path.is_none() {
@@ -4556,6 +4574,7 @@ pub fn build_mount_source_ex(
     }
     Ok(MountBundle {
         source,
+        plain_tar_file,
         _remotes: remotes,
     })
 }

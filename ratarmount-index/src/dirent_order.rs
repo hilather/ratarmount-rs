@@ -8,8 +8,9 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use ratarmount_core::{S_IFMT, S_IFREG};
+use rusqlite::{Connection, OpenFlags};
 
-use crate::{CompactOpenCookie, IndexDirent, Result, SqliteIndex};
+use crate::{CompactOpenCookie, IndexDirent, IndexError, Result, SqliteIndex, MAX_DIR_PAGE};
 
 /// GNU dumpdir whiteout stored in `files.linkname` (formats-tar marker).
 pub(crate) const DUMPDIR_DELETE_LINKNAME: &str = "\0GNU.dumpdir.delete";
@@ -105,6 +106,72 @@ fn is_payload_regular(mode: u32, linkname: &str, isgenerated: bool) -> bool {
 }
 
 impl SqliteIndex {
+    /// Prepare the optional archive-order index once, without changing paging
+    /// semantics on failure. Ordinary read-only callers pass `false`.
+    ///
+    /// `allow_sidecar_writes` explicitly permits opening a separate writable
+    /// connection to a local sidecar (Session uses its original open policy).
+    /// The catalog's read-only connection is never upgraded. In-memory and
+    /// remote-cache files are never modified, even with this permission.
+    pub fn prepare_offset_order_index(&self, allow_sidecar_writes: bool) {
+        self.offset_order_index.get_or_init(|| {
+            let result = self.with_conn(|conn| {
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'files_offsetheader')",
+                    [], |row| row.get(0),
+                )?;
+                if exists {
+                    return Ok(());
+                }
+                let path = self.path.as_ref().ok_or_else(|| {
+                    IndexError::Invalid("in-memory catalog".into())
+                })?;
+                let metadata = std::fs::metadata(path)?;
+                if crate::is_meta_cache_path(path) || metadata.permissions().readonly() {
+                    return Err(IndexError::Invalid("sidecar is read-only or remote-cached".into()));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.nlink() > 1 {
+                        return Err(IndexError::Invalid("sidecar shares its inode with another path".into()));
+                    }
+                }
+                let canonical = std::fs::canonicalize(path)?;
+                let snapshot = canonical.file_name().and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".sqlite"))
+                    .and_then(|name| name.rsplit_once(".index."))
+                    .is_some_and(|(_, id)| crate::parse_index_id(id).is_ok());
+                if snapshot || crate::index_pointer_path_for_index_file(&canonical).is_file() {
+                    return Err(IndexError::Invalid("published index bytes are pinned by SHA-256".into()));
+                }
+                let sql = "CREATE INDEX IF NOT EXISTS files_offsetheader ON files(offsetheader)";
+                if !self.read_only && !conn.is_readonly(rusqlite::MAIN_DB)? {
+                    conn.execute_batch(sql)?;
+                } else if allow_sidecar_writes {
+                    // Match open_writable's connection settings without CREATE:
+                    // a removed sidecar must not be recreated by an optimization.
+                    let writer = Connection::open_with_flags(path,
+                        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+                    writer.busy_timeout(std::time::Duration::from_secs(10))?;
+                    writer.execute_batch(
+                        "PRAGMA temp_store = MEMORY;
+                         PRAGMA journal_mode = WAL;
+                         PRAGMA synchronous = NORMAL;
+                         PRAGMA locking_mode = NORMAL;"
+                    )?;
+                    writer.execute_batch(sql)?;
+                } else {
+                    return Err(IndexError::Invalid("read-only catalog".into()));
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                log::debug!("archive-order paging is unindexed; scanning each page: {error}");
+            }
+        });
+    }
+
     /// Newest-wins directory listing in [`DirentOrder`].
     ///
     /// `Name` is exactly [`Self::list_dirents`]. `OffsetHeader` is that same set
@@ -156,6 +223,119 @@ impl SqliteIndex {
             )
         });
         Ok(members)
+    }
+
+    /// Bounded SQL keyset page of the same newest-wins payload set as
+    /// [`Self::list_visible_files_by_offset`]. `after` is exclusive
+    /// `(offsetheader, fullpath)`; unknown/negative offsets sort last as `None`.
+    ///
+    /// Filters are applied after choosing the newest version, so tombstones,
+    /// directories, links, and generated rows cannot resurrect older payloads.
+    /// At most `MAX_DIR_PAGE + 1` rows are returned (one lookahead for callers).
+    /// Compact-only indexes have no SQL catalog and return an error.
+    pub fn list_visible_files_by_offset_page(
+        &self,
+        after: Option<(Option<i64>, &str)>,
+        limit: u32,
+    ) -> Result<Vec<VisibleMember>> {
+        if self.compact_only {
+            return Err(IndexError::Invalid(
+                "offset paging requires a SQL catalog".into(),
+            ));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.prepare_offset_order_index(false);
+        let limit = limit.min(MAX_DIR_PAGE + 1);
+        let (after_offset, after_path) = after.unwrap_or((None, ""));
+        let after_offset = offset_sort_key(after_offset);
+        let unknown_only = after.is_some() && after_offset.is_none();
+        self.with_conn(|conn| {
+            let mut out = Vec::new();
+            // Keep real offsets in their own range query so the offsetheader
+            // index can seek directly to the cursor. Unknown offsets form a
+            // final path-ordered tail and never collide with a real offset.
+            for unknown in [false, true] {
+                if (!unknown && unknown_only) || out.len() == limit as usize {
+                    continue;
+                }
+                let (keyset, order) = if unknown {
+                    (
+                        "(offsetheader IS NULL OR offsetheader < 0) AND fullpath > ?4",
+                        "fullpath",
+                    )
+                } else {
+                    (
+                        "offsetheader >= ?3 AND (offsetheader > ?3 OR fullpath > ?4)",
+                        "offsetheader, fullpath",
+                    )
+                };
+                let sql = format!(
+                    r#"
+                    WITH candidates AS (
+                      SELECT f.*, f.rowid AS version_rowid,
+                        CASE WHEN path = '' OR path = '/' THEN '/' || name
+                             ELSE path || '/' || name END AS fullpath
+                      FROM "files" AS f
+                    )
+                    SELECT path, name, offsetheader, offset, size, mode,
+                           istar, issparse, isgenerated, recursiondepth
+                    FROM candidates AS f
+                    WHERE {keyset}
+                      AND name != ''
+                      AND (mode & ?1) = ?2
+                      AND COALESCE(linkname, '') = ''
+                      AND COALESCE(isgenerated, 0) = 0
+                      AND NOT EXISTS (
+                        SELECT 1 FROM "files" AS newer
+                        WHERE newer.path = f.path AND newer.name = f.name
+                          AND (newer.offsetheader > f.offsetheader
+                               OR (f.offsetheader IS NULL AND newer.offsetheader IS NOT NULL)
+                               OR (newer.offsetheader IS f.offsetheader
+                                   AND newer.rowid > f.version_rowid))
+                      )
+                    ORDER BY {order}
+                    LIMIT ?5
+                    "#,
+                );
+                let mut stmt = conn.prepare_cached(&sql)?;
+                let rows = stmt.query_map(
+                    rusqlite::params![
+                        i64::from(S_IFMT),
+                        i64::from(S_IFREG),
+                        after_offset.unwrap_or(0),
+                        if unknown && !unknown_only {
+                            ""
+                        } else {
+                            after_path
+                        },
+                        i64::from(limit) - out.len() as i64,
+                    ],
+                    |row| {
+                        Ok(VisibleMember {
+                            path: row.get(0)?,
+                            name: row.get(1)?,
+                            cookie: CompactOpenCookie {
+                                offsetheader: row.get::<_, Option<i64>>(2)?.unwrap_or(-1),
+                                offset: row.get::<_, i64>(3)?.max(0) as u64,
+                                size: row.get::<_, i64>(4)?.max(0) as u64,
+                                mode: row.get::<_, i64>(5)? as u32,
+                                istar: row.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+                                issparse: row.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+                                isgenerated: row.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0,
+                                recursiondepth: row.get::<_, Option<i64>>(9)?.unwrap_or(0).max(0)
+                                    as u32,
+                            },
+                        })
+                    },
+                )?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            Ok(out)
+        })
     }
 
     fn sql_visible_newest_payloads(&self) -> Result<Vec<VisibleMember>> {
@@ -280,6 +460,240 @@ mod tests {
         rows.iter()
             .map(|m| catalog_fullpath(&m.path, &m.name))
             .collect()
+    }
+
+    fn collect_offset_pages(idx: &SqliteIndex, limit: u32) -> Vec<VisibleMember> {
+        let mut all: Vec<VisibleMember> = Vec::new();
+        loop {
+            let after = all.last().map(|row| {
+                (
+                    cookie_offset_key(&row.cookie),
+                    catalog_fullpath(&row.path, &row.name),
+                )
+            });
+            let page = idx
+                .list_visible_files_by_offset_page(
+                    after
+                        .as_ref()
+                        .map(|(offset, path)| (*offset, path.as_str())),
+                    limit,
+                )
+                .unwrap();
+            if page.is_empty() {
+                return all;
+            }
+            assert!(page.len() <= limit as usize);
+            all.extend(page);
+            assert!(all.len() < 100, "cursor must make progress");
+        }
+    }
+
+    fn has_offset_order_index(idx: &SqliteIndex) -> bool {
+        idx.with_conn(|conn| Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'files_offsetheader')",
+            [], |row| row.get(0),
+        )?)).unwrap()
+    }
+
+    fn build_offset_sidecar(path: &std::path::Path) {
+        let mut idx = SqliteIndex::create_writable(Some(path)).unwrap();
+        idx.insert_files_batch(&[
+            file_row("", "z", 0, false),
+            file_row("/d", "a", 512, false),
+            file_row("", "last", 1024, false),
+        ])
+        .unwrap();
+        idx.publish_tmp().unwrap();
+    }
+
+    /// Regression: normal cold builds must not pay for an unused secondary index.
+    #[test]
+    fn offset_page_normal_build_has_no_index_until_writable_paging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lazy.sqlite");
+        build_offset_sidecar(&path);
+        let idx = SqliteIndex::open_writable(&path).unwrap();
+        assert!(!has_offset_order_index(&idx));
+        let expected = idx.list_visible_files_by_offset().unwrap();
+        assert!(!has_offset_order_index(&idx));
+        assert_eq!(collect_offset_pages(&idx, 1), expected);
+        assert!(has_offset_order_index(&idx));
+    }
+
+    /// Regression: read-only connections page without creating an auxiliary index.
+    #[test]
+    fn offset_page_read_only_connection_stays_unindexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.sqlite");
+        build_offset_sidecar(&path);
+        let idx = SqliteIndex::open_catalog_read_only(&path).unwrap();
+        let expected = idx.list_visible_files_by_offset().unwrap();
+        assert!(!has_offset_order_index(&idx));
+        for size in [1, 2, 7] {
+            assert_eq!(collect_offset_pages(&idx, size), expected);
+        }
+        assert!(!has_offset_order_index(&idx));
+    }
+
+    /// Regression: memory catalogs must not get the optional disk-sidecar index.
+    #[test]
+    fn offset_page_memory_catalog_stays_unindexed() {
+        let idx = insert_za_unsealed();
+        let expected = idx.list_visible_files_by_offset().unwrap();
+        idx.prepare_offset_order_index(true);
+        assert_eq!(collect_offset_pages(&idx, 1), expected);
+        assert!(!has_offset_order_index(&idx));
+    }
+
+    /// Regression: remote-cache blobs must not be changed even with write permission.
+    #[test]
+    fn offset_page_remote_cached_sidecar_stays_unindexed() {
+        let _guard = crate::meta_cache::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct RestoreXdg(Option<std::ffi::OsString>);
+        impl Drop for RestoreXdg {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+                    None => std::env::remove_var("XDG_CACHE_HOME"),
+                }
+            }
+        }
+        let _restore = RestoreXdg(std::env::var_os("XDG_CACHE_HOME"));
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        let path = dir.path().join("ratarmount/meta-v3/remote.sqlite");
+        build_offset_sidecar(&path);
+        assert!(crate::is_meta_cache_path(&path));
+        let idx = SqliteIndex::open_catalog_read_only(&path).unwrap();
+        let expected = idx.list_visible_files_by_offset().unwrap();
+        idx.prepare_offset_order_index(true);
+        assert_eq!(collect_offset_pages(&idx, 1), expected);
+        assert!(!has_offset_order_index(&idx));
+    }
+
+    /// Regression: a locked CREATE INDEX must fall back once without breaking pages.
+    #[test]
+    fn offset_page_locked_index_creation_falls_back_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.sqlite");
+        build_offset_sidecar(&path);
+        let idx = SqliteIndex::open_writable(&path).unwrap();
+        idx.with_conn(|conn| {
+            conn.busy_timeout(std::time::Duration::ZERO)?;
+            Ok(())
+        })
+        .unwrap();
+        let expected = idx.list_visible_files_by_offset().unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(collect_offset_pages(&idx, 1), expected);
+        assert!(!has_offset_order_index(&idx));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(collect_offset_pages(&idx, 2), expected);
+        assert!(
+            !has_offset_order_index(&idx),
+            "failed creation is attempted only once"
+        );
+    }
+
+    /// Regression: equal offsets need the full path tie-breaker, with NULL offsets last.
+    #[test]
+    fn offset_page_equal_and_unknown_offsets_no_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("order.sqlite");
+        let mut idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+        idx.insert_files_batch(&[
+            file_row("/z", "same", 10, false),
+            file_row("/a", "same", 10, false),
+            file_row("", "zero", 0, false),
+            file_row("", "negative", -2, false),
+            file_row("", "maximum", i64::MAX - 512, false),
+        ])
+        .unwrap();
+        idx.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO files (path, name, offsetheader, offset, size, mode)
+                   VALUES ('', 'unknown', NULL, 0, 0, ?1)"#,
+                [REG],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let expected = idx.list_visible_files_by_offset().unwrap();
+        for size in [1, 2, 7] {
+            assert_eq!(collect_offset_pages(&idx, size), expected);
+        }
+        idx.publish_tmp().unwrap();
+        drop(idx);
+        // The public Session catalog has no in-memory projection.
+        let idx = SqliteIndex::open_catalog_read_only(&path).unwrap();
+        assert!(!idx.has_mem_index());
+        assert_eq!(collect_offset_pages(&idx, 1), expected);
+        assert!(idx
+            .list_visible_files_by_offset_page(None, 0)
+            .unwrap()
+            .is_empty());
+        drop(idx);
+        // Existing Python/older Rust sidecars need no schema migration.
+        let idx = SqliteIndex::open_writable(&path).unwrap();
+        idx.with_conn(|conn| {
+            conn.execute("DROP INDEX files_offsetheader", [])?;
+            Ok(())
+        })
+        .unwrap();
+        drop(idx);
+        let idx = SqliteIndex::open_catalog_read_only(&path).unwrap();
+        assert_eq!(collect_offset_pages(&idx, 2), expected);
+        assert!(!has_offset_order_index(&idx));
+    }
+
+    /// Regression: filtering before newest-wins resurrects deleted or non-payload versions.
+    #[test]
+    fn offset_page_newest_tombstone_directory_link_generated_hide_old_payload() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.insert_files_batch(&[
+            file_row("", "gone", 0, false),
+            file_row_link("", "gone", 100, DUMPDIR_DELETE_LINKNAME, REG),
+            file_row("", "directory", 1, false),
+            file_row_link("", "directory", 101, "", DIR),
+            file_row("", "link", 2, false),
+            file_row_link("", "link", 102, "target", REG),
+            file_row("", "generated", 3, false),
+            file_row("", "generated", 103, true),
+            file_row("", "keep", 4, false),
+            file_row("", "keep", 104, false),
+            file_row_link("", "symlink", 105, "target", 0o120777),
+        ])
+        .unwrap();
+        let rows = collect_offset_pages(&idx, 1);
+        assert_eq!(visible_names(&rows), ["/keep"]);
+        assert_eq!(rows[0].cookie.offsetheader, 104);
+        assert_eq!(rows, idx.list_visible_files_by_offset().unwrap());
+    }
+
+    /// Regression: nullable foreign primary keys permit duplicate NULL versions.
+    #[test]
+    fn offset_page_duplicate_null_versions_do_not_resurrect_tombstone() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.with_conn(|conn| {
+            for (name, linkname) in [
+                ("keep", ""),
+                ("keep", ""),
+                ("gone", ""),
+                ("gone", DUMPDIR_DELETE_LINKNAME),
+            ] {
+                conn.execute(
+                    r#"INSERT INTO files (path, name, offsetheader, offset, size, mode, linkname)
+                       VALUES ('', ?1, NULL, 0, 0, ?2, ?3)"#,
+                    rusqlite::params![name, REG, linkname],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visible_names(&collect_offset_pages(&idx, 1)), ["/keep"]);
     }
 
     fn insert_za_unsealed() -> SqliteIndex {

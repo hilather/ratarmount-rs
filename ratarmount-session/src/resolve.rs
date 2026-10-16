@@ -118,6 +118,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate,
         }
     }
@@ -161,6 +162,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate,
         }
     }
@@ -285,6 +287,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("CliCompat memory last resort should still open");
@@ -424,6 +427,7 @@ mod tests {
                 password: None,
                 recursive: false,
                 recursion_depth: None,
+                parallelization: Default::default(),
                 recreate: Recreate::IfInvalid,
             }) {
                 Err(e) => e,
@@ -490,6 +494,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         }) {
             Err(e) => e,

@@ -18,7 +18,10 @@ use secrecy::ExposeSecret;
 
 use crate::factory::{self, CompositingOptions, MountBundle};
 use crate::resolve::resolve_index;
-use crate::types::{DirCursor, DirEnt, DirPage, IndexPolicy, OpenRequest, Recreate, SourceSpec};
+use crate::types::{
+    DirCursor, DirEnt, DirPage, IndexPolicy, MemberExtent, OffsetCursor, OffsetPage, OpenRequest,
+    Recreate, SourceSpec,
+};
 use crate::Error;
 
 /// Default `list_dirents_page` limit when the caller passes `0`.
@@ -61,6 +64,7 @@ pub struct Session {
     pub(crate) source: OpenedSource,
     pub(crate) catalog: Option<SqliteIndex>,
     pub(crate) loc: CatalogLoc,
+    catalog_writes_allowed: bool,
 }
 
 pub(crate) enum OpenedSource {
@@ -121,17 +125,8 @@ impl Session {
             return Err(Error::Cancelled);
         }
 
-        let (clear_index_cache, write_index, read_only_index) = match req.recreate {
-            Recreate::Always => (true, true, false),
-            Recreate::IfInvalid => (false, true, false),
-            Recreate::Never => (false, false, true),
-        };
-        let passwords = req
-            .password
-            .as_ref()
-            .map(|s| vec![s.expose_secret().clone()])
-            .unwrap_or_default();
-        let had_passwords = !passwords.is_empty();
+        let mut options = open_options(&req, hooks);
+        let had_passwords = !options.passwords.is_empty();
 
         let recreate_flag = matches!(req.recreate, Recreate::Always);
         let archive_path = match &req.source {
@@ -190,19 +185,8 @@ impl Session {
             }
         };
 
-        let mut options = OpenOptions {
-            recursive: req.recursive,
-            recursion_depth: req.recursion_depth,
-            passwords,
-            clear_index_cache,
-            write_index,
-            read_only_index,
-            index_in_memory,
-            index_file_path,
-            index_folders: Vec::new(),
-            index_build: hooks.clone(),
-            ..OpenOptions::default()
-        };
+        options.index_in_memory = index_in_memory;
+        options.index_file_path = index_file_path;
 
         if matches!(req.recreate, Recreate::Never) {
             check_recreate_never(&archive_path, &loc)?;
@@ -255,6 +239,9 @@ impl Session {
             source,
             catalog,
             loc,
+            catalog_writes_allowed: options.write_index
+                && !options.read_only_index
+                && !remote_archive,
         })
     }
 
@@ -339,6 +326,115 @@ impl Session {
             .map(|fi| dirent_from_file_info(path, &fi)))
     }
 
+    /// Return the actual data-byte extent of a local, top-level plain TAR file.
+    ///
+    /// Compressed/remote/split archives, recursive sessions, sparse/generated
+    /// members, directories and links return `None`. Missing members return
+    /// [`Error::NotFound`], as in [`Self::read_range`]. The caller must keep the
+    /// backing archive unchanged for the lifetime of any mapping or read.
+    pub fn member_extent(&self, path: &str) -> Result<Option<MemberExtent>, Error> {
+        let path = query_normpath(path);
+        let fi = self
+            .mount_source()
+            .lookup(&path, 0)
+            .ok_or(Error::NotFound)?;
+        let file = match &self.source {
+            OpenedSource::Bundle(b) => b.plain_tar_file.as_ref(),
+            OpenedSource::Local(_) => None,
+        };
+        let Some(file) = file else {
+            return Ok(None);
+        };
+        if fi.mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFREG || !fi.linkname.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(ud) = fi.userdata.iter().find_map(|data| match data {
+            UserData::Tar(ud) => Some(ud),
+            UserData::Other(_) => None,
+        }) else {
+            return Ok(None);
+        };
+        if ud.issparse || ud.isgenerated || ud.recursiondepth != 0 || ud.offsetheader.is_none() {
+            return Ok(None);
+        }
+        let metadata = std::fs::metadata(file).map_err(crate::read::map_member_io)?;
+        if !metadata.is_file()
+            || ud
+                .offset
+                .checked_add(fi.size)
+                .is_none_or(|end| end > metadata.len())
+        {
+            return Ok(None);
+        }
+        Ok(Some(MemberExtent {
+            file: file.clone(),
+            offset: ud.offset,
+            len: fi.size,
+        }))
+    }
+
+    /// Page newest-wins regular payload files by `(offsetheader, fullpath)`.
+    ///
+    /// Directories, symlinks, hardlinks, generated rows and dumpdir tombstones
+    /// are omitted. Offsets are header hints in the logical (decompressed)
+    /// stream, never byte extents. Unknown offsets sort last, by full path.
+    /// The catalog must remain unchanged across pages. Requires a path-backed
+    /// SQL catalog; unsupported sources return [`Error::UnsupportedFormat`].
+    /// `0` uses the default page size; larger limits are capped at `MAX_DIR_PAGE`.
+    pub fn iter_by_offset_page(
+        &self,
+        cursor: OffsetCursor,
+        limit: u32,
+    ) -> Result<OffsetPage, Error> {
+        let cat = self.catalog().ok_or_else(|| {
+            Error::UnsupportedFormat("offset paging requires a path-backed SQL catalog".into())
+        })?;
+        cat.prepare_offset_order_index(self.catalog_writes_allowed);
+        let limit = if limit == 0 {
+            DEFAULT_DIR_PAGE
+        } else {
+            limit.min(MAX_DIR_PAGE)
+        };
+        let after = match &cursor {
+            OffsetCursor::Start => None,
+            OffsetCursor::AfterOffset { offsetheader, path } => {
+                Some((*offsetheader, path.as_str()))
+            }
+        };
+        let mut rows = cat
+            .list_visible_files_by_offset_page(after, limit + 1)
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        let more = rows.len() > limit as usize;
+        if more {
+            rows.pop();
+        }
+        let entries: Vec<DirEnt> = rows
+            .into_iter()
+            .map(|row| {
+                let path = join_archive_path(&row.path, &row.name);
+                DirEnt {
+                    path,
+                    name: row.name,
+                    is_dir: false,
+                    size: row.cookie.size,
+                    mtime: None,
+                    mode: row.cookie.mode,
+                    archive_offset: u64::try_from(row.cookie.offsetheader).ok(),
+                }
+            })
+            .collect();
+        let next = if more {
+            entries.last().map(|entry| OffsetCursor::AfterOffset {
+                offsetheader: entry.archive_offset.map(|offset| offset as i64),
+                path: entry.path.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(OffsetPage { entries, next })
+    }
+
     /// Start the HTTP Range server (CLI `--http`). Feature `http-export`.
     ///
     /// Default bind is [`crate::DEFAULT_HTTP_BIND`] (`127.0.0.1:20491`).
@@ -366,6 +462,7 @@ impl Session {
             source: OpenedSource::Local(Arc::new(StubMount)),
             catalog: None,
             loc: CatalogLoc::None,
+            catalog_writes_allowed: false,
         }
     }
 
@@ -390,6 +487,7 @@ impl Session {
             source: OpenedSource::Local(src),
             catalog: None,
             loc: CatalogLoc::None,
+            catalog_writes_allowed: false,
         }
     }
 
@@ -401,6 +499,29 @@ impl Session {
             CatalogLoc::Path(p) | CatalogLoc::Temp(p) => IndexLocation::Path(p),
             CatalogLoc::Memory | CatalogLoc::None => IndexLocation::Memory,
         }
+    }
+}
+
+fn open_options(req: &OpenRequest, hooks: &IndexBuildHooks) -> OpenOptions {
+    let (clear_index_cache, write_index, read_only_index) = match req.recreate {
+        Recreate::Always => (true, true, false),
+        Recreate::IfInvalid => (false, true, false),
+        Recreate::Never => (false, false, true),
+    };
+    OpenOptions {
+        recursive: req.recursive,
+        recursion_depth: req.recursion_depth,
+        parallelization: req.parallelization.clone(),
+        passwords: req
+            .password
+            .as_ref()
+            .map(|s| vec![s.expose_secret().clone()])
+            .unwrap_or_default(),
+        clear_index_cache,
+        write_index,
+        read_only_index,
+        index_build: hooks.clone(),
+        ..OpenOptions::default()
     }
 }
 
@@ -620,9 +741,27 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open")
+    }
+
+    /// Regression: Session requests must reach OpenOptions instead of silently using one thread.
+    #[test]
+    fn parallelization_request_reaches_open_options() {
+        let mut req = never_req(PathBuf::from("a.tar.zst"), PathBuf::from("a.sqlite"));
+        let default = open_options(&req, &IndexBuildHooks::default());
+        assert_eq!(default.threads_for("zstd"), 1);
+        assert_eq!(default.threads_for("gzip"), 1);
+        req.parallelization = ratarmount_core::ParallelizationSpec::new(4);
+        let options = open_options(&req, &IndexBuildHooks::default());
+        assert_eq!(options.threads_for("zstd"), 4);
+        assert_eq!(options.threads_for("bzip2"), 4);
+        req.parallelization = ratarmount_core::ParallelizationSpec::parse(":2,zstd:4").unwrap();
+        let options = open_options(&req, &IndexBuildHooks::default());
+        assert_eq!(options.threads_for("zstd"), 4);
+        assert_eq!(options.threads_for("gzip"), 2);
     }
 
     /// Regression: Session is Send — embedders move it onto a worker thread (G5.1).
@@ -753,6 +892,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("open dumpdir tar");
@@ -789,6 +929,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         };
         if std::env::var_os("RATARMOUNT_CATALOG_OPEN_CHILD").is_some() {
@@ -833,6 +974,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::Never,
         }
     }
@@ -875,6 +1017,7 @@ mod tests {
                 password: None,
                 recursive: false,
                 recursion_depth: None,
+                parallelization: Default::default(),
                 recreate: Recreate::IfInvalid,
             })
             .expect("seed sidecar"),
@@ -909,6 +1052,7 @@ mod tests {
                 password: None,
                 recursive: false,
                 recursion_depth: None,
+                parallelization: Default::default(),
                 recreate: Recreate::IfInvalid,
             })
             .expect("seed sidecar"),
@@ -958,6 +1102,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("Temp open");
@@ -1002,6 +1147,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         });
         INJECT_CATALOG_OPEN_ERR.with(|c| c.set(false));
@@ -1112,6 +1258,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         });
         #[cfg(unix)]

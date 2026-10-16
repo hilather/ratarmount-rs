@@ -117,6 +117,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open")
@@ -165,6 +166,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("open 100 MiB member tar");
@@ -427,6 +429,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("metadata-only 7z open");

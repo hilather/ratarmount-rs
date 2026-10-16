@@ -61,7 +61,7 @@ pub use search::{locate_pattern_matches, FindAfter, SearchHit, SearchQuery, DEFA
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use ratarmount_core::{
     create_root_file_info, query_normpath, FileInfo, IndexBuildHooks, IndexBuildTick,
@@ -477,6 +477,8 @@ pub struct SqliteIndex {
     build_entries: AtomicU64,
     build_bytes_scanned: AtomicU64,
     build_bytes_total_hint: Mutex<Option<u64>>,
+    /// Lazy archive-order optimization, attempted at most once per catalog.
+    offset_order_index: OnceLock<()>,
 }
 
 /// Monotonic suffix so two [`SqliteIndex::create_writable`] calls in one process
@@ -648,6 +650,7 @@ impl SqliteIndex {
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
             build_bytes_total_hint: Mutex::new(None),
+            offset_order_index: OnceLock::new(),
         };
         idx.validate_loaded()?;
         if load_mem {
@@ -719,6 +722,7 @@ impl SqliteIndex {
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
             build_bytes_total_hint: Mutex::new(None),
+            offset_order_index: OnceLock::new(),
         })
     }
 
@@ -743,6 +747,7 @@ impl SqliteIndex {
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
             build_bytes_total_hint: Mutex::new(None),
+            offset_order_index: OnceLock::new(),
         })
     }
 
@@ -1035,6 +1040,7 @@ impl SqliteIndex {
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
             build_bytes_total_hint: Mutex::new(None),
+            offset_order_index: OnceLock::new(),
         })
     }
 
@@ -2324,6 +2330,7 @@ impl SqliteIndex {
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
             build_bytes_total_hint: Mutex::new(None),
+            offset_order_index: OnceLock::new(),
         };
         idx.validate_loaded()?;
         Ok(idx)
