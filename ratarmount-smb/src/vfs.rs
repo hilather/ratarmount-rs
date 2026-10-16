@@ -352,6 +352,24 @@ fn check_leaf(path: &str) -> Result<(), u32> {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: unsupported raw OS errors must remain STATUS_NOT_SUPPORTED.
+    #[test]
+    fn regression_smb_preserves_legacy_raw_errors() {
+        for (raw, expected) in [
+            (libc::EPERM, smb2::STATUS_ACCESS_DENIED),
+            (libc::EOPNOTSUPP, smb2::STATUS_NOT_SUPPORTED),
+            (libc::ENOTEMPTY, smb2::STATUS_ACCESS_DENIED),
+            (libc::ENOTDIR, smb2::STATUS_ACCESS_DENIED),
+            (libc::EXDEV, smb2::STATUS_ACCESS_DENIED),
+            (libc::EBUSY, smb2::STATUS_ACCESS_DENIED),
+            (libc::EMFILE, smb2::STATUS_ACCESS_DENIED),
+        ] {
+            let errno =
+                ratarmount_export_core::io_to_errno(&std::io::Error::from_raw_os_error(raw));
+            assert_eq!(errno_to_nt(errno), expected);
+        }
+    }
+
     use super::*;
     use std::io::Cursor;
 

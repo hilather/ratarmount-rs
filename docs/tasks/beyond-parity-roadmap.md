@@ -4,6 +4,8 @@
 **Status:** living checklist — not Python parity. Prefer implementing here when it multiplies `MountSource` + SQLite 0.7.x + FUSE/NFS.  
 **Legend:** `todo` · `partial` · `done` · `defer`
 
+The [Local AI roadmap](plans/local-ai-roadmap.md) tracks current implementation work that updates this checklist.
+
 Parity leftovers stay in [`parity-todo.md`](../parity-todo.md) and [`upstream-feature-requests.md`](upstream-feature-requests.md). This file is **new surface**: more ways in, more ways out, and making the index do more than open a mount.
 
 Protocol inbound/outbound batch (**P-1–P-10**, **F-1**, **F-4**, **G-1** booleans) landed 2026-08-23 (factory/CLI in PR-12; living tables in PR-14). Leftover close-out 2026-08-24: **P-6** / **P-10** `done`; **P-2** `done` (signing + 3.1.1 preauth/optional encrypt + leases/create contexts; Finder not CI). Inbound HMAC / FTP LIST / `rclone+` residuals dropped. Remaining first bets after F-2 / F-3 / G-2: F-5..F-10, G-3..G-5. gzip/rapidgzip thruput and Phase 12 announce stay residual / ops — not this table.
@@ -117,17 +119,9 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-3 | **SQLite FTS5 / locate** over the index | `done` | M | index + CLI + control plane |
 | F-4 | **OCI image mount** (layer union; product on P-1) | `done` | L | compositing `OciImageMountSource` + remote fetch + factory |
 | F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `partial` | L | fuse + packaging |
-| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `partial` | M | `ratarmount-remote` codec + Range + `SmbListing`; session `remote_open` wired |
-| F-7 | **Write-through / commit-to-remote** | `todo` | L | compositing + remote S3/HTTP |
-| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + FAT offset + exFAT/NTFS + UDIF DMG crates; remaining image crates + factory |
-| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR crate + FAT offset + exFAT/NTFS + WIM crates; remaining image crates + factory |
-| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
-| F-7 | **Write-through / commit-to-remote** | `partial` | L | compositing + CLI live `s3://` TAR/ZST; GCS/Azure PUT residual |
-| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR crate + FAT offset + exFAT/NTFS crates; remaining image crates + factory |
-| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + QCOW2 crates + FAT offset + exFAT/NTFS crates; remaining image crates + factory |
-| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + FAT offset + exFAT/NTFS + VHD/VHDX crates; remaining image crates + factory |
-| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + exFAT/NTFS + VMDK (KDMV sparse) crates; remaining image crates + factory |
-| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | Factory wired (Udf before Iso; Fat/Exfat/Ntfs before Block; Qcow2/Vhd/Vmdk after Block). Residuals: HFS+/APFS, LZX/LZMS, LVM/RAID/Btrfs, compressed VMDK grains, QCOW2 zstd/HTTP, VHD differencing |
+| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `partial` | M | In-tree SMB 2.0.2 codec, Range + folders wired; file dialect still falls back to `smbclient`; SMB 3.x/Kerberos/DFS residual |
+| F-7 | **Write-through / commit-to-remote** | `partial` | L | Live `-w` commit to S3, GCS (`gs://`) and Azure (`az://`) exists; offline remote commit unsupported |
+| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | Factory and crates cover listed formats; HFS+/APFS, codec/features, differencing and advanced volume residuals remain |
 | F-9 | **Producer: `--repack-seekable`** | `done` | M | compress engine + CLI; ZIP/7z/bzip2/xz residual |
 | F-10 | **Library / FFI / `ratar://` replacement** | `partial` | L | session landed; L0 dry-run only (Q5=a); PyO3 residual |
 
@@ -179,16 +173,13 @@ Homebrew **tap cask** shipped: unpacks the signed `macos-arm64` GitHub Release t
 
 **Landed:** in-tree blocking SMB 2.0.2 Direct-TCP packet codec (`ratarmount-remote/src/smb2_client.rs`): NEGOTIATE, SESSION_SETUP (guest + NTLMv2), TREE_CONNECT, CREATE, READ at offset, QUERY_DIRECTORY, QUERY_INFO, CLOSE. Live Range (`open_smb_range` / `SmbRangeFile`). Share listing (`open_smb_folder` / `SmbListing` QUERY_DIRECTORY Depth-1 on F-1 `RemoteFolderMountSource`; listing TTL `RATARMOUNT_REMOTE_LIST_TTL_SECS`). Session `open_remote_input` wires `smb://` through `open_s3_like` (Range) and `try_open_remote_folder_url` (folders). Fake-server tests; default stays on the in-tree codec. Crate-disjoint from `ratarmount-smb`. File dialect residual still falls back to `smbclient` download-to-temp.
 
-**Residual:** `SmbRangeFile` / `open_smb_range` (PR 3b), `SmbListing` folders (PR 3c), factory `smb://` live Range (PR 4). SMB 3.x encryption, Kerberos, DFS, SMB1.
-**Residual:** factory `smb://` live Range + folder probe (PR 4). `smbclient` directory listing. SMB 3.x encryption, Kerberos, DFS, SMB1.
-**Residual:** `smbclient` directory listing. SMB 3.x encryption, Kerberos, DFS, SMB1.
+**Residual:** file dialects that require `smbclient` download-to-temp; SMB 3.x encryption, Kerberos, DFS, SMB1.
 
-### F-7 — Write-through / commit-to-remote
 ### F-7 — Write-through / commit-to-remote — `partial`
 
-`s3://bucket/a.tar.zst` (or uncompressed TAR) + durable `-w` + `--commit-overlay-interval` / `--commit-overlay-on-exit` multipart-uploads the spliced spool and then the patched sqlite blob + `{url}.index.ptr`. Reuses the V-4 live queue (`enqueue_commit` IntervalIdle/OnExit). Offline `--commit-overlay` + `s3://` exits 2 (not on that executor). Anonymous / `RATARMOUNT_S3_ANONYMOUS=1` / missing keys exit 2 before mount. Write probe is `CreateMultipartUpload` + immediate `AbortMultipartUpload`. Reopen is live Range (`open_live_remote`), not `File::open(spool)`. CLI `--publish-index` PUTs blob-then-pointer for `s3://` archives.
+Live `-w` commit for S3, GCS (`gs://`) and Azure (`az://`) multipart-uploads the spliced archive and index siblings through the V-4 queue. Offline `--commit-overlay` for `s3://` exits 2. Anonymous / missing credentials exit 2 before mount. CLI `--publish-index` copies the sidecar to a local path only; remote index PUT exists only inside live overlay commit via `put_s3_index_siblings`.
 
-**Residual:** GCS `gs://` / Azure `az://` PUT; offline `s3://` commit; create-if-missing on remote URLs (K16 Unchanged).
+**Residual:** offline `s3://` commit; create-if-missing on remote URLs (K16 Unchanged).
 
 ### F-8 — Block and disk-image family
 
@@ -246,12 +237,9 @@ Larger than a protocol or a feature; still concrete enough to implement. Items 6
 |----|------|--------|--------|---------|
 | G-1 | **`ratarmount serve`** — one binary, several exports on the same tree | `done` | L | P-2 / P-5 / P-6 (NFS already); **booleans**, no `serve` subcommand |
 | G-2 | **Index as a portable artifact** (sidecar + OCI referrer / HTTP `Link:`) | `done` | M | index; pairs with P-1 |
-| G-3 | **Content-addressed member cache** (hash to decompressed chunk) | `done` | L | `--hashes` (partial today) |
-| G-4 | **Snapshot browser:** restic / borg / kopia / ZFS send | `todo` | L | new MountSources |
-| G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `partial` | L | packaging; F-1 makes volumes useful |
-| G-3 | **Content-addressed member cache** (hash to decompressed chunk) | `todo` | L | `--hashes` (partial today) |
-| G-4 | **Snapshot browser:** restic / borg / kopia / ZFS send | `partial` | L | new MountSources |
-| G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `todo` | L | packaging; F-1 makes volumes useful |
+| G-3 | **Content-addressed member cache** (hash to decompressed member) | `partial` | L | `payload-v1/` caches whole decompressed members; no remote range/chunk cache |
+| G-4 | **Snapshot browser:** restic / borg / kopia / ZFS send | `partial` | L | restic reader exists; borg, kopia and ZFS send readers absent |
+| G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `partial` | L | systemd/autofs helper examples shipped; CSI remains spec-only |
 
 ### G-1 — `ratarmount serve` — `done` (booleans)
 
@@ -263,19 +251,19 @@ A `ratarmount serve` **subcommand was not shipped** (clap positionals steal the 
 
 Media type `application/vnd.ratarmount.index.v1+sqlite` names this SQLite **blob family** (`v1`). Inner `INDEX_VERSION` stays `0.7.0` (`files` schema). Not SOCI / eStargz / nydus zTOC.
 
-Discovery (fail-open): explicit `--index-file` (CLI `--index-id HEX` pre-resolves to this path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known sibling GET → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Pointer/blob/tarstats failure continues (additional candidate, not terminal). After a remote fetch, `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Object-store sibling **GET** of pointer then blob then well-known is in. S3 **PUT** of blob then pointer is the remote primitive (`put_s3_file` / `publish_index_to_s3`; never pointer-first; leftover blob on pointer failure). CLI `--publish-index` and live overlay commit remain F-7. GCS/Azure PUT residual.
+Discovery (fail-open): explicit `--index-file` (CLI `--index-id HEX` pre-resolves to this path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known sibling GET → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Pointer/blob/tarstats failure continues (additional candidate, not terminal). After a remote fetch, `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Object-store sibling **GET** of pointer then blob then well-known is in. Remote index PUT exists only inside live overlay commit via `put_s3_index_siblings`; `put_s3_file` / `publish_index_to_s3` do not exist. CLI `--publish-index` is local only.
 
 Publish: `--publish-index` copies the sidecar next to the archive; `--publish-index-to PATH` is a required value. Both always write `{archive}.index.ptr` (`ratarmount.index.pointer.v1`; `index_id` = sha256 of the blob, 64 hex), including dest==sidecar. Keep-last-K=2 local snapshots (`{archive}.index.{old_id}.sqlite`) when a pointer is written. HTTP export `GET /.ratarmount-control/index.sqlite` is HTTP-only (not a FUSE control file) with that Content-Type. `--http` still serves the **indexed tree**, not host archive bytes. Inbound clients consume `Link` on the archive HEAD, not on `--http` tree export.
 
-**Residual:** SOCI / eStargz / nydus zTOC converter; GCS/Azure PUT; offline `s3://` `--commit-overlay`; FUSE/NFS exposure of the SQLite blob; Docker Hub Referrers matrix; tag-convention fallback.
+**Residual:** SOCI / eStargz / nydus zTOC converter; offline `s3://` `--commit-overlay`; FUSE/NFS exposure of the SQLite blob; Docker Hub Referrers matrix; tag-convention fallback.
 
-### G-3 — Content-addressed member cache — `done`
+### G-3 — Content-addressed member cache — `partial`
 
 Hash members (`--hashes sha256` on TAR/ZIP/7z). Cache decompressed **member bodies** by sha256 across mounts (`payload-v1/{hh}/{sha256}`). Nested Debian sources, OCI layers, and unioned backup tars share identical members. Default-on when `user.hash.sha256` exists; do not hash on cold `open`. Skip `:memory:` indexes, overlay writes, members > 64 MiB (`RATARMOUNT_PAYLOAD_CACHE_MEMBER_MAX`), and `RATARMOUNT_PAYLOAD_CACHE_BYTES=0`. LRU cap default 4 GiB.
 
 `payload-v1/` is a **sibling** of `local-index-v1/` under [`platform_cache_root()`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-index/src/local_cache.rs) (macOS `~/Library/Caches/ratarmount/`, Linux XDG, Windows `%LOCALAPPDATA%\ratarmount\`). Distinct from V-3 (`$XDG_CACHE_HOME/ratarmount/meta-v3/`), which caches whole **sidecar downloads** (SQLite blobs ≤ 64 MiB) and is **not** migrated to Library/Caches.
 
-**Residual:** CDC / nydus-like chunking of members larger than 64 MiB (would need a chunk table; do not put it in SQLite `files`).
+**Residual:** remote range/chunk caching (needed for lazy remote model loading); CDC / nydus-like chunking of members larger than 64 MiB (would need a chunk table; do not put it in SQLite `files`).
 
 ### G-4 — Snapshot browser — `partial` (restic done; borg / kopia / ZFS residual)
 

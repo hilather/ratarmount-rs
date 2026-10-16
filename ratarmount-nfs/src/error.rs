@@ -7,9 +7,6 @@ use nfsserve::nfs::nfsstat3;
 /// Password / permission failures must not collapse to generic I/O — that is
 /// what users see when opening encrypted nested 7z without `--password`.
 pub fn io_to_nfsstat3(err: &std::io::Error) -> nfsstat3 {
-    if err.raw_os_error() == Some(libc::EPERM) {
-        return nfsstat3::NFS3ERR_PERM;
-    }
     match err.kind() {
         ErrorKind::ReadOnlyFilesystem => nfsstat3::NFS3ERR_ROFS,
         ErrorKind::QuotaExceeded => nfsstat3::NFS3ERR_DQUOT,
@@ -29,6 +26,32 @@ pub fn io_to_nfsstat3(err: &std::io::Error) -> nfsstat3 {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: raw permission/unsupported and unknown errors keep their old statuses.
+    #[test]
+    fn regression_nfs_preserves_legacy_raw_errors() {
+        for (raw, expected) in [
+            (libc::EPERM, nfsstat3::NFS3ERR_ACCES),
+            (libc::EOPNOTSUPP, nfsstat3::NFS3ERR_NOTSUPP),
+            (libc::ENOTSUP, nfsstat3::NFS3ERR_NOTSUPP),
+            (libc::ENOTEMPTY, nfsstat3::NFS3ERR_IO),
+            (libc::ENOTDIR, nfsstat3::NFS3ERR_IO),
+            (libc::ELOOP, nfsstat3::NFS3ERR_IO),
+            (libc::EXDEV, nfsstat3::NFS3ERR_IO),
+            (libc::EBUSY, nfsstat3::NFS3ERR_IO),
+            (libc::EMFILE, nfsstat3::NFS3ERR_IO),
+            (libc::ENFILE, nfsstat3::NFS3ERR_IO),
+            (libc::EROFS, nfsstat3::NFS3ERR_ROFS),
+            (libc::EDQUOT, nfsstat3::NFS3ERR_DQUOT),
+            (libc::ENOSPC, nfsstat3::NFS3ERR_NOSPC),
+        ] {
+            assert_eq!(
+                io_to_nfsstat3(&std::io::Error::from_raw_os_error(raw)) as u32,
+                expected as u32,
+                "raw {raw}"
+            );
+        }
+    }
+
     use super::*;
     use std::io::{Error, ErrorKind};
 
@@ -37,7 +60,7 @@ mod tests {
     fn regression_overlay_policy_errno_mapping() {
         assert_eq!(
             io_to_nfsstat3(&Error::from_raw_os_error(libc::EPERM)) as u32,
-            nfsstat3::NFS3ERR_PERM as u32
+            nfsstat3::NFS3ERR_ACCES as u32
         );
         assert_eq!(
             io_to_nfsstat3(&Error::new(ErrorKind::ReadOnlyFilesystem, "policy")) as u32,

@@ -9,9 +9,6 @@ use ratarmount_compositing::{OverlayError, WriteOverlay};
 /// Password / permission failures must not collapse to generic EIO — that is
 /// what users see when opening encrypted nested 7z without `--password`.
 pub fn io_to_errno(err: &io::Error) -> i32 {
-    if let Some(errno) = err.raw_os_error() {
-        return errno;
-    }
     match err.kind() {
         ErrorKind::ReadOnlyFilesystem => libc::EROFS,
         ErrorKind::QuotaExceeded => libc::EDQUOT,
@@ -56,6 +53,33 @@ pub fn overlay_truncate(overlay: &WriteOverlay, path: &str, size: u64) -> io::Re
 
 #[cfg(test)]
 mod tests {
+    /// Regression: adding policy errors must not change historical errno mapping.
+    #[test]
+    fn regression_io_to_errno_preserves_legacy_raw_errors() {
+        for (raw, expected) in [
+            (libc::EPERM, libc::EACCES),
+            (libc::EACCES, libc::EACCES),
+            (libc::EOPNOTSUPP, libc::ENOSYS),
+            (libc::ENOTSUP, libc::ENOSYS),
+            (libc::ENOTEMPTY, libc::EIO),
+            (libc::ENOTDIR, libc::EIO),
+            (libc::ELOOP, libc::EIO),
+            (libc::EXDEV, libc::EIO),
+            (libc::EBUSY, libc::EIO),
+            (libc::EMFILE, libc::EIO),
+            (libc::ENFILE, libc::EIO),
+            (libc::EROFS, libc::EROFS),
+            (libc::EDQUOT, libc::EDQUOT),
+            (libc::ENOSPC, libc::ENOSPC),
+        ] {
+            assert_eq!(
+                io_to_errno(&std::io::Error::from_raw_os_error(raw)),
+                expected,
+                "raw {raw}"
+            );
+        }
+    }
+
     use super::*;
     use std::io::Cursor;
     use std::sync::Arc;
@@ -134,9 +158,6 @@ mod tests {
             (ErrorKind::StorageFull, libc::ENOSPC),
         ] {
             assert_eq!(io_to_errno(&io::Error::new(kind, "policy")), raw);
-            assert_eq!(io_to_errno(&io::Error::from_raw_os_error(raw)), raw);
-        }
-        for raw in [libc::EMFILE, libc::ENFILE, libc::EPERM, libc::EOPNOTSUPP] {
             assert_eq!(io_to_errno(&io::Error::from_raw_os_error(raw)), raw);
         }
     }

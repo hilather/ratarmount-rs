@@ -11,9 +11,6 @@ use embednfs::FsError;
 /// the VFS layer remaps that to [`FsError::Stale`]. Lookup name-miss is
 /// [`FsError::NotFound`] without going through `io::Error`.
 pub fn io_to_fserror(err: &std::io::Error) -> FsError {
-    if err.raw_os_error() == Some(libc::EPERM) {
-        return FsError::PermissionDenied;
-    }
     match err.kind() {
         ErrorKind::ReadOnlyFilesystem => FsError::ReadOnly,
         // embednfs has no DQUOT variant; NOSPC is its capacity-error response.
@@ -30,6 +27,32 @@ pub fn io_to_fserror(err: &std::io::Error) -> FsError {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: raw permission/unsupported and unknown errors keep their old statuses.
+    #[test]
+    fn regression_nfs_preserves_legacy_raw_errors() {
+        for (raw, expected) in [
+            (libc::EPERM, FsError::AccessDenied),
+            (libc::EOPNOTSUPP, FsError::Unsupported),
+            (libc::ENOTSUP, FsError::Unsupported),
+            (libc::ENOTEMPTY, FsError::Io),
+            (libc::ENOTDIR, FsError::Io),
+            (libc::ELOOP, FsError::Io),
+            (libc::EXDEV, FsError::Io),
+            (libc::EBUSY, FsError::Io),
+            (libc::EMFILE, FsError::Io),
+            (libc::ENFILE, FsError::Io),
+            (libc::EROFS, FsError::ReadOnly),
+            (libc::EDQUOT, FsError::NoSpace),
+            (libc::ENOSPC, FsError::NoSpace),
+        ] {
+            assert_eq!(
+                io_to_fserror(&std::io::Error::from_raw_os_error(raw)),
+                expected,
+                "raw {raw}"
+            );
+        }
+    }
+
     use super::*;
     use std::io::{Error, ErrorKind};
 
@@ -38,7 +61,7 @@ mod tests {
     fn regression_overlay_policy_errno_mapping() {
         assert_eq!(
             io_to_fserror(&Error::from_raw_os_error(libc::EPERM)),
-            FsError::PermissionDenied
+            FsError::AccessDenied
         );
         assert_eq!(
             io_to_fserror(&Error::new(ErrorKind::ReadOnlyFilesystem, "policy")),
