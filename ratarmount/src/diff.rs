@@ -253,16 +253,24 @@ fn base_entries(
 
 fn collect(args: &DiffArgs, source: &dyn MountSource) -> Result<Vec<Change>, String> {
     let removed = tombstones(&args.directory, args.include_git_dir)?;
+    collect_removed(args, source, &removed)
+}
+
+fn collect_removed(
+    args: &DiffArgs,
+    source: &dyn MountSource,
+    removed: &BTreeSet<String>,
+) -> Result<Vec<Change>, String> {
     let mut host = BTreeMap::new();
     host_entries(
         &args.directory,
         "",
         args.include_git_dir,
-        &removed,
+        removed,
         &mut host,
     )?;
     let mut old = BTreeMap::new();
-    for path in &removed {
+    for path in removed {
         base_entries(source, path, args.include_git_dir, &mut old)?;
     }
     for (path, entry) in &host {
@@ -358,6 +366,27 @@ impl Drop for ProgressToStderr {
             libc::dup2(self.0.as_raw_fd(), libc::STDOUT_FILENO);
         }
     }
+}
+
+/// Render against an already composed base (also used by the sandbox API).
+pub(crate) fn render_source(
+    args: &DiffArgs,
+    source: &dyn MountSource,
+    deleted: Option<Vec<String>>,
+) -> Result<String, String> {
+    let changes = if let Some(deleted) = deleted {
+        let mut removed = BTreeSet::new();
+        for path in deleted {
+            let path = checked_path(&path)?;
+            if !excluded(&path, args.include_git_dir) {
+                removed.insert(path);
+            }
+        }
+        collect_removed(args, source, &removed)?
+    } else {
+        collect(args, source)?
+    };
+    patch::render(&changes, args).map_err(|e| e.to_string())
 }
 
 fn execute(args: &DiffArgs) -> Result<(String, bool), String> {

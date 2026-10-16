@@ -274,3 +274,209 @@ remain an error in synthetic mode. A write overlay wraps the complete union.
 See the [rootfs recipe](recipes/sandbox-rootfs.md) for bubblewrap,
 systemd-nspawn, and microVM exports. This assembles filesystem content; the
 sandbox runtime supplies process isolation.
+
+## Sandbox supervisor API
+
+The Linux supervisor manages a fleet of independent attempts without a Python
+binding. Each attempt is a foreground ratarmount process mounting the registered
+base directly, with its own writable overlay and FUSE request worker. The base
+itself is never mounted by the supervisor.
+
+```sh
+mkdir -m 700 -p "$HOME/.local/state/ratarmount-sandboxes"
+ratarmount sandbox daemon --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" \
+  --state-dir "$HOME/.local/state/ratarmount-sandboxes" --max-attempts 256
+# In another terminal:
+ratarmount sandbox create-base --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" \
+  task /srv/repos/project.git@0123456789abcdef0123456789abcdef01234567 \
+  --options '{"git_synthetic_head":true,"readonly_globs":["tests/**"],"quota":2147483648}'
+ratarmount sandbox new --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" task --count 8
+ratarmount sandbox list --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" --base task
+ratarmount sandbox diff --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" ATTEMPT_ID --git
+ratarmount sandbox stats --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" ATTEMPT_ID
+ratarmount sandbox destroy --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" ATTEMPT_ID
+ratarmount sandbox destroy --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" --base task
+ratarmount sandbox shutdown --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock"
+```
+
+Client commands print the server's JSON response envelope, including server
+errors (exit 1). Local option and transport errors go to stderr.
+`new` also accepts `--overlay disk|tmpfs`, `--quota SIZE`, and repeated
+`--readonly GLOBS`. `--socket` works before or after the subcommand.
+`daemon --timeout SECONDS` sets base-validation and batch-readiness deadlines
+(default 120, range 1–3600). The foreground daemon exits on `shutdown`, SIGINT
+or SIGTERM after destroying its attempts. Base definitions and warmed indexes
+remain available for the next daemon run.
+
+The state directory must be owned by the daemon user, mode 0700, and must not
+be a symlink. Its parent must already exist. Exclusive locks protect both the
+state directory and socket address. Socket permissions are 0600 from creation;
+existing symlinks, regular files, foreign-owned sockets, and active listeners
+are refused. An owned stale socket may be replaced. The socket parent must be
+owned by the caller and protected against other users replacing entries (a
+root-owned sticky directory such as `/tmp` is also accepted). Lock files remain
+on disk; flock, not file existence, indicates ownership. Use a local filesystem
+for state and locks.
+
+### Protocol version 1
+
+Transport is UTF-8 JSON lines over AF_UNIX/SOCK_STREAM. Every complete request
+line receives one response line, in order on its connection. There are no
+notifications or unsolicited output. Multiple lines per connection are allowed;
+the CLI and Python client use one connection per call. Unknown operations,
+unknown fields (including option keys), missing fields, and malformed JSON
+are errors. Each request includes integer `version: 1` and an `op` string:
+
+```json
+{"version":1,"op":"create_base","name":"task","source":"/srv/base.tar","options":{"quota":2147483648}}
+{"version":1,"op":"new","base":"task","count":8,"overlay":"disk"}
+{"version":1,"op":"list","base":"task"}
+{"version":1,"op":"diff","id":"attempt-ABC123","git":true}
+{"version":1,"op":"stats","id":"attempt-ABC123"}
+{"version":1,"op":"destroy","id":"attempt-ABC123"}
+{"version":1,"op":"destroy","base":"task"}
+{"version":1,"op":"shutdown"}
+```
+
+| Operation | Fields and result |
+| --- | --- |
+| `create_base` | Required `name`, `source`; optional `options` object. Validates by opening/indexing without mounting, then durably records and returns `{name,source,options}`. An existing name returns `already_exists`. |
+| `new` | Required `base`; `count` defaults to 1, `overlay` to `"disk"`; optional integer `quota` in bytes and `readonly_globs` string array. Returns an array of attempts only after all mounts are ready. |
+| `list` | Optional `base` filters the attempt array. Status is `"ready"` or `"crashed"` (`"starting"` is internal to setup). An unknown base is an error. |
+| `diff` | Required `id`; boolean `git` defaults to false. Returns `{"patch":"..."}` using the in-process diff renderer and the same composed base, including recursive sources and binds. |
+| `stats` | Required `id`. Returns the same integer object as `overlay-stats --json`. |
+| `destroy` | Exactly one of `id` or `base`. Returns `{"destroyed":true}`. A base selector destroys its attempts, retaining its registered definition/indexes. Unknown IDs return `not_found`. |
+| `shutdown` | No additional fields. Destroys all attempts, returns `{"shutdown":true}`, and stops the daemon. If cleanup fails, returns an error and stays available for retry. |
+
+An attempt is `{id,base,path,overlay_dir,status}`. Paths are absolute host paths;
+`path` is the writable merged mount and `overlay_dir` contains changed content
+and the overlay database. IDs are unique generated directory names. Base names
+start with an ASCII letter or digit, followed by letters, digits, `.`, `_` or
+`-`, at most 128 characters. Source strings accept ordinary ratarmount inputs,
+including Git `repo.git@REV`, OCI URLs and restic snapshots. Relative local
+sources and bind sources resolve against the daemon's working directory at
+registration and are stored as absolute paths. Pin Git revisions, container
+digests and snapshot IDs: registration does not freeze mutable folders or refs.
+
+`options` accepts these keys (all optional):
+
+| Key | Type / default |
+| --- | --- |
+| `git_synthetic_head` | boolean, false; history-free synthetic Git metadata |
+| `recursive` | boolean, false |
+| `uid`, `gid` | unsigned 32-bit integers; default daemon effective IDs |
+| `umask` | octal string, e.g. `"027"`; default no mask override |
+| `readonly_globs` | array of glob strings, default `[]` |
+| `quota` | unsigned integer logical bytes, default unlimited |
+| `passthrough` | `"auto"`, `"on"` or `"off"`; default `"auto"` |
+| `binds` | array of `/MOUNTPATH=SOURCE` strings, default `[]` |
+| `allow_other` | boolean, false; true requires the FUSE configuration described above |
+
+Attempts always use `noatime` and omit file-version virtual directories. New
+attempt read-only rules append to base rules; quotas use the smaller of the
+base and attempt caps. A request cannot loosen a base policy. Options are typed;
+there is no arbitrary shell command or mount-argument passthrough. Remote
+credentials come from the daemon's inherited environment/backend configuration.
+State and logs may contain source URLs; prefer credential-free URLs.
+
+Response envelopes are:
+
+```json
+{"version":1,"ok":true,"result":[{"id":"attempt-ABC123","base":"task","path":"/state/attempts/attempt-ABC123/mnt","overlay_dir":"/state/attempts/attempt-ABC123/overlay","status":"ready"}]}
+{"version":1,"ok":false,"error":{"code":"capacity","message":"count must be positive and fit --max-attempts (including crashed attempts)"}}
+```
+
+Stable error codes include `invalid_request`, `unsupported_version`,
+`not_found`, `already_exists`, `capacity`, `in_use`, `unsafe_path`,
+`base_open_failed`, `mount_failed`, `timeout`, `unmount_failed`, `diff_failed`,
+`stats_failed`, `response_too_large`, `unsupported`, and `io`. Messages provide
+context and may change. Validation logs live in `indexes/BASE/prepare.log`;
+attempt diagnostics live in `attempts/ID/mount.log` until destroy. Failed-batch
+errors include a bounded excerpt of the failing mount's log when available.
+
+### Lifetime, concurrency and recovery
+
+Registration warms `state-dir/indexes/BASE` with `--no-mount`; subsequent
+attempts share that cache, including source-specific indexes for binds. No
+per-attempt archive copy or Git worktree is made. Warm setup still includes
+process startup, opening the cached index and mounting FUSE; it is not promised
+to take zero time. The ignored 64-attempt test reports measured setup/teardown
+milliseconds per attempt on the orchestrator's host.
+
+All children in a batch start before readiness is polled. `--max-attempts`
+(default 256, maximum 4096) caps total retained attempts across bases, including
+crashed attempts, until destroy. Mutating requests and diff/stats execute
+serially; separate clients may connect concurrently. Up to 32 connections are
+retained. Incomplete/idle connections expire after 30 seconds, request lines
+are limited to 1 MiB, response lines to 64 MiB, and stalled response writes to
+5 seconds. Diff/source reads use the existing backend timeouts; the batch
+readiness timeout does not interrupt an in-process diff. Stop agent writers
+before diff/stats for a consistent result: files and SQLite are separate
+snapshots, and these calls do not pause applications. Live attempts return
+in-memory deletion records over a private child inspection socket, avoiding
+the overlay database's exclusive lock (including deletions awaiting SQL retry).
+The supervisor renders the patch and scans usage in-process. For a crashed
+attempt, diff/stats use its offline database; an unrecoverable database returns
+a structured error. State paths must leave room within the platform's Unix
+socket path limit for `attempts/ID/inspect.sock`.
+
+A failed/timed-out batch rolls back its own children and directories without
+affecting previous attempts. If unmount fails, directories and attempt records
+are retained, and the error names the IDs for inspection/retry. A crashed mount
+is marked `crashed`; siblings and the supervisor continue. Its disk/RAM overlay
+is retained for inspection until destroy. Destroy tries normal unmount, then
+lazy unmount, and stops/reaps the child if needed. It never deletes backing
+content while a mount remains attached. Shutdown and destroy-by-base can
+partially succeed if one cleanup fails; `list` reports what remains.
+
+RAM overlays use Linux `/dev/shm`, falling back to verified tmpfs at
+`$XDG_RUNTIME_DIR`. The supervisor owns a private directory there and passes
+its explicit path to each mount with `-w`, using the same tmpfs verification
+and logical quota semantics as `--overlay-tmpfs`. Owning the directory here
+keeps `overlay_dir` known and permits cleanup after child SIGKILL. No RAM is
+reserved; set a quota. State records the RAM location for restart cleanup.
+
+After daemon restart, registered bases and caches survive; **all abandoned
+attempts are unmounted and discarded**, including disk overlays. They are never
+re-adopted. Cleanup must succeed before requests are served. Linux children
+receive SIGKILL if their supervisor dies (including during startup); restart
+then removes disconnected mounts and directories. Persisted process IDs are
+never used to kill processes. An exclusive state lock prevents a second daemon
+from reconciling an active daemon's attempts. This initial supervisor is Linux
+only; other platforms can use ordinary mounts and offline diff/stats.
+
+A lost connection is not cancellation. A mutation may finish after the client
+times out; clients must reconcile with `list` before retrying `new`. There is
+no request deduplication or automatic retry. Normal shutdown discards attempts;
+collect patches first. Registered bases currently have no API to unregister
+or evict their index cache; remove those state files only with the daemon
+stopped and no attempts left.
+
+### Python client
+
+Add `clients/python` to `PYTHONPATH` or copy
+`clients/python/ratarmount_sandbox.py` into the harness. It uses only the Python
+standard library (Python 3.9+), with no extension module or runtime dependency:
+
+```python
+from ratarmount_sandbox import RatarmountSandbox
+
+with RatarmountSandbox("/run/user/1000/ratarmount-sandbox.sock") as client:
+    attempts = client.new("task", count=8, overlay="disk")
+    for attempt in attempts:
+        print(attempt.path, attempt.overlay_dir)
+        # Run and stop the agent before exporting:
+        patch = attempt.diff(git=True)
+        usage = attempt.stats()
+# All attempts created through this client are destroyed, even on exceptions.
+```
+
+`create_base(name, source, **options)`, `list(base=None)`,
+`destroy(id=... | base=...)`, and `shutdown()` expose the other operations.
+An individual `Attempt` is also a context manager; `destroy()` is locally
+idempotent. A client context destroys only attempts created through that
+client; it does not shut down the shared daemon or destroy attempts returned
+by `list`. `SandboxError.code` exposes the structured error code. Transport
+errors raise `OSError`/`TimeoutError`; no mutations are retried automatically.
+The default client I/O timeout is 3600 seconds, configurable on construction.
+See the [SWE-bench recipe](recipes/swe-bench-sandboxes.md).
