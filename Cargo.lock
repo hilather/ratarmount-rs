@@ -3913,6 +3913,7 @@ version = "0.1.34"
 dependencies = [
  "pyo3",
  "ratarmount-formats-tar",
+ "ratarmount-remote",
  "ratarmount-session",
  "secrecy",
  "tempfile",
