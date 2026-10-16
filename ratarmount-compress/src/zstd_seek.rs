@@ -1215,17 +1215,20 @@ impl ZstdFrameReader {
     }
 
     fn reserve_frame(&self, bytes: u64, budget: u64) -> Option<Reservation> {
-        self.reserved_slots
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
-                (slots < u64::from(self.options.threads.min(16))).then_some(slots + 1)
-            })
-            .ok()?;
-        if self
-            .reserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|&total| total <= budget)
-            })
-            .is_err()
+        ratarmount_core::try_update_u64(
+            &self.reserved_slots,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |slots| (slots < u64::from(self.options.threads.min(16))).then_some(slots + 1),
+        )
+        .ok()?;
+        if ratarmount_core::try_update_u64(
+            &self.reserved,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |used| used.checked_add(bytes).filter(|&total| total <= budget),
+        )
+        .is_err()
         {
             self.reserved_slots.fetch_sub(1, Ordering::AcqRel);
             return None;

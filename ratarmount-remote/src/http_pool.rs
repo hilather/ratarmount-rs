@@ -742,12 +742,11 @@ impl PrefetchBudget {
     }
 
     fn try_acquire(self: &Arc<Self>) -> Option<PrefetchPermit> {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                (used < self.limit).then_some(used + 1)
-            })
-            .ok()
-            .map(|_| PrefetchPermit(Arc::clone(self)))
+        ratarmount_core::try_update_usize(&self.used, Ordering::AcqRel, Ordering::Acquire, |used| {
+            (used < self.limit).then_some(used + 1)
+        })
+        .ok()
+        .map(|_| PrefetchPermit(Arc::clone(self)))
     }
 }
 
