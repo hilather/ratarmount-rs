@@ -1,6 +1,7 @@
 //! Write overlay: redirect creates/writes/deletes to a host folder.
 //! Mirrors Python `WritableFolderMountSource` (subset) + `commit_overlay`.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -586,6 +587,7 @@ pub struct WriteOverlay {
     #[cfg(test)]
     cow_before_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     base: Arc<dyn MountSource>,
+    rolling: Option<Arc<crate::RollingMountSource>>,
     /// After a live TAR commit, the reopened archive.
     replacement: RwLock<Option<Arc<dyn MountSource>>>,
     root: PathBuf,
@@ -1075,6 +1077,7 @@ impl WriteOverlay {
             #[cfg(test)]
             cow_before_read_hook: Mutex::new(None),
             base,
+            rolling: None,
             replacement: RwLock::new(None),
             root,
             db: Mutex::new(conn),
@@ -1601,7 +1604,8 @@ impl WriteOverlay {
         out
     }
 
-    fn load_tombstone_paths(&self) -> HashSet<String> {
+    /// Snapshot live deletions without opening the exclusively locked overlay DB.
+    pub fn load_tombstone_paths(&self) -> HashSet<String> {
         self.tombstones.lock().expect("overlay tombstones").clone()
     }
 
@@ -2000,6 +2004,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
         self.check_mutation(OverlayMutation::Unlink, &[path])?;
+        self.refuse_sealed_delete(path)?;
         let path = normpath(path);
         let real = self.realpath(&path);
         // unlink of a symlink removes the link itself (safe); refuse only when the
@@ -2031,6 +2036,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
         self.check_mutation(OverlayMutation::Rmdir, &[path])?;
+        self.refuse_sealed_delete(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
         // POSIX: refuse non-directories and non-empty dirs in the union view.
@@ -2172,6 +2178,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
         self.check_mutation(OverlayMutation::Rename, &[from, to])?;
+        self.refuse_sealed_delete(from)?;
         let from = normpath(from);
         let to = normpath(to);
         if from == "/" || to == "/" || from == to {
@@ -2683,6 +2690,9 @@ impl WriteOverlay {
         let _policy = self.policy_lock();
         let path = normpath(path);
         self.check_mutation(OverlayMutation::Write, &[&path])?;
+        if self.rolling.is_some() && !self.has_file(&path) {
+            self.refuse_sealed_delete(&path)?;
+        }
         if path == "/" {
             return Err(io::Error::from_raw_os_error(libc::EPERM).into());
         }
@@ -2785,6 +2795,66 @@ impl WriteOverlay {
         self.commit_mode = mode;
     }
 
+    /// Install the series used as this overlay's base before serving requests.
+    pub fn set_rolling(&mut self, rolling: Arc<crate::RollingMountSource>) {
+        self.rolling = Some(rolling);
+    }
+
+    /// Actual active path (the CLI keeps the original generation as its label).
+    pub fn commit_archive_path(&self, archive: &Path) -> PathBuf {
+        self.rolling
+            .as_ref()
+            .map_or_else(|| archive.to_path_buf(), |series| series.active_path())
+    }
+
+    fn refuse_sealed_delete(&self, path: &str) -> Result<()> {
+        if self
+            .rolling
+            .as_ref()
+            .is_some_and(|series| series.sealed_contains(path))
+        {
+            return Err(io::Error::from_raw_os_error(libc::EROFS).into());
+        }
+        Ok(())
+    }
+
+    fn rolling_commit_target(&self, archive: &Path, plan: &OverlayCommitPlan) -> Result<PathBuf> {
+        let Some(series) = &self.rolling else {
+            return Ok(archive.to_path_buf());
+        };
+        let mut defer = false;
+        for path in &plan.deleted_paths {
+            if !plan.append_entries.iter().any(|(p, _)| p == path) {
+                self.refuse_sealed_delete(path)?;
+                defer |= series.active_source().exists(&archive_lookup_path(path));
+            }
+        }
+        for path in plan.xattrs.keys() {
+            if !plan.append_entries.iter().any(|(p, _)| p == path) {
+                self.refuse_sealed_delete(path)?;
+                defer = true;
+            }
+        }
+        series.prepare_commit(defer)
+    }
+
+    fn rolling_persist_plan<'a>(&self, plan: &'a OverlayCommitPlan) -> Cow<'a, OverlayCommitPlan> {
+        let Some(series) = &self.rolling else {
+            return Cow::Borrowed(plan);
+        };
+        let mut plan = plan.clone();
+        // Offsets and deletion names belong to the active archive only.
+        // Overlay cleanup still consumes the original, unfiltered plan.
+        let active = series.active_source();
+        plan.deleted_paths
+            .retain(|p| active.exists(&archive_lookup_path(p)));
+        plan.deletions_nul.clear();
+        for path in &plan.deleted_paths {
+            add_deletion_variants(&mut plan.deletions_nul, path);
+        }
+        Cow::Owned(plan)
+    }
+
     /// True when `archive` can be live-committed (uncompressed TAR or `.tar.zst`).
     pub fn live_commit_supported(archive: &Path) -> Result<()> {
         live_commit_is_supported(archive)
@@ -2796,6 +2866,8 @@ impl WriteOverlay {
             return self.commit_atomic_remote();
         }
         let _gate = self.commit_gate.write().expect("overlay commit gate");
+        let archive_path = self.commit_archive_path(archive);
+        let archive = archive_path.as_path();
         ratarmount_compress::commit_journal::recover(archive)?;
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
@@ -2811,7 +2883,13 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
-        let window = self.persist_by_format(archive, format, &plan)?;
+        let target = self.rolling_commit_target(archive, &plan)?;
+        let archive = target.as_path();
+        let persist_plan = self.rolling_persist_plan(&plan);
+        let window = self.persist_by_format(archive, format, &persist_plan)?;
+        if let Some(series) = &self.rolling {
+            series.committed(None);
+        }
         self.stash_patch_window(window);
         self.commit_generation.fetch_add(1, Ordering::SeqCst);
         Ok(true)
@@ -3425,6 +3503,8 @@ impl WriteOverlay {
         reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
     ) -> Result<bool> {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
+        let archive_path = self.commit_archive_path(archive);
+        let archive = archive_path.as_path();
         if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
             self.refuse_base_after_commit_failure();
             return Err(e.into());
@@ -3455,11 +3535,19 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
-        let window = self.persist_by_format(archive, format, &plan)?;
+        let target = self.rolling_commit_target(archive, &plan)?;
+        let archive = target.as_path();
+        let persist_plan = self.rolling_persist_plan(&plan);
+        let window = self.persist_by_format(archive, format, &persist_plan)?;
         self.stash_patch_window(window);
         match reopen(archive) {
             Ok(src) => {
-                *self.replacement.write().expect("overlay replacement") = Some(src);
+                if let Some(series) = &self.rolling {
+                    // The existing base wrappers already refer to this mutable series.
+                    series.committed(Some(src));
+                } else {
+                    *self.replacement.write().expect("overlay replacement") = Some(src);
+                }
                 // Bump before overlay cleanup: readers must drop pre-commit
                 // offsets even if forget/reset fails.
                 self.commit_generation.fetch_add(1, Ordering::SeqCst);
@@ -3811,7 +3899,11 @@ impl WriteOverlay {
         // Record GNU `--append` window from the two-zero EOF **before** tar runs.
         // `metadata().len()` includes EOF padding; parse would start after the
         // appended members.
-        let window = uncompressed_patch_window(archive, self.current_base().as_ref(), plan)?;
+        let classify_base = self
+            .rolling
+            .as_ref()
+            .map_or_else(|| self.current_base(), |series| series.active_source());
+        let window = uncompressed_patch_window(archive, classify_base.as_ref(), plan)?;
         let parent = archive
             .parent()
             .filter(|p| !p.as_os_str().is_empty())

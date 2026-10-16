@@ -219,6 +219,7 @@ pub struct HttpRangeSource {
     content_token: Mutex<CacheIdentity>,
     cache: Option<RangeCache>,
     hub_repo: Option<String>,
+    hub_cache: Option<Arc<crate::hf_cache::HubCacheFile>>,
     linked_sha256: Arc<Mutex<Option<String>>>,
 }
 
@@ -232,12 +233,18 @@ impl HttpRangeSource {
             content_token: Mutex::new(CacheIdentity::default()),
             cache: RangeCache::from_env(),
             hub_repo: None,
+            hub_cache: None,
             linked_sha256: Arc::default(),
         }
     }
 
     pub(crate) fn with_hub_repo(mut self, repo: String) -> Self {
         self.hub_repo = Some(repo);
+        self
+    }
+
+    pub(crate) fn with_hub_cache(mut self, cache: Arc<crate::hf_cache::HubCacheFile>) -> Self {
+        self.hub_cache = Some(cache);
         self
     }
 
@@ -308,18 +315,108 @@ impl HttpRangeSource {
         self
     }
 
-    /// Contiguous completed cache file for passthrough/Hub-cache consumers.
+    pub(crate) fn initialize_hub_cache(&self) {
+        if let Some(hub) = &self.hub_cache {
+            hub.initialize();
+        }
+    }
+
+    pub(crate) fn store_buffered(
+        &self,
+        bytes: Arc<Vec<u8>>,
+        memory: Option<Arc<ratarmount_core::budget::Reservation>>,
+    ) {
+        if let Some(hub) = &self.hub_cache {
+            hub.buffered(bytes, memory);
+        }
+    }
+
+    pub(crate) fn store_spooled(&self, file: Arc<Mutex<std::fs::File>>, size: u64) {
+        if let Some(hub) = &self.hub_cache {
+            hub.spooled(file, size);
+        }
+    }
+
+    pub(crate) fn backing_file(&self, size: u64) -> Option<std::fs::File> {
+        if let Some(hub) = &self.hub_cache {
+            if let Some(local) = hub.local().filter(|b| b.size == size) {
+                return local.backing_file();
+            }
+            let cache = self.cache.as_ref()?;
+            hub.complete(cache, &self.token(size)?);
+            return hub.local().filter(|b| b.size == size)?.backing_file();
+        }
+        self.cache
+            .as_ref()?
+            .complete_backing_file(&self.token(size)?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_publication(&self) {
+        if let Some(hub) = &self.hub_cache {
+            hub.wait();
+        }
+    }
+
+    /// Contiguous completed cache file. Hub publication is asynchronous; this
+    /// returns None until its worker finishes and never waits for that worker.
     pub fn complete_file(&self, size: u64) -> Option<std::path::PathBuf> {
-        self.cache.as_ref()?.complete_file(&self.token(size)?)
+        if let Some(local) = self
+            .hub_cache
+            .as_ref()
+            .and_then(|cache| cache.local())
+            .filter(|b| b.size == size)
+        {
+            return Some(local.path.clone());
+        }
+        let cache = self.cache.as_ref()?;
+        let token = self.token(size)?;
+        if let Some(hub) = &self.hub_cache {
+            hub.complete(cache, &token)
+        } else {
+            cache.complete_file(&token)
+        }
     }
 
     fn read_cached_into(&self, start: u64, size: u64, buf: &mut [u8]) -> Option<usize> {
-        self.cache
-            .as_ref()?
-            .read_into(&self.token(size)?, start, buf)
+        if let Some(local) = self
+            .hub_cache
+            .as_ref()
+            .and_then(|cache| cache.local())
+            .filter(|b| b.size == size)
+        {
+            return local.read_at(start, buf).ok();
+        }
+        let cache = self.cache.as_ref()?;
+        let token = self.token(size)?;
+        let n = cache.read_into(&token, start, buf)?;
+        self.observe_chunk(cache, &token, start / cache.chunk_size());
+        Some(n)
+    }
+
+    fn observe_chunk(&self, cache: &RangeCache, token: &ContentToken, chunk: u64) {
+        if let Some(hub) = &self.hub_cache {
+            hub.observed(cache, token, chunk);
+        }
+    }
+
+    fn store_chunk(&self, cache: &RangeCache, token: &ContentToken, chunk: u64, bytes: &[u8]) {
+        if let Err(err) = cache.put(token, chunk, bytes) {
+            log::debug!("range-v1 store skipped: {err}");
+        } else {
+            self.observe_chunk(cache, token, chunk);
+        }
     }
 
     fn cache_available(&self, start: u64, end: u64, size: u64) -> bool {
+        if self
+            .hub_cache
+            .as_ref()
+            .and_then(|hub| hub.local())
+            .is_some_and(|b| b.size == size)
+        {
+            return true;
+        }
         let (Some(cache), Some(token)) = (&self.cache, self.token(size)) else {
             return false;
         };
@@ -526,7 +623,9 @@ impl HttpRangeSource {
         if let Some(n) = self.read_cached_into(start, size, &mut buf[..len]) {
             return Ok(n);
         }
-        if (sequential || len >= 256 * 1024)
+        if (sequential
+            || len >= 256 * 1024
+            || self.hub_cache.is_some() && (start > 0 || len as u64 == size))
             && self.cache.as_ref().is_some_and(|c| c.is_enabled())
             && self.token(size).is_some()
         {
@@ -542,7 +641,7 @@ impl HttpRangeSource {
             if start.is_multiple_of(cache.chunk_size())
                 && len as u64 == cache.chunk_size().min(size - start)
             {
-                let _ = cache.put(&token, start / cache.chunk_size(), &buf[..len]);
+                self.store_chunk(cache, &token, start / cache.chunk_size(), &buf[..len]);
             }
         }
         Ok(len)
@@ -565,9 +664,7 @@ impl HttpRangeSource {
             if start.is_multiple_of(cache.chunk_size())
                 && data.len() as u64 == cache.chunk_size().min(size - start)
             {
-                if let Err(err) = cache.put(&token, start / cache.chunk_size(), &data) {
-                    log::debug!("range-v1 store skipped: {err}");
-                }
+                self.store_chunk(cache, &token, start / cache.chunk_size(), &data);
             }
         }
         Ok(data)
@@ -592,8 +689,17 @@ impl HttpRangeSource {
             let first = chunk * cache.chunk_size();
             let last = first + cache.chunk_size().min(size - first) - 1;
             let mut bytes = match cache.get(&token, chunk) {
-                Some(bytes) => bytes,
-                None => self.fetch_network(first, last, size, cancelled)?,
+                Some(bytes) => {
+                    self.observe_chunk(cache, &token, chunk);
+                    bytes
+                }
+                None => {
+                    let mut bytes = vec![0; (last - first + 1) as usize];
+                    match self.read_cached_into(first, size, &mut bytes) {
+                        Some(n) if n == bytes.len() => bytes,
+                        _ => self.fetch_network(first, last, size, cancelled)?,
+                    }
+                }
             };
             let from = start.saturating_sub(first) as usize;
             let until = (end.min(last) - first + 1) as usize;
@@ -742,12 +848,11 @@ impl PrefetchBudget {
     }
 
     fn try_acquire(self: &Arc<Self>) -> Option<PrefetchPermit> {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                (used < self.limit).then_some(used + 1)
-            })
-            .ok()
-            .map(|_| PrefetchPermit(Arc::clone(self)))
+        ratarmount_core::try_update_usize(&self.used, Ordering::AcqRel, Ordering::Acquire, |used| {
+            (used < self.limit).then_some(used + 1)
+        })
+        .ok()
+        .map(|_| PrefetchPermit(Arc::clone(self)))
     }
 }
 

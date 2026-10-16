@@ -229,26 +229,167 @@ The test selects a small public Xet-backed fixture, checks four concurrent range
 and the complete SHA-256, and skips with a reason unless explicitly enabled.
 Normal CI only uses in-process mock servers.
 
-## Offline and write-back limits
+## One shared Hub cache
 
-`HF_HUB_OFFLINE=1` (also `true`, `yes`, or `on`) refuses `hf://` mounts before any
-network access. Legacy `TRANSFORMERS_OFFLINE` is used when `HF_HUB_OFFLINE` is
-unset or empty; an explicit `HF_HUB_OFFLINE=0` overrides it. Listing caches alone cannot supply the file data. Shared Hub
-blob-cache reuse and `hf-cache://` offline mounts belong to AI-HF3 and are not
-implemented here. Do not treat this listing cache as an offline snapshot.
+`hf://` reads existing `huggingface_hub` files before requesting file bytes.
+The cache root follows upstream [constants.py](https://github.com/huggingface/huggingface_hub/blob/main/src/huggingface_hub/constants.py):
+`HF_HUB_CACHE`, then legacy `HUGGINGFACE_HUB_CACHE`, then `$HF_HOME/hub`.
+Without `HF_HOME`, use `$XDG_CACHE_HOME/huggingface/hub`, or
+`~/.cache/huggingface/hub`. Paths expand `~`, `$VAR`, and `${VAR}`.
+If no cache location or home directory can be determined, sharing is disabled
+and explicit offline mounts ask for `HF_HUB_CACHE`; no relative `~/` cache is created.
 
-Hub reads are read-only. `--commit-overlay` and live overlay commit report that
-`hf://` is not supported for commit. Index publication is supported as described above; archive write-back remains a
-separate roadmap task. Full-file LFS hash verification is performed by the live test;
-ordinary partial reads validate HTTP byte ranges, not the entire LFS object hash.
+Sharing defaults **on only when that cache directory already exists**.
+`RATARMOUNT_HF_SHARE_CACHE=1` enables it and permits creating the directory;
+`RATARMOUNT_HF_SHARE_CACHE=0` disables read-through and write-back for `hf://`.
+It does not disable explicit `hf-cache://` mounts. This avoids creating a new
+Hugging Face cache for users who have never used the Hub libraries.
+
+The layout matches the [Hub cache](https://huggingface.co/docs/huggingface_hub/guides/manage-cache):
+
+```text
+$HF_HUB_CACHE/
+  datasets--org--name/
+    blobs/<etag>
+    snapshots/<commit>/shards/part.tar -> ../../../blobs/<etag>
+    refs/main                         # commit SHA, no newline required
+  .locks/datasets--org--name/<etag>.lock
+```
+
+Files are matched by pinned commit/path or known blob hash and expected size
+when tree/response metadata is available. Snapshot symlinks may resolve only
+into that repository's `blobs` directory; symlink directories, `.incomplete`
+files, and escaping pointers are rejected. Copied snapshot files (used by the
+Python library on systems without symlink support) are also accepted.
+`.no_exist` markers and unfinished downloads are never presented as payloads.
+Normal `hf://` mounts still resolve the revision and may fetch tree metadata;
+a cache hit avoids **file** requests, not necessarily all Hub API requests.
+
+By default, regular Git blobs trust size and name. LFS blobs verify SHA-256
+before their first open. `RATARMOUNT_HF_CACHE_VERIFY=1` also verifies regular
+files using Git's SHA-1 blob format (`blob <size>\0<bytes>`).
+`RATARMOUNT_HF_CACHE_VERIFY=0` trusts size/name for both types. Successful and
+failed verification results use an in-memory LRU of 1,024 entries, keyed by
+path, expected hash, size, mtime, inode/device, and ctime on Unix. Eviction
+removes the least recently used entry rather than clearing the memo. The first
+open after eviction or process restart can rehash; verification is not persisted.
+
+Read-through keeps the verified descriptor and uses positional reads from it.
+Byte reads do not reopen its pathname, rehash the file, or walk cache directories.
+Backing extents use that descriptor too, so replacing a blob pathname cannot
+switch an existing reader or backing extent to an unverified inode. Cache misses
+are remembered for that file for the mount lifetime; remount to discover files
+that another process downloads later. Ratarmount's own background publication
+can populate a remembered miss. Avoid editing cache blobs in place while using
+open readers: descriptors pin inodes, not immutable copies of their contents.
+
+`HF_HUB_DISABLE_SYMLINKS=1` (also `true`, `yes`, or `on`) makes publication write
+ordinary snapshot copies instead of symlinks. Copied snapshots use available
+Hub tree hashes (`lfs.oid`/`lfs_sha256` or Git `oid`/`blob_id`) when verifying.
+Ratarmount also records expected hashes for its own copied files under the
+repository's `.ratarmount-hashes-v1/<commit>/<path>`. If a pre-existing copied
+snapshot has no expected hash metadata, it remains readable using size checks,
+including with `RATARMOUNT_HF_CACHE_VERIFY=1`; its contents cannot be hash-verified
+until that metadata is available. Offline listings inspect sizes without hashing
+all cached weights; opening a file or requesting a backing extent applies the
+configured verification. A known hash mismatch is a miss for `hf://` and an
+error for offline reads.
+
+When all verified chunks are available, a bounded background pool (two workers,
+64 queued jobs) assembles and publishes the whole file. A worker attempts the
+same per-blob `flock` as Python without waiting. Busy locks, a full queue, and
+failed writes retain the range data and back off for 30 seconds; later reads,
+opens of buffered files, or completion requests can retry. Workers hash while
+copying to a temporary file inside `blobs`, verify the full LFS SHA-256 or Git
+blob SHA-1 regardless of the read-verification setting, sync the file, and rename
+it into place. Reads never wait for the copy/hash or hold their file-state mutex
+while it runs. Non-Range buffered responses are also published asynchronously;
+their spool is under the Hub cache's `blobs` directory, never system `/tmp`.
+
+Publication atomically replaces the snapshot pointer (or copy) after the blob is
+complete. It never writes a revision ref. Named refs are updated only while the
+mount opens, conditional on the ref still matching what was observed before the
+revision API request, or created without clobbering an existing file when absent.
+A long-running pinned mount therefore cannot roll a newer Python `refs/main`
+back when one of its old files finishes downloading.
+
+New blobs, snapshot copies, metadata, and refs use `0o666 & ~umask` permissions;
+new directories use `0o777 & ~umask`. A temporary permission probe reads the
+kernel-applied mask without changing the process-global umask. Temporary files
+remain private until their permissions are set on the descriptor before rename.
+Snapshot symlink staging names have automatic cleanup on errors. Background
+publication also reclaims ratarmount-owned temporary blob files older than one
+hour when their publishing process has exited. It leaves active publishers,
+Python `.incomplete` downloads, and unrecognized temporary names alone.
+
+No partial blob or `.incomplete` download is published. Each pathname is replaced
+atomically; an interrupted publication can leave an unreferenced complete blob.
+Publication is best effort: closing the process can interrupt a queued job, and
+cache failures leave normal reads working. A complete Hub blob exposes both a
+local complete-file path and a verified backing descriptor for whole-repository
+mounts and FUSE passthrough consumers. Embedders should pass the descriptor from
+`HttpRangeFile::backing_file()` to such consumers: a `complete_file()` pathname
+can be replaced by another cache writer, while the descriptor pins the verified
+inode.
+
+After successful installation, the corresponding `range-v1` chunks and complete
+file are removed. Subsequent reads use the Hub blob. The Hub cache belongs to
+`huggingface_hub`: **it is not counted against `RATARMOUNT_PAYLOAD_CACHE_BYTES`**
+and is not evicted by ratarmount. Use the Hub cache-management tools to prune it.
+The ratarmount cap still limits chunks and assembly before this handoff; a file
+larger than that cap cannot be completed through this path. Set a sufficient cap
+when syncing large weights. `RATARMOUNT_PAYLOAD_CACHE_BYTES=0` disables range-cache
+write-back, while existing Hub blobs can still be read. Non-Range buffered files
+can be shared independently of that cap. Mounts using a custom `HF_ENDPOINT`
+share the same root, like Python; select a separate `HF_HUB_CACHE` for mirrors
+whose repository IDs do not represent the same content.
+
+## Offline snapshots (`hf-cache://`)
+
+```sh
+# List cached repository folders (models--org--name, datasets--org--name, ...).
+ratarmount 'hf-cache://' cached-repos/
+# Mount the cached main revision, with archive shards opened recursively.
+ratarmount -r 'hf-cache://datasets/org/name' offline/
+ratarmount 'hf-cache://org/model@0123456789abcdef0123456789abcdef01234567' model/
+ratarmount 'hf-cache://spaces/org/demo@v1/assets' assets/
+```
+
+`hf-cache://[datasets/|spaces/]org/name[@revision]` uses **only local files**,
+without resolving an endpoint, loading a token, or making network requests.
+It works with `HF_HUB_OFFLINE=1` and even an unreachable/invalid `HF_ENDPOINT`.
+The default revision is `main`; named revisions resolve through `refs/<revision>`,
+and a full 40-hex SHA directly selects `snapshots/<sha>`. A 4–39 hex commit prefix
+also works when it uniquely matches a cached snapshot; ambiguous prefixes fail.
+The same percent-encoding
+and revision syntax as `hf://` applies. An optional path selects a cached
+directory. Missing snapshots report available named revisions and commit SHAs.
+Bare `hf-cache://` is a repository catalog: its named directories are empty and
+are not browsable snapshot mounts. For example, after seeing `datasets--org--name`,
+mount `hf-cache://datasets/org/name` to inspect that repository. Non-UTF-8 cache
+entry names are skipped because they cannot be represented by this URL API.
+
+Snapshot pointers appear as ordinary read-only files with their blob sizes,
+not as symlinks. `-r` opens cached archive shards through the existing nested
+readers in place, without a download or a temporary copy of the shard. The
+existing nested-format matrix still determines whether a particular format
+needs materialization. A snapshot can be **partial**: only files actually cached
+are listed. This is a browser of cached files, not proof that every file from a
+remote repository has been synced. Root and file xattrs expose `user.hf.commit`.
+
+`HF_HUB_OFFLINE=1` (also `true`, `yes`, or `on`) still refuses `hf://` mounts
+before network access; use `hf-cache://` to browse offline. Legacy
+`TRANSFORMERS_OFFLINE` is used when `HF_HUB_OFFLINE` is unset or empty; an explicit
+`HF_HUB_OFFLINE=0` overrides it. The separate ratarmount tree cache stores only
+listing metadata and is not itself an offline snapshot.
+
+Hub sources remain read-only. `--commit-overlay` and live overlay commit do not
+write archive changes back to Hub repositories. Index publication is supported
+as described above; archive publication is a separate capability.
 
 Persistent range data uses the [shared body cache](phase10-remote.md#persistent-remote-range-cache-ai-rc).
-Every file source carries endpoint, repository kind/name, pinned commit and
-path as its content token. `X-Linked-Etag` (including on the Hub redirect) and
-tree `lfs.oid` SHA-256 values additionally verify completed files. Reopening a
-file within the same pinned repository reuses its probe/redirect state and
-cached body bytes, issuing zero CDN GETs when the requested bytes are cached.
-A new commit uses a separate identity. If a strong response ETag changes within
-a source, caching is bypassed while network reads continue. Multi-chunk complete
-files are assembled only when a consumer calls `complete_file`, with one
-assembly per token at a time; byte reads do not trigger whole-file copies.
+Every source carries endpoint, repository kind/name, pinned commit and path as
+its content token. `X-Linked-Etag` and tree `lfs.oid` additionally verify LFS
+completions. A new commit has a separate range identity. Non-Hub HTTP readers
+retain on-demand complete-file assembly; Hub sharing triggers assembly after
+all chunks have been observed and hands the verified result to the shared cache.
