@@ -1,27 +1,20 @@
-# Spec-only example. No in-tree kube crate; a separate CSI repo execs the
-# packaged ratarmount binary. Do not put AWS/RESTIC passwords in parameters.
+# Static provisioning only; there is no external provisioner/controller.
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: ratarmount-ro
-provisioner: ratarmount.csi.example
+provisioner: kubernetes.io/no-provisioner
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
 allowVolumeExpansion: false
-parameters:
-  archive: s3://bucket/dataset.tar.zst
-  readOnly: "true"
 ---
 apiVersion: storage.k8s.io/v1
 kind: CSIDriver
 metadata:
-  name: ratarmount.csi.example
+  name: ratarmount.csi.hilather.github.io
 spec:
   attachRequired: false
-  podInfoOnMount: false
-  # None: v1 is ReadOnlyMany FUSE (allow_other). File would recursive-chown
-  # a RO mount and fail NodePublish. ReadWriteOnceWithFSType would skip ROM
-  # anyway; None is explicit.
+  podInfoOnMount: true
   fsGroupPolicy: None
   volumeLifecycleModes:
     - Persistent

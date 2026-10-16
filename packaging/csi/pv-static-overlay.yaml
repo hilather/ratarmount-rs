@@ -1,0 +1,48 @@
+# Read-only base with independent ephemeral writes at EACH pod target.
+# ReadWriteMany here does NOT mean shared writes between pods.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ratarmount-private-overlay
+provisioner: kubernetes.io/no-provisioner
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ratarmount-rl-base
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes: ["ReadWriteMany"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ratarmount-private-overlay
+  csi:
+    driver: ratarmount.csi.hilather.github.io
+    volumeHandle: rl-base-v1
+    readOnly: false
+    volumeAttributes:
+      source: hf://datasets/ORG/REPO@REVISION/data.tar.zst
+      overlay: tmpfs:2G
+      readonlyGlobs: tests/**,data/**
+      quota: 1G
+      uid: "1000"
+      gid: "1000"
+      umask: "022"
+      recursive: "true"
+      passthrough: auto
+    # For gated repositories add nodePublishSecretRef to a Secret with HF_TOKEN.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ratarmount-rl-base
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: ratarmount-private-overlay
+  volumeName: ratarmount-rl-base
+  resources:
+    requests:
+      storage: 2Gi
