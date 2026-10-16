@@ -27,6 +27,18 @@ CI workflow: [`.github/workflows/packages.yml`](https://github.com/hilather/rata
 
 Each native package is built **on** that distro (matching glibc / libfuse). The **portable** job uses Debian bullseye so one tarball runs on most modern Ubuntu/Rocky hosts with glibc ≥ 2.31.
 
+The portable binary vendors OpenSSL statically. The runtime still uses the
+host's `libarchive.so.13` and `libfuse3.so.3`; their own transitive dependencies
+come from those distro packages. The CI dependency gate
+[`packaging/test-portable-deps.sh`](../packaging/test-portable-deps.sh) checks
+the binary's direct ELF `NEEDED` entries and rejects direct `libssl` or
+`libcrypto` dependencies. Portable releases built before this fix directly
+need `libssl.so.1.1` and `libcrypto.so.1.1`; install an OpenSSL 1.1 compatibility
+package to run them on systems that still provide one. On Arch, the observed
+`libcrypto.so.3` in `ldd` output is pulled in transitively by the host's
+`libarchive.so.13`, not directly by ratarmount; the distro's libarchive package
+supplies its matching OpenSSL dependency.
+
 **Triggers**
 
 | Event | Result |
@@ -225,3 +237,75 @@ Prefer distro packages or the **portable-glibc2.31** tarball for production unti
 - Library crates (`ratarmount-core`, `ratarmount-index`, formats, …) may be published later for embedders under workspace lockstep versioning. L3.5 `ratarmount-session` stays path-depend until a freeze review.
 - Do **not** publish the `ratarmount` binary as a library API surface; `ratarmount-fuse` is the optional FUSE **adapter** library, not the CLI.
 - Dual-run and 1.0-class packaging do **not** require any crates.io publish.
+
+## Additional package drafts
+
+These formats are prepared for maintainers but are not published by CI.
+
+### Arch Linux (AUR)
+
+`packaging/aur/PKGBUILD` packages the portable release binary as
+`ratarmount-rs-bin` for x86_64 and aarch64, installs the FUSE mount helper,
+docs and license, and declares `fuse3` and `glibc`. An optional source-build
+recipe is in `packaging/aur/PKGBUILD.source`. Before updating a release, set
+`pkgver` to the release version and run `packaging/aur/update-sums.sh VERSION`
+after `SHA256SUMS` is available on GitHub. Regenerate `.SRCINFO` with
+`makepkg --printsrcinfo > .SRCINFO` from `packaging/aur/`.
+
+`packaging/test-aur.sh` checks shell syntax and generated metadata; `namcap`
+runs when installed. `ratarmount-rs-bin` sets `options=(!debug)` so makepkg does
+not emit an empty debug split package.
+
+### Nix
+
+The root `flake.nix` builds the Rust workspace binary with
+`nfsv4,sftp-russh`, exposes `packages.default`, an overlay and a development
+shell, and targets Linux. The package uses the checked-in Cargo lockfile.
+Validate with `packaging/test-nix.sh` (it skips when Nix is not installed).
+A `flake.lock` is not included until `nix flake lock` can be run against the
+selected nixpkgs input.
+
+### Conda-forge
+
+`packaging/conda/meta.yaml` is a staged-recipes starting point for the Python
+package `ratarmount-rs`. It builds the abi3 extension with maturin and Rust and
+tests the import. Review selectors and platform dependencies with conda-build
+before opening a conda-forge staged-recipes PR. This recipe does not produce a
+second CLI output.
+
+### Homebrew core formula draft
+
+`packaging/homebrew/Formula/ratarmount-rs.rb` is a Linux-only formula draft
+that builds the CLI from source. Homebrew core requires supported, declared
+dependencies. macFUSE cannot be a core dependency because it is proprietary,
+so this formula does not target macOS. A macOS core formula would need a
+supported open-source FUSE backend such as FUSE-T and a working core CI build.
+The existing macOS tap cask described above is unchanged. See [Homebrew's
+formula cookbook](https://docs.brew.sh/Formula-Cookbook) and [acceptable
+formula policy](https://docs.brew.sh/Acceptable-Formulae).
+
+### Python wheels on GitHub Releases
+
+`.github/workflows/python.yml` builds Linux x86_64/aarch64 and macOS arm64
+wheels as workflow artifacts. They are not attached to GitHub Releases here:
+Actions artifacts are scoped to their workflow run, while the package release
+job is a separate concurrent workflow. Cross-run artifact API logic would also
+need coordination to avoid racing a tag build. The workflow makes no PyPI
+publication. A later change can add a workflow-run handoff or coordinated
+release job; workflow artifacts are not release assets.
+
+### Manual publication steps
+
+Nothing in this task publishes packages. When a publication is approved:
+
+1. **AUR:** update the version and hashes, regenerate `.SRCINFO`, run
+   `packaging/test-aur.sh`, then commit and push the package files to the AUR
+   Git repository.
+2. **conda-forge:** build and validate the recipe with conda-build, add it to
+   `conda-forge/staged-recipes`, and open a PR for review.
+3. **Homebrew core:** validate the formula on supported Linux CI, update its
+   version and source checksum, then submit it to `Homebrew/homebrew-core`.
+   Keep the existing macOS cask in its tap.
+4. **PyPI:** download the intended wheels and sdist from the Python workflow,
+   verify their provenance and contents, then publish with
+   `python -m twine upload dist/*` using an authorized PyPI account.
