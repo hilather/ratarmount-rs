@@ -1,8 +1,9 @@
 # Implement the Local AI roadmap in ratarmount-rs
 
 Written 2026-10-16 against `main` at `db217f0`. Source document:
-`~/Downloads/ratarmount-rs for Local AI Roadmap.md` (Oct 16, 2026, "companion to
-the Local AI Plan"). Goal set by the user: every proposal in that document is
+`~/Downloads/ratarmount-rs for Local AI Roadmap (1).md` (Oct 16, 2026,
+"companion to the Local AI Plan"; this revision adds the "BitTorrent and Pirate
+Face magnet links" section, tracked as AI-BT1 and AI-BT2). Goal set by the user: every proposal in that document is
 fully supported by ratarmount-rs. Implementation is done by Codex workers in
 git worktrees; this session orchestrates, reviews, merges and runs the gates.
 
@@ -16,7 +17,7 @@ merges, and README / parity docs are updated in the same merge.
 |---|---|
 | In scope | Every proposal in the document, including its "later" list: Hub write-back, the CSI driver, parallel gzip in packaged builds. |
 | Not built, on the document's own terms | **Expert-overflow inference backend** (the document: "belongs inside the engine with direct `io_uring` reads") and **a checkpoint dedup store** ("content-defined chunking finds little"). Supporting the document means honoring these two non-goals. The user can override. |
-| Outward-facing, prepared here, published only on the user's say-so | PyPI wheels, conda-forge feedstock, AUR package, Homebrew core formula, nixpkgs, the `huggingface_hub` docs PR, a public Hub dataset with a published index, any `git push` / PR to GitHub. |
+| Outward-facing, prepared here, published only on the user's say-so | Seeding to a public BitTorrent swarm, PyPI wheels, conda-forge feedstock, AUR package, Homebrew core formula, nixpkgs, the `huggingface_hub` docs PR, a public Hub dataset with a published index, any `git push` / PR to GitHub. |
 | Hardware not available to this session | DGX Spark / Dell GB10, the M5 MacBook, the two-Dell ConnectX-7 link. Scripts, guides and local runs on this laptop (Linux 7.2, x86_64) are delivered; the numbers on those machines need those machines. |
 | Python track | Cuttable. Nothing else depends on it (see the dependency graph in section 5). The Rust APIs under it (AI-0d) stay because FUSE passthrough and the shard tool also use them. |
 
@@ -71,6 +72,14 @@ merges, and README / parity docs are updated in the same merge.
     csi argv builder and `chunk_cache.rs` are not merged by this plan. The
     uncommitted wheel / CSI gRPC / quota work described in
     `partial-features-completion.md` was lost with `/tmp/grok-stack-0dde7c7d`.
+11. **librqbit (9.0.1) streams on demand and has LAN discovery, but no web
+    seeds.** `torrent_state/streaming.rs` gives piece-on-read streaming and
+    `librqbit_lsd` gives BEP 14; there is no BEP 19 `url-list` support. The
+    "web seed first" path is therefore built on AI-0b's HTTP range reader,
+    fetching whole pieces from the Hugging Face web seed and checking them
+    against the torrent's piece hashes, with librqbit as the swarm fallback.
+    librqbit pulls in tokio and reqwest, so the backend sits behind a
+    `bittorrent` cargo feature (on in package builds, off in the minimal one).
 
 ## 3. Tracking table
 
@@ -95,12 +104,14 @@ work), **luna** = `gpt-6-luna` (docs, packaging, scripts). Effort in brackets.
 | AI-PY1 | Python binding: port, cdylib + maturin, pytest (§10) — **cuttable** | 1 | sol [high] | new `ratarmount-python/**`, `pyproject.toml` | Port only `ratarmount-python` from the integration branch; module imports in a fresh venv; `open/ls/read/mmap/iter`; GIL released on blocking calls; pytest covers paging without duplicates, `bytes` range reads, invalid range, missing member, extract skip/replace, mmap equals read for stored members; not in default workspace features | todo |
 | AI-HF2 | `--publish-index` to `hf://` (and s3/gs/az) (§3.2) | 2 | sol [xhigh] | `ratarmount/src/publish_index.rs`, new `ratarmount-remote/src/hf_commit.rs` | HF commit API: preupload check, LFS batch upload for the sqlite blob, NDJSON commit with `.ptr`; blob then pointer ordering (fail-closed like V-2); mock-server tests; real-Hub test gated on `RATARMOUNT_TEST_HF_REPO` + token; README recipe for dataset authors | todo |
 | AI-HF3 | Shared Hub cache + `hf-cache://` offline mounts (§3.4, §3.5) | 2 | sol [high] | `ratarmount-remote/src/hf_cache.rs`, range cache hook | Completed whole files land in `$HF_HUB_CACHE` as `blobs/<etag>` + `snapshots/<sha>/<path>` symlinks + `refs/<rev>`, atomically, never `.incomplete` partials; reads hit an existing Hub cache blob before the network; `hf-cache://org/name@rev` mounts a cached snapshot offline with archives opening in place; layout compatibility test against `huggingface_hub` when Python + package available (skip otherwise) | todo |
+| AI-BT1 | `magnet:` / `.torrent` remote: lazy file tree, on-demand pieces, web seed first, piece + Hub SHA-256 checks, archives inside torrents (BitTorrent §1–4) | 2 | astra [xhigh] | new `ratarmount-remote/src/torrent/**` behind feature `bittorrent`, `REMOTE_SCHEMES`, `remote_open.rs` arm | File tree listed from metadata before any piece is fetched (magnet resolves metadata via DHT/trackers/web seed); reads fetch the pieces under the read plus `--readahead` pieces, highest priority first; BEP 19 web seed served through AI-0b with whole-piece fetch and SHA-1 piece check, swarm (librqbit streaming) only when the web seed fails or is absent; a tampered piece is refused and refetched, never returned; completed files checked against the Hub SHA-256 (from the torrent's metadata or the Hub tree API's `lfs.oid`; task records which Pirate Face provides) and refused on mismatch; v2 / hybrid torrents use per-file piece roots when present; `-r` opens tar shards in place; a `*.index.ptr`/sidecar shipped in the torrent is discovered like a sibling; tests use an in-process tracker-less swarm on loopback plus a local HTTP web seed (no public network in CI); live Pirate Face test gated on `RATARMOUNT_TEST_MAGNET`; `docs/remote-bittorrent.md` with the network-policy caveat | todo |
 | AI-SB2 | `ratarmount diff <overlay> [--git]` (§4.4) | 2 | sol [high] | new `ratarmount/src/diff.rs`, read-only use of overlay DB | Unified diff of modified/added/deleted/renamed files from the overlay alone; `--git` output passes `git apply --check` on the base checkout; binary files as `GIT binary patch` or a "Binary files differ" line; symlinks and mode changes | todo |
 | AI-SB3 | uid/gid mapping, `--sandbox` preset, `--overlay-tmpfs` (§4.5) | 2 | sol [high] | attr builders in FUSE/NFS/9P/SFTP, `-o` parsing, `main.rs` | `-o uid=,gid=,umask=` applied to every attr path (unit test per frontend); `--sandbox` = `allow_other,noatime,uid/gid of caller unless given, --overlay-tmpfs`; `--overlay-tmpfs` puts the overlay on `memfd`/`/dev/shm` with a size cap; clear error when `user_allow_other` is missing; `docs/sandbox.md` documents `/etc/fuse.conf` | todo |
 | AI-PERF | Parallel zstd decode-ahead, `posix_fadvise`, `--direct-io` (§8) | 2 | astra [high] | `ratarmount-compress/src/zstd_seek.rs`, fuse open flags | Bounded decode-ahead pool sized by `--readahead`/`--parallelization`, frames delivered in order, cancellation on seek; sequential `cat` of a 1 GiB multi-frame shard uses >1 core and matches bytes; `POSIX_FADV_SEQUENTIAL` on archive fds; `--direct-io` sets `FOPEN_DIRECT_IO` and drops archive pages after read; benchmark script entry | todo |
 | AI-SH | `ratarmount shard` + `export-index --format parquet\|jsonl` (§5) | 2 | sol [high] | new `ratarmount/src/shard.rs`, `export_index.rs`; parquet behind feature `export-parquet` (on in packages) | Packs a dir into N `.tar.zst` shards ≤ `--size`, seek table per shard, one index each, `shards.json` manifest; `--group-by-key` keeps WebDataset `basename.{jpg,json,txt}` in one frame; `--frame-per-sample`; sorted, reproducible bytes for the same input; parquet rows `path, shard, offset, size, frame, frame_offset` match index; README | todo |
 | AI-PV | Provenance xattrs + sidecar manifest on commit (§7) | 2 | astra [high] | overlay xattr table + `setxattr`/`removexattr` in FUSE, `UstarMember` xattrs, index insert, `find --xattr` | `setfattr -n user.train_ok -v false` survives commit as PAX `SCHILY.xattr.user.*`, reindex, remount; `find --xattr train_ok=false`; only `user.*` writable; each commit writes `archive.manifest.jsonl` (path, size, sha256, xattrs, commit id) atomically | todo |
 | AI-PY2 | fsspec `ratar://` + chained URLs, torch Dataset, WebDataset reader, wheel CI (§5, §10) — **cuttable** | 2 | sol [high] | `ratarmount-python/python/**`, `.github/workflows/python.yml` | `fsspec.open("ratar::hf://...")` and `ratar://path.tar.zst::member`; registered via entry point; `datasets` webdataset load test against a local shard set (skip if package absent); torch `Dataset` + WebDataset-style iterator over AI-SH shards; manylinux x86_64/aarch64 + macOS arm64 wheels built in CI; installed-wheel smoke test | todo |
+| AI-BT2 | LAN sharing (BEP 14), opt-in `--seed` with upload cap, one cache with `hf://`, v2 preference (BitTorrent §5–7, caveats) | 3 | sol [xhigh] | `ratarmount-remote/src/torrent/**`, cache glue with AI-RC / AI-HF3 | LSD on by default for magnet mounts with `--no-lsd` to disable; two-session loopback test fetches from the LAN peer with the web seed disabled; `--seed` off by default, serves only verified pieces from the cache, `--seed-upload-limit` enforced (rate test); completed verified files stored in the Hub-style blob cache keyed by SHA-256 so `hf://` reuses them and vice versa (test both directions); BitTorrent v2 chosen when a magnet offers both v1 and v2 info hashes | todo |
 | AI-CM2 | Rolling archives `--roll-every 1d\|20G` (§7) | 3 | sol [high] | roll policy module, union of series | New archive when the size/time limit is hit; series mounted as one tree; old archives removable while mounted; naming `name.000001.tar.zst`; tests for both triggers | todo |
 | AI-UN | Per-source subpaths, image + repo union, `corpus` verb (§4.6, §5) | 3 | sol [high] | factory compositing glue, `main.rs` | `SRC::/repo` (or `--bind /repo=SRC`) wraps a source in `PrefixMountSource` before the union; `docker://img` + git repo at `/repo` test with a local OCI layout; `ratarmount corpus list.txt mnt/` mounts `repo@sha` lines at `org/name/`; recipe for bwrap/nspawn | todo |
 | AI-SB4 | Sandbox API: `sandbox new\|list\|destroy` + Python client (§4.7) | 3 | astra [xhigh] | new `ratarmount/src/sandbox/**`, `clients/python/ratarmount_sandbox.py` | Daemon over a Unix socket (JSON lines, `0600`), one shared base per task, N overlay mounts per request, destroy unmounts and deletes; crash of an attempt mount does not affect siblings; pure-Python client (no binding) ~100 lines with a test; 64 parallel attempts integration test (FUSE, run by orchestrator) | todo |
@@ -142,6 +153,10 @@ or documentation (no new code, per the document): teacher logits as shards
 - **AI-CM1:** the append path must be crash-safe at every syscall boundary.
   The journal is fsynced before the first byte is appended; recovery runs on
   mount and before the next commit.
+- **AI-BT1 / AI-BT2:** no test touches the public swarm or a public tracker;
+  live runs are opt-in by env var. Seeding is never on by default and never
+  enabled by the orchestrator on this machine. Piece verification happens
+  before any byte reaches a reader or the cache.
 - **AI-PT:** passthrough is negotiated, never assumed. Fallback is the current
   daemon path. macOS keeps the daemon path; measure the gap in AI-BENCH.
 - **AI-PY1:** port only `ratarmount-python/` from
@@ -155,8 +170,8 @@ or documentation (no new code, per the document): teacher logits as shards
 Wave 0  AI-0a fuser ─────────────┐        AI-0b http ──┬─────────┐      AI-0c overlay funnel ─┐     AI-0d session APIs ─┐   AI-0e docs
 Wave 1  AI-PT passthrough ◄──────┘        AI-HF1 hf:// ◄┘  AI-RC ◄┘      AI-SB1 ◄──────────────┘     AI-PY1 ◄────────────┤
         AI-GIT   AI-CM1   AI-ST                                                                                          │
-Wave 2  AI-HF2 (HF1)  AI-HF3 (HF1,RC)  AI-SB2  AI-SB3  AI-PERF  AI-SH  AI-PV (after CM1)                AI-PY2 (PY1,SH) ◄┤
-Wave 3  AI-CM2 (CM1,PV)  AI-UN (GIT)  AI-SB4 (SB1-3,UN)  AI-SNAP  AI-MEM (RC,PERF)  AI-DK (SB3)  AI-PKG  AI-BENCH  AI-DOCS   AI-PY3 (PY2) ◄┘
+Wave 2  AI-BT1 (0b,HF1,RC)  AI-HF2 (HF1)  AI-HF3 (HF1,RC)  AI-SB2  AI-SB3  AI-PERF  AI-SH  AI-PV (after CM1)                AI-PY2 (PY1,SH) ◄┤
+Wave 3  AI-BT2 (BT1,HF3)  AI-CM2 (CM1,PV)  AI-UN (GIT)  AI-SB4 (SB1-3,UN)  AI-SNAP  AI-MEM (RC,PERF)  AI-DK (SB3)  AI-PKG  AI-BENCH  AI-DOCS   AI-PY3 (PY2) ◄┘
 Wave 4  AI-HFW (HF2,CM1)  AI-CSI (SB3)  AI-GZ
 ```
 
@@ -167,7 +182,9 @@ Mapping to the document's suggested order: its step 1 (prove on our own work)
 is AI-BENCH + AI-DOCS, started in wave 3 once there is something to measure
 but with the benchmark harness skeleton landing with AI-PERF; step 2 = HF1,
 HF2; step 3 = SB1–SB3, GIT; step 4 = CM1; step 5 = PY1–PY3; step 6 = PT;
-step 7 = ST, HF3, CM2, MEM; step 8 = SB4, DK, UN; step 9 = PV; step 10 = HFW,
+step 7 = ST, HF3, CM2, MEM; the BitTorrent section ("after `hf://` read
+mounts, since it reuses their cache and range code") = BT1 in wave 2, BT2 in
+wave 3; step 8 = SB4, DK, UN; step 9 = PV; step 10 = HFW,
 CSI, GZ. Waves differ from that order only where a prerequisite forces it
 (fuser upgrade before passthrough, write funnel before quotas).
 
