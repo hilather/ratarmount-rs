@@ -334,14 +334,24 @@ struct Args {
     /// window if rapidgzip is preferred (`--use-backend rapidgzip` or
     /// `RATARMOUNT_GZIP_BACKEND=rapidgzip`) **or** any mount input looks like a
     /// gzip archive (`.gz` / `.tgz` / `.tar.gz` / `.gzip`). Pass `--readahead 0`
-    /// to keep readahead off. For local zstd this flag also bounds speculative
-    /// decoded bytes; when omitted zstd uses a separate 16 MiB decode window.
+    /// to keep readahead off. Torrent mounts use BYTES for verified HTTP piece
+    /// prefetch; the swarm library has a separate fixed 32 MiB lookahead.
+    /// For local zstd this flag also bounds speculative decoded bytes; when
+    /// omitted zstd uses a separate 16 MiB decode window.
     #[arg(long = "readahead", default_value = "0", value_name = "BYTES")]
     readahead: String,
 
     /// Process-wide optional buffer/cache budget (e.g. 512M); excludes kernel pages.
     #[arg(long, value_name = "SIZE", value_parser = parse_byte_size)]
     memory_budget: Option<u64>,
+
+    /// Torrent peer discovery: auto starts only when metadata/web seeds cannot serve a request.
+    #[arg(long, default_value = "auto", value_name = "auto|always|never")]
+    torrent_swarm: ratarmount_core::TorrentSwarmPolicy,
+
+    /// Maximum swarm scratch disk usage per torrent session (web seed reads use the range cache).
+    #[arg(long, default_value = "2GiB", value_name = "BYTES", value_parser = parse_byte_size)]
+    torrent_scratch_limit: u64,
 
     /// Bypass FUSE's page cache for source members; overlay files keep normal caching.
     /// Disables passthrough and advises eviction of consumed local zstd/TAR pages.
@@ -1446,6 +1456,11 @@ fn main() {
         ignore_zeros: args.ignore_zeros,
         gnu_incremental,
         parallelization,
+        readahead_bytes: parse_byte_size(&args.readahead)
+            .map(clamp_readahead)
+            .unwrap_or(0),
+        torrent_swarm: args.torrent_swarm,
+        torrent_scratch_bytes: args.torrent_scratch_limit,
         direct_io: args.direct_io,
         zstd_readahead_bytes: if readahead_flag_on_argv(std::env::args()) {
             clamp_readahead(parse_byte_size(&args.readahead).unwrap_or_else(|e| {
@@ -3364,6 +3379,10 @@ fn print_features() {
     println!("  sftp-russh: compiled");
     #[cfg(not(feature = "sftp-russh"))]
     println!("  sftp-russh: not compiled");
+    #[cfg(feature = "bittorrent")]
+    println!("  bittorrent: compiled (magnet/.torrent; web seeds first; uploads disabled)");
+    #[cfg(not(feature = "bittorrent"))]
+    println!("  bittorrent: not compiled");
     println!(
         "  compress: gzip/bzip2/xz/zstd/lz4/lzip/lzo/Z/lzma/zlib seekable bodies; plain single-file materialize"
     );
@@ -3405,6 +3424,8 @@ fn print_oss_attributions(full: bool) {
         "regex / thiserror / anyhow / url / tempfile — utilities",
         "ureq / ssh2 / … — remote backends (http/s3/gs/az/ftp/ssh/oci/ipfs/rclone)",
         "nfsserve / tokio — in-process NFSv3 export (--nfs)",
+        #[cfg(feature = "bittorrent")]
+        "librqbit — torrent metadata and streaming (Apache-2.0; uploads disabled)",
         #[cfg(feature = "nfsv4")]
         "embednfs — in-process NFSv4.1 export (--nfs-vers 4) (MIT)",
         "httparse — HTTP/WebDAV export (--http / --webdav)",
@@ -6954,5 +6975,49 @@ mod rolling_cli_tests {
             "traces.tar"
         ])
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod torrent_policy_tests {
+    use super::*;
+    /// Regression: swarm policy and disk limit silently used defaults or consumed input positionals.
+    #[test]
+    fn regression_torrent_policy_and_scratch_cli() {
+        let defaults = Args::try_parse_from(["ratarmount", "source.tar", "mnt"]).unwrap();
+        assert_eq!(
+            defaults.torrent_swarm,
+            ratarmount_core::TorrentSwarmPolicy::Auto
+        );
+        assert_eq!(defaults.torrent_scratch_limit, 2 * 1024 * 1024 * 1024);
+        for policy in ["auto", "always", "never"] {
+            let args = Args::try_parse_from([
+                "ratarmount",
+                "--torrent-swarm",
+                policy,
+                "--torrent-scratch-limit",
+                "64M",
+                "source.tar",
+                "mnt",
+            ])
+            .unwrap();
+            assert_eq!(args.torrent_swarm, policy.parse().unwrap());
+            assert_eq!(args.torrent_scratch_limit, 64 * 1024 * 1024);
+            assert_eq!(args.paths.len(), 2);
+        }
+        assert!(
+            Args::try_parse_from(["ratarmount", "--torrent-swarm", "bad", "source.tar"]).is_err()
+        );
+    }
+    /// Regression: a mountpoint directory named x.torrent was taken as another mount input.
+    #[test]
+    fn regression_torrent_directory_remains_mountpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let mountpoint = temp.path().join("x.torrent");
+        std::fs::create_dir(&mountpoint).unwrap();
+        let paths = vec![PathBuf::from("source.tar"), mountpoint.clone()];
+        let (inputs, mount) = split_inputs_mountpoint(&paths, false);
+        assert_eq!(inputs, vec![PathBuf::from("source.tar")]);
+        assert_eq!(mount, Some(mountpoint));
     }
 }

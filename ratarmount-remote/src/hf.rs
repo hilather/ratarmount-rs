@@ -399,7 +399,47 @@ pub struct HfRepo {
     metadata: FileMetadata,
 }
 
+#[cfg(feature = "bittorrent")]
+fn torrent_auth(config: &Config, url: &str) -> HttpAuthOptions {
+    let same_origin = Url::parse(url).is_ok_and(|u| u.origin() == config.endpoint.origin());
+    HttpAuthOptions {
+        bearer_token: if same_origin {
+            config.token.clone()
+        } else {
+            None
+        },
+    }
+}
+
 impl HfRepo {
+    /// Torrent verification shares the pinned tree API and Hub credential rules.
+    #[cfg(feature = "bittorrent")]
+    pub(crate) fn torrent_sha256s(&self) -> Result<BTreeMap<String, String>> {
+        let Some(tree) = self.tree()? else {
+            return Ok(BTreeMap::new());
+        };
+        let _ = HfListing::new(self.clone(), &tree)?;
+        Ok(self
+            .hashes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|((commit, _), _)| commit == &self.commit)
+            .map(|((_, path), hash)| (path.clone(), hash.clone()))
+            .collect())
+    }
+
+    #[cfg(all(test, feature = "bittorrent"))]
+    pub(crate) fn torrent_http_auth(&self, url: &str) -> HttpAuthOptions {
+        torrent_auth(&self.config, url)
+    }
+    #[cfg(feature = "bittorrent")]
+    pub(crate) fn torrent_auth_from_env(url: &str) -> HttpAuthOptions {
+        Config::from_env()
+            .map(|config| torrent_auth(&config, url))
+            .unwrap_or_default()
+    }
+
     pub fn resolve(input: &str) -> Result<Self> {
         Self::with_config(parse_hf_url(input)?, Config::from_env()?)
     }

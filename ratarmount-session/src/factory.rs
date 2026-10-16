@@ -2157,9 +2157,9 @@ fn open_split_set(
     Ok(Arc::new(KeepAliveMount { inner, _tmp: tmp }))
 }
 
-struct KeepAliveMount {
-    inner: Arc<dyn MountSource>,
-    _tmp: tempfile::NamedTempFile,
+pub(crate) struct KeepAliveMount {
+    pub(crate) inner: Arc<dyn MountSource>,
+    pub(crate) _tmp: tempfile::NamedTempFile,
 }
 
 impl MountSource for KeepAliveMount {
@@ -2174,6 +2174,9 @@ impl MountSource for KeepAliveMount {
     }
     fn lookup(&self, path: &str, file_version: i32) -> Option<ratarmount_core::FileInfo> {
         self.inner.lookup(path, file_version)
+    }
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<ratarmount_core::CheapSearchHit>> {
+        self.inner.search_cheap(pattern)
     }
     fn open(
         &self,
@@ -4036,6 +4039,12 @@ fn apply_compositing(
     if comp.recursive {
         let opener = open_nested_fn(opts.clone());
         let reader_opener = open_nested_reader_fn(opts.clone());
+        #[cfg(feature = "bittorrent")]
+        let reader_opener = if archive_path.to_string_lossy().starts_with("torrent:") {
+            remote_open::torrent_nested_reader_fn(src.clone(), opts.clone())
+        } else {
+            reader_opener
+        };
         let depth = match opts.recursion_depth.unwrap_or(0) {
             d if d < 0 => 0,
             d => d as u32,

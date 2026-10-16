@@ -242,6 +242,7 @@ pub struct HttpRangeSource {
     hub_repo: Option<String>,
     hub_cache: Option<Arc<crate::hf_cache::HubCacheFile>>,
     linked_sha256: Arc<Mutex<Option<String>>>,
+    max_skip_prefix: u64,
 }
 
 #[allow(clippy::result_large_err)]
@@ -256,6 +257,7 @@ impl HttpRangeSource {
             hub_repo: None,
             hub_cache: None,
             linked_sha256: Arc::default(),
+            max_skip_prefix: u64::MAX,
         }
     }
 
@@ -445,9 +447,15 @@ impl HttpRangeSource {
             .all(|chunk| cache.contains(&token, chunk))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bittorrent"))]
     pub(crate) fn without_range_cache(mut self) -> Self {
         self.cache = None;
+        self
+    }
+
+    #[cfg(feature = "bittorrent")]
+    pub(crate) fn with_max_skip_prefix(mut self, bytes: u64) -> Self {
+        self.max_skip_prefix = bytes;
         self
     }
 
@@ -531,7 +539,7 @@ impl HttpRangeSource {
         Ok(resp)
     }
 
-    fn request_with_timeout(
+    pub(crate) fn request_with_timeout(
         &self,
         method: &str,
         range: Option<(u64, u64)>,
@@ -612,6 +620,12 @@ impl HttpRangeSource {
         }
         let mut reader = resp.into_reader();
         if status == 200 {
+            if start > self.max_skip_prefix {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "web seed ignored Range beyond the prefix discard limit",
+                ));
+            }
             skip_prefix(&mut reader, start, cancelled)?;
         }
         Ok((reader, status, cache_token))

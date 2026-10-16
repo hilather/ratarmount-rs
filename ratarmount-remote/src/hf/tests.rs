@@ -1131,6 +1131,51 @@ fn regression_memory_budget_hf_spills_ignored_range() {
     assert!(snapshot.pools.iter().any(|p| p.name == "hf-fallback"));
 }
 
+/// Regression: torrent checksum discovery downloaded payloads or discarded Hub lfs.oid hashes.
+#[cfg(feature = "bittorrent")]
+#[test]
+fn regression_torrent_hub_tree_sha256_without_payload() {
+    let hub = Server::new(|req| {
+        if req.path.contains("/revision/") {
+            return Response::new(200, json!({"sha": SHA}).to_string());
+        }
+        assert!(
+            req.path.contains("/tree/"),
+            "only pinned tree metadata is needed"
+        );
+        assert_eq!(
+            req.headers.get("authorization").map(String::as_str),
+            Some("Bearer hf_test_secret")
+        );
+        Response::new(
+            200,
+            json!([
+                {"type":"file", "path":"weights", "size":123, "lfs":{"oid":"ab".repeat(32)}},
+                {"type":"file", "path":"config.json", "size":4, "oid":"cd".repeat(20)}
+            ])
+            .to_string(),
+        )
+    });
+    let repo = HfRepo::with_config(
+        parse_hf_url(&format!("hf://org/model@{SHA}")).unwrap(),
+        config(&hub, None),
+    )
+    .unwrap();
+    assert_eq!(
+        repo.torrent_sha256s().unwrap(),
+        BTreeMap::from([("weights".into(), "ab".repeat(32))])
+    );
+    assert_eq!(hub.count("/tree/"), 1);
+    assert!(repo
+        .torrent_http_auth(&format!("{}/file", hub.url))
+        .bearer_token
+        .is_some());
+    assert!(repo
+        .torrent_http_auth("https://huggingface.co/file")
+        .bearer_token
+        .is_none());
+}
+
 fn shared_cache_config(server: &Server, root: &std::path::Path) -> Config {
     let mut config = config(server, None);
     config.hub_cache = Some(crate::hf_cache::HubCache::from_values(&|key| {

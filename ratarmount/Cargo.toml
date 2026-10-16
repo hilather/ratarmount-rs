@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = ["export-parquet"]
+bittorrent = ["ratarmount-session/bittorrent", "ratarmount-remote/bittorrent"]
 # Arrow/Parquet 60 require Rust 1.88 (workspace MSRV: 1.90).
 export-parquet = ["dep:arrow", "dep:parquet"]
 # Path-backed rapidgzip gzip backend (requires rustc ≥ 1.87). See docs/gzip-binding-decision.md.

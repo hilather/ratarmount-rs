@@ -50,6 +50,8 @@ pub use hf_cache::HfCacheMountSource;
 mod hf_commit;
 pub use hf_commit::{HfCommitFile, HfCommitResult};
 mod folder;
+#[cfg(feature = "bittorrent")]
+pub mod torrent;
 pub use folder::{try_open_remote_folder, RemoteDirent, RemoteFolderMountSource, RemoteListing};
 mod ftp;
 pub use ftp::{
@@ -472,14 +474,22 @@ pub type Result<T> = std::result::Result<T, RemoteError>;
 const REMOTE_SCHEMES: &[&str] = &[
     "http", "https", "file", "ftp", "ftps", "s3", "gs", "az", "azure", "ssh", "sftp", "scp", "smb",
     "webdav", "webdavs", "dropbox", "oci", "docker", "ghcr", "ipfs", "ipns", "rclone", "restic",
-    "hf", "hf-cache",
+    "hf", "hf-cache", "magnet", "torrent",
 ];
 
-/// ASCII-lowercase scheme before the first `://`, if any.
+/// ASCII-lowercase remote scheme, including magnets and local torrent metainfo.
 ///
 /// `rclone+remote:path` has no `://`; the `rclone+` prefix (case-insensitive)
 /// is still scheme `rclone` so [`is_remote_url`] does not treat it as a local path.
 pub fn remote_url_scheme(s: &str) -> Option<String> {
+    if s.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("magnet:"))
+    {
+        return Some("magnet".into());
+    }
+    if is_torrent_input(s) {
+        return Some("torrent".into());
+    }
     if s.len() >= 7 && s[..7].eq_ignore_ascii_case("rclone+") {
         return Some("rclone".into());
     }
@@ -492,6 +502,37 @@ pub fn remote_url_scheme(s: &str) -> Option<String> {
         return None;
     }
     Some(scheme.to_ascii_lowercase())
+}
+
+/// Torrent metainfo is a lazy remote tree even when the metainfo file is local.
+pub fn is_torrent_input(s: &str) -> bool {
+    if s.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("magnet:"))
+    {
+        return true;
+    }
+    #[cfg(not(feature = "bittorrent"))]
+    {
+        false
+    }
+    #[cfg(feature = "bittorrent")]
+    {
+        if s.contains("://") {
+            return Url::parse(s).is_ok_and(|u| {
+                u.path().to_ascii_lowercase().ends_with(".torrent")
+                    && match u.scheme() {
+                        "http" | "https" => true,
+                        "file" => u.to_file_path().is_ok_and(|p| p.is_file()),
+                        _ => false,
+                    }
+            });
+        }
+        let path = Path::new(s);
+        path.is_file()
+            && path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+    }
 }
 
 fn is_known_remote_scheme(scheme: &str) -> bool {
@@ -524,6 +565,16 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
     }
     let scheme = remote_url_scheme(input).unwrap_or_default();
     match scheme.as_str() {
+        "magnet" | "torrent" => {
+            #[cfg(not(feature = "bittorrent"))]
+            return Err(RemoteError::Url(
+                "built without bittorrent support; rebuild with --features bittorrent".into(),
+            ));
+            #[cfg(feature = "bittorrent")]
+            return Err(RemoteError::Url(
+                "torrent inputs are directory mounts; use TorrentMountSource or Session".into(),
+            ));
+        }
         "hf" => keep_from_reader(input, open_hf_range(input)?),
         "file" => {
             let url = Url::parse(input).map_err(|e| RemoteError::Url(e.to_string()))?;
@@ -2822,5 +2873,57 @@ mod tests {
     fn webdav_parse_maps_webdavs() {
         let loc = parse_webdav_url("webdavs://files.example.com/vault/x.tar").unwrap();
         assert_eq!(loc.http_url, "https://files.example.com/vault/x.tar");
+    }
+}
+
+#[cfg(test)]
+mod torrent_dispatch_tests {
+    /// Regression: a minimal remote library returned a generic unsupported-scheme error.
+    #[cfg(not(feature = "bittorrent"))]
+    #[test]
+    fn regression_built_without_bittorrent_error() {
+        {
+            let input = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
+            assert!(super::resolve_to_local(input)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("built without bittorrent"));
+        }
+    }
+    /// Regression: suffix detection treated torrent directories as remote inputs, even feature-off.
+    #[test]
+    fn regression_torrent_remote_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.TORRENT");
+        let mount = dir.path().join("mount.torrent");
+        std::fs::write(&file, b"metadata").unwrap();
+        std::fs::create_dir(&mount).unwrap();
+        assert!(!super::is_torrent_input(mount.to_str().unwrap()));
+        assert!(!super::is_remote_url(mount.to_str().unwrap()));
+        assert!(!super::is_torrent_input("missing.torrent"));
+        for input in [file.to_str().unwrap(), "https://example/a.torrent?token=x"] {
+            assert_eq!(super::is_torrent_input(input), cfg!(feature = "bittorrent"));
+        }
+        assert_eq!(
+            super::remote_url_scheme("https://example/a.torrent").as_deref(),
+            Some(if cfg!(feature = "bittorrent") {
+                "torrent"
+            } else {
+                "https"
+            })
+        );
+        assert!(super::is_torrent_input(
+            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
+        ));
+        for input in [
+            "a.torrent.tar",
+            "a.torrent/child",
+            "a.txt",
+            "https://example/a.tar?name=a.torrent",
+            "s3://bucket/a.torrent",
+        ] {
+            assert!(!super::is_torrent_input(input), "{input}");
+        }
     }
 }

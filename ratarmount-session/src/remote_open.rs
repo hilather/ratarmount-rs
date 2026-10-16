@@ -1036,6 +1036,36 @@ pub(super) fn open_remote_input(
         resolve_access, RemoteAccess, RemoteHttp,
     };
 
+    if ratarmount_remote::is_torrent_input(input) {
+        #[cfg(feature = "bittorrent")]
+        {
+            let source = ratarmount_remote::torrent::TorrentMountSource::open(
+                input,
+                ratarmount_remote::torrent::TorrentOptions {
+                    readahead_bytes: opts.readahead_bytes,
+                    swarm: ratarmount_remote::torrent::SwarmOptions {
+                        policy: opts.torrent_swarm,
+                        scratch_bytes: opts.torrent_scratch_bytes,
+                        // A failed fixture must never start public discovery.
+                        #[cfg(test)]
+                        dht: false,
+                        #[cfg(test)]
+                        trackers: false,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok((
+                PathBuf::from(format!("torrent:{}", source.infohash())),
+                Arc::new(source),
+            ));
+        }
+        #[cfg(not(feature = "bittorrent"))]
+        return Err("built without bittorrent support; rebuild with --features bittorrent".into());
+    }
+
     if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf-cache") {
         let source =
             ratarmount_remote::HfCacheMountSource::open(input).map_err(|e| e.to_string())?;
@@ -1385,6 +1415,132 @@ pub(super) fn try_open_dropbox_folder(input: &str) -> Result<Option<Arc<dyn Moun
     }
 }
 
+/// Torrent siblings are already authenticated by the parent piece hashes. Only
+/// index metadata is materialized; the TAR body remains a seekable torrent reader.
+#[cfg(feature = "bittorrent")]
+pub(super) fn torrent_nested_reader_fn(
+    parent: Arc<dyn MountSource>,
+    options: OpenOptions,
+) -> ratarmount_compositing::OpenNestedReaderFn {
+    let fallback = super::open_nested_reader_fn(options.clone());
+    Arc::new(move |reader, label, ctx| {
+        if label
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("tar"))
+        {
+            match torrent_tar_sidecar(parent.as_ref(), &ctx.member_path, &options) {
+                Ok(Some(source)) => return Ok(source),
+                Ok(None) => {}
+                Err(e) => log::warn!("torrent sibling index refused for {}: {e}", ctx.member_path),
+            }
+        }
+        fallback(reader, label, ctx)
+    })
+}
+
+#[cfg(feature = "bittorrent")]
+fn torrent_index_temp() -> std::io::Result<tempfile::NamedTempFile> {
+    let cache_dir = ratarmount_index::platform_cache_root().join("torrent-v1/indexes");
+    std::fs::create_dir_all(&cache_dir)?;
+    tempfile::NamedTempFile::new_in(cache_dir)
+}
+
+#[cfg(feature = "bittorrent")]
+fn torrent_tar_sidecar(
+    parent: &dyn MountSource,
+    member: &str,
+    options: &OpenOptions,
+) -> std::io::Result<Option<Arc<dyn MountSource>>> {
+    use std::io::{self, Write};
+    let Some(fi) = parent.lookup(member, 0) else {
+        return Ok(None);
+    };
+    let mut candidates = Vec::new();
+    if let Some(pointer) = parent.lookup(&format!("{member}.index.ptr"), 0) {
+        if pointer.size <= 64 * 1024 {
+            let mut json = String::new();
+            parent
+                .open(&pointer, 0)?
+                .take(64 * 1024 + 1)
+                .read_to_string(&mut json)?;
+            if let Ok(ptr) = parse_index_pointer_json(&json) {
+                candidates.push((
+                    format!("{member}.index.{}.sqlite", ptr.index_id),
+                    Some(ptr.index_id),
+                ));
+            }
+        }
+    }
+    candidates.push((format!("{member}.index.sqlite"), None));
+    for (candidate, digest) in candidates {
+        let Some(index_fi) = parent.lookup(&candidate, 0) else {
+            continue;
+        };
+        if index_fi.size > 256 * 1024 * 1024 {
+            continue;
+        }
+        let mut tmp = torrent_index_temp()?;
+        let copied = io::copy(
+            &mut parent.open(&index_fi, 0)?.take(256 * 1024 * 1024 + 1),
+            &mut tmp,
+        )?;
+        if copied != index_fi.size {
+            continue;
+        }
+        tmp.flush()?;
+        if let Some(digest) = digest {
+            tmp.seek(SeekFrom::Start(0))?;
+            if sha256_hex_stream(&mut tmp)? != digest {
+                continue;
+            }
+        }
+        let index = match SqliteIndex::open_read_only(tmp.path()) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        let Some(stats) = index.tarstats().map_err(io::Error::other)? else {
+            continue;
+        };
+        let mut body = parent.open(&fi, 0)?;
+        let sample = fi.size.min(TARSTATS_SAMPLE_BYTES as u64);
+        let prefix = sha256_hex_stream(&mut (&mut body).take(sample))?;
+        body.seek(SeekFrom::Start(fi.size - sample))?;
+        let suffix = sha256_hex_stream(&mut (&mut body).take(sample))?;
+        let full = if fi.size <= TARSTATS_FULL_HASH_MAX {
+            body.seek(SeekFrom::Start(0))?;
+            Some(sha256_hex_stream(&mut body)?)
+        } else {
+            None
+        };
+        if check_tarstats_matches_remote(
+            &stats,
+            fi.size,
+            Some(&prefix),
+            Some(&suffix),
+            full.as_deref(),
+        )
+        .is_err()
+        {
+            continue;
+        }
+        body.seek(SeekFrom::Start(0))?;
+        // Drop SQLite before unlinking its cache-local backing file on all platforms.
+        let source =
+            ratarmount_formats_tar::SqliteIndexedTar::open_with_existing_index_from_reader(
+                body,
+                format!("torrent:{member}"),
+                tmp.path(),
+                options.clone(),
+            )
+            .map_err(io::Error::other)?;
+        return Ok(Some(Arc::new(crate::factory::KeepAliveMount {
+            inner: Arc::new(source),
+            _tmp: tmp,
+        })));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1445,6 +1601,228 @@ mod tests {
         .unwrap();
         ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
         tar
+    }
+
+    #[cfg(feature = "bittorrent")]
+    fn torrent_bytes(files: &[(String, Vec<u8>)], seed: &str) -> Vec<u8> {
+        fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+            out.extend_from_slice(format!("{}:", value.len()).as_bytes());
+            out.extend_from_slice(value);
+        }
+        let body: Vec<u8> = files
+            .iter()
+            .flat_map(|(_, data)| data.iter().copied())
+            .collect();
+        let mut out = b"d4:infod5:filesl".to_vec();
+        for (path, data) in files {
+            out.extend_from_slice(format!("d6:lengthi{}e4:pathl", data.len()).as_bytes());
+            for part in path.split('/') {
+                bytes(&mut out, part.as_bytes());
+            }
+            out.extend_from_slice(b"ee");
+        }
+        out.extend_from_slice(b"e4:name6:bundle12:piece lengthi16384e6:pieces");
+        let mut hashes = Vec::new();
+        for chunk in body.chunks(16384) {
+            let hex = hash_hex("sha1", chunk).unwrap();
+            for i in (0..hex.len()).step_by(2) {
+                hashes.push(u8::from_str_radix(&hex[i..i + 2], 16).unwrap());
+            }
+        }
+        bytes(&mut out, &hashes);
+        out.extend_from_slice(b"e8:url-listl");
+        bytes(&mut out, seed.as_bytes());
+        out.extend_from_slice(b"ee");
+        out
+    }
+
+    /// Regression: sibling SQLite metadata used /tmp and disappeared before its source closed.
+    #[cfg(feature = "bittorrent")]
+    #[test]
+    fn regression_torrent_index_spool_lifetime() {
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        struct IndexOwner(PathBuf);
+        impl Drop for IndexOwner {
+            fn drop(&mut self) {
+                assert!(self.0.is_file(), "index removed before source closed");
+            }
+        }
+        impl MountSource for IndexOwner {
+            fn is_immutable(&self) -> bool {
+                true
+            }
+            fn list(&self, _: &str) -> Option<ratarmount_core::ListResult> {
+                None
+            }
+            fn lookup(&self, _: &str, _: i32) -> Option<ratarmount_core::FileInfo> {
+                None
+            }
+            fn search_cheap(&self, _: &str) -> Option<Vec<ratarmount_core::CheapSearchHit>> {
+                Some(Vec::new())
+            }
+            fn open(
+                &self,
+                _: &ratarmount_core::FileInfo,
+                _: i32,
+            ) -> std::io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                unreachable!()
+            }
+        }
+        let tmp = torrent_index_temp().unwrap();
+        let path = tmp.path().to_owned();
+        assert!(
+            path.starts_with(ratarmount_index::platform_cache_root().join("torrent-v1/indexes"))
+        );
+        let source = crate::factory::KeepAliveMount {
+            inner: Arc::new(IndexOwner(path.clone())),
+            _tmp: tmp,
+        };
+        assert!(path.is_file());
+        assert!(source.search_cheap("*").is_some());
+        drop(source);
+        assert!(!path.exists());
+    }
+
+    /// Regression: recursive torrent mounts spooled shards or failed to discover sibling indexes.
+    #[cfg(feature = "bittorrent")]
+    #[test]
+    fn regression_torrent_nested_tar_and_sibling_indexes() {
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        use ratarmount_remote::torrent::{SwarmOptions, TorrentMountSource, TorrentOptions};
+        for sidecar in [None, Some(false), Some(true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let tar = hf_tar("hello.txt", b"inside torrent shard");
+            let archive = dir.path().join("shard.tar");
+            fs::write(&archive, &tar).unwrap();
+            let index_path = dir.path().join("shard.tar.index.sqlite");
+            let opts = OpenOptions {
+                index_file_path: Some(index_path.clone()),
+                ..Default::default()
+            };
+            drop(
+                ratarmount_formats_tar::SqliteIndexedTar::create_index(
+                    &archive,
+                    &archive,
+                    Some(&index_path),
+                    &opts,
+                    "test",
+                    &mut None,
+                )
+                .unwrap(),
+            );
+            let index = fs::read(index_path).unwrap();
+            let mut files = vec![("shard.tar".into(), tar.clone())];
+            if sidecar == Some(true) {
+                let id = ratarmount_index::sha256_hex(&index);
+                files.push(("shard.tar.index.ptr".into(), pointer_json_for_blob(&index)));
+                files.push((format!("shard.tar.index.{id}.sqlite"), index));
+            } else if sidecar == Some(false) {
+                files.push(("shard.tar.index.sqlite".into(), index));
+            }
+            let objects = files
+                .iter()
+                .map(|(p, b)| (format!("/bundle/{p}"), b.clone()))
+                .collect();
+            let http = spawn_index_http("/unused", Vec::new(), objects, None, None);
+            let bytes = torrent_bytes(&files, &format!("http://{}/", http.addr));
+            let source = TorrentMountSource::from_bytes(
+                bytes.clone(),
+                TorrentOptions {
+                    metadata_dir: dir.path().join("metadata"),
+                    range_cache: None,
+                    swarm: SwarmOptions {
+                        dht: false,
+                        trackers: false,
+                        ..Default::default()
+                    },
+                    readahead_bytes: 0,
+                },
+            )
+            .unwrap();
+            assert!(
+                http.gets.lock().unwrap().is_empty(),
+                "listing must fetch no pieces"
+            );
+            assert_eq!(
+                torrent_tar_sidecar(&source, "/shard.tar", &OpenOptions::default())
+                    .unwrap()
+                    .is_some(),
+                sidecar.is_some(),
+                "valid sibling must be reused"
+            );
+            let meta_path = dir.path().join("local.torrent");
+            fs::write(&meta_path, &bytes).unwrap();
+            let session =
+                crate::Session::open(hf_request(meta_path.to_str().unwrap(), None, true)).unwrap();
+            assert_eq!(
+                hf_read(&session, "/shard.tar/hello.txt"),
+                b"inside torrent shard"
+            );
+            drop(session);
+            // HTTP metainfo uses the same remote dispatch as a local .torrent.
+            let metadata_http =
+                spawn_index_http("/meta.torrent", bytes, Default::default(), None, None);
+            let session = crate::Session::open(hf_request(
+                &format!("http://{}/meta.torrent", metadata_http.addr),
+                None,
+                true,
+            ))
+            .unwrap();
+            assert_eq!(
+                hf_read(&session, "/shard.tar/hello.txt"),
+                b"inside torrent shard"
+            );
+        }
+    }
+
+    /// Regression: a sibling sidecar for different archive bytes, or a bad pointer digest, was trusted.
+    #[cfg(feature = "bittorrent")]
+    #[test]
+    fn regression_torrent_sibling_stale_or_bad_pointer_refused() {
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("shard.tar");
+        let other = dir.path().join("other.tar");
+        let original = hf_tar("correct", b"original");
+        let wrong = hf_tar("wrongxx", b"replaced");
+        assert_eq!(original.len(), wrong.len());
+        fs::write(&archive, &original).unwrap();
+        fs::write(&other, wrong).unwrap();
+        let sidecar = dir.path().join("shard.tar.index.sqlite");
+        drop(
+            ratarmount_formats_tar::SqliteIndexedTar::create_index(
+                &other,
+                &other,
+                Some(&sidecar),
+                &OpenOptions::default(),
+                "test",
+                &mut None,
+            )
+            .unwrap(),
+        );
+        let parent = FolderMountSource::new(dir.path()).unwrap();
+        assert!(
+            torrent_tar_sidecar(&parent, "/shard.tar", &OpenOptions::default())
+                .unwrap()
+                .is_none()
+        );
+        let index = fs::read(&sidecar).unwrap();
+        fs::remove_file(&sidecar).unwrap();
+        let pointer = pointer_json_for_blob(&index);
+        fs::write(dir.path().join("shard.tar.index.ptr"), pointer).unwrap();
+        let id = ratarmount_index::sha256_hex(&index);
+        let mut corrupt = index;
+        corrupt.push(0);
+        fs::write(
+            dir.path().join(format!("shard.tar.index.{id}.sqlite")),
+            corrupt,
+        )
+        .unwrap();
+        assert!(
+            torrent_tar_sidecar(&parent, "/shard.tar", &OpenOptions::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn bind_hf(http: &IndexHttp, cache: &Path) -> SmbEnv {
@@ -3617,5 +3995,24 @@ mod tests {
                 panic!("UserCache must not write flattened XDG {}", p.display());
             }
         });
+    }
+}
+
+#[cfg(all(test, not(feature = "bittorrent")))]
+mod torrent_feature_tests {
+    /// Regression: disabled torrent support treated magnets/metainfo as ordinary files.
+    #[test]
+    fn regression_built_without_bittorrent_error() {
+        {
+            let input = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
+            assert!(ratarmount_remote::is_remote_url(input));
+            let result = super::open_remote_input(
+                input,
+                &mut ratarmount_core::OpenOptions::default(),
+                false,
+                &mut Vec::new(),
+            );
+            assert!(result.err().unwrap().contains("built without bittorrent"));
+        }
     }
 }

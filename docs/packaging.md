@@ -97,13 +97,18 @@ Uses [nfpm](https://nfpm.goreleaser.com/) for `.deb`/`.rpm` (auto-downloaded if 
 
 **NFS export** is userspace (`nfsserve` NFSv3 + optional `embednfs` NFSv4.1). Packages do **not** depend on `nfs-kernel-server`. Default listen port is **20490** (unprivileged). Binding **2049** needs root or `CAP_NET_BIND_SERVICE` (`--nfs-bind 2049`; already parsed). See [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 
-**`nfsv4` and `sftp-russh` are enabled in the package compile lines** — a stronger commitment than `gzip-rapidgzip` (still off). Editing only [`.github/workflows/packages.yml`](https://github.com/hilather/ratarmount-rs/blob/main/.github/workflows/packages.yml) does **not** compile either feature.
+**`nfsv4`, `sftp-russh`, and `bittorrent` are enabled in the package compile lines** — a stronger commitment than `gzip-rapidgzip` (still off). Editing only [`.github/workflows/packages.yml`](https://github.com/hilather/ratarmount-rs/blob/main/.github/workflows/packages.yml) does **not** change the scripts’ feature lists.
 
 | Script | `cargo build --release -p ratarmount` |
 |--------|----------------------------------------|
-| [`packaging/build-native-packages.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-native-packages.sh) (deb / rpm / portable) | `--features nfsv4,sftp-russh` |
-| [`packaging/build-appimage.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-appimage.sh) | `--features nfsv4,sftp-russh` |
-| [`packaging/build-macos-tarball.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-macos-tarball.sh) | `--features nfsv4,sftp-russh` (rustup **stable**; workspace MSRV 1.90) |
+| [`packaging/build-native-packages.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-native-packages.sh) (deb / rpm / portable) | `--features nfsv4,sftp-russh,bittorrent` |
+| [`packaging/build-appimage.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-appimage.sh) | `--features nfsv4,sftp-russh,bittorrent` |
+| [`packaging/build-macos-tarball.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-macos-tarball.sh) | `--features nfsv4,sftp-russh,bittorrent` (rustup **stable**; workspace MSRV 1.90) |
+
+The CLI and library crates keep `bittorrent` off by default; Cargo users opt in
+with `--features bittorrent`. Default CI does not compile librqbit. See [BitTorrent sources](remote-bittorrent.md)
+for verification, uploads-disabled behavior, and upstream v2/swarm limitations.
+The feature-list regression is `./packaging/test-bittorrent-features.sh`.
 
 Source builds without `--features nfsv4` leave `--nfs --nfs-vers 4` as exit 2 (`rebuild with --features nfsv4 (rustc >= 1.88)`). Without `--features sftp-russh`, `--sftp` exits 2 (`rebuild with --features sftp-russh`). Default `cargo test --workspace` compiles neither embednfs nor russh (opt-in features, not compiled by default CI). Current package jobs install rustup **stable**.
 
