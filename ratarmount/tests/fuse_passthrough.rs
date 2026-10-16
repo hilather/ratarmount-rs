@@ -213,6 +213,7 @@ fn fuse_passthrough_folder_and_tar_identical_bytes() {
                 ratarmount_formats_tar::write_ustar_members(
                     &mut File::create(&path).unwrap(),
                     &[ratarmount_formats_tar::UstarMember {
+                        xattrs: &[],
                         path: "file",
                         payload: ratarmount_formats_tar::UstarPayload::File { bytes: &payload },
                         mode: 0o644,

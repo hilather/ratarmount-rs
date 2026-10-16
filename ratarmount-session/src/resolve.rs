@@ -93,6 +93,7 @@ mod tests {
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,

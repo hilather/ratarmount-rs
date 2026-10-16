@@ -300,6 +300,7 @@ fn write_split_tar_zst(dir: &Path, first: &[(&str, &[u8])], last: &[(&str, &[u8]
         let ustar: Vec<ratarmount_formats_tar::UstarMember<'_>> = members
             .iter()
             .map(|(n, b)| ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: n,
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: b },
                 mode: 0o644,
@@ -1285,6 +1286,7 @@ fn spawn_s3_live_ex(
 fn s3_interval_uploads_once() {
     let dir = tempfile::tempdir().unwrap();
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.txt",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
         mode: 0o644,
@@ -1507,6 +1509,7 @@ fn s3_interval_uploads_once() {
 fn gs_interval_uploads_once() {
     let dir = tempfile::tempdir().unwrap();
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.txt",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
         mode: 0o644,
@@ -1993,6 +1996,7 @@ fn az_env(cmd: &mut Command, addr: std::net::SocketAddr, secret_b64: &str, cache
 fn az_interval_uploads_once() {
     let dir = tempfile::tempdir().unwrap();
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.txt",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
         mode: 0o644,
@@ -2190,6 +2194,7 @@ fn az_interval_uploads_once() {
 fn az_pointer_put_failure_keeps_overlay() {
     let dir = tempfile::tempdir().unwrap();
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.txt",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
         mode: 0o644,
@@ -2306,6 +2311,7 @@ fn az_block_list_failure_keeps_overlay() {
         *b = (state >> 24) as u8;
     }
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.bin",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: &payload },
         mode: 0o644,
@@ -2456,6 +2462,7 @@ fn ustar_name_count(tar: &[u8], name: &str) -> usize {
 fn etag_mismatch_landed_put_keeps_one_member() {
     let dir = tempfile::tempdir().unwrap();
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.txt",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
         mode: 0o644,
@@ -2651,6 +2658,7 @@ fn commit_overlay_live_append_fuse_inode_and_readers() {
         ratarmount_formats_tar::write_ustar_members(
             &mut plain,
             &[ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "old",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: &old },
                 mode: 0o644,
@@ -2771,6 +2779,7 @@ fn commit_overlay_append_recovery_before_mount_open() {
         ratarmount_formats_tar::write_ustar_members(
             &mut plain,
             &[ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "old",
                 payload: ratarmount_formats_tar::UstarPayload::File {
                     bytes: b"old contents",
@@ -2839,6 +2848,7 @@ fn commit_overlay_append_prints_plan() {
         ratarmount_formats_tar::write_ustar_members(
             &mut plain,
             &[ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "old",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"old" },
                 mode: 0o644,

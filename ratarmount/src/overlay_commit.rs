@@ -1228,6 +1228,7 @@ mod tests {
     fn write_tiny_tar_zst(path: &std::path::Path) {
         let payload = b"x\n";
         let member = ratarmount_formats_tar::UstarMember {
+            xattrs: &[],
             path: "a.txt",
             payload: ratarmount_formats_tar::UstarPayload::File { bytes: payload },
             mode: 0o644,
@@ -1245,6 +1246,7 @@ mod tests {
     fn write_split_tar_zst(path: &std::path::Path, prefix: &[u8], last: &[u8]) {
         fn member<'a>(path: &'a str, bytes: &'a [u8]) -> ratarmount_formats_tar::UstarMember<'a> {
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path,
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes },
                 mode: 0o644,
@@ -1646,6 +1648,7 @@ mod tests {
         let dropped = b"drop-mount\n";
         let members = [
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "keep.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: keep },
                 mode: 0o644,
@@ -1654,6 +1657,7 @@ mod tests {
                 mtime: 0,
             },
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "drop.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: dropped },
                 mode: 0o644,
@@ -1688,6 +1692,7 @@ mod tests {
         let other = b"different-reget-bytes-not-the-mount\n";
         let spool_members = [
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "keep.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: other },
                 mode: 0o644,
@@ -1696,6 +1701,7 @@ mod tests {
                 mtime: 0,
             },
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "drop.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: other },
                 mode: 0o644,
@@ -1759,6 +1765,7 @@ mod tests {
 
     fn ustar_archive(name: &str, payload: &[u8]) -> Vec<u8> {
         let member = ratarmount_formats_tar::UstarMember {
+            xattrs: &[],
             path: name,
             payload: ratarmount_formats_tar::UstarPayload::File { bytes: payload },
             mode: 0o644,
