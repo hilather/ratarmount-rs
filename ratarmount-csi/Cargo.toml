@@ -1,0 +1,31 @@
+[package]
+name = "ratarmount-csi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Kubernetes CSI node plugin supervising the ratarmount CLI"
+
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tonic = "=0.12.3"
+prost = "=0.13.5"
+prost-types = "=0.13.5"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+url = "2"
+sha2 = "0.10"
+
+[build-dependencies]
+protox = "=0.7.2"
+tonic-build = "=0.12.3"
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { version = "0.4", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }

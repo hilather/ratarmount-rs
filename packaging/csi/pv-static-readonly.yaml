@@ -1,4 +1,4 @@
-# Spec-only static ReadOnlyMany volume. Credentials come from the Secret
+# Static ReadOnlyMany volume. Credentials come from the Secret
 # referenced by nodePublishSecretRef (env), never from volumeAttributes.
 apiVersion: v1
 kind: PersistentVolume
@@ -12,14 +12,14 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   storageClassName: ratarmount-ro
   csi:
-    driver: ratarmount.csi.example
-    volumeHandle: s3://bucket/dataset.tar.zst
+    driver: ratarmount.csi.hilather.github.io
+    volumeHandle: dataset-v1
     readOnly: true
     nodePublishSecretRef:
       name: ratarmount-s3
       namespace: kube-system
     volumeAttributes:
-      archive: s3://bucket/dataset.tar.zst
+      source: s3://bucket/dataset.tar.zst
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

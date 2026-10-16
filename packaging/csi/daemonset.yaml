@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ratarmount-csi-node
+  namespace: kube-system
+# No Role/ClusterRole binding: neither the driver nor node-driver-registrar
+# calls the Kubernetes API. Kubelet supplies nodePublishSecretRef secrets.
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ratarmount-csi-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: ratarmount-csi-node
+  template:
+    metadata:
+      labels:
+        app: ratarmount-csi-node
+    spec:
+      serviceAccountName: ratarmount-csi-node
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: driver
+          # Build locally using packaging/csi/Dockerfile; no published image yet.
+          image: ratarmount-csi:local
+          imagePullPolicy: IfNotPresent
+          args: ["--endpoint=unix:///csi/csi.sock"]
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RUST_LOG
+              value: info
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: kubelet-pods
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: state
+              mountPath: /var/lib/ratarmount-csi
+            - name: overlays
+              mountPath: /dev/shm/ratarmount-csi
+            - name: fuse
+              mountPath: /dev/fuse
+        - name: registrar
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/ratarmount.csi.hilather.github.io/csi.sock
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: registration
+              mountPath: /registration
+      volumes:
+        - name: socket
+          hostPath:
+            path: /var/lib/kubelet/plugins/ratarmount.csi.hilather.github.io
+            type: DirectoryOrCreate
+        - name: registration
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: kubelet-pods
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+        - name: state
+          hostPath:
+            path: /var/lib/ratarmount-csi
+            type: DirectoryOrCreate
+        - name: overlays
+          hostPath:
+            path: /dev/shm/ratarmount-csi
+            type: DirectoryOrCreate
+        - name: fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice
