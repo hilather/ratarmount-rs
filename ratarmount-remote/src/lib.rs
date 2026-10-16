@@ -43,6 +43,8 @@ mod ssh;
 mod webdav;
 
 // --- inbound protocol modules (worktree PRs: one `mod` + `pub use` pair only) ---
+mod hf;
+pub use hf::{open_hf_range, parse_hf_url, HfLocation, HfMountSource, HfRepo};
 mod folder;
 pub use folder::{try_open_remote_folder, RemoteDirent, RemoteFolderMountSource, RemoteListing};
 mod ftp;
@@ -409,6 +411,8 @@ pub enum RemoteError {
     Io(#[from] io::Error),
     #[error("url: {0}")]
     Url(String),
+    #[error("hf: {0}")]
+    Hf(String),
     #[error("http: {0}")]
     Http(String),
     #[error("s3: {0}")]
@@ -447,6 +451,7 @@ pub type Result<T> = std::result::Result<T, RemoteError>;
 const REMOTE_SCHEMES: &[&str] = &[
     "http", "https", "file", "ftp", "ftps", "s3", "gs", "az", "azure", "ssh", "sftp", "scp", "smb",
     "webdav", "webdavs", "dropbox", "oci", "docker", "ghcr", "ipfs", "ipns", "rclone", "restic",
+    "hf",
 ];
 
 /// ASCII-lowercase scheme before the first `://`, if any.
@@ -498,6 +503,7 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
     }
     let scheme = remote_url_scheme(input).unwrap_or_default();
     match scheme.as_str() {
+        "hf" => keep_from_reader(input, open_hf_range(input)?),
         "file" => {
             let url = Url::parse(input).map_err(|e| RemoteError::Url(e.to_string()))?;
             let path = url
