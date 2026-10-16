@@ -1601,7 +1601,8 @@ impl WriteOverlay {
         out
     }
 
-    fn load_tombstone_paths(&self) -> HashSet<String> {
+    /// Snapshot live deletions without opening the exclusively locked overlay DB.
+    pub fn load_tombstone_paths(&self) -> HashSet<String> {
         self.tombstones.lock().expect("overlay tombstones").clone()
     }
 
