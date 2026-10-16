@@ -263,3 +263,18 @@ RUN_FULL_BENCH=1 GENERATE_RESULTS=1 RATARMOUNT_PY_ROOT=../ratarmount \
 |-----|-----|------|
 | `benchmark-gates` | default | Cold-index **hard** gate; PR-safe, FUSE-free |
 | `benchmark-gates-full` | `RUN_FULL_BENCH=1 ALLOW_RATIO_SKIP=1` | Exercises ratio path when a results CSV is present (committed or generated); soft-skips if not |
+
+## Local AI workloads
+
+The [AI suite](ai/README.md) has six parameterized laptop-scale benchmarks:
+WebDataset sample throughput, 64 parallel sandbox attempts, sandbox build/test
+time, published-index cold opens/mounts, RSS for 32 mounts, and first/second
+Hugging Face model reads. Each appends CSV under `ai/results/` and prints a table;
+missing FUSE or optional tools produce explicit skips. It also includes a
+[two-box/loopback NFS benchmark](../docs/local-ai/two-box-nfs.md).
+
+See the [recorded laptop results](../docs/local-ai/results.md),
+[DGX Spark setup](../docs/local-ai/dgx-spark.md),
+[NVMe placement](../docs/local-ai/nvme-placement.md) and
+[Apple silicon/VM notes](../docs/local-ai/apple-silicon.md). GB10 and M5 results
+remain marked “needs hardware” until runs on those machines.
