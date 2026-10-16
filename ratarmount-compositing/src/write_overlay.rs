@@ -68,7 +68,7 @@ fn is_overlay_internal_name(name: &str) -> bool {
 /// SQLite sidecars, either marker name). Hidden and immutable through the
 /// mount at every depth, including anything beneath such a name, so a
 /// full-path frontend (SMB, SFTP) cannot `create_dir_all` one into being.
-fn is_overlay_internal_path(path: &str) -> bool {
+pub(crate) fn is_overlay_internal_path(path: &str) -> bool {
     path.split('/').any(is_overlay_internal_name)
 }
 
