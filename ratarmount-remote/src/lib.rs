@@ -9,7 +9,8 @@
 //!   - **Cookie:** env [`HTTP_COOKIE_ENV`] (raw Cookie header) or
 //!     [`HTTP_COOKIE_FILE_ENV`] (Netscape jar / simple cookie lines) → `Cookie: …`
 //!
-//!   Both may be sent together on HEAD, GET, and Range requests. Not a browser cookie
+//!   Explicit [`HttpAuthOptions`] add secret Bearer authentication for API callers.
+//!   Basic or Bearer may combine with Cookie on HEAD, GET, and Range requests. Not a browser cookie
 //!   jar (no `Set-Cookie` persistence / per-domain store).
 //! - `s3://bucket/key` → GetObject to temp with prefer-range for large objects
 //!   (env keys → ECS/IMDS role → optional anonymous); live Range via [`open_s3_range`] / [`S3RangeFile`]
@@ -33,6 +34,7 @@
 pub(crate) static SMB_CLIENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 mod dropbox;
+mod http_pool;
 mod index_sibling;
 mod s3;
 mod smb;
@@ -81,6 +83,10 @@ pub use ipfs::{
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use http_pool::{HttpRangeSource, Prefetch};
+use secrecy::SecretString;
 
 use log::debug;
 use sha2::{Digest, Sha256};
@@ -127,7 +133,7 @@ pub use webdav::{
     WebDavLocation,
 };
 
-/// Chunk size for sequential Range GET materialization (4 MiB).
+/// Chunk size for sequential HTTP readahead and Range materialization (4 MiB).
 pub const HTTP_RANGE_CHUNK: u64 = 4 * 1024 * 1024;
 
 /// Env: HTTP Basic username when the URL has no userinfo (FR-2 / #157).
@@ -169,6 +175,15 @@ impl std::fmt::Debug for HttpAuth {
             .field("password", &self.password.as_ref().map(|_| "***"))
             .finish()
     }
+}
+
+/// Explicit HTTP authentication options for callers with a token (e.g. a remote backend).
+///
+/// A Bearer token takes precedence over Basic credentials from the URL/environment.
+/// Cookies still apply independently. Tokens are redacted by `SecretString` in Debug.
+#[derive(Clone, Debug, Default)]
+pub struct HttpAuthOptions {
+    pub bearer_token: Option<SecretString>,
 }
 
 /// HTTP(S) request target: clean URL (no userinfo) + optional Basic auth and/or Cookie.
@@ -349,10 +364,10 @@ fn load_http_cookie() -> Result<Option<String>> {
 
 /// Attach Basic `Authorization` and/or `Cookie` headers for HTTP(S) requests.
 fn apply_http_auth(
-    mut req: ureq::Request,
+    mut req: http_pool::HttpRequest,
     auth: Option<&HttpAuth>,
     cookie: Option<&str>,
-) -> ureq::Request {
+) -> http_pool::HttpRequest {
     if let Some(a) = auth {
         req = req.set("Authorization", &a.authorization_header());
     }
@@ -654,15 +669,14 @@ pub fn probe_http(url: &str) -> Result<HttpProbe> {
 }
 
 fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
-    let url = loc.url.as_str();
+    let source = HttpRangeSource::new(loc.clone(), HttpAuthOptions::default());
+    probe_http_source(&source)
+}
+
+fn probe_http_source(source: &HttpRangeSource) -> Result<HttpProbe> {
+    let url = source.url();
     let mut link = None;
-    match apply_http_auth(
-        ureq::head(url).set("User-Agent", USER_AGENT),
-        loc.auth.as_ref(),
-        loc.cookie.as_deref(),
-    )
-    .call()
-    {
+    match source.request("HEAD", None) {
         Ok(resp) if (200..300).contains(&resp.status()) => {
             link = resp
                 .header("Link")
@@ -682,7 +696,7 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
             }
             if accept_ranges {
                 // Ranges OK but size unknown — try Content-Range probe.
-                if let Some(mut probe) = probe_range_size(loc)? {
+                if let Some(mut probe) = probe_range_size(source)? {
                     if probe.link.is_none() {
                         probe.link = link;
                     }
@@ -698,7 +712,7 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
                 });
             }
             // Fall through to range probe when length missing or ambiguous.
-            if let Some(mut probe) = probe_range_size(loc)? {
+            if let Some(mut probe) = probe_range_size(source)? {
                 if probe.link.is_none() {
                     probe.link = link;
                 }
@@ -724,7 +738,7 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
         }
     }
 
-    if let Some(mut probe) = probe_range_size(loc)? {
+    if let Some(mut probe) = probe_range_size(source)? {
         if probe.link.is_none() {
             probe.link = link;
         }
@@ -740,17 +754,9 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
 }
 
 /// Issue `GET` with `Range: bytes=0-0`. Returns probe meta on 206; `None` if ranges unusable.
-fn probe_range_size(loc: &HttpLocation) -> Result<Option<HttpProbe>> {
-    let url = loc.url.as_str();
-    let resp = match apply_http_auth(
-        ureq::get(url)
-            .set("User-Agent", USER_AGENT)
-            .set("Range", "bytes=0-0"),
-        loc.auth.as_ref(),
-        loc.cookie.as_deref(),
-    )
-    .call()
-    {
+fn probe_range_size(source: &HttpRangeSource) -> Result<Option<HttpProbe>> {
+    let url = source.url();
+    let resp = match source.request("GET", Some((0, 0))) {
         Ok(r) => r,
         Err(ureq::Error::Status(401, _)) => {
             return Err(http_unauthorized(url));
@@ -763,7 +769,17 @@ fn probe_range_size(loc: &HttpLocation) -> Result<Option<HttpProbe>> {
     let status = resp.status();
     if status == 206 {
         // Prefer Content-Range total (Content-Length on 206 is only the partial length).
-        let total = parse_content_range_total(resp.header("Content-Range"));
+        let total = http_pool::validate_content_range(&resp, 0, 0, None)?;
+        // Consume the probe body so the connection returns to the shared pool.
+        let mut byte = [0];
+        let mut reader = resp.into_reader();
+        reader.read_exact(&mut byte)?;
+        if reader.read(&mut byte)? != 0 {
+            return Err(RemoteError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "extra range probe bytes",
+            )));
+        }
         return Ok(Some(HttpProbe {
             content_length: total,
             accept_ranges: true,
@@ -793,7 +809,7 @@ pub fn fetch_http_range_bytes(url: &str, start: u64, end_inclusive: u64) -> Resu
     let loc = parse_http_url(url)?;
     let range = format!("bytes={start}-{end_inclusive}");
     let resp = apply_http_auth(
-        ureq::get(loc.url.as_str())
+        http_pool::get(loc.url.as_str())
             .set("User-Agent", USER_AGENT)
             .set("Range", &range),
         loc.auth.as_ref(),
@@ -804,6 +820,9 @@ pub fn fetch_http_range_bytes(url: &str, start: u64, end_inclusive: u64) -> Resu
     let status = resp.status();
     if status != 206 && !(200..300).contains(&status) {
         return Err(http_status_err(status, loc.url.as_str()));
+    }
+    if status == 206 {
+        http_pool::validate_content_range(&resp, start, end_inclusive, None)?;
     }
     let mut reader = resp.into_reader();
     let mut buf = Vec::new();
@@ -822,7 +841,7 @@ pub fn hash_http_range_sha256(url: &str, start: u64, end_inclusive: u64) -> Resu
     let loc = parse_http_url(url)?;
     let range = format!("bytes={start}-{end_inclusive}");
     let resp = apply_http_auth(
-        ureq::get(loc.url.as_str())
+        http_pool::get(loc.url.as_str())
             .set("User-Agent", USER_AGENT)
             .set("Range", &range),
         loc.auth.as_ref(),
@@ -833,6 +852,9 @@ pub fn hash_http_range_sha256(url: &str, start: u64, end_inclusive: u64) -> Resu
     let status = resp.status();
     if status != 206 && !(200..300).contains(&status) {
         return Err(http_status_err(status, loc.url.as_str()));
+    }
+    if status == 206 {
+        http_pool::validate_content_range(&resp, start, end_inclusive, None)?;
     }
     let mut reader = resp.into_reader();
     let mut hasher = Sha256::new();
@@ -857,17 +879,22 @@ pub fn fetch_http_to_temp(url: &str) -> Result<(NamedTempFile, u64)> {
 ///
 /// Used for `{url}.index.ptr` so a cache-miss mount cannot slurp an unbounded object.
 pub fn fetch_http_bytes_capped(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
-    let loc = parse_http_url(url)?;
-    let resp = apply_http_auth(
-        ureq::get(loc.url.as_str()).set("User-Agent", USER_AGENT),
-        loc.auth.as_ref(),
-        loc.cookie.as_deref(),
-    )
-    .call()
-    .map_err(|e| map_ureq_http_error(e, loc.url.as_str()))?;
+    fetch_http_bytes_capped_with_auth(url, max_bytes, HttpAuthOptions::default())
+}
+
+/// Bounded GET with explicit secret Bearer authentication.
+pub fn fetch_http_bytes_capped_with_auth(
+    url: &str,
+    max_bytes: u64,
+    options: HttpAuthOptions,
+) -> Result<Vec<u8>> {
+    let source = HttpRangeSource::new(parse_http_url(url)?, options);
+    let resp = source
+        .request("GET", None)
+        .map_err(|e| map_ureq_http_error(e, source.url()))?;
     let status = resp.status();
     if !(200..300).contains(&status) {
-        return Err(http_status_err(status, loc.url.as_str()));
+        return Err(http_status_err(status, source.url()));
     }
     let buf = read_at_most(&mut resp.into_reader(), max_bytes)?;
     if buf.len() as u64 > max_bytes {
@@ -889,7 +916,11 @@ pub(crate) fn read_at_most(reader: &mut impl Read, max_bytes: u64) -> io::Result
 /// factory changes. Matches the Python fsspec-style prefer-range path.
 pub fn fetch_http_to_temp_prefer_range(url: &str) -> Result<(NamedTempFile, u64)> {
     let loc = parse_http_url(url)?;
-    let probe = probe_http_location(&loc)?;
+    let source = Arc::new(HttpRangeSource::new(
+        loc.clone(),
+        HttpAuthOptions::default(),
+    ));
+    let probe = probe_http_source(&source)?;
     if probe.accept_ranges {
         if let Some(size) = probe.content_length {
             debug!(
@@ -920,7 +951,7 @@ pub fn fetch_http_to_temp_prefer_range(url: &str) -> Result<(NamedTempFile, u64)
 
 fn fetch_http_full_get(loc: &HttpLocation) -> Result<(NamedTempFile, u64)> {
     let resp = apply_http_auth(
-        ureq::get(&loc.url).set("User-Agent", USER_AGENT),
+        http_pool::get(&loc.url).set("User-Agent", USER_AGENT),
         loc.auth.as_ref(),
         loc.cookie.as_deref(),
     )
@@ -948,7 +979,7 @@ fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile
     for (start, end) in range_chunk_windows(size, HTTP_RANGE_CHUNK) {
         let range = format!("bytes={start}-{end}");
         let resp = apply_http_auth(
-            ureq::get(&loc.url)
+            http_pool::get(&loc.url)
                 .set("User-Agent", USER_AGENT)
                 .set("Range", &range),
             loc.auth.as_ref(),
@@ -958,6 +989,7 @@ fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile
         .map_err(|e| map_ureq_http_error(e, &loc.url))?;
         let status = resp.status();
         if status == 206 {
+            http_pool::validate_content_range(&resp, start, end, Some(size))?;
             let mut reader = resp.into_reader();
             let expected = end - start + 1;
             let n = io::copy(&mut reader, &mut tmp)?;
@@ -994,24 +1026,28 @@ fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile
 /// Prefer [`open_http_range`] / [`resolve_http`] for the public entry points.
 /// [`resolve_to_local`] still fully materializes HTTP(S) for path-based openers.
 ///
-/// Basic auth and/or Cookie from the open URL / env are retained for subsequent Range GETs.
+/// Credentials are retained for the origin; redirected targets receive no origin credentials.
+/// Sequential reads use bounded parallel readahead; `RATARMOUNT_HTTP_PARALLEL=1` disables it.
 pub struct HttpRangeFile {
-    /// Wire URL without userinfo.
-    url: String,
-    auth: Option<HttpAuth>,
-    cookie: Option<String>,
+    source: Arc<HttpRangeSource>,
     size: u64,
     pos: u64,
-    /// Optional fully buffered body if ranges unavailable
+    /// Optional fully buffered body if ranges unavailable.
     buffered: Option<Vec<u8>>,
+    last_read_end: Option<u64>,
+    sequential_bytes: u64,
+    last_read_size: usize,
+    parallel: usize,
+    prefetch: Option<Prefetch>,
 }
 
 impl std::fmt::Debug for HttpRangeFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpRangeFile")
-            .field("url", &self.url)
-            .field("auth", &self.auth)
-            .field("cookie", &self.cookie.as_deref().map(redact_cookie_header))
+            .field("url", &self.source.url())
+            .field("auth", &self.source.location.auth)
+            .field("options", &self.source.options)
+            .field("cookie", &self.cookie().map(redact_cookie_header))
             .field("size", &self.size)
             .field("pos", &self.pos)
             .field("uses_ranges", &self.uses_ranges())
@@ -1021,64 +1057,73 @@ impl std::fmt::Debug for HttpRangeFile {
 
 impl HttpRangeFile {
     /// Open `url`, using live Range GETs when the server supports ranges and size is known.
-    ///
     /// Without usable ranges, buffers the full response body in memory.
     pub fn open(url: &str) -> Result<Self> {
-        let loc = parse_http_url(url)?;
-        let probe = probe_http_location(&loc)?;
-        if probe.accept_ranges {
-            if let Some(size) = probe.content_length {
-                return Ok(Self::from_location(loc, size, None));
-            }
-        }
-
-        // Fallback: full download into memory (fine for test fixtures / small objects)
-        let (mut tmp, size) = fetch_http_full_get(&loc)?;
-        let mut buf = Vec::with_capacity(size as usize);
-        tmp.read_to_end(&mut buf)?;
-        Ok(Self::from_location(loc, buf.len() as u64, Some(buf)))
+        Self::open_with_auth(url, HttpAuthOptions::default())
     }
 
-    fn from_location(loc: HttpLocation, size: u64, buffered: Option<Vec<u8>>) -> Self {
+    /// Open with explicit secret Bearer authentication, retaining URL/env Basic and Cookies.
+    pub fn open_with_auth(url: &str, options: HttpAuthOptions) -> Result<Self> {
+        let source = Arc::new(HttpRangeSource::new(parse_http_url(url)?, options));
+        let probe = probe_http_source(&source)?;
+        if probe.accept_ranges {
+            if let Some(size) = probe.content_length {
+                return Ok(Self::from_source(source, size, None));
+            }
+        }
+        let resp = source
+            .request("GET", None)
+            .map_err(|e| map_ureq_http_error(e, source.url()))?;
+        if !(200..300).contains(&resp.status()) {
+            return Err(http_status_err(resp.status(), source.url()));
+        }
+        let mut buf = Vec::new();
+        resp.into_reader().read_to_end(&mut buf)?;
+        Ok(Self::from_source(source, buf.len() as u64, Some(buf)))
+    }
+
+    fn from_source(source: Arc<HttpRangeSource>, size: u64, buffered: Option<Vec<u8>>) -> Self {
         Self {
-            url: loc.url,
-            auth: loc.auth,
-            cookie: loc.cookie,
+            source,
             size,
             pos: 0,
             buffered,
+            last_read_end: None,
+            sequential_bytes: 0,
+            last_read_size: 0,
+            parallel: http_pool::parallelism(),
+            prefetch: None,
         }
     }
 
-    /// Construct a live Range-backed reader (no probe; caller must know size).
-    ///
-    /// Parses Basic auth and Cookie from URL userinfo / env the same way as [`open`].
+    /// Construct a live Range-backed reader without probing; caller must know the size.
     pub fn range_backed(url: &str, size: u64) -> Self {
-        match parse_http_url(url) {
-            Ok(loc) => Self::from_location(loc, size, None),
-            Err(_) => Self {
-                url: url.to_string(),
-                auth: None,
-                cookie: None,
-                size,
-                pos: 0,
-                buffered: None,
-            },
-        }
+        Self::range_backed_with_auth(url, size, HttpAuthOptions::default())
     }
 
+    /// Construct an unprobed reader with explicit secret Bearer authentication.
+    pub fn range_backed_with_auth(url: &str, size: u64, options: HttpAuthOptions) -> Self {
+        let loc = parse_http_url(url).unwrap_or_else(|_| HttpLocation {
+            url: url.to_string(),
+            auth: None,
+            cookie: None,
+        });
+        Self::from_source(Arc::new(HttpRangeSource::new(loc, options)), size, None)
+    }
+
+    /// Origin URL, with userinfo removed.
     pub fn url(&self) -> &str {
-        &self.url
+        self.source.url()
     }
 
-    /// Basic auth retained for live Range GETs, if any.
+    /// Basic auth retained for the origin, if any.
     pub fn auth(&self) -> Option<&HttpAuth> {
-        self.auth.as_ref()
+        self.source.location.auth.as_ref()
     }
 
-    /// Cookie header retained for live Range GETs, if any.
+    /// Cookie header retained for the origin, if any.
     pub fn cookie(&self) -> Option<&str> {
-        self.cookie.as_deref()
+        self.source.location.cookie.as_deref()
     }
 
     pub fn len(&self) -> u64 {
@@ -1154,12 +1199,16 @@ impl RemoteHttp {
 /// [`resolve_to_local`] remains the full-materialize path for path-based openers.
 pub fn resolve_http(url: &str) -> Result<RemoteHttp> {
     let loc = parse_http_url(url)?;
-    let probe = probe_http_location(&loc)?;
+    let source = Arc::new(HttpRangeSource::new(
+        loc.clone(),
+        HttpAuthOptions::default(),
+    ));
+    let probe = probe_http_source(&source)?;
     if probe.accept_ranges {
         if let Some(size) = probe.content_length {
             debug!("HTTP live Range for {} ({size} bytes)", loc.url);
-            return Ok(RemoteHttp::Range(HttpRangeFile::from_location(
-                loc, size, None,
+            return Ok(RemoteHttp::Range(HttpRangeFile::from_source(
+                source, size, None,
             )));
         }
     }
@@ -1220,87 +1269,77 @@ impl Read for HttpRangeFile {
         if self.pos >= self.size || buf.is_empty() {
             return Ok(0);
         }
-        if let Some(data) = &self.buffered {
+        let n = if let Some(data) = &self.buffered {
             let start = self.pos as usize;
-            let end = (self.pos as usize + buf.len()).min(data.len());
-            let n = end - start;
-            buf[..n].copy_from_slice(&data[start..end]);
-            self.pos += n as u64;
-            return Ok(n);
-        }
-        let end = (self.pos + buf.len() as u64).min(self.size);
-        if end <= self.pos {
-            return Ok(0);
-        }
-        // Inclusive Range end
-        let range = format!("bytes={}-{}", self.pos, end - 1);
-        let resp = apply_http_auth(
-            ureq::get(&self.url)
-                .set("User-Agent", USER_AGENT)
-                .set("Range", &range),
-            self.auth.as_ref(),
-            self.cookie.as_deref(),
-        )
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::Status(401, _) => io::Error::other(format!(
-                "HTTP 401 Unauthorized for {}; check URL userinfo, {}/{}, or Cookie via {}/{}",
-                self.url, HTTP_USER_ENV, HTTP_PASSWORD_ENV, HTTP_COOKIE_ENV, HTTP_COOKIE_FILE_ENV
-            )),
-            other => io::Error::other(other.to_string()),
-        })?;
-        let status = resp.status();
-        if status == 206 {
-            let mut reader = resp.into_reader();
-            let mut chunk = vec![0u8; (end - self.pos) as usize];
-            reader.read_exact(&mut chunk)?;
-            let n = chunk.len().min(buf.len());
-            buf[..n].copy_from_slice(&chunk[..n]);
-            self.pos += n as u64;
-            return Ok(n);
-        }
-        if status == 200 {
-            // Server ignored Range and returned the full body; skip to pos then read.
-            let mut reader = resp.into_reader();
-            let skip = self.pos;
-            if skip > 0 {
-                io::copy(&mut reader.by_ref().take(skip), &mut io::sink())?;
+            let n = buf.len().min(data.len() - start);
+            buf[..n].copy_from_slice(&data[start..start + n]);
+            n
+        } else {
+            if self.parallel > 1
+                && self.last_read_end == Some(self.pos)
+                && (self.sequential_bytes >= 1024 * 1024 || self.last_read_size >= 64 * 1024)
+                && self.prefetch.is_none()
+            {
+                self.prefetch = Some(Prefetch::new(
+                    Arc::clone(&self.source),
+                    self.pos,
+                    self.size,
+                    self.parallel,
+                ));
             }
-            let need = (end - self.pos) as usize;
-            let mut chunk = vec![0u8; need];
-            reader.read_exact(&mut chunk)?;
-            let n = chunk.len().min(buf.len());
-            buf[..n].copy_from_slice(&chunk[..n]);
-            self.pos += n as u64;
-            return Ok(n);
-        }
-        if status == 401 {
-            return Err(io::Error::other(format!(
-                "HTTP 401 Unauthorized for {}; check URL userinfo, {}/{}, or Cookie via {}/{}",
-                self.url, HTTP_USER_ENV, HTTP_PASSWORD_ENV, HTTP_COOKIE_ENV, HTTP_COOKIE_FILE_ENV
-            )));
-        }
-        Err(io::Error::other(format!(
-            "HTTP {status} for range {range} on {}",
-            self.url
-        )))
+            let prefetched = match &mut self.prefetch {
+                Some(prefetch) => match prefetch.read(self.pos, buf) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        self.prefetch = None;
+                        self.last_read_end = None;
+                        self.sequential_bytes = 0;
+                        self.last_read_size = 0;
+                        return Err(err);
+                    }
+                },
+                None => None,
+            };
+            match prefetched {
+                Some(n) => n,
+                None => {
+                    self.prefetch = None;
+                    self.source.read_into(self.pos, self.size, buf)?
+                }
+            }
+        };
+        self.sequential_bytes = if self.last_read_end == Some(self.pos) {
+            self.sequential_bytes.saturating_add(n as u64)
+        } else {
+            n as u64
+        };
+        self.last_read_size = n;
+        self.pos += n as u64;
+        self.last_read_end = Some(self.pos);
+        Ok(n)
     }
 }
 
 impl Seek for HttpRangeFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let new = match pos {
-            SeekFrom::Start(o) => o as i64,
-            SeekFrom::End(o) => self.size as i64 + o,
-            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::Start(o) => i128::from(o),
+            SeekFrom::End(o) => i128::from(self.size) + i128::from(o),
+            SeekFrom::Current(o) => i128::from(self.pos) + i128::from(o),
         };
-        if new < 0 {
-            return Err(io::Error::new(
+        let new = u64::try_from(new).map_err(|_| {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "seek before start",
-            ));
+                "seek outside HTTP file offset range",
+            )
+        })?;
+        if new != self.pos {
+            self.prefetch = None;
+            self.last_read_end = None;
+            self.sequential_bytes = 0;
+            self.last_read_size = 0;
+            self.pos = new;
         }
-        self.pos = new as u64;
         Ok(self.pos)
     }
 }
