@@ -1,5 +1,8 @@
 //! FUSE mount using `fuser` low-level API (read + optional write overlay).
 
+#[cfg(test)]
+mod fuser_tests;
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::io::{AsRawFd, OwnedFd};
@@ -9,15 +12,18 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
-    FUSE_ROOT_ID,
+    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
+    ReplyXattr, Request, SessionACL, WriteFlags,
 };
 use libc::{EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
 use log::{debug, info, warn};
 use ratarmount_compositing::{Parked, WriteOverlay};
 use ratarmount_core::{CheapDirent, FileInfo, InodeAttrCookie, MountSource};
 use std::io::ErrorKind;
+
+const FUSE_ROOT_ID: u64 = INodeNo::ROOT.0;
 
 /// Kernel attribute/entry cache TTL for immutable attrs (read-only mounts and
 /// archive members that the write overlay has not shadowed).
@@ -445,11 +451,11 @@ trait InvalSink: Send + 'static {
 impl InvalSink for fuser::Notifier {
     fn inval_inode(&self, ino: u64) -> std::io::Result<()> {
         // Whole inode: offset 0, len -1 (fuser / libfuse convention).
-        fuser::Notifier::inval_inode(self, ino, 0, -1)
+        fuser::Notifier::inval_inode(self, INodeNo(ino), 0, -1)
     }
 
     fn inval_entry(&self, parent: u64, name: &OsStr) -> std::io::Result<()> {
-        fuser::Notifier::inval_entry(self, parent, name)
+        fuser::Notifier::inval_entry(self, INodeNo(parent), name)
     }
 }
 
@@ -786,8 +792,8 @@ impl RatarmountFs {
     fn readdirplus_fill(
         &self,
         ino: u64,
-        offset: i64,
-        mut add: impl FnMut(u64, i64, &str, &Duration, &FileAttr) -> bool,
+        offset: u64,
+        mut add: impl FnMut(u64, u64, &str, &Duration, &FileAttr) -> bool,
     ) -> Result<(), i32> {
         let path = self.path_for_ino(ino).ok_or(ENOENT)?;
         let entries = self.list_mode_cached(&path).ok_or(ENOENT)?;
@@ -830,7 +836,7 @@ impl RatarmountFs {
         }
         for (i, (cino, name, attr)) in full.into_iter().enumerate().skip(offset as usize) {
             let entry_ttl = self.readdirplus_entry_ttl(&attr);
-            if add(cino, (i + 1) as i64, &name, &entry_ttl, &attr) {
+            if add(cino, (i + 1) as u64, &name, &entry_ttl, &attr) {
                 break;
             }
             // Buffered with this TTL for entry and attr (zero with an overlay
@@ -1064,7 +1070,7 @@ impl RatarmountFs {
 
     /// Body of `create`, replying-free so it can be unit-tested.
     fn create_entry(
-        &mut self,
+        &self,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -1103,7 +1109,7 @@ impl RatarmountFs {
 
     /// Body of `mkdir`, replying-free so it can be unit-tested.
     fn mkdir_entry(
-        &mut self,
+        &self,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -1134,7 +1140,7 @@ impl RatarmountFs {
     }
 
     /// Body of `unlink` / `rmdir`, replying-free so it can be unit-tested.
-    fn remove_entry(&mut self, parent: u64, name: &OsStr, dir: bool) -> Result<(), i32> {
+    fn remove_entry(&self, parent: u64, name: &OsStr, dir: bool) -> Result<(), i32> {
         let path = self.overlay_child_path(parent, name)?;
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
         let name = name.to_string_lossy();
@@ -1710,7 +1716,7 @@ impl RatarmountFs {
         let perm = (fi.mode & 0o7777) as u16;
         let mtime = unix_float_to_system_time(fi.mtime);
         FileAttr {
-            ino,
+            ino: INodeNo(ino),
             size: fi.size,
             blocks: fi.size.div_ceil(512),
             atime: mtime,
@@ -1820,7 +1826,7 @@ impl RatarmountFs {
 
         let fi = self.file_info_for_open(ino, &path).ok_or(ENOENT)?;
         let fh = self.open_source_backend(path, fi, false)?;
-        Ok((fh, fuser::consts::FOPEN_KEEP_CACHE))
+        Ok((fh, FopenFlags::FOPEN_KEEP_CACHE.bits()))
     }
 
     fn inode_is_detached(&self, ino: u64) -> bool {
@@ -1877,7 +1883,7 @@ impl RatarmountFs {
             }
             Kind::Archive { path, fi } => {
                 let fh = self.open_source_backend(path, fi, true)?;
-                Ok((fh, fuser::consts::FOPEN_KEEP_CACHE))
+                Ok((fh, FopenFlags::FOPEN_KEEP_CACHE.bits()))
             }
             Kind::Meta => Err(EACCES),
             Kind::Missing => {
@@ -2004,7 +2010,7 @@ fn reply_xattr_bytes(size: u32, data: &[u8], reply: ReplyXattr) {
     } else if data.len() <= size as usize {
         reply.data(data);
     } else {
-        reply.error(libc::ERANGE);
+        reply.error(Errno::ERANGE);
     }
 }
 
@@ -2071,7 +2077,7 @@ fn file_attr_from_stat(ino: u64, st: &libc::stat) -> FileAttr {
     let size = u64::try_from(st.st_size).unwrap_or(0);
     let mtime = unix_float_to_system_time(st.st_mtime as f64);
     FileAttr {
-        ino,
+        ino: INodeNo(ino),
         size,
         blocks: size.div_ceil(512),
         atime: mtime,
@@ -2266,55 +2272,63 @@ fn raise_nofile_soft_to_hard() {
 }
 
 impl Filesystem for RatarmountFs {
-    fn init(
-        &mut self,
-        _req: &Request<'_>,
-        _config: &mut fuser::KernelConfig,
-    ) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         raise_nofile_soft_to_hard();
+        // ABI 7.12 left Linux's 32-page I/O cap and 12/9 background limits
+        // in effect. 0.18 negotiates MAX_PAGES by default; keep those bounds.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            let max_io = 32 * u32::try_from(page_size).unwrap_or(4096);
+            let _ = config.set_max_write(max_io);
+            // An error means the kernel offered a smaller limit; keep it.
+            let _ = config.set_max_readahead(max_io);
+        }
+        let _ = config.set_max_background(12);
+        let _ = config.set_congestion_threshold(9);
         Ok(())
     }
 
-    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        self.forget_nlookup(ino, nlookup);
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.forget_nlookup(ino.0, nlookup);
     }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        match self.lookup_entry(parent, name) {
-            Some((_, attr, ttl)) => reply.entry(&ttl, &attr, 0),
-            None => reply.error(ENOENT),
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        match self.lookup_entry(parent.0, name) {
+            Some((_, attr, ttl)) => reply.entry(&ttl, &attr, Generation(0)),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        match self.getattr_reply(ino) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match self.getattr_reply(ino.0) {
             Ok((ttl, attr)) => reply.attr(&ttl, &attr),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error(Errno::from_i32(errno)),
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let Some(path) = self.path_for_ino(ino) else {
-            reply.error(ENOENT);
+        let Some(path) = self.path_for_ino(ino.0) else {
+            reply.error(Errno::ENOENT);
             return;
         };
         let Some(entries) = self.list_mode_cached(&path) else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         };
 
         let mut full: Vec<(u64, FileType, String)> = Vec::new();
-        full.push((ino, FileType::Directory, ".".into()));
+        full.push((ino.0, FileType::Directory, ".".into()));
         full.push((
             if path == "/" {
-                ino
+                ino.0
             } else {
                 let parent = path.rsplit_once('/').map(|(p, _)| {
                     if p.is_empty() {
@@ -2338,8 +2352,8 @@ impl Filesystem for RatarmountFs {
         }
 
         for (i, (cino, kind, name)) in full.into_iter().enumerate().skip(offset as usize) {
-            let next_offset = (i + 1) as i64;
-            if reply.add(cino, next_offset, kind, name) {
+            let next_offset = (i + 1) as u64;
+            if reply.add(INodeNo(cino), next_offset, kind, name) {
                 break;
             }
         }
@@ -2347,172 +2361,185 @@ impl Filesystem for RatarmountFs {
     }
 
     fn readdirplus(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
         // Cheap list_mode only — do not call MountSource::list (fat FileInfo map).
         // Full attrs (size/mtime/uid) are filled at getattr/lookup/open.
         // nlookup is not bumped; see [`RatarmountFs::readdirplus_fill`].
-        match self.readdirplus_fill(ino, offset, |cino, off, name, ttl, attr| {
-            reply.add(cino, off, name, ttl, attr, 0)
+        match self.readdirplus_fill(ino.0, offset, |cino, off, name, ttl, attr| {
+            reply.add(INodeNo(cino), off, name, ttl, attr, Generation(0))
         }) {
             Ok(()) => reply.ok(),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error(Errno::from_i32(errno)),
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        match self.open_inode(ino, flags) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        match self.open_inode(ino.0, flags.0) {
             Ok((fh, open_flags)) => {
-                reply.opened(fh, open_flags);
+                reply.opened(FileHandle(fh), FopenFlags::from_bits_retain(open_flags));
                 self.flush_kernel_invals();
             }
             Err(e) => {
                 debug!("open error kind={e}");
-                reply.error(e);
+                reply.error(Errno::from_i32(e));
             }
         }
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.read_handle(fh, offset, size) {
+        match self.read_handle(fh.0, (offset as i64).max(0), size) {
             Ok(buf) => reply.data(&buf),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         let fd = {
             let g = self.handles.lock().unwrap();
-            match g.get(&fh) {
+            match g.get(&fh.0) {
                 Some(OpenBackend::OverlayFd(fd)) => *fd,
                 _ => {
-                    reply.error(if self.writable() { EIO } else { EROFS });
+                    reply.error(Errno::from_i32(if self.writable() { EIO } else { EROFS }));
                     return;
                 }
             }
         };
-        let n = unsafe { libc::pwrite(fd, data.as_ptr() as *const _, data.len(), offset.max(0)) };
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                data.as_ptr() as *const _,
+                data.len(),
+                (offset as i64).max(0),
+            )
+        };
         if n < 0 {
-            reply.error(EIO);
+            reply.error(Errno::EIO);
         } else {
             // First write of a previously cached archive member must drop the
             // 60s kernel attr. Later overlay writes already have TTL 0.
-            self.drop_stable_attr(ino);
+            self.drop_stable_attr(ino.0);
             reply.written(n as u32);
             self.flush_kernel_invals();
         }
     }
 
     fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        match self.create_entry(parent, name, mode) {
+        match self.create_entry(parent.0, name, mode) {
             Ok((ttl, attr, fh)) => {
-                reply.created(&ttl, &attr, 0, fh, 0);
+                reply.created(
+                    &ttl,
+                    &attr,
+                    Generation(0),
+                    FileHandle(fh),
+                    FopenFlags::empty(),
+                );
                 self.flush_kernel_invals();
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error(Errno::from_i32(errno)),
         }
     }
 
     fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        match self.mkdir_entry(parent, name, mode) {
+        match self.mkdir_entry(parent.0, name, mode) {
             Ok((ttl, attr)) => {
-                reply.entry(&ttl, &attr, 0);
+                reply.entry(&ttl, &attr, Generation(0));
                 self.flush_kernel_invals();
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error(Errno::from_i32(errno)),
         }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.remove_entry(parent, name, false) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.remove_entry(parent.0, name, false) {
             Ok(()) => {
                 reply.ok();
                 self.flush_kernel_invals();
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error(Errno::from_i32(errno)),
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.remove_entry(parent, name, true) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.remove_entry(parent.0, name, true) {
             Ok(()) => {
                 reply.ok();
                 self.flush_kernel_invals();
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error(Errno::from_i32(errno)),
         }
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        flags: u32,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         self.rename_reply(
-            parent,
+            parent.0,
             &name.to_string_lossy(),
-            newparent,
+            newparent.0,
             &newname.to_string_lossy(),
-            flags,
+            flags.bits(),
             |result| match result {
                 Ok(()) => reply.ok(),
-                Err(errno) => reply.error(errno),
+                Err(errno) => reply.error(Errno::from_i32(errno)),
             },
         );
     }
 
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -2520,33 +2547,33 @@ impl Filesystem for RatarmountFs {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<u64>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        match self.setattr_entry(ino, size, fh) {
+        match self.setattr_entry(ino.0, size, fh.map(|fh| fh.0)) {
             Ok((ttl, attr)) => {
                 reply.attr(&ttl, &attr);
                 self.flush_kernel_invals();
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error(Errno::from_i32(errno)),
         }
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Some(OpenBackend::OverlayFd(fd)) = self.handles.lock().unwrap().remove(&fh) {
+        if let Some(OpenBackend::OverlayFd(fd)) = self.handles.lock().unwrap().remove(&fh.0) {
             if let Some(ov) = &self.overlay {
                 ov.close_overlay_fd(fd);
             } else {
@@ -2558,44 +2585,37 @@ impl Filesystem for RatarmountFs {
         reply.ok();
     }
 
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         // Same cache/overlay policy as getattr — do not force a second source.lookup.
-        let Some(fi) = self.file_info_for_ino(ino) else {
-            reply.error(ENOENT);
+        let Some(fi) = self.file_info_for_ino(ino.0) else {
+            reply.error(Errno::ENOENT);
             return;
         };
         reply.data(fi.linkname.as_bytes());
     }
 
-    fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        name: &OsStr,
-        size: u32,
-        reply: ReplyXattr,
-    ) {
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let key = name.to_string_lossy();
-        match self.xattr_value(ino, key.as_ref()) {
+        match self.xattr_value(ino.0, key.as_ref()) {
             Ok(Some(value)) => reply_xattr_bytes(size, &value, reply),
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error(Errno::from_i32(errno)),
             Ok(None) => {
                 // Linux: ENODATA; macOS/BSD: ENOATTR (same numeric value on many systems).
                 #[cfg(target_os = "linux")]
-                reply.error(libc::ENODATA);
+                reply.error(Errno::ENODATA);
                 #[cfg(not(target_os = "linux"))]
-                reply.error(libc::ENOATTR);
+                reply.error(Errno::ENOATTR);
             }
         }
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
-        match self.xattr_list(ino) {
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        match self.xattr_list(ino.0) {
             Ok(keys) => {
                 let bytes = encode_xattr_list(&keys);
                 reply_xattr_bytes(size, &bytes, reply);
             }
-            Err(errno) => reply.error(errno),
+            Err(errno) => reply.error(Errno::from_i32(errno)),
         }
     }
 }
@@ -2603,6 +2623,8 @@ impl Filesystem for RatarmountFs {
 /// Parse a Python-style `-o` / `--fuse` comma-separated option string into `MountOption`s.
 ///
 /// Unknown tokens become `MountOption::CUSTOM` (passed through to libfuse/kernel).
+/// `allow_root` and `allow_other` are also CUSTOM here; [`mount_blocking`]
+/// extracts them into the session ACL before mounting.
 pub fn parse_fuse_options(s: &str) -> Vec<MountOption> {
     s.split(',')
         .map(str::trim)
@@ -2614,8 +2636,6 @@ pub fn parse_fuse_options(s: &str) -> Vec<MountOption> {
 fn mount_option_from_str(s: &str) -> MountOption {
     match s {
         "auto_unmount" => MountOption::AutoUnmount,
-        "allow_other" => MountOption::AllowOther,
-        "allow_root" => MountOption::AllowRoot,
         "default_permissions" => MountOption::DefaultPermissions,
         "dev" => MountOption::Dev,
         "nodev" => MountOption::NoDev,
@@ -2636,9 +2656,83 @@ fn mount_option_from_str(s: &str) -> MountOption {
     }
 }
 
+/// Preserve the libfuse option and access policy used before fuser 0.18.
+fn mount_config(writable: bool, extra_fuse_opts: &str) -> Config {
+    let mut options = vec![MountOption::FSName("ratarmount".into())];
+    if !writable {
+        options.push(MountOption::RO);
+    }
+    let mut acl = SessionACL::Owner;
+    for opt in parse_fuse_options(extra_fuse_opts) {
+        // User `-o rw` can override default RO for writable overlays; for RO mounts keep RO.
+        match &opt {
+            MountOption::CUSTOM(value) if value == "allow_root" => {
+                acl = SessionACL::RootAndOwner;
+                continue;
+            }
+            MountOption::CUSTOM(value) if value == "allow_other" => {
+                if acl != SessionACL::RootAndOwner {
+                    acl = SessionACL::All;
+                }
+                continue;
+            }
+            MountOption::RW if !writable => continue,
+            MountOption::RO => {}
+            MountOption::FSName(_) => {
+                // Prefer user-supplied fsname if present.
+                options.retain(|o| !matches!(o, MountOption::FSName(_)));
+            }
+            _ => {}
+        }
+        // Session::new now rejects conflicting flags; libfuse previously
+        // applied them in order. Keep that last-option-wins behavior.
+        options.retain(|old| !mount_options_conflict(old, &opt));
+        options.push(opt);
+    }
+    if acl == SessionACL::Owner {
+        for opt in &mut options {
+            if *opt == MountOption::AutoUnmount {
+                // 0.15 passed allow_other to libfuse but enforced Owner in
+                // userspace. 0.18 rejects typed AutoUnmount + Owner, so pass
+                // the libfuse option verbatim and keep the same userspace ACL.
+                *opt = MountOption::CUSTOM("auto_unmount".into());
+            }
+        }
+        if options.contains(&MountOption::CUSTOM("auto_unmount".into())) {
+            options.push(MountOption::CUSTOM("allow_other".into()));
+        }
+    }
+    let mut config = Config::default();
+    config.mount_options = options;
+    config.acl = acl;
+    // Detached raw fds and notification ordering rely on serial requests.
+    config.n_threads = Some(1);
+    config.clone_fd = false;
+    config
+}
+
+fn mount_options_conflict(a: &MountOption, b: &MountOption) -> bool {
+    use MountOption::*;
+    matches!(
+        (a, b),
+        (RO, RW)
+            | (RW, RO)
+            | (Dev, NoDev)
+            | (NoDev, Dev)
+            | (Suid, NoSuid)
+            | (NoSuid, Suid)
+            | (Exec, NoExec)
+            | (NoExec, Exec)
+            | (Atime, NoAtime)
+            | (NoAtime, Atime)
+            | (Sync, Async)
+            | (Async, Sync)
+    )
+}
+
 /// `Session::run` outcome after the mount has been established.
 ///
-/// fuser 0.15 turns `ENODEV` into `Ok` and returns every other `read` errno.
+/// fuser turns `ENODEV` into `Ok` and returns every other `read` errno.
 /// Upstream fuser treats `ECONNABORTED` as the same clean end of session
 /// (cberner/fuser#212). The kernel returns it when the connection is aborted,
 /// including a normal unmount that wins the race in `fuse_dev_do_read` after
@@ -2671,49 +2765,29 @@ pub fn mount_blocking(
     extra_fuse_opts: &str,
     readahead: u64,
 ) -> std::io::Result<()> {
-    let mut options = vec![MountOption::FSName("ratarmount".into())];
-    if !writable {
-        options.push(MountOption::RO);
-    }
-    for opt in parse_fuse_options(extra_fuse_opts) {
-        // User `-o rw` can override default RO for writable overlays; for RO mounts keep RO.
-        match &opt {
-            MountOption::RW if !writable => continue,
-            MountOption::RO => {}
-            MountOption::FSName(_) => {
-                // Prefer user-supplied fsname if present.
-                options.retain(|o| !matches!(o, MountOption::FSName(_)));
-            }
-            _ => {}
-        }
-        options.push(opt);
-    }
+    let config = mount_config(writable, extra_fuse_opts);
     let _ = foreground;
     // Idempotent with `Filesystem::init`. In place before `Session::new`.
     raise_nofile_soft_to_hard();
     let fs = RatarmountFs::with_readahead(source, overlay, readahead);
-    // `mount2` does not hand back `Session::notifier`. The notifier thread
+    // `mount` does not hand back `Session::notifier`. The notifier thread
     // must exist before `run` so a shadowed archive member can drop a 60s
     // kernel cache, and so those writes never run on the request thread.
     //
-    // Shutdown, every return path: drop the sender, `session.unmount()`,
-    // join the notifier, then return `res`. With libfuse3, `unmount` drops
-    // fuser's `Mount` (`fuse_session_unmount` + `fuse_session_destroy`). The
-    // notifier writes on its own dup of the `/dev/fuse` fd (`Arc<File>` in
-    // `fuser::Notifier`) and shares no lock with libfuse, so this is safe.
-    // `run` can return `Ok` on a bad request while the connection is still
-    // up, hence the explicit unmount. A notify parked on a directory
-    // `i_rwsem` returns once the holder drops that lock; the holder was
+    // `run` consumes the session and unmounts before returning. Then drop
+    // the sender and join the notifier, whose fd is independently owned.
+    // No notification shares a lock with libfuse.
+    // `run` also drops the mount on a malformed request. A notify parked on
+    // a directory `i_rwsem` returns once the holder drops that lock; the holder was
     // waiting on a reply the session thread sent before `run` returned.
     // After unmount a further write fails with `ENODEV` or `ECONNABORTED`
     // (thread exits), and the dropped sender ends `recv`.
     let kernel_notify = Arc::clone(&fs.kernel_notify);
-    let mut session = fuser::Session::new(fs, mountpoint.as_ref(), &options)?;
+    let session = fuser::Session::new(fs, mountpoint.as_ref(), &config)?;
     let (tx, notifier_thread) = spawn_notifier(session.notifier());
     kernel_notify.install(tx);
     let res = fuse_session_result(session.run());
     kernel_notify.clear();
-    session.unmount();
     let _ = notifier_thread.join();
     res
 }
@@ -3309,7 +3383,7 @@ mod tests {
             "stable read open skips overlay stat"
         );
         assert!(!fs.test_fh_is_overlay_fd(fh));
-        assert_eq!(flags, fuser::consts::FOPEN_KEEP_CACHE);
+        assert_eq!(flags, FopenFlags::FOPEN_KEEP_CACHE.bits());
         assert_eq!(fs.read_handle(fh, 0, 8).expect("read"), b"aaaa");
         assert_eq!(opens.load(Ordering::Relaxed), 1);
 
@@ -5382,7 +5456,7 @@ mod tests {
     /// overlay refuses it and the handlers reply EACCES.
     #[test]
     fn overlay_internal_name_create_unlink_reply_eacces() {
-        let (dir, mut fs) = readable_members_fs(&["m"]);
+        let (dir, fs) = readable_members_fs(&["m"]);
         let ov = fs.overlay.as_ref().expect("write overlay");
         let db = ov.root().join(ratarmount_compositing::HIDDEN_DB);
         let len = std::fs::metadata(&db).unwrap().len();
@@ -5941,7 +6015,7 @@ mod tests {
     /// kept answering ENOENT. The old id still reads the old body.
     #[test]
     fn detached_overlay_unlink_keeps_attrs_and_bytes() {
-        let (_dir, ov, mut fs) = overlay_fs_for_rename();
+        let (_dir, ov, fs) = overlay_fs_for_rename();
         overlay_write_new(&ov, "/gone", b"keep-me");
         let (ino, _, _) = fs
             .lookup_entry(FUSE_ROOT_ID, OsStr::new("gone"))
@@ -5993,7 +6067,7 @@ mod tests {
         let (fh_detached, flags) = fs
             .open_inode(final_ino, libc::O_RDONLY)
             .expect("open detached archive id");
-        assert_eq!(flags, fuser::consts::FOPEN_KEEP_CACHE);
+        assert_eq!(flags, FopenFlags::FOPEN_KEEP_CACHE.bits());
         let (keep_ino, _, _) = fs
             .lookup_entry(FUSE_ROOT_ID, OsStr::new("keep"))
             .expect("keep");
@@ -6036,7 +6110,7 @@ mod tests {
     /// bytes across a generation bump. The name is gone.
     #[test]
     fn detached_archive_unlink_keeps_bytes_across_generation() {
-        let (_dir, mut fs, bytes) = byte_members_fs(&[("gone", "ARCHIVE-BODY")]);
+        let (_dir, fs, bytes) = byte_members_fs(&[("gone", "ARCHIVE-BODY")]);
         let (ino, _, _) = fs
             .lookup_entry(FUSE_ROOT_ID, OsStr::new("gone"))
             .expect("lookup");
@@ -6189,7 +6263,7 @@ mod tests {
     /// detached id still getattrs until its own FORGET.
     #[test]
     fn create_after_unlink_allocates_new_nodeid() {
-        let (_dir, ov, mut fs) = overlay_fs_for_rename();
+        let (_dir, ov, fs) = overlay_fs_for_rename();
         overlay_write_new(&ov, "/a", b"old-a");
         let (old, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("a")).unwrap();
         let n = fs.nlookup_of(old).unwrap();
@@ -6199,9 +6273,9 @@ mod tests {
         let (_ttl, attr, _fh) = fs
             .create_entry(FUSE_ROOT_ID, OsStr::new("a"), 0o644)
             .expect("create");
-        assert_ne!(attr.ino, old);
+        assert_ne!(attr.ino.0, old);
         let (got, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("a")).unwrap();
-        assert_eq!(got, attr.ino);
+        assert_eq!(got, attr.ino.0);
         assert!(fs.getattr_reply(old).is_ok());
         fs.forget_nlookup(old, n);
         assert!(fs.getattr_reply(old).is_err());
@@ -6272,13 +6346,13 @@ mod tests {
     /// fd, and `last_fi`. FORGET drops them only when nlookup reaches 0.
     #[test]
     fn create_entry_nlookup_is_one_and_unlinked_file_stays_until_forget() {
-        let (_dir, _ov, mut fs) = overlay_fs_for_rename();
+        let (_dir, _ov, fs) = overlay_fs_for_rename();
         let counter = Arc::new(AtomicUsize::new(0));
         fs.track_parked_fd_drops(Arc::clone(&counter));
         let (_ttl, attr, _fh) = fs
             .create_entry(FUSE_ROOT_ID, OsStr::new("new"), 0o644)
             .expect("create");
-        let ino = attr.ino;
+        let ino = attr.ino.0;
         assert_eq!(fs.nlookup_of(ino), Some(1), "create replies one lookup");
         fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("new")).unwrap();
         assert_eq!(fs.nlookup_of(ino), Some(2));
@@ -6308,13 +6382,13 @@ mod tests {
     /// inode, parked fd, and `last_fi` until FORGET brings the count to 0.
     #[test]
     fn create_entry_nlookup_replaced_file_stays_until_forget() {
-        let (_dir, _ov, mut fs) = overlay_fs_for_rename();
+        let (_dir, _ov, fs) = overlay_fs_for_rename();
         let counter = Arc::new(AtomicUsize::new(0));
         fs.track_parked_fd_drops(Arc::clone(&counter));
         let (_ttl, attr, _fh) = fs
             .create_entry(FUSE_ROOT_ID, OsStr::new("dst"), 0o644)
             .expect("create dst");
-        let dst = attr.ino;
+        let dst = attr.ino.0;
         assert_eq!(fs.nlookup_of(dst), Some(1));
         fs.create_entry(FUSE_ROOT_ID, OsStr::new("src"), 0o644)
             .expect("create src");
@@ -6614,7 +6688,7 @@ mod tests {
     fn mode_000_rename_and_unlink_detach_with_fd() {
         use std::os::unix::fs::PermissionsExt;
 
-        let (_dir, ov, mut fs) = overlay_fs_for_rename();
+        let (_dir, ov, fs) = overlay_fs_for_rename();
         overlay_write_new(&ov, "/locked", b"secret");
         overlay_write_new(&ov, "/src", b"incoming");
         std::fs::set_permissions(

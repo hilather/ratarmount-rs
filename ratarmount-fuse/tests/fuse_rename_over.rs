@@ -34,6 +34,52 @@ const SMOKE_DEADLINE: Duration = Duration::from_secs(60);
 /// Poll/write phase of one stress run. Not the 60s `fuse_rename` guard.
 const STRESS_DEADLINE: Duration = Duration::from_secs(120);
 
+/// Regression: fuser 0.18's Config conflict check must preserve libfuse's last flag.
+#[test]
+fn fuse_fuser_mount_options_preserve_last_flag() {
+    mount_and_run(
+        "rrs-fuser-flags-",
+        &[("d/base.txt", b"base\n")],
+        &["-o", "ro,rw,noexec,exec"],
+        SMOKE_DEADLINE,
+        |d, _ov, _tar| {
+            assert_eq!(fs::read(d.join("base.txt")).unwrap(), b"base\n");
+            fs::write(d.join("new"), b"written\n").unwrap();
+            assert_eq!(fs::read(d.join("new")).unwrap(), b"written\n");
+        },
+    );
+}
+
+/// Regression: owner-only auto_unmount must still reach libfuse after the Config migration.
+/// The userspace UID filter is also covered by the socket protocol unit test.
+#[test]
+fn fuse_fuser_auto_unmount_accepts_owner_only() {
+    if let Some(msg) = skip_reason() {
+        eprintln!("{msg}");
+        return;
+    }
+    let allow_other = fs::read_to_string("/etc/fuse.conf").is_ok_and(|config| {
+        config
+            .lines()
+            .any(|line| line.split('#').next().unwrap_or("").trim() == "user_allow_other")
+    });
+    if unsafe { libc::geteuid() } != 0 && !allow_other {
+        eprintln!("skip: owner-only auto_unmount requires user_allow_other in /etc/fuse.conf");
+        return;
+    }
+    mount_and_run(
+        "rrs-fuser-auto-",
+        &[("d/base.txt", b"base\n")],
+        &["-o", "auto_unmount"],
+        SMOKE_DEADLINE,
+        |d, _ov, _tar| {
+            assert_eq!(fs::read(d.join("base.txt")).unwrap(), b"base\n");
+            fs::write(d.join("new"), b"written\n").unwrap();
+            assert_eq!(fs::read(d.join("new")).unwrap(), b"written\n");
+        },
+    );
+}
+
 /// Regression (#88): 1 writer × 50 rename-overs of an overlay-backed `d/final`
 /// produce 0 ENOENT.
 #[test]
