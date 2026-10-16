@@ -597,6 +597,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open")
@@ -654,6 +655,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open of header-size > body TAR");
@@ -1128,6 +1130,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .unwrap();
@@ -1202,6 +1205,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .unwrap();
@@ -1291,6 +1295,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .unwrap();
@@ -1386,6 +1391,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open of raw tar")
@@ -1568,6 +1574,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("metadata-only 7z open");

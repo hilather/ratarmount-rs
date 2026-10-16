@@ -23,13 +23,16 @@ Related: [`docs/tasks/gui-embedder-support.md`](https://github.com/hilather/rata
 |---------|------------------|-------|
 | Types (`SourceSpec`, `OpenRequest`, `DirCursor`, `FindCursor`, `DirEnt`, …) | **compile** | G0.1 |
 | `Error` (no `Busy`) | **compile** | G0.1 |
-| `Session` (`Send + Sync`, no `Clone`) | **`open` / `list_dirents_page` / `lookup` / `read_range` / `extract_to` / `find` / `Drop`** | G1.1–G1.6 / G3 |
+| `Session` (`Send + Sync`, no `Clone`) | **`open` / `list_dirents_page` / `lookup` / `read_range` / `member_extent` / `iter_by_offset_page` / `extract_to` / `find` / `Drop`** | G1.1–G1.6 / G3 / AI-0d |
 | `IndexJob` | **`run` (blocking)** | G2 |
 | `RangeReader` | **`Read + Send`** (capped; not `Sync`; no member `Vec`) | G1.4 |
 | `Session::open` | **implemented** (catalog via `open_catalog_read_only`) | G1.1 |
 | `open_with_job` | **implemented** (`OpenOptions.index_build` hooks) | G2 |
 | `list_dirents_page` / `lookup` | **implemented** (SQL keyset; no `list()` dump) | G1.2 / G1.3 |
 | `read_range` / `extract_to` | **implemented** (fill-loop + 64 KiB copy; no slurp) | G1.4 / G1.5 |
+| `member_extent` | **implemented** (contiguous data bytes in a local top-level uncompressed TAR; conservative `None` otherwise) | AI-0d |
+| `iter_by_offset_page` | **implemented** (bounded SQL keyset by header offset + full path, newest-wins regular payloads) | AI-0d |
+| `OpenRequest.parallelization` | **implemented** (`ParallelizationSpec`, one thread by default; forwarded to codec options) | AI-0d |
 | `Session::find` | **implemented** (SQL `FindAfter` keyset; CLI first page still 10_000) | G3 |
 | `IndexJob::run` | **implemented** (Always rebuild; cancel never `publish_tmp`) | G2 |
 | `resolve_index` | **implemented** (`SiblingNotWritable`; `UserCache` → `local-index-v1`; CliCompat still `:memory:`) | G4 / PR6–PR7 |
@@ -61,12 +64,29 @@ pub struct OpenRequest {
     pub password: Option<secrecy::SecretString>,
     pub recursive: bool,
     pub recursion_depth: Option<i32>,
+    pub parallelization: ParallelizationSpec, // Default::default() = one thread
     pub recreate: Recreate,
 }
 
 pub enum DirCursor { Start, AfterName { name: String } }
 
 pub enum FindCursor { Start, AfterPath { path: String, offsetheader: Option<i64> } }
+
+pub enum OffsetCursor {
+    Start,
+    AfterOffset { offsetheader: Option<i64>, path: String },
+}
+
+pub struct OffsetPage {
+    pub entries: Vec<DirEnt>,
+    pub next: Option<OffsetCursor>,
+}
+
+pub struct MemberExtent {
+    pub file: PathBuf, // absolute local backing archive path
+    pub offset: u64,   // actual data offset, not offsetheader
+    pub len: u64,
+}
 
 pub struct DirPage {
     pub path: String,
@@ -281,6 +301,77 @@ Do not migrate `meta-v3` onto macOS Library/Caches. Env `RATARMOUNT_LOCAL_INDEX_
 - Extract-all walks the catalog with a newest-wins `fullpath > ?` keyset (page 1024), not `list()` / `list_visible_files_by_offset` dumped into a `Vec`.
 - `extractPlan` (conflict sample) stays in the **GUI**, not engine v1.
 - Path escape (`..`, absolute, Windows prefixes, or an intermediate dest-dir symlink) → `Error::PathEscape` unless `allow_unsafe_paths`. Replace unlinks a dest symlink instead of following it; Skip treats a dest symlink as present. Cancel, failed symlink create, and dangling TAR hardlinks unlink only the sibling tmp (pre-existing dest intact). TAR hardlinks copy the target member.
+
+## Local backing extents and archive-order pages
+
+`Session::member_extent(&self, path: &str) -> Result<Option<MemberExtent>, Error>`
+returns a byte range suitable for a direct file read or an embedder-managed
+mapping. Eligibility comes from the successful local uncompressed TAR probe;
+it does not depend on the filename extension or merely finding TAR-shaped
+userdata. `offset` is `SQLiteIndexedTarUserData.offset`, the **data** offset.
+`DirEnt.archive_offset` remains the **header** offset and must not be used to
+read member bytes.
+
+Only top-level, non-sparse regular payloads in a local plain TAR are supported.
+Compressed streams (including `.tar.zst`), remote inputs, split archives,
+nested members, generated entries, directories, symlinks and hardlinks return
+`None`. Recursive sessions conservatively return `None` for every member.
+Other formats (including stored ZIP and AR), encrypted members and overlay
+sources have no extent support. Session v1 does not expose overlay mutation.
+Missing paths return `Error::NotFound`, matching `read_range` (whereas `lookup`
+returns `Ok(None)`). The returned path is absolute. The caller must keep the
+archive unchanged and present while opening or using the range; this API does
+not pin an inode or protect against external modification/replacement. A member
+larger than 1 MiB has the same extent semantics as a small member.
+
+`Session::iter_by_offset_page(&self, cursor: OffsetCursor, limit: u32)` returns
+`Result<OffsetPage, Error>`. Start with `OffsetCursor::Start`, then pass each
+page's `next` until it is `None`. `limit == 0` means 200; the maximum is the
+index crate's `MAX_DIR_PAGE` (10,000). Each SQL query fetches at most the limit
+plus one lookahead row; no full member `Vec` is built. The existing index helper
+`list_visible_files_by_offset` is unchanged.
+
+Normal cold index builds do not create an archive-order secondary index. The
+first page attempts `CREATE INDEX IF NOT EXISTS files_offsetheader` only for a
+writable local sidecar whose session policy permits writes. The paging
+catalog keeps its read-only query connection; the optional creation uses a
+separate writable connection with the index crate's writable-sidecar settings.
+`Recreate::Never`, read-only files/connections, remote sources and remote-cache
+files never gain this index; in-memory catalogs are not modified either.
+Published SHA-256 snapshots and sidecars with a published pointer also stay
+unindexed so paging cannot invalidate the published content identity.
+On Unix, sidecars with multiple hardlinks are also left untouched.
+If creation fails (including a locked or read-only database), paging continues
+correctly using the same keyset query with a full scan per page. Creation is
+attempted at most once per catalog, and unindexed paging logs once at debug
+level. Existing sidecars need no migration. The first writable paging call may
+take longer while SQLite builds the optional index; ordinary opens and cold
+builds avoid its storage and insertion cost.
+
+Pages contain the newest version of each regular payload file across the
+outer catalog, ordered by `(offsetheader, full archive path)`. Directories,
+symlinks, TAR hardlinks, generated entries and GNU dumpdir tombstones are
+excluded **after** newest-version selection, so an older payload cannot be
+resurrected by filtering. Unknown/negative header offsets sort last, by path,
+and use `offsetheader: None` in the cursor. Equal offsets use the path tie
+breaker; offsets need not be unique. `mtime` is `None` in these cheap entries.
+Keep the catalog unchanged across pages; cursors are session/catalog specific.
+The order is over logical/decompressed stream offsets and includes cataloged
+flattened nested payloads, not a recursive traversal of AutoMount catalogs.
+This API requires a path-backed SQL catalog: memory-only sessions, live folder
+sources and sources without a catalog return `Error::UnsupportedFormat`.
+
+## Codec parallelization
+
+`OpenRequest.parallelization` uses the core `ParallelizationSpec`, re-exported
+by `ratarmount-session`. Existing callers should add
+`parallelization: Default::default()` to request literals to retain one thread.
+Use `ParallelizationSpec::new(4)` for four threads, `new(0)` for the available
+CPU count, or `ParallelizationSpec::parse(":1,zstd:4")?` for per-codec counts.
+The complete matrix is forwarded to `OpenOptions.parallelization` on both
+`open` and `open_with_job` (and therefore `IndexJob::run`). Multi-frame zstd
+and other supporting codecs use their existing threaded paths; a thread count
+does not make an inherently sequential format parallel.
 
 ## `IndexJob` (blocking)
 

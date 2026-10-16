@@ -51,7 +51,40 @@ pub struct OpenRequest {
     pub password: Option<SecretString>,
     pub recursive: bool,
     pub recursion_depth: Option<i32>,
+    /// Codec thread counts. Default is one thread; `new(0)` uses available CPUs.
+    pub parallelization: ratarmount_core::ParallelizationSpec,
     pub recreate: Recreate,
+}
+
+/// Contiguous member bytes in a local, uncompressed archive file.
+///
+/// The archive must remain unchanged while this extent is used. Unlike
+/// [`DirEnt::archive_offset`], `offset` points to the member's data bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberExtent {
+    pub file: PathBuf,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Exclusive keyset for global archive-order iteration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum OffsetCursor {
+    #[default]
+    Start,
+    /// Header offset and full archive path of the last emitted entry.
+    /// Unknown or negative catalog offsets are represented by `None` and sort last.
+    AfterOffset {
+        offsetheader: Option<i64>,
+        path: String,
+    },
+}
+
+/// One page of newest-wins regular payload files in archive order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OffsetPage {
+    pub entries: Vec<DirEnt>,
+    pub next: Option<OffsetCursor>,
 }
 
 /// Opaque keyset for **directory listing**. Napi encodes as `cursor: string`.

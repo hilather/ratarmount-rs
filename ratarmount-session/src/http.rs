@@ -126,6 +126,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         }
     }
