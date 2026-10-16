@@ -14,6 +14,12 @@ with `allow_other` need `user_allow_other` enabled in `/etc/fuse.conf`. The
 example maps ownership to the host caller and runs the container as that UID;
 adapt the mapping if using user namespaces.
 
+For a minimal local end-to-end smoke with a temporary Git repository, run
+[`scripts/swe-bench-sandbox.sh`](scripts/swe-bench-sandbox.sh). It pins the
+base commit, enables `--git-synthetic-head`, protects `tests/**`, writes one
+attempt result, and exports a patch with `ratarmount diff --git`. It reports a
+mount skip without `/dev/fuse`.
+
 Start the daemon in a separate terminal:
 
 ```sh

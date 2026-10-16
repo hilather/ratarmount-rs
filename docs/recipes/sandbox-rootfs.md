@@ -1,5 +1,10 @@
 # An image rootfs with a private repository
 
+The [`scripts/rootfs-union.sh`](scripts/rootfs-union.sh) smoke accepts
+`REPO_SOURCE=/path/to/repo.git@<commit>` and `ROOTFS_IMAGE=docker://...`, then
+mounts the union and runs `git status` inside bubblewrap or systemd-nspawn when
+available. It reports a mount skip without `/dev/fuse`.
+
 Combine an OCI image at `/` with a committed Git tree at `/repo`. No Docker
 daemon is needed; image layers are read through the registry backend. Use an
 image digest and a full commit SHA for reproducible attempts. Run these examples
