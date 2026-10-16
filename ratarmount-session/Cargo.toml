@@ -34,6 +34,7 @@ formats-all = [
   "qcow2",
   "sqlar",
   "squashfs",
+  "tensors",
   "udf",
   "vhd",
   "vmdk",
@@ -60,6 +61,7 @@ pdf = ["dep:ratarmount-formats-pdf"]
 qcow2 = ["dep:ratarmount-formats-qcow2"]
 sqlar = ["dep:ratarmount-formats-sqlar"]
 squashfs = ["dep:ratarmount-formats-squashfs"]
+tensors = ["dep:ratarmount-formats-tensors"]
 udf = ["dep:ratarmount-formats-udf"]
 vhd = ["dep:ratarmount-formats-vhd"]
 vmdk = ["dep:ratarmount-formats-vmdk"]
@@ -107,6 +109,7 @@ ratarmount-formats-pdf = { workspace = true, optional = true }
 ratarmount-formats-qcow2 = { workspace = true, optional = true }
 ratarmount-formats-sqlar = { workspace = true, optional = true }
 ratarmount-formats-squashfs = { workspace = true, optional = true }
+ratarmount-formats-tensors = { workspace = true, optional = true }
 ratarmount-formats-udf = { workspace = true, optional = true }
 ratarmount-formats-vhd = { workspace = true, optional = true }
 ratarmount-formats-vmdk = { workspace = true, optional = true }

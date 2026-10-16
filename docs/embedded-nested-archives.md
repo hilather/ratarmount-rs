@@ -99,7 +99,7 @@ When the **outer** archive has a **writable on-disk** SQLite index, a successful
 | **Fingerprint** | Store/stencil bodies: head / mid / tail SHA-256 (4 KiB). Progressive/compressed parent members (large pure-LZMA2 7z): **head + size only** — mid/tail seeks would fully decompress the member. Residual: same-size edits outside sampled windows are not full-content hashed |
 | **Live mount after import** | Still **compact-only** MemIndex — durable storage is export/import, not nested SQLite `files` as the hot path |
 | **Formats (warm)** | Nested **ZIP**, uncompressed **TAR**, **7z** (file table **+ structure** sidecars — no header re-parse), **CPIO**, **AR** via outer `nestedindexes` |
-| **Formats still cold** | Nested compressed streams (`.tar.gz`/zstd/bz2/xz file table after codec), ISO/WARC/ASAR/XAR/CAB/SQLAR/FAT/SquashFS/EXT4 (residual — not yet durable-wired) |
+| **Formats still cold** | Nested compressed streams (`.tar.gz`/zstd/bz2/xz file table after codec), ISO/WARC/ASAR/XAR/CAB/SQLAR/FAT/SquashFS/EXT4/safetensors/GGUF (residual — not yet durable-wired) |
 | **7z warm details** | Blob stores compact file rows **and** folder/pack/member open cookies; warm open attaches seekable body + imports graph (logs: `imported 7z file table + structure … no header re-parse`). Solid folder decompress CPU/RAM still applies on member open |
 | **Policy** | No nested durable write when `write_index=false`, outer index is `:memory:`, read-only index mode, or no on-disk outer index path |
 | **Logs** | `nested durable index: stored …` / `loaded …` / `imported … file table` |
@@ -139,6 +139,7 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 | **`.tar.xz`** | xz magic + TAR | Seekable xz + TAR | Index map (multi-block / multi-stream preferred); large single-block spills |
 | **CPIO** (newc/odc/bin) | `070701` / `070702` / `070707` / binary magic / `.cpio` | `CpioMountSource::open_from_reader` | **Yes** — stencil |
 | **AR** | `!<arch>\n` / `.ar` / `.a` | `ArMountSource::open_from_reader` | **Yes** — stencil |
+| **safetensors / GGUF v2–v3** | bounded safetensors header / `GGUF` magic / `.safetensors` or `.gguf` | `TensorsMountSource::open_from_reader`; compact file table; default recursive archive suffixes | **Yes** — tensor byte-range stencils; seek cost inherits the parent reader. No body spool. Single safetensors shards; little-endian GGUF only — [details](formats-tensors.md) |
 | **UDF** | VRS `NSR02`/`NSR03` from byte 32 KiB / `.udf` | `UdfMountSource::open_from_reader` | **Yes** — extent stencils (no full-image copy). Mixed ISO+UDF: factory probes UDF **before** ISO. **Residual:** 2.50 metadata partition |
 | **ISO 9660** | PVD `CD001` @ sector 16 / `.iso` | `Iso9660MountSource::open_from_reader` | **Yes** — extent stencils (no full-image RAM load) |
 | **WARC** | `WARC/` / `.warc` | `WarcMountSource::open_from_reader` | **Yes** — payload stencils |
