@@ -27,7 +27,7 @@
 //! and with `overwrite` rename replaces the symlink itself.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::read::MultiGzDecoder;
@@ -677,42 +677,65 @@ fn recompress_read_to_zstd<R: Read>(
     frame_size: u64,
     level: i32,
 ) -> Result<(u32, u64)> {
-    let mut entries: Vec<(u32, u32)> = Vec::new();
-    let mut uncompressed = 0u64;
-    loop {
-        let start = out.stream_position()?;
-        let mut limited = dec.by_ref().take(frame_size);
-        let (comp, plain) = encode_zstd_frame_to(&mut limited, out, level)?;
-        if plain == 0 {
-            // Encoder::finish emits a frame even when `take` is already at EOF.
-            out.flush()?;
-            out.seek(SeekFrom::Start(start))?;
-            out.set_len(start)?;
-            break;
-        }
-        let comp_u = u32::try_from(comp).map_err(|_| {
-            CompressError::Msg(format!(
-                "repack compressed frame of {comp} bytes exceeds u32::MAX"
-            ))
-        })?;
-        let plain_u = u32::try_from(plain).map_err(|_| {
-            CompressError::Msg(format!(
-                "repack uncompressed frame of {plain} bytes exceeds u32::MAX"
-            ))
-        })?;
-        entries.push((comp_u, plain_u));
-        uncompressed = uncompressed.checked_add(plain).ok_or_else(|| {
-            CompressError::Msg("repack-seekable uncompressed length overflow".into())
-        })?;
-        if plain < frame_size {
-            break;
+    check_frame_size(frame_size)?;
+    let mut dec = io::BufReader::new(dec);
+    let mut writer = ZstdFrameWriter::new(out, level);
+    while !io::BufRead::fill_buf(&mut dec)?.is_empty() {
+        writer.write_frame(dec.by_ref().take(frame_size))?;
+    }
+    let stats = (writer.entries.len() as u32, writer.uncompressed);
+    writer.finish()?;
+    Ok(stats)
+}
+
+/// Streaming writer for independent zstd frames and the official seekable footer.
+/// Callers choose frame boundaries by limiting each reader passed to `write_frame`.
+/// Frame sizes and frame count must fit the seekable format's `u32` fields.
+pub struct ZstdFrameWriter<W: Write> {
+    out: W,
+    level: i32,
+    entries: Vec<(u32, u32)>,
+    uncompressed: u64,
+}
+
+impl<W: Write> ZstdFrameWriter<W> {
+    pub fn new(out: W, level: i32) -> Self {
+        Self {
+            out,
+            level,
+            entries: Vec::new(),
+            uncompressed: 0,
         }
     }
-    out.write_all(&build_seek_table_skippable(&entries))?;
-    let frames = u32::try_from(entries.len()).map_err(|_| {
-        CompressError::Msg("repack-seekable produced more than u32::MAX frames".into())
-    })?;
-    Ok((frames, uncompressed))
+
+    /// Encode one frame without buffering the complete input. An empty reader
+    /// deliberately emits an empty frame. On failure discard the output.
+    pub fn write_frame(&mut self, reader: impl Read) -> Result<()> {
+        if self.entries.len() >= u32::MAX as usize {
+            return Err(CompressError::Msg("too many seekable zstd frames".into()));
+        }
+        let (compressed, plain) = encode_zstd_frame_to(reader, &mut self.out, self.level)?;
+        let sizes = (u32::try_from(compressed), u32::try_from(plain));
+        let (Ok(compressed), Ok(plain)) = sizes else {
+            return Err(CompressError::Msg(
+                "seekable zstd frame exceeds u32::MAX bytes".into(),
+            ));
+        };
+        self.uncompressed = self
+            .uncompressed
+            .checked_add(u64::from(plain))
+            .ok_or_else(|| CompressError::Msg("seekable zstd length overflow".into()))?;
+        self.entries.push((compressed, plain));
+        Ok(())
+    }
+
+    /// Append the seek table, flush, and return the underlying writer.
+    pub fn finish(mut self) -> Result<W> {
+        self.out
+            .write_all(&build_seek_table_skippable(&self.entries))?;
+        self.out.flush()?;
+        Ok(self.out)
+    }
 }
 
 fn sum_uncompressed(map: &ZstdFrameMap) -> Result<u64> {
@@ -762,6 +785,23 @@ fn report(
 
 #[cfg(test)]
 mod tests {
+    /// Regression: caller-selected sample boundaries must survive the seek table.
+    #[test]
+    fn regression_frame_writer_preserves_sample_boundaries() {
+        let mut writer = super::ZstdFrameWriter::new(Vec::new(), 3);
+        writer.write_frame(&b"first"[..]).unwrap();
+        writer.write_frame(&b"second sample"[..]).unwrap();
+        let bytes = writer.finish().unwrap();
+        let map = crate::scan_zstd_frames(&mut std::io::Cursor::new(&bytes)).unwrap();
+        assert!(map.seek_table.is_some());
+        assert_eq!(map.frames.len(), 2);
+        assert_eq!(map.frames[1].uncompressed_offset, 5);
+        assert_eq!(
+            zstd::stream::decode_all(&bytes[..]).unwrap(),
+            b"firstsecond sample"
+        );
+    }
+
     use super::*;
     use crate::gzip_seek::GzipSeekBlobFormat;
     use crate::zstd_seek::{
@@ -986,26 +1026,35 @@ mod tests {
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(buf, b"bravo-payload");
 
-        // The encoder must be fed by `take(frame_size)`, not a slurped buffer.
-        let src_text = include_str!("repack_seekable.rs");
-        let prod = src_text.split("mod tests").next().unwrap();
-        let fn_body = prod
-            .split("fn recompress_read_to_zstd")
-            .nth(1)
-            .unwrap()
-            .split("\nfn ")
-            .next()
-            .unwrap();
-        assert!(
-            fn_body.contains(".take(frame_size)"),
-            "encoder must be fed by take(frame_size)"
-        );
-        assert!(
-            fn_body.contains("encode_zstd_frame_to(&mut limited"),
-            "encode_zstd_frame_to must read the take"
-        );
-        assert!(!fn_body.contains("decode_zstd_frames_to("));
-        assert!(!prod.contains("maybe_rebuild_seek_table("));
+        // Regression: the reusable writer must keep partial reads streaming.
+        struct Chunked<'a> {
+            remaining: &'a [u8],
+            calls: usize,
+        }
+        impl Read for Chunked<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                let n = buf.len().min(31).min(self.remaining.len());
+                buf[..n].copy_from_slice(&self.remaining[..n]);
+                self.remaining = &self.remaining[n..];
+                Ok(n)
+            }
+            fn read_to_end(&mut self, _: &mut Vec<u8>) -> io::Result<usize> {
+                panic!("repack must not materialize its input with read_to_end");
+            }
+        }
+        let mut chunked = Chunked {
+            remaining: &tar,
+            calls: 0,
+        };
+        let mut streamed = tempfile::tempfile().unwrap();
+        let (frames, len) =
+            recompress_read_to_zstd(&mut chunked, &mut streamed, frame_size, 3).unwrap();
+        assert_eq!(len, tar.len() as u64);
+        assert_eq!(u64::from(frames), len.div_ceil(frame_size));
+        assert!(chunked.calls > 1);
+        streamed.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(zstd::stream::decode_all(streamed).unwrap(), tar);
     }
 
     #[test]
