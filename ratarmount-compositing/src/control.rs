@@ -593,6 +593,17 @@ impl MountSource for ControlFolderMountSource {
         self.inner.content_generation()
     }
 
+    fn supports_backing_extents(&self) -> bool {
+        self.inner.supports_backing_extents()
+    }
+
+    fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        if Self::control_tag(file_info).is_some() {
+            return None;
+        }
+        self.inner.backing_extent(file_info)
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         if Self::control_tag(file_info).is_some() {
             return true;

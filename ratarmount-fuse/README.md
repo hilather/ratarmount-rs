@@ -29,15 +29,29 @@ and [`fs/fuse/fuse_i.h`](https://github.com/torvalds/linux/blob/master/fs/fuse/f
 The higher ABI itself is intentional; wire negotiation and malformed-request
 handling cannot be identical to the old 7.12 session.
 
-## Passthrough handoff (AI-PT)
+## Passthrough (AI-PT)
+
+`--passthrough auto|on|off` and opt-in bounded member copying are implemented.
+See [FUSE kernel tuning](../docs/fuse-kernel-tuning.md#linux-fuse-passthrough)
+for eligibility, cache placement, privilege requirements, and integration checks.
+Writable overlay mounts keep daemon I/O so a later writer can use the overlay
+policy funnel. Explicitly read-only overlay mounts can pass whole-file fds.
+Passthrough replies omit `FOPEN_KEEP_CACHE` (the kernel rejects that combination);
+daemon replies retain their existing flags. Registration failure fixes that
+inode's mode to daemon I/O until its last release, avoiding mixed-mode EIO.
 
 On Linux, `Filesystem::init` receives `&mut fuser::KernelConfig`. Check
 `kernel_abi()` (at least `fuser::Version(7, 40)`) and
-`capabilities().contains(fuser::InitFlags::FUSE_PASSTHROUGH)`. Only when supported,
-call `add_capabilities(InitFlags::FUSE_PASSTHROUGH)` and
-`set_max_stack_depth(1)` (or 2 if backing files may themselves be on a stacked
-filesystem). Handle negotiation and backing-registration failures with the
-existing daemon path. Keep macOS on that path.
+`capabilities().contains(fuser::InitFlags::FUSE_PASSTHROUGH)`. Auto also requires
+initial-namespace `CAP_SYS_ADMIN` and an eligible source. Once selected,
+request `FUSE_PASSTHROUGH` and `set_max_stack_depth(1)`.
+Forced on negotiates whenever supported and probes registration after INIT,
+failing startup on error. All of
+these init calls are Linux-only; macOS keeps the daemon path. EPERM latches
+before future preparation, and ELOOP/EXDEV are cached per backing filesystem.
+Clones are created on the archive's filesystem with only the final partial
+block copied. Full copies and tails share the `--passthrough-copy-total-max`
+budget (default 1 GiB), released with the last open.
 
 At open, `ReplyOpen::open_backing(fd)` returns a managed `BackingId`;
 `opened_passthrough(FileHandle, FopenFlags, &BackingId)` sends the open reply.

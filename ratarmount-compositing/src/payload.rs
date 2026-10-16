@@ -106,6 +106,14 @@ impl MountSource for PayloadCacheLayer {
         }
     }
 
+    fn supports_backing_extents(&self) -> bool {
+        self.inner.supports_backing_extents()
+    }
+
+    fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        self.inner.backing_extent(file_info)
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         if !is_overlay_userdata(file_info) && is_regular_file(file_info) {
             if let Some(sha) = sha256_from_xattr(self.inner.as_ref(), file_info) {

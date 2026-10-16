@@ -174,11 +174,25 @@ mod protocol {
 
     impl Harness {
         fn new(config: Config, readahead: u32) -> Self {
-            let fs = RatarmountFs::with_readahead(Arc::new(Source), None, 1024);
+            let fs = RatarmountFs::with_readahead(Arc::new(Source), None, 1024).with_passthrough(
+                PassthroughOptions {
+                    mode: PassthroughMode::Off,
+                    ..Default::default()
+                },
+            );
             Self::with_fs(config, readahead, fs)
         }
 
         fn with_fs(config: Config, readahead: u32, fs: RatarmountFs) -> Self {
+            Self::with_capabilities(config, readahead, fs, InitFlags::all())
+        }
+
+        fn with_capabilities(
+            config: Config,
+            readahead: u32,
+            fs: RatarmountFs,
+            capabilities: InitFlags,
+        ) -> Self {
             // SOCK_SEQPACKET preserves the one-request-per-read /dev/fuse contract.
             let mut fds = [-1; 2];
             assert_eq!(
@@ -195,7 +209,7 @@ mod protocol {
             let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
             let mut peer = unsafe { UnixStream::from_raw_fd(fds[1]) };
             peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let flags = InitFlags::all().bits();
+            let flags = capabilities.bits();
             let mut init = words(&[7, 40, readahead, flags as u32, (flags >> 32) as u32]);
             init.resize(64, 0);
             peer.write_all(&request(26, 0, unsafe { libc::geteuid() }, &init))
@@ -237,6 +251,104 @@ mod protocol {
         body.extend(offset.to_ne_bytes());
         body.extend(words(&[size, 0, 0, 0, 0, 0]));
         body
+    }
+
+    /// Regression: forced passthrough on an unsupported kernel must fail INIT clearly.
+    #[test]
+    fn fuser_passthrough_on_unavailable_fails_mount() {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let mut peer = unsafe { UnixStream::from_raw_fd(fds[1]) };
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut init = words(&[7, 40, 4096, 0, 0]);
+        init.resize(64, 0);
+        peer.write_all(&request(26, 0, unsafe { libc::geteuid() }, &init))
+            .unwrap();
+        let fs = RatarmountFs::new(Arc::new(Source), None).with_passthrough(PassthroughOptions {
+            mode: PassthroughMode::On,
+            ..Default::default()
+        });
+        let config = mount_config(false, "");
+        let error = Session::from_fd(fs, fd, config.acl, config)
+            .err()
+            .expect("INIT must fail");
+        assert!(
+            error.to_string().contains("--passthrough on requires"),
+            "{error}"
+        );
+    }
+
+    /// Regression: auto negotiates only offered passthrough; forced off never does.
+    #[test]
+    fn fuser_passthrough_negotiation_and_registration_failure_falls_back() {
+        use ratarmount_compositing::FolderMountSource;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), b"payload").unwrap();
+        for (mode, offered, privileged, eligible, expected) in [
+            (PassthroughMode::Auto, true, true, true, true),
+            (PassthroughMode::Auto, true, false, true, false),
+            (PassthroughMode::Auto, true, true, false, false),
+            (PassthroughMode::Auto, false, true, true, false),
+            (PassthroughMode::Off, true, true, true, false),
+            (PassthroughMode::On, true, false, true, true),
+        ] {
+            let source = Arc::new(FolderMountSource::new(dir.path()).unwrap());
+            let mut fs = RatarmountFs::new(source, None).with_passthrough(PassthroughOptions {
+                mode,
+                ..Default::default()
+            });
+            fs.passthrough_auto_privilege = Some(privileged);
+            fs.passthrough_readonly_mount = eligible;
+            let caps = if offered {
+                InitFlags::all()
+            } else {
+                InitFlags::all() & !InitFlags::FUSE_PASSTHROUGH
+            };
+            let mut harness = Harness::with_capabilities(mount_config(false, ""), 4096, fs, caps);
+            let init = &harness.init[16..];
+            let flags = u32_at(init, 12) as u64 | ((u32_at(init, 32) as u64) << 32);
+            assert_eq!(
+                InitFlags::from_bits_retain(flags).contains(InitFlags::FUSE_PASSTHROUGH),
+                expected
+            );
+            assert_eq!(u32_at(init, 36), u32::from(expected));
+            let lookup = harness.call(1, 1, b"file\0");
+            let ino = u64_at(&lookup, 0);
+            // A socket cannot register a backing fd (ENOTTY). The real open
+            // handler must preserve KEEP_CACHE and serve identical daemon bytes.
+            let opened = harness.call(14, ino, &words(&[0, 0]));
+            let fh = u64_at(&opened, 0);
+            assert_eq!(u32_at(&opened, 8), FopenFlags::FOPEN_KEEP_CACHE.bits());
+            assert_eq!(harness.call(15, ino, &read_args(fh, 0, 7)), b"payload");
+            let mut release = fh.to_ne_bytes().to_vec();
+            release.extend(words(&[0, 0, 0, 0]));
+            harness.call(18, ino, &release);
+            harness.finish();
+        }
+    }
+
+    /// Regression: a privileged compressed/virtual-only mount must not consume stacking depth.
+    #[test]
+    fn fuser_passthrough_auto_without_backing_sources_keeps_stack_depth_zero() {
+        let mut fs = RatarmountFs::new(Arc::new(Source), None);
+        fs.passthrough_auto_privilege = Some(true);
+        let harness = Harness::with_fs(mount_config(false, ""), 4096, fs);
+        let init = &harness.init[16..];
+        let flags = u32_at(init, 12) as u64 | ((u32_at(init, 32) as u64) << 32);
+        assert!(!InitFlags::from_bits_retain(flags).contains(InitFlags::FUSE_PASSTHROUGH));
+        assert_eq!(u32_at(init, 36), 0);
+        harness.finish();
     }
 
     /// Regression: ABI 7.40 availability must not enable passthrough, larger I/O, or caching flags.

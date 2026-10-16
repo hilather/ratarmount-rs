@@ -19,7 +19,8 @@ use ratarmount_compress::{
 };
 use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
 use ratarmount_fuse::{
-    clamp_readahead, mount_blocking, parse_byte_size, unmount, RECOMMENDED_READAHEAD_BYTES,
+    clamp_readahead, mount_blocking_with_passthrough as mount_blocking, parse_byte_size, unmount,
+    PassthroughMode, PassthroughOptions, RECOMMENDED_READAHEAD_BYTES,
 };
 use ratarmount_index::{
     bind_local_index_id, default_index_folders, fill_content_hashes, parse_index_folders,
@@ -316,6 +317,22 @@ struct Args {
     /// to keep readahead off.
     #[arg(long = "readahead", default_value = "0", value_name = "BYTES")]
     readahead: String,
+
+    /// Linux >= 6.9 FUSE passthrough: auto requires privileges and eligible sources; on probes support.
+    #[arg(long, default_value = "auto", value_name = "auto|on|off")]
+    passthrough: PassthroughMode,
+
+    /// Allow copying stored TAR members when reflinking cannot prepare a backing file.
+    #[arg(long)]
+    passthrough_copy: bool,
+
+    /// Maximum copied member size (bytes or K/M/G suffix); 0 disables copying.
+    #[arg(long, default_value = "0", value_name = "BYTES", value_parser = parse_byte_size)]
+    passthrough_copy_max: u64,
+
+    /// Total copied bytes held by concurrent passthrough opens (including clone tails).
+    #[arg(long, default_value = "1G", value_name = "BYTES", value_parser = parse_byte_size)]
+    passthrough_copy_total_max: u64,
 
     /// Recursion depth for --recursive (0 = deep default when combined with -r)
     #[arg(long = "recursion-depth", default_value_t = 0)]
@@ -1422,6 +1439,12 @@ fn main() {
 
     let writable = overlay_arc.is_some();
     let fuse_opts = args.fuse.clone();
+    let passthrough = PassthroughOptions {
+        mode: args.passthrough,
+        copy: args.passthrough_copy,
+        copy_max: args.passthrough_copy_max,
+        copy_total_max: args.passthrough_copy_total_max,
+    };
 
     // Optional control: Unix socket + in-FS `/.ratarmount-control/` (Python parity).
     let control_stop = Arc::new(AtomicBool::new(false));
@@ -1498,6 +1521,7 @@ fn main() {
                     writable,
                     overlay_arc,
                     &fuse_opts,
+                    passthrough,
                     readahead,
                     nfs_opts,
                     args.foreground,
@@ -1517,6 +1541,7 @@ fn main() {
             writable,
             overlay_arc,
             &fuse_opts,
+            passthrough,
             readahead,
             Some(nfs_opts),
             plan,
@@ -1538,6 +1563,7 @@ fn main() {
             writable,
             overlay_arc,
             &fuse_opts,
+            passthrough,
             readahead,
             None,
             plan,
@@ -1558,6 +1584,7 @@ fn main() {
         writable,
         overlay_arc,
         &fuse_opts,
+        passthrough,
         readahead,
         args.foreground,
         args.log_file.is_some(),
@@ -2104,6 +2131,7 @@ fn run_exports(
     writable: bool,
     overlay_arc: Option<Arc<WriteOverlay>>,
     fuse_opts: &str,
+    passthrough: PassthroughOptions,
     readahead: u64,
     mut nfs_opts: Option<ratarmount_nfs::NfsOptions>,
     mut plan: ExportPlan,
@@ -2225,6 +2253,7 @@ fn run_exports(
                     overlay_arc.clone(),
                     fuse_opts,
                     readahead,
+                    passthrough,
                 );
                 nfs_stop.request_stop();
                 export_stop.request_stop();
@@ -2297,6 +2326,7 @@ fn run_exports(
                         overlay_arc.clone(),
                         fuse_opts,
                         readahead,
+                        passthrough,
                     );
                     nfs_stop.request_stop();
                     export_stop.request_stop();
@@ -2403,6 +2433,7 @@ fn run_fuse_and_nfs(
     writable: bool,
     overlay_arc: Option<Arc<WriteOverlay>>,
     fuse_opts: &str,
+    passthrough: PassthroughOptions,
     readahead: u64,
     mut nfs_opts: ratarmount_nfs::NfsOptions,
     foreground: bool,
@@ -2453,6 +2484,7 @@ fn run_fuse_and_nfs(
             overlay_arc.clone(),
             fuse_opts,
             readahead,
+            passthrough,
         );
         stop.request_stop();
         let _ = handle.join();
@@ -2523,6 +2555,7 @@ fn run_fuse_and_nfs(
                 overlay_arc.clone(),
                 fuse_opts,
                 readahead,
+                passthrough,
             );
             stop.request_stop();
             let _ = handle.join();
@@ -2551,6 +2584,7 @@ fn run_fuse_only(
     writable: bool,
     overlay_arc: Option<Arc<WriteOverlay>>,
     fuse_opts: &str,
+    passthrough: PassthroughOptions,
     readahead: u64,
     foreground: bool,
     has_log_file: bool,
@@ -2588,6 +2622,7 @@ fn run_fuse_only(
             overlay_arc.clone(),
             fuse_opts,
             readahead,
+            passthrough,
         );
         finish_overlay_serve(overlay_arc, None, interval, commit_exit);
         if let Err(e) = mount_err {
@@ -2635,6 +2670,7 @@ fn run_fuse_only(
                 overlay_arc.clone(),
                 fuse_opts,
                 readahead,
+                passthrough,
             );
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
@@ -5613,6 +5649,101 @@ mod git_cli_tests {
             [PathBuf::from("repo.git@HEAD~1"), PathBuf::from("mnt")]
         );
         assert!(Args::try_parse_from(["ratarmount", "--git-ref"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod passthrough_cli_tests {
+    use super::*;
+
+    /// Regression: merged sandbox, Git and passthrough flags must coexist.
+    #[test]
+    fn passthrough_flags_coexist_with_sandbox_and_git() {
+        let args = parse_args_from([
+            "ratarmount",
+            "--git",
+            "--git-ref",
+            "HEAD",
+            "--git-prefix",
+            "src",
+            "--git-synthetic-head",
+            "-w",
+            "overlay",
+            "--overlay-readonly",
+            "tests/**",
+            "--overlay-quota",
+            "2G",
+            "--overlay-quota-files",
+            "12",
+            "--passthrough",
+            "off",
+            "--passthrough-copy-total-max",
+            "0",
+            "repo",
+            "mnt",
+        ])
+        .unwrap();
+        assert!(args.git && args.git_synthetic_head);
+        assert_eq!(args.git_ref.as_deref(), Some("HEAD"));
+        assert_eq!(args.git_prefix.as_deref(), Some("src"));
+        assert_eq!(args.overlay_readonly, ["tests/**"]);
+        assert_eq!(args.overlay_quota, Some(2 << 30));
+        assert_eq!(args.overlay_quota_files, Some(12));
+        assert_eq!(args.passthrough, PassthroughMode::Off);
+        assert_eq!(args.passthrough_copy_total_max, 0);
+        assert_eq!(args.paths, [PathBuf::from("repo"), PathBuf::from("mnt")]);
+        for invalid in ["nope", "18446744073709551615G"] {
+            assert!(Args::try_parse_from([
+                "ratarmount",
+                "--passthrough-copy-total-max",
+                invalid,
+                "repo"
+            ])
+            .is_err());
+        }
+    }
+
+    /// Regression: passthrough defaults and copy flags must not consume source/mountpoint.
+    #[test]
+    fn passthrough_flags_preserve_positionals_and_validate_cap() {
+        let args = Args::try_parse_from(["ratarmount", "source.tar", "mnt"]).unwrap();
+        assert_eq!(args.passthrough, PassthroughMode::Auto);
+        assert!(!args.passthrough_copy);
+        assert_eq!(args.passthrough_copy_max, 0);
+        assert_eq!(args.passthrough_copy_total_max, 1 << 30);
+        for mode in ["auto", "on", "off"] {
+            let args = Args::try_parse_from([
+                "ratarmount",
+                "--passthrough",
+                mode,
+                "--passthrough-copy",
+                "--passthrough-copy-max",
+                "1M",
+                "--passthrough-copy-total-max",
+                "8M",
+                "source.tar",
+                "mnt",
+            ])
+            .unwrap();
+            assert_eq!(
+                args.paths,
+                vec![PathBuf::from("source.tar"), PathBuf::from("mnt")]
+            );
+            assert_eq!(args.passthrough, mode.parse().unwrap());
+            assert!(args.passthrough_copy);
+            assert_eq!(args.passthrough_copy_max, 1024 * 1024);
+            assert_eq!(args.passthrough_copy_total_max, 8 << 20);
+        }
+        assert!(
+            Args::try_parse_from(["ratarmount", "--passthrough", "maybe", "source.tar"]).is_err()
+        );
+        assert!(Args::try_parse_from([
+            "ratarmount",
+            "--passthrough-copy-max",
+            "nope",
+            "source.tar"
+        ])
+        .is_err());
     }
 }
 
