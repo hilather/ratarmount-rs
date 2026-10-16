@@ -98,10 +98,12 @@ impl SocketGuard {
             .unwrap_or(Path::new("."));
         let meta = fs::metadata(parent)?;
         // A sticky directory (e.g. /tmp) also prevents another uid replacing our socket.
+        // libc::S_ISVTX is u16 on macOS and u32 on Linux; the bit value is the same.
+        const STICKY_BIT: u32 = 0o1000;
         if !meta.is_dir()
-            || (meta.mode() & 0o022 != 0 && meta.mode() & libc::S_ISVTX == 0)
+            || (meta.mode() & 0o022 != 0 && meta.mode() & STICKY_BIT == 0)
             || (meta.uid() != unsafe { libc::geteuid() }
-                && !(meta.uid() == 0 && meta.mode() & libc::S_ISVTX != 0))
+                && !(meta.uid() == 0 && meta.mode() & STICKY_BIT != 0))
         {
             return Err(ApiError::new(
                 "unsafe_path",
