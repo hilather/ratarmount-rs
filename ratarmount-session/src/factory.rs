@@ -2177,21 +2177,55 @@ fn open_path_impl(
     recreate: bool,
     allow_split: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
-    if path.is_dir() {
-        // Git: bare repos / `.git` dirs (HEAD+objects, no nested `.git`), or force via env.
-        // Normal worktrees keep FolderMountSource so the live working tree is shown.
-        #[cfg(feature = "git")]
-        {
-            let is_git_dir_or_bare = path.join("HEAD").is_file()
-                && path.join("objects").is_dir()
-                && !path.join(".git").exists();
-            let force_git = std::env::var_os("RATARMOUNT_FORCE_GIT").is_some();
-            if (is_git_dir_or_bare || force_git) && looks_like_git(path) {
-                return GitMountSource::open(path, None)
-                    .map(|g| Arc::new(g) as Arc<dyn MountSource>)
-                    .map_err(|e| e.to_string());
+    // Resolve inline refs before the normal filesystem existence check.
+    #[cfg(feature = "git")]
+    {
+        let inline = ratarmount_formats_git::split_inline_reference(path);
+        let git_path = inline.as_ref().map_or(path, |(p, _)| p.as_path());
+        let is_bare = git_path.join("HEAD").is_file()
+            && git_path.join("objects").is_dir()
+            && git_path.join("refs").is_dir()
+            && !git_path.join(".git").exists();
+        let force = options.git
+            || options.git_ref.is_some()
+            || inline.is_some()
+            || (git_path.is_dir()
+                && looks_like_git(git_path)
+                && std::env::var_os("RATARMOUNT_FORCE_GIT").is_some());
+        if is_bare || force {
+            if !looks_like_git(git_path) {
+                return Err(format!("{} is not a git repository", git_path.display()));
             }
+            if inline.is_some() && options.git_ref.is_some() {
+                return Err("use either repo@REV or --git-ref, not both".into());
+            }
+            let reference = options
+                .git_ref
+                .as_deref()
+                .or_else(|| inline.as_ref().map(|(_, r)| r.as_str()));
+            let mut git = GitMountSource::open(git_path, reference).map_err(|e| e.to_string())?;
+            if let Some(prefix) = &options.git_prefix {
+                git = git.with_prefix(prefix).map_err(|e| e.to_string())?;
+            }
+            if options.git_synthetic_head {
+                let cache = ratarmount_index::platform_cache_root();
+                if !cache.is_absolute() {
+                    return Err("synthetic Git requires an absolute platform cache root; set XDG_CACHE_HOME or HOME (LOCALAPPDATA on Windows)".into());
+                }
+                let cache = cache.join("git-synthetic-v1");
+                git = git.with_synthetic_head(&cache).map_err(|e| e.to_string())?;
+            }
+            return Ok(Arc::new(git));
         }
+    }
+    if options.git_synthetic_head || options.git_prefix.is_some() {
+        return Err("--git-synthetic-head and --git-prefix require Git mode (--git, --git-ref, repo@REV, a bare repo, or RATARMOUNT_FORCE_GIT)".into());
+    }
+    #[cfg(not(feature = "git"))]
+    if options.git || options.git_ref.is_some() {
+        return Err("Git support is not enabled in this build".into());
+    }
+    if path.is_dir() {
         return FolderMountSource::new(path)
             .map(|f| Arc::new(f) as Arc<dyn MountSource>)
             .map_err(|e| e.to_string());
@@ -4413,6 +4447,11 @@ pub fn build_mount_source_ex(
     recreate: bool,
     comp: CompositingOptions,
 ) -> Result<MountBundle, String> {
+    if options.git_synthetic_head && paths.len() != 1 {
+        return Err(
+            "--git-synthetic-head requires exactly one input; unions are not supported".into(),
+        );
+    }
     if paths.is_empty() {
         return Err("no input paths".into());
     }
@@ -4430,6 +4469,14 @@ pub fn build_mount_source_ex(
     let cli_opts = options.clone();
     for p in paths {
         let input = p.to_string_lossy();
+        if (options.git
+            || options.git_ref.is_some()
+            || options.git_prefix.is_some()
+            || options.git_synthetic_head)
+            && ratarmount_remote::is_remote_url(&input)
+        {
+            return Err("Git options require a local Git repository".into());
+        }
 
         // Do not force a default index path here — `open_path` resolves via folders / :memory:.
         let mut opts = cli_opts.clone();
@@ -8282,5 +8329,341 @@ mod tests {
                 ..ctx
             },
         );
+    }
+}
+
+#[cfg(all(test, feature = "git", unix))]
+mod git_tests {
+    use super::*;
+
+    /// Regression: the factory ignored explicit refs and mounted the future fix at HEAD.
+    #[test]
+    fn regression_git_ref_inline_and_options_select_same_commit() {
+        if std::env::var_os("RATARMOUNT_GIT_CACHE_TEST_CHILD").is_none() {
+            let cache = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "factory::git_tests::regression_git_ref_inline_and_options_select_same_commit",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("RATARMOUNT_GIT_CACHE_TEST_CHILD", "1")
+                .env("XDG_CACHE_HOME", cache.path().canonicalize().unwrap())
+                .env_remove("RATARMOUNT_FORCE_GIT")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(cache.path().join("ratarmount/git-synthetic-v1").is_dir());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repo");
+        let repo = git2::Repository::init(&path).unwrap();
+        let sig = git2::Signature::now("test", "test@example.test").unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder
+            .insert("before", repo.blob(b"base").unwrap(), 0o100644)
+            .unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let first = repo
+            .commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+        builder
+            .insert("fix", repo.blob(b"future").unwrap(), 0o100644)
+            .unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "fix",
+            &tree,
+            &[&repo.find_commit(first).unwrap()],
+        )
+        .unwrap();
+        // Plain worktrees retain their original live-folder behavior.
+        let plain = open_path(&path, &OpenOptions::default(), false).unwrap();
+        assert!(plain.lookup("/.git/HEAD", 0).is_some());
+        assert!(plain.lookup("/before", 0).is_none());
+        let options = OpenOptions {
+            git_ref: Some(first.to_string()),
+            ..Default::default()
+        };
+        let selected = open_path(&path, &options, false).unwrap();
+        for input in [
+            format!("{}@{first}", path.display()),
+            format!("{}@{first}", repo.path().display()),
+        ] {
+            let inline = open_path(Path::new(&input), &OpenOptions::default(), false).unwrap();
+            assert!(inline.lookup("/fix", 0).is_none());
+            assert_eq!(
+                inline
+                    .read(&inline.lookup("/before", 0).unwrap(), 4, 0)
+                    .unwrap(),
+                b"base"
+            );
+            assert_eq!(
+                selected.list_dirents("/").unwrap().len(),
+                inline.list_dirents("/").unwrap().len()
+            );
+        }
+        assert!(selected.lookup("/fix", 0).is_none());
+        let ambiguous = PathBuf::from(format!("{}@{first}", path.display()));
+        assert!(open_path(&ambiguous, &options, false)
+            .err()
+            .unwrap()
+            .contains("either repo@REV or --git-ref"));
+        let bad = OpenOptions {
+            git_ref: Some("does-not-exist".into()),
+            ..Default::default()
+        };
+        assert!(open_path(&path, &bad, false)
+            .err()
+            .unwrap()
+            .contains("cannot resolve git ref"));
+        let bad_inline = format!("{}@does-not-exist", repo.path().display());
+        assert!(
+            open_path(Path::new(&bad_inline), &OpenOptions::default(), false)
+                .err()
+                .unwrap()
+                .contains("cannot resolve git ref")
+        );
+        let explicit = OpenOptions {
+            git: true,
+            ..Default::default()
+        };
+        assert!(open_path(&path, &explicit, false)
+            .unwrap()
+            .lookup("/fix", 0)
+            .is_some());
+        let synthetic = OpenOptions {
+            git_synthetic_head: true,
+            index_file_path: Some(dir.path().join("index.sqlite")),
+            ..options
+        };
+        let mounted = open_path(&path, &synthetic, false).unwrap();
+        assert!(mounted.lookup("/.git/index", 0).is_some());
+        assert!(mounted.lookup("/fix", 0).is_none());
+        assert!(!dir.path().join("git-synthetic-v1").exists());
+        let without_mode = OpenOptions {
+            git_synthetic_head: true,
+            ..Default::default()
+        };
+        assert!(open_path(dir.path(), &without_mode, false)
+            .err()
+            .unwrap()
+            .contains("require Git mode"));
+        let invalid_prefix = OpenOptions {
+            git: true,
+            git_prefix: Some("missing".into()),
+            ..Default::default()
+        };
+        assert!(open_path(&path, &invalid_prefix, false)
+            .err()
+            .unwrap()
+            .contains("git prefix"));
+        let mut remote_options = without_mode;
+        assert!(build_mount_source(
+            &[PathBuf::from("https://example.invalid/repo.tar")],
+            &mut remote_options,
+            false,
+            false,
+        )
+        .err()
+        .unwrap()
+        .contains("local Git repository"));
+    }
+
+    fn git_env_child(name: &str, force: bool, no_home: bool) -> bool {
+        if std::env::var("RATARMOUNT_GIT_REVIEW_CHILD").ok().as_deref() == Some(name) {
+            return false;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                format!("factory::git_tests::{name}"),
+                "--exact".into(),
+                "--nocapture".into(),
+            ])
+            .env("RATARMOUNT_GIT_REVIEW_CHILD", name)
+            .current_dir(dir.path())
+            .env_remove("RATARMOUNT_FORCE_GIT")
+            .env("XDG_CACHE_HOME", dir.path().canonicalize().unwrap());
+        if force {
+            command.env("RATARMOUNT_FORCE_GIT", "1");
+        }
+        if no_home {
+            for key in ["HOME", "XDG_CACHE_HOME", "LOCALAPPDATA"] {
+                command.env_remove(key);
+            }
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+        true
+    }
+
+    /// Regression: the ambient Git override broke archive inputs and Session::open.
+    #[test]
+    fn regression_force_git_environment_keeps_archives_and_session_working() {
+        if git_env_child(
+            "regression_force_git_environment_keeps_archives_and_session_working",
+            true,
+            false,
+        ) {
+            return;
+        }
+        use ratarmount_formats_tar::{
+            write_tar_eof, write_ustar_members, UstarMember, UstarPayload,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("data.tar");
+        let mut file = std::fs::File::create(&tar).unwrap();
+        write_ustar_members(
+            &mut file,
+            &[UstarMember {
+                path: "before",
+                payload: UstarPayload::File { bytes: b"base" },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        write_tar_eof(&mut file).unwrap();
+        drop(file);
+        let zip = dir.path().join("empty.zip");
+        std::fs::write(&zip, b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+        let options = OpenOptions {
+            index_file_path: Some(PathBuf::from(":memory:")),
+            ..Default::default()
+        };
+        for path in [&tar, &zip] {
+            assert!(
+                open_path(path, &options, false).is_ok(),
+                "{}",
+                path.display()
+            );
+            let explicit = OpenOptions {
+                git: true,
+                ..options.clone()
+            };
+            assert!(open_path(path, &explicit, false)
+                .err()
+                .unwrap()
+                .contains("not a git repository"));
+        }
+        let session = crate::Session::open(crate::OpenRequest {
+            source: crate::SourceSpec::Path(tar.clone()),
+            index: crate::IndexPolicy::Memory,
+            explicit_index: None,
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: crate::Recreate::IfInvalid,
+        });
+        assert!(session.is_ok(), "{}", session.err().unwrap());
+        let mut remotes = Vec::new();
+        let (_, source) = remote_open::materialize_remote_input(
+            url::Url::from_file_path(tar).unwrap().as_str(),
+            &options,
+            false,
+            &mut remotes,
+        )
+        .unwrap();
+        assert!(source.lookup("/before", 0).is_some());
+    }
+
+    /// Regression: HEAD plus objects without refs was mistaken for a bare repository.
+    #[test]
+    fn regression_git_incomplete_directory_remains_folder_without_explicit_git() {
+        if git_env_child(
+            "regression_git_incomplete_directory_remains_folder_without_explicit_git",
+            true,
+            false,
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(dir.path().join("objects")).unwrap();
+        let folder = open_path(dir.path(), &OpenOptions::default(), false).unwrap();
+        assert!(folder.lookup("/HEAD", 0).is_some());
+        assert!(folder.lookup("/objects", 0).is_some());
+        let explicit = OpenOptions {
+            git: true,
+            ..Default::default()
+        };
+        assert!(open_path(dir.path(), &explicit, false)
+            .err()
+            .unwrap()
+            .contains("not a git repository"));
+    }
+
+    /// Regression: missing HOME/XDG silently put synthetic Git data in the cwd.
+    #[test]
+    fn regression_synthetic_git_missing_platform_cache_fails_without_cwd_fallback() {
+        if git_env_child(
+            "regression_synthetic_git_missing_platform_cache_fails_without_cwd_fallback",
+            false,
+            true,
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("test", "test@example.test").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+        let options = OpenOptions {
+            git: true,
+            git_synthetic_head: true,
+            index_file_path: Some(dir.path().join("index")),
+            ..Default::default()
+        };
+        let error = open_path(dir.path(), &options, false).err().unwrap();
+        assert!(error.contains("absolute platform cache root"), "{error}");
+        assert!(!Path::new("ratarmount").exists());
+        assert!(!dir.path().join("git-synthetic-v1").exists());
+    }
+
+    /// Regression: unions merged synthetic .git trees and made pristine status dirty.
+    #[test]
+    fn regression_synthetic_git_rejects_multiple_inputs_before_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        git2::Repository::init(&repo).unwrap();
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let mut options = OpenOptions {
+            git: true,
+            git_synthetic_head: true,
+            ..Default::default()
+        };
+        for paths in [
+            vec![],
+            vec![repo.clone(), repo.clone()],
+            vec![repo.clone(), folder],
+            vec![repo, dir.path().join("missing.tar")],
+        ] {
+            assert!(build_mount_source(&paths, &mut options, false, false)
+                .err()
+                .unwrap()
+                .contains("requires exactly one input"));
+        }
     }
 }

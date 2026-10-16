@@ -519,6 +519,12 @@ pub struct OpenOptions {
     pub read_only_index: bool,
     /// Force folder index usage (`--force-folder-index`); folders still bind-mount live.
     pub force_folder_index: bool,
+    /// Select a committed Git tree instead of the live working directory.
+    pub git: bool,
+    pub git_ref: Option<String>,
+    pub git_prefix: Option<String>,
+    /// Expose a history-free `.git` backed by the synthetic repository cache.
+    pub git_synthetic_head: bool,
     /// Content hash algorithms to compute and store as index xattrs (`--hashes`).
     /// Values match Python CLI names, e.g. `crc32`, `md5`, `sha1`, `sha256`.
     pub hashes: Vec<String>,
@@ -549,6 +555,10 @@ impl Default for OpenOptions {
             use_backends: Vec::new(),
             read_only_index: false,
             force_folder_index: false,
+            git: false,
+            git_ref: None,
+            git_prefix: None,
+            git_synthetic_head: false,
             hashes: Vec::new(),
             index_build: IndexBuildHooks::default(),
         }
@@ -587,6 +597,10 @@ impl fmt::Debug for OpenOptions {
             .field("use_backends", &self.use_backends)
             .field("read_only_index", &self.read_only_index)
             .field("force_folder_index", &self.force_folder_index)
+            .field("git", &self.git)
+            .field("git_ref", &self.git_ref)
+            .field("git_prefix", &self.git_prefix)
+            .field("git_synthetic_head", &self.git_synthetic_head)
             .field("hashes", &self.hashes)
             .field("index_build", &self.index_build)
             .finish()
