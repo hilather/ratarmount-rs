@@ -41,7 +41,7 @@ pub use overlay_policy::{
     QuotaUsage, ReadOnlyGlobs,
 };
 pub use payload::{maybe_wrap_payload_cache, PayloadCacheLayer};
-pub use prefix::PrefixMountSource;
+pub use prefix::{validate_mount_path, PrefixMountSource, SourceBind};
 pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};
 pub use versioning::FileVersionLayer;
