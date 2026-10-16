@@ -14,6 +14,12 @@ use ratarmount_core::{
 };
 use thiserror::Error;
 
+mod synthetic;
+#[cfg(all(test, unix))]
+mod synthetic_tests;
+
+pub const COMMIT_XATTR: &str = "user.ratarmount.git.commit";
+
 pub const BACKEND_NAME: &str = "GitMountSource";
 
 #[derive(Debug, Error)]
@@ -40,6 +46,22 @@ pub fn looks_like_git(path: &Path) -> bool {
     path.join("HEAD").is_file() && path.join("objects").is_dir() && path.join("refs").is_dir()
 }
 
+/// Split a local `repo@revision` only when its repository exists. An existing
+/// literal path wins, so repositories whose names contain `@` remain usable.
+pub fn split_inline_reference(path: &Path) -> Option<(PathBuf, String)> {
+    if path.exists() {
+        return None;
+    }
+    let text = path.to_str()?;
+    for (at, _) in text.rmatch_indices('@') {
+        let candidate = Path::new(&text[..at]);
+        if looks_like_git(candidate) {
+            return Some((candidate.to_path_buf(), text[at + 1..].to_owned()));
+        }
+    }
+    None
+}
+
 fn git_path_userdata(path: &str) -> UserData {
     UserData::Other(format!("git:{path}"))
 }
@@ -61,14 +83,13 @@ fn normalize_vpath(path: &str) -> String {
 }
 
 pub struct GitMountSource {
-    #[allow(dead_code)]
     repo_path: PathBuf,
     /// Commit time (unix seconds) for mtime of all entries.
     commit_time: i64,
     /// Tree oid at the resolved ref.
     tree_oid: Oid,
-    /// Optional prefix inside the tree (like Python `prefix`).
-    prefix: String,
+    commit_oid: Oid,
+    synthetic: Option<synthetic::SyntheticGit>,
     /// Keep repository open under a mutex (git2 Repository is not Sync).
     repo: Mutex<Repository>,
 }
@@ -87,35 +108,74 @@ impl GitMountSource {
             .map(|s| s.to_string())
             .unwrap_or_else(|| default_reference(&repo));
 
-        let (tree_oid, commit_time) = {
+        let (tree_oid, commit_time, commit_oid) = {
             let obj = repo
                 .revparse_single(&reference)
-                .or_else(|_| repo.revparse_single("HEAD"))?;
+                .map_err(|e| GitError::Msg(format!("cannot resolve git ref {reference:?}: {e}")))?;
             let commit = obj
                 .peel_to_commit()
                 .map_err(|e| GitError::Msg(format!("ref {reference} is not a commit: {e}")))?;
             let tree = commit.tree()?;
             let commit_time = commit.time().seconds();
             let tree_oid = tree.id();
+            let commit_oid = commit.id();
             // Drop commit/tree/obj before moving repo into Mutex.
             drop(tree);
             drop(commit);
             drop(obj);
-            (tree_oid, commit_time)
+            (tree_oid, commit_time, commit_oid)
         };
 
+        log::info!(
+            "git: {} ref {reference:?} resolved to {commit_oid}",
+            path.display()
+        );
         Ok(Self {
-            repo_path: path.to_path_buf(),
+            repo_path: repo.path().canonicalize()?,
             commit_time,
             tree_oid,
-            prefix: String::new(),
+            commit_oid,
+            synthetic: None,
             repo: Mutex::new(repo),
         })
     }
 
-    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.prefix = normalize_vpath(&prefix.into());
-        self
+    /// Select a subtree before creating the synthetic repository.
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Result<Self> {
+        if self.synthetic.is_some() {
+            return Err(GitError::Msg(
+                "select --git-prefix before synthetic HEAD".into(),
+            ));
+        }
+        let prefix = normalize_vpath(&prefix.into());
+        self.tree_oid = self.with_repo(|repo| {
+            let obj = self
+                .look_up_path(repo, &prefix)?
+                .ok_or_else(|| GitError::Msg(format!("git prefix {prefix:?} does not exist")))?;
+            obj.into_tree()
+                .map(|t| t.id())
+                .map_err(|_| GitError::Msg(format!("git prefix {prefix:?} is not a directory")))
+        })?;
+        Ok(self)
+    }
+
+    pub fn resolved_commit(&self) -> Oid {
+        self.commit_oid
+    }
+
+    /// Cache a standalone repository and expose its files under `/.git`.
+    pub fn with_synthetic_head(mut self, cache_root: &Path) -> Result<Self> {
+        self.synthetic = Some(self.with_repo(|repo| {
+            synthetic::SyntheticGit::build(
+                repo,
+                &self.repo_path,
+                self.commit_oid,
+                self.tree_oid,
+                self.commit_time,
+                cache_root,
+            )
+        })?);
+        Ok(self)
     }
 
     fn with_repo<R>(&self, f: impl FnOnce(&Repository) -> Result<R>) -> Result<R> {
@@ -131,7 +191,7 @@ impl GitMountSource {
         Ok(obj.peel_to_tree()?)
     }
 
-    /// Look up a virtual path under prefix+path → git object.
+    /// Look up a virtual path in the selected tree.
     fn look_up_path<'a>(
         &self,
         repo: &'a Repository,
@@ -139,9 +199,6 @@ impl GitMountSource {
     ) -> Result<Option<git2::Object<'a>>> {
         let tree = self.root_tree(repo)?;
         let mut parts: Vec<&str> = Vec::new();
-        if !self.prefix.is_empty() {
-            parts.extend(self.prefix.split('/').filter(|s| !s.is_empty()));
-        }
         let rel = normalize_vpath(path);
         if !rel.is_empty() {
             parts.extend(rel.split('/').filter(|s| !s.is_empty()));
@@ -164,16 +221,26 @@ impl GitMountSource {
         Ok(Some(current))
     }
 
-    fn convert_mode(obj: &git2::Object<'_>, filemode: i32) -> u32 {
+    fn convert_mode(&self, obj: &git2::Object<'_>, filemode: i32) -> u32 {
         // git filemodes: 0o100644, 0o100755, 0o120000 (link), 0o040000 (tree), 0o160000 (submodule)
         if filemode == 0o120000 {
             return ratarmount_core::S_IFLNK | 0o555;
         }
         match obj.kind() {
-            Some(ObjectType::Tree) => ratarmount_core::S_IFDIR | 0o555,
+            Some(ObjectType::Tree) => {
+                ratarmount_core::S_IFDIR
+                    | if self.synthetic.is_some() {
+                        0o755
+                    } else {
+                        0o555
+                    }
+            }
             _ => {
                 let exec = filemode & 0o111 != 0;
-                let perms = if exec { 0o555 } else { 0o444 };
+                let mut perms = if exec { 0o555 } else { 0o444 };
+                if self.synthetic.is_some() {
+                    perms |= 0o200;
+                }
                 ratarmount_core::S_IFREG | perms
             }
         }
@@ -186,11 +253,18 @@ impl GitMountSource {
         vpath: &str,
         filemode: i32,
     ) -> Result<FileInfo> {
-        let mode = Self::convert_mode(obj, filemode);
+        let mode = self.convert_mode(obj, filemode);
         let (size, linkname) = if mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFLNK {
             let blob = obj.peel_to_blob()?;
             let target = String::from_utf8_lossy(blob.content()).into_owned();
-            (0, target)
+            (
+                if self.synthetic.is_some() {
+                    blob.size() as u64
+                } else {
+                    0
+                },
+                target,
+            )
         } else if mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             (0, String::new())
         } else if let Ok(blob) = obj.peel_to_blob() {
@@ -211,6 +285,11 @@ impl GitMountSource {
     }
 
     fn list_dir(&self, path: &str) -> Option<BTreeMap<String, FileInfo>> {
+        if let Some(synthetic) = &self.synthetic {
+            if synthetic::is_git_path(path) {
+                return synthetic.list(path);
+            }
+        }
         self.with_repo(|repo| {
             let obj = match self.look_up_path(repo, path)? {
                 Some(o) => o,
@@ -238,6 +317,11 @@ impl GitMountSource {
                 let fi = self.object_to_file_info(repo, &child, &child_v, entry.filemode())?;
                 map.insert(name, fi);
             }
+            if normalize_vpath(path).is_empty() {
+                if let Some(synthetic) = &self.synthetic {
+                    map.insert(".git".into(), synthetic.lookup("/.git").unwrap());
+                }
+            }
             Ok(Some(map))
         })
         .ok()
@@ -246,6 +330,17 @@ impl GitMountSource {
 
     /// Cheap readdir: tree entry `filemode` + blob `size()`, no `FileInfo` userdata.
     fn list_dirents_inner(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        if self.synthetic.is_some() && synthetic::is_git_path(path) {
+            return self.list_dir(path).map(|map| {
+                map.into_iter()
+                    .map(|(name, fi)| CheapDirent {
+                        name,
+                        mode: fi.mode,
+                        size: fi.size,
+                    })
+                    .collect()
+            });
+        }
         self.with_repo(|repo| {
             let obj = match self.look_up_path(repo, path)? {
                 Some(o) => o,
@@ -262,13 +357,23 @@ impl GitMountSource {
                     None => continue,
                 };
                 let child = entry.to_object(repo)?;
-                let mode = Self::convert_mode(&child, entry.filemode());
-                let size = if mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG {
+                let mode = self.convert_mode(&child, entry.filemode());
+                let size = if mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG
+                    || (self.synthetic.is_some()
+                        && mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFLNK)
+                {
                     child.peel_to_blob().map(|b| b.size() as u64).unwrap_or(0)
                 } else {
                     0
                 };
                 dents.push(CheapDirent { name, mode, size });
+            }
+            if self.synthetic.is_some() && normalize_vpath(path).is_empty() {
+                dents.push(CheapDirent {
+                    name: ".git".into(),
+                    mode: ratarmount_core::S_IFDIR | 0o755,
+                    size: 0,
+                });
             }
             Ok(Some(dents))
         })
@@ -278,10 +383,8 @@ impl GitMountSource {
 }
 
 fn default_reference(repo: &Repository) -> String {
-    if let Ok(head) = repo.head() {
-        if let Some(name) = head.shorthand() {
-            return name.to_string();
-        }
+    if repo.head().is_ok() {
+        return "HEAD".into();
     }
     for branch in ["master", "main"] {
         if repo.find_reference(&format!("refs/heads/{branch}")).is_ok() {
@@ -309,6 +412,11 @@ impl MountSource for GitMountSource {
     }
 
     fn lookup(&self, path: &str, _file_version: i32) -> Option<FileInfo> {
+        if let Some(synthetic) = &self.synthetic {
+            if synthetic::is_git_path(path) {
+                return synthetic.lookup(path);
+            }
+        }
         let path_n = if path == "/" || path.is_empty() {
             return Some(create_root_file_info());
         } else {
@@ -366,6 +474,11 @@ impl MountSource for GitMountSource {
         let path = path_from_userdata(file_info).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "missing git path userdata")
         })?;
+        if let Some(synthetic) = &self.synthetic {
+            if synthetic::is_git_path(&path) {
+                return synthetic.open(&path);
+            }
+        }
         let data = self
             .with_repo(|repo| {
                 let obj = self
@@ -376,6 +489,19 @@ impl MountSource for GitMountSource {
             })
             .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(Box::new(Cursor::new(data)))
+    }
+
+    fn list_xattr(&self, _file_info: &FileInfo) -> Vec<String> {
+        if self.synthetic.is_some() {
+            Vec::new()
+        } else {
+            vec![COMMIT_XATTR.into()]
+        }
+    }
+
+    fn get_xattr(&self, _file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+        (self.synthetic.is_none() && key == COMMIT_XATTR)
+            .then(|| self.commit_oid.to_string().into_bytes())
     }
 
     fn is_immutable(&self) -> bool {

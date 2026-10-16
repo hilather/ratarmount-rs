@@ -2875,6 +2875,7 @@ version = "0.1.34"
 dependencies = [
  "clap",
  "env_logger",
+ "git2",
  "libc",
  "log",
  "nix 0.29.0",
@@ -3115,10 +3116,13 @@ dependencies = [
 name = "ratarmount-formats-git"
 version = "0.1.34"
 dependencies = [
+ "errno",
+ "flate2",
  "git2",
  "libc",
  "log",
  "ratarmount-core",
+ "sha1 0.10.7",
  "tempfile",
  "thiserror",
 ]
@@ -3504,6 +3508,7 @@ dependencies = [
 name = "ratarmount-session"
 version = "0.1.34"
 dependencies = [
+ "git2",
  "libc",
  "log",
  "ratarmount-compositing",
