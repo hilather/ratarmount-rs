@@ -27,6 +27,13 @@ CI workflow: [`.github/workflows/packages.yml`](https://github.com/hilather/rata
 
 Each native package is built **on** that distro (matching glibc / libfuse). The **portable** job uses Debian bullseye so one tarball runs on most modern Ubuntu/Rocky hosts with glibc ≥ 2.31.
 
+The portable binary vendors OpenSSL statically. Releases up to 0.1.34 linked
+bullseye's `libssl.so.1.1`, which Arch, Ubuntu 22.04+ (including DGX OS) and
+current Fedora do not ship, so those tarballs fail with "error while loading
+shared libraries: libssl.so.1.1". `packaging/test-portable-deps.sh BINARY`
+lists the binary's direct `NEEDED` libraries and fails on any `libssl` or
+`libcrypto`; the Packages workflow runs it before upload.
+
 **Triggers**
 
 | Event | Result |

@@ -156,6 +156,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Homebrew tap cask is a formula / path-URL install / missing sha256 | `./packaging/test-homebrew-cask.sh` |
 | mount.fuse.ratarmount helper puts secrets on argv / Type≠fuse.ratarmount | `./packaging/test-systemd-unit.sh` (skip systemd-analyze if no systemd; kubeconform skip-if-missing) |
 | Packages portable apt CDN reset (missing glibc2.31 amd64) | `./packaging/test-packages-apt-retries.sh` |
+| Portable glibc 2.31 tarball links OpenSSL 1.1 (fails to start on Arch, Ubuntu 22.04+, DGX OS) | `./packaging/test-portable-deps.sh` (Packages job runs it on the built binary; pass a binary or extracted tarball path locally) |
 | CI apt CDN hang cancels cold-index / FUSE allowlists | `./packaging/test-ci-apt-retries.sh` |
 | Windows session/index compile without FUSE (G6, no WinFsp) | `./packaging/test-windows-lib-ci.sh` · `cargo test -p ratarmount-core --lib effective_ids` · `cargo test -p ratarmount-core --lib metadata_helpers` · `cargo test -p ratarmount-index --lib tar_stats_from_metadata_uses_len` · `cargo test -p ratarmount-index --lib home_dir_prefers` |
 | NFS short-read / cheap-dirent empty `cat` | `cargo test -p ratarmount-nfs --lib fill_loops` · `cargo test -p ratarmount-nfs --lib readdir_size_zero` |
