@@ -77,7 +77,7 @@ fn clean_token(value: String) -> Option<String> {
 }
 
 // Python expanduser followed by expandvars, with unknown variables left intact.
-fn expand_env_path(path: &str, env: &impl Fn(&str) -> Option<String>) -> String {
+pub(crate) fn expand_env_path(path: &str, env: &impl Fn(&str) -> Option<String>) -> String {
     let path = if path == "~" || path.starts_with("~/") {
         env("HOME")
             .map(|home| format!("{home}{}", &path[1..]))
@@ -144,6 +144,7 @@ fn bounded_body(mut reader: impl Read, cap: u64) -> io::Result<Option<Vec<u8>>> 
     Ok((reader.read(&mut [0; 1])? == 0).then_some(bytes))
 }
 
+type FileMetadata = Arc<Mutex<BTreeMap<String, (u64, String)>>>;
 type FileHashes = Arc<Mutex<BTreeMap<(String, String), String>>>;
 type FileCache = Arc<Mutex<BTreeMap<(String, String), Arc<Mutex<Option<CachedFile>>>>>>;
 
@@ -281,6 +282,7 @@ struct Config {
     token: Option<SecretString>,
     cache: Option<PathBuf>,
     offline: bool,
+    hub_cache: Option<crate::hf_cache::HubCache>,
     #[cfg(test)]
     range_cache: Option<ratarmount_index::RangeCache>,
 }
@@ -350,6 +352,7 @@ impl Config {
             token,
             cache,
             offline,
+            hub_cache: crate::hf_cache::HubCache::sharing(&env),
             #[cfg(test)]
             range_cache: None,
         })
@@ -357,7 +360,7 @@ impl Config {
 
     fn online(&self) -> Result<()> {
         if self.offline {
-            Err(error("HF_HUB_OFFLINE is enabled: hf:// requires network access; cached listings alone do not contain file data (offline Hub snapshots are a separate backend)"))
+            Err(error("HF_HUB_OFFLINE is enabled: hf:// requires network access; use hf-cache:// for offline Hub snapshots"))
         } else {
             Ok(())
         }
@@ -379,6 +382,7 @@ pub(crate) fn commit_test_repo(endpoint: &str, token: Option<&str>) -> HfRepo {
         config,
         files: Arc::default(),
         hashes: Arc::default(),
+        metadata: Arc::default(),
     }
 }
 
@@ -390,6 +394,7 @@ pub struct HfRepo {
     config: Config,
     files: FileCache,
     hashes: FileHashes,
+    metadata: FileMetadata,
 }
 
 impl HfRepo {
@@ -399,12 +404,17 @@ impl HfRepo {
 
     fn with_config(location: HfLocation, config: Config) -> Result<Self> {
         config.online()?;
+        let observed_ref = config
+            .hub_cache
+            .as_ref()
+            .and_then(|cache| cache.observe_ref(&location));
         let mut repo = Self {
             location,
             config,
             commit: String::new(),
             files: Arc::default(),
             hashes: Arc::default(),
+            metadata: Arc::default(),
         };
         let url = repo.api_url(&format!("revision/{}", encode(&repo.location.revision)));
         let response = repo.get_api(&url)?;
@@ -416,6 +426,13 @@ impl HfRepo {
             return Err(error("Hub returned an invalid commit SHA"));
         }
         repo.commit = sha.to_ascii_lowercase();
+        if let Some(cache) = &repo.config.hub_cache {
+            if let Err(error) =
+                cache.record_open(&repo.location, &repo.commit, observed_ref.as_deref())
+            {
+                log::debug!("Hub revision ref update skipped: {error}");
+            }
+        }
         log::info!(
             "hf: {}/{}@{} resolved commit {}",
             repo.location.kind,
@@ -614,6 +631,7 @@ impl HfRepo {
         }
         match file.as_ref().unwrap() {
             CachedFile::Ready { source, size, buffered } => {
+                if let Some(bytes) = buffered { source.store_buffered(bytes.clone()); }
                 Ok(HttpRangeFile::from_source(source.clone(), *size, buffered.clone()))
             }
             CachedFile::TooLarge => Err(error(format!(
@@ -641,13 +659,50 @@ impl HfRepo {
             // Transport mocks must not depend on a writable developer/CI cache.
             None => source.without_range_cache(),
         };
-        let source = Arc::new(source);
+        let metadata = self
+            .metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+            .cloned();
+        let cached = self.config.hub_cache.as_ref().map(|cache| {
+            Arc::new(crate::hf_cache::HubCacheFile::new(
+                cache.clone(),
+                self.location.clone(),
+                self.commit.clone(),
+                path.into(),
+                metadata.as_ref().map(|(_, etag)| etag.clone()),
+                metadata.as_ref().map(|(size, _)| *size),
+            ))
+        });
+        if let Some(cached) = &cached {
+            cached.initialize();
+        }
+        if let Some(size) = cached
+            .as_ref()
+            .and_then(|file| file.local())
+            .map(|b| b.size)
+        {
+            let source = Arc::new(source.with_hub_cache(cached.unwrap()));
+            self.attach_content_token(&source, path, size);
+            return Ok(CachedFile::Ready {
+                source,
+                size,
+                buffered: None,
+            });
+        }
+        let mut source = match cached {
+            Some(cached) => source.with_hub_cache(cached),
+            None => source,
+        };
         // Some Hub/CDN HEAD responses omit Accept-Ranges.
         let response = match source.request("GET", Some((0, 0))) {
             Err(ureq::Error::Status(416, response))
                 if response.header("Content-Range") == Some("bytes */0") =>
             {
+                let source = Arc::new(source);
                 self.attach_content_token(&source, path, 0);
+                source.store_buffered(Arc::from([]));
                 return Ok(CachedFile::Ready {
                     source,
                     size: 0,
@@ -668,6 +723,33 @@ impl HfRepo {
         {
             return Err(error("Hub file response does not match the pinned commit"));
         }
+        let etag = source
+            .linked_sha256()
+            .or_else(|| metadata.as_ref().map(|(_, etag)| etag.clone()))
+            .or_else(|| {
+                response
+                    .header("X-Linked-Etag")
+                    .or_else(|| response.header("ETag"))
+                    .map(|s| s.trim_matches('"').to_ascii_lowercase())
+            });
+        if let Some(cache) = &self.config.hub_cache {
+            source = source.with_hub_cache(Arc::new(crate::hf_cache::HubCacheFile::new(
+                cache.clone(),
+                self.location.clone(),
+                self.commit.clone(),
+                path.into(),
+                etag,
+                if response.status() == 206 {
+                    http_pool::validate_content_range(&response, 0, 0, None)?
+                } else {
+                    response
+                        .header("Content-Length")
+                        .and_then(|s| s.parse().ok())
+                },
+            )));
+        }
+        source.initialize_hub_cache();
+        let source = Arc::new(source);
         if response.status() == 206 {
             let size = http_pool::validate_content_range(&response, 0, 0, None)?
                 .ok_or_else(|| error("Hub range response has no total length"))?;
@@ -694,10 +776,12 @@ impl HfRepo {
             match bounded_body(response.into_reader(), MAX_BUFFER_BYTES)? {
                 Some(bytes) => {
                     self.attach_content_token(&source, path, bytes.len() as u64);
+                    let bytes: Arc<[u8]> = bytes.into();
+                    source.store_buffered(bytes.clone());
                     Ok(CachedFile::Ready {
                         source,
                         size: bytes.len() as u64,
-                        buffered: Some(bytes.into()),
+                        buffered: Some(bytes),
                     })
                 }
                 None => Ok(CachedFile::TooLarge),
@@ -851,6 +935,7 @@ impl HfRepo {
             inner: source,
             commit: self.commit.clone(),
             folder: true,
+            repo: Some(self.clone()),
         })))
     }
 }
@@ -967,10 +1052,24 @@ impl HfListing {
         let mut entries = entries(tree)?;
         if let Some(items) = tree.as_array() {
             let mut hashes = repo.hashes.lock().unwrap_or_else(|e| e.into_inner());
+            let mut metadata = repo.metadata.lock().unwrap_or_else(|e| e.into_inner());
             for item in items {
                 let Some(path) = item["path"].as_str() else {
                     continue;
                 };
+                if let (Some(size), Some(etag)) = (
+                    item["size"].as_u64(),
+                    item["lfs"]["oid"]
+                        .as_str()
+                        .or_else(|| item["lfs"]["sha256"].as_str())
+                        .or_else(|| item["oid"].as_str()),
+                ) {
+                    let etag = etag.strip_prefix("sha256:").unwrap_or(etag);
+                    if matches!(etag.len(), 40 | 64) && etag.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        metadata.insert(path.into(), (size, etag.to_ascii_lowercase()));
+                    }
+                }
                 let Some(sha) = item["lfs"]["oid"]
                     .as_str()
                     .or_else(|| item["lfs"]["sha256"].as_str())
@@ -1047,6 +1146,7 @@ pub struct HfMountSource {
     inner: Arc<dyn MountSource>,
     commit: String,
     folder: bool,
+    repo: Option<HfRepo>,
 }
 impl HfMountSource {
     pub fn new(inner: Arc<dyn MountSource>, commit: String) -> Self {
@@ -1054,6 +1154,7 @@ impl HfMountSource {
             inner,
             commit,
             folder: false,
+            repo: None,
         }
     }
 }
@@ -1082,6 +1183,28 @@ impl MountSource for HfMountSource {
             return self.inner.open(&original, buffering);
         }
         self.inner.open(fi, buffering)
+    }
+    fn supports_backing_extents(&self) -> bool {
+        self.repo.is_some() || self.inner.supports_backing_extents()
+    }
+    fn backing_extent(&self, fi: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        if let Some(repo) = &self.repo {
+            if fi.mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFREG {
+                return None;
+            }
+            let path = fi.userdata.iter().find_map(|u| match u {
+                UserData::Other(path) => Some(path.trim_matches('/')),
+                _ => None,
+            })?;
+            let range = repo.open_file(path).ok()?;
+            let file = range.backing_file()?;
+            return Some(ratarmount_core::BackingExtent {
+                file,
+                offset: 0,
+                len: range.len(),
+            });
+        }
+        self.inner.backing_extent(fi)
     }
     fn member_seek_is_cheap(&self, fi: &FileInfo) -> bool {
         self.inner.member_seek_is_cheap(fi)

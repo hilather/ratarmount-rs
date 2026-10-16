@@ -1036,6 +1036,12 @@ pub(super) fn open_remote_input(
         resolve_access, RemoteAccess, RemoteHttp,
     };
 
+    if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf-cache") {
+        let source =
+            ratarmount_remote::HfCacheMountSource::open(input).map_err(|e| e.to_string())?;
+        return Ok((PathBuf::from(input), Arc::new(source)));
+    }
+
     if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf") {
         return open_hf_input(input, opts, recreate, remotes);
     }
@@ -1487,6 +1493,60 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         bytes
+    }
+
+    /// Regression: offline Hub snapshots were treated as local paths; recursive shards must use their blob in place.
+    #[cfg(unix)]
+    #[test]
+    fn regression_hf_cache_session_offline_recursive_tar_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = dir.path().join("hub");
+        let repo = hub.join("datasets--org--data");
+        let snapshot = repo.join("snapshots").join(HF_SHA);
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repo.join("blobs")).unwrap();
+        fs::create_dir_all(repo.join("refs")).unwrap();
+        let tar = hf_tar("hello.txt", b"offline nested bytes");
+        fs::write(repo.join("blobs").join(HF_SHA), tar).unwrap();
+        std::os::unix::fs::symlink(format!("../../blobs/{HF_SHA}"), snapshot.join("shard.tar"))
+            .unwrap();
+        fs::write(repo.join("refs/main"), HF_SHA).unwrap();
+        let env = SmbEnv::acquire(&[
+            "HF_HUB_CACHE",
+            "HF_HUB_OFFLINE",
+            "HF_ENDPOINT",
+            "RATARMOUNT_HF_SHARE_CACHE",
+            "RATARMOUNT_HF_CACHE_VERIFY",
+        ]);
+        env.set("HF_HUB_CACHE", &hub);
+        env.set("HF_HUB_OFFLINE", "1");
+        env.set("HF_ENDPOINT", "this-is-not-a-network-endpoint");
+        env.set("RATARMOUNT_HF_SHARE_CACHE", "0");
+        let session =
+            crate::Session::open(hf_request("hf-cache://datasets/org/data", None, true)).unwrap();
+        assert_eq!(
+            hf_read(&session, "/shard.tar/hello.txt"),
+            b"offline nested bytes"
+        );
+        let mut remotes = Vec::new();
+        let (label, _) = open_remote_input(
+            "hf-cache://datasets/org/data",
+            &mut OpenOptions::default(),
+            false,
+            &mut remotes,
+        )
+        .unwrap();
+        assert!(
+            remotes.is_empty(),
+            "offline cached snapshot must not be materialized"
+        );
+        assert_eq!(label, PathBuf::from("hf-cache://datasets/org/data"));
+        let session =
+            crate::Session::open(hf_request("hf-cache://datasets/org/data", None, false)).unwrap();
+        let source = session.mount_source();
+        let fi = source.lookup("/shard.tar", 0).unwrap();
+        assert_eq!(fi.mode & ratarmount_core::S_IFREG, ratarmount_core::S_IFREG);
+        assert!(source.lookup("/shard.tar/hello.txt", 0).is_none());
     }
 
     /// Regression: hf archives fell through to local-path handling; pin once and keep SHA in SQLite/root xattr.

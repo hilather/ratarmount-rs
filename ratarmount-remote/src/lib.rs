@@ -45,6 +45,8 @@ mod webdav;
 // --- inbound protocol modules (worktree PRs: one `mod` + `pub use` pair only) ---
 mod hf;
 pub use hf::{open_hf_range, parse_hf_url, HfLocation, HfMountSource, HfRepo};
+mod hf_cache;
+pub use hf_cache::HfCacheMountSource;
 mod hf_commit;
 pub use hf_commit::{HfCommitFile, HfCommitResult};
 mod folder;
@@ -470,7 +472,7 @@ pub type Result<T> = std::result::Result<T, RemoteError>;
 const REMOTE_SCHEMES: &[&str] = &[
     "http", "https", "file", "ftp", "ftps", "s3", "gs", "az", "azure", "ssh", "sftp", "scp", "smb",
     "webdav", "webdavs", "dropbox", "oci", "docker", "ghcr", "ipfs", "ipns", "rclone", "restic",
-    "hf",
+    "hf", "hf-cache",
 ];
 
 /// ASCII-lowercase scheme before the first `://`, if any.
@@ -1165,9 +1167,15 @@ impl HttpRangeFile {
         self
     }
 
-    /// A contiguous local file once every remote chunk has been cached.
+    /// A contiguous verified local file. Hub-backed files become available
+    /// after background publication completes; this does not wait for it.
     pub fn complete_file(&self) -> Option<PathBuf> {
         self.source.complete_file(self.size)
+    }
+
+    /// Descriptor verified at open or by background Hub-cache publication.
+    pub fn backing_file(&self) -> Option<std::fs::File> {
+        self.source.backing_file(self.size)
     }
 
     /// Origin URL, with userinfo removed.

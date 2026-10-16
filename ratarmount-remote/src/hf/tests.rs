@@ -212,6 +212,7 @@ fn config(server: &Server, cache: Option<PathBuf>) -> Config {
         token: Some(SecretString::new("hf_test_secret".into())),
         cache,
         offline: false,
+        hub_cache: None,
         range_cache: None,
     }
 }
@@ -591,6 +592,7 @@ fn regression_hf_subdirectory_tree_does_not_expose_outside_entries() {
     let repo = HfRepo {
         files: Arc::default(),
         hashes: Arc::default(),
+        metadata: Arc::default(),
         location: parse_hf_url("hf://datasets/org/data/train").unwrap(),
         commit: SHA.into(),
         config,
@@ -1105,4 +1107,342 @@ fn regression_hf_range_cache_tree_lfs_oid_verifies_complete_file() {
         file.complete_file().is_none(),
         "the bad LFS digest must prevent completed publication"
     );
+}
+
+fn shared_cache_config(server: &Server, root: &std::path::Path) -> Config {
+    let mut config = config(server, None);
+    config.hub_cache = Some(crate::hf_cache::HubCache::from_values(&|key| {
+        (key == "HF_HUB_CACHE").then(|| root.join("hub").to_string_lossy().into())
+    }));
+    config.range_cache = Some(ratarmount_index::RangeCache::with_dirs(
+        root.join("payload/range-v1"),
+        root.join("payload"),
+        1024 * 1024,
+        4,
+    ));
+    config
+}
+
+fn shared_cache_server(data: &'static [u8], lfs: bool) -> (Server, String) {
+    let etag = if lfs {
+        hex::encode(Sha256::digest(data))
+    } else {
+        let mut hash = sha1::Sha1::new();
+        hash.update(format!("blob {}\0", data.len()).as_bytes());
+        hash.update(data);
+        hex::encode(hash.finalize())
+    };
+    let hash = etag.clone();
+    let server = Server::new(move |req| {
+        if req.path.contains("/revision/") {
+            Response::new(200, json!({"sha": SHA}).to_string())
+        } else if req.path.contains("/tree/") {
+            let entry = if lfs {
+                json!({"type": "file", "path": "sub/file", "size": data.len(), "lfs": {"oid": hash}})
+            } else {
+                json!({"type": "file", "path": "sub/file", "size": data.len(), "oid": hash})
+            };
+            Response::new(200, json!([entry]).to_string())
+        } else {
+            range_response(&req, data).header("ETag", format!("\"{hash}\""))
+        }
+    });
+    (server, etag)
+}
+
+fn cached_file_requests(server: &Server) -> usize {
+    server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.contains("/resolve/"))
+        .count()
+}
+
+/// Regression: hf:// re-fetched files already downloaded by huggingface_hub.
+#[cfg(unix)]
+#[test]
+fn regression_hf_cache_read_through_zero_file_requests_and_passthrough() {
+    let data = b"existing Hub blob";
+    let (server, etag) = shared_cache_server(data, true);
+    let dir = tempfile::tempdir().unwrap();
+    let config = shared_cache_config(&server, dir.path());
+    let repo_dir = dir.path().join("hub/datasets--org--data");
+    let snapshot = repo_dir.join("snapshots").join(SHA).join("sub");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::create_dir_all(repo_dir.join("blobs")).unwrap();
+    std::fs::write(repo_dir.join("blobs").join(&etag), data).unwrap();
+    std::os::unix::fs::symlink(format!("../../../blobs/{etag}"), snapshot.join("file")).unwrap();
+    let repo =
+        HfRepo::with_config(parse_hf_url("hf://datasets/org/data").unwrap(), config).unwrap();
+    let source = repo.folder().unwrap().unwrap();
+    let fi = source.lookup("/sub/file", 0).unwrap();
+    let mut bytes = Vec::new();
+    source
+        .open(&fi, 0)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, data);
+    let mut extent = source.backing_extent(&fi).unwrap();
+    assert_eq!(extent.offset, 0);
+    let mut local = Vec::new();
+    extent.file.read_to_end(&mut local).unwrap();
+    assert_eq!(local, data);
+    assert_eq!(cached_file_requests(&server), 0);
+    // A known tree hash can reuse a blob even without a snapshot pointer.
+    std::fs::remove_file(snapshot.join("file")).unwrap();
+    let repo = HfRepo::with_config(
+        parse_hf_url("hf://datasets/org/data").unwrap(),
+        shared_cache_config(&server, dir.path()),
+    )
+    .unwrap();
+    let source = repo.folder().unwrap().unwrap();
+    let fi = source.lookup("/sub/file", 0).unwrap();
+    let mut bytes = Vec::new();
+    source
+        .open(&fi, 0)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, data);
+    assert_eq!(cached_file_requests(&server), 0);
+}
+
+/// Regression: complete range bytes were duplicated instead of atomically shared with the Hub.
+#[test]
+fn regression_hf_cache_write_back_drops_range_copy_and_second_mount_no_file_requests() {
+    for lfs in [false, true] {
+        let data = b"new Hub bytes spread over multiple chunks";
+        let (server, etag) = shared_cache_server(data, lfs);
+        let dir = tempfile::tempdir().unwrap();
+        let config = shared_cache_config(&server, dir.path());
+        let ranges = config.range_cache.clone().unwrap();
+        let location = parse_hf_url("hf://datasets/org/data@feature%2Fone").unwrap();
+        let repo = HfRepo::with_config(location.clone(), config.clone()).unwrap();
+        let source = repo.folder().unwrap().unwrap();
+        let fi = source.lookup("/sub/file", 0).unwrap();
+        let mut bytes = Vec::new();
+        source
+            .open(&fi, 0)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, data);
+        repo.open_file("sub/file")
+            .unwrap()
+            .source
+            .wait_for_publication();
+        let blob = dir.path().join("hub/datasets--org--data/blobs").join(&etag);
+        assert_eq!(std::fs::read(&blob).unwrap(), data);
+        let mut range = repo.open_file("sub/file").unwrap();
+        assert_eq!(range.complete_file().unwrap(), blob);
+        range.seek(SeekFrom::Start(3)).unwrap();
+        let mut suffix = Vec::new();
+        range.read_to_end(&mut suffix).unwrap();
+        assert_eq!(suffix, &data[3..]);
+        let token = ContentToken::HfCommitPath {
+            endpoint: config.endpoint.as_str().into(),
+            repo_kind: location.kind.clone(),
+            repo: location.repo.clone(),
+            commit: SHA.into(),
+            path: "sub/file".into(),
+            size: data.len() as u64,
+        };
+        let token = if lfs {
+            token.with_sha256(etag.clone())
+        } else {
+            token
+        };
+        assert!(ranges.complete_file(&token).is_none());
+        for chunk in 0..(data.len() as u64).div_ceil(4) {
+            assert!(!ranges.contains(&token, chunk));
+        }
+        assert_eq!(
+            std::fs::read_dir(blob.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("hub/datasets--org--data/refs/feature/one"))
+                .unwrap(),
+            SHA
+        );
+        assert!(dir
+            .path()
+            .join("hub/.locks/datasets--org--data")
+            .join(format!("{etag}.lock"))
+            .exists());
+        let before = cached_file_requests(&server);
+        let repo = HfRepo::with_config(location, config).unwrap();
+        let source = repo.folder().unwrap().unwrap();
+        let mut bytes = Vec::new();
+        source
+            .open(&source.lookup("/sub/file", 0).unwrap(), 0)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, data);
+        assert_eq!(cached_file_requests(&server), before);
+    }
+}
+
+/// Regression: a corrupt same-size LFS blob must be refetched and repaired, never served.
+#[test]
+fn regression_hf_cache_lfs_mismatch_refetched() {
+    let data = b"correct cached weights";
+    let (server, etag) = shared_cache_server(data, true);
+    let dir = tempfile::tempdir().unwrap();
+    let config = shared_cache_config(&server, dir.path());
+    let blobs = dir.path().join("hub/datasets--org--data/blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&etag), vec![b'!'; data.len()]).unwrap();
+    let repo =
+        HfRepo::with_config(parse_hf_url("hf://datasets/org/data").unwrap(), config).unwrap();
+    let source = repo.folder().unwrap().unwrap();
+    let mut bytes = Vec::new();
+    source
+        .open(&source.lookup("/sub/file", 0).unwrap(), 0)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, data);
+    repo.open_file("sub/file")
+        .unwrap()
+        .source
+        .wait_for_publication();
+    assert!(cached_file_requests(&server) > 0);
+    assert_eq!(std::fs::read(blobs.join(etag)).unwrap(), data);
+}
+
+/// Regression: non-Range responses and empty files bypassed whole-file cache sharing.
+#[test]
+fn regression_hf_cache_buffered_and_empty_files_shared() {
+    for data in [b"buffered body".as_slice(), b"".as_slice()] {
+        let hash = {
+            let mut sha = sha1::Sha1::new();
+            sha.update(format!("blob {}\0", data.len()).as_bytes());
+            sha.update(data);
+            hex::encode(sha.finalize())
+        };
+        let etag = hash.clone();
+        let server = Server::new(move |req| {
+            if req.path.contains("/revision/") {
+                Response::new(200, json!({"sha": SHA}).to_string())
+            } else if req.path.contains("/tree/") {
+                Response::new(
+                    200,
+                    json!([{"type":"file", "path":"file", "size":data.len(), "oid":etag}])
+                        .to_string(),
+                )
+            } else if data.is_empty() {
+                Response::new(416, "").header("Content-Range", "bytes */0")
+            } else {
+                Response::new(200, data).header("ETag", format!("\"{etag}\""))
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = shared_cache_config(&server, dir.path());
+        config.range_cache = None;
+        let location = parse_hf_url("hf://org/model").unwrap();
+        let repo = HfRepo::with_config(location.clone(), config.clone()).unwrap();
+        repo.folder().unwrap();
+        let mut file = repo.open_file("file").unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, data);
+        file.source.wait_for_publication();
+        let blob = dir.path().join("hub/models--org--model/blobs").join(hash);
+        assert_eq!(std::fs::read(&blob).unwrap(), data);
+        assert_eq!(file.complete_file().unwrap(), blob);
+        let before = cached_file_requests(&server);
+        let repo = HfRepo::with_config(location, config).unwrap();
+        let mut file = repo.open_file("file").unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, data);
+        assert_eq!(cached_file_requests(&server), before);
+    }
+}
+
+/// Regression: uppercase response ETags created noncanonical, unshared blob names.
+#[test]
+fn regression_hf_cache_header_etag_lowercase() {
+    let data = b"header-only regular file";
+    let mut sha = sha1::Sha1::new();
+    sha.update(format!("blob {}\0", data.len()).as_bytes());
+    sha.update(data);
+    let etag = hex::encode(sha.finalize());
+    let header = etag.to_ascii_uppercase();
+    let server = Server::new(move |request| {
+        if request.path.contains("/revision/") {
+            Response::new(200, json!({"sha": SHA}).to_string())
+        } else {
+            range_response(&request, data).header("ETag", format!("\"{header}\""))
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let repo = HfRepo::with_config(
+        parse_hf_url("hf://org/model/file").unwrap(),
+        shared_cache_config(&server, dir.path()),
+    )
+    .unwrap();
+    let mut file = repo.open_file("file").unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    file.source.wait_for_publication();
+    assert_eq!(bytes, data);
+    let blobs = dir.path().join("hub/models--org--model/blobs");
+    let names: Vec<_> = std::fs::read_dir(blobs)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec![etag]);
+}
+
+/// Regression: a newer Python ref written while the revision API was in flight was replaced at mount open.
+#[test]
+fn regression_hf_cache_mount_open_preserves_concurrent_ref_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let reference = dir.path().join("hub/models--org--model/refs/main");
+    std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+    std::fs::write(&reference, "b".repeat(40)).unwrap();
+    let destination = reference.clone();
+    let server = Server::new(move |_| {
+        std::fs::write(&destination, "c".repeat(40)).unwrap();
+        Response::new(200, json!({"sha": SHA}).to_string())
+    });
+    let repo = HfRepo::with_config(
+        parse_hf_url("hf://org/model").unwrap(),
+        shared_cache_config(&server, dir.path()),
+    )
+    .unwrap();
+    assert_eq!(repo.commit, SHA);
+    assert_eq!(std::fs::read_to_string(reference).unwrap(), "c".repeat(40));
+}
+
+/// Regression: disabling Hub sharing also disabled completed range-cache passthrough.
+#[test]
+fn regression_hf_cache_disabled_sharing_keeps_range_backing_fd() {
+    let data = b"range cache backing without Hub sharing";
+    let (server, _) = shared_cache_server(data, true);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = shared_cache_config(&server, dir.path());
+    config.hub_cache = None;
+    let repo =
+        HfRepo::with_config(parse_hf_url("hf://datasets/org/data").unwrap(), config).unwrap();
+    let source = repo.folder().unwrap().unwrap();
+    let fi = source.lookup("/sub/file", 0).unwrap();
+    let mut bytes = Vec::new();
+    source
+        .open(&fi, 0)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, data);
+    let mut extent = source.backing_extent(&fi).unwrap();
+    let mut bytes = Vec::new();
+    extent.file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, data);
+    assert!(!dir.path().join("hub").exists());
 }

@@ -10,6 +10,7 @@ ratarmount-core.workspace = true
 ratarmount-index.workspace = true
 thiserror.workspace = true
 log.workspace = true
+libc.workspace = true
 tempfile.workspace = true
 ureq = { version = "2", default-features = true, features = ["tls"] }
 url = "2"
