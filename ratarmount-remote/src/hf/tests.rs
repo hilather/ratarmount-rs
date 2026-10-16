@@ -212,6 +212,7 @@ fn config(server: &Server, cache: Option<PathBuf>) -> Config {
         token: Some(SecretString::new("hf_test_secret".into())),
         cache,
         offline: false,
+        range_cache: None,
     }
 }
 fn range_response(req: &Request, data: &[u8]) -> Response {
@@ -589,6 +590,7 @@ fn regression_hf_subdirectory_tree_does_not_expose_outside_entries() {
             .unwrap();
     let repo = HfRepo {
         files: Arc::default(),
+        hashes: Arc::default(),
         location: parse_hf_url("hf://datasets/org/data/train").unwrap(),
         commit: SHA.into(),
         config,
@@ -984,5 +986,123 @@ fn hf_live_unexpanded_tree_page_retains_file_metadata() {
         "HF live unexpanded tree: commit={} entries={} xetHash entries={xet_count}",
         repo.commit,
         items.len()
+    );
+}
+
+/// Regression: Hub opens bypassed the persistent byte cache despite a pinned commit.
+#[test]
+fn regression_hf_range_cache_second_read_zero_cdn_gets_and_commit_refetch() {
+    let body = b"cached model weights";
+    let cdn = Server::new(move |req| range_response(&req, body));
+    let cdn_url = cdn.url.clone();
+    let hub = Server::new(move |req| {
+        if req.path.contains("/revision/") {
+            return Response::new(200, json!({"sha":SHA}).to_string());
+        }
+        Response::new(302, vec![]).header("Location", format!("{cdn_url}/file"))
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let mut cfg = config(&hub, None);
+    cfg.range_cache = Some(ratarmount_index::RangeCache::with_dirs(
+        temp.path().join("payload-v1/range-v1"),
+        temp.path().join("payload-v1"),
+        1024,
+        4 * 1024 * 1024,
+    ));
+    let repo =
+        HfRepo::with_config(parse_hf_url("hf://org/model/weights.bin").unwrap(), cfg).unwrap();
+    let mut first = repo.open_file("weights.bin").unwrap();
+    let mut bytes = Vec::new();
+    first.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, body);
+    let before = cdn.count("/file");
+    let mut second = repo.open_file("weights.bin").unwrap();
+    bytes.clear();
+    second.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, body);
+    assert_eq!(cdn.count("/file"), before);
+    let mut other = repo.clone();
+    other.commit = "b".repeat(40);
+    let mut changed = other.open_file("weights.bin").unwrap();
+    bytes.clear();
+    changed.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, body);
+    assert!(
+        cdn.count("/file") > before,
+        "a different commit must have its own probe and byte identity"
+    );
+}
+
+/// Regression: X-Linked-Etag on the Hub redirect was lost before completed-file verification.
+#[test]
+fn regression_hf_range_cache_linked_sha256_verifies_complete_file() {
+    for valid in [true, false] {
+        let body = b"verified weights";
+        let digest = hex::encode(Sha256::digest(if valid {
+            body.as_slice()
+        } else {
+            b"wrong weights"
+        }));
+        let cdn = Server::new(move |req| range_response(&req, body));
+        let cdn_url = cdn.url.clone();
+        let hub = Server::new(move |req| {
+            if req.path.contains("/revision/") {
+                return Response::new(200, json!({"sha":SHA}).to_string());
+            }
+            Response::new(302, vec![])
+                .header("Location", format!("{cdn_url}/file"))
+                .header("X-Linked-Etag", format!("\"{digest}\""))
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = config(&hub, None);
+        cfg.range_cache = Some(ratarmount_index::RangeCache::with_dirs(
+            temp.path().join("payload-v1/range-v1"),
+            temp.path().join("payload-v1"),
+            1024,
+            4 * 1024 * 1024,
+        ));
+        let repo = HfRepo::with_config(parse_hf_url("hf://org/model/f").unwrap(), cfg).unwrap();
+        let mut file = repo.open_file("f").unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(
+            bytes, body,
+            "a cache digest mismatch must not fail the network read"
+        );
+        assert_eq!(file.complete_file().is_some(), valid);
+    }
+}
+
+/// Regression: tree API lfs.oid digests were discarded before file cache verification.
+#[test]
+fn regression_hf_range_cache_tree_lfs_oid_verifies_complete_file() {
+    let body = b"lfs body";
+    let hub = Server::new(move |req| {
+        if req.path.contains("/revision/") {
+            return Response::new(200, json!({"sha":SHA}).to_string());
+        }
+        range_response(&req, body)
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let mut cfg = config(&hub, None);
+    cfg.range_cache = Some(ratarmount_index::RangeCache::with_dirs(
+        temp.path().join("payload-v1/range-v1"),
+        temp.path().join("payload-v1"),
+        1024,
+        4 * 1024 * 1024,
+    ));
+    let repo = HfRepo::with_config(parse_hf_url("hf://org/model").unwrap(), cfg).unwrap();
+    let _listing = HfListing::new(
+        repo.clone(),
+        &json!([{"type":"file", "path":"f", "size":body.len(), "lfs":{"oid":"0".repeat(64)}}]),
+    )
+    .unwrap();
+    let mut file = repo.open_file("f").unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, body);
+    assert!(
+        file.complete_file().is_none(),
+        "the bad LFS digest must prevent completed publication"
     );
 }

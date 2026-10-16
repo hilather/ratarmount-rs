@@ -241,3 +241,14 @@ Hub reads are read-only. `--commit-overlay` and live overlay commit report that
 `hf://` is not supported for commit. Index publication is supported as described above; archive write-back remains a
 separate roadmap task. Full-file LFS hash verification is performed by the live test;
 ordinary partial reads validate HTTP byte ranges, not the entire LFS object hash.
+
+Persistent range data uses the [shared body cache](phase10-remote.md#persistent-remote-range-cache-ai-rc).
+Every file source carries endpoint, repository kind/name, pinned commit and
+path as its content token. `X-Linked-Etag` (including on the Hub redirect) and
+tree `lfs.oid` SHA-256 values additionally verify completed files. Reopening a
+file within the same pinned repository reuses its probe/redirect state and
+cached body bytes, issuing zero CDN GETs when the requested bytes are cached.
+A new commit uses a separate identity. If a strong response ETag changes within
+a source, caching is bypassed while network reads continue. Multi-chunk complete
+files are assembled only when a consumer calls `complete_file`, with one
+assembly per token at a time; byte reads do not trigger whole-file copies.

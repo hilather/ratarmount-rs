@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
-    http_pool, HttpAuthOptions, HttpLocation, HttpRangeFile, RemoteDirent, RemoteError,
-    RemoteFolderMountSource, RemoteListing, Result, USER_AGENT,
+    http_pool, ContentToken, HttpAuthOptions, HttpLocation, HttpRangeFile, RemoteDirent,
+    RemoteError, RemoteFolderMountSource, RemoteListing, Result, USER_AGENT,
 };
 
 const MAX_ENTRIES: usize = 1_000_000;
@@ -144,7 +144,8 @@ fn bounded_body(mut reader: impl Read, cap: u64) -> io::Result<Option<Vec<u8>>> 
     Ok((reader.read(&mut [0; 1])? == 0).then_some(bytes))
 }
 
-type FileCache = Arc<Mutex<BTreeMap<String, Arc<Mutex<Option<CachedFile>>>>>>;
+type FileHashes = Arc<Mutex<BTreeMap<(String, String), String>>>;
+type FileCache = Arc<Mutex<BTreeMap<(String, String), Arc<Mutex<Option<CachedFile>>>>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HfLocation {
@@ -280,6 +281,8 @@ struct Config {
     token: Option<SecretString>,
     cache: Option<PathBuf>,
     offline: bool,
+    #[cfg(test)]
+    range_cache: Option<ratarmount_index::RangeCache>,
 }
 
 impl Config {
@@ -347,6 +350,8 @@ impl Config {
             token,
             cache,
             offline,
+            #[cfg(test)]
+            range_cache: None,
         })
     }
 
@@ -383,6 +388,7 @@ pub struct HfRepo {
     pub commit: String,
     config: Config,
     files: FileCache,
+    hashes: FileHashes,
 }
 
 impl HfRepo {
@@ -397,6 +403,7 @@ impl HfRepo {
             config,
             commit: String::new(),
             files: Arc::default(),
+            hashes: Arc::default(),
         };
         let url = repo.api_url(&format!("revision/{}", encode(&repo.location.revision)));
         let response = repo.get_api(&url)?;
@@ -596,7 +603,7 @@ impl HfRepo {
             .files
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(path.into())
+            .entry((self.commit.clone(), path.into()))
             .or_default()
             .clone();
         // Only initialization of this file is serialized, not other shards or reads.
@@ -616,24 +623,30 @@ impl HfRepo {
     }
 
     fn probe_file(&self, path: &str) -> Result<CachedFile> {
-        let source = Arc::new(
-            http_pool::HttpRangeSource::new(
-                HttpLocation {
-                    url: self.resolve_url(path),
-                    auth: None,
-                    cookie: None,
-                },
-                HttpAuthOptions {
-                    bearer_token: self.config.token.clone(),
-                },
-            )
-            .with_hub_repo(self.location.repo.clone()),
-        );
+        let source = http_pool::HttpRangeSource::new(
+            HttpLocation {
+                url: self.resolve_url(path),
+                auth: None,
+                cookie: None,
+            },
+            HttpAuthOptions {
+                bearer_token: self.config.token.clone(),
+            },
+        )
+        .with_hub_repo(self.location.repo.clone());
+        #[cfg(test)]
+        let source = match &self.config.range_cache {
+            Some(cache) => source.with_range_cache(cache.clone()),
+            // Transport mocks must not depend on a writable developer/CI cache.
+            None => source.without_range_cache(),
+        };
+        let source = Arc::new(source);
         // Some Hub/CDN HEAD responses omit Accept-Ranges.
         let response = match source.request("GET", Some((0, 0))) {
             Err(ureq::Error::Status(416, response))
                 if response.header("Content-Range") == Some("bytes */0") =>
             {
+                self.attach_content_token(&source, path, 0);
                 return Ok(CachedFile::Ready {
                     source,
                     size: 0,
@@ -657,6 +670,8 @@ impl HfRepo {
         if response.status() == 206 {
             let size = http_pool::validate_content_range(&response, 0, 0, None)?
                 .ok_or_else(|| error("Hub range response has no total length"))?;
+            self.attach_content_token(&source, path, size);
+            source.observe_identity(&response, size);
             let mut bytes = Vec::new();
             response.into_reader().take(2).read_to_end(&mut bytes)?;
             if bytes.len() != 1 {
@@ -676,16 +691,41 @@ impl HfRepo {
                 return Ok(CachedFile::TooLarge);
             }
             match bounded_body(response.into_reader(), MAX_BUFFER_BYTES)? {
-                Some(bytes) => Ok(CachedFile::Ready {
-                    source,
-                    size: bytes.len() as u64,
-                    buffered: Some(bytes.into()),
-                }),
+                Some(bytes) => {
+                    self.attach_content_token(&source, path, bytes.len() as u64);
+                    Ok(CachedFile::Ready {
+                        source,
+                        size: bytes.len() as u64,
+                        buffered: Some(bytes.into()),
+                    })
+                }
                 None => Ok(CachedFile::TooLarge),
             }
         } else {
             Err(error("unexpected Hub range response"))
         }
+    }
+
+    fn attach_content_token(&self, source: &http_pool::HttpRangeSource, path: &str, size: u64) {
+        let token = ContentToken::HfCommitPath {
+            endpoint: self.config.endpoint.as_str().into(),
+            repo_kind: self.location.kind.clone(),
+            repo: self.location.repo.clone(),
+            commit: self.commit.clone(),
+            path: path.into(),
+            size,
+        };
+        let sha256 = source.linked_sha256().or_else(|| {
+            self.hashes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(self.commit.clone(), path.into()))
+                .cloned()
+        });
+        source.set_content_token(match sha256 {
+            Some(sha256) => token.with_sha256(sha256),
+            None => token,
+        });
     }
 
     pub fn materialize(&self) -> Result<crate::RemoteLocal> {
@@ -924,6 +964,24 @@ struct HfListing {
 impl HfListing {
     fn new(repo: HfRepo, tree: &Value) -> Result<Self> {
         let mut entries = entries(tree)?;
+        if let Some(items) = tree.as_array() {
+            let mut hashes = repo.hashes.lock().unwrap_or_else(|e| e.into_inner());
+            for item in items {
+                let Some(path) = item["path"].as_str() else {
+                    continue;
+                };
+                let Some(sha) = item["lfs"]["oid"]
+                    .as_str()
+                    .or_else(|| item["lfs"]["sha256"].as_str())
+                else {
+                    continue;
+                };
+                let sha = sha.strip_prefix("sha256:").unwrap_or(sha);
+                if sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    hashes.insert((repo.commit.clone(), path.into()), sha.to_ascii_lowercase());
+                }
+            }
+        }
         if !repo.location.path.is_empty() {
             let prefix = format!("{}/", repo.location.path);
             if entries.keys().any(|path| !path.starts_with(&prefix)) {
