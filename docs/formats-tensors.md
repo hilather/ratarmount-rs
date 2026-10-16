@@ -167,7 +167,8 @@ restrictive. Extensionless nested containers can be selected with
 `--recursive-extensions '*'`. The reader dispatcher recognizes both formats
 from an existing parent stream; it opens tensors without a temporary body
 spool. Random-read cost still depends on the parent reader's compression.
-For several checkpoints inside a TAR, `--parallel-nested 1` avoids the parent
-reader's observed interference between concurrent seeks. The no-spool
-regressions cover one nested checkpoint per TAR; parent-reader synchronization
-is outside this backend.
+Several checkpoints inside one TAR can open in parallel with the default
+`--parallel-nested` setting. File-backed TAR member readers have independent
+logical positions and use positional I/O without a shared read lock. Regressions
+cover four simultaneous safetensors/GGUF opens and concurrent tensor reads without
+temporary spooling, as well as parallel AR opens from the same kind of parent.
