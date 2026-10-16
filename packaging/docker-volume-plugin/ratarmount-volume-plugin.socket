@@ -1,0 +1,11 @@
+[Unit]
+Description=ratarmount Docker / Podman volume plugin socket
+
+[Socket]
+ListenStream=/run/docker/plugins/ratarmount.sock
+SocketMode=0600
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

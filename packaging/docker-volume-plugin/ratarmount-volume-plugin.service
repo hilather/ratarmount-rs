@@ -1,0 +1,19 @@
+[Unit]
+Description=ratarmount Docker / Podman volume driver
+Requires=ratarmount-volume-plugin.socket
+After=ratarmount-volume-plugin.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ratarmount-volume-plugin
+EnvironmentFile=-/etc/ratarmount-volume-plugin.env
+StateDirectory=ratarmount-volume-plugin
+StateDirectoryMode=0700
+UMask=0077
+# Mounts must be visible to the container engine in the host namespace.
+PrivateMounts=no
+KillMode=mixed
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=2
