@@ -862,6 +862,168 @@ pub(super) fn materialize_remote_input(
     Ok((path, src))
 }
 
+/// Resolve once before probing folder/file shape. All subsequent URLs include the SHA.
+fn open_hf_input(
+    input: &str,
+    opts: &mut OpenOptions,
+    recreate: bool,
+    remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
+) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+    let repo = ratarmount_remote::HfRepo::resolve(input).map_err(|e| e.to_string())?;
+    eprintln!("hf: {input} commit {}", repo.commit);
+    let label = repo.resolve_url(&repo.location.path);
+    if let Some(source) = repo.folder().map_err(|e| e.to_string())? {
+        return Ok((PathBuf::from(label), source));
+    }
+    let range = repo
+        .open_file(&repo.location.path)
+        .map_err(|e| e.to_string())?;
+    let len = range.len();
+    let mut rebuild = recreate;
+    // An explicitly chosen cache path may span moving revisions or different mirrors.
+    // Never reuse offsets just because a URL-labelled tarstats check is a no-op.
+    let (_, index_path) = super::remote_index_setup(Path::new(&label), opts, recreate);
+    if let Some(path) = index_path.as_ref().filter(|p| path_is_nonempty_file(p)) {
+        let identity = SqliteIndex::open_read_only(path)
+            .and_then(|i| i.metadata())
+            .ok()
+            .and_then(|m| m.get("hf.resolve_url").cloned());
+        if identity.as_deref() != Some(&label) {
+            if opts.read_only_index {
+                return Err(
+                    "HF index has no matching commit/path/endpoint identity; rebuild the index"
+                        .into(),
+                );
+            }
+            rebuild = true;
+        }
+    }
+    if !rebuild
+        && !opts.index_in_memory
+        && !index_path
+            .as_ref()
+            .is_some_and(|p| path_is_nonempty_file(p))
+    {
+        apply_hf_index_discovery(&repo, opts, len, index_path.as_deref())?;
+    }
+    let opened = open_from_live_range(range, len, &label, opts, rebuild, "HF Range", || {
+        repo.open_file(&repo.location.path)
+            .map_err(|e| e.to_string())
+    })?;
+    let (path, source) = match opened {
+        Some(opened) => opened,
+        None => {
+            let remote = repo.materialize().map_err(|e| e.to_string())?;
+            let path = remote.path().to_path_buf();
+            let source = open_path(&path, opts, rebuild)?;
+            remotes.push(remote);
+            (path, source)
+        }
+    };
+    let (_, index_path) = super::remote_index_setup(Path::new(&label), opts, false);
+    if !opts.read_only_index {
+        if let Some(path) = index_path.filter(|p| path_is_nonempty_file(p)) {
+            let index = SqliteIndex::open_writable(&path).map_err(|e| e.to_string())?;
+            index
+                .store_metadata_key_value("hf.commit", &repo.commit)
+                .map_err(|e| e.to_string())?;
+            index
+                .store_metadata_key_value("hf.resolve_url", &label)
+                .map_err(|e| e.to_string())?;
+            opts.index_file_path = Some(path);
+        }
+    }
+    Ok((
+        path,
+        Arc::new(ratarmount_remote::HfMountSource::new(source, repo.commit)),
+    ))
+}
+
+/// Reuse the HTTP sibling convention and index validation with Hub-only credentials.
+fn apply_hf_index_discovery(
+    repo: &ratarmount_remote::HfRepo,
+    opts: &mut OpenOptions,
+    size: u64,
+    cache_dest: Option<&Path>,
+) -> Result<(), String> {
+    let url = repo.resolve_url(&repo.location.path);
+    let mut candidates = Vec::new();
+    if let Some(pointer) = sibling_index_pointer_url(&url) {
+        if let Ok(bytes) = repo.fetch_bytes(&pointer, INDEX_POINTER_MAX_BYTES) {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                if let Ok(ptr) = parse_index_pointer_json(text) {
+                    candidates.extend(
+                        sibling_index_id_candidates(&url, &ptr.index_id)
+                            .into_iter()
+                            .map(|u| (u, Some(ptr.index_id.clone()))),
+                    );
+                }
+            }
+        }
+    }
+    candidates.extend(
+        sibling_index_candidates(&url)
+            .into_iter()
+            .map(|u| (u, None)),
+    );
+    for (candidate, expected) in candidates {
+        let wire = MetaCache::from_env().get_or_fetch_path(
+            &cache_identity("hf", &candidate),
+            None,
+            || {
+                let tmp = repo
+                    .fetch_to_temp(&candidate, 1024 * 1024 * 1024)
+                    .map_err(std::io::Error::other)?;
+                keep_http_index_temp(tmp).map_err(std::io::Error::other)
+            },
+        );
+        let Ok(wire) = wire else {
+            continue;
+        };
+        let Ok(path) = materialize_index_file(&wire) else {
+            invalidate_meta_cache_identity("hf", &candidate);
+            continue;
+        };
+        if expected
+            .as_ref()
+            .is_some_and(|id| !blob_matches_index_id(&path, id))
+        {
+            invalidate_meta_cache_identity("hf", &candidate);
+            drop_fetched_sidecar(&path);
+            continue;
+        }
+        let mut reader = repo
+            .open_file(&repo.location.path)
+            .map_err(|e| e.to_string())?;
+        let mut hash = |start: u64, count: u64| -> Option<String> {
+            reader.seek(SeekFrom::Start(start)).ok()?;
+            let mut window = (&mut reader).take(count);
+            sha256_hex_stream(&mut window).ok()
+        };
+        let sample = size.min(TARSTATS_SAMPLE_BYTES as u64);
+        let prefix = hash(0, sample);
+        let suffix = hash(size.saturating_sub(sample), sample);
+        let full = if size <= TARSTATS_FULL_HASH_MAX {
+            hash(0, size)
+        } else {
+            None
+        };
+        if try_install_remote_index(
+            opts,
+            path,
+            size,
+            prefix.as_deref(),
+            suffix.as_deref(),
+            full.as_deref(),
+            cache_dest,
+        ) {
+            return Ok(());
+        }
+        invalidate_meta_cache_identity("hf", &candidate);
+    }
+    Ok(())
+}
+
 /// Open a remote URL: folder probe, live Range, OCI layer union, else materialize.
 pub(super) fn open_remote_input(
     input: &str,
@@ -873,6 +1035,10 @@ pub(super) fn open_remote_input(
         open_azure_range, open_ftp_range, open_gcs_range, open_ipfs, open_rclone, open_s3_range,
         resolve_access, RemoteAccess, RemoteHttp,
     };
+
+    if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf") {
+        return open_hf_input(input, opts, recreate, remotes);
+    }
 
     if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("restic") {
         return open_restic_repo(input);
@@ -1252,6 +1418,276 @@ mod tests {
                 "{input} must not be probed as a remote folder"
             );
         }
+    }
+
+    const HF_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn hf_tar(name: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut tar = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(
+            &mut tar,
+            &[ratarmount_formats_tar::UstarMember {
+                path: name,
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
+        tar
+    }
+
+    fn bind_hf(http: &IndexHttp, cache: &Path) -> SmbEnv {
+        let env = SmbEnv::acquire(&[
+            "HF_ENDPOINT",
+            "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
+            "HF_TOKEN_PATH",
+            "HF_HOME",
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+            "RATARMOUNT_HF_TREE_CACHE",
+        ]);
+        env.set("HF_ENDPOINT", format!("http://{}", http.addr));
+        env.set("HF_TOKEN_PATH", cache.join("no-token"));
+        env.set("RATARMOUNT_HF_TREE_CACHE", cache.join("tree"));
+        env
+    }
+
+    fn hf_request(url: &str, index: Option<PathBuf>, recursive: bool) -> crate::OpenRequest {
+        crate::OpenRequest {
+            source: crate::SourceSpec::Url(url.into()),
+            index: if index.is_some() {
+                crate::IndexPolicy::Explicit
+            } else {
+                crate::IndexPolicy::Memory
+            },
+            explicit_index: index,
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive,
+            recursion_depth: None,
+            parallelization: Default::default(),
+            recreate: crate::Recreate::IfInvalid,
+        }
+    }
+
+    fn hf_read(session: &crate::Session, path: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        session
+            .read_range(crate::ReadRequest {
+                path: path.into(),
+                offset: 0,
+                max_len: 4096,
+            })
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    /// Regression: hf archives fell through to local-path handling; pin once and keep SHA in SQLite/root xattr.
+    #[test]
+    fn regression_hf_session_tar_zst_pins_commit_and_reads_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("a.tar");
+        let zst = dir.path().join("a.tar.zst");
+        fs::write(&tar, hf_tar("hello.txt", b"hello Hub\n")).unwrap();
+        ratarmount_compress::repack_seekable(&tar, &zst, &Default::default()).unwrap();
+        let path = format!("/datasets/org/data/resolve/{HF_SHA}/a.tar.zst");
+        let objects = std::collections::HashMap::from([(
+            "/api/datasets/org/data/revision/v1".into(),
+            format!(r#"{{"sha":"{HF_SHA}"}}"#).into_bytes(),
+        )]);
+        let http = spawn_index_http(&path, fs::read(zst).unwrap(), objects, None, None);
+        let _env = bind_hf(&http, dir.path());
+        let index = dir.path().join("index.sqlite");
+        let url = "hf://datasets/org/data@v1/a.tar.zst";
+        {
+            let session =
+                crate::Session::open(hf_request(url, Some(index.clone()), false)).unwrap();
+            assert!(session.lookup("/hello.txt").unwrap().is_some());
+            assert_eq!(hf_read(&session, "/hello.txt"), b"hello Hub\n");
+            let source = session.mount_source();
+            assert_eq!(
+                source
+                    .get_xattr(&source.lookup("/", 0).unwrap(), "user.hf.commit")
+                    .unwrap(),
+                HF_SHA.as_bytes()
+            );
+        }
+        assert_eq!(
+            SqliteIndex::open_read_only(&index)
+                .unwrap()
+                .metadata()
+                .unwrap()["hf.commit"],
+            HF_SHA
+        );
+        let session = crate::Session::open(hf_request(url, Some(index), false)).unwrap();
+        assert_eq!(hf_read(&session, "/hello.txt"), b"hello Hub\n");
+        assert_eq!(
+            http.gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.contains("/revision/"))
+                .count(),
+            2
+        );
+    }
+
+    /// Regression: repository files must stay lazy and tar shards must auto-mount under -r.
+    #[test]
+    fn regression_hf_session_folder_parquet_and_recursive_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = hf_tar("hello.txt", b"inside shard");
+        let resolve = format!("/datasets/org/data/resolve/{HF_SHA}");
+        let tree = format!(
+            r#"[{{"type":"file","path":"data.parquet","size":8}},{{"type":"file","path":"shard.tar","size":{}}}]"#,
+            tar.len()
+        );
+        let objects = std::collections::HashMap::from([
+            (
+                "/api/datasets/org/data/revision/main".into(),
+                format!(r#"{{"sha":"{HF_SHA}"}}"#).into_bytes(),
+            ),
+            (
+                format!("/api/datasets/org/data/tree/{HF_SHA}"),
+                tree.into_bytes(),
+            ),
+            (format!("{resolve}/data.parquet"), b"PAR1PAR1".to_vec()),
+        ]);
+        let http = spawn_index_http(&format!("{resolve}/shard.tar"), tar, objects, None, None);
+        let _env = bind_hf(&http, dir.path());
+        let session =
+            crate::Session::open(hf_request("hf://datasets/org/data", None, true)).unwrap();
+        let source = session.mount_source();
+        assert_eq!(
+            source
+                .get_xattr(&source.lookup("/", 0).unwrap(), "user.hf.commit")
+                .unwrap(),
+            HF_SHA.as_bytes()
+        );
+        assert_eq!(hf_read(&session, "/data.parquet"), b"PAR1PAR1");
+        assert_eq!(hf_read(&session, "/shard.tar/hello.txt"), b"inside shard");
+        drop(session);
+        let session =
+            crate::Session::open(hf_request("hf://datasets/org/data", None, false)).unwrap();
+        assert!(session.lookup("/shard.tar").unwrap().is_some());
+        assert_eq!(
+            http.gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.contains("/tree/"))
+                .count(),
+            1
+        );
+    }
+
+    /// Regression: explicit index names can span commits; same-sized tar files need new offsets/names.
+    #[test]
+    fn regression_hf_new_commit_rebuilds_explicit_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha2 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let old = hf_tar("old.txt", b"old bytes");
+        let new = hf_tar("new.txt", b"new bytes");
+        assert_eq!(old.len(), new.len());
+        let objects = std::collections::HashMap::from([
+            (
+                "/api/models/org/model/revision/v1".into(),
+                format!(r#"{{"sha":"{HF_SHA}"}}"#).into_bytes(),
+            ),
+            (
+                "/api/models/org/model/revision/v2".into(),
+                format!(r#"{{"sha":"{sha2}"}}"#).into_bytes(),
+            ),
+            (format!("/org/model/resolve/{sha2}/a.tar"), new),
+        ]);
+        let http = spawn_index_http(
+            &format!("/org/model/resolve/{HF_SHA}/a.tar"),
+            old,
+            objects,
+            None,
+            None,
+        );
+        let _env = bind_hf(&http, dir.path());
+        let index = dir.path().join("index.sqlite");
+        let session = crate::Session::open(hf_request(
+            "hf://org/model@v1/a.tar",
+            Some(index.clone()),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(hf_read(&session, "/old.txt"), b"old bytes");
+        drop(session);
+        let session = crate::Session::open(hf_request(
+            "hf://org/model@v2/a.tar",
+            Some(index.clone()),
+            false,
+        ))
+        .unwrap();
+        assert!(session.lookup("/old.txt").unwrap().is_none());
+        assert_eq!(hf_read(&session, "/new.txt"), b"new bytes");
+        assert_eq!(
+            SqliteIndex::open_read_only(index)
+                .unwrap()
+                .metadata()
+                .unwrap()["hf.commit"],
+            sha2
+        );
+    }
+
+    /// Regression: .index.ptr siblings must resolve at the mounted SHA and use Hub credentials.
+    #[test]
+    fn regression_hf_sibling_pointer_discovered_at_pinned_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("a.tar");
+        fs::write(&tar, hf_tar("hello.txt", b"hi")).unwrap();
+        let index_bytes = make_sidecar_for(&tar);
+        let id = ratarmount_index::sha256_hex(&index_bytes);
+        let path = format!("/datasets/org/data/resolve/{HF_SHA}/a.tar");
+        let objects = std::collections::HashMap::from([
+            (
+                "/api/datasets/org/data/revision/main".into(),
+                format!(r#"{{"sha":"{HF_SHA}"}}"#).into_bytes(),
+            ),
+            (
+                format!("{path}.index.ptr"),
+                pointer_json_for_blob(&index_bytes),
+            ),
+            (format!("{path}.index.{id}.sqlite"), index_bytes),
+        ]);
+        let http = spawn_index_http_cfg(
+            &path,
+            fs::read(&tar).unwrap(),
+            objects,
+            None,
+            None,
+            false,
+            Some("Bearer hf_test_token".into()),
+        );
+        let env = bind_hf(&http, dir.path());
+        env.set("HF_TOKEN", "hf_test_token");
+        let repo = ratarmount_remote::HfRepo::resolve("hf://datasets/org/data/a.tar").unwrap();
+        let dest = dir.path().join("discovered.sqlite");
+        let mut opts = OpenOptions::default();
+        apply_hf_index_discovery(
+            &repo,
+            &mut opts,
+            fs::metadata(tar).unwrap().len(),
+            Some(&dest),
+        )
+        .unwrap();
+        assert_eq!(opts.index_file_path.as_deref(), Some(dest.as_path()));
+        let gets = http.gets.lock().unwrap();
+        assert!(gets.contains(&format!("{path}.index.ptr")));
+        assert!(gets.contains(&format!("{path}.index.{id}.sqlite")));
+        assert!(!well_known_get_logged(&gets, &path));
+        assert_eq!(gets.iter().filter(|p| p.contains("/revision/")).count(), 1);
     }
 
     const SMB_EXPORT_PW: &str = "EXPORT_SERVER_PW_7f3c9a";
@@ -1792,6 +2228,7 @@ mod tests {
             link_on_archive,
             require_cookie,
             false,
+            None,
         )
     }
 
@@ -1800,7 +2237,7 @@ mod tests {
         archive_bytes: Vec<u8>,
         objects: std::collections::HashMap<String, Vec<u8>>,
     ) -> IndexHttp {
-        spawn_index_http_cfg(archive_path, archive_bytes, objects, None, None, true)
+        spawn_index_http_cfg(archive_path, archive_bytes, objects, None, None, true, None)
     }
 
     fn spawn_index_http_cfg(
@@ -1810,6 +2247,7 @@ mod tests {
         link_on_archive: Option<String>,
         require_cookie: Option<String>,
         ignore_range: bool,
+        require_bearer: Option<String>,
     ) -> IndexHttp {
         use std::io::{BufRead, BufReader, Write as IoWrite};
         use std::net::TcpListener;
@@ -1832,6 +2270,7 @@ mod tests {
                 }
                 let mut range_hdr: Option<String> = None;
                 let mut cookie_hdr: Option<String> = None;
+                let mut bearer_hdr: Option<String> = None;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).is_err() {
@@ -1843,9 +2282,19 @@ mod tests {
                     if let Some(v) = line.strip_prefix("Range:") {
                         range_hdr = Some(v.trim().to_string());
                     }
+                    if let Some(v) = line.strip_prefix("Authorization:") {
+                        bearer_hdr = Some(v.trim().to_string());
+                    }
                     if let Some(v) = line.strip_prefix("Cookie:") {
                         cookie_hdr = Some(v.trim().to_string());
                     }
+                }
+                if let Some(ref want) = require_bearer {
+                    assert_eq!(
+                        bearer_hdr.as_deref(),
+                        Some(want.as_str()),
+                        "Hub sidecar requests require Bearer auth"
+                    );
                 }
                 if let Some(ref want) = require_cookie {
                     if cookie_hdr.as_deref() != Some(want.as_str()) {
@@ -1880,7 +2329,7 @@ mod tests {
                     let msg = b"not found";
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 404 Not Found\r\nX-Error-Code: EntryNotFound\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         msg.len()
                     );
                     if !is_head {
@@ -1963,6 +2412,7 @@ mod tests {
     /// fetches the sidecar when local folder candidates miss (pointer 404 continues).
     #[test]
     fn apply_remote_index_discovery_follows_archive_link() {
+        let _env = EnvGuard::acquire(&[]);
         use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2009,6 +2459,7 @@ mod tests {
     /// Regression: pointer + blob + tarstats success skips well-known GET.
     #[test]
     fn apply_remote_index_discovery_pointer_blob_skips_well_known() {
+        let _env = EnvGuard::acquire(&[]);
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("archive.tar");
         let archive_bytes = vec![b'B'; 1024];
@@ -2053,6 +2504,7 @@ mod tests {
     /// Regression: pointer 404 still finds describedby.
     #[test]
     fn apply_remote_index_discovery_pointer_404_falls_back_describedby() {
+        let _env = EnvGuard::acquire(&[]);
         use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2181,6 +2633,7 @@ mod tests {
     /// Regression: pointer blob sha256 ≠ index_id continues to well-known.
     #[test]
     fn apply_remote_index_discovery_pointer_blob_id_mismatch_falls_back_well_known() {
+        let _env = EnvGuard::acquire(&[]);
         let dir = tempfile::tempdir().unwrap();
         let good = dir.path().join("good.tar");
         let other = dir.path().join("other.tar");
