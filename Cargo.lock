@@ -3306,6 +3306,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratarmount-formats-tensors"
+version = "0.1.34"
+dependencies = [
+ "ratarmount-compress",
+ "ratarmount-core",
+ "ratarmount-index",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ratarmount-formats-udf"
 version = "0.1.34"
 dependencies = [
@@ -3518,6 +3531,7 @@ dependencies = [
  "ratarmount-formats-sqlar",
  "ratarmount-formats-squashfs",
  "ratarmount-formats-tar",
+ "ratarmount-formats-tensors",
  "ratarmount-formats-udf",
  "ratarmount-formats-vhd",
  "ratarmount-formats-vmdk",

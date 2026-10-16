@@ -70,6 +70,10 @@ use ratarmount_formats_squashfs::{
     looks_like_squashfs, looks_like_squashfs_reader, SquashFsMountSource,
 };
 use ratarmount_formats_tar::{SingleFileMountSource, SqliteIndexedTar};
+#[cfg(feature = "tensors")]
+use ratarmount_formats_tensors::{
+    looks_like_gguf, looks_like_safetensors, looks_like_safetensors_reader, TensorsMountSource,
+};
 #[cfg(feature = "udf")]
 use ratarmount_formats_udf::{looks_like_udf, looks_like_udf_reader, UdfMountSource};
 #[cfg(feature = "vhd")]
@@ -156,6 +160,8 @@ enum FormatBackend {
     Pdf,
     #[cfg(feature = "html")]
     Html,
+    #[cfg(feature = "tensors")]
+    Tensors,
     #[cfg(feature = "libarchive")]
     Libarchive,
     Tar,
@@ -214,6 +220,8 @@ const DEFAULT_FORMAT_PROBE_ORDER: &[FormatBackend] = &[
     FormatBackend::Pdf,
     #[cfg(feature = "html")]
     FormatBackend::Html,
+    #[cfg(feature = "tensors")]
+    FormatBackend::Tensors,
     #[cfg(feature = "libarchive")]
     FormatBackend::Libarchive,
     FormatBackend::Tar,
@@ -285,6 +293,8 @@ fn parse_format_backend(name: &str) -> Option<FormatBackend> {
         "pdf" => FormatBackend::Pdf,
         #[cfg(feature = "html")]
         "html" | "htm" => FormatBackend::Html,
+        #[cfg(feature = "tensors")]
+        "tensors" | "safetensors" | "gguf" | "tensorsmountsource" => FormatBackend::Tensors,
         // RAR/RPM have no dedicated Rust backend; prefer libarchive when requested.
         #[cfg(feature = "libarchive")]
         "rar" | "rarfile" | "rpm" => FormatBackend::Libarchive,
@@ -572,6 +582,16 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "tensors")]
+        FormatBackend::Tensors => {
+            if !looks_like_safetensors(path) && !looks_like_gguf(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                TensorsMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
         #[cfg(feature = "libarchive")]
         FormatBackend::Libarchive => {
             if !looks_like_libarchive(path) {
@@ -704,7 +724,7 @@ mod split_open_tests {
     }
 
     /// K7b locked sequence: Udf immediately before Iso; after Fat: Exfat, Ntfs,
-    /// Dmg, Wim, Block, Qcow2, Vhd, Vmdk; Ogg, Pdf, Html, Libarchive, Tar last.
+    /// Dmg, Wim, Block, Qcow2, Vhd, Vmdk; Ogg, Pdf, Html, Tensors, Libarchive, Tar last.
     #[test]
     fn probe_order_f8() {
         #[cfg(all(
@@ -766,6 +786,8 @@ mod split_open_tests {
                     "Ogg",
                     "Pdf",
                     "Html",
+                    #[cfg(feature = "tensors")]
+                    "Tensors",
                     "Libarchive",
                     "Tar",
                 ]
@@ -868,6 +890,7 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
 ///
 /// Supports:
 /// - **7z**, **ZIP**, uncompressed **TAR**
+/// - **safetensors** and **GGUF** tensor containers
 /// - **gzip / zstd / bzip2 / xz** when the body is a compressed TAR (e.g. `.tar.gz`
 ///   embedded in a store 7z) — seekable decompress + in-memory TAR index
 /// - **CPIO**, **AR**, **UDF** (before ISO on mixed NSR02/NSR03 discs), **ISO 9660**,
@@ -1218,6 +1241,20 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             if looks_vmdk {
                 return map_nested_open("VMDK", label, || {
                     VmdkMountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+
+        #[cfg(feature = "tensors")]
+        {
+            let looks_tensors = head.starts_with(b"GGUF")
+                || head.starts_with(b"FUGG")
+                || name_suggests_ext(label, &["safetensors", "gguf"])
+                || looks_like_safetensors_reader(&mut reader);
+            reader.seek(SeekFrom::Start(0))?;
+            if looks_tensors {
+                return map_nested_open("Tensors", label, || {
+                    TensorsMountSource::open_from_reader(reader, label, None, &opts, VERSION)
                 });
             }
         }
@@ -1657,6 +1694,7 @@ fn open_nested_ar_with_durable(
     feature = "qcow2",
     feature = "sqlar",
     feature = "squashfs",
+    feature = "tensors",
     feature = "udf",
     feature = "vhd",
     feature = "vmdk",
@@ -4421,6 +4459,23 @@ pub fn build_mount_source_ex(
         .as_deref()
         .map(parse_recursive_extensions)
         .unwrap_or_default();
+    #[cfg(feature = "tensors")]
+    let ext_set = {
+        let mut ext_set = ext_set;
+        // Tensor containers join the archive category without widening explicit
+        // suffix selections such as `--recursive-extensions .tar`.
+        if comp.recursive_extensions.as_deref().is_none_or(|spec| {
+            spec.split(',')
+                .any(|token| matches!(token.trim(), "/archive" | "/all"))
+        }) {
+            for suffix in [".safetensors", ".gguf"] {
+                if !ext_set.suffixes.iter().any(|entry| entry == suffix) {
+                    ext_set.suffixes.push(suffix.to_string());
+                }
+            }
+        }
+        ext_set
+    };
     let mut sources = Vec::new();
     let mut remotes = Vec::new();
     // Per-input clone of the CLI options. `read_only_index` may clear write
@@ -8284,3 +8339,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "tensors"))]
+#[path = "factory_tensors_tests.rs"]
+mod tensors_tests;
