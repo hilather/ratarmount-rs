@@ -1,7 +1,8 @@
 # Gzip binding decision (PR-08a / PR-08b)
 
-**Date:** 2026-07-25 (updated 2026-08-01)  
-**Decision:** **G3** (pure Rust Tier A+B via `flate2` / `miniz_oxide`).
+**Date:** 2026-07-25 (updated 2026-08-01 and 2026-10-16)
+
+**Decision:** **G3** (pure Rust Tier A+B via `flate2` / `miniz_oxide`); packaged builds keep `gzip-rapidgzip` off.
 
 ## Options considered
 
@@ -108,6 +109,46 @@ Default `xz -c` emits **one block**. Open can still parse Index with a few range
 | Default CI | Feature **off** (not compiled by default CI; ISA-L needs system lib) |
 
 ### Residual — performance (thruput / cost)
+
+### Packaged-build gate (AI-GZ, 2026-10-16)
+
+The package scripts continue to compile without `gzip-rapidgzip`. On `brewtop`
+(x86_64 Linux, rustc 1.98.0, 12 logical CPUs), the existing
+`compare-gzip-backends.sh` harness measured three cold-index runs on its
+64 MiB half-zero / half-random corpus (`gzip -1`, `-P gzip:8`; median shown):
+
+| Archive | G3 median | rapidgzip median | rapidgzip / G3 |
+|---------|-----------|------------------|----------------|
+| `large-64m.tar.gz` | 0.0547 s | 0.4695 s | 8.6× slower |
+| `large-64m.bin.gz` | 0.1828 s | 0.8525 s | 4.7× slower |
+| `small-100.tar.gz` | 0.1606 s | 0.2468 s | 1.5× slower |
+
+The three timed samples varied under machine load, but rapidgzip was slower in
+every sample for all three corpora. These are cold-index / full-decode times;
+the harness could not measure FUSE sequential reads because `/dev/fuse` is not
+available in the worker. The Python reference was skipped because the sibling
+checkout lacked the `ratarmountcore` Python dependency. Thus these measurements
+do not establish FUSE throughput or Python parity, and they do not support
+turning the feature on in package builds.
+
+The release binary built with default features was **45,674,848 bytes**; with
+`gzip-rapidgzip`, **47,288,904 bytes** (+1,614,056 bytes, +3.5%). This comparison
+used the default `export-parquet` feature and did not include the package-only
+`nfsv4,sftp-russh` features. The feature build uses pure Rust `rapidgzip-core`
+(edition 2024, rustc ≥1.87); there is no C++ compiler requirement. ISA-L remains
+separate and is not included.
+
+Decision: keep `gzip-rapidgzip` out of native, portable, AppImage, and macOS
+package feature lists. The measured cold-index regressions fail the AI-GZ
+enablement gate. The `ratarmount-compress` release build with
+`gzip-rapidgzip` succeeded under rustc 1.90 in the Debian bullseye container
+(glibc 2.31, GCC 10.2), confirming the backend crate builds on the portable
+baseline. The full app package build was blocked before Cargo by stale bullseye
+mirror 404s while installing `libarchive-dev` and OpenSSL headers. The macOS
+arm64 cross-check was also inconclusive: the Linux worker lacks Apple clang
+and the macOS SDK, so bundled zlib's C files rejected Apple's `-arch` flags.
+Neither failure points to rapidgzip itself; native macOS package CI remains the
+meaningful full check. The rapidgzip regression tests passed on Linux.
 
 Separate from wiring (path/nested/Range + GZIDX **done**; nested fail→G3 **R1 done**): even on the verified path FUSE open, **rapidgzip is not yet claimed G3-competitive** on small single-member corpora without a post-P2/P4 re-bench, and **default remains G3**. Python rapidgzip thruput parity is still a thruput residual (not a missing wire). Integration knobs from [P1–P5](tasks/rapidgzip-perf-batch.md) **all done**; batch residuals [R1–R5](tasks/rapidgzip-residual-batch.md) **all done** — remaining product gaps are thruput re-bench, large nested mutex, nested imported-index side table, and default-on policy.
 
