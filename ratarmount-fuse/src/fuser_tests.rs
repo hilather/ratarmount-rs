@@ -295,17 +295,21 @@ mod protocol {
         use ratarmount_compositing::FolderMountSource;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file"), b"payload").unwrap();
-        for (mode, offered, expected) in [
-            (PassthroughMode::Auto, true, true),
-            (PassthroughMode::Auto, false, false),
-            (PassthroughMode::Off, true, false),
-            (PassthroughMode::On, true, true),
+        for (mode, offered, privileged, eligible, expected) in [
+            (PassthroughMode::Auto, true, true, true, true),
+            (PassthroughMode::Auto, true, false, true, false),
+            (PassthroughMode::Auto, true, true, false, false),
+            (PassthroughMode::Auto, false, true, true, false),
+            (PassthroughMode::Off, true, true, true, false),
+            (PassthroughMode::On, true, false, true, true),
         ] {
             let source = Arc::new(FolderMountSource::new(dir.path()).unwrap());
-            let fs = RatarmountFs::new(source, None).with_passthrough(PassthroughOptions {
+            let mut fs = RatarmountFs::new(source, None).with_passthrough(PassthroughOptions {
                 mode,
                 ..Default::default()
             });
+            fs.passthrough_auto_privilege = Some(privileged);
+            fs.passthrough_readonly_mount = eligible;
             let caps = if offered {
                 InitFlags::all()
             } else {
@@ -332,6 +336,19 @@ mod protocol {
             harness.call(18, ino, &release);
             harness.finish();
         }
+    }
+
+    /// Regression: a privileged compressed/virtual-only mount must not consume stacking depth.
+    #[test]
+    fn fuser_passthrough_auto_without_backing_sources_keeps_stack_depth_zero() {
+        let mut fs = RatarmountFs::new(Arc::new(Source), None);
+        fs.passthrough_auto_privilege = Some(true);
+        let harness = Harness::with_fs(mount_config(false, ""), 4096, fs);
+        let init = &harness.init[16..];
+        let flags = u32_at(init, 12) as u64 | ((u32_at(init, 32) as u64) << 32);
+        assert!(!InitFlags::from_bits_retain(flags).contains(InitFlags::FUSE_PASSTHROUGH));
+        assert_eq!(u32_at(init, 36), 0);
+        harness.finish();
     }
 
     /// Regression: ABI 7.40 availability must not enable passthrough, larger I/O, or caching flags.

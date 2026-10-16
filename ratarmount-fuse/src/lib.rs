@@ -556,6 +556,10 @@ struct DirCacheEntry {
 pub struct RatarmountFs {
     passthrough: PassthroughOptions,
     passthrough_enabled: bool,
+    #[cfg(all(test, target_os = "linux"))]
+    passthrough_auto_privilege: Option<bool>,
+    #[cfg(target_os = "linux")]
+    passthrough_state: passthrough::linux::State,
     // Writable overlay inodes cannot mix policy-enforcing daemon opens with
     // passthrough opens. Only an explicitly RO mount can pass overlay fds.
     passthrough_readonly_mount: bool,
@@ -636,6 +640,12 @@ impl RatarmountFs {
         Self {
             passthrough: PassthroughOptions::default(),
             passthrough_enabled: false,
+            #[cfg(all(test, target_os = "linux"))]
+            passthrough_auto_privilege: None,
+            #[cfg(target_os = "linux")]
+            passthrough_state: passthrough::linux::State::new(
+                PassthroughOptions::default().copy_total_max,
+            ),
             passthrough_readonly_mount: overlay.is_none(),
             #[cfg(target_os = "linux")]
             backing_opens: Mutex::new(passthrough::OpenBackings::default()),
@@ -661,17 +671,24 @@ impl RatarmountFs {
     /// Set passthrough negotiation and optional per-member copying.
     pub fn with_passthrough(mut self, options: PassthroughOptions) -> Self {
         self.passthrough = options;
+        #[cfg(target_os = "linux")]
+        {
+            self.passthrough_state = passthrough::linux::State::new(options.copy_total_max);
+        }
         self
     }
 
     #[cfg(target_os = "linux")]
     fn passthrough_file(
         &self,
-        ino: u64,
+        _ino: u64,
         fh: u64,
         flags: i32,
-    ) -> std::io::Result<Option<std::fs::File>> {
-        if !self.passthrough_readonly_mount || flags & libc::O_ACCMODE != libc::O_RDONLY {
+    ) -> std::io::Result<Option<passthrough::linux::PreparedBacking>> {
+        if self.passthrough_state.denied()
+            || !self.passthrough_readonly_mount
+            || flags & libc::O_ACCMODE != libc::O_RDONLY
+        {
             return Ok(None);
         }
         let fi = {
@@ -682,21 +699,36 @@ impl RatarmountFs {
                     use std::os::fd::BorrowedFd;
                     let fd = unsafe { BorrowedFd::borrow_raw(*fd) }.try_clone_to_owned()?;
                     let file = std::fs::File::from(fd);
-                    return Ok(file.metadata()?.is_file().then_some(file));
+                    let len = file.metadata()?.len();
+                    return passthrough::linux::prepare(
+                        ratarmount_core::BackingExtent {
+                            file,
+                            offset: 0,
+                            len,
+                        },
+                        self.passthrough,
+                        &self.passthrough_state,
+                        passthrough::linux::cache_parent,
+                    );
                 }
                 Some(OpenBackend::Source {
                     file_info,
                     detached: false,
                     ..
                 }) => Some(file_info.clone()),
-                Some(OpenBackend::Empty) => self.cached_fi(ino),
+                Some(OpenBackend::Empty) => None,
                 _ => None,
             }
         };
         let Some(extent) = fi.and_then(|fi| self.source.backing_extent(&fi)) else {
             return Ok(None);
         };
-        passthrough::linux::prepare(extent, self.passthrough, passthrough::linux::cache_parent)
+        passthrough::linux::prepare(
+            extent,
+            self.passthrough,
+            &self.passthrough_state,
+            passthrough::linux::cache_parent,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -711,17 +743,21 @@ impl RatarmountFs {
             return None;
         }
         self.backing_opens.lock().unwrap().open(ino, fh, || {
-            let result: std::io::Result<_> = (|| {
-                let Some(file) = self.passthrough_file(ino, fh, flags)? else {
-                    return Ok(None);
-                };
-                let id = reply.open_backing(&file)?;
-                debug!("FUSE passthrough open ino={ino}");
-                Ok(Some(passthrough::linux::RegisteredBacking {
-                    id,
-                    _file: file,
-                }))
-            })();
+            let result = self
+                .passthrough_state
+                .register(
+                    || self.passthrough_file(ino, fh, flags),
+                    |file| reply.open_backing(file),
+                )
+                .map(|registered| {
+                    registered.map(|(id, prepared)| {
+                        debug!("FUSE passthrough open ino={ino}");
+                        passthrough::linux::RegisteredBacking {
+                            id,
+                            _prepared: prepared,
+                        }
+                    })
+                });
             match result {
                 Ok(backing) => backing,
                 Err(e) => {
@@ -2441,28 +2477,38 @@ fn raise_nofile_soft_to_hard() {
 impl Filesystem for RatarmountFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         raise_nofile_soft_to_hard();
-        let supported = cfg!(target_os = "linux")
-            && config.kernel_abi() >= fuser::Version(7, 40)
-            && config
-                .capabilities()
-                .contains(fuser::InitFlags::FUSE_PASSTHROUGH);
-        self.passthrough_enabled = passthrough::negotiate(self.passthrough.mode, supported)?;
-        if self.passthrough_enabled {
-            config.set_max_stack_depth(1).map_err(|_| {
-                std::io::Error::other("cannot configure FUSE passthrough stack depth")
-            })?;
-            config
-                .add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH)
-                .map_err(|_| std::io::Error::other("cannot negotiate FUSE passthrough"))?;
+        #[cfg(target_os = "linux")]
+        {
+            let supported = config.kernel_abi() >= fuser::Version(7, 40)
+                && config
+                    .capabilities()
+                    .contains(fuser::InitFlags::FUSE_PASSTHROUGH);
+            let privileged = passthrough::linux::has_initial_sys_admin();
+            #[cfg(test)]
+            let privileged = self.passthrough_auto_privilege.unwrap_or(privileged);
+            let eligible = self.passthrough_readonly_mount
+                && (self.overlay.is_some() || self.source.supports_backing_extents());
+            self.passthrough_enabled =
+                passthrough::negotiate(self.passthrough.mode, supported, privileged && eligible)?;
+            if self.passthrough_enabled {
+                config.set_max_stack_depth(1).map_err(|_| {
+                    std::io::Error::other("cannot configure FUSE passthrough stack depth")
+                })?;
+                config
+                    .add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH)
+                    .map_err(|_| std::io::Error::other("cannot negotiate FUSE passthrough"))?;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.passthrough_enabled = passthrough::negotiate(self.passthrough.mode, false, false)?;
         }
         info!(
             "FUSE I/O mode: {}",
-            if self.passthrough_enabled && self.passthrough_readonly_mount {
-                "passthrough for eligible opens (daemon fallback)"
-            } else if self.passthrough_enabled {
-                "daemon (writable overlay; passthrough negotiated)"
+            if self.passthrough_enabled {
+                "daemon until backing registration (passthrough negotiated)"
             } else {
-                "daemon (passthrough off or unavailable)"
+                "daemon (passthrough off, unavailable, unprivileged, or no eligible source)"
             }
         );
         // ABI 7.12 left Linux's 32-page I/O cap and 12/9 background limits
@@ -2994,6 +3040,10 @@ pub fn mount_blocking_with_passthrough(
     // (thread exits), and the dropped sender ends `recv`.
     let kernel_notify = Arc::clone(&fs.kernel_notify);
     let session = fuser::Session::new(fs, mountpoint.as_ref(), &config)?;
+    #[cfg(target_os = "linux")]
+    if passthrough.mode == PassthroughMode::On {
+        passthrough::linux::probe(&session)?;
+    }
     let (tx, notifier_thread) = spawn_notifier(session.notifier());
     kernel_notify.install(tx);
     let res = fuse_session_result(session.run());
@@ -3254,6 +3304,32 @@ mod tests {
         }
     }
 
+    /// Regression: an empty open must not expose a host file that grew after lookup.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn passthrough_empty_open_stays_empty_after_host_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty");
+        std::fs::write(&path, b"").unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(dir.path()).unwrap());
+        let fs = RatarmountFs::new(source, None);
+        let ino = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("empty"))
+            .unwrap()
+            .0;
+        let (fh, _) = fs.open_inode(ino, libc::O_RDONLY).unwrap();
+        assert!(matches!(
+            fs.handles.lock().unwrap().get(&fh),
+            Some(OpenBackend::Empty)
+        ));
+        std::fs::write(path, b"must remain invisible to this empty handle").unwrap();
+        assert!(fs
+            .passthrough_file(ino, fh, libc::O_RDONLY)
+            .unwrap()
+            .is_none());
+        assert!(fs.read_handle(fh, 0, 4096).unwrap().is_empty());
+    }
+
     /// Regression: passthrough must not bypass overlay policy, including a later writer.
     #[cfg(target_os = "linux")]
     #[test]
@@ -3262,6 +3338,7 @@ mod tests {
         let mut overlay = WriteOverlay::new(Arc::new(EmptyBase), dir.path()).unwrap();
         let fd = overlay.create_file("/file", 0o644).unwrap();
         overlay.close_overlay_fd(fd);
+        std::fs::write(dir.path().join("file"), b"payload").unwrap();
         overlay.set_policy(Some(Arc::new(TestPolicy)));
         let overlay = Arc::new(overlay);
         let mut fs = RatarmountFs::new(overlay.clone(), Some(overlay.clone()));
@@ -3284,7 +3361,7 @@ mod tests {
             .unwrap();
         use std::os::unix::fs::MetadataExt;
         assert_eq!(
-            file.metadata().unwrap().ino(),
+            file.file.metadata().unwrap().ino(),
             std::fs::metadata(dir.path().join("file")).unwrap().ino()
         );
         assert!(fs

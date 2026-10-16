@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(20);
 
-fn available() -> bool {
+fn fuse_available() -> bool {
     if !Path::new("/dev/fuse").exists() {
         eprintln!("skip: /dev/fuse unavailable");
         return false;
@@ -22,6 +22,35 @@ fn available() -> bool {
         .is_err()
     {
         eprintln!("skip: fusermount3 unavailable");
+        return false;
+    }
+    true
+}
+
+fn privileged() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let caps = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("CapEff:")
+                .and_then(|s| u64::from_str_radix(s.trim(), 16).ok())
+        })
+        .unwrap_or(0);
+    caps & (1 << 21) != 0
+        && fs::metadata("/proc/self/ns/user").is_ok_and(|ns| ns.ino() == 0xeffffffd)
+}
+
+fn available() -> bool {
+    if !fuse_available() {
+        return false;
+    }
+    if !privileged() {
+        assert!(
+            std::env::var_os("RATARMOUNT_TEST_REQUIRE_PASSTHROUGH").is_none(),
+            "CAP_SYS_ADMIN in initial user namespace required"
+        );
+        eprintln!("skip: passthrough on requires CAP_SYS_ADMIN in the initial user namespace");
         return false;
     }
     true
@@ -201,7 +230,10 @@ fn fuse_passthrough_folder_and_tar_identical_bytes() {
             assert_bytes(&mount, &payload);
             let logs = mount.logs();
             if mode == "on" {
-                assert!(logs.contains("FUSE I/O mode: passthrough"), "{logs}");
+                assert!(
+                    logs.contains("passthrough registration probe succeeded"),
+                    "{logs}"
+                );
                 if std::env::var_os("RATARMOUNT_TEST_REQUIRE_PASSTHROUGH").is_some() {
                     assert!(
                         logs.lines()
@@ -237,11 +269,13 @@ fn fuse_passthrough_overlay_readonly_and_writable_modes() {
         let mount = Mount::start(dir.path(), &folder, "on", false, Some((&overlay, readonly)));
         assert_bytes(&mount, &payload);
         if readonly {
-            assert!(mount.logs().contains("FUSE I/O mode: passthrough"));
+            assert!(mount
+                .logs()
+                .contains("passthrough registration probe succeeded"));
         } else {
             assert!(mount
                 .logs()
-                .contains("FUSE I/O mode: daemon (writable overlay"));
+                .contains("FUSE I/O mode: daemon until backing registration"));
             let path = mount.path.join("file");
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
@@ -258,5 +292,64 @@ fn fuse_passthrough_overlay_readonly_and_writable_modes() {
                 .expect("concurrent overlay opens/read/write failed");
         }
         mount.finish();
+    }
+}
+
+/// Regression: unprivileged auto mounts retain daemon I/O; forced on fails at startup.
+#[test]
+fn fuse_passthrough_unprivileged_auto_and_on() {
+    if !fuse_available() {
+        return;
+    }
+    if privileged() {
+        eprintln!("skip: unprivileged passthrough check requires no initial CAP_SYS_ADMIN");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("folder");
+    fs::create_dir(&folder).unwrap();
+    let payload = vec![0x61; 4096];
+    fs::write(folder.join("file"), &payload).unwrap();
+    let mount = Mount::start(dir.path(), &folder, "auto", false, None);
+    assert_bytes(&mount, &payload);
+    assert!(mount.logs().contains("FUSE I/O mode: daemon"));
+    assert!(!mount.logs().contains("passthrough negotiated"));
+    mount.finish();
+
+    let log = dir.path().join("forced.log");
+    let child = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["-f", "--passthrough", "on", "-d", "3"])
+        .arg(&folder)
+        .arg(dir.path().join("mnt"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(File::create(&log).unwrap()))
+        .spawn()
+        .unwrap();
+    let mut forced = Mount {
+        child,
+        path: dir.path().join("mnt"),
+        log,
+    };
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        if let Some(status) = forced.child.try_wait().unwrap() {
+            let logs = forced.logs();
+            assert!(
+                !status.success(),
+                "forced mount unexpectedly succeeded: {logs}"
+            );
+            // Older kernels fail negotiation before they reach the permission probe.
+            assert!(
+                logs.contains("CAP_SYS_ADMIN") || logs.contains("--passthrough on requires"),
+                "{logs}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "forced mount did not reject startup: {}",
+            forced.logs()
+        );
+        thread::sleep(Duration::from_millis(30));
     }
 }

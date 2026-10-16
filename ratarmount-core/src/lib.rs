@@ -691,6 +691,13 @@ pub trait MountSource: Send + Sync {
 
     fn open(&self, file_info: &FileInfo, buffering: i32) -> io::Result<Box<dyn ArchiveRead>>;
 
+    /// Whether this source can supply backing extents for any regular files.
+    /// This conservative hint avoids negotiating kernel stacking limits for
+    /// sources which can never use passthrough. Wrappers forward the hint.
+    fn supports_backing_extents(&self) -> bool {
+        false
+    }
+
     /// Optional backing for regular file bytes. Compressed, sparse, generated,
     /// or otherwise transformed content must return `None`. Errors discovering
     /// an extent also return `None`; callers retain the ordinary read path.
@@ -992,6 +999,7 @@ mod tests {
             }
         }
         assert!(Dummy.backing_extent(&create_root_file_info()).is_none());
+        assert!(!Dummy.supports_backing_extents());
         let dents = Dummy.list_dirents("/").expect("dirents");
         assert_eq!(dents.len(), 1);
         assert_eq!(dents[0].name, "a");

@@ -778,6 +778,12 @@ impl MountSource for UnionMountSource {
             .fold(0u64, |acc, s| acc.saturating_add(s.content_generation()))
     }
 
+    fn supports_backing_extents(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| source.supports_backing_extents())
+    }
+
     fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
         if let Some(si) = self.source_from_info(file_info) {
             if let Some(src) = self.sources.get(si) {

@@ -237,6 +237,10 @@ impl MountSource for FolderMountSource {
         Ok(Box::new(File::open(real)?))
     }
 
+    fn supports_backing_extents(&self) -> bool {
+        true
+    }
+
     fn backing_extent(&self, fi: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
         if fi.mode & S_IFMT != ratarmount_core::S_IFREG || !fi.linkname.is_empty() {
             return None;
@@ -295,11 +299,18 @@ mod tests {
         ));
         let cache =
             ratarmount_index::PayloadCache::with_dir(dir.path().join("cache"), Some(1024), 1024);
-        let source = crate::PayloadCacheLayer::new(automount, cache);
+        let source = crate::ControlFolderMountSource::new(
+            Arc::new(crate::PayloadCacheLayer::new(automount, cache)),
+            crate::ControlFolderOptions::enabled(),
+        );
+        assert!(source
+            .backing_extent(&source.lookup("/.ratarmount-control/status", 0).unwrap())
+            .is_none());
         for (path, expected) in [
             ("/data/file", b"payload".as_slice()),
             ("/data/file.versions/1", b"wrong source".as_slice()),
         ] {
+            assert!(source.supports_backing_extents());
             let fi = source.lookup(path, 0).unwrap();
             let mut extent = source.backing_extent(&fi).unwrap();
             assert_eq!(extent.offset, 0);

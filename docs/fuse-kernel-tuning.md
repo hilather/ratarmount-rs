@@ -178,20 +178,29 @@ These are **illustrative** of what the harness is designed to surface; re-run lo
 
 ## Linux FUSE passthrough
 
-`--passthrough auto|on|off` defaults to `auto`. On Linux 6.9 or later,
-ratarmount negotiates `FUSE_PASSTHROUGH` only when the kernel advertises it
-(ABI 7.40 or later), with a maximum stacking depth of 1. `auto` silently keeps
-daemon I/O when unavailable; `on` rejects an unsupported mount with a clear
-error; `off` keeps the existing read and page-cache behavior. macOS uses daemon
-I/O (`on` reports unsupported).
+`--passthrough auto|on|off` defaults to `auto`. Linux 6.9 or later and
+`FUSE_PASSTHROUGH` (ABI 7.40) are required. `auto` negotiates only when the
+process has effective `CAP_SYS_ADMIN` in the **initial user namespace** and the
+mount has an eligible source type: a read-only folder, uncompressed local TAR,
+or read-only overlay. Unknown privileges, compressed-only sources and writable
+overlay mounts keep daemon I/O. Negotiation sets maximum stack depth to 1;
+avoiding it for unprivileged mounts preserves their ability to support stacked
+filesystems above ratarmount.
 
-Use `-d 2` to see the single mount-level `FUSE I/O mode:` log line. A negotiated
-mount can still serve individual files through the daemon. `-d 3` also logs
-successful backing registrations and per-open fallback errors. Current Linux
-requires `CAP_SYS_ADMIN` to register backing descriptors; a kernel advertising
-the capability does not guarantee that registration will succeed. Registration
-errors, including permission and filesystem stacking errors, fall back to daemon
-reads even with `on`. See the [kernel passthrough documentation](https://docs.kernel.org/filesystems/fuse/fuse-passthrough.html).
+`on` forces negotiation and probes regular-file backing registration before
+serving requests. A denied probe fails the mount with an error naming
+`CAP_SYS_ADMIN`; other probe failures also reject startup. `off` retains the
+existing read and page-cache behavior. macOS always uses daemon I/O and rejects
+`on`; Linux passthrough init calls are excluded from non-Linux builds.
+
+Use `-d 2` to see `FUSE I/O mode:` logs. The init line distinguishes negotiation
+from actual registration; the first successful file registration reports
+passthrough. An `EPERM` registration failure logs one warning and permanently
+disables preparation of new backings for that mount. `ELOOP`/`EXDEV` failures
+are remembered per backing filesystem (`st_dev`). Existing registrations remain
+pinned until their last release. Other per-open registration errors log at
+`-d 3` and keep daemon reads. See the
+[kernel passthrough documentation](https://docs.kernel.org/filesystems/fuse/fuse-passthrough.html).
 
 | Source | Eligibility |
 |--------|-------------|
@@ -200,39 +209,58 @@ reads even with `on`. See the [kernel passthrough documentation](https://docs.ke
 | Compressed TAR, sparse members, reader-backed/nested archives | Daemon reads |
 | Overlay files on an explicitly read-only mount (`-w overlay -o ro`) | Read-only whole-file fds, including when an overlay policy is installed |
 | Writable overlay mounts | Daemon I/O for all opens, preserving write policy, quota accounting, and live-commit behavior |
-| Future completed caches | `MountSource::backing_extent` can supply an open whole-file extent; partial caches must return `None` |
+| Future completed caches | Implement `supports_backing_extents` and supply a whole-file `backing_extent`; partial caches must return `None` |
+| Empty file handles | Always daemon reads, even if the host file subsequently grows |
 
 The kernel backing-file interface has **no offset**. Passing a TAR archive fd
 would expose its header as the first member byte. Instead, ratarmount prepares
 a private per-member file with byte zero at the member's first byte. It tries
-`FICLONERANGE` only when both the source offset and member length align to the
-filesystem block size. Reflinks require a supporting filesystem (such as btrfs
-or XFS with reflink enabled) and source and cache on the same filesystem.
-Ordinary TAR's 512-byte layout often fails the alignment check.
+`FICLONERANGE` for the aligned prefix and copies only the final partial block.
+The source and destination offsets must be congruent modulo the filesystem
+block size. Since the backing starts at byte zero, the member's **data offset
+must be block-aligned**. Its length need not be aligned, but a clone needs at
+least one full block. For 4 KiB blocks, only roughly one in eight possible
+512-byte TAR offsets is eligible. The upcoming shard tool will offer
+block-aligned member placement.
 
-Prepared files use a private `0700` directory under `$XDG_CACHE_HOME` (or
-`$HOME/.cache`), with `O_TMPFILE` where supported and an immediately unlinked
-file otherwise. Their fds last until the last concurrent open is released;
-they do not form a persistent member cache. Place the cache on the archive's
-filesystem for reflinks. Failure to create a cache or clone a member keeps
-daemon reads unless copying is explicitly allowed:
+Reflinks require a supporting filesystem (such as btrfs or reflink-enabled
+XFS). Ratarmount first creates an `O_TMPFILE` beside the archive, so source and
+target share a filesystem. If that directory is not writable, it tries the
+cache directory and temporary directory only when their `st_dev` matches the
+archive. Without a writable matching location it skips cloning. On filesystems
+without `O_TMPFILE`, it uses a private `0700` directory and an immediately
+unlinked file. Clone `ELOOP`/`EXDEV` failures are cached per source filesystem;
+opt-in bounded copying can still use another filesystem.
+
+Full copies use `$XDG_CACHE_HOME` (or `$HOME/.cache`). Prepared fds last until
+the last concurrent open is released; they are not a persistent member cache.
+Failure to create or clone a backing keeps daemon reads unless copying is
+explicitly allowed:
 
 ```bash
 # Clone eligible aligned members, otherwise read through the daemon:
 ratarmount --passthrough auto stored.tar /mnt
 
 # Permit copying individual members up to 64 MiB, including unaligned members:
-ratarmount --passthrough on --passthrough-copy --passthrough-copy-max 64M stored.tar /mnt
+ratarmount --passthrough on --passthrough-copy --passthrough-copy-max 64M \
+  --passthrough-copy-total-max 1G stored.tar /mnt
 
 # Compare the original daemon path:
 ratarmount --passthrough off stored.tar /mnt
 ```
 
-Copying requires **both** `--passthrough-copy` and a positive
+Full-member copying requires **both** `--passthrough-copy` and a positive
 `--passthrough-copy-max`; the default cap is `0` (off). The cap is per member,
-not a total mount budget. A copy completes before the open reply, so it can
-increase first-open latency and disk usage. Clone/copy failures always fall
-back; the member is never partially published.
+and `--passthrough-copy-total-max` separately limits copied bytes retained by
+all concurrently open backings (default **1 GiB**). It includes copied clone
+tails; whole-file fds and cloned blocks consume no copy budget. Budget exhaustion
+uses daemon reads. Reservations are released on preparation/registration failure
+or the last release of a registered inode; concurrent opens share a reservation.
+A total cap of `0` disables all copying, including clone tails.
+
+Copies complete before the open reply on the serial request worker, so they
+can increase first-open latency and disk usage. Clone/copy failures always fall
+back; partial files are never published.
 
 All concurrent opens of an inode reuse one registration. If its first open
 falls back, subsequent opens keep daemon I/O until its last release. Linux
@@ -255,9 +283,10 @@ cargo test -p ratarmount --test fuse_passthrough
 RATARMOUNT_TEST_REQUIRE_PASSTHROUGH=1 cargo test -p ratarmount --test fuse_passthrough
 ```
 
-The ordinary integration test checks bytes and the negotiated mode; it permits
-per-open registration fallback. The opt-in environment variable additionally
-requires actual registrations for the folder and copied TAR cases. Unit tests
+The privileged integration tests require initial-namespace `CAP_SYS_ADMIN` and
+check bytes plus the startup registration probe. The opt-in environment variable
+also requires actual registrations for the folder and copied TAR cases. A
+separate unprivileged test checks `auto` daemon mode and forced-on startup denial. Unit tests
 exercise negotiation and registration failure over a socket without `/dev/fuse`,
 copy limits, alignment, tmpfs fallback, and reflinks on btrfs/XFS. Set
 `RATARMOUNT_TEST_REFLINK_DIR` to choose the filesystem for the real clone test.

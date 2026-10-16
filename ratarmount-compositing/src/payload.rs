@@ -106,6 +106,10 @@ impl MountSource for PayloadCacheLayer {
         }
     }
 
+    fn supports_backing_extents(&self) -> bool {
+        self.inner.supports_backing_extents()
+    }
+
     fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
         self.inner.backing_extent(file_info)
     }

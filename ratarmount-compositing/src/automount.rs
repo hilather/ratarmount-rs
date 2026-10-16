@@ -1254,6 +1254,10 @@ impl MountSource for AutoMountLayer {
         self.root.content_generation()
     }
 
+    fn supports_backing_extents(&self) -> bool {
+        self.root.supports_backing_extents()
+    }
+
     fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
         if let Some(key) = Self::automount_key(file_info) {
             if key == "/" {

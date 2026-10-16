@@ -148,6 +148,62 @@ pub use write::{
     UstarPayload,
 };
 
+/// File reader with a private logical cursor and no shared seek state or lock.
+struct PositionalFile {
+    file: Arc<File>,
+    pos: u64,
+}
+
+impl PositionalFile {
+    fn read_at(&self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_at(buf, self.pos)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            // seek_read changes the OS cursor, but every reader supplies its
+            // own offset and never relies on that shared cursor.
+            self.file.seek_read(buf, self.pos)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = buf;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "positional file reads are unavailable on this platform",
+            ))
+        }
+    }
+}
+
+impl Read for PositionalFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.read_at(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for PositionalFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let (base, offset) = match pos {
+            SeekFrom::Start(pos) => (pos, 0),
+            SeekFrom::Current(offset) => (self.pos, offset),
+            SeekFrom::End(offset) => (self.file.metadata()?.len(), offset),
+        };
+        self.pos = base.checked_add_signed(offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek outside file offset range",
+            )
+        })?;
+        Ok(self.pos)
+    }
+}
+
 /// Mutex-backed `Read + Seek` for concurrent stencil opens (HTTP Range / Cursor / remote).
 struct SharedSeekReader {
     inner: Mutex<Box<dyn SeekRead>>,
@@ -218,7 +274,7 @@ impl Seek for PositionedSeekReader {
 enum ContentBackend {
     /// Plain file (uncompressed archive or materialised temp body).
     File {
-        file: File,
+        file: Arc<File>,
         _keep: Option<NamedTempFile>,
     },
     /// Seekable gzip (checkpoint decoder).
@@ -232,7 +288,10 @@ enum ContentBackend {
 impl ContentBackend {
     fn open_reader(&self) -> io::Result<ContentReader> {
         match self {
-            Self::File { file, .. } => Ok(ContentReader::File(file.try_clone()?)),
+            Self::File { file, .. } => Ok(ContentReader::File(PositionalFile {
+                file: Arc::clone(file),
+                pos: 0,
+            })),
             Self::Gzip(g) => Ok(ContentReader::Gzip(g.reader()?)),
             Self::Body(b) => Ok(ContentReader::Dyn(b.open_reader()?)),
             Self::Shared(s) => Ok(ContentReader::Shared(s.open_reader())),
@@ -242,7 +301,7 @@ impl ContentBackend {
 
 /// Concrete reader used by open paths.
 enum ContentReader {
-    File(File),
+    File(PositionalFile),
     Gzip(ratarmount_compress::SeekableGzipReader),
     Dyn(Box<dyn SeekRead>),
     Shared(PositionedSeekReader),
@@ -304,7 +363,7 @@ impl SqliteIndexedTar {
             archive_path,
             data_path,
             backend: ContentBackend::File {
-                file: data_file,
+                file: Arc::new(data_file),
                 _keep: materialised.take(),
             },
             index,
@@ -349,7 +408,7 @@ impl SqliteIndexedTar {
         let data_path = data_path.as_ref().to_path_buf();
         let mut file = File::open(&data_path)?;
         let backend = ContentBackend::File {
-            file: file.try_clone()?,
+            file: Arc::new(file.try_clone()?),
             _keep: materialised.take(),
         };
         Self::build_index_from_reader(
@@ -874,6 +933,11 @@ impl MountSource for SqliteIndexedTar {
         )))
     }
 
+    fn supports_backing_extents(&self) -> bool {
+        matches!(self.backend, ContentBackend::File { _keep: None, .. })
+            && self.archive_path == self.data_path
+    }
+
     fn backing_extent(&self, fi: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
         let ContentBackend::File { file, _keep: None } = &self.backend else {
             return None;
@@ -893,7 +957,7 @@ impl MountSource for SqliteIndexedTar {
             return None;
         }
         Some(ratarmount_core::BackingExtent {
-            file: file.try_clone().ok()?,
+            file: file.as_ref().try_clone().ok()?,
             offset: ud.offset,
             len: fi.size,
         })
@@ -3170,7 +3234,12 @@ mod tests {
             &mut None,
         )
         .unwrap();
+        assert!(source.supports_backing_extents());
         let fi = source.lookup("/member", 0).unwrap();
+        let mut reader = source.open(&fi, 0).unwrap();
+        let mut first = [0; 2];
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"pa");
         let mut extent = source.backing_extent(&fi).unwrap();
         assert_eq!(extent.offset, 512);
         assert_eq!(extent.len, 7);
@@ -3180,6 +3249,10 @@ mod tests {
         let mut bytes = [0; 7];
         extent.file.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"payload");
+        // Seeking the duplicated archive fd must not move an existing reader.
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).unwrap();
+        assert_eq!(remaining, b"yload");
         for kind in 0..7 {
             let mut bad = fi.clone();
             let UserData::Tar(ud) = &mut bad.userdata[0] else {
@@ -3216,6 +3289,7 @@ mod tests {
         assert!(source
             .backing_extent(&source.lookup("/member", 0).unwrap())
             .is_none());
+        assert!(!source.supports_backing_extents());
         let plain = dir.path().join("materialized.tar");
         std::fs::write(&plain, bytes).unwrap();
         let source = SqliteIndexedTar::create_index(
@@ -3230,6 +3304,110 @@ mod tests {
         assert!(source
             .backing_extent(&source.lookup("/member", 0).unwrap())
             .is_none());
+    }
+
+    /// Regression: parallel TAR member reads used a sibling's seek position.
+    #[test]
+    fn regression_parallel_member_readers_keep_independent_positions() {
+        let mut file = NamedTempFile::new().unwrap();
+        let payload: Vec<u8> = (0..=255).collect();
+        file.write_all(&payload).unwrap();
+        let backend = ContentBackend::File {
+            file: Arc::new(File::open(file.path()).unwrap()),
+            _keep: Some(file),
+        };
+        let barrier = std::sync::Barrier::new(4);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|member| {
+                    let mut reader = backend.open_reader().unwrap();
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let mut actual = Vec::new();
+                        for offset in 0..32 {
+                            reader.seek(SeekFrom::Start(member * 32 + offset)).unwrap();
+                            // Force the interleaving between StenciledFile's seek
+                            // and read: every sibling has sought before any reads.
+                            barrier.wait();
+                            let mut byte = [0];
+                            reader.read_exact(&mut byte).unwrap();
+                            actual.push(byte[0]);
+                            barrier.wait();
+                        }
+                        actual
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (member, actual) in results.iter().enumerate() {
+            assert_eq!(actual, &payload[member * 32..(member + 1) * 32]);
+        }
+    }
+
+    /// Regression: file-backed TAR readers must not queue behind a shared mutex.
+    /// Regular-file syscalls cannot be paused portably, so pin the reader's
+    /// entire state to Arc<File> + u64; the test above exercises concurrent I/O.
+    #[test]
+    fn regression_parallel_file_readers_share_only_file_without_mutex() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let backend = ContentBackend::File {
+            file: Arc::clone(&file),
+            _keep: None,
+        };
+        for _ in 0..2 {
+            // Exhaustive destructuring deliberately rejects additional state
+            // such as a shared lock, and the annotation rejects Arc<Mutex<File>>.
+            let ContentReader::File(PositionalFile { file: shared, pos }) =
+                backend.open_reader().unwrap()
+            else {
+                panic!("file backend must use positional I/O");
+            };
+            let shared: Arc<File> = shared;
+            assert!(Arc::ptr_eq(&shared, &file));
+            assert_eq!(pos, 0);
+        }
+    }
+
+    /// Regression: positional TAR cursors must preserve short-read, EOF and seek semantics.
+    #[test]
+    fn regression_positional_file_short_reads_and_seeks() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"abcdef").unwrap();
+        let mut reader = PositionalFile {
+            file: Arc::new(file),
+            pos: 0,
+        };
+        let mut buf = [0; 8];
+        assert_eq!(reader.read(&mut buf[..2]).unwrap(), 2);
+        assert_eq!(&buf[..2], b"ab");
+        assert_eq!(reader.seek(SeekFrom::Current(1)).unwrap(), 3);
+        assert_eq!(reader.read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], b"def");
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        assert_eq!(reader.seek(SeekFrom::End(-2)).unwrap(), 4);
+        assert_eq!(reader.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"ef");
+        assert_eq!(reader.seek(SeekFrom::Start(8)).unwrap(), 8);
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        reader.rewind().unwrap();
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert_eq!(
+            reader.seek(SeekFrom::Current(-1)).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(reader.stream_position().unwrap(), 0);
+        reader.seek(SeekFrom::Start(u64::MAX)).unwrap();
+        assert_eq!(
+            reader.seek(SeekFrom::Current(1)).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(reader.stream_position().unwrap(), u64::MAX);
+        reader.file.set_len(8).unwrap();
+        assert_eq!(reader.seek(SeekFrom::End(0)).unwrap(), 8);
     }
 
     /// Regression: #102, `Creating offset dictionary` panicked (exit 101) when

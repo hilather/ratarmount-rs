@@ -42,11 +42,16 @@ inode's mode to daemon I/O until its last release, avoiding mixed-mode EIO.
 
 On Linux, `Filesystem::init` receives `&mut fuser::KernelConfig`. Check
 `kernel_abi()` (at least `fuser::Version(7, 40)`) and
-`capabilities().contains(fuser::InitFlags::FUSE_PASSTHROUGH)`. Only when supported,
-call `add_capabilities(InitFlags::FUSE_PASSTHROUGH)` and
-`set_max_stack_depth(1)` (or 2 if backing files may themselves be on a stacked
-filesystem). Handle negotiation and backing-registration failures with the
-existing daemon path. Keep macOS on that path.
+`capabilities().contains(fuser::InitFlags::FUSE_PASSTHROUGH)`. Auto also requires
+initial-namespace `CAP_SYS_ADMIN` and an eligible source. Once selected,
+request `FUSE_PASSTHROUGH` and `set_max_stack_depth(1)`.
+Forced on negotiates whenever supported and probes registration after INIT,
+failing startup on error. All of
+these init calls are Linux-only; macOS keeps the daemon path. EPERM latches
+before future preparation, and ELOOP/EXDEV are cached per backing filesystem.
+Clones are created on the archive's filesystem with only the final partial
+block copied. Full copies and tails share the `--passthrough-copy-total-max`
+budget (default 1 GiB), released with the last open.
 
 At open, `ReplyOpen::open_backing(fd)` returns a managed `BackingId`;
 `opened_passthrough(FileHandle, FopenFlags, &BackingId)` sends the open reply.

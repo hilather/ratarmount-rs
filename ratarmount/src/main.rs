@@ -36,6 +36,7 @@ mod quiet_print;
 
 mod find;
 mod overlay_commit;
+mod overlay_stats;
 mod publish_index;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -55,7 +56,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     after_help = "Export sugar: ratarmount serve --nfs --http ARCHIVE\n\
                   Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem.\n\
                   Incompatible with --no-mount. Boolean flags remain the stable interface.\n\
-                  Locate: ratarmount find [--fts] [--hashes] [--offset-order] PATTERN ARCHIVE (no FUSE)."
+                  Locate: ratarmount find [--fts] [--hashes] [--offset-order] PATTERN ARCHIVE (no FUSE).\n\
+                  Statistics: ratarmount overlay-stats OVERLAY [--json] (no FUSE)."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -316,7 +318,7 @@ struct Args {
     #[arg(long = "readahead", default_value = "0", value_name = "BYTES")]
     readahead: String,
 
-    /// Linux >= 6.9 FUSE passthrough: auto negotiates when offered; on requires support.
+    /// Linux >= 6.9 FUSE passthrough: auto requires privileges and eligible sources; on probes support.
     #[arg(long, default_value = "auto", value_name = "auto|on|off")]
     passthrough: PassthroughMode,
 
@@ -327,6 +329,10 @@ struct Args {
     /// Maximum copied member size (bytes or K/M/G suffix); 0 disables copying.
     #[arg(long, default_value = "0", value_name = "BYTES", value_parser = parse_byte_size)]
     passthrough_copy_max: u64,
+
+    /// Total copied bytes held by concurrent passthrough opens (including clone tails).
+    #[arg(long, default_value = "1G", value_name = "BYTES", value_parser = parse_byte_size)]
+    passthrough_copy_total_max: u64,
 
     /// Recursion depth for --recursive (0 = deep default when combined with -r)
     #[arg(long = "recursion-depth", default_value_t = 0)]
@@ -418,6 +424,21 @@ struct Args {
     /// A missing uncompressed `.tar` or `.tar.zst` is created as an empty archive.
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
+
+    /// Protect root-relative paths (repeatable, comma-separated; quote globs).
+    #[arg(long, value_delimiter = ',', action = ArgAction::Append, requires = "write_overlay", conflicts_with = "commit_overlay")]
+    overlay_readonly: Vec<String>,
+
+    /// Maximum logical overlay bytes, including COW (bytes or binary K/M/G/T).
+    #[arg(long, value_parser = ratarmount_compositing::parse_overlay_size, requires = "write_overlay", conflicts_with = "commit_overlay")]
+    overlay_quota: Option<u64>,
+
+    /// Maximum overlay regular files and symlinks, including COW copies.
+    #[arg(long, requires = "write_overlay", conflicts_with = "commit_overlay")]
+    overlay_quota_files: Option<u64>,
+
+    #[arg(skip)]
+    overlay_stats: Option<overlay_stats::StatsArgs>,
 
     /// Commit write-overlay changes into a TAR (uncompressed / gzip / bzip2 / xz via GNU tar,
     /// or `.tar.zst` via frame splice) or ZIP (full rebuild). Does not mount; requires
@@ -541,6 +562,15 @@ where
     T: Into<OsString> + Clone,
 {
     let raw: Vec<OsString> = iter.into_iter().map(Into::into).collect();
+    if raw.get(1).is_some_and(|s| s == "overlay-stats") {
+        let stats = overlay_stats::StatsArgs::try_parse_from(
+            std::iter::once(OsString::from("ratarmount overlay-stats"))
+                .chain(raw.iter().skip(2).cloned()),
+        )?;
+        let mut args = Args::try_parse_from(&raw[..1])?;
+        args.overlay_stats = Some(stats);
+        return Ok(args);
+    }
     let find = raw.get(1).is_some_and(|s| s == "find");
     let serve = raw.get(1).is_some_and(|s| s == "serve");
     let stripped: Vec<OsString> = if find || serve {
@@ -557,6 +587,11 @@ where
         (stripped, false, false, false)
     };
     let mut args = Args::try_parse_from(stripped)?;
+    if !args.overlay_readonly.is_empty() {
+        ratarmount_compositing::ReadOnlyGlobs::new(&args.overlay_readonly).map_err(|e| {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string())
+        })?;
+    }
     args.serve = serve;
     args.find = find;
     args.find_fts = find_fts;
@@ -785,6 +820,17 @@ fn main() {
     // mount exists, so point dead stdio at /dev/null first.
     neutralize_dead_stdio();
     let args = parse_args_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
+
+    if let Some(stats) = &args.overlay_stats {
+        match overlay_stats::run(stats) {
+            Ok(output) => println!("{}", output.trim_end()),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     if args.print_features {
         // Features print does not need a full logger.
@@ -1182,6 +1228,7 @@ fn main() {
 
     let mut _temp_overlay: Option<tempfile::TempDir> = None;
     let mut overlay_arc: Option<Arc<WriteOverlay>> = None;
+    let mut overlay_quota: Option<Arc<ratarmount_compositing::OverlayQuota>> = None;
 
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
@@ -1200,6 +1247,36 @@ fn main() {
         match WriteOverlay::new(Arc::clone(&bundle.source), &overlay_path) {
             Ok(mut ov) => {
                 ov.set_encoding(&args.encoding);
+                if !args.overlay_readonly.is_empty()
+                    || args.overlay_quota.is_some()
+                    || args.overlay_quota_files.is_some()
+                {
+                    use ratarmount_compositing::{
+                        CompositeOverlayPolicy, OverlayPolicy, OverlayQuota, ReadOnlyGlobs,
+                    };
+                    let quota = match OverlayQuota::new(
+                        ov.root(),
+                        args.overlay_quota,
+                        args.overlay_quota_files,
+                    ) {
+                        Ok(quota) => Arc::new(quota),
+                        Err(e) => {
+                            eprintln!("error scanning write overlay: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let mut policies: Vec<Arc<dyn OverlayPolicy>> = Vec::new();
+                    if !args.overlay_readonly.is_empty() {
+                        policies.push(Arc::new(
+                            ReadOnlyGlobs::new(&args.overlay_readonly)
+                                .and_then(|rules| rules.with_overlay_root(ov.root()))
+                                .expect("validated read-only globs and overlay root"),
+                        ));
+                    }
+                    policies.push(quota.clone());
+                    ov.set_policy(Some(Arc::new(CompositeOverlayPolicy(policies))));
+                    overlay_quota = Some(quota);
+                }
                 let ov = Arc::new(ov);
                 bundle.source = Arc::clone(&ov) as Arc<dyn MountSource>;
                 overlay_arc = Some(ov);
@@ -1366,6 +1443,7 @@ fn main() {
         mode: args.passthrough,
         copy: args.passthrough_copy,
         copy_max: args.passthrough_copy_max,
+        copy_total_max: args.passthrough_copy_total_max,
     };
 
     // Optional control: Unix socket + in-FS `/.ratarmount-control/` (Python parity).
@@ -1381,17 +1459,28 @@ fn main() {
             inputs[0].clone(),
             open_opts.clone(),
         );
-        bundle.source = Arc::new(ControlFolderMountSource::new(
-            pre_control,
-            ControlFolderOptions::enabled()
-                .with_label(mp.display().to_string())
-                .with_on_unmount(Arc::new(move || {
-                    stop.store(true, Ordering::SeqCst);
-                    let _ = unmount(&mp_ctrl);
-                }))
-                .with_on_search(Arc::clone(&on_search)),
-        )) as Arc<dyn MountSource>;
-        start_control_interface(mp, Arc::clone(&control_stop), Some(on_search))
+        bundle.source = Arc::new(
+            ControlFolderMountSource::new(
+                pre_control,
+                ControlFolderOptions::enabled()
+                    .with_label(mp.display().to_string())
+                    .with_on_unmount(Arc::new(move || {
+                        stop.store(true, Ordering::SeqCst);
+                        let _ = unmount(&mp_ctrl);
+                    }))
+                    .with_on_search(Arc::clone(&on_search)),
+            )
+            .with_on_status(overlay_quota.clone().map(|quota| {
+                Arc::new(move || quota.usage().status_text())
+                    as Arc<dyn Fn() -> String + Send + Sync>
+            })),
+        ) as Arc<dyn MountSource>;
+        start_control_interface(
+            mp,
+            Arc::clone(&control_stop),
+            Some(on_search),
+            overlay_quota.clone(),
+        )
     } else {
         None
     };
@@ -2768,6 +2857,7 @@ fn start_control_interface(
     mountpoint: &Path,
     stop: Arc<AtomicBool>,
     on_search: Option<SearchFn>,
+    quota: Option<Arc<ratarmount_compositing::OverlayQuota>>,
 ) -> Option<PathBuf> {
     let sock = std::env::temp_dir().join(format!("ratarmount-control-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock);
@@ -2791,7 +2881,13 @@ fn start_control_interface(
                     let mut reader = BufReader::new(&stream);
                     let mut line = String::new();
                     if reader.read_line(&mut line).is_ok() {
-                        let reply = control_reply(line.trim(), &mp, &stop, on_search.as_ref());
+                        let reply = control_reply_with_quota(
+                            line.trim(),
+                            &mp,
+                            &stop,
+                            on_search.as_ref(),
+                            quota.as_deref(),
+                        );
                         let _ = stream.write_all(reply.as_bytes());
                     }
                 }
@@ -2803,6 +2899,22 @@ fn start_control_interface(
         let _ = std::fs::remove_file(&sock_path);
     });
     Some(sock)
+}
+
+fn control_reply_with_quota(
+    cmd: &str,
+    mp: &Path,
+    stop: &AtomicBool,
+    on_search: Option<&SearchFn>,
+    quota: Option<&ratarmount_compositing::OverlayQuota>,
+) -> String {
+    let mut reply = control_reply(cmd, mp, stop, on_search);
+    if cmd == "status" {
+        if let Some(quota) = quota {
+            reply.push_str(&quota.usage().status_text());
+        }
+    }
+    reply
 }
 
 fn control_reply(cmd: &str, mp: &Path, stop: &AtomicBool, on_search: Option<&SearchFn>) -> String {
@@ -5512,6 +5624,53 @@ mod git_cli_tests {
 mod passthrough_cli_tests {
     use super::*;
 
+    /// Regression: merged sandbox, Git and passthrough flags must coexist.
+    #[test]
+    fn passthrough_flags_coexist_with_sandbox_and_git() {
+        let args = parse_args_from([
+            "ratarmount",
+            "--git",
+            "--git-ref",
+            "HEAD",
+            "--git-prefix",
+            "src",
+            "--git-synthetic-head",
+            "-w",
+            "overlay",
+            "--overlay-readonly",
+            "tests/**",
+            "--overlay-quota",
+            "2G",
+            "--overlay-quota-files",
+            "12",
+            "--passthrough",
+            "off",
+            "--passthrough-copy-total-max",
+            "0",
+            "repo",
+            "mnt",
+        ])
+        .unwrap();
+        assert!(args.git && args.git_synthetic_head);
+        assert_eq!(args.git_ref.as_deref(), Some("HEAD"));
+        assert_eq!(args.git_prefix.as_deref(), Some("src"));
+        assert_eq!(args.overlay_readonly, ["tests/**"]);
+        assert_eq!(args.overlay_quota, Some(2 << 30));
+        assert_eq!(args.overlay_quota_files, Some(12));
+        assert_eq!(args.passthrough, PassthroughMode::Off);
+        assert_eq!(args.passthrough_copy_total_max, 0);
+        assert_eq!(args.paths, [PathBuf::from("repo"), PathBuf::from("mnt")]);
+        for invalid in ["nope", "18446744073709551615G"] {
+            assert!(Args::try_parse_from([
+                "ratarmount",
+                "--passthrough-copy-total-max",
+                invalid,
+                "repo"
+            ])
+            .is_err());
+        }
+    }
+
     /// Regression: passthrough defaults and copy flags must not consume source/mountpoint.
     #[test]
     fn passthrough_flags_preserve_positionals_and_validate_cap() {
@@ -5519,6 +5678,7 @@ mod passthrough_cli_tests {
         assert_eq!(args.passthrough, PassthroughMode::Auto);
         assert!(!args.passthrough_copy);
         assert_eq!(args.passthrough_copy_max, 0);
+        assert_eq!(args.passthrough_copy_total_max, 1 << 30);
         for mode in ["auto", "on", "off"] {
             let args = Args::try_parse_from([
                 "ratarmount",
@@ -5527,6 +5687,8 @@ mod passthrough_cli_tests {
                 "--passthrough-copy",
                 "--passthrough-copy-max",
                 "1M",
+                "--passthrough-copy-total-max",
+                "8M",
                 "source.tar",
                 "mnt",
             ])
@@ -5538,6 +5700,7 @@ mod passthrough_cli_tests {
             assert_eq!(args.passthrough, mode.parse().unwrap());
             assert!(args.passthrough_copy);
             assert_eq!(args.passthrough_copy_max, 1024 * 1024);
+            assert_eq!(args.passthrough_copy_total_max, 8 << 20);
         }
         assert!(
             Args::try_parse_from(["ratarmount", "--passthrough", "maybe", "source.tar"]).is_err()
@@ -5549,5 +5712,103 @@ mod passthrough_cli_tests {
             "source.tar"
         ])
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod sandbox_cli_tests {
+    use super::*;
+
+    /// Regression: overlay-stats DIR must use its verb parser, never archive/mountpoint splitting.
+    #[test]
+    fn regression_overlay_stats_flag_keeps_directory() {
+        let args = parse_args_from(["ratarmount", "overlay-stats", "overlay", "--json"]).unwrap();
+        assert!(args.paths.is_empty());
+        let stats = args.overlay_stats.unwrap();
+        assert_eq!(stats.directory, Path::new("overlay"));
+        assert!(stats.json);
+        assert!(parse_args_from(["ratarmount", "overlay-stats"]).is_err());
+        assert!(parse_args_from(["ratarmount", "overlay-stats", "one", "two"]).is_err());
+        assert!(parse_args_from(["ratarmount", "overlay-stats", "one", "--nfs"]).is_err());
+        let args = parse_args_from(["ratarmount", "--no-mount", "overlay-stats"]).unwrap();
+        assert!(args.overlay_stats.is_none());
+        assert_eq!(args.paths, [PathBuf::from("overlay-stats")]);
+    }
+
+    /// Regression: sandbox flags require -w, preserve positionals and reject invalid rules/sizes.
+    #[test]
+    fn regression_overlay_policy_flags_require_write_overlay() {
+        for flag in [
+            "--overlay-readonly",
+            "--overlay-quota",
+            "--overlay-quota-files",
+        ] {
+            assert!(parse_args_from(["ratarmount", flag, "1", "a.tar", "mnt"]).is_err());
+            assert!(parse_args_from([
+                "ratarmount",
+                "-w",
+                "ov",
+                "--commit-overlay",
+                flag,
+                "1",
+                "a.tar"
+            ])
+            .is_err());
+        }
+        let args = parse_args_from([
+            "ratarmount",
+            "-w",
+            "ov",
+            "--overlay-readonly",
+            "t/**,tests/**",
+            "--overlay-readonly",
+            "/src/private",
+            "--overlay-quota",
+            "2G",
+            "--overlay-quota-files",
+            "12",
+            "a.tar",
+            "mnt",
+        ])
+        .unwrap();
+        assert_eq!(args.overlay_readonly, ["t/**", "tests/**", "/src/private"]);
+        assert_eq!(args.overlay_quota, Some(2 << 30));
+        assert_eq!(args.overlay_quota_files, Some(12));
+        assert_eq!(args.paths, [PathBuf::from("a.tar"), PathBuf::from("mnt")]);
+        for rule in ["", "../t", "t,,a", "x**y"] {
+            assert!(parse_args_from([
+                "ratarmount",
+                "-w",
+                "ov",
+                "--overlay-readonly",
+                rule,
+                "a.tar"
+            ])
+            .is_err());
+        }
+        assert!(parse_args_from([
+            "ratarmount",
+            "-w",
+            "ov",
+            "--overlay-quota",
+            "18446744073709551615G",
+            "a.tar"
+        ])
+        .is_err());
+    }
+    /// Regression: socket status includes the same live policy fields as the virtual file.
+    #[test]
+    fn regression_control_socket_quota_status() {
+        let root = tempfile::tempdir().unwrap();
+        let quota =
+            ratarmount_compositing::OverlayQuota::new(root.path(), Some(1024), None).unwrap();
+        let stop = AtomicBool::new(false);
+        let reply =
+            control_reply_with_quota("status", Path::new("/mnt"), &stop, None, Some(&quota));
+        assert_eq!(reply, "mounted /mnt\noverlay_bytes 0\noverlay_quota_bytes 1024\noverlay_files 0\noverlay_quota_files unlimited\n");
+        assert_eq!(
+            control_reply_with_quota("ping", Path::new("/mnt"), &stop, None, Some(&quota)),
+            "pong\n"
+        );
     }
 }
