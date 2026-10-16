@@ -116,7 +116,10 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-fn apply_auth(mut req: ureq::Request, loc: &WebDavLocation) -> ureq::Request {
+fn apply_auth(
+    mut req: crate::http_pool::HttpRequest,
+    loc: &WebDavLocation,
+) -> crate::http_pool::HttpRequest {
     if let Some(user) = loc.username.as_deref() {
         let hdr = basic_auth_header(user, loc.password.as_deref());
         req = req.set("Authorization", &hdr);
@@ -132,7 +135,7 @@ pub fn propfind_content_length(loc: &WebDavLocation) -> Result<Option<u64>> {
         r#"<?xml version="1.0" encoding="utf-8" ?>"#,
         r#"<D:propfind xmlns:D="DAV:"><D:prop><D:getcontentlength/></D:prop></D:propfind>"#
     );
-    let req = ureq::request("PROPFIND", &loc.http_url)
+    let req = crate::http_pool::request("PROPFIND", &loc.http_url)
         .set("User-Agent", USER_AGENT)
         .set("Depth", "0")
         .set("Content-Type", "application/xml; charset=utf-8");
@@ -205,7 +208,7 @@ const PROPFIND_BODY: &str = concat!(
 /// Depth-0/1 PROPFIND; `depth == 0` is self only, `1` includes children.
 pub fn propfind_entries(loc: &WebDavLocation, depth: u32) -> Result<Vec<WebDavDirent>> {
     let depth_s = if depth == 0 { "0" } else { "1" };
-    let req = ureq::request("PROPFIND", &loc.http_url)
+    let req = crate::http_pool::request("PROPFIND", &loc.http_url)
         .set("User-Agent", USER_AGENT)
         .set("Depth", depth_s)
         .set("Content-Type", "application/xml; charset=utf-8");
@@ -452,7 +455,7 @@ pub fn webdav_is_collection(loc: &WebDavLocation) -> Result<bool> {
 }
 
 fn propfind_self_is_collection(loc: &WebDavLocation) -> Result<bool> {
-    let req = ureq::request("PROPFIND", &loc.http_url)
+    let req = crate::http_pool::request("PROPFIND", &loc.http_url)
         .set("User-Agent", USER_AGENT)
         .set("Depth", "0")
         .set("Content-Type", "application/xml; charset=utf-8");
@@ -490,7 +493,7 @@ pub fn fetch_webdav_location_to_temp(loc: &WebDavLocation) -> Result<(NamedTempF
         debug!("webdav PROPFIND {} skipped or no size", loc.http_url);
     }
 
-    let req = ureq::get(&loc.http_url).set("User-Agent", USER_AGENT);
+    let req = crate::http_pool::get(&loc.http_url).set("User-Agent", USER_AGENT);
     let req = apply_auth(req, loc);
     let resp = req.call().map_err(|e| RemoteError::WebDav(e.to_string()))?;
     if !(200..300).contains(&resp.status()) {

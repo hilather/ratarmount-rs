@@ -9,7 +9,7 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 | Scheme | Behavior |
 |--------|----------|
 | `file://` | Map to local path |
-| `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic** + **Cookie** auth on HEAD/GET/Range. Trailing `/` or HTML autoindex → **folder** (nginx/apache `<a href>`). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite`, then `Link: rel="describedby"` on archive HEAD, then well-known `{url}.index.sqlite` (+ `.gz`/`.zst`/`.xz`/`.bz2`). Pointer/blob/tarstats failure continues |
+| `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic** + **Cookie** auth on HEAD/GET/Range; explicit secret **Bearer** auth through the Rust API. Shared keep-alive connections and parallel sequential readahead (`RATARMOUNT_HTTP_PARALLEL`). Trailing `/` or HTML autoindex → **folder** (nginx/apache `<a href>`). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite`, then `Link: rel="describedby"` on archive HEAD, then well-known `{url}.index.sqlite` (+ `.gz`/`.zst`/`.xz`/`.bz2`). Pointer/blob/tarstats failure continues |
 | `s3://bucket/key` | Live Range (`open_s3_range` / `S3RangeFile`) when the object supports it; else GetObject → temp. SigV4 env + IMDS/ECS + anonymous. Empty key / trailing `/` / list children → **prefix folder** (`ListObjectsV2`, continuation loop, 100k cap). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` then well-known `{url}.index.sqlite`. **PUT** (`put_s3_file` / multipart, abort on error; `publish_index_to_s3` blob-then-pointer). Anonymous is GET-only. Live overlay commit (`-w` + `--commit-overlay-interval` / `--on-exit`) for TAR/ZST: write probe, persistent spool, multipart PUT, then blob+pointer; reopen is live Range. Offline `--commit-overlay` + `s3://` exits 2 |
 | `gs://bucket/object` | XML path-style Range GET (`storage.googleapis.com/{bucket}/{object}`). Prefix folder via JSON list + `pageToken` (HMAC GOOG1 lists via XML). R2/MinIO stay `s3://` + `AWS_ENDPOINT_URL`. Same sibling pointer/blob/well-known GET as S3 |
 | `az://container/blob` | Azure Blob Range (`azure://` alias). Prefix folder via List Blobs + `NextMarker`. Account from env, not URL host. Not `wasb://`. Same sibling pointer/blob/well-known GET as S3 |
@@ -33,6 +33,60 @@ Factory `open_remote_input` probes `restic:` first (local snapshot browser), the
 Order: explicit `--index-file` (including `--index-id HEX` already resolved to that path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then immutable `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known `{url}.index.sqlite` (+ compressed suffixes) → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Fail-open. Pointer/blob/tarstats failure **continues** the chain (pointer is an additional candidate, not terminal). Remote sidecar is checked with `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Media type `application/vnd.ratarmount.index.v1+sqlite` is the blob family; `INDEX_VERSION` `0.7.0` is the `files` schema — not SOCI. Publish with `--publish-index` / `--publish-index-to PATH` (local copy + `{archive}.index.ptr` JSON pointer, schema `ratarmount.index.pointer.v1`, `index_id` = sha256 of the blob). Object-store **GET** of pointer/blob/well-known is supported. S3 **PUT** of the immutable blob then the pointer is [`publish_index_to_s3`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-remote/src/index_sibling.rs) (never pointer-first; pointer PUT failure after blob PUT does not claim success — leftover blob is not deleted). CLI `--publish-index` PUTs that blob-then-pointer for `s3://` archives. GCS/Azure PUT is residual. Local `--index-id HEX` remounts `{archive}.index.{id}.sqlite` (keep-last-K=2 when a pointer is written).
 
 Whole sidecar GETs ≤ 64 MiB are stored in `$XDG_CACHE_HOME/ratarmount/meta-v3/` (V-3; cap `RATARMOUNT_META_CACHE_BYTES`, default 256 MiB, `=0` disables). Lookup is URL-first so a remount without `.ptr` still hits. Not archive `HttpRangeFile` paging and not G-3 member bodies. `file://` / `:memory:` / a nonempty local folder candidate skip the download. HPC home-quota: set `XDG_CACHE_HOME` to scratch.
+
+### HTTP transport and sequential readahead (AI-0b)
+
+HTTP(S), HTTP folder listing, WebDAV, Dropbox, OCI and IPFS share one blocking
+`ureq::Agent` per process. Connections return to its keep-alive pool after the
+response body is consumed. The shared agent keeps ureq's existing defaults:
+30-second connect timeout and no socket read/write or overall request timeout.
+Existing per-request timeouts still apply, including across redirects.
+S3/GCS/Azure retain their existing transports.
+
+`HttpRangeFile` caches the final redirect URL from HEAD or the first ranged GET.
+Subsequent requests go directly to that URL. Authorization and Cookie headers
+are sent only to the origin and removed on every redirect, including redirects
+to another path on the same host. A cached target returning 401, 403, 404 or 410
+triggers one origin re-resolution and retry; concurrent failures share that
+refresh. Every 206 must have a matching `Content-Range`, including the object
+length when known. Servers returning a full 200 response retain the existing
+skip-to-offset fallback.
+
+| Env | Behavior |
+|-----|----------|
+| `RATARMOUNT_HTTP_PARALLEL` | Maximum sequential range requests per reader, default **8**. **1** disables readahead and keeps reads on the calling thread. Values are clamped to 1–64; invalid values use 8. Read at reader creation. |
+| `RATARMOUNT_HTTP_PREFETCH_LIMIT` | Process-wide background chunk/worker cap, default **64** (**256 MiB** of chunk payloads). Values are clamped to 1–1024; invalid values use 64. Read once when prefetch first starts. |
+
+Readahead starts after at least **1 MiB** of contiguous progress, or after a
+read of at least **64 KiB** followed by an adjacent read. Two small archive-header
+reads do not start prefetch. The window ramps through **1, 2, 4, 8** chunks,
+up to the reader's configured maximum, as chunks are consumed. Each chunk is
+**4 MiB**, and results are delivered in byte order. Both running workers and
+completed, unconsumed chunks count against the process-wide cap, shared by all
+open files. Cancelled workers retain their slots until they exit. At capacity,
+new prefetch is skipped and the foreground reads directly into the caller's
+buffer, without another chunk allocation. Payload storage is reserved only
+after the first body bytes arrive. The payload cap excludes caller-owned
+buffers, transport buffers and thread stacks.
+
+A random read uses one request capped at 4 MiB; callers continue filling after
+a short read. Seeking to a different position or dropping the reader cancels
+and detaches background work immediately, without waiting for network progress.
+Cancellation is checked while skipping an ignored-Range 200 prefix as well as
+while receiving chunk data. Background requests have a **60-second overall
+per-request deadline**, covering redirects and body reads; an expired target's
+origin refresh is a separate attempt with the same deadline. This deadline
+applies only to prefetch, so slow IPFS gateways and foreground/full downloads
+retain their existing timeout behavior. A failed prefetch is discarded, and
+the next read at that offset retries synchronously. This is an in-memory
+window, not a persistent range cache.
+
+Rust callers can pass `HttpAuthOptions { bearer_token: Some(SecretString::new(token)) }`
+to `HttpRangeFile::open_with_auth`, `HttpRangeFile::range_backed_with_auth`, or
+`fetch_http_bytes_capped_with_auth`. Bearer takes precedence over URL/env Basic
+credentials, combines with the configured Cookie header at the origin, and is
+redacted from Debug output. There is no new CLI token option or HF-specific
+handling in this transport layer.
 
 ### HTTP(S) Basic authentication (FR-2 / [#157](https://github.com/mxmlnkn/ratarmount/issues/157))
 

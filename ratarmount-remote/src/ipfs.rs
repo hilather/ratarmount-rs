@@ -587,7 +587,7 @@ fn ls_via_http(api_base: &str, loc: &IpfsLocation) -> Result<String> {
     let url = ls_url(api_base, loc)?;
     let url_s = url.as_str();
     debug!("IPFS API ls {url_s}");
-    match ureq::post(url_s)
+    match crate::http_pool::post(url_s)
         .timeout(API_TIMEOUT)
         .set("User-Agent", USER_AGENT)
         .call()
@@ -595,7 +595,7 @@ fn ls_via_http(api_base: &str, loc: &IpfsLocation) -> Result<String> {
         Ok(resp) => read_ureq_body(resp, "ls"),
         Err(ureq::Error::Status(code, _)) if code == 404 || code == 405 => {
             // Some gateways only allow GET on /api/v0/ls.
-            match ureq::get(url_s)
+            match crate::http_pool::get(url_s)
                 .timeout(API_TIMEOUT)
                 .set("User-Agent", USER_AGENT)
                 .call()
@@ -766,14 +766,14 @@ fn type_is_directory(ty: Option<&serde_json::Value>) -> bool {
 }
 
 fn gateway_looks_like_directory(url: &str) -> bool {
-    match ureq::head(url)
+    match crate::http_pool::head(url)
         .timeout(API_TIMEOUT)
         .set("User-Agent", USER_AGENT)
         .call()
     {
         Ok(resp) => content_type_is_html(resp.header("Content-Type")),
         Err(ureq::Error::Status(_, resp)) => content_type_is_html(resp.header("Content-Type")),
-        Err(_) => match ureq::get(url)
+        Err(_) => match crate::http_pool::get(url)
             .timeout(API_TIMEOUT)
             .set("User-Agent", USER_AGENT)
             .set("Range", "bytes=0-0")
