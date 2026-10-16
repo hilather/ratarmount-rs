@@ -308,3 +308,47 @@ def test_regression_empty_member_at_aligned_archive_eof_maps_empty_view(tmp_path
         backing = view.obj
         view.release()
         backing.close()
+
+
+@pytest.mark.parametrize("kind", ["tar", "tar.zst", "nested"])
+def test_regression_32_threads_read_sibling_payloads_without_cursor_race(tmp_path, kind):
+    """Regression: concurrent ranged reads must not consume a sibling's cursor."""
+    import io
+    import tarfile
+
+    payloads = {f"member-{i}.bin": bytes([i]) * (262144 + i * 509) for i in range(8)}
+    inner = io.BytesIO()
+    with tarfile.open(fileobj=inner, mode="w") as tar:
+        for name, data in payloads.items():
+            entry = tarfile.TarInfo(name)
+            entry.size = len(data)
+            tar.addfile(entry, io.BytesIO(data))
+    path = tmp_path / ("outer.tar" if kind == "nested" else "shard." + kind)
+    prefix = ""
+    if kind == "nested":
+        with tarfile.open(path, "w") as tar:
+            entry = tarfile.TarInfo("inner.tar")
+            entry.size = len(inner.getvalue())
+            tar.addfile(entry, io.BytesIO(inner.getvalue()))
+        prefix = "inner.tar/"
+    elif kind == "tar.zst":
+        zstandard = pytest.importorskip("zstandard", reason="skip: zstandard is unavailable")
+        path.write_bytes(zstandard.ZstdCompressor().compress(inner.getvalue()))
+    else:
+        path.write_bytes(inner.getvalue())
+    barrier = threading.Barrier(32)
+    with ratar.open(path, recursive=kind == "nested") as archive:
+        # Trigger lazy nested mounting before the simultaneous member reads.
+        assert archive.read(prefix + "member-0.bin", 0, 1) == b"\0"
+
+        def read(worker):
+            barrier.wait(timeout=30)
+            for turn in range(40):
+                name = f"member-{(worker + turn) % 8}.bin"
+                offset = (worker * 7907 + turn * 1543) % 230000
+                assert archive.read(prefix + name, offset, 16384) == payloads[name][offset:offset + 16384]
+                with archive.open(prefix + name) as member:
+                    member.seek(offset)
+                    assert member.read(8192) == payloads[name][offset:offset + 8192]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+            list(executor.map(read, range(32)))

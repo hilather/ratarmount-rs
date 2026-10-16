@@ -1,0 +1,121 @@
+name: Python wheels
+
+on:
+  pull_request:
+    paths:
+      - 'ratarmount-*/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/python.yml'
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: '4'
+  UV_CACHE_DIR: ${{ github.workspace }}/.uv-cache
+
+jobs:
+  wheels:
+    name: Wheel (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: '2_28'
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: '2_28'
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            manylinux: 'off'
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+        if: runner.os == 'macOS'
+      - name: macOS build libraries
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkgconf libarchive
+          echo "MACOSX_DEPLOYMENT_TARGET=14.0" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$(brew --prefix libarchive)/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: Build abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --manifest-path ratarmount-python/Cargo.toml --out dist --interpreter python3.12
+          before-script-linux: yum install -y libarchive-devel zlib-devel
+      - name: Bundle macOS dynamic libraries
+        if: runner.os == 'macOS'
+        run: |
+          uv venv --python python "$RUNNER_TEMP/repair-venv"
+          uv pip install --python "$RUNNER_TEMP/repair-venv/bin/python" delocate
+          "$RUNNER_TEMP/repair-venv/bin/delocate-wheel" --require-archs arm64 -w repaired dist/*.whl
+          rm dist/*.whl
+          mv repaired/*.whl dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --manifest-path ratarmount-python/Cargo.toml --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  test:
+    name: Installed wheel (${{ matrix.target }}, Python ${{ matrix.python }})
+    needs: wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python: '3.9'
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python: '3.12'
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            python: '3.12'
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-${{ matrix.target }}
+          path: dist
+      - name: Install wheel in a fresh venv
+        run: |
+          uv venv --python python .wheel-venv
+          uv pip install --python .wheel-venv/bin/python dist/*.whl pytest fsspec zstandard pyyaml pandas pyarrow webdataset datasets
+      - name: Test installed package
+        run: |
+          .wheel-venv/bin/python -c 'import ratarmount_rs; assert "site-packages" in ratarmount_rs.__file__'
+          .wheel-venv/bin/python -m pytest ratarmount-python/tests -ra

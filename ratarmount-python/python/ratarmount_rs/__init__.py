@@ -1,8 +1,8 @@
 """Read indexed archives without mounting a filesystem.
 
 All blocking native operations release the GIL. An Archive may be shared by
-threads; Session operations on one Archive are serialized to protect backing
-reader positions. Closing prevents new operations while in-flight work finishes.
+threads and perform Session I/O concurrently. Closing prevents new operations
+while in-flight work finishes.
 """
 from __future__ import annotations
 
