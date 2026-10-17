@@ -327,33 +327,37 @@ and the cold mount of one 640 MiB `.tar.zst`.
 **Every format, one corpus** (1,000 × 32 KiB files plus a 64 MiB blob, packed
 into each container, indexed, mounted and read with the same binary on
 2026-10-17; see [the full table](docs/formats.md#measured) for sequential
-bandwidth, `find`, methodology and the four formats skipped for lack of a
-producer tool):
+bandwidth, `find`, methodology):
 
 | Format | Cold index | Cold mount | Random file read | Random 64 KiB read | Peak RSS |
 |---|---:|---:|---:|---:|---:|
-| tar | 0.069 s | 0.064 s | 0.9 ms | 0.1 ms | 21.8 MiB |
-| tar.gz | 0.106 s | 0.127 s | 4.7 ms | 2.1 ms | 20.6 MiB |
-| tar.bz2 | 9.433 s | 10.123 s | 4.5 ms | 12.2 ms | 92.5 MiB |
-| tar.xz | 0.344 s | 0.377 s | 35.3 ms | 5.0 ms | 19.9 MiB |
-| tar.zst | 0.049 s | 0.065 s | 2.5 ms | 1.9 ms | 20.0 MiB |
-| tar.lz4 | 0.055 s | 0.065 s | 1.4 ms | 0.6 ms | 39.7 MiB |
-| zip-deflate | 0.036 s | 0.064 s | 1.0 ms | 0.0 ms | 20.5 MiB |
-| zip-store | 0.037 s | 0.064 s | 1.0 ms | 0.1 ms | 20.4 MiB |
-| cpio | 0.035 s | 0.064 s | 0.9 ms | 0.0 ms | 20.1 MiB |
-| ar | 0.034 s | 0.066 s | 0.9 ms | 0.0 ms | 21.4 MiB |
-| iso | 0.029 s | 0.064 s | 0.9 ms | 0.0 ms | 20.0 MiB |
-| ext4 | 0.007 s | 0.011 s | 1.0 ms | 0.1 ms | 18.1 MiB |
-| mbr/ext4 | 0.007 s | 0.011 s | 1.0 ms | 0.0 ms | 18.5 MiB |
-| qcow2/ext4 | 0.007 s | 0.011 s | 0.9 ms | 0.0 ms | 18.6 MiB |
-| safetensors | 0.025 s | 0.064 s | 1.0 ms | 0.1 ms | 21.3 MiB |
-| gguf | 0.025 s | 0.064 s | 0.9 ms | 0.0 ms | 21.3 MiB |
-| nested-tar | 0.107 s | 0.126 s | 0.9 ms | 0.0 ms | 29.3 MiB |
+| tar | 0.097 s | 0.066 s | 1.0 ms | 0.1 ms | 21.6 MiB |
+| tar.gz | 0.129 s | 0.128 s | 4.6 ms | 2.1 ms | 20.6 MiB |
+| tar.bz2 | 9.896 s | 10.315 s | 3.7 ms | 12.2 ms | 92.2 MiB |
+| tar.xz | 0.323 s | 0.312 s | 34.4 ms | 4.9 ms | 20.1 MiB |
+| tar.zst | 0.038 s | 0.064 s | 2.4 ms | 1.8 ms | 19.8 MiB |
+| tar.lz4 | 0.048 s | 0.065 s | 1.4 ms | 0.6 ms | 35.8 MiB |
+| zip-deflate | 0.037 s | 0.064 s | 1.0 ms | 0.0 ms | 20.4 MiB |
+| zip-store | 0.041 s | 0.064 s | 0.9 ms | 0.0 ms | 20.5 MiB |
+| cpio | 0.030 s | 0.064 s | 0.9 ms | 0.0 ms | 20.0 MiB |
+| ar | 0.029 s | 0.066 s | 0.9 ms | 0.0 ms | 21.2 MiB |
+| iso | 0.027 s | 0.064 s | 0.9 ms | 0.0 ms | 20.5 MiB |
+| ext4 | 0.007 s | 0.011 s | 1.0 ms | 0.0 ms | 18.2 MiB |
+| mbr/ext4 | 0.007 s | 0.011 s | 1.0 ms | 0.0 ms | 18.7 MiB |
+| qcow2/ext4 | 0.007 s | 0.011 s | 1.0 ms | 0.0 ms | 18.6 MiB |
+| safetensors | 0.026 s | 0.064 s | 0.9 ms | 0.0 ms | 21.3 MiB |
+| gguf | 0.025 s | 0.064 s | 0.9 ms | 0.0 ms | 21.2 MiB |
+| nested-tar | 0.100 s | 0.124 s | 0.9 ms | 0.1 ms | 29.8 MiB |
+| 7z | 0.028 s | 0.064 s | 91.8 ms | 2.4 ms | 20.4 MiB |
+| squashfs | 0.008 s | 0.012 s | 1.1 ms | 0.0 ms | 18.2 MiB |
+| fat | 0.007 s | 0.012 s | 1.9 ms | 0.0 ms | 17.8 MiB |
+| exfat | 0.007 s | 0.011 s | 0.9 ms | 0.0 ms | 18.1 MiB |
 
 Cold index builds the SQLite index from scratch; cold mount rebuilds it and
 waits for the first listing; random reads are medians over a warm mount.
 The bzip2 outlier is the cost of decoding every 100 KiB block once to build
-its seek map; xz pays per block on every random read.
+its seek map; xz pays per block on every random read, and a default solid 7z
+archive pays for its whole LZMA2 block.
 
 ---
 

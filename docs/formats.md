@@ -140,10 +140,10 @@ for a random read, is [Nested archives and temp files](embedded-nested-archives.
 One corpus, every format: 1,000 files of 32 KiB in ten folders plus a 64 MiB
 incompressible blob, packed by `benchmarks/compare-formats.sh` into each
 container the local tools could produce, then indexed, mounted and read with
-the same binary. Run on 2026-10-17 with `ratarmount 0.1.34` on an i7-8750H @ 2.20GHz laptop
-(one-minute load before/after 4.71 / 3.24, with another agent's build running on the same six-core machine). Fixtures marked with a dash were
-skipped because the producer tool is not installed here; see the table below
-the overview.
+the same binary. Run on 2026-10-17 with `ratarmount 0.1.34` on a i7-8750H @ 2.20GHz laptop
+(one-minute load before/after 3.27 / 2.57). Every fixture the script knows
+was built; the producer tools were 7-Zip, squashfs-tools, mtools and
+libguestfs for the last four rows.
 
 Columns: cold index is `--no-mount -c`; cold and warm mount are the time until
 a foreground mount answers its first listing; peak RSS is `VmHWM` of the warm
@@ -154,43 +154,44 @@ full `cat` of that member; find walks the whole tree.
 
 | Format (fixture) | Size | Cold index (s) | Cold mount (s) | Warm mount (s) | Peak RSS warm (MiB) | Random cat (ms) | 64 KiB pread (ms) | Sequential (MiB/s) | Find (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| tar (`corpus.tar`) | 95.8 MiB | 0.069 | 0.064 | 0.064 | 21.8 | 0.9 | 0.1 | 19249 | 2.7 |
-| tar.gz (`corpus.tar.gz`) | 68.3 MiB | 0.106 | 0.127 | 0.065 | 20.6 | 4.7 | 2.1 | 19489 | 2.6 |
-| tar.bz2 (`corpus.tar.bz2`) | 72.4 MiB | 9.433 | 10.123 | 0.064 | 92.5 | 4.5 | 12.2 | 19529 | 3.3 |
-| tar.xz (`corpus.tar.xz`) | 68.0 MiB | 0.344 | 0.377 | 0.012 | 19.9 | 35.3 | 5.0 | 19269 | 3.1 |
-| tar.zst (`corpus.tar.zst`) | 67.9 MiB | 0.049 | 0.065 | 0.064 | 20.0 | 2.5 | 1.9 | 18805 | 2.6 |
-| tar.lz4 (`corpus.tar.lz4`) | 68.1 MiB | 0.055 | 0.065 | 0.066 | 39.7 | 1.4 | 0.6 | 19408 | 3.0 |
-| zip-deflate (`corpus.zip`) | 68.3 MiB | 0.036 | 0.064 | 0.064 | 20.5 | 1.0 | 0.0 | 22334 | 2.7 |
-| zip-store (`corpus-store.zip`) | 95.3 MiB | 0.037 | 0.064 | 0.064 | 20.4 | 1.0 | 0.1 | 19632 | 2.9 |
-| cpio (`corpus.cpio`) | 95.4 MiB | 0.035 | 0.064 | 0.012 | 20.1 | 0.9 | 0.0 | 20647 | 2.6 |
-| ar (`corpus.ar`) | 95.3 MiB | 0.034 | 0.066 | 0.013 | 21.4 | 0.9 | 0.0 | 17793 | 2.1 |
-| iso (`corpus.iso`) | 95.7 MiB | 0.029 | 0.064 | 0.064 | 20.0 | 0.9 | 0.0 | 19429 | 2.6 |
-| ext4 (`corpus.ext4`) | 152.0 MiB | 0.007 | 0.011 | 0.012 | 18.1 | 1.0 | 0.1 | 1321 | 5.4 |
-| mbr/ext4 (`corpus-mbr.img`) | 153.0 MiB | 0.007 | 0.011 | 0.011 | 18.5 | 1.0 | 0.0 | 1367 | 5.2 |
-| qcow2/ext4 (`corpus.qcow2`) | 96.4 MiB | 0.007 | 0.011 | 0.011 | 18.6 | 0.9 | 0.0 | 1223 | 4.9 |
-| safetensors (`model.safetensors`) | 64.0 MiB | 0.025 | 0.064 | 0.011 | 21.3 | 1.0 | 0.1 | 6486 | 4.6 |
-| gguf (`model.gguf`) | 64.0 MiB | 0.025 | 0.064 | 0.011 | 21.3 | 0.9 | 0.0 | 7039 | 4.2 |
-| nested-tar (`nested.tar`) | 136.6 MiB | 0.107 | 0.126 | 0.125 | 29.3 | 0.9 | 0.0 | 20050 | 4.2 |
-| 7z (`corpus.7z`) | — | — | — | — | — | — | — | — | — |
-| squashfs (`corpus.squashfs`) | — | — | — | — | — | — | — | — | — |
-| fat (`corpus.fat`) | — | — | — | — | — | — | — | — | — |
-| exfat (`corpus.exfat`) | — | — | — | — | — | — | — | — | — |
+| tar (`corpus.tar`) | 95.8 MiB | 0.097 | 0.066 | 0.014 | 21.6 | 1.0 | 0.1 | 16654 | 5.0 |
+| tar.gz (`corpus.tar.gz`) | 68.3 MiB | 0.129 | 0.128 | 0.064 | 20.6 | 4.6 | 2.1 | 18986 | 2.8 |
+| tar.bz2 (`corpus.tar.bz2`) | 72.4 MiB | 9.896 | 10.315 | 0.064 | 92.2 | 3.7 | 12.2 | 18538 | 2.8 |
+| tar.xz (`corpus.tar.xz`) | 68.0 MiB | 0.323 | 0.312 | 0.011 | 20.1 | 34.4 | 4.9 | 19210 | 2.8 |
+| tar.zst (`corpus.tar.zst`) | 67.9 MiB | 0.038 | 0.064 | 0.064 | 19.8 | 2.4 | 1.8 | 16825 | 2.8 |
+| tar.lz4 (`corpus.tar.lz4`) | 68.1 MiB | 0.048 | 0.065 | 0.065 | 35.8 | 1.4 | 0.6 | 18397 | 2.7 |
+| zip-deflate (`corpus.zip`) | 68.3 MiB | 0.037 | 0.064 | 0.067 | 20.4 | 1.0 | 0.0 | 16820 | 3.7 |
+| zip-store (`corpus-store.zip`) | 95.3 MiB | 0.041 | 0.064 | 0.064 | 20.5 | 0.9 | 0.0 | 19044 | 2.9 |
+| cpio (`corpus.cpio`) | 95.4 MiB | 0.030 | 0.064 | 0.011 | 20.0 | 0.9 | 0.0 | 19920 | 2.9 |
+| ar (`corpus.ar`) | 95.3 MiB | 0.029 | 0.066 | 0.066 | 21.2 | 0.9 | 0.0 | 19285 | 2.2 |
+| iso (`corpus.iso`) | 95.7 MiB | 0.027 | 0.064 | 0.064 | 20.5 | 0.9 | 0.0 | 19313 | 2.8 |
+| ext4 (`corpus.ext4`) | 152.0 MiB | 0.007 | 0.011 | 0.011 | 18.2 | 1.0 | 0.0 | 2545 | 2.5 |
+| mbr/ext4 (`corpus-mbr.img`) | 153.0 MiB | 0.007 | 0.011 | 0.011 | 18.7 | 1.0 | 0.0 | 2918 | 2.8 |
+| qcow2/ext4 (`corpus.qcow2`) | 96.4 MiB | 0.007 | 0.011 | 0.011 | 18.6 | 1.0 | 0.0 | 2503 | 2.7 |
+| safetensors (`model.safetensors`) | 64.0 MiB | 0.026 | 0.064 | 0.011 | 21.3 | 0.9 | 0.0 | 7408 | 4.1 |
+| gguf (`model.gguf`) | 64.0 MiB | 0.025 | 0.064 | 0.011 | 21.2 | 0.9 | 0.0 | 6888 | 4.4 |
+| nested-tar (`nested.tar`) | 136.6 MiB | 0.100 | 0.124 | 0.124 | 29.8 | 0.9 | 0.1 | 19682 | 4.3 |
+| 7z (`corpus.7z`) | 68.0 MiB | 0.028 | 0.064 | 0.064 | 20.4 | 91.8 | 2.4 | 19180 | 2.7 |
+| squashfs (`corpus.squashfs`) | 68.2 MiB | 0.008 | 0.012 | 0.011 | 18.2 | 1.1 | 0.0 | 2570 | 2.8 |
+| fat (`corpus.fat`) | 152.0 MiB | 0.007 | 0.012 | 0.011 | 17.8 | 1.9 | 0.0 | 624 | 2.8 |
+| exfat (`corpus.exfat`) | 152.0 MiB | 0.007 | 0.011 | 0.011 | 18.1 | 0.9 | 0.0 | 1681 | 2.8 |
 
 | Fixture | Metric | Status | Reason / producer |
 |---|---|---|---|
-| corpus.7z | fixture | skip | missing 7z / 7za / 7zz |
-| corpus.squashfs | fixture | skip | missing mksquashfs |
-| corpus.fat | fixture | skip | missing mformat |
-| corpus.exfat | fixture | skip | missing guestfish |
+| — | — | — | None |
 
 What the table says: every container with a real table of contents (TAR, ZIP,
-CPIO, AR, ISO, the filesystem images, safetensors, GGUF) indexes in tens of
-milliseconds and serves random reads in about a millisecond; the compressed
-TARs pay for their seek map once at indexing time (bzip2 by far the most,
-because every 100 KiB block is decoded once) and then differ in how large a
-unit must be decoded per read: lz4 blocks and zstd frames cost a millisecond
-or two, gzip and bzip2 a few milliseconds, and xz blocks the most at tens of
-milliseconds. Sequential
+CPIO, AR, ISO, 7z, the filesystem images, safetensors, GGUF) indexes in tens
+of milliseconds and serves random reads of stored data in about a millisecond.
+The compressed TARs pay for their seek map once at indexing time (bzip2 by far
+the most, because every 100 KiB block is decoded once) and then differ in how
+large a unit must be decoded per read: lz4 blocks and zstd frames cost a
+millisecond or two, gzip and bzip2 a few milliseconds, xz blocks tens of
+milliseconds, and a default 7z archive about 90 ms because its solid LZMA2
+block is decoded from the start for each random member. Filesystem images
+stream at 0.6–3 GiB/s rather than the page-cache speeds of the archive
+containers, because reads follow the image's cluster map (FAT is the slowest,
+EXT4 and SquashFS the fastest). Sequential
 numbers through FUSE are page-cache speeds for a file that fits in RAM, not
 disk speeds. Full methodology, CSV and caveats:
 [benchmarks/format-results.md](../benchmarks/format-results.md).
