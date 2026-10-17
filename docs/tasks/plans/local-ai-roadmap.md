@@ -137,9 +137,9 @@ Session API; **AI-FIX-VHDX** — qemu-img 11 fixed VHDX rejected by the parser.
 
 Deferred on the roadmap's own condition: **`io_uring` for backend reads**
 (§8 "once the rest is measured"). Measured here: library-mode Session reads of a
-256 MiB seekable-zstd member run at about the same speed as `zstd -d` on the
-same file (≈480 vs ≈430 MB/s, cold), and the FUSE request path, not the
-backend's `read` syscalls, is what separates FUSE from library throughput.
+256 MiB seekable-zstd member run faster than `zstd -d` on the same file (2.2–2.8
+vs 1.6 GB/s), and the FUSE request path, not the backend's `read` syscalls, is
+what separates FUSE (1.25–1.6 GB/s) from library throughput.
 `io_uring` would not move either number, so it stays out until a profile on
 the GB10 shows syscall overhead in the backend read path.
 
@@ -266,7 +266,7 @@ CSI, GZ. Waves differ from that order only where a prerequisite forces it
 | Cold open of shards | scan 0.086 s vs published index 0.016 s |
 | RSS, 32 mounts | 679 MiB total (≈21 MiB per mount) |
 | Model load (small safetensors) | `hf download` + load 1.35 s · `hf://` mount setup + first load 0.35 s · second load 5 ms |
-| zstd decode-ahead (256 MiB, loaded machine) | FUSE cat 129 → 218 MB/s with 4 threads; direct-I/O dd regressed 372 → 229 MB/s (needs an idle rerun) |
+| zstd decode-ahead (256 MiB multi-frame member, idle machine, archive in page cache) | Session 2,206 → 2,762 MB/s (1 → 4 threads) · FUSE cat 852 → 1,251 MB/s · FUSE dd 1 MiB `--direct-io` 1,253 → 1,633 MB/s · `zstd -d` 1,631 MB/s; an earlier run under heavy load showed a spurious direct-I/O regression |
 | Live Hub | `--publish-index hf://` and overlay write-back verified against a private dataset repo |
 
 GB10 / DGX Spark and M5 numbers still need that hardware; FUSE passthrough's
