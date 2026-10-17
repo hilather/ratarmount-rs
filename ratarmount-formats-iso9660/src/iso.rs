@@ -678,21 +678,50 @@ fn apply_joliet_fallback(primary: &mut [Node], joliet: &[Node]) -> Vec<Option<us
                 };
             }
         }
-        if let Some(j) = matches[id] {
-            let p = primary[id].parent;
-            let jp = joliet[j].parent;
-            if matches[p].is_some_and(|old| old != jp) {
-                ambiguous.insert(p);
-            }
-            if !ambiguous.contains(&p) {
-                matches[p] = Some(jp);
-            } else {
-                matches[p] = None;
-            }
+        let Some(j) = matches[id] else {
+            continue;
+        };
+        // Do not propagate from an SL directory. Its id is cleared below and grafted.
+        if rec.is_dir && rec.rr.link.is_some() {
+            continue;
+        }
+        // Nearest non-SL ancestor. Root counts, so the walk stops at 0.
+        let mut ancestor = primary[id].parent;
+        let mut crossed_sl = false;
+        let mut guard = 0;
+        while ancestor != 0
+            && primary[ancestor].record.is_dir
+            && primary[ancestor].record.rr.link.is_some()
+            && guard < primary.len()
+        {
+            crossed_sl = true;
+            ancestor = primary[ancestor].parent;
+            guard += 1;
+        }
+        let joliet_parent = joliet[j].parent;
+        // File under an SL run: one ghost hop for the whole run.
+        // Directory under an SL run: one hop. A second hop binds the plain ancestor too high.
+        // Every other matched node writes one joliet.parent onto that ancestor
+        // (normally its parent).
+        #[allow(clippy::if_same_then_else)]
+        let evidence = if !rec.is_dir && crossed_sl {
+            joliet[joliet_parent].parent
+        } else if rec.is_dir && crossed_sl {
+            joliet_parent
+        } else {
+            joliet_parent
+        };
+        if matches[ancestor].is_some_and(|old| old != evidence) {
+            ambiguous.insert(ancestor);
+        }
+        if !ambiguous.contains(&ancestor) {
+            matches[ancestor] = Some(evidence);
+        } else {
+            matches[ancestor] = None;
         }
     }
-    // A child's match propagates through an SL directory onto its parent.
-    // Clear the SL directory so it is grafted, not paired with the Joliet dir.
+    // The loop above does not write through an SL directory. Drop a match on
+    // the SL id itself so the directory is grafted, not paired with a Joliet dir.
     for id in 1..primary.len() {
         if primary[id].record.is_dir && primary[id].record.rr.link.is_some() {
             matches[id] = None;
