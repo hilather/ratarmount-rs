@@ -27,17 +27,22 @@ CI workflow: [`.github/workflows/packages.yml`](https://github.com/hilather/rata
 
 Each native package is built **on** that distro (matching glibc / libfuse). The **portable** job uses Debian bullseye so one tarball runs on most modern Ubuntu/Rocky hosts with glibc ≥ 2.31.
 
-The portable binary vendors OpenSSL statically. The runtime still uses the
-host's `libarchive.so.13` and `libfuse3.so.3`; their own transitive dependencies
-come from those distro packages. The CI dependency gate
-[`packaging/test-portable-deps.sh`](../packaging/test-portable-deps.sh) checks
-the binary's direct ELF `NEEDED` entries and rejects direct `libssl` or
-`libcrypto` dependencies. Portable releases built before this fix directly
-need `libssl.so.1.1` and `libcrypto.so.1.1`; install an OpenSSL 1.1 compatibility
-package to run them on systems that still provide one. On Arch, the observed
-`libcrypto.so.3` in `ldd` output is pulled in transitively by the host's
-`libarchive.so.13`, not directly by ratarmount; the distro's libarchive package
-supplies its matching OpenSSL dependency.
+The portable binary vendors OpenSSL statically. Releases up to 0.1.34 linked
+bullseye's `libssl.so.1.1`, which Arch, Ubuntu 22.04+ (including DGX OS) and
+current Fedora do not ship, so those tarballs fail with "error while loading
+shared libraries: libssl.so.1.1". `packaging/test-portable-deps.sh BINARY`
+lists the binary's direct `NEEDED` libraries and fails on any `libssl` or
+`libcrypto`; the Packages workflow runs it before upload.
+
+Vendoring freezes OpenSSL inside the portable tarball. That tarball receives
+OpenSSL fixes only when maintainers rebuild and re-release it. After an
+OpenSSL security advisory, rebuild and re-release the portable tarball.
+Users get those fixes by upgrading to the new tarball. Updating distro
+OpenSSL packages does not change an already-shipped portable tarball.
+
+The runtime still uses the host's `libarchive.so.13` and `libfuse3.so.3`, and
+their own dependencies come from those distro packages; on Arch the
+`libcrypto.so.3` seen in `ldd` comes from the host libarchive, not ratarmount.
 
 **Triggers**
 

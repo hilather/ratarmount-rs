@@ -10,12 +10,15 @@
 //! * Concurrent `open` of the **same cacheable** Deflate member runs **one** inflate; waiters
 //!   share the resulting `Arc<InflateBytes>` (zero-copy `ArcBytes` views).
 //! * Concurrent `open` of **distinct** Deflate members inflates in parallel on the
-//!   path-backed backend (`File::try_clone` + independent `flate2` decoders). On the
-//!   shared-stream backend, compressed bytes are read under the stream mutex then
-//!   inflated offline so decode still overlaps across members. Budgeted opens stream
-//!   compressed input instead of retaining a second member-sized buffer.
-//! * Store stencils and encrypted (ZipCrypto/AES) members are unchanged: store stays
-//!   random-access; encrypted always goes through the `zip` crate decrypt path.
+//!   path-backed backend (`read_file_range_at`, then an independent `flate2` decoder).
+//!   On the shared-stream backend, compressed bytes are read under the stream mutex
+//!   then inflated offline so decode still overlaps across members.
+//! * Stored members stay on `SharedArchiveFile` (random-access stencil). Encrypted
+//!   members and every method other than Stored or Deflate go through the `zip` crate:
+//!   file-backed opens use `PositionalFile`; `ZipBackend::Shared` stays on
+//!   `SharedSeekHandle`.
+//!   Budgeted opens stream compressed input instead of retaining a second
+//!   member-sized buffer.
 //!
 //! # Multi-disk / multi-part ZIP
 //!
@@ -433,10 +436,11 @@ struct OpenedArchive {
 
 /// Content backend for ZIP member open (path file vs generic Read+Seek).
 enum ZipBackend {
-    /// Path-based: `try_clone` + [`SharedArchiveFile`] (multi-part join supported).
+    /// Path-based `Arc<File>` (multi-part join supported). Stored reads use
+    /// [`SharedArchiveFile`]. Zip-crate opens use [`PositionalFile`].
     File {
         archive_file: Arc<SharedArchiveFile>,
-        raw_file: File,
+        raw_file: Arc<File>,
         /// Keep multi-part join temp file from being deleted.
         _joined: Option<NamedTempFile>,
     },
@@ -491,6 +495,62 @@ impl Seek for SharedSeekHandle {
             ));
         }
         self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+/// File reader with a private logical cursor and no shared seek state or lock.
+struct PositionalFile {
+    file: Arc<File>,
+    pos: u64,
+}
+
+impl PositionalFile {
+    fn read_at(&self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_at(buf, self.pos)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            // seek_read changes the OS cursor, but every reader supplies its
+            // own offset and never relies on that shared cursor.
+            self.file.seek_read(buf, self.pos)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = buf;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "positional file reads are unavailable on this platform",
+            ))
+        }
+    }
+}
+
+impl Read for PositionalFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.read_at(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for PositionalFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let (base, offset) = match pos {
+            SeekFrom::Start(pos) => (pos, 0),
+            SeekFrom::Current(offset) => (self.pos, offset),
+            SeekFrom::End(offset) => (self.file.metadata()?.len(), offset),
+        };
+        self.pos = base.checked_add_signed(offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek outside file offset range",
+            )
+        })?;
         Ok(self.pos)
     }
 }
@@ -665,7 +725,7 @@ impl ZipMountSource {
             archive_path: opened.user_path,
             backend: ZipBackend::File {
                 archive_file: Arc::new(SharedArchiveFile::new(opened.file.try_clone()?)),
-                raw_file: opened.file,
+                raw_file: Arc::new(opened.file),
                 _joined: opened._joined,
             },
             index,
@@ -900,7 +960,7 @@ impl ZipMountSource {
             archive_path: opened.user_path,
             backend: ZipBackend::File {
                 archive_file: Arc::new(SharedArchiveFile::new(opened.file.try_clone()?)),
-                raw_file: opened.file,
+                raw_file: Arc::new(opened.file),
                 _joined: opened._joined,
             },
             index,
@@ -918,7 +978,7 @@ impl ZipMountSource {
     /// `user.hash.<algo>` index xattrs (Python parity; TAR uses the same xattr keys).
     ///
     /// When `parallel_file` is `Some`, plain (unencrypted) Stored/Deflate members are
-    /// inflated and hashed on worker threads via independent `File::try_clone` reads
+    /// inflated and hashed on worker threads via `read_file_range_at`
     /// (FR-4 multi-member parallel inflate). Encrypted / other methods stay sequential
     /// through the `zip` crate.
     #[allow(clippy::too_many_arguments)]
@@ -1099,8 +1159,8 @@ impl ZipMountSource {
 /// members may be Deflate/AES; digests match file contents served by [`MountSource::open`].
 ///
 /// With `parallel_file`, unencrypted Stored/Deflate members are decoded in parallel
-/// (independent clones of the archive file). Encrypted and other compression methods
-/// stay sequential via the `zip` crate.
+/// via `read_file_range_at` (no shared file cursor). Encrypted and other compression
+/// methods stay sequential via the `zip` crate.
 fn store_member_content_hashes<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     index: &SqliteIndex,
@@ -1461,7 +1521,10 @@ impl ZipMountSource {
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
         match &self.backend {
             ZipBackend::File { raw_file, .. } => {
-                let file = raw_file.try_clone()?;
+                let file = PositionalFile {
+                    file: Arc::clone(raw_file),
+                    pos: 0,
+                };
                 Self::read_member_via_zip_archive(file, meta, self.password.as_deref())
             }
             ZipBackend::Shared(shared) => {
@@ -2806,6 +2869,93 @@ mod tests {
             h.join().expect("thread");
         }
         assert_eq!(src.inflate_cache.completed_len(), 3);
+    }
+
+    /// Regression: concurrent zip-crate opens returned a sibling member's bytes (shared OS cursor from File::try_clone).
+    #[test]
+    fn regression_parallel_zip_crate_member_reads_keep_own_bytes() {
+        const N: usize = 8;
+        const ROUNDS: usize = 16;
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![b'A' + i as u8; 64 * 1024]).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parallel-bzip2.zip");
+        {
+            let file = File::create(&path).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Bzip2);
+            for (i, payload) in payloads.iter().enumerate() {
+                zw.start_file(format!("m{i}.bin"), opts).unwrap();
+                zw.write_all(payload).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).expect("open bzip2 zip");
+        let infos: Vec<_> = (0..N)
+            .map(|i| {
+                let fi = src.lookup(&format!("/m{i}.bin"), 0).expect("lookup");
+                assert_eq!(fi.size, payloads[i].len() as u64);
+                fi
+            })
+            .collect();
+        for round in 0..ROUNDS {
+            let barrier = std::sync::Barrier::new(N);
+            std::thread::scope(|scope| {
+                for (i, fi) in infos.iter().enumerate() {
+                    let src = &src;
+                    let barrier = &barrier;
+                    let expected = &payloads[i];
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let mut reader = src.open(fi, 0).expect("open member");
+                        let mut actual = Vec::new();
+                        reader.read_to_end(&mut actual).expect("read member");
+                        assert_eq!(actual, *expected, "round {round} member {i}");
+                    });
+                }
+            });
+        }
+    }
+
+    /// Regression: positional ZIP cursors must preserve short-read, EOF and seek semantics.
+    #[test]
+    fn regression_positional_file_short_reads_and_seeks() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"abcdef").unwrap();
+        let mut reader = PositionalFile {
+            file: Arc::new(file),
+            pos: 0,
+        };
+        let mut buf = [0; 8];
+        assert_eq!(reader.read(&mut buf[..2]).unwrap(), 2);
+        assert_eq!(&buf[..2], b"ab");
+        assert_eq!(reader.seek(SeekFrom::Current(1)).unwrap(), 3);
+        assert_eq!(reader.read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], b"def");
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        assert_eq!(reader.seek(SeekFrom::End(-2)).unwrap(), 4);
+        assert_eq!(reader.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"ef");
+        assert_eq!(reader.seek(SeekFrom::Start(8)).unwrap(), 8);
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        reader.rewind().unwrap();
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert_eq!(
+            reader.seek(SeekFrom::Current(-1)).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(reader.stream_position().unwrap(), 0);
+        reader.seek(SeekFrom::Start(u64::MAX)).unwrap();
+        assert_eq!(
+            reader.seek(SeekFrom::Current(1)).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(reader.stream_position().unwrap(), u64::MAX);
+        reader.file.set_len(8).unwrap();
+        assert_eq!(reader.seek(SeekFrom::End(0)).unwrap(), 8);
     }
 
     /// Shared-stream backend: concurrent same-member open still single-flights correctly.
