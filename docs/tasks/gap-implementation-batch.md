@@ -92,7 +92,7 @@ Non-overlapping crate ownership so agents could not stomp each other:
 
 | Agent | Ownership | Result |
 |-------|-----------|--------|
-| bzip2 large maps | `bzip2_seek.rs` | bit-block map cap 8 MiB → **256 MiB** + faster scan |
+| bzip2 large maps | `bzip2_seek.rs` | **256 MiB** in-memory compressed threshold; larger inputs use file-backed maps, with no block-count cap. TAR header reads span block boundaries. |
 | gzip from reader | `gzip_seek.rs` | `open_*_from_reader` for Range / Cursor |
 | xz stream/block map | `xz_seek.rs` | Index + multi-stream seek maps |
 | Dropbox TTL/Range | `remote/dropbox` | 30s list TTL; chunked content Range |

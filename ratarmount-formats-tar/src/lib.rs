@@ -1447,6 +1447,27 @@ fn sparse_map_from_pax(pax: &PaxParsed) -> Vec<(u64, u64)> {
     Vec::new()
 }
 
+/// Fill a TAR record across short reads (e.g. bzip2 block boundaries).
+/// Only EOF before any bytes is a clean end; a partial record is truncated.
+fn read_tar_header<R: Read>(reader: &mut R, header: &mut [u8; 512]) -> io::Result<bool> {
+    let mut filled = 0;
+    while filled < header.len() {
+        match reader.read(&mut header[filled..]) {
+            Ok(0) if filled == 0 => return Ok(false),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("truncated TAR header: {filled} of 512 bytes"),
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
 /// Scan headers for GNU dumpdir typeflag `D` (Python `_detect_gnu_incremental`).
 fn detect_gnu_incremental<R: Read + Seek>(reader: &mut R, ignore_zeros: bool) -> Result<bool> {
     let old_pos = reader.stream_position()?;
@@ -1462,8 +1483,7 @@ fn detect_gnu_incremental<R: Read + Seek>(reader: &mut R, ignore_zeros: bool) ->
                 return Ok(false);
             }
             reader.seek(SeekFrom::Start(pos))?;
-            let n = reader.read(&mut header)?;
-            if n < 512 {
+            if !read_tar_header(reader, &mut header)? {
                 return Ok(false);
             }
 
@@ -1471,8 +1491,7 @@ fn detect_gnu_incremental<R: Read + Seek>(reader: &mut R, ignore_zeros: bool) ->
                 pos += BLOCK_SIZE;
                 reader.seek(SeekFrom::Start(pos))?;
                 let mut next = [0u8; 512];
-                let n2 = reader.read(&mut next)?;
-                if n2 < 512 || next.iter().all(|&b| b == 0) {
+                if !read_tar_header(reader, &mut next)? || next.iter().all(|&b| b == 0) {
                     if ignore_zeros {
                         continue;
                     }
@@ -1666,11 +1685,7 @@ fn parse_tar_from<R: Read + Seek>(
             bytes_total_hint,
         );
         reader.seek(SeekFrom::Start(pos))?;
-        let n = reader.read(&mut header)?;
-        if n == 0 {
-            break;
-        }
-        if n < 512 {
+        if !read_tar_header(reader, &mut header)? {
             break;
         }
 
@@ -1682,8 +1697,7 @@ fn parse_tar_from<R: Read + Seek>(
             pos += BLOCK_SIZE;
             reader.seek(SeekFrom::Start(pos))?;
             let mut next = [0u8; 512];
-            let n2 = reader.read(&mut next)?;
-            if n2 < 512 || next.iter().all(|&b| b == 0) {
+            if !read_tar_header(reader, &mut next)? || next.iter().all(|&b| b == 0) {
                 break;
             }
             break;
@@ -2185,8 +2199,7 @@ fn walk_tar_region<R: Read + Seek>(
             break;
         }
         reader.seek(SeekFrom::Start(pos))?;
-        let n = reader.read(&mut header)?;
-        if n < 512 {
+        if !read_tar_header(reader, &mut header)? {
             break;
         }
 
@@ -2200,8 +2213,7 @@ fn walk_tar_region<R: Read + Seek>(
             if next_pos + BLOCK_SIZE <= region_end {
                 reader.seek(SeekFrom::Start(next_pos))?;
                 let mut next = [0u8; 512];
-                let n2 = reader.read(&mut next)?;
-                if n2 < 512 || next.iter().all(|&b| b == 0) {
+                if !read_tar_header(reader, &mut next)? || next.iter().all(|&b| b == 0) {
                     break;
                 }
             }
@@ -2493,11 +2505,10 @@ fn peek_tar_magic_at<R: Read + Seek>(reader: &mut R, data_off: u64) -> Result<bo
         return Ok(false);
     }
     let mut magic = [0u8; 5];
-    let n = match reader.read(&mut magic) {
-        Ok(n) => n,
-        Err(_) => return Ok(false),
-    };
-    Ok(n == 5 && (&magic == b"ustar" || &magic == b"GNU  " || magic.starts_with(b"ustar")))
+    if reader.read_exact(&mut magic).is_err() {
+        return Ok(false);
+    }
+    Ok(&magic == b"ustar" || &magic == b"GNU  ")
 }
 
 fn store_nested_tar_members(index: &SqliteIndex, members: &[NestedTarMember]) -> Result<()> {
@@ -3969,6 +3980,133 @@ mod tests {
         // two zero blocks
         out.extend(std::iter::repeat_n(0u8, 1024));
         out
+    }
+
+    /// Two independently compressed blocks put a restart exactly where requested.
+    /// The production failure needs only a header crossing a block boundary, not
+    /// 1,000 blocks: these tiny concatenated streams exercise the same reader.
+    fn bzip2_body_split_at(bytes: &[u8], split: usize) -> Arc<dyn SeekableBody> {
+        use bzip2::{write::BzEncoder, Compression};
+        let mut compressed = Vec::new();
+        for part in [&bytes[..split], &bytes[split..]] {
+            let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(part).unwrap();
+            compressed.extend(encoder.finish().unwrap());
+        }
+        let body = ratarmount_compress::open_seekable_bzip2_from_reader(
+            std::io::Cursor::new(compressed),
+            "memory://boundary.tar.bz2",
+        )
+        .unwrap();
+        assert_eq!(body.size(), bytes.len() as u64);
+        assert_eq!(body.checkpoint_count(), 2);
+        body
+    }
+
+    fn two_member_tar() -> Vec<u8> {
+        let mut bytes = synthetic_ustar("first.bin", b"first payload");
+        bytes.truncate(bytes.len() - 1024);
+        bytes.extend(synthetic_ustar("last.bin", b"last payload"));
+        bytes
+    }
+
+    /// Regression: bzip2 short reads at block boundaries silently lose TAR members.
+    #[test]
+    fn regression_bzip2_block_boundary_indexes_every_member() {
+        let bytes = two_member_tar();
+        let body = bzip2_body_split_at(&bytes, 1024 + 123);
+        let mut reader = body.open_reader().unwrap();
+        reader.seek(SeekFrom::Start(1024)).unwrap();
+        assert_eq!(reader.read(&mut [0; 512]).unwrap(), 123);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let tar = SqliteIndexedTar::create_index_body(
+            body.path(),
+            Arc::clone(&body),
+            None,
+            &opts,
+            "test",
+        )
+        .unwrap();
+        for (name, expected) in [
+            ("first.bin", b"first payload".as_slice()),
+            ("last.bin", b"last payload"),
+        ] {
+            let fi = tar.lookup(&format!("/{name}"), 0).expect(name);
+            let mut data = Vec::new();
+            tar.open(&fi, 0).unwrap().read_to_end(&mut data).unwrap();
+            assert_eq!(data, expected);
+        }
+    }
+
+    /// Regression: a bzip2 boundary inside a nested TAR header truncates flattening.
+    #[test]
+    fn regression_bzip2_block_boundary_indexes_every_nested_member() {
+        let bytes = synthetic_ustar("inner.tar", &two_member_tar());
+        let body = bzip2_body_split_at(&bytes, 512 + 1024 + 123);
+        let tar = SqliteIndexedTar::create_index_body(
+            body.path(),
+            Arc::clone(&body),
+            None,
+            &OpenOptions {
+                index_in_memory: true,
+                ..OpenOptions::default()
+            },
+            "test",
+        )
+        .unwrap();
+        let fi = tar
+            .lookup("/inner.tar/last.bin", 0)
+            .expect("last nested member");
+        let mut data = Vec::new();
+        tar.open(&fi, 0).unwrap().read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"last payload");
+    }
+
+    /// Regression: the incremental detector mistakes a short header read for EOF.
+    #[test]
+    fn regression_bzip2_block_boundary_detects_gnu_incremental() {
+        let mut bytes = synthetic_ustar("dumpdir/", b"Yfile\0\0");
+        bytes[156] = b'D';
+        bytes[148..156].fill(b' ');
+        let sum: u32 = bytes[..512].iter().map(|&b| u32::from(b)).sum();
+        bytes[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        let body = bzip2_body_split_at(&bytes, 123);
+        let mut reader = body.open_reader().unwrap();
+        reader.seek(SeekFrom::Start(37)).unwrap();
+        assert!(detect_gnu_incremental(&mut reader, false).unwrap());
+        assert_eq!(reader.stream_position().unwrap(), 37);
+    }
+
+    /// Regression: a block boundary in ustar magic hides a nested TAR.
+    #[test]
+    fn regression_bzip2_block_boundary_detects_nested_tar_magic() {
+        let bytes = synthetic_ustar("inner.tar", &two_member_tar());
+        let body = bzip2_body_split_at(&bytes, 512 + 257 + 2);
+        assert!(peek_tar_magic_at(&mut body.open_reader().unwrap(), 512).unwrap());
+    }
+
+    /// Regression: an incomplete header must not publish a successful partial index.
+    #[test]
+    fn regression_truncated_tar_header_is_an_error() {
+        let mut bytes = two_member_tar();
+        bytes.truncate(1024 + 123);
+        let result = SqliteIndexedTar::open_from_reader(
+            std::io::Cursor::new(bytes),
+            "memory://truncated.tar",
+            None,
+            &OpenOptions {
+                index_in_memory: true,
+                gnu_incremental: Some(false),
+                ..OpenOptions::default()
+            },
+            "test",
+        );
+        assert!(
+            matches!(result, Err(TarError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof)
+        );
     }
 
     #[test]
