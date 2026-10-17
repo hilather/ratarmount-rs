@@ -6,7 +6,6 @@ use ratarmount_csi::{
     Mounter,
 };
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 #[test]
@@ -20,22 +19,33 @@ fn regression_mountinfo_escaped_target_is_not_a_prefix_match() {
 #[tokio::test]
 async fn regression_child_secret_env_and_exit_are_supervised() {
     let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("fake-mounter");
     // The temporary directory path contains no shell metacharacters.
-    std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}/args'\nprintf '%s' \"$HF_TOKEN\" > '{}/token'\nprintf '%s' \"${{NODE_ID-unset}}\" > '{}/inherited'\nexit 7\n", dir.path().display(), dir.path().display(), dir.path().display())).unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let script = common::write_fake_mounter(
+        dir.path(),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}/args'\nprintf '%s' \"$HF_TOKEN\" > '{}/token'\nprintf '%s' \"${{NODE_ID-unset}}\" > '{}/inherited'\nexit 7\n",
+            dir.path().display(),
+            dir.path().display(),
+            dir.path().display()
+        ),
+    );
     let mounter = ProcessMounter::new(script, dir.path().join("overlays"), Duration::from_secs(2));
     let mut req = common::request(dir.path().join("target").to_str().unwrap());
     req.volume_context
         .insert("source".into(), "/dev/null".into());
     let spec = options::parse(&req).unwrap();
-    let error = mounter
-        .mount(
-            &spec,
-            BTreeMap::from([("HF_TOKEN".into(), "secret-in-env-only".into())]),
-        )
-        .await
-        .unwrap_err();
+    let error = common::mount_retrying_spawn(
+        &mounter,
+        &spec,
+        BTreeMap::from([("HF_TOKEN".into(), "secret-in-env-only".into())]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert_eq!(
+        error.message(),
+        "ratarmount exited before mounting; check source, credentials and FUSE configuration"
+    );
     assert!(!error.message().contains("secret-in-env-only"));
     assert!(!std::fs::read_to_string(dir.path().join("args"))
         .unwrap()
@@ -55,9 +65,7 @@ async fn regression_child_secret_env_and_exit_are_supervised() {
 #[tokio::test]
 async fn regression_mount_timeout_stops_the_child() {
     let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("fake-mounter");
-    std::fs::write(&script, "#!/bin/sh\nexec sleep 60\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let script = common::write_fake_mounter(dir.path(), "#!/bin/sh\nexec sleep 60\n");
     let mounter = ProcessMounter::new(
         script,
         dir.path().join("overlays"),
@@ -67,14 +75,11 @@ async fn regression_mount_timeout_stops_the_child() {
     req.volume_context
         .insert("source".into(), "/dev/null".into());
     let spec = options::parse(&req).unwrap();
-    assert_eq!(
-        mounter
-            .mount(&spec, BTreeMap::new())
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::DeadlineExceeded
-    );
+    let err = common::mount_retrying_spawn(&mounter, &spec, BTreeMap::new())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+    assert_eq!(err.message(), "timed out waiting for FUSE mount");
     mounter.unmount(&spec.target).await.unwrap();
     assert!(!mounter.healthy(&spec.target).await.unwrap());
 }
@@ -97,9 +102,9 @@ fn parent_exit_helper() {
         let mut req = common::request(dir.join("mount").to_str().unwrap());
         req.volume_context
             .insert("source".into(), "/dev/null".into());
-        let _ = mounter
-            .mount(&options::parse(&req).unwrap(), BTreeMap::new())
-            .await;
+        let _ =
+            common::mount_retrying_spawn(&mounter, &options::parse(&req).unwrap(), BTreeMap::new())
+                .await;
     });
 }
 
@@ -107,16 +112,13 @@ fn parent_exit_helper() {
 #[test]
 fn regression_driver_death_kills_owned_child() {
     let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("fake-mounter");
-    std::fs::write(
-        &script,
-        format!(
+    common::write_fake_mounter(
+        dir.path(),
+        &format!(
             "#!/bin/sh\necho $$ > '{}/child.pid'\nexec sleep 60\n",
             dir.path().display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let mut driver = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "parent_exit_helper"])
         .env("CSI_HELPER_DIR", dir.path())
