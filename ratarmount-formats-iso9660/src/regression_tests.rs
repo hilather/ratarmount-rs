@@ -829,6 +829,377 @@ fn regression_joliet_unmatched_directory_pairing_skips_sl_directories() {
     });
 }
 
+/// Regression: nested SL directories keep the inner directory, its file, and its symlink.
+#[test]
+fn regression_joliet_nested_sl_directories() {
+    let primary = [record(
+        22,
+        true,
+        b"OUT",
+        &[px(ratarmount_core::S_IFLNK | 0o750, false), sl("outer")].concat(),
+    )];
+    let supplementary = [record(31, false, &joliet("Joliet Only;1"), &[])];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(
+        &mut bytes,
+        22,
+        &[],
+        &[record(
+            23,
+            true,
+            b"IN",
+            &[px(ratarmount_core::S_IFLNK | 0o755, false), sl("inner")].concat(),
+        )],
+    );
+    directory(
+        &mut bytes,
+        23,
+        &[],
+        &[
+            record(30, false, b"F.;1", &[]),
+            record(30, false, b"L.;1", &sl("leaf")),
+        ],
+    );
+    check_sources(bytes, |src| {
+        assert_eq!(names(src, "/"), ["Joliet Only", "OUT"]);
+        let out = src.lookup("/OUT", 0).unwrap();
+        assert_eq!(out.mode, ratarmount_core::S_IFDIR | 0o750);
+        assert_eq!(out.linkname, "");
+        assert_eq!(out.size, 0);
+        assert_is_directory(src, &out);
+        assert_eq!(names(src, "/OUT"), ["IN"]);
+        let inner = src.lookup("/OUT/IN", 0).unwrap();
+        assert_eq!(inner.mode, ratarmount_core::S_IFDIR | 0o755);
+        assert_eq!(inner.linkname, "");
+        assert_eq!(inner.size, 0);
+        let children = names(src, "/OUT/IN");
+        assert_eq!(children, ["F", "L"]);
+        assert_eq!(children.len(), 2);
+        assert_file(src, "/OUT/IN/F");
+        let link = src.lookup("/OUT/IN/L", 0).unwrap();
+        assert_eq!(link.mode, ratarmount_core::S_IFLNK | 0o644);
+        assert_eq!(link.linkname, "leaf");
+        match src.open(&link, 0) {
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("symlink opened as a file"),
+        }
+        assert!(src.lookup("/IN", 0).is_none());
+        assert!(src.lookup("/L", 0).is_none());
+        assert!(src.lookup("/OUT/L", 0).is_none());
+    });
+}
+
+/// Regression: an extent-matched child must not bind its SL directory to the Joliet parent.
+#[test]
+fn regression_joliet_sl_directory_matched_descendant() {
+    let primary = [record(
+        22,
+        true,
+        b"D",
+        &[px(ratarmount_core::S_IFLNK | 0o750, false), sl("elsewhere")].concat(),
+    )];
+    let supplementary = [record(23, true, &joliet("Other"), &[])];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(
+        &mut bytes,
+        22,
+        &[],
+        &[
+            record(30, false, b"KEEP.;1", &[]),
+            record(32, false, b"ONLY.;1", &[]),
+        ],
+    );
+    directory(
+        &mut bytes,
+        23,
+        &[],
+        &[record(30, false, &joliet("Kept Name;1"), &[])],
+    );
+    bytes[32 * BLOCK..32 * BLOCK + 4].copy_from_slice(b"data");
+    check_sources(bytes, |src| {
+        assert_eq!(names(src, "/"), ["D", "Other"]);
+        assert_eq!(names(src, "/D"), ["ONLY"]);
+        assert_eq!(names(src, "/Other"), ["Kept Name"]);
+        assert_file(src, "/D/ONLY");
+        assert_file(src, "/Other/Kept Name");
+        let d = src.lookup("/D", 0).unwrap();
+        assert_eq!(d.mode, ratarmount_core::S_IFDIR | 0o750);
+        assert_eq!(d.linkname, "");
+        assert_eq!(
+            src.lookup("/Other", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o755
+        );
+        assert!(src.lookup("/D/KEEP", 0).is_none());
+        assert!(src.lookup("/D/Kept Name", 0).is_none());
+    });
+}
+
+/// Regression: a matched child binds an SL directory's non-unique parent without binding the SL directory.
+#[test]
+fn regression_joliet_sl_directory_under_non_unique_parent() {
+    let primary = [
+        record(22, true, b"P", &px(ratarmount_core::S_IFDIR | 0o700, false)),
+        record(24, true, b"SIB", &[]),
+    ];
+    let supplementary = [
+        record(23, true, &joliet("Parent"), &[]),
+        record(26, true, &joliet("Sibling"), &[]),
+    ];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(
+        &mut bytes,
+        22,
+        &[],
+        &[record(
+            25,
+            true,
+            b"D",
+            &[px(ratarmount_core::S_IFLNK | 0o750, false), sl("elsewhere")].concat(),
+        )],
+    );
+    directory(
+        &mut bytes,
+        25,
+        &[],
+        &[
+            record(30, false, b"KEEP.;1", &[]),
+            record(32, false, b"ONLY.;1", &[]),
+        ],
+    );
+    directory(
+        &mut bytes,
+        23,
+        &[],
+        &[record(27, true, &joliet("Other"), &[])],
+    );
+    directory(
+        &mut bytes,
+        27,
+        &[],
+        &[record(30, false, &joliet("Kept Name;1"), &[])],
+    );
+    bytes[32 * BLOCK..32 * BLOCK + 4].copy_from_slice(b"data");
+    check_sources(bytes, |src| {
+        assert_eq!(names(src, "/"), ["Parent", "Sibling"]);
+        assert_eq!(names(src, "/Parent"), ["D", "Other"]);
+        assert_eq!(names(src, "/Parent/D"), ["ONLY"]);
+        assert_eq!(names(src, "/Parent/Other"), ["Kept Name"]);
+        assert_eq!(
+            src.lookup("/Parent", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o700
+        );
+        assert_eq!(
+            src.lookup("/Parent/Other", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o755
+        );
+        assert_eq!(
+            src.lookup("/Sibling", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o755
+        );
+        let d = src.lookup("/Parent/D", 0).unwrap();
+        assert_eq!(d.mode, ratarmount_core::S_IFDIR | 0o750);
+        assert_eq!(d.linkname, "");
+        assert_file(src, "/Parent/D/ONLY");
+        assert_file(src, "/Parent/Other/Kept Name");
+    });
+}
+
+/// Regression: a plain directory between an SL directory and a matched file must not mis-bind or drop either file.
+#[test]
+fn regression_joliet_sl_directory_with_plain_dir_before_match() {
+    let primary = [record(
+        22,
+        true,
+        b"D",
+        &[px(ratarmount_core::S_IFLNK | 0o750, false), sl("elsewhere")].concat(),
+    )];
+    // Joliet omitted the SL directory and hoisted MID to the supplementary root.
+    let supplementary = [record(24, true, &joliet("Other"), &[])];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(
+        &mut bytes,
+        22,
+        &[],
+        &[
+            record(
+                23,
+                true,
+                b"MID",
+                &px(ratarmount_core::S_IFDIR | 0o711, false),
+            ),
+            record(32, false, b"ONLY.;1", &[]),
+        ],
+    );
+    directory(&mut bytes, 23, &[], &[record(30, false, b"KEEP.;1", &[])]);
+    directory(
+        &mut bytes,
+        24,
+        &[],
+        &[record(30, false, &joliet("Kept Name;1"), &[])],
+    );
+    bytes[32 * BLOCK..32 * BLOCK + 4].copy_from_slice(b"data");
+    check_sources(bytes, |src| {
+        fn collect(
+            src: &Iso9660MountSource,
+            path: &str,
+            dirs: &mut Vec<(String, u32)>,
+            keeps: &mut Vec<String>,
+        ) {
+            let Some(entries) = src.list_dirents(path) else {
+                return;
+            };
+            for ent in entries {
+                let child = if path == "/" {
+                    format!("/{}", ent.name)
+                } else {
+                    format!("{path}/{}", ent.name)
+                };
+                if ent.name == "KEEP" || ent.name == "Kept Name" {
+                    keeps.push(child.clone());
+                }
+                let Some(fi) = src.lookup(&child, 0) else {
+                    continue;
+                };
+                if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
+                    dirs.push((child.clone(), fi.mode));
+                    collect(src, &child, dirs, keeps);
+                }
+            }
+        }
+
+        assert_file(src, "/D/ONLY");
+        let d = src.lookup("/D", 0).unwrap_or_else(|| panic!("missing /D"));
+        assert_eq!(d.mode, ratarmount_core::S_IFDIR | 0o750);
+        assert_eq!(d.linkname, "");
+        let root = src.lookup("/", 0).unwrap_or_else(|| panic!("missing /"));
+        assert_ne!(root.mode, ratarmount_core::S_IFDIR | 0o750);
+        let mut dirs = vec![("/".to_string(), root.mode)];
+        let mut keeps = Vec::new();
+        collect(src, "/", &mut dirs, &mut keeps);
+        for (path, mode) in &dirs {
+            if path != "/D" {
+                assert_ne!(
+                    *mode,
+                    ratarmount_core::S_IFDIR | 0o750,
+                    "{path} took the SL directory mode"
+                );
+            }
+        }
+        assert_eq!(
+            keeps.len(),
+            1,
+            "Kept Name/KEEP data reachable {} times at {keeps:?}",
+            keeps.len()
+        );
+        assert_file(src, &keeps[0]);
+    });
+}
+
+/// Regression: nested SL directories with an extent-matched inner file stay grafted; the Joliet directory keeps mode 0o755.
+#[test]
+fn regression_joliet_nested_sl_with_matched_file() {
+    let primary = [record(
+        22,
+        true,
+        b"OUT",
+        &[px(ratarmount_core::S_IFLNK | 0o750, false), sl("outer")].concat(),
+    )];
+    let supplementary = [record(24, true, &joliet("Other"), &[])];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(
+        &mut bytes,
+        22,
+        &[],
+        &[record(
+            23,
+            true,
+            b"IN",
+            &[px(ratarmount_core::S_IFLNK | 0o700, false), sl("inner")].concat(),
+        )],
+    );
+    directory(
+        &mut bytes,
+        23,
+        &[],
+        &[
+            record(30, false, b"KEEP.;1", &[]),
+            record(32, false, b"ONLY.;1", &[]),
+        ],
+    );
+    directory(
+        &mut bytes,
+        24,
+        &[],
+        &[record(30, false, &joliet("Kept Name;1"), &[])],
+    );
+    bytes[32 * BLOCK..32 * BLOCK + 4].copy_from_slice(b"data");
+    check_sources(bytes, |src| {
+        assert_eq!(names(src, "/"), ["OUT", "Other"]);
+        assert!(src.lookup("/IN", 0).is_none());
+        let out = src.lookup("/OUT", 0).unwrap();
+        assert_eq!(out.mode, ratarmount_core::S_IFDIR | 0o750);
+        assert_eq!(out.linkname, "");
+        assert_eq!(names(src, "/OUT"), ["IN"]);
+        let inner = src.lookup("/OUT/IN", 0).unwrap();
+        assert_eq!(inner.mode, ratarmount_core::S_IFDIR | 0o700);
+        assert_eq!(inner.linkname, "");
+        assert_eq!(names(src, "/OUT/IN"), ["ONLY"]);
+        assert_eq!(
+            src.lookup("/Other", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o755
+        );
+        assert_eq!(names(src, "/Other"), ["Kept Name"]);
+        assert_file(src, "/OUT/IN/ONLY");
+        assert_file(src, "/Other/Kept Name");
+    });
+}
+
+/// Regression: a type-2 SVD whose escape is not Joliet is ignored while its tree stays valid.
+#[test]
+fn regression_non_joliet_supplementary_descriptor_ignored() {
+    for escape in [b"%/A", b"%/D", b"   "] {
+        let primary = [
+            record(30, false, b"FILE.;1", &[]),
+            record(22, true, b"SUBDIR", &[]),
+        ];
+        let supplementary = [record(31, false, &joliet("Supplementary Only;1"), &[])];
+        let mut bytes = image(false, &primary, Some(&supplementary));
+        bytes[17 * BLOCK + 88..17 * BLOCK + 91].copy_from_slice(escape);
+        directory(&mut bytes, 22, &[], &[record(30, false, b"CHILD;1", &[])]);
+        check_sources(bytes, |src| {
+            assert_eq!(names(src, "/"), ["FILE", "SUBDIR"]);
+            assert_eq!(names(src, "/SUBDIR"), ["CHILD"]);
+            assert_file(src, "/FILE");
+            assert_file(src, "/SUBDIR/CHILD");
+            assert!(src.lookup("/Supplementary Only", 0).is_none());
+        });
+    }
+}
+
+/// Regression: a child directory past EOF is rejected; one that ends on the last byte is listed.
+#[test]
+fn regression_directory_extent_past_eof_and_exact_end() {
+    let edge = 20 * BLOCK
+        + record(20, true, &[0], &entry(b"SP", &[0xbe, 0xef, 0])).len()
+        + record(20, true, &[1], &[]).len();
+    let mut past_eof = image(true, &[record(99, true, b"EDGE", &[])], None);
+    directory(&mut past_eof, 99, &[], &[record(30, false, b"F.;1", &[])]);
+    past_eof[edge + 10..edge + 18].copy_from_slice(&both(4096));
+    match open_mem(past_eof) {
+        Err(err) => assert!(err.to_string().contains("extends beyond image"), "{err}"),
+        Ok(_) => panic!("directory extent past the image was accepted"),
+    }
+
+    let mut exact = image(true, &[record(99, true, b"EDGE", &[])], None);
+    directory(&mut exact, 99, &[], &[record(30, false, b"F.;1", &[])]);
+    exact[edge + 10..edge + 18].copy_from_slice(&both(2048));
+    check_sources(exact, |src| {
+        assert_eq!(names(src, "/"), ["EDGE"]);
+        assert_eq!(names(src, "/EDGE"), ["F"]);
+        assert_file(src, "/EDGE/F");
+    });
+}
+
 /// Regression: a damaged Joliet tree fails the image or replaces the ISO 9660 names.
 #[test]
 fn regression_damaged_joliet_falls_back_to_iso() {

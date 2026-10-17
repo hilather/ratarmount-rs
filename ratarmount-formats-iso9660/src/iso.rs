@@ -691,6 +691,13 @@ fn apply_joliet_fallback(primary: &mut [Node], joliet: &[Node]) -> Vec<Option<us
             }
         }
     }
+    // A child's match propagates through an SL directory onto its parent.
+    // Clear the SL directory so it is grafted, not paired with the Joliet dir.
+    for id in 1..primary.len() {
+        if primary[id].record.is_dir && primary[id].record.rr.link.is_some() {
+            matches[id] = None;
+        }
+    }
     // Resolve remaining aliases within matched parents. A single unmatched
     // directory on each side is also unambiguous, including an empty directory.
     // Multiple empty siblings with different names have no on-disc shared ID.
