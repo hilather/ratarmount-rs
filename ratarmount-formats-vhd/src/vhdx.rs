@@ -379,6 +379,11 @@ fn parse_metadata<R: Read + Seek>(reader: &mut R, off: u64, len: u32) -> Result<
             "differencing VHDX is residual (no parent chain)".into(),
         ));
     }
+    if logical_sector != 512 && logical_sector != 4096 {
+        return Err(VhdError::Msg(format!(
+            "VHDX logical sector size {logical_sector} is not 512 or 4096"
+        )));
+    }
     Ok(Metadata {
         file_params,
         virt_size,
@@ -459,11 +464,6 @@ where
         )));
     }
     let logical = u64::from(meta.logical_sector);
-    if logical != 512 && logical != 4096 {
-        return Err(VhdError::Msg(format!(
-            "VHDX logical sector size {logical} is not 512 or 4096"
-        )));
-    }
     // chunk_ratio = (2^23 * logical_sector_size) / block_size
     let chunk_ratio = (8 * MIB)
         .checked_mul(logical)
@@ -801,6 +801,185 @@ mod tests {
             err.to_string().contains("missing Logical Sector Size"),
             "{err}"
         );
+    }
+
+    /// Regression: MS-VHDX GUID helpers must match the spec's on-disk bytes.
+    #[test]
+    fn regression_vhdx_metadata_guid_bytes() {
+        assert_eq!(
+            guid_bat(),
+            [
+                0x66, 0x77, 0xC2, 0x2D, 0x23, 0xF6, 0x00, 0x42, 0x9D, 0x64, 0x11, 0x5E, 0x9B, 0xFD,
+                0x4A, 0x08,
+            ]
+        );
+        assert_eq!(
+            guid_metadata(),
+            [
+                0x06, 0xA2, 0x7C, 0x8B, 0x90, 0x47, 0x9A, 0x4B, 0xB8, 0xFE, 0x57, 0x5F, 0x05, 0x0F,
+                0x88, 0x6E,
+            ]
+        );
+        assert_eq!(
+            guid_file_params(),
+            [
+                0x37, 0x67, 0xA1, 0xCA, 0x36, 0xFA, 0x43, 0x4D, 0xB3, 0xB6, 0x33, 0xF0, 0xAA, 0x44,
+                0xE7, 0x6B,
+            ]
+        );
+        assert_eq!(
+            guid_virt_size(),
+            [
+                0x24, 0x42, 0xA5, 0x2F, 0x1B, 0xCD, 0x76, 0x48, 0xB2, 0x11, 0x5D, 0xBE, 0xD8, 0x3B,
+                0xF4, 0xB8,
+            ]
+        );
+        assert_eq!(
+            guid_logical_sector(),
+            [
+                0x1D, 0xBF, 0x41, 0x81, 0x6F, 0xA9, 0x09, 0x47, 0xBA, 0x47, 0xF2, 0x33, 0xA8, 0xFA,
+                0xAB, 0x5F,
+            ]
+        );
+        assert_eq!(
+            guid_physical_sector(),
+            [
+                0xC7, 0x48, 0xA3, 0xCD, 0x5D, 0x44, 0x71, 0x44, 0x9C, 0xC9, 0xE9, 0x88, 0x52, 0x51,
+                0xC5, 0x56,
+            ]
+        );
+        assert_eq!(
+            guid_parent_locator(),
+            [
+                0x2D, 0x5F, 0xD3, 0xA8, 0x0B, 0xB3, 0x4D, 0x45, 0xAB, 0xF7, 0xD3, 0xD8, 0x48, 0x34,
+                0xAB, 0x0C,
+            ]
+        );
+        assert_eq!(
+            guid_disk_id(),
+            [
+                0xAB, 0x12, 0xCA, 0xBE, 0xE6, 0xB2, 0x23, 0x45, 0x93, 0xEF, 0xC3, 0x09, 0xE0, 0x00,
+                0xC7, 0x46,
+            ]
+        );
+    }
+
+    /// Regression: region length 65536 is not "< 64 KiB"; 65535 is.
+    #[test]
+    fn regression_vhdx_metadata_region_len_64kib_edge() {
+        let mut img = vec![0u8; 65536];
+        img[0..8].copy_from_slice(b"metadata");
+        let err = parse_metadata(&mut Cursor::new(img), 0, 65536)
+            .err()
+            .expect("64 KiB region with no items");
+        let msg = err.to_string();
+        assert!(msg.contains("missing File Parameters"), "{msg}");
+        assert!(!msg.contains("< 64 KiB"), "{msg}");
+
+        let err = parse_metadata(&mut Cursor::new(Vec::<u8>::new()), 0, 65535)
+            .err()
+            .expect("65535-byte region must fail the minimum");
+        assert!(err.to_string().contains("< 64 KiB"), "{err}");
+    }
+
+    /// Regression: entry count 2047 is accepted; 2048 is too large.
+    #[test]
+    fn regression_vhdx_metadata_entry_count_2047_edge() {
+        let mut img = metadata_image();
+        // Index 2046 sits at byte 65504, so e + 32 == raw.len() and `>` must keep it.
+        let logical = 32 + 3 * 32;
+        img.copy_within(logical..logical + 32, 32 + 2046 * 32);
+        // Whole 32-byte filler, not just the id. id[0] = 0xEE and the index is a
+        // little-endian u16 at bytes 1..3. A single id byte collides past 255.
+        for i in 0..2047 {
+            if matches!(i, 0 | 1 | 2 | 4 | 2046) {
+                continue;
+            }
+            let e = 32 + i * 32;
+            img[e..e + 32].fill(0);
+            img[e] = 0xEE;
+            img[e + 1..e + 3].copy_from_slice(&(i as u16).to_le_bytes());
+        }
+        img[10..12].copy_from_slice(&2047u16.to_le_bytes());
+        let meta = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+            .expect("2047 entries at the table end");
+        assert_eq!(meta.logical_sector, 512);
+        assert_eq!(meta.virt_size, MIB);
+        assert_eq!(meta.file_params.block_size, MIB as u32);
+
+        // Leave the 2048-count image unfilled. Removing the cap yields
+        // "VHDX duplicate metadata item" (the zero tail shares one id),
+        // so the "entry count 2048" assertion still fails.
+        let mut img = metadata_image();
+        img[10..12].copy_from_slice(&2048u16.to_le_bytes());
+        let err = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+            .err()
+            .expect("entry count 2048 must fail");
+        assert!(err.to_string().contains("entry count 2048"), "{err}");
+    }
+
+    /// Regression: a metadata item of exactly 1 MiB is accepted; one byte over is not.
+    #[test]
+    fn regression_vhdx_metadata_item_len_1mib_edge() {
+        // Physical Sector Size (entry 4): offset 0x10024, length field at byte 180.
+        const PHYS_LEN_AT: usize = 32 + 4 * 32 + 20;
+        let accept_end = 0x10024 + 1_048_576;
+        let mut img = metadata_image();
+        img.resize(accept_end, 0);
+        img[PHYS_LEN_AT..PHYS_LEN_AT + 4].copy_from_slice(&1_048_576u32.to_le_bytes());
+        let meta = parse_metadata(&mut Cursor::new(img), 0, accept_end as u32)
+            .expect("item length of exactly 1 MiB");
+        assert_eq!(meta.logical_sector, 512);
+
+        let mut img = metadata_image();
+        img[PHYS_LEN_AT..PHYS_LEN_AT + 4].copy_from_slice(&1_048_577u32.to_le_bytes());
+        let err = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+            .err()
+            .expect("item length of 1 MiB + 1 must fail");
+        assert!(err.to_string().contains("exceeds 1 MiB"), "{err}");
+    }
+
+    /// Regression: logical sector sizes other than 512 and 4096 fail in parse_metadata.
+    #[test]
+    fn regression_vhdx_metadata_logical_sector_rejected() {
+        for sector in [512u32, 4096] {
+            let mut img = metadata_image();
+            img[0x10020..0x10024].copy_from_slice(&sector.to_le_bytes());
+            let meta = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+                .expect("512 and 4096 are valid logical sectors");
+            assert_eq!(meta.logical_sector, sector);
+        }
+        for sector in [0u32, 511, 513, 1024, 4095, 4097, 8192] {
+            let mut img = metadata_image();
+            img[0x10020..0x10024].copy_from_slice(&sector.to_le_bytes());
+            let err = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+                .err()
+                .expect("logical sector other than 512 or 4096 must fail");
+            assert!(
+                err.to_string().contains("not 512 or 4096"),
+                "sector {sector}: {err}"
+            );
+        }
+    }
+
+    /// Regression: open_vhdx accepts logical sector 4096 and rejects 1024.
+    #[test]
+    fn regression_vhdx_metadata_logical_sector_open() {
+        let patch = MIB as usize + 0x10020;
+        let mut img = encode_fixed_vhdx(b"x", MIB).unwrap();
+        img[patch..patch + 4].copy_from_slice(&4096u32.to_le_bytes());
+        let (mut disk, kind) = open_vhdx(Cursor::new(img)).expect("4096 logical sector opens");
+        assert_eq!(kind, VhdKind::Vhdx);
+        let mut byte = [0u8; 1];
+        disk.read_exact(&mut byte).unwrap();
+        assert_eq!(byte[0], b'x');
+
+        let mut img = encode_fixed_vhdx(b"x", MIB).unwrap();
+        img[patch..patch + 4].copy_from_slice(&1024u32.to_le_bytes());
+        let err = open_vhdx(Cursor::new(img))
+            .err()
+            .expect("logical sector 1024 must fail");
+        assert!(err.to_string().contains("not 512 or 4096"), "{err}");
     }
 
     /// Regression: even an all-zero log cannot bypass the non-zero LogGuid refusal.
