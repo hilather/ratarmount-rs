@@ -1,5 +1,79 @@
 # Benchmarks
 
+## Format sweep
+
+[`compare-formats.sh`](compare-formats.sh) measures the Rust binary across 21
+archive, filesystem, disk-image and model-container fixtures. It requires
+`python3` (standard library only) and uses the shared `test-harness/env.sh`
+mount/unmount helpers. Python ratarmount is not needed.
+
+```bash
+cargo build --release -p ratarmount
+./benchmarks/compare-formats.sh
+# → benchmarks/format-results.{csv,md}
+
+# Fixtures and regression checks, without a binary or FUSE:
+MICRO=1 PREPARE_ONLY=1 ./benchmarks/compare-formats.sh
+./benchmarks/test-compare-formats.sh
+
+# Real cold-index measurements when /dev/fuse is unavailable:
+MICRO=1 NO_FUSE=1 LARGE_MIB=2 ./benchmarks/compare-formats.sh
+```
+
+The deterministic corpus has 1,000 regular 32 KiB files in ten directories,
+with seeded, compressible contents and fixed mtimes, plus a seeded
+incompressible 64 MiB blob. `MICRO=1` uses 100 files and defaults to a 2 MiB
+blob. Both model fixtures always contain the same 48 F16 tensors, ranging from
+64 KiB to 8 MiB, with 64 MiB of payload. All fixtures and indexes live in
+a `mktemp -d` directory; `TMPDIR` selects its filesystem. Choose a disk-backed
+`TMPDIR` when desired: Linux `/tmp` may be tmpfs. No fixture is stored in the
+repository. Tools may put creation times, UUIDs or other nondeterministic
+metadata into images; fixed corpus bytes do not guarantee identical images.
+
+Rows cover TAR with gzip/bzip2/multi-block xz/seekable zstd/independent-block
+lz4, deflated/stored ZIP, newc CPIO, flat AR, Rock Ridge ISO, EXT4, MBR+EXT4,
+QCOW2 of that disk, safetensors, GGUF v3, recursive ZIP+tar.gz inside TAR,
+7z, SquashFS, FAT32 and exFAT. Missing producers create explicit skip rows.
+In particular, ISO needs `xorriso`, `genisoimage` or `mkisofs`; disk images need
+`mkfs.ext4` and `sfdisk` or `parted`; QCOW2 needs `qemu-img`; optional rows need
+`7z`/`7za`/`7zz`, `mksquashfs`, `mformat`+`mcopy`, or
+`mkfs.exfat`+`guestfish`. The exFAT population path uses libguestfs without a
+privileged host mount. Zstd prefers the binary's `--repack-seekable`, falling
+back to `zstd -1` independent 4 MiB frames plus a seek table; CSV notes identify
+the producer. Producer, daemon, membership and checksum failures are errors,
+and the sweep exits nonzero after writing its report if any occurred.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RUST_BIN` | `target/release/ratarmount` | Existing executable; build explicitly first |
+| `MICRO` | `0` | 100 files and default 2 MiB blob instead of 1,000 / 64 MiB |
+| `LARGE_MIB` | `64` (`2` in MICRO) | Explicit blob size in MiB |
+| `PREPARE_ONLY` | `0` | Build and verify; emit `PREPARE_OK` / `PREPARE_SKIP`; no binary needed |
+| `NO_FUSE` | `0` | Cold index only; also automatic on Linux without `/dev/fuse` |
+| `COMPARE_KEEP` | `0` | Keep scratch fixtures, logs, manifest and Python helper for diagnosis |
+| `CSV_OUT` / `MD_OUT` | `benchmarks/format-results.{csv,md}` | Existing parent directories required, including during prepare |
+| `MOUNT_ATTEMPTS` | `2400` | Mount readiness polls, 50 ms between attempts (about 120 s) |
+
+The report includes per-format size, cold `--no-mount -c` index time,
+cold/warm foreground mount readiness and `VmHWM` peak RSS at readiness,
+median of 15 random cats and 64 KiB `os.pread` samples, median of three
+sequential cats, and one `find` walk. Read metrics run on the warm mount.
+Random cats use 32 KiB corpus members or 64 KiB tensors; bandwidth and
+pread use the blob or the 8 MiB `layer/47/weight` tensor. Partition paths begin
+with `p1/`; recursive reads use `corpus.zip/`. Regular member counts include
+model JSON sidecars (98 safetensors / 97 GGUF files) and both nested trees.
+The bandwidth member must pass SHA-256 verification. CSV preserves unrounded
+values and producer/error notes; Markdown includes host/build/load/corpus
+metadata, an Overview, skips/errors and caveats. Progress goes to stderr;
+stdout contains the final table. FUSE omissions and unavailable `VmHWM`
+(on macOS) have empty values with skip status, never zero-time successes.
+
+Cold means rebuilding the index, without flushing the OS cache. FUSE plus
+page cache is not disk speed. Treat this single-host sweep as directional;
+small timings include process startup, and mount times include readiness
+polling. Run the full sweep on a quiet host with a release binary before
+publishing numbers.
+
 ## Nested durable indexes (with vs without)
 
 Measures eager recursive nested open (`-r --no-mount`) when the outer SQLite
