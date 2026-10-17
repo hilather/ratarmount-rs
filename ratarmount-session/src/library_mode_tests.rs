@@ -274,6 +274,8 @@ fn member_extent_remote_tar_returns_none() {
                     }
                     Err(error) => panic!("accept: {error}"),
                 };
+                // macOS/BSD accept inherits the listener's O_NONBLOCK.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();

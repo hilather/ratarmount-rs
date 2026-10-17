@@ -120,6 +120,11 @@ pub fn serve_blocking(source: Arc<dyn MountSource>, opts: NinepOptions) -> io::R
     serve_listener(listener, source, opts)
 }
 
+// macOS/BSD accept inherits O_NONBLOCK; connection handlers use blocking I/O.
+fn configure_accepted_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nonblocking(false)
+}
+
 fn serve_listener(
     listener: TcpListener,
     source: Arc<dyn MountSource>,
@@ -133,6 +138,7 @@ fn serve_listener(
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                configure_accepted_stream(&stream)?;
                 let fs = Arc::clone(&fs);
                 let stop = stop.clone();
                 let _ = thread::Builder::new()
@@ -944,6 +950,25 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(2))
             .expect("9P serve stop timed out")
             .expect("join");
+    }
+
+    /// Regression: inherited O_NONBLOCK must not truncate replies on macOS/BSD.
+    #[cfg(unix)]
+    #[test]
+    fn regression_accepted_socket_clears_inherited_nonblocking() {
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        // Linux does not inherit this flag; simulate the BSD accept result.
+        stream.set_nonblocking(true).unwrap();
+        configure_accepted_stream(&stream).unwrap();
+        // SAFETY: F_GETFL only reads flags from the live stream's descriptor.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
     }
 
     #[test]

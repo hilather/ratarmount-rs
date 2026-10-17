@@ -7,7 +7,7 @@ mod linux {
     use std::io::{self, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -79,6 +79,11 @@ mod linux {
         Ok(listener)
     }
 
+    // Keep connection I/O blocking independently of the listener's poll mode.
+    fn configure_accepted_stream(stream: &UnixStream) -> io::Result<()> {
+        stream.set_nonblocking(false)
+    }
+
     pub fn run() -> Result<(), String> {
         let args = Args::parse();
         let driver = Arc::new(Mutex::new(Driver::open(
@@ -109,6 +114,10 @@ mod linux {
             }
             match listener.accept() {
                 Ok((stream, _)) => {
+                    if let Err(e) = configure_accepted_stream(&stream) {
+                        error = Some(format!("cannot configure plugin connection: {e}"));
+                        break;
+                    }
                     if active.load(Ordering::Relaxed) >= 32 {
                         drop(stream);
                         continue;
@@ -145,6 +154,31 @@ mod linux {
         if let Err(error) = run() {
             let _ = writeln!(io::stderr(), "ratarmount-volume-plugin: {error}");
             std::process::exit(1);
+        }
+    }
+    #[cfg(test)]
+    mod accepted_socket_tests {
+        use super::*;
+        use std::os::fd::AsRawFd;
+
+        /// Regression: inherited O_NONBLOCK must not abort a delayed request or reply.
+        #[test]
+        fn regression_accepted_socket_clears_inherited_nonblocking() {
+            let dir = tempfile::tempdir().unwrap();
+            let listener = UnixListener::bind(dir.path().join("socket")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let _client = std::os::unix::net::UnixStream::connect(
+                listener.local_addr().unwrap().as_pathname().unwrap(),
+            )
+            .unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            // Linux does not inherit this flag; simulate the BSD accept result.
+            stream.set_nonblocking(true).unwrap();
+            configure_accepted_stream(&stream).unwrap();
+            // SAFETY: F_GETFL only reads flags from the live stream's descriptor.
+            let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+            assert_ne!(flags, -1);
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
         }
     }
 }
