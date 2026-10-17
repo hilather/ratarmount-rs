@@ -80,21 +80,24 @@ use crate::seekable_body::{SeekRead, SeekableBody};
 use crate::{CompressError, Result};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
-/// Test counter: successful G3-D hard GZIDX imports (no soft rehydrate).
+// The import path runs synchronously on the test thread, so a thread-local
+// isolates parallel tests.
 #[cfg(test)]
-static G3_D_HARD_IMPORT_HITS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static G3_D_HARD_IMPORT_HITS: Cell<usize> = const { Cell::new(0) };
+}
 
-/// How many times hard GZIDX import succeeded in this process (tests only).
+/// How many times hard GZIDX import succeeded on this thread (tests only).
 #[cfg(test)]
 pub fn g3_d_hard_import_hits() -> usize {
-    G3_D_HARD_IMPORT_HITS.load(Ordering::SeqCst)
+    G3_D_HARD_IMPORT_HITS.with(Cell::get)
 }
 
 #[cfg(test)]
 fn g3_d_note_hard_import() {
-    G3_D_HARD_IMPORT_HITS.fetch_add(1, Ordering::SeqCst);
+    G3_D_HARD_IMPORT_HITS.with(|hits| hits.set(hits.get() + 1));
 }
 
 /// Default seek-point spacing (uncompressed), matching Python CLI default (16 MiB).
