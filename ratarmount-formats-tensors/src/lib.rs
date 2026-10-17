@@ -305,6 +305,14 @@ fn build_index(
     }
     let index = SqliteIndex::create_writable_for_open(path, options)?;
     index.begin_write()?;
+    // Every intermediate component needs its own directory row: readdir of the
+    // parent and path-walking lookups (FUSE resolves `/layer/0/weight` one
+    // component at a time) only see rows, never implied prefixes. Without these
+    // a standalone mount listed just the root JSON files. BTreeSet order puts
+    // parents before children.
+    for directory in &directories {
+        insert_directory(&index, directory)?;
+    }
     for (i, tensor) in parsed.tensors.iter_mut().enumerate() {
         let mut path = tensor_path(&tensor.name);
         if directories.contains(&path) {
@@ -340,13 +348,42 @@ fn build_index(
     Ok(index)
 }
 
-fn insert(index: &SqliteIndex, full: &str, offset: u64, size: u64, inline: &str) -> Result<()> {
+/// Split `a/b/c` into the SQLite `path` column (`/a/b`, or empty at the root) and `name`.
+fn split_parent(full: &str) -> (String, &str) {
     let (path, name) = full.rsplit_once('/').unwrap_or(("", full));
     let path = if path.is_empty() {
         String::new()
     } else {
         format!("/{path}")
     };
+    (path, name)
+}
+
+/// A generated, read-only directory row for one tensor path prefix.
+fn insert_directory(index: &SqliteIndex, full: &str) -> Result<()> {
+    let (path, name) = split_parent(full);
+    index.insert_file(
+        &path,
+        name,
+        0,
+        0,
+        0,
+        0.0,
+        (ratarmount_core::S_IFDIR | 0o555) as i64,
+        0,
+        "",
+        0,
+        0,
+        false,
+        false,
+        true,
+        0,
+    )?;
+    Ok(())
+}
+
+fn insert(index: &SqliteIndex, full: &str, offset: u64, size: u64, inline: &str) -> Result<()> {
+    let (path, name) = split_parent(full);
     let offset =
         i64::try_from(offset).map_err(|_| invalid("tensor offset exceeds SQLite range"))?;
     let size = i64::try_from(size).map_err(|_| invalid("tensor size exceeds SQLite range"))?;
