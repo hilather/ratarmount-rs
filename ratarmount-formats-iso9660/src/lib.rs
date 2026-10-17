@@ -6,6 +6,19 @@
 //! seekable stream: [`Iso9660MountSource::open_from_reader`] indexes from any
 //! `Read + Seek` and retains a mutex-shared handle for extent stencil opens.
 //! Large images are never loaded fully into RAM.
+//!
+//! # Names and file types
+//!
+//! The file type comes from the ISO 9660 directory record (the directory flag),
+//! not from Rock Ridge PX `S_IFMT`. PX contributes only permission bits
+//! (`mode & 0o7777`). `SL` is a symlink only on a non-directory record; a
+//! directory `SL` is ignored (empty link name, size 0) and its children stay.
+//! Character and block devices, FIFOs, sockets, and `PN` are regular files:
+//! `FileInfo` has no device number, and a device type would ask FUSE for a
+//! kernel device node. The ISO data length is kept. Joliet names are used when
+//! that tree parses and no Rock Ridge `NM` exists. A damaged Joliet tree logs
+//! one warning and the index keeps the primary tree. Sidecar
+//! `isoMetadataVersion` is `rock-ridge-joliet-v2`.
 // #102: shadow std print macros so a closed pipe does not panic (exit 101).
 #[macro_use]
 extern crate ratarmount_core;
@@ -29,7 +42,7 @@ const SECTOR: u64 = 2048;
 mod iso;
 
 // Reject old sidecars that contain only ISO aliases and default metadata.
-const ISO_METADATA_VERSION: &str = "rock-ridge-joliet-v1";
+const ISO_METADATA_VERSION: &str = "rock-ridge-joliet-v2";
 
 #[derive(Debug, Error)]
 pub enum IsoError {

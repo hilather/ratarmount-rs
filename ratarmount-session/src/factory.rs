@@ -7663,6 +7663,8 @@ mod tests {
                     eprintln!("skip: {bin} failed ({})", cmd.display());
                 }
             }
+            // xorriso cannot make UDF images: `xorriso -as mkisofs` rejects `-udf`,
+            // so this probe skips. mkudffs (udftools) is what makes the test run.
             if let Some(xorriso) = which_cmd("xorriso") {
                 let status = std::process::Command::new(&xorriso)
                     .args(["-as", "mkisofs", "-udf", "-o"])

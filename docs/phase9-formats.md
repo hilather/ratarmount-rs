@@ -6,7 +6,7 @@
 |--------|-------|--------|
 | Unix AR | `ratarmount-formats-ar` | GNU-style `name/` members |
 | CPIO newc/crc/odc/binary | `ratarmount-formats-cpio` | Stencil offsets |
-| ISO 9660 | `ratarmount-formats-iso9660` | Extent LBA stencils |
+| ISO 9660 | `ratarmount-formats-iso9660` | Extent LBA stencils. Rock Ridge NM, PX permission bits (not PX file type), SL on non-directories, TF. Joliet names when that tree parses. A damaged Joliet tree is skipped with a warning. Character/block devices, FIFOs, sockets, and PN are regular files; the ISO data length is kept. |
 | WARC | `ratarmount-formats-warc` | Payload offsets |
 | XAR | `ratarmount-formats-xar` | TOC heap offsets; gzip/bzip2 members |
 | CAB store/MSZIP | `ratarmount-formats-cab` | LZX/Quantum → libarchive |
