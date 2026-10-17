@@ -39,6 +39,9 @@ jobs:
       - name: workspace lock version matches Cargo.toml
         run: bash packaging/test-workspace-lock-version.sh
 
+      - name: portable deps allowlist self-test
+        run: bash packaging/test-portable-deps-selftest.sh
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
