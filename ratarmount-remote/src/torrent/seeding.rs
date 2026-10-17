@@ -66,6 +66,9 @@ impl Storage {
 }
 
 impl TorrentStorage for Storage {
+    fn externally_populated(&self) -> bool {
+        true
+    }
     fn init(
         &mut self,
         shared: &ManagedTorrentShared,

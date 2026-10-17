@@ -366,7 +366,7 @@ struct Args {
     seed_upload_limit: u32,
 
     /// Incoming TCP port when --seed is enabled (0 chooses an available port).
-    #[arg(long, default_value = "4240", value_name = "PORT")]
+    #[arg(long, default_value = "0", value_name = "PORT")]
     torrent_listen_port: u16,
 
     /// Bypass FUSE's page cache for source members; overlay files keep normal caching.
@@ -7052,6 +7052,8 @@ mod torrent_policy_tests {
     /// Regression: LAN/seeding flags consumed paths, enabled uploads implicitly, or bypassed never.
     #[test]
     fn regression_torrent_lan_seed_flags_and_conflicts() {
+        let defaults = Args::try_parse_from(["ratarmount", "file.torrent"]).unwrap();
+        assert_eq!(defaults.torrent_listen_port, 0);
         let defaults = Args::try_parse_from(["ratarmount", "source.torrent", "mnt"]).unwrap();
         assert!(defaults.torrent_lsd);
         assert!(!defaults.seed);

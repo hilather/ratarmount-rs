@@ -473,6 +473,9 @@ mod tests {
                         }
                         Err(_) => break,
                     };
+                    // Darwin accept inherits O_NONBLOCK from the listener; Linux does not.
+                    // Request bodies (especially the multi-MiB LFS fixture) need blocking reads.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -541,7 +544,8 @@ mod tests {
         json!({"files": body["files"].as_array().unwrap().iter().map(|f| json!({"path": f["path"], "uploadMode": if lfs && !f["path"].as_str().unwrap().ends_with(".ptr") { "lfs" } else { "regular" }, "shouldIgnore": false})).collect::<Vec<_>>()})
     }
 
-    /// Regression: archive upload slurped the entire spool, or published siblings separately.
+    /// Regression: archive upload slurped the spool, published siblings separately,
+    /// or hit WouldBlock in the mock server on Darwin's inherited nonblocking socket.
     #[test]
     fn regression_hf_archive_streams_lfs_with_atomic_siblings() {
         let archive = vec![b'a'; 2 * 1024 * 1024 + 17];

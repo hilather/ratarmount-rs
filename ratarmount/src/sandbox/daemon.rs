@@ -92,6 +92,7 @@ pub struct SocketGuard {
 
 impl SocketGuard {
     pub fn bind(path: &Path) -> Result<Self> {
+        super::inspection::validate_socket_path(path)?;
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())

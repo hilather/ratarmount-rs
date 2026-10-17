@@ -297,6 +297,7 @@ pub(crate) struct HubCache {
     verify: Option<bool>,
     verified: Arc<Mutex<VerifiedBlobs>>,
     disable_symlinks: bool,
+    preserve_snapshots: bool,
     cleaned: Arc<Mutex<BTreeSet<PathBuf>>>,
     #[cfg(test)]
     stats: Arc<CacheStats>,
@@ -321,6 +322,7 @@ impl HubCache {
             root,
             verify: env("RATARMOUNT_HF_CACHE_VERIFY").map(|v| v != "0"),
             verified: Arc::default(),
+            preserve_snapshots: false,
             disable_symlinks: env("HF_HUB_DISABLE_SYMLINKS").is_some_and(|v| {
                 matches!(v.to_ascii_uppercase().as_str(), "1" | "TRUE" | "YES" | "ON")
             }),
@@ -622,11 +624,15 @@ impl HubCache {
         location: &HfLocation,
         commit: &str,
         path: &str,
-        sha256: &str,
+        etag: &str,
         size: u64,
         reader: &mut impl Read,
     ) -> io::Result<LocalBlob> {
-        self.install_with(location, commit, path, sha256, size, || Ok(reader))
+        Self {
+            preserve_snapshots: true,
+            ..self.clone()
+        }
+        .install_with(location, commit, path, etag, size, || Ok(reader))
     }
 
     #[cfg(feature = "bittorrent")]
@@ -708,6 +714,27 @@ impl HubCache {
             .installs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let repo = self.repo_dir(location);
+        let snapshot = repo.join("snapshots").join(commit).join(path);
+        if self.preserve_snapshots && fs::symlink_metadata(&snapshot).is_ok() {
+            // Include dangling links. A pinned snapshot is immutable, including
+            // when an independently verified different blob already exists.
+            if let Some(existing) = self.find(location, commit, path, None, Some(size)) {
+                if let Some(file) = self.checked(&existing.path, etag, Some(size), true) {
+                    return Ok(LocalBlob {
+                        file: Arc::new(file),
+                        ..existing
+                    });
+                }
+            }
+            log::warn!(
+                "torrent Hub publication skipped: pinned snapshot already exists: {}",
+                snapshot.display()
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "pinned Hub snapshot differs",
+            ));
+        }
         let blobs = repo.join("blobs");
         directories(&self.root, &blobs, true)?;
         let locks = self.root.join(".locks").join(repo.file_name().unwrap());
@@ -786,6 +813,20 @@ impl HubCache {
             target.push(etag);
             let tmp = temporary(parent)?.into_temp_path();
             fs::remove_file(&tmp)?;
+            if self.preserve_snapshots {
+                // symlink creation is atomic and cannot replace an existing entry.
+                match std::os::unix::fs::symlink(&target, snapshot) {
+                    Ok(()) => return sync_dir(parent),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        log::warn!(
+                            "torrent Hub publication skipped: pinned snapshot already exists: {}",
+                            snapshot.display()
+                        );
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             std::os::unix::fs::symlink(target, &tmp)?;
             // TempPath owns cleanup even when rename fails or the link is dangling.
             fs::rename(&tmp, snapshot)?;
@@ -800,7 +841,19 @@ impl HubCache {
         io::copy(&mut reader, &mut tmp)?;
         published_permissions(tmp.as_file(), parent)?;
         tmp.as_file().sync_all()?;
-        tmp.persist(snapshot).map_err(|e| e.error)?;
+        if self.preserve_snapshots {
+            tmp.persist_noclobber(snapshot).map_err(|e| {
+                if e.error.kind() == io::ErrorKind::AlreadyExists {
+                    log::warn!(
+                        "torrent Hub publication skipped: pinned snapshot already exists: {}",
+                        snapshot.display()
+                    );
+                }
+                e.error
+            })?;
+        } else {
+            tmp.persist(snapshot).map_err(|e| e.error)?;
+        }
         sync_dir(parent)
     }
 }
@@ -2271,13 +2324,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cache, location, _, _) = fixture(dir.path(), "file", b"original", true);
         let snapshots = cache.repo_dir(&location).join("snapshots");
-        fs::write(
-            snapshots
-                .join(COMMIT)
-                .join(std::ffi::OsString::from_vec(vec![0xff])),
-            b"skip me",
-        )
-        .unwrap();
+        if cfg!(target_os = "macos") {
+            eprintln!("skip: macOS filesystems reject non-UTF-8 file names; HOME and short-commit checks still run");
+        } else {
+            fs::write(
+                snapshots
+                    .join(COMMIT)
+                    .join(std::ffi::OsString::from_vec(vec![0xff])),
+                b"skip me",
+            )
+            .unwrap();
+        }
         let mounted =
             HfCacheMountSource::with_cache("hf-cache://datasets/org/data@0123456", cache.clone())
                 .unwrap();
@@ -2477,6 +2534,122 @@ except Timeout:
             result.status.success(),
             "{}",
             String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[cfg(all(test, feature = "bittorrent"))]
+mod torrent_publication_tests {
+    use super::*;
+
+    /// Regression: torrent publication redirected a pinned snapshot when a different blob already existed.
+    #[test]
+    fn regression_torrent_publication_preserves_existing_snapshot_and_blob() {
+        for copies in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cache = HubCache::from_values(&|key| {
+                (key == "HF_HUB_CACHE").then(|| dir.path().to_string_lossy().into())
+            });
+            cache.disable_symlinks = copies;
+            let commit = "a".repeat(40);
+            let location = crate::parse_hf_url(&format!("hf://org/model@{commit}")).unwrap();
+            let good = b"real";
+            let evil = b"fake";
+            let good_hash = hex::encode(Sha256::digest(good));
+            let evil_hash = hex::encode(Sha256::digest(evil));
+            cache
+                .install_reader(&location, &commit, "config", &good_hash, 4, &mut &good[..])
+                .unwrap();
+            cache
+                .install_reader(&location, &commit, "other", &evil_hash, 4, &mut &evil[..])
+                .unwrap();
+            let err = cache
+                .install_reader(&location, &commit, "config", &evil_hash, 4, &mut &evil[..])
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+            let snapshot = cache
+                .repo_dir(&location)
+                .join("snapshots")
+                .join(&commit)
+                .join("config");
+            assert_eq!(fs::read(&snapshot).unwrap(), good);
+            assert_eq!(
+                fs::read(cache.repo_dir(&location).join("blobs").join(good_hash)).unwrap(),
+                good
+            );
+        }
+    }
+
+    /// Regression: a snapshot created by another publisher between lookup and install was overwritten.
+    #[test]
+    fn regression_torrent_publication_snapshot_race_never_clobbers() {
+        for copies in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cache = HubCache::from_values(&|key| {
+                (key == "HF_HUB_CACHE").then(|| dir.path().to_string_lossy().into())
+            });
+            cache.disable_symlinks = copies;
+            let commit = "a".repeat(40);
+            let location = crate::parse_hf_url(&format!("hf://org/model@{commit}")).unwrap();
+            let snapshot = cache
+                .repo_dir(&location)
+                .join("snapshots")
+                .join(&commit)
+                .join("file");
+            let started = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            *cache.stats.before_install.lock().unwrap() = Some((started.clone(), resume.clone()));
+            let worker = std::thread::spawn(move || {
+                cache.install_reader(
+                    &location,
+                    &commit,
+                    "file",
+                    &hex::encode(Sha256::digest(b"fake")),
+                    4,
+                    &mut &b"fake"[..],
+                )
+            });
+            started.wait();
+            fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+            fs::write(&snapshot, b"real").unwrap();
+            resume.wait();
+            assert_eq!(
+                worker.join().unwrap().unwrap_err().kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(fs::read(snapshot).unwrap(), b"real");
+        }
+    }
+
+    /// Regression: a dangling pinned snapshot link was treated as absent and replaced.
+    #[cfg(unix)]
+    #[test]
+    fn regression_torrent_publication_keeps_dangling_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = HubCache::from_values(&|key| {
+            (key == "HF_HUB_CACHE").then(|| dir.path().to_string_lossy().into())
+        });
+        let commit = "a".repeat(40);
+        let location = crate::parse_hf_url(&format!("hf://org/model@{commit}")).unwrap();
+        let snapshot = cache
+            .repo_dir(&location)
+            .join("snapshots")
+            .join(&commit)
+            .join("file");
+        fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../../blobs/missing", &snapshot).unwrap();
+        let result = cache.install_reader(
+            &location,
+            &commit,
+            "file",
+            &hex::encode(Sha256::digest(b"fake")),
+            4,
+            &mut &b"fake"[..],
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_link(snapshot).unwrap(),
+            PathBuf::from("../../blobs/missing")
         );
     }
 }

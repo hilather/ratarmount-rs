@@ -36,7 +36,7 @@ base64 = "0.22"
 # 6.2.1+ rust-version is 1.80.1; pin 6.2.0 written for the former 1.74 MSRV.
 suppaftp = { version = "=6.2.0", default-features = false, features = ["rustls"] }
 jsonwebtoken = "9"
-librqbit = { version = "=9.0.1", optional = true, default-features = false, features = ["rust-tls", "disable-upload"] }
+librqbit = { path = "../vendor/librqbit", version = "=9.0.1", optional = true, default-features = false, features = ["rust-tls", "disable-upload"] }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "sync", "time", "io-util", "macros"] }
 
 anyhow = { version = "1", optional = true }

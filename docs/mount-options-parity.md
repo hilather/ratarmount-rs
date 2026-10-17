@@ -1,12 +1,12 @@
 # Mount options & abilities: Python vs Rust
 
-Last updated: 2026-08-24.
+Last updated: 2026-10-16.
 
 ## Summary
 
 **Not full parity yet.** Core day-to-day mount flags (`-r/-l/-s/-w/-f/-u`, indexes, passwords, FUSE `-o`) are present. Gaps are mainly advanced recursion filters, path transforms, union layout, backend selection, and a few index/control options.
 
-Legend: `[x]` parity · `~` partial · `[ ]` missing
+Legend: `[x]` parity · `~` partial · `[ ]` missing · `[x]` Rust-only = beyond parity
 
 ---
 
@@ -32,6 +32,27 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--commit-overlay-mode copy\|append\|auto` | no | **added** (default `copy`; reflink/kernel-copy acceleration; `append` journals adds-only uncompressed TAR / seek-table `.tar.zst` suffixes in place; `auto` also excludes hard-linked archives; other plans copy; in-place readers can observe the write) | `[x]` Rust-only |
 | `--commit-overlay-on-exit` | no | **added** (uncompressed TAR or `.tar.zst` + durable `-w`; same create-if-missing as `-w`; last-frame zstd rewrite — does not recompress the prefix; default copy uses reflink/kernel copy when available; opt-in append retains the prefix in place; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; copy fallback needs 2× compressed disk headroom; append needs old/new suffix space; never refuse on size; warn when last-frame uncompressed > 64 MiB; gzip rejected; live still **rejects** prefix-frame mutate — offline `--commit-overlay` is the zstd escape hatch; later-frame deletes classify past per-frame TAR EOF even when the remount omitted `-i`; SIGINT/SIGTERM / serve return) | `[x]` Rust-only |
 | `--commit-overlay-interval DURATION` | no | **added** (`0` off; `2s`/`15m`/`1h`; uncompressed TAR or `.tar.zst` + durable `-w`; same create-if-missing as `-w`; in-process; commits overlay files whose host mtime is at least DURATION old **and** that have no open write fd, not a dump of every overlay file on the clock; same last-frame cost model; later complete-TAR-frame deletes persist even if the remount omitted `-i`) | `[x]` Rust-only |
+| `--overlay-readonly GLOBS` | no | **added** (protected overlay paths; EROFS across write frontends) | `[x]` Rust-only |
+| `--overlay-quota SIZE` / `--overlay-quota-files N` | no | **added** (shared logical content/file caps including copy-up; EDQUOT; xattr metadata excluded) | `[x]` Rust-only |
+| `--sandbox` | no | **added** (allow_other + noatime + caller uid/gid; RAM overlay unless explicit `-w`; Linux) | `[x]` Rust-only |
+| `--overlay-tmpfs[=SIZE]` | no | **added** (verified Linux tmpfs; optional logical byte quota, not a RAM reservation; discarded on cleanup) | `[x]` Rust-only |
+| `--overlay-tmpfs-allow-commit` | no | **added** (explicitly permits live commit from a RAM overlay) | `[x]` Rust-only |
+| `-o uid=UID,gid=GID,umask=MASK` | yes | **added** (reported attrs in FUSE/NFS/9P/SFTP; stored ownership unchanged) | `[x]` |
+| `--bind /PATH=SOURCE` | no | **added** (per-source mount path before union; repeatable) | `[x]` Rust-only |
+| `--git` / `--git-ref REV` / `repo@REV` | mixed | **added** (explicit worktree Git selection and revision; bad refs fail) | `[x]` Rust-only selectors |
+| `--git-prefix PATH` / `--git-synthetic-head` | no | **added** (subtree; history-free one-commit `.git`; private writes with overlay) | `[x]` Rust-only |
+| `--roll-every LIMIT` | no | **added** (local TAR / `.tar.zst` numbered union; time, size or both; implies on-exit commit) | `[x]` Rust-only |
+| `--commit-manifest` / `--manifest-hashes new|all|none` | no | **added** (opt-in local TAR / `.tar.zst` commit provenance JSONL; default hash policy `new`) | `[x]` Rust-only |
+| `--passthrough auto|on|off` | no | **added** (`auto` default; Linux ≥6.9, initial-namespace CAP_SYS_ADMIN, eligible source; daemon fallback) | `[x]` Rust-only |
+| `--passthrough-copy` / `--passthrough-copy-max BYTES` / `--passthrough-copy-total-max BYTES` | no | **added** (explicit bounded stored-member copy fallback; default per-member cap 0 disables it) | `[x]` Rust-only |
+| `--direct-io` | no | **added** (source-member FOPEN_DIRECT_IO and local TAR/zstd eviction advice; disables passthrough; overlay stays cached) | `[x]` Rust-only |
+| `--memory-budget SIZE` | no | **added** (managed RAM pool cap; synchronous fallback under pressure; excludes kernel page cache) | `[x]` Rust-only |
+| `overlay-stats OVERLAY [--json]` | no | **added** (overlay usage/deletions without mounting) | `[x]` Rust-only |
+| `diff OVERLAY --base SOURCE [--git]` | no | **added** (unified / Git patch; exit 1 means changes, 2 means error) | `[x]` Rust-only |
+| `sandbox daemon|create-base|new|list|diff|stats|destroy|shutdown` | no | **added** (Linux supervisor; Unix socket and pure-Python client) | `[x]` Rust-only |
+| `snapshot add|list` | no | **added** (external restic CLI wrapper) | `[x]` Rust-only |
+| `corpus MANIFEST MOUNTPOINT` | no | **added** (pinned repository collection) | `[x]` Rust-only |
+| `shard` / `export-index --format parquet|jsonl|csv` | no | **added** (dataset packing and index export without FUSE; Parquet is default feature `export-parquet`) | `[x]` Rust-only |
 | `-p` / `--prefix` | yes | yes | `[x]` |
 | `--file-versions` / `--no-file-versions` | yes | **both forms** | `[x]` |
 | `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket **and** in-FS folder (`status`/`pid`/`unmount`/`help` plus read-only `search/<pattern>` glob locate; quote globs). No FUSE write-then-read `echo pat > search`. | `[x]` / overlay names not in catalog |
@@ -53,12 +74,12 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--sftp-authorized-keys PATH` | no | **added** (required when bind is not loopback unless password env is set) | `[x]` |
 | `--sftp-subsystem` | no | **added** (stdio SFTP v3; exclusive with `--sftp`; ignores bind/keys; needs `sftp-russh`) | `[x]` Rust-only |
 | `serve` subcommand | no | **added** (optional sugar: `ratarmount serve --nfs --http ARCHIVE`; ≥1 export required; incompatible with `--no-mount`; no `--fuse`; booleans remain the stable interface) | `[x]` Rust-only |
-| `find` sugar | no | **added** (`ratarmount find [--fts] [--hashes] PATTERN ARCHIVE`; no FUSE; TSV `path\tsize\tmtime`; `--fts` is find-argv only, not a mount flag; `--hashes` includes cheap `user.hash.*` columns / fill when `ALGO` is given) | `[x]` Rust-only |
+| `find` sugar | no | **added** (`ratarmount find [--fts] [--hashes] [--xattr NAME[=VALUE]] PATTERN ARCHIVE`; no FUSE; TSV `path\tsize\tmtime`; `--fts` is find-argv only, not a mount flag; `--hashes` includes cheap `user.hash.*` columns / fill when `ALGO` is given) | `[x]` Rust-only |
 | `-o` / `--fuse` | yes | yes | `[x]` |
 | `-e` / `--encoding` | yes | yes | `[x]` |
 | `-i` / `--ignore-zeros` | yes | yes (`-i` + long) | `[x]` |
 | `--gnu-incremental` / `--detect-gnu-incremental` | yes | **both** | `[x]` |
-| `-P` / `--parallelization` | backend matrix string | matrix string (`1`/`0`/`bzip2:4,…`) | `[x]` / `~` sequential codecs API-only |
+| `-P` / `--parallelization` | backend matrix string | matrix string (`1`/`0`/`bzip2:4,…`); CLI default min(cores, 4), reaches zstd decode-ahead | `[x]` |
 | `--parallel-nested N` | n/a (Python uses process pool elsewhere) | **added** (`0`/`auto` = cores; `1` = sequential; `N≥2` = cap; FR-6 / #80 eager same-dir only; lazy ignores) | `[x]` |
 | `--password` | yes | yes (repeatable) | `[x]` |
 | `--password-file` | yes | **added** | `[x]` |
@@ -70,7 +91,8 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--union-resolve-symlinks` | no (issue #160) | **added** (opt-in multi-hop resolve within winning source; B-4 dir>symlink unchanged; cheap `list_dirents` + per-symlink `lookup`, not fat `list()`) | `~` Rust-only FR-10: `lookup(join(listed_path, name))` may leave `S_IFLNK` on path-keyed archives listed through a symlink-to-dir |
 | `--index-file` / `:memory:` / folders | yes | yes | `[x]` |
 | `--index-id HEX` | no | **added** (required value; `{archive}.index.{sha256}.sqlite` or pointer-named well-known blob; tarstats mismatch / unknown id exit 2) | `[x]` Rust-only |
-| `--publish-index` / `--publish-index-to PATH` | no | **added** (boolean + required-value dest; local copy of 0.7.x sidecar; always writes `{archive}.index.ptr`; keep-last-K=2 snapshots when a pointer exists; no S3 PUT; OCI referrer PUT residual) | `[x]` Rust-only |
+| `--publish-index` / `--publish-index-to PATH_OR_URL` | no | **added** (local or hf/s3/gs/az blob + pointer publication; local keep-last-2; OCI referrer PUT residual) | `[x]` Rust-only |
+| `--publish-revision REV` / `--create-pr` | no | **added** (Hub publication branch / PR; `--create-pr` also supports live Hub archive write-back) | `[x]` Rust-only |
 | Remote/compressed index URL | yes | yes (`http(s)://` / `file://` + gzip/xz/zstd/bz2 decompress; auto `Link: describedby` on archive HEAD + http(s) sibling; OCI referrer on local `oci:{digest}` miss) | `[x]` |
 | `--verify-mtime` | yes | yes | `[x]` |
 | `--force-folder-index` | yes | accepted (folders still live) | `~` |
@@ -113,6 +135,11 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | Remote `gs://` / `az://` / `ftp://` / `oci://` / `ipfs://` / `rclone://` | mixed | yes (factory scheme-prefix; OCI overlayfs union; rclone argv + `rclone+`; GCS GOOG1 HMAC; FTP LIST/MLSD folders) | `[x]` / residuals in [`phase10-remote.md`](phase10-remote.md) |
 | Remote directory mounts (S3 prefix / SSH dir / WebDAV / HTTP index) | yes (fsspec) | yes (F-1 `RemoteFolderMountSource`; GCS/Azure/rclone/IPFS/FTP folders too) | `[x]` |
 
+Local AI option details: [sandbox](sandbox.md), [Git](git-mounts.md),
+[Hub publishing](remote-hf.md), [provenance](provenance.md),
+[rolling](rolling-archives.md), [shards](shards.md), and
+[FUSE tuning](fuse-kernel-tuning.md).
+
 ## Implementation notes (this work)
 
 - New CLI flags land in `ratarmount/src/main.rs` and flow through `OpenOptions` / `CompositingOptions`.
@@ -120,7 +147,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 - Path `--transform` is a `TransformMountSource` layer (regex on full path).
 - `--disable-union-mount` wraps each source in a basename prefix then unions.
 - `--use-backend` reorders factory detection for known backend names (see `--print-features`).
-- Export flags (`--http` / `--webdav` / `--smb` / `--ninep` / `--sftp` / `--sftp-subsystem`) are booleans (`ArgAction::SetTrue`) with required-value binds (`num_args = 1`). There is no `serve` subcommand and no `--fuse` flag. See [`export.md`](export.md).
+- Export flags (`--http` / `--webdav` / `--smb` / `--ninep` / `--sftp` / `--sftp-subsystem`) are booleans (`ArgAction::SetTrue`) with required-value binds (`num_args = 1`). Optional `serve` sugar requires at least one export; there is no `--fuse` flag. See [`export.md`](export.md).
 
 ### `-g` / `--gzip-seek-point-spacing` (Python `-gs`)
 

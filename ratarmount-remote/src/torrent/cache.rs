@@ -10,15 +10,20 @@ struct Target {
     location: HfLocation,
     path: String,
     local: Mutex<(Option<String>, Option<LocalBlob>)>,
-    trusted: Mutex<Option<[u8; 32]>>,
+    trusted: Mutex<Option<(u64, String)>>,
+    source: String,
 }
 pub(super) struct HubFiles {
     cache: Option<HubCache>,
     targets: Vec<Option<Target>>,
+    pub(super) discover: bool,
 }
 impl HubFiles {
     pub fn new(meta: &Metainfo) -> Self {
-        Self::with_cache(meta, HubCache::sharing(&|key| std::env::var(key).ok()))
+        let mut files = Self::with_cache(meta, HubCache::sharing(&|key| std::env::var(key).ok()));
+        // Tests inject mock Hub observations explicitly; never contact public APIs.
+        files.discover = !cfg!(test);
+        files
     }
     pub(super) fn with_cache(meta: &Metainfo, cache: Option<HubCache>) -> Self {
         let targets = (0..meta.files.len())
@@ -43,24 +48,36 @@ impl HubFiles {
                 Some(Target {
                     location: crate::parse_hf_url(&repo).ok()?,
                     path,
+                    source: repo,
                     local: Mutex::new((None, None)),
                     trusted: Mutex::new(None),
                 })
             })
             .collect();
-        Self { cache, targets }
+        Self {
+            cache,
+            targets,
+            discover: false,
+        }
     }
 
-    pub fn authorize(
-        &self,
-        data: &Metainfo,
-        hashes: &std::collections::BTreeMap<String, [u8; 32]>,
-    ) {
-        for (file, target) in self.targets.iter().enumerate() {
-            if let (Some(target), Some(hash)) = (target, hashes.get(&data.files[file].path)) {
-                *target.trusted.lock().unwrap_or_else(|e| e.into_inner()) = Some(*hash);
+    pub fn authorize(&self, hashes: &super::checksums::HubHashes) {
+        for target in self.targets.iter().flatten() {
+            if let Some(oid) = hashes.get(&(target.source.clone(), target.path.clone())) {
+                *target.trusted.lock().unwrap_or_else(|e| e.into_inner()) = Some(oid.clone());
             }
         }
+    }
+
+    pub fn git_oid(&self, file: usize) -> Option<String> {
+        self.targets[file]
+            .as_ref()?
+            .trusted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|(_, oid)| oid.len() == 40)
+            .map(|(_, oid)| oid.clone())
     }
 
     fn local(&self, data: &Data, file: usize) -> Option<LocalBlob> {
@@ -96,7 +113,6 @@ impl HubFiles {
                     return None;
                 }
                 state.expected = Some(hash);
-                *target.trusted.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash);
                 *local = (Some(hex::encode(hash)), Some(blob.clone()));
                 return Some(blob);
             }
@@ -161,8 +177,17 @@ impl HubFiles {
         let (Some(cache), Some(target)) = (&self.cache, &self.targets[file]) else {
             return Ok(());
         };
-        if *target.trusted.lock().unwrap_or_else(|e| e.into_inner()) != Some(sha256) {
-            // A metainfo extension alone does not establish the Hub path/commit's hash.
+        let Some((size, etag)) = target
+            .trusted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            // Metainfo, third-party manifests, checksum caches and local snapshots
+            // never authorize new Hub snapshot entries. Only the pinned Hub API does.
+            return Ok(());
+        };
+        if size != data.meta.files[file].len || (etag.len() == 64 && etag != hex::encode(sha256)) {
             return Ok(());
         }
         if target
@@ -180,14 +205,18 @@ impl HubFiles {
             file,
             pos: 0,
         };
-        let blob = cache.install_reader(
+        let blob = match cache.install_reader(
             &target.location,
             &target.location.revision,
             &target.path,
-            &sha256,
+            &etag,
             data.meta.files[file].len,
             &mut reader,
-        )?;
+        ) {
+            Ok(blob) => blob,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => return Err(e),
+        };
         *target.local.lock().unwrap_or_else(|e| e.into_inner()) = (Some(sha256), Some(blob));
         if let Some(ranges) = &data.options.range_cache {
             let mut pos = 0;
@@ -201,11 +230,9 @@ impl HubFiles {
                 {
                     ranges.remove_file(&data.token(key));
                 }
+                data.notify_seed(key);
                 pos += data.size(key) - within as u64;
             }
-        }
-        if data.options.swarm.seed {
-            data.seed_dirty.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -257,13 +284,13 @@ mod tests {
             *files.targets[0].as_ref().unwrap().trusted.lock().unwrap(),
             None
         );
-        files.authorize(
-            &meta,
-            &std::collections::BTreeMap::from([("file".into(), [7; 32])]),
-        );
+        files.authorize(&std::collections::BTreeMap::from([(
+            (format!("hf://org/model@{}", "a".repeat(40)), "file".into()),
+            (4, "07".repeat(32)),
+        )]));
         assert_eq!(
             *files.targets[0].as_ref().unwrap().trusted.lock().unwrap(),
-            Some([7; 32])
+            Some((4, "07".repeat(32)))
         );
         meta.web_seeds.push(format!(
             "https://huggingface.co/other/model/resolve/{}/file",

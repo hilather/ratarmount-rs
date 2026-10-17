@@ -47,8 +47,8 @@ impl Default for SwarmOptions {
             lsd: true,
             seed: false,
             upload_limit: 1024 * 1024,
-            listen_port: 4240,
-            listen_ip: std::net::Ipv4Addr::UNSPECIFIED.into(),
+            listen_port: 0,
+            listen_ip: std::net::Ipv6Addr::UNSPECIFIED.into(),
             announced: Arc::default(),
         }
     }
@@ -127,6 +127,20 @@ const LAN_ALLOWLIST: &str = concat!(
     "mapped:::ffff:169.254.0.0-::ffff:169.254.255.255\n",
 );
 
+fn lan_listen_ip() -> std::net::IpAddr {
+    // UDP connect selects a route without transmitting a packet. A public default
+    // address must never turn the LAN discovery listener into a public listener.
+    let local = || -> io::Result<std::net::IpAddr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        socket.connect("192.0.2.1:9")?;
+        Ok(socket.local_addr()?.ip())
+    };
+    local()
+        .ok()
+        .filter(|ip| is_lan(*ip))
+        .unwrap_or(std::net::Ipv4Addr::LOCALHOST.into())
+}
+
 pub(crate) fn session_options(options: &SwarmOptions) -> SessionOptions {
     SessionOptions {
         dht: (options.dht && options.public_discovery()).then(|| DhtSessionConfig {
@@ -137,20 +151,27 @@ pub(crate) fn session_options(options: &SwarmOptions) -> SessionOptions {
         disable_upload: !options.seed,
         disable_local_service_discovery: !options.lsd
             || options.policy == TorrentSwarmPolicy::Never,
-        // BEP 14 announces a connectable port to solicit a prompt reply. With
-        // uploads off this listener exchanges metadata/protocol messages only.
-        listen: (options.seed || options.lsd).then(|| librqbit::ListenerOptions {
-            listen_addr: SocketAddr::new(
-                options.listen_ip,
-                if options.seed { options.listen_port } else { 0 },
-            ),
-            ..Default::default()
-        }),
+        // Public downloaders never accept inbound TCP connections. LAN discovery
+        // may solicit replies using a listener bound to one private local address.
+        listen: (options.seed || (options.lsd && options.policy == TorrentSwarmPolicy::Lan)).then(
+            || librqbit::ListenerOptions {
+                listen_addr: SocketAddr::new(
+                    if options.seed || is_lan(options.listen_ip) {
+                        options.listen_ip
+                    } else {
+                        lan_listen_ip()
+                    },
+                    if options.seed { options.listen_port } else { 0 },
+                ),
+                ..Default::default()
+            },
+        ),
         ratelimits: librqbit::limits::LimitsConfig {
             upload_bps: std::num::NonZeroU32::new(options.effective_upload_limit()),
             ..Default::default()
         },
         persistence: None,
+        peer_limit: Some(32),
         runtime_worker_threads: Some(2),
         ..Default::default()
     }
@@ -159,7 +180,12 @@ pub(crate) fn session_options(options: &SwarmOptions) -> SessionOptions {
 type Reply = mpsc::SyncSender<io::Result<Vec<u8>>>;
 enum Command {
     Resolve(String, Reply),
-    Read(Vec<u8>, Vec<(Option<usize>, u64, usize)>, Reply),
+    Read(
+        Vec<u8>,
+        Vec<(Option<usize>, u64, usize)>,
+        Option<Duration>,
+        Reply,
+    ),
 }
 
 pub(crate) struct Swarm {
@@ -170,6 +196,8 @@ pub(crate) struct Swarm {
     metadata_peers: Arc<Mutex<Vec<SocketAddr>>>,
     #[cfg(test)]
     pub(super) listen_addr: Option<SocketAddr>,
+    #[cfg(test)]
+    pub(super) seed_checks: Arc<Mutex<Vec<u32>>>,
 }
 
 fn error(e: impl std::fmt::Display) -> io::Error {
@@ -184,6 +212,34 @@ async fn until_stopped<T>(
         _ = session.cancellation_token().cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "torrent source unmounted")),
         result = work => result,
     }
+}
+
+async fn command_deadline<T>(
+    session: &Session,
+    timeout: Duration,
+    connected_timeout: Option<Duration>,
+    work: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "torrent swarm timed out");
+    tokio::pin!(work);
+    until_stopped(session, async {
+        tokio::select! {
+            result = &mut work => result,
+            _ = tokio::time::sleep(timeout) => {
+                let connected = session.with_torrents(|torrents| {
+                    for (_, torrent) in torrents {
+                        if torrent.live().is_some_and(|live| live.stats_snapshot().peer_stats.live != 0) { return true; }
+                    }
+                    false
+                });
+                if let Some(limit) = connected_timeout.filter(|_| connected) {
+                    // With no web-seed fallback, a connected, capped transfer is
+                    // allowed its normal deadline. Discovery still fails quickly.
+                    tokio::time::timeout(limit.saturating_sub(timeout), &mut work).await.map_err(|_| timed_out())?
+                } else { Err(timed_out()) }
+            }
+        }
+    }).await
 }
 
 async fn add_payload(
@@ -240,6 +296,10 @@ impl Swarm {
         let lan_only = options.policy == TorrentSwarmPolicy::Lan;
         let metadata_peers = Arc::new(Mutex::new(Vec::new()));
         let found_peers = metadata_peers.clone();
+        #[cfg(test)]
+        let seed_checks: Arc<Mutex<Vec<u32>>> = Arc::default();
+        #[cfg(test)]
+        let checked_pieces = seed_checks.clone();
         let (tx, rx) = mpsc::sync_channel(8);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
@@ -305,8 +365,8 @@ impl Swarm {
                 if options.seed {
                     log::warn!("BITTORRENT SEEDING ENABLED: incoming {:?}; upload limit {} bytes/s; verified pieces only; stops on unmount", session.listen_addr(), options.effective_upload_limit());
                 }
-                let mut refresh_at = std::time::Instant::now();
                 let mut seed_ready = false;
+                let mut seed_cursor = 0u64;
                 loop {
                     if session.cancellation_token().is_cancelled() { break; }
                     let queued = match rx.try_recv() {
@@ -314,36 +374,49 @@ impl Swarm {
                         Err(mpsc::TryRecvError::Empty) => None,
                         Err(mpsc::TryRecvError::Disconnected) => break,
                     };
-                    // rqbit has no public API for marking externally verified pieces.
-                    // Refresh its bitmap when idle, coalescing HTTP/cache publications.
-                    let refresh = queued.is_none() && data.upgrade().is_some_and(|d| {
-                        options.seed && (handle.is_none() ||
-                            (refresh_at.elapsed() >= Duration::from_secs(2) && d.seed_dirty.swap(false, Ordering::AcqRel)))
-                    });
-                    if refresh {
-                        current_stream.take();
-                        current_file = None;
-                        let bytes = data.upgrade().map(|d| d.meta.bytes.clone());
-                        let result = rt.block_on(until_stopped(&session, async {
-                            if let Some(old) = handle.take() {
-                                session.delete(old.id().into(), false).await.map_err(error)?;
+                    if options.seed {
+                        if let Some(data) = data.upgrade() {
+                            if handle.is_none() {
+                                let result = rt.block_on(until_stopped(&session, async {
+                                    let torrent = add_payload(&session, &options, data.meta.bytes.clone(), &initializing).await?;
+                                    session.unpause(&torrent).await.map_err(error)?;
+                                    Ok(torrent)
+                                }));
+                                match result {
+                                    Ok(torrent) => handle = Some(torrent),
+                                    Err(e) => { log::warn!("torrent seed initialization: {e}"); break; }
+                                }
                             }
-                            if let Some(bytes) = bytes {
-                                let torrent = add_payload(&session, &options, bytes, &initializing).await?;
-                                session.unpause(&torrent).await.map_err(error)?;
-                                handle = Some(torrent);
+                            if let Some(live) = handle.as_ref().and_then(|h| h.live()) {
+                                // Inspect each cache slot once on startup; thereafter only
+                                // newly verified pieces. HAVE updates keep peers connected.
+                                let count = data.meta.total.div_ceil(data.meta.piece_len);
+                                let mut pending = data.seed_pending.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut batch = Vec::with_capacity(32);
+                                while batch.len() < 32 {
+                                    if let Some(index) = pending.pop_first() { batch.push(index); }
+                                    else if seed_cursor < count { batch.push(seed_cursor); seed_cursor += 1; }
+                                    else { break; }
+                                }
+                                drop(pending);
+                                for index in batch {
+                                    #[cfg(test)]
+                                    checked_pieces.lock().unwrap().push(index as u32);
+                                    if session.cancellation_token().is_cancelled() { break; }
+                                    if let Err(e) = rt.block_on(async { tokio::task::spawn_blocking({
+                                        let live = live.clone();
+                                        move || live.recheck_external_piece(index as u32)
+                                    }).await }).map_err(error).and_then(|r| r.map_err(error)) {
+                                        log::debug!("torrent seed piece {index} unavailable: {e}");
+                                    }
+                                }
+                                if seed_cursor == count && !seed_ready {
+                                    log::warn!("BITTORRENT SEEDING READY: initial cache inspection finished; verified pieces available on {:?}", session.listen_addr());
+                                    seed_ready = true;
+                                }
+                                if seed_cursor < count && queued.is_none() { continue; }
                             }
-                            Ok::<_, io::Error>(())
-                        }));
-                        if let Err(e) = result {
-                            if !session.cancellation_token().is_cancelled() {
-                                log::warn!("torrent seed cache refresh: {e}");
-                            }
-                        } else if !seed_ready {
-                            log::warn!("BITTORRENT SEEDING READY: initial cache scan finished; verified pieces available on {:?}", session.listen_addr());
-                            seed_ready = true;
                         }
-                        refresh_at = std::time::Instant::now();
                     }
                     let command = match queued.map(Ok).unwrap_or_else(|| rx.recv_timeout(Duration::from_millis(100))) {
                         Ok(command) => command,
@@ -351,11 +424,14 @@ impl Swarm {
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
                     let reply = match &command {
-                        Command::Resolve(_, r) | Command::Read(_, _, r) => r.clone(),
+                        Command::Resolve(_, r) | Command::Read(_, _, _, r) => r.clone(),
                     };
-                    let result = rt
-                        .block_on(async {
-                            tokio::time::timeout(options.timeout, async {
+                    let timeout = match &command { Command::Read(_, _, limit, _) => limit.unwrap_or(options.timeout), _ => options.timeout };
+                    let connected_timeout = (options.policy == TorrentSwarmPolicy::Lan
+                        && matches!(&command, Command::Read(..))
+                        && data.upgrade().is_some_and(|d| d.options.swarm.policy == TorrentSwarmPolicy::Lan && d.meta.web_seeds.is_empty()))
+                        .then_some(options.timeout);
+                    let result = rt.block_on(command_deadline(&session, timeout, connected_timeout, async {
                                 match command {
                                     Command::Resolve(magnet, _) => {
                                         let mut peers = options.initial_peers.clone();
@@ -400,7 +476,7 @@ impl Swarm {
                                             _ => Err(error("metadata response was not list-only")),
                                         }
                                     }
-                                    Command::Read(bytes, spans, _) => {
+                                    Command::Read(bytes, spans, _, _) => {
                                         if handle.is_none() {
                                             handle = Some(add_payload(&session, &options, bytes, &initializing).await?);
                                         }
@@ -450,15 +526,7 @@ impl Swarm {
                                         Ok(output)
                                     }
                                 }
-                            })
-                            .await
-                        })
-                        .unwrap_or_else(|_| {
-                            Err(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "torrent swarm timed out",
-                            ))
-                        });
+                        }));
                     let _ = reply.send(result);
                 }
                 drop(current_stream);
@@ -477,6 +545,8 @@ impl Swarm {
             metadata_peers,
             #[cfg(test)]
             listen_addr: _listen_addr,
+            #[cfg(test)]
+            seed_checks,
         })
     }
 
@@ -532,14 +602,11 @@ impl Swarm {
         self.tx
             .as_ref()
             .unwrap()
-            .send(Command::Read(bytes.to_vec(), spans, tx))
+            .send(Command::Read(bytes.to_vec(), spans, timeout, tx))
             .map_err(error)?;
-        match timeout {
-            Some(timeout) => rx
-                .recv_timeout(timeout)
-                .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e))?,
-            None => rx.recv().map_err(error)?,
-        }
+        // The runtime owns the deadline and cancels the actual request. Let an
+        // established LAN-only transfer use its longer no-web-seed deadline.
+        rx.recv().map_err(error)?
     }
 }
 
@@ -623,6 +690,7 @@ mod tests {
             lan_only: false,
             metadata_peers: Arc::default(),
             listen_addr: None,
+            seed_checks: Arc::default(),
         };
         let start = std::time::Instant::now();
         drop(swarm);
@@ -755,5 +823,69 @@ mod lan_tests {
             assert!(!allow.has(ip), "public address allowed: {ip}");
         }
         rt.block_on(session.stop());
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+
+    /// Regression: default LSD enabled an inbound listener on public downloader sessions.
+    #[test]
+    fn regression_public_downloaders_never_listen_and_lan_binds_private() {
+        for policy in [
+            TorrentSwarmPolicy::Auto,
+            TorrentSwarmPolicy::Always,
+            TorrentSwarmPolicy::Never,
+        ] {
+            let opts = SwarmOptions {
+                policy,
+                ..Default::default()
+            };
+            let config = session_options(&opts);
+            assert!(config.listen.is_none());
+            assert_eq!(config.peer_limit, Some(32));
+        }
+        let config = session_options(&SwarmOptions {
+            policy: TorrentSwarmPolicy::Lan,
+            ..Default::default()
+        });
+        let addr = config.listen.unwrap().listen_addr;
+        assert!(!addr.ip().is_unspecified());
+        assert!(is_lan(addr.ip()));
+        assert!(!is_lan("100.64.0.1".parse().unwrap()));
+    }
+
+    /// Regression: two seed mounts collided on the fixed default port, and IPv6 peers could not connect.
+    #[test]
+    fn regression_seed_default_random_port_accepts_ipv6() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = SwarmOptions {
+            seed: true,
+            dht: false,
+            trackers: false,
+            lsd: false,
+            policy: TorrentSwarmPolicy::Lan,
+            ..Default::default()
+        };
+        assert_eq!(options.listen_port, 0);
+        assert!(options.listen_ip.is_ipv6());
+        let probe = match std::net::TcpListener::bind("[::1]:0") {
+            Ok(probe) => probe,
+            Err(e) => {
+                eprintln!("skip: IPv6 loopback unavailable: {e}");
+                return;
+            }
+        };
+        drop(probe);
+        let first = Swarm::new(options.clone(), dir.path().join("first"), "test").unwrap();
+        let second = Swarm::new(options, dir.path().join("second"), "test").unwrap();
+        let a = first.listen_addr.unwrap();
+        let b = second.listen_addr.unwrap();
+        assert_ne!(a.port(), b.port());
+        for addr in [a, b] {
+            std::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, addr.port())).unwrap();
+            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, addr.port())).unwrap();
+        }
     }
 }

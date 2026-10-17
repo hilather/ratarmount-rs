@@ -13,6 +13,9 @@ is compiled with pinned tonic 0.12.3, prost 0.13.5 and protox 0.7.2; no system
 It is a workspace member, so workspace checks include it, but no other crate
 depends on it. Default Cargo builds and existing package scripts still build
 only `ratarmount`. This driver and its container are separate opt-in builds.
+The driver implementation and its mount/RPC tests compile only on Linux.
+On other platforms the binary exits with `CSI node plugin requires Linux`
+before parsing node options; workspace builds can still include the crate.
 
 ## Build and deploy
 

@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/librqbit"]
 members = [
     "ratarmount",
     "ratarmount-core",

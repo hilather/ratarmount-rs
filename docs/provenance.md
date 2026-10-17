@@ -26,7 +26,10 @@ the missing/corrupt database and marker protections remain in effect. Attributes
 inherit from the archive until changed or removed. Rename carries attributes
 with the file, and unlink/recreate clears the old attributes.
 
-Commit persistence supports uncompressed TAR and `.tar.zst`. Attributes use
+Commit persistence supports uncompressed TAR and `.tar.zst`. Overlay roots are
+canonicalized for both live and offline provenance commits, including paths
+beneath macOS's `/var` symlink. Confinement still rejects member paths that
+escape the overlay root. Attributes use
 `SCHILY.xattr.<name>` PAX records with **raw binary values**, matching GNU tar's
 length-prefixed representation; invalid UTF-8, NUL and newlines in values are
 preserved. Reindexing and remount read these values back. Metadata-only edits

@@ -37,6 +37,12 @@ may block or flag the protocol regardless of the content being transferred.
   through peer exchange or incoming connections. Private IPv4, IPv4 link-local,
   loopback, IPv6 ULA and IPv6 link-local addresses are allowed; a LAN using only
   globally routed addresses needs a private/link-local address for this mode.
+  CGNAT `100.64.0.0/10` (including Tailscale IPv4 addresses) is not treated as LAN;
+  there is currently no CIDR override. With a web seed available, a LAN attempt
+  gets at most two seconds, then failed discovery backs off for 60 seconds.
+  Other pieces can use the web seed while that attempt is pending. With no web
+  seed, absent peers still time out after two seconds, but an established peer
+  transfer gets the normal transfer timeout (30 seconds by default).
   HTTPS metadata, checksum APIs and web seeds remain permitted; `lan` limits peer
   discovery, rather than making every request offline.
 
@@ -52,9 +58,10 @@ if that is unacceptable. UPnP port mapping remains disabled.
 
 `--torrent-lsd on|off` defaults to `on`, and only takes effect while a swarm
 session exists. BEP 14 multicasts stay on the local network. `auto` with working
-web seeds and `never` create no LSD socket. LSD uses an ephemeral incoming
-protocol listener to solicit prompt discovery replies even when uploads are off;
-payload uploads still require `--seed`. LAN activation logs explicitly state that
+web seeds and `never` create no LSD socket. Public `auto`/`always` downloader
+sessions never accept incoming TCP connections. LAN-only sessions can use an
+ephemeral protocol listener bound to a private local address to solicit prompt
+LSD replies; payload uploads still require `--seed`. LAN activation logs explicitly state that
 DHT and trackers are disabled. `--torrent-lsd off` disables multicast; library
 users can still provide explicit private peer addresses.
 
@@ -128,8 +135,8 @@ seeks cancel only that reader’s previous window between pieces. The demanded p
 before that window is scheduled. The range cache shares the existing
 `RATARMOUNT_PAYLOAD_CACHE_BYTES` budget with other remote/payload reads; `0`
 disables persistent pieces and HTTP prefetch. A shared LRU holds at most four
-verified pieces / 256 MiB; concurrent misses for a piece share one fetch. This
-branch has no core memory-budget API. Active readers and in-flight requests may
+verified pieces / 256 MiB; concurrent misses for a piece share one fetch. Torrent-specific piece buffers are not currently charged to `--memory-budget`.
+Active readers and in-flight requests may
 hold additional piece buffers.
 
 ## Swarm behavior and current limits
@@ -164,11 +171,15 @@ temporary-file fallback.
 ## Opt-in seeding and two-Dell LAN setup
 
 `--seed` is off by default. It activates the selected swarm policy immediately,
-accepts incoming connections on `--torrent-listen-port` (default `4240`; `0`
-selects an available port), and logs **BITTORRENT SEEDING ENABLED**, the listener
+accepts incoming IPv4 and IPv6 connections on `--torrent-listen-port` (default `0`,
+which selects an available port for each mount), and logs **BITTORRENT SEEDING ENABLED**, the listener
 and upload cap. `--seed --torrent-swarm never` is an error. `--seed` also requires
 a build with `--features bittorrent`. Use `--torrent-swarm lan` on both machines
-to share without announcing to internet trackers or DHT peers.
+to share without announcing to internet trackers or DHT peers. With `auto` or
+`always`, **`--seed` joins public DHT/trackers at mount time**, including when
+all requested reads can be served by cache or web seeds. Each session permits
+at most 32 connected peers. An explicit occupied listen port remains an error;
+use the random default for multiple concurrent mounts.
 
 `--seed-upload-limit BYTES/s` defaults to **1048576** (1 MiB/s). It accepts decimal
 integer byte rates from 16384 through 1000000000. The minimum is one 16 KiB
@@ -191,9 +202,13 @@ upload rather than returning zero-filled scratch holes. Scratch fallback is
 independently rehashed as well: a HAVE bit that authenticated a cached overlay
 cannot authorize different speculative blocks underneath it after eviction.
 No cache miss performs HTTP or swarm fetching on an upload thread.
-New HTTP/cache pieces coalesce into a bitmap refresh when the bridge is idle,
-at most once every two seconds; this scans the logical torrent and rechecks
-pieces, including missing zero-filled scratch holes, and can reconnect peers. This upstream API limitation adds disk/hash work for large torrents.
+The seed starts with an empty availability bitmap and inspects cache slots once.
+Missing slots are not hashed as zero-filled files. Newly verified HTTP/cache
+pieces enter an incremental queue: rqbit verifies only that piece, updates HAVE,
+and announces it over existing peer connections. It never deletes/re-adds the
+torrent for refreshes or rehashes previously advertised pieces. A small vendored
+rqbit patch provides this API; its provenance and changes are recorded in
+`vendor/librqbit/RATARMOUNT.md`.
 Unmount cancels listeners, discovery and uploads even if a read is still timing out.
 
 For two Dells on the same private LAN, place the same `.torrent` metadata file on
@@ -220,8 +235,8 @@ needs private addresses and multicast routing on that link. Keep the donor mount
 while reading on the second machine. The default scratch quota remains 2 GiB;
 a swarm-only 300 GB sequential download needs a larger quota, as above, and enough
 local disk. Wait for **BITTORRENT SEEDING READY** on the donor before starting
-the second mount: the initial checksum scan of a very large torrent can take
-minutes, while individual peer operations time out after 30 seconds by default.
+the second mount: the first inspection and verification of a very large warm
+cache can take minutes. Already inspected pieces can be served during that work.
 Scratch is temporary and separate from the shared persistent cache.
 The default range-cache budget is also independent of that quota. A first Dell
 with only partially cached pieces can serve those pieces; other requested pieces
@@ -244,8 +259,8 @@ Other upstream limitations:
 A file's bencoded `sha256` extension (32 raw bytes or 64 hex digits) supplies an
 expected whole-file checksum. For pinned Hugging Face web seeds matching
 `https://huggingface.co/[datasets/|spaces/]<owner>/<repo>/resolve/<commit>/<path>`,
-the backend also reuses the `hf://` tree API, token rules and tree cache to read
-`lfs.oid` / `lfs.sha256`. Mutable branch URLs are not treated as a pinned source
+the backend uses the `hf://` tree API and token rules to read fresh `lfs.oid`
+values for the exact pinned commit. Non-LFS files use the Hub's Git blob `oid`. Mutable branch URLs are not treated as a pinned source
 identity. Missing independent hashes leave piece verification active, but do
 not claim Hub whole-file verification.
 
@@ -292,15 +307,22 @@ piece verification or claim whole-file verification.
 
 `TorrentMountSource::verified_file_sha256(path)` returns a digest only after the
 full-file check succeeds. For one unambiguous pinned Hub/Pirate Face repository
-identity, a matching Hub LFS or source-bound Pirate Face manifest observation
-also authorizes publication into the shared Hub cache. A metainfo `sha256`
-extension alone does not authorize a Hub snapshot mapping. Conflicting identities
-or independent hashes fail closed. Missing hashes retain piece verification.
+identity, only a fresh, authenticated Hub tree response for that exact commit
+authorizes publication into the shared Hub cache. LFS files use the Hub's
+`lfs.oid` SHA-256; non-LFS files are verified and installed only under the Hub's
+Git blob SHA-1 `oid`. Metainfo extensions, Pirate Face manifests, on-disk torrent
+checksum records and cached tree responses never authorize new snapshot entries.
+Manifest hashes only add integrity checks that can make reads fail with EIO.
+Offline, gated, rate-limited or failed Hub lookups leave publication disabled.
+Conflicting identities or independent hashes fail closed.
 
 Publication streams into AI-HF3's existing installer: the same
-`$HF_HUB_CACHE/models--owner--repo/blobs/<sha256>`, snapshot symlink, file lock,
+`$HF_HUB_CACHE/models--owner--repo/blobs/<Hub-oid>`, snapshot symlink, file lock,
 atomic rename, digest check and `0666 & ~umask` permissions used by `hf://`.
-It creates no second completed-file spool. Busy blob locks and failed installs
+It creates no second completed-file spool. Torrent publication never replaces an
+existing `snapshots/<commit>/<path>` entry, including dangling symlinks and entries
+created concurrently. A conflicting entry is preserved and logged even when the
+new blob already exists. Busy blob locks and transient failed installs
 are retried by the background verifier at idle five-second intervals, without
 requiring another read; dropping the source stops further publication work. Once publication succeeds, redundant
 torrent range pieces are removed (cross-file v1 pieces wait for all their spans).

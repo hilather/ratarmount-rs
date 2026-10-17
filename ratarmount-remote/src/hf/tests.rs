@@ -1162,8 +1162,11 @@ fn regression_torrent_hub_tree_sha256_without_payload() {
     )
     .unwrap();
     assert_eq!(
-        repo.torrent_sha256s().unwrap(),
-        BTreeMap::from([("weights".into(), "ab".repeat(32))])
+        repo.torrent_oids().unwrap(),
+        BTreeMap::from([
+            ("weights".into(), (123, "ab".repeat(32))),
+            ("config.json".into(), (4, "cd".repeat(20)))
+        ])
     );
     assert_eq!(hub.count("/tree/"), 1);
     assert!(repo
@@ -1512,4 +1515,52 @@ fn regression_hf_cache_disabled_sharing_keeps_range_backing_fd() {
     extent.file.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, data);
     assert!(!dir.path().join("hub").exists());
+}
+
+/// Regression: failed/offline Hub requests and a stale tree cache still authorized torrent publication.
+#[cfg(feature = "bittorrent")]
+#[test]
+fn regression_torrent_hub_authorization_requires_fresh_exact_commit() {
+    let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+    let response_status = status.clone();
+    let hub = Server::new(move |req| {
+        assert_eq!(req.headers["authorization"], "Bearer hf_test_secret");
+        if req.path.contains("/revision/") {
+            return Response::new(200, json!({"sha": SHA}).to_string());
+        }
+        assert!(req.path.contains(&format!("/tree/{SHA}?")));
+        Response::new(
+            response_status.load(Ordering::Relaxed),
+            json!([
+                {"type":"file", "path":"weights", "size":4, "lfs":{"oid":"ab".repeat(32)}},
+                {"type":"file", "path":"config", "size":4, "oid":"cd".repeat(20)}
+            ])
+            .to_string(),
+        )
+        .header("Retry-After", "0")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut repo = HfRepo::with_config(
+        parse_hf_url(&format!("hf://org/model@{SHA}")).unwrap(),
+        config(&hub, Some(dir.path().into())),
+    )
+    .unwrap();
+    repo.tree().unwrap(); // valid cached tree is not authorization
+    for code in [401, 403, 429] {
+        status.store(code, Ordering::Relaxed);
+        assert!(
+            repo.torrent_oids().is_err(),
+            "status {code} must fail closed"
+        );
+    }
+    status.store(200, Ordering::Relaxed);
+    repo.config.offline = true;
+    assert!(repo.torrent_oids().is_err());
+    repo.config.offline = false;
+    repo.commit = "b".repeat(40);
+    assert!(repo.torrent_oids().is_err());
+    repo.commit = SHA.into();
+    let oids = repo.torrent_oids().unwrap();
+    assert_eq!(oids["weights"], (4, "ab".repeat(32)));
+    assert_eq!(oids["config"], (4, "cd".repeat(20)));
 }

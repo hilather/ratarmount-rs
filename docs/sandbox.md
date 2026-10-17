@@ -14,6 +14,35 @@ These options require an overlay from `-w` / `--write-overlay`,
 overlay to FUSE, NFS, 9P, SFTP, SMB and WebDAV. Reads and read-only opens remain
 available. The base archive is unchanged by ordinary overlay writes.
 
+## Executables and file metadata
+
+Writable FUSE mounts honor chmod and access/modification time updates, including
+“now” and omitted timestamps. New files and directories use the requested mode
+masked by the FUSE request's umask; the daemon's umask is not applied a second
+time. Archive members with execute bits and executables built inside the overlay
+can run normally. Mounts default to `exec`; an explicit `-o noexec` still wins.
+A configured `-o umask=...` continues to mask the attributes exposed to clients.
+
+Changing an archive member's mode or times records metadata without copying its
+payload into the overlay. Reads still come from the archive. The changes survive
+reopening the overlay, and a later data write preserves the mode during copy-up.
+TAR and compressed-TAR commit preserve executable bits and modification times;
+the current TAR writer stores whole-second mtime and does not store atime.
+Metadata-only commit uses the same temporary payload staging as provenance
+xattrs and is limited to the TAR commit formats. The current `ratarmount diff`
+scanner walks host files, so it omits these metadata-only archive edits until
+a data write copies the member into the overlay.
+
+NFSv3/v4 SETATTR, 9P Tsetattr and SFTP SETSTAT also apply mode and time changes.
+SFTP OPEN honors requested creation permissions. The current NFSv3 server dependency
+does not forward MKDIR attributes to the filesystem adapter, so newly created
+NFSv3 directories initially use mode 0755; SETATTR can change it afterwards.
+Ownership changes are refused
+with `EPERM` (the corresponding permission status for SFTP); they neither chown
+host files nor invent stored owners. Use `-o uid=...,gid=...` for presentation
+mapping. chmod on a symlink itself is unsupported. SMB Basic Information has no
+Unix mode field; unsupported SET_INFO classes continue to return an error.
+
 ## Read-only path rules
 
 `--overlay-readonly GLOBS` accepts a comma-separated list and can be repeated.
@@ -35,7 +64,7 @@ match `tests`, `tests/a`, and `tests/a/b.t`, but not `other/tests/a`.
   Empty rules, empty interior components, `.` and `..` are rejected.
 
 A protected path rejects creation, write opens, writes, truncate, COW copy-up,
-unlink, rmdir, mkdir and symlink creation with `EROFS` (read-only filesystem).
+unlink, rmdir, mkdir, chmod, timestamp updates and symlink creation with `EROFS` (read-only filesystem).
 Both rename endpoints are checked. Host parent symlinks are resolved as well,
 so a symlink alias cannot bypass rules for pre-existing overlay content; unlinking
 the alias itself remains allowed. Rename, rmdir and overlay reset also reject
@@ -170,8 +199,8 @@ should accept both 0 and 1 as successful comparisons.
 masks permission bits with `mode & ~umask`, including directories and symlinks.
 The options apply to FUSE, NFS v3/v4, 9P and SFTP attributes, including overlay
 files. Omit an option to retain its original value. IDs are decimal; umask is
-octal (`000` through `777`). Stored ownership, creation credentials, chmod and
-chown behavior remain unchanged. SMB and WebDAV expose no Unix uid/gid fields.
+octal (`000` through `777`). These presentation options do not change stored ownership or creation
+credentials; chmod and timestamp updates use the overlay metadata behavior above. SMB and WebDAV expose no Unix uid/gid fields.
 This mapping can avoid Git's “dubious ownership” check when a container uses a
 different user; see [Git mounts](git-mounts.md).
 
@@ -418,7 +447,11 @@ the overlay database's exclusive lock (including deletions awaiting SQL retry).
 The supervisor renders the patch and scans usage in-process. For a crashed
 attempt, diff/stats use its offline database; an unrecoverable database returns
 a structured error. State paths must leave room within the platform's Unix
-socket path limit for `attempts/ID/inspect.sock`.
+socket path limit for `attempts/ID/inspect.sock`: the full path must be shorter
+than 104 bytes on macOS or 108 bytes on Linux. Overlong paths return an error
+with the native limit and the offending path. Use a short private state directory
+under `$XDG_RUNTIME_DIR` or `/tmp` when the usual state/temp directory is too long;
+socket addresses are not relocated automatically.
 
 A failed/timed-out batch rolls back its own children and directories without
 affecting previous attempts. If unmount fails, directories and attempt records

@@ -19,15 +19,15 @@ issue from the README feature tables.
 | [#176](https://github.com/mxmlnkn/ratarmount/issues/176) | Create index only, do not mount | **done** | `--no-mount` |
 | [#151](https://github.com/mxmlnkn/ratarmount/issues/151) | Mount compression layer only | **done** / **partial** | Plain compress + `--recursion-depth`; no separate "undo TAR" flag beyond depth 0 |
 | [#109](https://github.com/mxmlnkn/ratarmount/issues/109) | Support more formats | **done** / **partial** | Broad matrix; RAR/LHA still libarchive sequential |
-| [#145](https://github.com/mxmlnkn/ratarmount/issues/145) | xattrs in TAR | **done** | Content-hash xattrs (`--hashes`) + TAR PAX `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*` → index + FUSE (vendor MPE/ZOS pax keys not mapped) |
-| [#100](https://github.com/mxmlnkn/ratarmount/issues/100) | Use pread | **done** | FUSE low-level read path is offset-based (pread-style) |
+| [#145](https://github.com/mxmlnkn/ratarmount/issues/145) | xattrs in TAR | **done** | Content hashes + TAR PAX xattrs → index/FUSE; writable FUSE `user.*` provenance survives TAR / `.tar.zst` commit and is searchable with `find --xattr` ([guide](../provenance.md)); vendor MPE/ZOS pax keys not mapped |
+| [#100](https://github.com/mxmlnkn/ratarmount/issues/100) | Use pread | **done** | FUSE offset reads + independent positional I/O for file-backed TAR members; concurrent nested opens cannot share a cursor ([matrix](../embedded-nested-archives.md)) |
 | [#79](https://github.com/mxmlnkn/ratarmount/issues/79) | Metadata for recursive compressed TARs in outer index | **partial** | `nestedTarMembers` / flatten paths; not full Python dual-index |
 | [#95](https://github.com/mxmlnkn/ratarmount/issues/95) | Indexes from un-seekable fileobj | **partial** | Materialize/spool path for some inputs; true non-seek still limited |
 | [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | Multi-frame / chunked zstd examples | **done** | User guide: [`docs/zstd-random-access.md`](../zstd-random-access.md) |
 | [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | ZIP commit-overlay | **done** (MVP) | Full rebuild in `commit_overlay`; residual encrypted/multi-part |
-| [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | HTTP(S) authentication | **done** / **partial** | Basic (URL userinfo + `RATARMOUNT_HTTP_USER`/`PASSWORD`) + Cookie (`RATARMOUNT_HTTP_COOKIE` / `COOKIE_FILE`); residual full browser jar / Set-Cookie |
+| [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | HTTP(S) authentication | **done** / **partial** | Pooled HTTP Basic/Bearer + Cookie (`RATARMOUNT_HTTP_COOKIE` / `COOKIE_FILE`); residual full browser jar / Set-Cookie |
 | [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | Parallel large ZIP deflate members | **done** | Single-flight Deflate cache + parallel multi-member open/hash |
-| [#180](https://github.com/mxmlnkn/ratarmount/issues/180) | Readahead-like option | **done** | `--readahead BYTES` (K/M/G); per-open sequential window up to 64 MiB |
+| [#180](https://github.com/mxmlnkn/ratarmount/issues/180) | Readahead-like option | **done** | `--readahead BYTES` (K/M/G); per-open sequential window up to 64 MiB; bounded HTTP prefetch and zstd decode-ahead also implemented |
 | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | Parallel index nested archives | **done** | Eager AutoMount same-dir fan-out (`AutoMountOptions::parallel_nested_threads`, default auto); lazy still sequential; CLI `--parallel-nested N` wires cap |
 
 ---

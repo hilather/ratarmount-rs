@@ -599,7 +599,7 @@ impl Default for OpenOptions {
             torrent_lsd: true,
             torrent_seed: false,
             torrent_seed_upload_limit: 1024 * 1024,
-            torrent_listen_port: 4240,
+            torrent_listen_port: 0,
             zstd_readahead_bytes: 16 * 1024 * 1024,
             direct_io: false,
             encoding: "utf-8".into(),

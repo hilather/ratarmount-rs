@@ -10,11 +10,13 @@ pub(super) enum Event {
     Barrier(mpsc::SyncSender<()>),
     Piece(Piece, Weak<Vec<u8>>),
     Complete(usize),
-    Hashes(BTreeMap<String, [u8; 32]>),
+    Hashes(checksums::Observations),
 }
 #[derive(Default)]
 struct Stream {
     hash: Sha256,
+    git: Option<sha1::Sha1>,
+    git_digest: Option<String>,
     next: u64,
     digest: Option<[u8; 32]>,
     covered: bool,
@@ -22,6 +24,19 @@ struct Stream {
 
 fn publish(data: &Arc<Data>, file: usize, expected: [u8; 32], pending: &mut BTreeSet<usize>) {
     if let Err(e) = data.hub.publish(data, file, expected) {
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            let mut state = data.verification[file]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.bad = true;
+            state.complete = false;
+            pending.remove(&file);
+            log::error!(
+                "torrent Hub object hash mismatch: {}",
+                data.meta.files[file].path
+            );
+            return;
+        }
         pending.insert(file);
         log::debug!("torrent Hub cache publication deferred: {e}");
     } else {
@@ -63,10 +78,17 @@ pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Res
                                     && stream.digest.is_none()
                                 {
                                     // Hashing can be expensive. No read-path mutex is held here.
+                                    let git = stream.git.get_or_insert_with(|| {
+                                        let mut hash = sha1::Sha1::new();
+                                        hash.update(format!("blob {}\0", data.meta.files[file].len).as_bytes());
+                                        hash
+                                    });
+                                    git.update(&bytes[offset..offset + len]);
                                     stream.hash.update(&bytes[offset..offset + len]);
                                     stream.next += len as u64;
                                     if stream.next == data.meta.files[file].len {
                                         stream.digest = Some(stream.hash.clone().finalize().into());
+                                        stream.git_digest = Some(hex::encode(git.clone().finalize()));
                                     }
                                     affected.push(file);
                                 }
@@ -79,7 +101,8 @@ pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Res
                         affected.push(file);
                     }
                     Event::Hashes(hashes) => {
-                        data.hub.authorize(&data.meta, &hashes);
+                        data.hub.authorize(&hashes.hub);
+                        let hashes = hashes.checks;
                         for (file, meta) in data.meta.files.iter().enumerate() {
                             let mut state = data.verification[file]
                                 .lock()
@@ -113,14 +136,15 @@ pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Res
                         }
                         state.expected
                     };
-                    let Some(expected) = expected else {
-                        continue;
-                    };
+                    let git_oid = data.hub.git_oid(file);
+                    if expected.is_none() && git_oid.is_none() { continue; }
                     if stream.digest.is_none() && stream.covered {
                         // Random reads (or an evicted weak piece) need an independent
                         // pass. It may use HTTP, but never holds a reader's mutex.
-                        let result = (|| -> std::io::Result<[u8; 32]> {
+                        let result = (|| -> std::io::Result<([u8; 32], String)> {
                             let mut hash = Sha256::new();
+                            let mut git = sha1::Sha1::new();
+                            git.update(format!("blob {}\0", data.meta.files[file].len).as_bytes());
                             let mut pos = 0;
                             while pos < data.meta.files[file].len {
                                 let (key, offset) = data.key(file, pos);
@@ -129,12 +153,13 @@ pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Res
                                     .min((bytes.len() - offset) as u64)
                                     as usize;
                                 hash.update(&bytes[offset..offset + n]);
+                                git.update(&bytes[offset..offset + n]);
                                 pos += n as u64;
                             }
-                            Ok(hash.finalize().into())
+                            Ok((hash.finalize().into(), hex::encode(git.finalize())))
                         })();
                         match result {
-                            Ok(digest) => stream.digest = Some(digest),
+                            Ok((digest, git)) => { stream.digest = Some(digest); stream.git_digest = Some(git); },
                             Err(e) => {
                                 log::warn!("torrent background SHA-256 verification: {e}");
                                 continue;
@@ -145,7 +170,9 @@ pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Res
                         let mut state = data.verification[file]
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        state.bad = digest != expected;
+                        let expected = expected.unwrap_or(digest);
+                        state.bad = digest != expected || git_oid.as_ref().is_some_and(|oid| stream.git_digest.as_ref() != Some(oid));
+                        if !state.bad { state.expected = Some(expected); }
                         state.complete = !state.bad;
                         state.ranges.clear();
                         let complete = state.complete;
@@ -172,7 +199,12 @@ pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Res
                 return;
             };
             let hashes = if data.hub.all_local(&data) {
-                BTreeMap::new()
+                checksums::Observations::default()
+            } else if !data.hub.discover {
+                checksums::Observations {
+                    checks: checksums::cached_only(&data.meta, &data.options.metadata_dir),
+                    ..Default::default()
+                }
             } else {
                 if data.stopped.load(std::sync::atomic::Ordering::Acquire) {
                     return;

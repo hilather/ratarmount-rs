@@ -7083,6 +7083,85 @@ mod tests {
         assert_eq!(mid.as_slice(), &payload[5..]);
     }
 
+    /// Regression: shared TAR cursors corrupted parallel nested AR opens and triggered spooling.
+    #[cfg(feature = "ar")]
+    #[test]
+    fn regression_parallel_nested_ar_correct_bytes_without_spool() {
+        use ratarmount_formats_tar::{
+            write_tar_eof, write_ustar_members, UstarMember, UstarPayload,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let members: Vec<_> = (0..4)
+            .map(|i| {
+                let payload = vec![b'A' + i; 4096];
+                let bytes = synthetic_ar("payload", &payload);
+                (format!("inner-{i}.ar"), bytes, payload)
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer.tar");
+        let tar_members: Vec<_> = members
+            .iter()
+            .map(|(name, bytes, _)| UstarMember {
+                path: name,
+                payload: UstarPayload::File { bytes },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: &[],
+            })
+            .collect();
+        let mut file = std::fs::File::create(&outer).unwrap();
+        write_ustar_members(&mut file, &tar_members).unwrap();
+        write_tar_eof(&mut file).unwrap();
+        drop(file);
+
+        for _ in 0..32 {
+            let options = OpenOptions {
+                index_in_memory: true,
+                ..OpenOptions::default()
+            };
+            let source = open_path(&outer, &options, false).unwrap();
+            let opener = open_nested_reader_fn(options);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reader_calls = Arc::clone(&calls);
+            let barrier = std::sync::Barrier::new(members.len());
+            let checked_reader: OpenNestedReaderFn = Arc::new(move |reader, label, context| {
+                // Align the real dispatcher's probes on four different TAR members.
+                barrier.wait();
+                let source = opener(reader, label, context)?;
+                reader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(source)
+            });
+            let forbidden_path: OpenNestedFn =
+                Arc::new(|path| panic!("parallel nested open spooled to {}", path.display()));
+            let layer = AutoMountLayer::new_with_openers(
+                source,
+                1,
+                forbidden_path,
+                Some(checked_reader),
+                AutoMountOptions {
+                    recursive_extensions: parse_recursive_extensions(".ar"),
+                    parallel_nested_threads: members.len() as u32,
+                    ..AutoMountOptions::default()
+                },
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), members.len());
+            std::thread::scope(|scope| {
+                for (name, _, expected) in &members {
+                    let layer = &layer;
+                    scope.spawn(move || {
+                        for _ in 0..32 {
+                            assert_eq!(read_all(layer, &format!("/{name}/payload")), *expected);
+                        }
+                    });
+                }
+            });
+        }
+    }
+
     #[cfg(feature = "ar")]
     #[test]
     fn nested_ar_from_cursor_via_opener() {
@@ -9146,7 +9225,8 @@ mod source_bind_tests {
             .any(|d| d.name.starts_with(".wh.")));
     }
 
-    /// Regression: synthetic HEAD rejected an image plus one bound repository.
+    /// Regression: synthetic HEAD rejected an image plus one bound repository;
+    /// macOS /var temp aliases must not trip the cache's no-follow protection.
     #[cfg(all(feature = "git", unix))]
     #[test]
     fn regression_source_bind_synthetic_head_appears_under_repo() {
@@ -9155,7 +9235,7 @@ mod source_bind_tests {
             let cache = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["factory::source_bind_tests::regression_source_bind_synthetic_head_appears_under_repo", "--exact", "--nocapture"])
-                .env(CHILD, "1").env("XDG_CACHE_HOME", cache.path())
+                .env(CHILD, "1").env("XDG_CACHE_HOME", cache.path().canonicalize().unwrap())
                 .env_remove("RATARMOUNT_FORCE_GIT").output().unwrap();
             assert!(
                 output.status.success(),

@@ -1177,10 +1177,10 @@ fn regression_checksum_arrives_after_read_without_network_wait() {
     source
         .data
         .verify_tx
-        .send(verification::Event::Hashes(BTreeMap::from([(
-            "file".into(),
-            Sha256::digest(b"test").into(),
-        )])))
+        .send(verification::Event::Hashes(checksums::Observations {
+            checks: BTreeMap::from([("file".into(), Sha256::digest(b"test").into())]),
+            ..Default::default()
+        }))
         .unwrap();
     wait_until(|| source.verified_file_sha256("/file").is_some());
     assert_eq!(
@@ -1522,6 +1522,42 @@ fn hub_metainfo(payload: &[u8], opts: &TorrentOptions) -> Metainfo {
     meta
 }
 
+fn authorize_mock_hub(hub: &cache::HubFiles, payload: &[u8], git: bool) {
+    let commit = "a".repeat(40);
+    let oid = if git {
+        let mut hash = Sha1::new();
+        hash.update(format!("blob {}\0", payload.len()).as_bytes());
+        hash.update(payload);
+        hex::encode(hash.finalize())
+    } else {
+        hex::encode(Sha256::digest(payload))
+    };
+    let item = if git {
+        serde_json::json!({"type":"file", "path":"file", "size":payload.len(), "oid":oid})
+    } else {
+        serde_json::json!({"type":"file", "path":"file", "size":payload.len(), "lfs":{"oid":oid}})
+    };
+    let web = Web::new(BTreeMap::from([
+        (
+            format!("/api/models/org/model/revision/{commit}"),
+            serde_json::to_vec(&serde_json::json!({"sha":commit})).unwrap(),
+        ),
+        (
+            format!("/api/models/org/model/tree/{commit}?recursive=true"),
+            serde_json::to_vec(&vec![item]).unwrap(),
+        ),
+    ]));
+    let source = format!("hf://org/model@{commit}");
+    let repo = HfRepo::torrent_test_repo(&source, &web.url).unwrap();
+    let hashes = repo
+        .torrent_oids()
+        .unwrap()
+        .into_iter()
+        .map(|(path, oid)| ((source.clone(), path), oid))
+        .collect();
+    hub.authorize(&hashes);
+}
+
 fn mock_hub_reader(
     web: &Web,
     cache: crate::hf_cache::HubCache,
@@ -1578,6 +1614,7 @@ fn regression_verified_torrent_installs_hub_blob_and_snapshot() {
     opts.swarm.initial_peers = vec![seed.addr];
     let cache = hub_cache(&dir.path().join("hub"));
     let hub = cache::HubFiles::with_cache(&meta, Some(cache.clone()));
+    authorize_mock_hub(&hub, &payload, false);
     let source = TorrentMountSource::with_hub(meta, opts, hub).unwrap();
     assert_eq!(read(&source, "/file").unwrap(), payload);
     let hash = hex::encode(Sha256::digest(&payload));
@@ -1854,6 +1891,7 @@ fn regression_torrent_hub_publication_retries_busy_lock_without_more_reads() {
         .unwrap();
     lock.lock().unwrap();
     let hub = cache::HubFiles::with_cache(&meta, Some(hub_cache(&root)));
+    authorize_mock_hub(&hub, &payload, false);
     let source = TorrentMountSource::with_hub(meta, opts, hub).unwrap();
     assert_eq!(read(&source, "/file").unwrap(), payload);
     wait_until(|| source.verified_file_sha256("/file").is_some());
@@ -1936,9 +1974,10 @@ fn regression_hub_snapshot_supplies_sha256_without_torrent_checksum_cache() {
         meta,
         options: opts,
         self_ref: weak.clone(),
-        seed_dirty: AtomicBool::new(false),
+        seed_pending: Mutex::default(),
         stopped: AtomicBool::new(false),
         lan_probe_done: AtomicBool::new(false),
+        lan_retry_at: Mutex::default(),
         swarm_gate: Mutex::new(()),
         hub,
         swarm: Mutex::new(None),
@@ -1957,4 +1996,197 @@ fn regression_hub_snapshot_supplies_sha256_without_torrent_checksum_cache() {
     assert_eq!(web.count.load(Ordering::Relaxed), 0);
     assert!(data.swarm.lock().unwrap().is_none());
     assert!(!data.options.metadata_dir.exists());
+}
+
+/// Regression: third-party manifests and legacy checksum caches authorized poisoned Hub snapshots.
+#[test]
+fn regression_manifest_hash_never_authorizes_hub_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = b"attacker bytes";
+    let opts = options(&dir.path().join("torrent"));
+    let meta = hub_metainfo(payload, &opts); // populates the legacy *.sha256-v2.json cache
+    cache_payload(&meta, &opts, payload);
+    let root = dir.path().join("hub");
+    let cache = hub_cache(&root);
+    let hub = cache::HubFiles::with_cache(&meta, Some(cache));
+    let source = TorrentMountSource::with_hub(meta, opts, hub).unwrap();
+    source
+        .data
+        .verify_tx
+        .send(verification::Event::Hashes(checksums::Observations {
+            checks: BTreeMap::from([("file".into(), Sha256::digest(payload).into())]),
+            hub: BTreeMap::new(), // gated/offline/429 Hub lookup cannot authorize
+        }))
+        .unwrap();
+    assert_eq!(read(&source, "/file").unwrap(), payload);
+    wait_until(|| source.verified_file_sha256("/file").is_some());
+    let (tx, rx) = mpsc::sync_channel(1);
+    source
+        .data
+        .verify_tx
+        .send(verification::Event::Barrier(tx))
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(!root.join("models--org--model/blobs").exists());
+    source
+        .data
+        .hub
+        .publish(&source.data, 0, Sha256::digest(payload).into())
+        .unwrap();
+    assert!(!root.join("models--org--model/snapshots").exists());
+}
+
+/// Regression: a Hub-vouched non-LFS object was installed under a manifest SHA-256 instead of its Git oid.
+#[test]
+fn regression_non_lfs_torrent_publishes_only_hub_git_oid() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = b"small git config";
+    let opts = options(&dir.path().join("torrent"));
+    let mut meta = hub_metainfo(payload, &opts);
+    meta.files[0].sha256 = None;
+    // No independent SHA-256 is needed when the fresh Hub Git oid verifies the file.
+    std::fs::remove_dir_all(&opts.metadata_dir).unwrap();
+    cache_payload(&meta, &opts, payload);
+    let root = dir.path().join("hub");
+    let hub = cache::HubFiles::with_cache(&meta, Some(hub_cache(&root)));
+    authorize_mock_hub(&hub, payload, true);
+    let oid = hub.git_oid(0).unwrap();
+    let source = TorrentMountSource::with_hub(meta, opts, hub).unwrap();
+    assert_eq!(read(&source, "/file").unwrap(), payload);
+    let blob = root.join("models--org--model/blobs").join(oid);
+    wait_until(|| blob.exists());
+    assert_eq!(std::fs::read(blob).unwrap(), payload);
+    assert!(!root
+        .join("models--org--model/blobs")
+        .join(hex::encode(Sha256::digest(payload)))
+        .exists());
+}
+
+/// Regression: each new seed piece rescanned old pieces and disconnected an already connected peer.
+#[test]
+fn regression_seed_incremental_have_keeps_peer_without_rescanning() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = vec![71; BLOCK * 3];
+    let web = Web::new(BTreeMap::from([("/file".into(), payload.clone())]));
+    let bytes = envelope(
+        v1_info(&[("file", &payload)], BLOCK, false, None),
+        &[format!("{}file", web.url)],
+    );
+    let meta = Metainfo::parse(bytes.clone()).unwrap();
+    let opts = seed_options(dir.path());
+    cache_payload(&meta, &opts, &payload[..BLOCK]);
+    let source = TorrentMountSource::from_bytes(bytes, opts).unwrap();
+    let seed = source.data.start_seed().unwrap();
+    wait_until(|| seed.seed_checks.lock().unwrap().len() == 3);
+    let hash = hex::decode(meta.v1_hash.unwrap()).unwrap();
+    let (mut peer, bitmap) = seed_bitfield(seed.listen_addr.unwrap(), &hash);
+    assert_eq!(bitmap[0] & 0xe0, 0x80);
+    peer.write_all(&[0, 0, 0, 2, 5, 0]).unwrap(); // peer's empty bitfield
+    peer.write_all(&[0, 0, 0, 1, 2]).unwrap(); // interested
+    let mut request = vec![0, 0, 0, 13, 6];
+    request.extend(0u32.to_be_bytes());
+    request.extend(0u32.to_be_bytes());
+    request.extend((BLOCK as u32).to_be_bytes());
+    peer.write_all(&request).unwrap();
+    loop {
+        let mut len = [0; 4];
+        peer.read_exact(&mut len).unwrap();
+        let len = u32::from_be_bytes(len) as usize;
+        if len == 0 {
+            continue;
+        }
+        assert!(len < BLOCK * 2);
+        let mut msg = vec![0; len];
+        peer.read_exact(&mut msg).unwrap();
+        if msg[0] == 7 {
+            assert_eq!(&msg[9..], &payload[..BLOCK]);
+            break;
+        }
+    }
+    // Avoid the LAN-first attempt: this is the piece completion path shared with HTTP reads.
+    source
+        .data
+        .fetch_piece(
+            Piece {
+                file: None,
+                index: 1,
+            },
+            false,
+        )
+        .unwrap();
+    loop {
+        let mut len = [0; 4];
+        peer.read_exact(&mut len)
+            .expect("existing peer must stay connected");
+        let len = u32::from_be_bytes(len) as usize;
+        assert!(len < 1024 * 1024);
+        if len == 0 {
+            continue;
+        }
+        let mut msg = vec![0; len];
+        peer.read_exact(&mut msg).unwrap();
+        if msg[0] == 4 && msg[1..] == 1u32.to_be_bytes() {
+            break;
+        }
+    }
+    assert_eq!(*seed.seed_checks.lock().unwrap(), vec![0, 1, 2, 1]);
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(*seed.seed_checks.lock().unwrap(), vec![0, 1, 2, 1]);
+}
+
+/// Regression: absent LAN peers delayed every piece and serialized unrelated HTTP fallbacks.
+#[test]
+fn regression_lan_absent_peer_backoff_does_not_block_other_pieces() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = vec![73; BLOCK * 9];
+    let web = Web::new(BTreeMap::from([("/file".into(), payload.clone())]));
+    let bytes = envelope(
+        v1_info(&[("file", &payload)], BLOCK, false, None),
+        &[format!("{}file", web.url)],
+    );
+    let mut opts = options(dir.path());
+    opts.swarm.policy = TorrentSwarmPolicy::Lan;
+    opts.swarm.timeout = Duration::from_secs(30);
+    opts.swarm.lsd = false;
+    let source = TorrentMountSource::from_bytes(bytes, opts).unwrap();
+    let data = source.data.clone();
+    let start = std::time::Instant::now();
+    let first = std::thread::spawn(move || {
+        data.piece(Piece {
+            file: None,
+            index: 0,
+        })
+        .unwrap()
+    });
+    wait_until(|| source.data.swarm_gate.try_lock().is_err());
+    let parallel = std::time::Instant::now();
+    let second = source
+        .data
+        .piece(Piece {
+            file: None,
+            index: 1,
+        })
+        .unwrap();
+    assert_eq!(&**second, &payload[..BLOCK]);
+    assert!(parallel.elapsed() < Duration::from_secs(1));
+    assert_eq!(&**first.join().unwrap(), &payload[..BLOCK]);
+    assert!(start.elapsed() < Duration::from_secs(4));
+    let after = std::time::Instant::now();
+    for index in 2..8 {
+        source.data.piece(Piece { file: None, index }).unwrap();
+    }
+    assert!(after.elapsed() < Duration::from_secs(1));
+    assert!(source.data.lan_retry_at.lock().unwrap().is_some());
+    // Expired negative entries permit a later discovery attempt.
+    *source.data.lan_retry_at.lock().unwrap() = Some(std::time::Instant::now());
+    let retry = std::time::Instant::now();
+    source
+        .data
+        .piece(Piece {
+            file: None,
+            index: 8,
+        })
+        .unwrap();
+    assert!(retry.elapsed() >= Duration::from_secs(1));
+    assert!(retry.elapsed() < Duration::from_secs(4));
 }

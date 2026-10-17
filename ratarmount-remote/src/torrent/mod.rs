@@ -95,9 +95,10 @@ struct Data {
     meta: Metainfo,
     options: TorrentOptions,
     self_ref: std::sync::Weak<Data>,
-    seed_dirty: AtomicBool,
+    seed_pending: Mutex<std::collections::BTreeSet<u64>>,
     stopped: AtomicBool,
     lan_probe_done: AtomicBool,
+    lan_retry_at: Mutex<Option<std::time::Instant>>,
     swarm_gate: Mutex<()>,
     hub: cache::HubFiles,
     swarm: Mutex<Option<Arc<Swarm>>>,
@@ -143,7 +144,6 @@ impl TorrentMountSource {
         let mut entries = BTreeMap::new();
         entries.insert("/".to_string(), create_root_file_info());
         let known = checksums::cached_only(&meta, &options.metadata_dir);
-        hub.authorize(&meta, &known);
         let verification = meta
             .files
             .iter()
@@ -200,9 +200,10 @@ impl TorrentMountSource {
             meta,
             options,
             self_ref: weak.clone(),
-            seed_dirty: AtomicBool::new(false),
+            seed_pending: Mutex::default(),
             stopped: AtomicBool::new(false),
             lan_probe_done: AtomicBool::new(false),
+            lan_retry_at: Mutex::default(),
             swarm_gate: Mutex::new(()),
             hub,
             swarm: Mutex::new(None),
@@ -399,6 +400,18 @@ impl Data {
         Some(bytes)
     }
 
+    fn notify_seed(&self, key: Piece) {
+        if self.options.swarm.seed {
+            let index = key.file.map_or(key.index, |f| {
+                self.meta.files[f].offset / self.meta.piece_len + key.index
+            });
+            self.seed_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(index);
+        }
+    }
+
     fn store(&self, key: Piece, bytes: &[u8]) {
         if let Some(cache) = &self.options.range_cache {
             for (chunk, data) in bytes.chunks(cache.chunk_size() as usize).enumerate() {
@@ -501,7 +514,7 @@ impl Data {
             self.verify_piece(key, &bytes)?;
             self.store(key, &bytes);
             if self.options.swarm.seed {
-                self.seed_dirty.store(true, Ordering::Release);
+                self.notify_seed(key);
             }
             bytes
         };
@@ -600,7 +613,27 @@ impl Data {
     }
 
     fn swarm_piece(&self, key: Piece) -> io::Result<Vec<u8>> {
-        let _gate = self.swarm_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let lan = self.options.swarm.policy == TorrentSwarmPolicy::Lan;
+        let _gate = if lan && !self.meta.web_seeds.is_empty() {
+            // Another LAN attempt must never hold unrelated web-seed reads up.
+            self.swarm_gate.try_lock().map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "LAN probe already running")
+            })?
+        } else {
+            self.swarm_gate.lock().unwrap_or_else(|e| e.into_inner())
+        };
+        if lan
+            && self
+                .lan_retry_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|at| std::time::Instant::now() < at)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "LAN peers unavailable; discovery backoff",
+            ));
+        }
         if self.meta.v1_hash.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -666,7 +699,26 @@ impl Data {
             }
         }
         let swarm = self.start_swarm()?;
-        let bytes = match swarm.read(&self.meta.bytes, spans.clone()) {
+        let result = if lan {
+            swarm.read_with_timeout(
+                &self.meta.bytes,
+                spans.clone(),
+                Some(
+                    self.options
+                        .swarm
+                        .timeout
+                        .min(std::time::Duration::from_secs(2)),
+                ),
+            )
+        } else {
+            swarm.read(&self.meta.bytes, spans.clone())
+        };
+        if lan {
+            *self.lan_retry_at.lock().unwrap_or_else(|e| e.into_inner()) = result
+                .is_err()
+                .then(|| std::time::Instant::now() + std::time::Duration::from_secs(60));
+        }
+        let bytes = match result {
             Ok(bytes) => bytes,
             Err(_) if auto_lan && swarm.lan_only => {
                 swarm.stop();

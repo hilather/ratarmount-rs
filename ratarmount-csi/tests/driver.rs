@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 mod common;
 use common::*;
 use ratarmount_csi::{

@@ -5,6 +5,7 @@ mod fuser_tests;
 
 mod passthrough;
 pub use passthrough::{PassthroughMode, PassthroughOptions};
+use ratarmount_compositing::{overlay_atime, OverlayMetadata};
 use ratarmount_core::AttributeMapping;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -47,6 +48,15 @@ fn overlay_errno(err: &ratarmount_compositing::OverlayError) -> i32 {
     }
 }
 
+fn metadata_errno(err: &ratarmount_compositing::OverlayError) -> i32 {
+    match err {
+        ratarmount_compositing::OverlayError::Io(e) => {
+            e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
+        }
+        _ => EIO,
+    }
+}
+
 /// Map `std::io::Error` to a FUSE/libc errno.
 ///
 /// Password / permission failures must not collapse to generic EIO — that is what
@@ -56,6 +66,14 @@ fn overlay_errno(err: &ratarmount_compositing::OverlayError) -> i32 {
 /// Unmapped raw OS errors pass through, including `EMFILE` and `ENFILE`.
 /// Unknown kind-only errors map to `EIO`.
 fn io_to_errno(err: &std::io::Error) -> i32 {
+    // Rust does not classify both Darwin unsupported-operation errnos as Unsupported.
+    // A predicate also handles platforms where these constants are aliases.
+    if err
+        .raw_os_error()
+        .is_some_and(|raw| raw == libc::ENOTSUP || raw == libc::EOPNOTSUPP)
+    {
+        return ENOSYS;
+    }
     match err.kind() {
         ErrorKind::ReadOnlyFilesystem => libc::EROFS,
         ErrorKind::QuotaExceeded => libc::EDQUOT,
@@ -797,7 +815,9 @@ impl RatarmountFs {
     }
 
     fn mapped_file_attr(&self, ino: u64, fi: &FileInfo) -> FileAttr {
-        self.mapped_attr(Self::file_attr(ino, fi))
+        let mut attr = Self::file_attr(ino, fi);
+        attr.atime = unix_float_to_system_time(overlay_atime(fi));
+        self.mapped_attr(attr)
     }
 
     /// Bypass the FUSE page cache for source reads. Passthrough is disabled.
@@ -1366,6 +1386,26 @@ impl RatarmountFs {
         }
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
         Ok(join_path(&parent_path, &name.to_string_lossy()))
+    }
+
+    fn create_masked_entry(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+    ) -> Result<(Duration, FileAttr, u64), i32> {
+        self.create_entry(parent, name, mode & !umask)
+    }
+
+    fn mkdir_masked_entry(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+    ) -> Result<(Duration, FileAttr), i32> {
+        self.mkdir_entry(parent, name, mode & !umask)
     }
 
     /// Body of `create`, replying-free so it can be unit-tested.
@@ -2073,7 +2113,11 @@ impl RatarmountFs {
         }
         let path = self.path_for_ino(ino)?;
         if path == "/" {
-            let fi = ratarmount_core::create_root_file_info();
+            let fi = self
+                .overlay
+                .as_ref()
+                .and_then(|ov| ov.lookup("/", 0))
+                .unwrap_or_else(ratarmount_core::create_root_file_info);
             self.store_fi(ino, fi.clone());
             return Some(fi);
         }
@@ -2275,23 +2319,41 @@ impl RatarmountFs {
 
     /// Body of `setattr`. Non-detached behavior is path `truncate`. A detached
     /// inode refuses an fh-less setattr; a write fh `ftruncate`s that fd.
+    #[cfg(test)]
     fn setattr_entry(
         &self,
         ino: u64,
         size: Option<u64>,
         fh: Option<u64>,
     ) -> Result<(Duration, FileAttr), i32> {
+        self.setattr_metadata_entry(ino, size, fh, &OverlayMetadata::default())
+    }
+
+    fn setattr_metadata_entry(
+        &self,
+        ino: u64,
+        size: Option<u64>,
+        fh: Option<u64>,
+        attrs: &OverlayMetadata,
+    ) -> Result<(Duration, FileAttr), i32> {
         if self.inode_is_detached(ino) {
-            return self.setattr_detached(ino, size, fh);
+            return self.setattr_detached(ino, size, fh, attrs);
         }
         let path = self.path_for_ino(ino).ok_or(ENOENT)?;
-        if let Some(sz) = size {
-            let ov = self.overlay.as_ref().ok_or(EROFS)?;
-            ov.truncate(&path, sz).map_err(|e| {
-                debug!("truncate: {e}");
-                overlay_errno(&e)
-            })?;
+        if size.is_some() || !attrs.is_empty() {
+            self.overlay
+                .as_ref()
+                .ok_or(EROFS)?
+                .set_attributes(&path, size, attrs)
+                .map_err(|e| metadata_errno(&e))?;
             self.drop_stable_attr(ino);
+            self.invalidate_dir_cache(path.rsplit_once('/').map_or("/", |(parent, _)| {
+                if parent.is_empty() {
+                    "/"
+                } else {
+                    parent
+                }
+            }));
         } else if !self.writable() {
             return Err(ENOSYS);
         }
@@ -2308,6 +2370,7 @@ impl RatarmountFs {
         ino: u64,
         size: Option<u64>,
         fh: Option<u64>,
+        attrs: &OverlayMetadata,
     ) -> Result<(Duration, FileAttr), i32> {
         let Some(fh) = fh else {
             return Err(EACCES);
@@ -2323,10 +2386,29 @@ impl RatarmountFs {
             if acc != libc::O_WRONLY && acc != libc::O_RDWR {
                 return Err(EACCES);
             }
+            if !attrs.is_empty() {
+                self.overlay
+                    .as_ref()
+                    .ok_or(EROFS)?
+                    .set_metadata_file(file, &path, attrs)
+                    .map_err(|e| e.raw_os_error().unwrap_or_else(|| io_to_errno(&e)))?;
+            }
             if let Some(sz) = size {
                 let ov = self.overlay.as_ref().ok_or(EROFS)?;
                 ov.truncate_file(file, &path, sz)
                     .map_err(|e| io_to_errno(&e))?;
+                if attrs.atime.is_some() || attrs.mtime.is_some() {
+                    ov.set_metadata_file(
+                        file,
+                        &path,
+                        &OverlayMetadata {
+                            atime: attrs.atime,
+                            mtime: attrs.mtime,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|e| io_to_errno(&e))?;
+                }
             }
             let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
             if unsafe { libc::fstat(fd, &mut st) } != 0 {
@@ -2450,6 +2532,17 @@ fn mode_to_kind(mode: u32) -> FileType {
 /// with a saturated `u64::MAX` seconds would panic, killing the daemon.
 const FAR_FUTURE_SECS: u64 = u32::MAX as u64;
 
+fn setattr_time(time: fuser::TimeOrNow, now: SystemTime) -> f64 {
+    let time = match time {
+        fuser::TimeOrNow::Now => now,
+        fuser::TimeOrNow::SpecificTime(t) => t,
+    };
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs_f64(),
+        Err(e) => -e.duration().as_secs_f64(),
+    }
+}
+
 fn unix_float_to_system_time(t: f64) -> SystemTime {
     if t <= 0.0 || t.is_nan() {
         return UNIX_EPOCH;
@@ -2494,12 +2587,13 @@ fn file_attr_from_stat(ino: u64, st: &libc::stat) -> FileAttr {
     #[cfg(not(target_os = "macos"))]
     let mode = st.st_mode;
     let size = u64::try_from(st.st_size).unwrap_or(0);
-    let mtime = unix_float_to_system_time(st.st_mtime as f64);
+    let mtime = unix_float_to_system_time(st.st_mtime as f64 + st.st_mtime_nsec as f64 / 1e9);
+    let atime = unix_float_to_system_time(st.st_atime as f64 + st.st_atime_nsec as f64 / 1e9);
     FileAttr {
         ino: INodeNo(ino),
         size,
         blocks: size.div_ceil(512),
-        atime: mtime,
+        atime,
         mtime,
         ctime: mtime,
         crtime: mtime,
@@ -2946,11 +3040,11 @@ impl Filesystem for RatarmountFs {
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        match self.create_entry(parent.0, name, mode) {
+        match self.create_masked_entry(parent.0, name, mode, umask) {
             Ok((ttl, attr, fh)) => {
                 reply.created(
                     &ttl,
@@ -2965,16 +3059,42 @@ impl Filesystem for RatarmountFs {
         }
     }
 
+    fn mknod(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        if mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFREG {
+            reply.error(Errno::EOPNOTSUPP);
+            return;
+        }
+        match self.create_masked_entry(parent.0, name, mode, umask) {
+            Ok((ttl, attr, fh)) => {
+                if let Some(OpenBackend::OverlayFd(fd)) = self.handles.lock().unwrap().remove(&fh) {
+                    self.overlay.as_ref().unwrap().close_overlay_fd(fd);
+                }
+                reply.entry(&ttl, &attr, Generation(0));
+                self.flush_kernel_invals();
+            }
+            Err(errno) => reply.error(Errno::from_i32(errno)),
+        }
+    }
+
     fn mkdir(
         &self,
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
-        match self.mkdir_entry(parent.0, name, mode) {
+        match self.mkdir_masked_entry(parent.0, name, mode, umask) {
             Ok((ttl, attr)) => {
                 reply.entry(&ttl, &attr, Generation(0));
                 self.flush_kernel_invals();
@@ -3030,12 +3150,12 @@ impl Filesystem for RatarmountFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
         fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
@@ -3044,7 +3164,15 @@ impl Filesystem for RatarmountFs {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        match self.setattr_entry(ino.0, size, fh.map(|fh| fh.0)) {
+        let now = SystemTime::now();
+        let attrs = OverlayMetadata {
+            mode,
+            uid,
+            gid,
+            atime: atime.map(|t| setattr_time(t, now)),
+            mtime: mtime.map(|t| setattr_time(t, now)),
+        };
+        match self.setattr_metadata_entry(ino.0, size, fh.map(|fh| fh.0), &attrs) {
             Ok((ttl, attr)) => {
                 reply.attr(&ttl, &attr);
                 self.flush_kernel_invals();
@@ -3253,7 +3381,7 @@ fn mount_option_from_str(s: &str) -> MountOption {
 
 /// Preserve the libfuse option and access policy used before fuser 0.18.
 fn mount_config(writable: bool, extra_fuse_opts: &str) -> Config {
-    let mut options = vec![MountOption::FSName("ratarmount".into())];
+    let mut options = vec![MountOption::FSName("ratarmount".into()), MountOption::Exec];
     if !writable {
         options.push(MountOption::RO);
     }
@@ -3574,7 +3702,7 @@ mod tests {
             bytes[512..1024]
         );
     }
-    /// Regression: adding policy errors must not change historical errno mapping.
+    /// Regression: policy errors and Darwin ENOTSUP must preserve historical errno mapping.
     #[test]
     fn regression_io_to_errno_preserves_legacy_raw_errors() {
         for (raw, expected) in [
@@ -4699,6 +4827,128 @@ mod tests {
             serial.source_open_flags(),
             FopenFlags::FOPEN_KEEP_CACHE.bits()
         );
+    }
+
+    /// Regression: creation applies the client's umask once, including executable output.
+    #[test]
+    fn regression_fuse_setattr_mode_create_umask() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        let (_, attr, fh) = fs
+            .create_masked_entry(1, OsStr::new("built"), 0o777, 0o027)
+            .unwrap();
+        assert_eq!(attr.perm, 0o750);
+        assert_eq!(ov.lookup("/built", 0).unwrap().mode & 0o7777, 0o750);
+        let (_, attr) = fs
+            .mkdir_masked_entry(1, OsStr::new("dir"), 0o777, 0o027)
+            .unwrap();
+        assert_eq!(attr.perm, 0o750);
+        let fd = match fs.handles.lock().unwrap().remove(&fh).unwrap() {
+            OpenBackend::OverlayFd(fd) => fd,
+            _ => panic!("overlay fd"),
+        };
+        ov.close_overlay_fd(fd);
+    }
+
+    /// Regression: chmod/touch requests were acknowledged without changing attrs.
+    #[test]
+    fn regression_fuse_setattr_mode_times_and_omit() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        let (_, attr, fh) = fs.create_entry(1, OsStr::new("built"), 0o644).unwrap();
+        let ino = attr.ino.0;
+        let attrs = OverlayMetadata {
+            mode: Some(0o755),
+            atime: Some(1234.25),
+            mtime: Some(5678.5),
+            ..Default::default()
+        };
+        let (_, attr) = fs
+            .setattr_metadata_entry(ino, None, Some(fh), &attrs)
+            .unwrap();
+        assert_eq!(attr.perm, 0o755);
+        assert_eq!(attr.atime, UNIX_EPOCH + Duration::from_millis(1234250));
+        assert_eq!(attr.mtime, UNIX_EPOCH + Duration::from_millis(5678500));
+        let (_, attr) = fs
+            .setattr_metadata_entry(
+                ino,
+                None,
+                None,
+                &OverlayMetadata {
+                    mode: Some(0o700),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(attr.perm, 0o700);
+        assert_eq!(attr.mtime, UNIX_EPOCH + Duration::from_millis(5678500));
+        assert_eq!(
+            fs.setattr_metadata_entry(
+                ino,
+                None,
+                None,
+                &OverlayMetadata {
+                    gid: Some(123),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
+            libc::EPERM
+        );
+        let now = UNIX_EPOCH + Duration::from_secs(42);
+        assert_eq!(setattr_time(fuser::TimeOrNow::Now, now), 42.0);
+        assert_eq!(
+            setattr_time(
+                fuser::TimeOrNow::SpecificTime(UNIX_EPOCH + Duration::from_secs(9)),
+                now
+            ),
+            9.0
+        );
+        if let Some(OpenBackend::OverlayFd(fd)) = fs.handles.lock().unwrap().remove(&fh) {
+            ov.close_overlay_fd(fd);
+        };
+    }
+
+    /// Regression: a detached chmod must affect the held inode, never its replacement.
+    #[test]
+    fn regression_fuse_setattr_mode_detached_inode() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        let (_, attr, fh) = fs.create_entry(1, OsStr::new("built"), 0o644).unwrap();
+        let ino = attr.ino.0;
+        fs.remove_entry(1, OsStr::new("built"), false).unwrap();
+        let fd = ov.create_file("/built", 0o600).unwrap();
+        ov.close_overlay_fd(fd);
+        let attrs = OverlayMetadata {
+            mode: Some(0o755),
+            ..Default::default()
+        };
+        assert_eq!(
+            fs.setattr_metadata_entry(ino, None, None, &attrs)
+                .unwrap_err(),
+            EACCES
+        );
+        assert_eq!(
+            fs.setattr_metadata_entry(ino, None, Some(fh), &attrs)
+                .unwrap()
+                .1
+                .perm,
+            0o755
+        );
+        assert_eq!(ov.lookup("/built", 0).unwrap().mode & 0o7777, 0o600);
+        if let Some(OpenBackend::OverlayFd(fd)) = fs.handles.lock().unwrap().remove(&fh) {
+            ov.close_overlay_fd(fd);
+        };
+    }
+
+    /// Regression: executables are allowed unless the user explicitly selects noexec.
+    #[test]
+    fn regression_fuse_setattr_mode_exec_mount_default() {
+        for writable in [false, true] {
+            assert!(mount_config(writable, "")
+                .mount_options
+                .contains(&MountOption::Exec));
+            let config = mount_config(writable, "noexec");
+            assert!(config.mount_options.contains(&MountOption::NoExec));
+            assert!(!config.mount_options.contains(&MountOption::Exec));
+        }
     }
 
     fn overlay_fs_for_rename() -> (tempfile::TempDir, Arc<WriteOverlay>, RatarmountFs) {

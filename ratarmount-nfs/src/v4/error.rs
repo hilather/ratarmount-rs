@@ -11,6 +11,14 @@ use embednfs::FsError;
 /// the VFS layer remaps that to [`FsError::Stale`]. Lookup name-miss is
 /// [`FsError::NotFound`] without going through `io::Error`.
 pub fn io_to_fserror(err: &std::io::Error) -> FsError {
+    // Rust does not classify both Darwin unsupported-operation errnos as Unsupported.
+    // A predicate also handles platforms where these constants are aliases.
+    if err
+        .raw_os_error()
+        .is_some_and(|raw| raw == libc::ENOTSUP || raw == libc::EOPNOTSUPP)
+    {
+        return FsError::Unsupported;
+    }
     match err.kind() {
         ErrorKind::ReadOnlyFilesystem => FsError::ReadOnly,
         // embednfs has no DQUOT variant; NOSPC is its capacity-error response.
@@ -27,7 +35,7 @@ pub fn io_to_fserror(err: &std::io::Error) -> FsError {
 
 #[cfg(test)]
 mod tests {
-    /// Regression: raw permission/unsupported and unknown errors keep their old statuses.
+    /// Regression: raw permission/unsupported (including Darwin ENOTSUP) and unknown errors keep their old statuses.
     #[test]
     fn regression_nfs_preserves_legacy_raw_errors() {
         for (raw, expected) in [
