@@ -1127,12 +1127,15 @@ impl WriteOverlay {
                 }
             }
         }
-        // Exclusive lock is held. In-flight staging exists only after `new`
-        // returns, in this process, so a crash leftover is safe to unlink.
+        // LOCKING_MODE=EXCLUSIVE keeps only a shared lock until the first
+        // write. Schema creation is that write on a new folder, but a later
+        // open does not write, so the sweep would otherwise run under a
+        // shared lock and a second open could delete this process's staging
+        // file. COMMIT does not drop the lock while locking mode is exclusive.
         // A failed open above returns before this, including SQLITE_BUSY.
-        if let Err(e) = sweep_cow_staging(&root) {
-            return Err(OverlayError::Io(e));
-        }
+        conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        // Best-effort. An unreadable directory must not fail the open.
+        sweep_cow_staging(&root);
         Ok(Self {
             policy: None,
             policy_gate: Mutex::new(()),
@@ -1533,7 +1536,16 @@ impl WriteOverlay {
             .parent()
             .ok_or_else(|| io::Error::other("copy-on-write target has no parent directory"))?;
         let mut dst = create_cow_staging(parent)?;
-        io::copy(&mut src, &mut dst)?;
+        // This path ignores the truncate hint. `O_TRUNC` and `truncate` copy
+        // the whole member, then the caller shortens the published file.
+        // Expected length is the archive `FileInfo` size, so a real empty
+        // member (size 0) still publishes. Symlinks and directories return
+        // above and never reach this copy.
+        let copied = io::copy(&mut src, &mut dst)?;
+        if copied != fi.size {
+            drop(dst);
+            return Err(cow_length_mismatch(copied, fi.size).into());
+        }
         publish_cow_staging(dst, &real, &metadata_from_info(&fi), |_| Ok(()))?;
         Ok(())
     }
@@ -1592,7 +1604,13 @@ impl WriteOverlay {
         };
         // Hidden staging keeps other writers from observing a partial copy.
         // No policy lock is held during archive open/decompression or host I/O.
+        // `take(limit)` stops a truncate hint early. The read must yield
+        // `min(member size, limit)` before publish: a shorter hint copies
+        // that prefix, a longer hint still needs the whole member before
+        // `set_len` extends it, and `O_TRUNC` (`limit == 0`) copies nothing.
+        // Compare bytes read, not the length after `set_len`.
         let limit = truncate.unwrap_or(u64::MAX);
+        let expected = fi.size.min(limit);
         let mut src = if limit == 0 {
             None
         } else {
@@ -1610,9 +1628,9 @@ impl WriteOverlay {
             .ok_or_else(|| io::Error::other("copy-on-write target has no parent directory"))?;
         let mut dst = create_cow_staging(parent)?;
         let copied: io::Result<()> = (|| {
+            let mut offset = 0u64;
             if let Some(src) = &mut src {
                 let mut buf = [0u8; 64 * 1024];
-                let mut offset = 0;
                 loop {
                     let n = match src.read(&mut buf) {
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1632,13 +1650,17 @@ impl WriteOverlay {
                     offset = end;
                 }
             }
+            if offset != expected {
+                return Err(cow_length_mismatch(offset, expected));
+            }
             if let Some(size) = truncate {
                 dst.as_file().set_len(size)?;
             }
             Ok(())
         })();
-        // A short or failed copy must not be renamed into place. Drop refunds
-        // the whole charge, including any in-loop top-up.
+        // A short or failed copy must not be renamed into place. Leave
+        // `reservation.bytes` charged, including any in-loop top-up, so Drop
+        // refunds it. Drop of `dst` removes the staging file.
         copied.map_err(OverlayError::Io)?;
         let actual = dst.as_file().metadata()?.len();
         // Declared after `reservation` so this guard drops first. Drop of the
@@ -1648,7 +1670,7 @@ impl WriteOverlay {
         self.ensure_under_root(&real)?;
         let attrs = metadata_from_info(&fi);
         publish_cow_staging(dst, &real, &attrs, |_| {
-            // Unused reservation is slack (a short EOF stays charged at `actual`).
+            // Settle to the published length. A short read never reaches here.
             // Zero `bytes` before `file_created` so Drop cannot refund a file
             // that already exists. `AlreadyExists` skips this closure and Drop
             // refunds the whole charge.
@@ -5759,6 +5781,15 @@ fn open_options_nofollow() -> FsOpenOptions {
     opts
 }
 
+/// Early EOF (or a longer body than `FileInfo` declares) must not be published.
+/// `UnexpectedEof` maps to `EIO` in the protocol errno helpers.
+fn cow_length_mismatch(copied: u64, expected: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("copy-on-write read {copied} bytes, expected {expected}"),
+    )
+}
+
 fn create_cow_staging(parent: &Path) -> io::Result<tempfile::NamedTempFile> {
     tempfile::Builder::new()
         .prefix(COW_STAGING_PREFIX)
@@ -5786,6 +5817,8 @@ fn publish_cow_staging(
     match dst.persist_noclobber(real) {
         Ok(published) => {
             after_publish(&published)?;
+            // Windows cannot open a directory as a File to fsync it.
+            #[cfg(not(windows))]
             if let Some(parent) = real.parent() {
                 File::open(parent)?.sync_all()?;
             }
@@ -5799,34 +5832,61 @@ fn publish_cow_staging(
 /// Remove crash leftovers named [`COW_STAGING_PREFIX`]. Regular files only.
 /// Does not follow symlinks. `NotFound` is ignored. Bookkeeping that does not
 /// have this prefix (the database, its sidecars, both markers) is left alone.
-fn sweep_cow_staging(root: &Path) -> io::Result<()> {
-    sweep_cow_staging_dir(root, root)
+///
+/// Best-effort: a directory read, metadata, or unlink error is logged and that
+/// directory or entry is skipped. The sweep never fails the open.
+fn sweep_cow_staging(root: &Path) {
+    sweep_cow_staging_dir(root, root);
 }
 
-fn sweep_cow_staging_dir(root: &Path, dir: &Path) -> io::Result<()> {
-    ensure_overlay_under_root(root, dir)?;
+fn sweep_cow_staging_dir(root: &Path, dir: &Path) {
+    if let Err(e) = ensure_overlay_under_root(root, dir) {
+        log::warn!(
+            "skipping copy-on-write staging sweep of {}: {e}",
+            dir.display()
+        );
+        return;
+    }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) => {
+            log::warn!(
+                "could not read overlay directory {} while sweeping copy-on-write staging: {e}",
+                dir.display()
+            );
+            return;
+        }
     };
     for ent in entries {
         let ent = match ent {
             Ok(ent) => ent,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            Err(e) => {
+                log::warn!(
+                    "could not read an overlay directory entry in {} while sweeping copy-on-write staging: {e}",
+                    dir.display()
+                );
+                continue;
+            }
         };
         let path = ent.path();
         let meta = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            Err(e) => {
+                log::warn!(
+                    "could not stat {} while sweeping copy-on-write staging: {e}",
+                    path.display()
+                );
+                continue;
+            }
         };
         if meta.file_type().is_symlink() {
             continue;
         }
         if meta.is_dir() {
-            sweep_cow_staging_dir(root, &path)?;
+            sweep_cow_staging_dir(root, &path);
             continue;
         }
         if !meta.is_file() {
@@ -5837,14 +5897,24 @@ fn sweep_cow_staging_dir(root: &Path, dir: &Path) -> io::Result<()> {
         if !has_ascii_prefix(&name, COW_STAGING_PREFIX) {
             continue;
         }
-        ensure_overlay_under_root(root, &path)?;
+        if let Err(e) = ensure_overlay_under_root(root, &path) {
+            log::warn!(
+                "skipping copy-on-write staging file {}: {e}",
+                path.display()
+            );
+            continue;
+        }
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(e) => {
+                log::warn!(
+                    "could not remove copy-on-write staging file {}: {e}",
+                    path.display()
+                );
+            }
         }
     }
-    Ok(())
 }
 
 fn overlay_symlink(target: &Path, dest: &Path) -> io::Result<()> {
@@ -8296,8 +8366,8 @@ mod tests {
         );
     }
 
-    /// Regression: a 6-byte member whose read returns 3 bytes then EOF keeps that
-    /// prefix and settles the unused reservation (`usage` is `(3, 1)`, not `(6, 1)`).
+    /// Regression: a 6-byte member whose read returns 3 bytes then EOF is not
+    /// published, and the quota charge is refunded to the pre-COW usage (#126).
     #[test]
     fn regression_overlay_policy_accounts_short_cow_eof_slack() {
         struct EofAfter3(io::Cursor<Vec<u8>>);
@@ -8336,9 +8406,77 @@ mod tests {
             }
         }
         let (td, ov, policy) = policy_overlay(Arc::new(ShortBase), 8);
-        ov.ensure_modifiable("/short").unwrap();
-        assert_eq!(fs::read(td.path().join("short")).unwrap(), b"abc");
-        assert_eq!(policy.usage(), (3, 1));
+        let before = policy.usage();
+        let host = td.path().join("short");
+        let err = ov.ensure_modifiable("/short");
+        let bytes = fs::read(&host).ok();
+        assert!(
+            matches!(
+                &err,
+                Err(OverlayError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof
+            ) && bytes.is_none()
+                && policy.usage() == before,
+            "short EOF must not publish and must refund the quota charge; err={err:?} bytes={bytes:?} before={before:?} usage={:?}",
+            policy.usage()
+        );
+    }
+
+    /// Regression: without a quota policy, a 6-byte member whose read returns 3
+    /// bytes then EOF is not published and leaves no staging file (#126).
+    #[test]
+    fn regression_cow_short_eof_default_path_not_published() {
+        struct EofAfter3(io::Cursor<Vec<u8>>);
+        impl Read for EofAfter3 {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.position() >= 3 {
+                    return Ok(0);
+                }
+                let room = (3 - self.0.position()) as usize;
+                let n = room.min(buf.len());
+                self.0.read(&mut buf[..n])
+            }
+        }
+        impl Seek for EofAfter3 {
+            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+                self.0.seek(pos)
+            }
+        }
+        struct ShortBase;
+        impl MountSource for ShortBase {
+            fn list(&self, _: &str) -> Option<ListResult> {
+                None
+            }
+            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+                (path == "/short").then(|| mem_file_info(path, 6))
+            }
+            fn open(
+                &self,
+                _: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                Ok(Box::new(EofAfter3(io::Cursor::new(b"abcdef".to_vec()))))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+        let td = tempfile::tempdir().unwrap();
+        let ov = WriteOverlay::new(Arc::new(ShortBase), td.path()).unwrap();
+        let host = td.path().join("short");
+        let err = ov.ensure_modifiable("/short");
+        let bytes = fs::read(&host).ok();
+        let staged = fs::read_dir(td.path())
+            .unwrap()
+            .flatten()
+            .any(|ent| name_has_cow_prefix(&ent.file_name().to_string_lossy()));
+        assert!(
+            matches!(
+                &err,
+                Err(OverlayError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof
+            ) && bytes.is_none()
+                && !staged,
+            "short EOF must not publish the final name or leave staging; err={err:?} bytes={bytes:?} staged={staged}"
+        );
     }
 
     fn name_has_cow_prefix(name: &str) -> bool {
@@ -8546,6 +8684,108 @@ mod tests {
         let fi = ov.lookup("/big.bin", 0).unwrap();
         assert_eq!(fi.size, original.len() as u64);
         assert_eq!(ov.read(&fi, original.len(), 0).unwrap(), original);
+    }
+
+    /// Regression: an unreadable overlay directory must not fail reopen (#126 v3).
+    ///
+    /// Symptom: the copy-on-write staging sweep returned the directory error,
+    /// so `WriteOverlay::new` failed when a subdirectory was mode 000.
+    #[test]
+    fn regression_cow_v3_unreadable_dir_reopen() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: euid 0 ignores mode 000");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        drop(WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).unwrap());
+        let locked = overlay.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(
+            locked.join(format!("{COW_STAGING_PREFIX}Ab12Cd")),
+            b"leftover",
+        )
+        .unwrap();
+        struct RestoreMode {
+            path: PathBuf,
+        }
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = RestoreMode {
+            path: locked.clone(),
+        };
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let err = WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).err();
+        assert!(
+            err.is_none(),
+            "unreadable dir must not fail reopen: {err:?}"
+        );
+    }
+
+    /// Regression: a second open must not sweep another holder's staging file (#126 v3).
+    ///
+    /// Symptom: `PRAGMA LOCKING_MODE = EXCLUSIVE` keeps only a shared lock until
+    /// the first write. After schema creation, a reopen does not write, so a
+    /// second `WriteOverlay::new` succeeded and deleted the in-progress temp.
+    #[test]
+    fn regression_cow_v3_second_open_keeps_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        drop(WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).unwrap());
+        let first = WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).unwrap();
+        let staging = overlay.join(format!("{COW_STAGING_PREFIX}Ab12Cd"));
+        fs::write(&staging, b"in-progress").unwrap();
+        match WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay) {
+            Ok(_) => panic!("second open must be refused while the first holds the lock"),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                assert!(
+                    msg.contains("locked") || msg.contains("busy"),
+                    "second open must be refused with the database lock, got {e}"
+                );
+            }
+        }
+        assert_eq!(fs::read(&staging).unwrap(), b"in-progress");
+        drop(first);
+    }
+
+    /// Regression: `persist_noclobber` AlreadyExists refunds the reservation (#126 v3).
+    ///
+    /// Symptom: a final name created after the reservation and before publish
+    /// was counted or replaced. The existing bytes must stay, the reservation
+    /// must be refunded by Drop, and the staging temp must be removed.
+    #[test]
+    fn regression_cow_v3_already_exists_refunds() {
+        let (td, ov, policy) = policy_overlay(Arc::new(MemBase::with(&[("/race", b"abcdef")])), 64);
+        let host = td.path().join("race");
+        let existing = b"keep-me";
+        let ov = Arc::new(ov);
+        let host_for_hook = host.clone();
+        *ov.cow_before_read_hook.lock().unwrap() = Some(Box::new(move || {
+            fs::write(&host_for_hook, existing).unwrap();
+        }));
+        let before = policy.usage();
+        ov.ensure_modifiable("/race").unwrap();
+        assert_eq!(
+            policy.usage(),
+            before,
+            "AlreadyExists must skip file_created and let Drop refund the reservation"
+        );
+        assert_eq!(fs::read(&host).unwrap(), existing);
+        assert!(
+            fs::read_dir(td.path())
+                .unwrap()
+                .flatten()
+                .all(|ent| { !name_has_cow_prefix(&ent.file_name().to_string_lossy()) }),
+            "staging temp must be removed"
+        );
     }
 
     /// Regression: read-only opens of an existing host file must not invoke a write policy.
