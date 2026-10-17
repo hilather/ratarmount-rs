@@ -1004,6 +1004,161 @@ fn regression_joliet_sl_directory_under_non_unique_parent() {
     });
 }
 
+/// Regression: nested SL dirs under a plain parent bind it one Joliet level too high.
+#[test]
+fn regression_joliet_nested_sl_under_plain_parent() {
+    let primary = [record(
+        22,
+        true,
+        b"P",
+        &px(ratarmount_core::S_IFDIR | 0o700, false),
+    )];
+    let supplementary = [record(23, true, &joliet("Parent"), &[])];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(
+        &mut bytes,
+        22,
+        &[],
+        &[record(
+            24,
+            true,
+            b"OUT",
+            &[px(ratarmount_core::S_IFLNK | 0o750, false), sl("outer")].concat(),
+        )],
+    );
+    directory(
+        &mut bytes,
+        24,
+        &[],
+        &[record(
+            25,
+            true,
+            b"IN",
+            &[px(ratarmount_core::S_IFLNK | 0o711, false), sl("inner")].concat(),
+        )],
+    );
+    directory(
+        &mut bytes,
+        25,
+        &[],
+        &[
+            record(30, false, b"KEEP.;1", &[]),
+            record(32, false, b"ONLY.;1", &[]),
+        ],
+    );
+    directory(
+        &mut bytes,
+        23,
+        &[],
+        &[record(27, true, &joliet("Other"), &[])],
+    );
+    directory(
+        &mut bytes,
+        27,
+        &[],
+        &[record(30, false, &joliet("Kept Name;1"), &[])],
+    );
+    bytes[32 * BLOCK..32 * BLOCK + 4].copy_from_slice(b"data");
+    check_sources(bytes, |src| {
+        assert!(src.lookup("/OUT", 0).is_none(), "/OUT exists");
+        assert!(src.lookup("/IN", 0).is_none());
+        assert!(src.lookup("/Parent/IN", 0).is_none());
+        assert_eq!(names(src, "/"), ["Parent"]);
+        assert_eq!(names(src, "/Parent"), ["OUT", "Other"]);
+        assert_eq!(names(src, "/Parent/OUT"), ["IN"]);
+        assert_eq!(names(src, "/Parent/OUT/IN"), ["ONLY"]);
+        assert_eq!(names(src, "/Parent/Other"), ["Kept Name"]);
+        assert_eq!(
+            src.lookup("/Parent", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o700
+        );
+        assert_ne!(
+            src.lookup("/", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o700
+        );
+        let out = src.lookup("/Parent/OUT", 0).unwrap();
+        assert_eq!(out.mode, ratarmount_core::S_IFDIR | 0o750);
+        assert_eq!(out.linkname, "");
+        assert_is_directory(src, &out);
+        let inner = src.lookup("/Parent/OUT/IN", 0).unwrap();
+        assert_eq!(inner.mode, ratarmount_core::S_IFDIR | 0o711);
+        assert_eq!(inner.linkname, "");
+        assert_is_directory(src, &inner);
+        assert_file(src, "/Parent/OUT/IN/ONLY");
+        assert_file(src, "/Parent/Other/Kept Name");
+    });
+}
+
+/// Regression: a second Joliet hop through a plain directory under an SL run binds the plain parent to the root.
+#[test]
+fn regression_joliet_sl_then_plain_dir_under_plain_parent() {
+    let primary = [record(
+        22,
+        true,
+        b"P",
+        &px(ratarmount_core::S_IFDIR | 0o700, false),
+    )];
+    let supplementary = [record(23, true, &joliet("Parent"), &[])];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(
+        &mut bytes,
+        22,
+        &[],
+        &[record(
+            24,
+            true,
+            b"OUT",
+            &[px(ratarmount_core::S_IFLNK | 0o750, false), sl("outer")].concat(),
+        )],
+    );
+    directory(
+        &mut bytes,
+        24,
+        &[],
+        &[record(
+            25,
+            true,
+            b"MID",
+            &px(ratarmount_core::S_IFDIR | 0o711, false),
+        )],
+    );
+    directory(&mut bytes, 25, &[], &[record(30, false, b"KEEP.;1", &[])]);
+    directory(
+        &mut bytes,
+        23,
+        &[],
+        &[record(26, true, &joliet("Other"), &[])],
+    );
+    directory(
+        &mut bytes,
+        26,
+        &[],
+        &[record(30, false, &joliet("Kept Name;1"), &[])],
+    );
+    check_sources(bytes, |src| {
+        assert!(src.lookup("/OUT", 0).is_none(), "/OUT exists");
+        assert_eq!(
+            src.lookup("/Parent", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o700
+        );
+        assert_eq!(
+            src.lookup("/Parent/Other", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o711
+        );
+        assert_ne!(
+            src.lookup("/", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o700
+        );
+        let out = src.lookup("/Parent/OUT", 0).unwrap();
+        assert_eq!(out.mode, ratarmount_core::S_IFDIR | 0o750);
+        assert_eq!(out.linkname, "");
+        assert_is_directory(src, &out);
+        assert_eq!(names(src, "/Parent"), ["OUT", "Other"]);
+        assert_eq!(names(src, "/Parent/Other"), ["Kept Name"]);
+        assert_file(src, "/Parent/Other/Kept Name");
+    });
+}
+
 /// Regression: a plain directory between an SL directory and a matched file must not mis-bind or drop either file.
 #[test]
 fn regression_joliet_sl_directory_with_plain_dir_before_match() {
@@ -1250,7 +1405,7 @@ fn regression_damaged_joliet_without_rock_ridge_falls_back_to_iso() {
     });
 }
 
-/// Regression: a rock-ridge-joliet-v1 sidecar keeps a PX directory type for a file.
+/// Regression: a rock-ridge-joliet-v1 through v3 sidecar keeps a PX directory type for a file.
 #[test]
 fn regression_iso_metadata_v1_rebuilds_after_type_split() {
     let dir = tempfile::tempdir().unwrap();
@@ -1271,48 +1426,69 @@ fn regression_iso_metadata_v1_rebuilds_after_type_split() {
         None,
     );
     std::fs::write(&path, bytes).unwrap();
-    let index =
-        SqliteIndex::create_writable_for_open(Some(&index_path), &OpenOptions::default()).unwrap();
-    index.begin_write().unwrap();
-    index
-        .insert_file(
-            "",
-            "PLAIN",
-            30 * BLOCK as i64,
-            30 * BLOCK as i64,
-            4,
-            0.0,
-            i64::from(ratarmount_core::S_IFDIR | 0o755),
-            0,
-            "",
-            0,
-            0,
+    for version in [
+        "rock-ridge-joliet-v1",
+        "rock-ridge-joliet-v2",
+        "rock-ridge-joliet-v3",
+    ] {
+        // A successful open rewrites isoMetadataVersion, so plant the stale
+        // directory row and the old version again before every open.
+        if index_path.exists() {
+            std::fs::remove_file(&index_path).unwrap();
+        }
+        let index =
+            SqliteIndex::create_writable_for_open(Some(&index_path), &OpenOptions::default())
+                .unwrap();
+        index.begin_write().unwrap();
+        index
+            .insert_file(
+                "",
+                "PLAIN",
+                30 * BLOCK as i64,
+                30 * BLOCK as i64,
+                4,
+                0.0,
+                i64::from(ratarmount_core::S_IFDIR | 0o755),
+                0,
+                "",
+                0,
+                0,
+                false,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        index
+            .store_metadata_key_value("isoMetadataVersion", version)
+            .unwrap();
+        index
+            .store_metadata_key_value("backendName", BACKEND_NAME)
+            .unwrap();
+        index.store_tarstats_for_path(&path).unwrap();
+        index.commit_write().unwrap();
+        drop(index.into_read_only().unwrap());
+        let src = Iso9660MountSource::open(
+            &path,
+            Some(&index_path),
+            &OpenOptions::default(),
+            "test",
             false,
-            false,
-            false,
-            0,
         )
         .unwrap();
-    index
-        .store_metadata_key_value("isoMetadataVersion", "rock-ridge-joliet-v1")
-        .unwrap();
-    index
-        .store_metadata_key_value("backendName", BACKEND_NAME)
-        .unwrap();
-    index.store_tarstats_for_path(&path).unwrap();
-    index.commit_write().unwrap();
-    drop(index.into_read_only().unwrap());
-    let src = Iso9660MountSource::open(
-        &path,
-        Some(&index_path),
-        &OpenOptions::default(),
-        "test",
-        false,
-    )
-    .unwrap();
-    assert_eq!(names(&src, "/"), ["Real Name"]);
-    let fi = assert_file(&src, "/Real Name");
-    assert_eq!(fi.mode, ratarmount_core::S_IFREG | 0o750);
+        assert_eq!(names(&src, "/"), ["Real Name"], "{version}");
+        let looked = src
+            .lookup("/Real Name", 0)
+            .unwrap_or_else(|| panic!("missing /Real Name ({version})"));
+        assert_eq!(
+            looked.mode,
+            ratarmount_core::S_IFREG | 0o750,
+            "{version} sidecar kept the PX directory type"
+        );
+        let fi = assert_file(&src, "/Real Name");
+        assert_eq!(fi.mode, ratarmount_core::S_IFREG | 0o750, "{version}");
+        drop(src);
+    }
 }
 
 /// Regression: real mkisofs -R -J output keeps mixed case, executable modes and symlinks.
