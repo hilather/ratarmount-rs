@@ -33,7 +33,7 @@ struct Store {
 }
 pub(super) struct Storage(Mutex<Option<Store>>);
 impl Storage {
-    fn new(dir: &Path, limit: u64) -> anyhow::Result<Self> {
+    pub(super) fn new(dir: &Path, limit: u64) -> anyhow::Result<Self> {
         Ok(Self(Mutex::new(Some(Store {
             file: tempfile::tempfile_in(dir)?,
             slots: BTreeMap::new(),
@@ -44,12 +44,28 @@ impl Storage {
         let mut store = self.0.lock().unwrap_or_else(|e| e.into_inner());
         f(store.as_mut().context("scratch storage paused")?)
     }
-}
-impl TorrentStorage for Storage {
-    fn init(&mut self, _: &ManagedTorrentShared, _: &TorrentMetadata) -> anyhow::Result<()> {
-        Ok(())
+    pub(super) fn take_storage(&self) -> Self {
+        Self(Mutex::new(
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).take(),
+        ))
     }
-    fn pread_exact(&self, file: usize, mut offset: u64, mut buf: &mut [u8]) -> anyhow::Result<()> {
+
+    pub(super) fn pread_present(
+        &self,
+        file: usize,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> anyhow::Result<()> {
+        self.pread(file, offset, buf, true)
+    }
+
+    fn pread(
+        &self,
+        file: usize,
+        mut offset: u64,
+        mut buf: &mut [u8],
+        require_present: bool,
+    ) -> anyhow::Result<()> {
         self.with(|store| {
             while !buf.is_empty() {
                 let within = offset % BLOCK;
@@ -57,6 +73,10 @@ impl TorrentStorage for Storage {
                 if let Some(slot) = store.slots.get(&(file, offset / BLOCK)) {
                     store.file.seek(SeekFrom::Start(slot + within))?;
                     store.file.read_exact(&mut buf[..n])?;
+                } else if require_present {
+                    return Err(anyhow!(
+                        "verified piece no longer available in cache/scratch"
+                    ));
                 } else {
                     buf[..n].fill(0);
                 }
@@ -65,6 +85,14 @@ impl TorrentStorage for Storage {
             }
             Ok(())
         })
+    }
+}
+impl TorrentStorage for Storage {
+    fn init(&mut self, _: &ManagedTorrentShared, _: &TorrentMetadata) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn pread_exact(&self, file: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.pread(file, offset, buf, false)
     }
     fn pwrite_all(&self, file: usize, mut offset: u64, mut buf: &[u8]) -> anyhow::Result<()> {
         self.with(|store| {
@@ -102,8 +130,7 @@ impl TorrentStorage for Storage {
         Ok(())
     }
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
-        let store = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
-        Ok(Box::new(Self(Mutex::new(store))))
+        Ok(Box::new(self.take_storage()))
     }
 }
 
@@ -172,6 +199,20 @@ pub(super) fn sweep(dir: &Path, age: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Regression: an evicted verified piece was replaced by an unverified zero-filled scratch hole.
+    #[test]
+    fn regression_scratch_missing_slot_refuses_upload_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path(), BLOCK).unwrap();
+        let mut bytes = [7; 5];
+        storage.pread_exact(0, 0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 5]);
+        assert!(storage.pread_present(0, 0, &mut bytes).is_err());
+        storage.pwrite_all(0, 0, b"valid").unwrap();
+        storage.pread_present(0, 0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"valid");
+    }
+
     /// Regression: sparse high-offset swarm reads grew scratch without a disk quota.
     #[test]
     fn regression_scratch_quota_bounds_high_offsets() {

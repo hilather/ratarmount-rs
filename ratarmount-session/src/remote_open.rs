@@ -1046,6 +1046,10 @@ pub(super) fn open_remote_input(
                     swarm: ratarmount_remote::torrent::SwarmOptions {
                         policy: opts.torrent_swarm,
                         scratch_bytes: opts.torrent_scratch_bytes,
+                        lsd: opts.torrent_lsd,
+                        seed: opts.torrent_seed,
+                        upload_limit: opts.torrent_seed_upload_limit,
+                        listen_port: opts.torrent_listen_port,
                         // A failed fixture must never start public discovery.
                         #[cfg(test)]
                         dht: false,

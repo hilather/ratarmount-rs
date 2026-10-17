@@ -346,12 +346,28 @@ struct Args {
     memory_budget: Option<u64>,
 
     /// Torrent peer discovery: auto starts only when metadata/web seeds cannot serve a request.
-    #[arg(long, default_value = "auto", value_name = "auto|always|never")]
+    #[arg(long, default_value = "auto", value_name = "auto|always|lan|never")]
     torrent_swarm: ratarmount_core::TorrentSwarmPolicy,
 
     /// Maximum swarm scratch disk usage per torrent session (web seed reads use the range cache).
     #[arg(long, default_value = "2GiB", value_name = "BYTES", value_parser = parse_byte_size)]
     torrent_scratch_limit: u64,
+
+    /// Local multicast peer discovery; used only while the swarm is active.
+    #[arg(long, action = ArgAction::Set, default_value = "on", value_name = "on|off", value_parser = parse_torrent_lsd)]
+    torrent_lsd: bool,
+
+    /// Upload verified torrent pieces until unmount (makes a swarm session active).
+    #[arg(long)]
+    seed: bool,
+
+    /// Maximum torrent upload bytes per second (at least one 16 KiB protocol block).
+    #[arg(long, default_value = "1048576", value_name = "BYTES/s", value_parser = clap::value_parser!(u32).range(16384..=1_000_000_000))]
+    seed_upload_limit: u32,
+
+    /// Incoming TCP port when --seed is enabled (0 chooses an available port).
+    #[arg(long, default_value = "4240", value_name = "PORT")]
+    torrent_listen_port: u16,
 
     /// Bypass FUSE's page cache for source members; overlay files keep normal caching.
     /// Disables passthrough and advises eviction of consumed local zstd/TAR pages.
@@ -656,6 +672,14 @@ fn parse_parallel_nested(s: &str) -> Result<u32, String> {
         .map_err(|_| format!("expected non-negative integer or 'auto', got {s:?}"))
 }
 
+fn parse_torrent_lsd(value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err("expected on or off".into()),
+    }
+}
+
 /// G-1 `serve` / F-3 `find` sugar: strip argv[1] when it is exactly `serve` or
 /// `find`, then parse the existing CLI. A clap `Subcommand` is hostile here:
 /// flags after the verb are unknown unless every `Args` field is `global = true`,
@@ -756,6 +780,18 @@ where
         (stripped, false, false, false)
     };
     let mut args = Args::try_parse_from(stripped)?;
+    if args.seed && args.torrent_swarm == ratarmount_core::TorrentSwarmPolicy::Never {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--seed conflicts with --torrent-swarm never",
+        ));
+    }
+    if args.seed && !cfg!(feature = "bittorrent") {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--seed requires a build with --features bittorrent",
+        ));
+    }
     if args.roll_every.is_some() {
         if find
             || !args.source_binds.is_empty()
@@ -1461,6 +1497,10 @@ fn main() {
             .unwrap_or(0),
         torrent_swarm: args.torrent_swarm,
         torrent_scratch_bytes: args.torrent_scratch_limit,
+        torrent_lsd: args.torrent_lsd,
+        torrent_seed: args.seed,
+        torrent_seed_upload_limit: args.seed_upload_limit,
+        torrent_listen_port: args.torrent_listen_port,
         direct_io: args.direct_io,
         zstd_readahead_bytes: if readahead_flag_on_argv(std::env::args()) {
             clamp_readahead(parse_byte_size(&args.readahead).unwrap_or_else(|e| {
@@ -3380,7 +3420,7 @@ fn print_features() {
     #[cfg(not(feature = "sftp-russh"))]
     println!("  sftp-russh: not compiled");
     #[cfg(feature = "bittorrent")]
-    println!("  bittorrent: compiled (magnet/.torrent; web seeds first; uploads disabled)");
+    println!("  bittorrent: compiled (magnet/.torrent; web seeds first (LAN mode available); uploads disabled by default; seeding opt-in)");
     #[cfg(not(feature = "bittorrent"))]
     println!("  bittorrent: not compiled");
     println!(
@@ -3425,7 +3465,7 @@ fn print_oss_attributions(full: bool) {
         "ureq / ssh2 / … — remote backends (http/s3/gs/az/ftp/ssh/oci/ipfs/rclone)",
         "nfsserve / tokio — in-process NFSv3 export (--nfs)",
         #[cfg(feature = "bittorrent")]
-        "librqbit — torrent metadata and streaming (Apache-2.0; uploads disabled)",
+        "librqbit — torrent metadata and streaming (Apache-2.0; seeding opt-in)",
         #[cfg(feature = "nfsv4")]
         "embednfs — in-process NFSv4.1 export (--nfs-vers 4) (MIT)",
         "httparse — HTTP/WebDAV export (--http / --webdav)",
@@ -6990,7 +7030,7 @@ mod torrent_policy_tests {
             ratarmount_core::TorrentSwarmPolicy::Auto
         );
         assert_eq!(defaults.torrent_scratch_limit, 2 * 1024 * 1024 * 1024);
-        for policy in ["auto", "always", "never"] {
+        for policy in ["auto", "always", "lan", "never"] {
             let args = Args::try_parse_from([
                 "ratarmount",
                 "--torrent-swarm",
@@ -7009,6 +7049,62 @@ mod torrent_policy_tests {
             Args::try_parse_from(["ratarmount", "--torrent-swarm", "bad", "source.tar"]).is_err()
         );
     }
+    /// Regression: LAN/seeding flags consumed paths, enabled uploads implicitly, or bypassed never.
+    #[test]
+    fn regression_torrent_lan_seed_flags_and_conflicts() {
+        let defaults = Args::try_parse_from(["ratarmount", "source.torrent", "mnt"]).unwrap();
+        assert!(defaults.torrent_lsd);
+        assert!(!defaults.seed);
+        assert_eq!(defaults.seed_upload_limit, 1024 * 1024);
+        let args = Args::try_parse_from([
+            "ratarmount",
+            "--torrent-swarm",
+            "lan",
+            "--torrent-lsd",
+            "off",
+            "--seed",
+            "--seed-upload-limit",
+            "65536",
+            "--torrent-listen-port",
+            "4241",
+            "source.torrent",
+            "mnt",
+        ])
+        .unwrap();
+        assert_eq!(args.torrent_swarm, ratarmount_core::TorrentSwarmPolicy::Lan);
+        assert!(!args.torrent_lsd);
+        assert!(args.seed);
+        assert_eq!(args.seed_upload_limit, 65536);
+        assert_eq!(args.torrent_listen_port, 4241);
+        assert_eq!(args.paths.len(), 2);
+        for verb in [None, Some("serve"), Some("find")] {
+            let mut argv = vec!["ratarmount"];
+            argv.extend(verb);
+            argv.extend(["--seed", "--torrent-swarm", "never", "source.torrent"]);
+            assert!(parse_args_from(argv)
+                .unwrap_err()
+                .to_string()
+                .contains("conflicts"));
+        }
+        for rate in ["0", "16383", "1000000001", "4294967296"] {
+            assert!(Args::try_parse_from([
+                "ratarmount",
+                "--seed-upload-limit",
+                rate,
+                "file.torrent"
+            ])
+            .is_err());
+        }
+        assert!(
+            Args::try_parse_from(["ratarmount", "--torrent-lsd", "bad", "file.torrent"]).is_err()
+        );
+        #[cfg(not(feature = "bittorrent"))]
+        assert!(parse_args_from(["ratarmount", "--seed", "file.torrent"])
+            .unwrap_err()
+            .to_string()
+            .contains("requires"));
+    }
+
     /// Regression: a mountpoint directory named x.torrent was taken as another mount input.
     #[test]
     fn regression_torrent_directory_remains_mountpoint() {

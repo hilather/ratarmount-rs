@@ -83,7 +83,7 @@ fn cached(meta: &Metainfo, dir: &Path, source: &str) -> Hashes {
     read().unwrap_or_default()
 }
 
-fn save(meta: &Metainfo, dir: &Path, source: &str, hashes: &Hashes) -> io::Result<()> {
+pub(super) fn save(meta: &Metainfo, dir: &Path, source: &str, hashes: &Hashes) -> io::Result<()> {
     if hashes.is_empty() {
         return Ok(());
     }
@@ -136,6 +136,10 @@ fn load_with(meta: &Metainfo, dir: &Path, mut fetch: impl FnMut(&str, bool) -> H
         }
     }
     result
+}
+
+pub(super) fn cached_only(meta: &Metainfo, dir: &Path) -> Hashes {
+    load_with(meta, dir, |_, _| Hashes::new())
 }
 
 pub(super) fn load(meta: &Metainfo, dir: &Path) -> Hashes {

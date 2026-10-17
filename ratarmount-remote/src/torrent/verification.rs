@@ -1,10 +1,11 @@
 //! Whole-file hashing and checksum discovery never run on a reader thread.
 use super::{checksums, Data, Piece};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{mpsc, Arc, Weak};
 
 pub(super) enum Event {
+    RetryPublication,
     #[cfg(test)]
     Barrier(mpsc::SyncSender<()>),
     Piece(Piece, Weak<Vec<u8>>),
@@ -19,18 +20,35 @@ struct Stream {
     covered: bool,
 }
 
+fn publish(data: &Arc<Data>, file: usize, expected: [u8; 32], pending: &mut BTreeSet<usize>) {
+    if let Err(e) = data.hub.publish(data, file, expected) {
+        pending.insert(file);
+        log::debug!("torrent Hub cache publication deferred: {e}");
+    } else {
+        pending.remove(&file);
+    }
+}
+
 pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Result<()> {
     let weak = Arc::downgrade(data);
     std::thread::Builder::new()
         .name("torrent-sha256".into())
         .spawn(move || {
             let mut streams: BTreeMap<usize, Stream> = BTreeMap::new();
-            while let Ok(event) = rx.recv() {
+            let mut pending = BTreeSet::new();
+            loop {
+                let event = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(event) => event,
+                    Err(mpsc::RecvTimeoutError::Timeout) => Event::RetryPublication,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 let Some(data) = weak.upgrade() else {
                     break;
                 };
+                if data.stopped.load(std::sync::atomic::Ordering::Acquire) { break; }
                 let mut affected = Vec::new();
                 match event {
+                    Event::RetryPublication => affected.extend(pending.iter().copied()),
                     #[cfg(test)]
                     Event::Barrier(tx) => {
                         let _ = tx.send(());
@@ -61,12 +79,19 @@ pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Res
                         affected.push(file);
                     }
                     Event::Hashes(hashes) => {
+                        data.hub.authorize(&data.meta, &hashes);
                         for (file, meta) in data.meta.files.iter().enumerate() {
                             let mut state = data.verification[file]
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            state.expected =
-                                state.expected.or_else(|| hashes.get(&meta.path).copied());
+                            if let Some(hash) = hashes.get(&meta.path) {
+                                if state.expected.is_some_and(|expected| expected != *hash) {
+                                    state.bad = true;
+                                    state.complete = false;
+                                    log::error!("torrent metainfo SHA-256 disagrees with pinned Hub/manifest hash: {}", meta.path);
+                                }
+                                state.expected = Some(*hash);
+                            }
                             affected.push(file);
                         }
                     }
@@ -77,7 +102,13 @@ pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Res
                         let state = data.verification[file]
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        if state.bad || state.complete {
+                        if state.bad { continue; }
+                        if state.complete {
+                            let expected = state.expected;
+                            drop(state);
+                            if let Some(expected) = expected {
+                                publish(&data, file, expected, &mut pending);
+                            }
                             continue;
                         }
                         state.expected
@@ -117,12 +148,17 @@ pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Res
                         state.bad = digest != expected;
                         state.complete = !state.bad;
                         state.ranges.clear();
+                        let complete = state.complete;
                         if state.bad {
                             log::error!(
                                 "TORRENT SHA-256 MISMATCH: {} in {}; all further reads refused",
                                 data.meta.files[file].path,
                                 data.meta.identity()
                             );
+                        }
+                        drop(state);
+                        if complete {
+                            publish(&data, file, expected, &mut pending);
                         }
                     }
                 }
@@ -135,7 +171,14 @@ pub(super) fn start(data: &Arc<Data>, rx: mpsc::Receiver<Event>) -> std::io::Res
             let Some(data) = weak.upgrade() else {
                 return;
             };
-            let hashes = checksums::load(&data.meta, &data.options.metadata_dir);
+            let hashes = if data.hub.all_local(&data) {
+                BTreeMap::new()
+            } else {
+                if data.stopped.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                checksums::load(&data.meta, &data.options.metadata_dir)
+            };
             let _ = data.verify_tx.send(Event::Hashes(hashes));
         })?;
     Ok(())

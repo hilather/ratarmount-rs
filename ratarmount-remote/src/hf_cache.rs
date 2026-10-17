@@ -122,7 +122,7 @@ fn digest(file: &mut File, etag: &str) -> io::Result<String> {
     })
 }
 
-fn copy_verified(source: &mut File, dest: &mut File, etag: &str, size: u64) -> io::Result<()> {
+fn copy_verified(source: &mut impl Read, dest: &mut File, etag: &str, size: u64) -> io::Result<()> {
     let mut sha256 = Sha256::new();
     let mut sha1 = Sha1::new();
     sha1.update(format!("blob {size}\0").as_bytes());
@@ -413,7 +413,7 @@ impl HubCache {
         let snapshot = repo.join("snapshots").join(commit).join(path);
         let mut candidates = Vec::new();
         if let Some(etag) = etag.filter(|etag| is_etag(etag)) {
-            candidates.push((blobs.join(etag), etag.to_string()));
+            candidates.push((blobs.join(etag), etag.to_string(), false));
         }
         if directories(&self.root, snapshot.parent()?, false).is_ok() {
             if let Ok(meta) = fs::symlink_metadata(&snapshot) {
@@ -426,20 +426,37 @@ impl HubCache {
                                 .and_then(|n| n.to_str())
                                 .filter(|n| is_etag(n))
                             {
-                                if etag.is_none_or(|expected| expected.eq_ignore_ascii_case(name)) {
-                                    candidates.push((target.clone(), name.into()));
+                                let cross_hash = etag.is_some_and(|expected| {
+                                    is_etag(expected) && expected.len() != name.len()
+                                });
+                                if cross_hash
+                                    || etag
+                                        .is_none_or(|expected| expected.eq_ignore_ascii_case(name))
+                                {
+                                    // Pirate Face has SHA-256 for small Git blobs too. A pinned
+                                    // snapshot may reuse either spelling, but only after checking
+                                    // the requested digest; size/name trust is insufficient here.
+                                    candidates.push((
+                                        target.clone(),
+                                        etag.unwrap_or(name).into(),
+                                        cross_hash,
+                                    ));
                                 }
                             }
                         }
                     }
                 } else if meta.is_file() {
                     // huggingface_hub copies snapshots on systems without symlink support.
-                    candidates.push((snapshot, etag.unwrap_or("").into()));
+                    let cross_hash = etag.is_some_and(|expected| {
+                        self.copied_hash(location, commit, path)
+                            .is_some_and(|hash| is_etag(expected) && expected.len() != hash.len())
+                    });
+                    candidates.push((snapshot, etag.unwrap_or("").into(), cross_hash));
                 }
             }
         }
-        for (path, etag) in candidates {
-            if let Some(file) = self.checked(&path, &etag, size, false) {
+        for (path, etag, full) in candidates {
+            if let Some(file) = self.checked(&path, &etag, size, full) {
                 #[cfg(test)]
                 {
                     let hook = self.stats.after_find.lock().unwrap().take();
@@ -593,6 +610,96 @@ impl HubCache {
         complete: &Path,
         size: u64,
     ) -> io::Result<LocalBlob> {
+        self.install_with(location, commit, path, etag, size, || {
+            open_regular(complete)
+        })
+    }
+
+    /// Torrent publication streams directly into the same locked, verified blob installer.
+    #[cfg(feature = "bittorrent")]
+    pub(crate) fn install_reader(
+        &self,
+        location: &HfLocation,
+        commit: &str,
+        path: &str,
+        sha256: &str,
+        size: u64,
+        reader: &mut impl Read,
+    ) -> io::Result<LocalBlob> {
+        self.install_with(location, commit, path, sha256, size, || Ok(reader))
+    }
+
+    #[cfg(feature = "bittorrent")]
+    pub(crate) fn find_sha256(
+        &self,
+        location: &HfLocation,
+        path: &str,
+        sha256: &str,
+        size: u64,
+    ) -> Option<LocalBlob> {
+        if sha256.len() != 64 || !is_etag(sha256) {
+            return None;
+        }
+        let blob = self.find(location, &location.revision, path, Some(sha256), Some(size))?;
+        // Seeding/torrent sharing always verifies LFS, even when HF cache verification is disabled.
+        let file = self.checked(&blob.path, sha256, Some(size), true)?;
+        Some(LocalBlob {
+            file: Arc::new(file),
+            ..blob
+        })
+    }
+
+    /// Recover an independent digest from an already-pinned Hub snapshot, so
+    /// a first torrent mount can reuse a Python-populated cache without an API call.
+    #[cfg(feature = "bittorrent")]
+    pub(crate) fn find_snapshot_sha256(
+        &self,
+        location: &HfLocation,
+        path: &str,
+        size: u64,
+    ) -> Option<(LocalBlob, [u8; 32])> {
+        let blob = self.find(location, &location.revision, path, None, Some(size))?;
+        let etag = blob
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| is_etag(name))
+            .map(str::to_string)
+            .or_else(|| self.copied_hash(location, &location.revision, path))?;
+        let mut file = self.checked(&blob.path, &etag, Some(size), true)?;
+        let sha256 = if etag.len() == 64 {
+            etag
+        } else {
+            // Bind the derived SHA-256 to the same Git-verified contents, even
+            // if another process changes the shared file between hash passes.
+            let before = stamp(&file).ok()?;
+            let sha256 = digest(&mut file, &"0".repeat(64)).ok()?;
+            if !digest(&mut file, &etag).ok()?.eq_ignore_ascii_case(&etag)
+                || stamp(&file).ok()? != before
+            {
+                return None;
+            }
+            sha256
+        };
+        let sha256 = hex::decode(sha256).ok()?.try_into().ok()?;
+        Some((
+            LocalBlob {
+                file: Arc::new(file),
+                ..blob
+            },
+            sha256,
+        ))
+    }
+
+    fn install_with<R: Read>(
+        &self,
+        location: &HfLocation,
+        commit: &str,
+        path: &str,
+        etag: &str,
+        size: u64,
+        source: impl FnOnce() -> io::Result<R>,
+    ) -> io::Result<LocalBlob> {
         if !is_etag(etag) || !is_commit(commit) || !relative(Path::new(path)) {
             return Err(io::Error::other("invalid Hub cache identity"));
         }
@@ -634,7 +741,7 @@ impl HubCache {
         let file = if let Some(file) = self.checked(&blob, etag, Some(size), true) {
             file
         } else {
-            let mut source = open_regular(complete)?;
+            let mut source = source()?;
             let mut tmp = temporary(&blobs)?;
             copy_verified(&mut source, tmp.as_file_mut(), etag, size)?;
             published_permissions(tmp.as_file(), &blobs)?;
@@ -1457,6 +1564,55 @@ mod tests {
                     .path,
                 blob
             );
+        }
+    }
+
+    /// Regression: Pirate Face's SHA-256 and the Hub's small-file Git hash created duplicate downloads.
+    #[test]
+    fn regression_hf_cache_pinned_snapshot_reuses_sha256_and_git_blob_names() {
+        for lfs in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let body = b"shared small file";
+            let (cache, location, _, blob) = fixture(dir.path(), "file", body, lfs);
+            let mut file = open_regular(&blob).unwrap();
+            let other = digest(&mut file, &"0".repeat(if lfs { 40 } else { 64 })).unwrap();
+            #[cfg(feature = "bittorrent")]
+            {
+                let mut pinned = location.clone();
+                pinned.revision = COMMIT.into();
+                let (_, sha256) = cache
+                    .find_snapshot_sha256(&pinned, "file", body.len() as u64)
+                    .unwrap();
+                assert_eq!(sha256, <[u8; 32]>::from(Sha256::digest(body)));
+            }
+            let found = cache
+                .find(
+                    &location,
+                    COMMIT,
+                    "file",
+                    Some(&other),
+                    Some(body.len() as u64),
+                )
+                .unwrap();
+            let mut bytes = vec![0; body.len()];
+            assert_eq!(found.read_at(0, &mut bytes).unwrap(), body.len());
+            assert_eq!(bytes, body);
+            assert_eq!(
+                fs::read_dir(cache.repo_dir(&location).join("blobs"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            let wrong = "f".repeat(other.len());
+            assert!(cache
+                .find(
+                    &location,
+                    COMMIT,
+                    "file",
+                    Some(&wrong),
+                    Some(body.len() as u64)
+                )
+                .is_none());
         }
     }
 

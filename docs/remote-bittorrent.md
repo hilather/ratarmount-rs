@@ -20,18 +20,27 @@ cargo build -p ratarmount-session --features bittorrent
 Check the company network policy before running BitTorrent at work. Firewalls
 may block or flag the protocol regardless of the content being transferred.
 
-**Network policy: `--torrent-swarm auto|always|never` defaults to `auto`.**
+**Network policy: `--torrent-swarm auto|always|lan|never` defaults to `auto`.**
 
 * `auto` starts the swarm only if metadata cannot be obtained from the cache,
   `xs` or metainfo file, or if no web seed can supply a verified requested piece.
   Available metadata plus a working web seed means **no DHT socket, tracker
-  announce, or peer connection**. Checksum discovery can still use HTTPS APIs.
+  announce, LSD multicast, or peer connection**. After web seeds fail, an LSD-enabled
+  mount gives LAN peers a three-second first attempt before public discovery.
+  Checksum discovery can still use HTTPS APIs. `--seed` explicitly activates a session.
 * `never` allows cache and web seeds only. Missing metadata or a piece that
   cannot be obtained and verified fails with a `--torrent-swarm never` error.
 * `always` creates the swarm runtime at mount time, including DHT when enabled.
   Torrent peer streaming and tracker requests begin when the swarm is used.
+* `lan` creates a session with **no DHT and no tracker requests**, and tries local
+  peers before web seeds. Its peer allowlist also blocks public addresses learned
+  through peer exchange or incoming connections. Private IPv4, IPv4 link-local,
+  loopback, IPv6 ULA and IPv6 link-local addresses are allowed; a LAN using only
+  globally routed addresses needs a private/link-local address for this mode.
+  HTTPS metadata, checksum APIs and web seeds remain permitted; `lan` limits peer
+  discovery, rather than making every request offline.
 
-At first swarm activation per mount, an info-level log says:
+At first public swarm activation per mount, an info-level log says:
 `BitTorrent swarm enabled for <infohash>: your IP is visible to trackers/DHT peers`.
 It uses normal log filtering; it does not bypass quiet logging. Disabling uploads
 or TCP listening does **not** prevent tracker announcements or IP disclosure.
@@ -39,7 +48,15 @@ On Unix the DHT uses librqbit's interface binding on the kernel-selected IPv4
 route interface (determined without sending a packet); failure to determine or
 bind that interface fails swarm startup. On non-Unix platforms this build cannot
 determine the default interface: librqbit binds DHT on all interfaces. Use `never`
-if that is unacceptable. LSD and UPnP listening remain disabled.
+if that is unacceptable. UPnP port mapping remains disabled.
+
+`--torrent-lsd on|off` defaults to `on`, and only takes effect while a swarm
+session exists. BEP 14 multicasts stay on the local network. `auto` with working
+web seeds and `never` create no LSD socket. LSD uses an ephemeral incoming
+protocol listener to solicit prompt discovery replies even when uploads are off;
+payload uploads still require `--seed`. LAN activation logs explicitly state that
+DHT and trackers are disabled. `--torrent-lsd off` disables multicast; library
+users can still provide explicit private peer addresses.
 
 ```sh
 ratarmount --torrent-swarm never ./dataset.torrent mnt/
@@ -60,7 +77,10 @@ for metainfo and individual pieces, and 64 bencode nesting levels.
 Magnets first consult the platform cache's `ratarmount/torrent-v1/`, keyed by
 the exact info dictionary hash. They then try HTTP(S) `xs` metadata URLs (also
 `ws` URLs explicitly ending in `.torrent`), then librqbit metadata exchange
-using the magnet's trackers and DHT. Swarm operations time out after 30 seconds
+using the magnet's policy-permitted discovery methods. LAN metadata exchange
+actively solicits a BEP 14 reply from an existing donor and retains that donor's
+address for the subsequent payload session. Auto gives this local attempt a
+three-second grace period before starting public discovery. Swarm operations time out after 30 seconds
 by default; library users can configure `TorrentOptions.swarm.timeout` and
 explicit peers or disable DHT/trackers. HTTP metadata requests also have that
 timeout. Cached metainfo retains the exact info bytes, v2 piece layers, web
@@ -80,8 +100,11 @@ files supply zero bytes and are hidden. For v2, pieces belong to individual
 files: 16 KiB block hashes and zero padding form the Merkle tree. Piece layers
 must first match the roots inside the hashed info dictionary. Hybrids use v2
 verification when available and retain the v1 mapping for swarm fallback.
-V1 metadata exchange omits the external v2 piece layers; a hybrid received this
-way uses its authenticated v1 piece hashes until full metainfo is supplied.
+When a magnet supplies both `btih` and `btmh`, the v2 cache entry is preferred.
+A layer-less hybrid cache entry remains a v1 fallback while other cache/`xs`
+sources are tried for full v2 metadata. V1 metadata exchange omits external v2
+piece layers; a hybrid received this way uses authenticated v1 piece hashes until
+full metainfo is supplied.
 Supplied layers that fail validation are always rejected. Hybrid file paths,
 lengths, alignment and independent SHA-256 fields must agree. BEP 47 padding
 entries (including repeated `.pad/<size>` names) are omitted from path collision
@@ -138,14 +161,74 @@ request timeout expires. Reader-capable nested formats, including TAR,
 do not need an archive-body spool; formats requiring a path keep their existing
 temporary-file fallback.
 
-The dependency is compiled with `disable-upload`, and every production session
-sets `disable_upload: true`. It does not advertise completed pieces or answer
-payload upload requests. There is no incoming listener, UPnP port mapping, LSD,
-session persistence, or seeding CLI option in AI-BT1. Tracker/DHT queries and
-peer protocol traffic are still network traffic. Opt-in seeding and LAN sharing
-belong to AI-BT2.
+## Opt-in seeding and two-Dell LAN setup
 
-Two upstream limitations remain explicit:
+`--seed` is off by default. It activates the selected swarm policy immediately,
+accepts incoming connections on `--torrent-listen-port` (default `4240`; `0`
+selects an available port), and logs **BITTORRENT SEEDING ENABLED**, the listener
+and upload cap. `--seed --torrent-swarm never` is an error. `--seed` also requires
+a build with `--features bittorrent`. Use `--torrent-swarm lan` on both machines
+to share without announcing to internet trackers or DHT peers.
+
+`--seed-upload-limit BYTES/s` defaults to **1048576** (1 MiB/s). It accepts decimal
+integer byte rates from 16384 through 1000000000. The minimum is one 16 KiB
+protocol block: librqbit's limiter refuses a block larger than its capacity.
+Rates are rounded down to the limiter's nanosecond clock resolution, retaining
+capacity for one protocol block; the activation log shows the effective cap.
+Larger values are rejected because the dependency would create a zero refill
+interval. The cap applies across the session's peers and permits an initial
+one-second burst. Protocol/metadata overhead is outside this payload rate. Ordinary downloads
+continue to set `disable_upload: true`; the dependency's `disable-upload` feature
+makes this runtime switch available rather than preventing opt-in uploads.
+
+The upload session reads verified range-cache pieces and complete Hub blobs,
+then rqbit rehashes them before advertising HAVE. It has no selected downloads or
+file streams. If the mount also needs peer downloads, a separate session keeps
+uploads disabled and uses the quota-limited protocol scratch store. Only complete
+pieces that pass the torrent layer's check enter the upload session's cache view.
+Cache reads recheck their torrent hash; a corrupted/evicted cached piece fails an
+upload rather than returning zero-filled scratch holes. Scratch fallback is
+independently rehashed as well: a HAVE bit that authenticated a cached overlay
+cannot authorize different speculative blocks underneath it after eviction.
+No cache miss performs HTTP or swarm fetching on an upload thread.
+New HTTP/cache pieces coalesce into a bitmap refresh when the bridge is idle,
+at most once every two seconds; this scans the logical torrent and rechecks
+pieces, including missing zero-filled scratch holes, and can reconnect peers. This upstream API limitation adds disk/hash work for large torrents.
+Unmount cancels listeners, discovery and uploads even if a read is still timing out.
+
+For two Dells on the same private LAN, place the same `.torrent` metadata file on
+both machines (or use a magnet with a reachable `xs=.torrent` URL). On the first
+Dell, warm the model's verified Hub cache through `hf://` or an existing Hub
+client, with the same pinned repository/revision and LFS SHA-256. Hub cache sharing
+is automatic when its directory exists; `RATARMOUNT_HF_SHARE_CACHE=1` also enables
+creation of a new cache. Then run:
+
+```sh
+# First Dell: serve verified pieces, at up to 100 MiB/s.
+ratarmount --torrent-swarm lan --seed --seed-upload-limit 104857600 \
+  --torrent-listen-port 4240 ./model.torrent donor/
+
+# Second Dell: discover the donor with BEP 14, before trying HTTPS.
+ratarmount --torrent-swarm lan --torrent-scratch-limit 400GiB \
+  ./model.torrent model/
+# Read model/model.safetensors normally. Stop sharing by unmounting donor/.
+```
+
+Allow local UDP multicast port 6771 and the donor's incoming TCP port through
+the LAN firewall. BEP 14 requires multicast connectivity; a direct ConnectX link
+needs private addresses and multicast routing on that link. Keep the donor mounted
+while reading on the second machine. The default scratch quota remains 2 GiB;
+a swarm-only 300 GB sequential download needs a larger quota, as above, and enough
+local disk. Wait for **BITTORRENT SEEDING READY** on the donor before starting
+the second mount: the initial checksum scan of a very large torrent can take
+minutes, while individual peer operations time out after 30 seconds by default.
+Scratch is temporary and separate from the shared persistent cache.
+The default range-cache budget is also independent of that quota. A first Dell
+with only partially cached pieces can serve those pieces; other requested pieces
+need another local donor or the configured web seed. Hardware throughput on the
+Dell/ConnectX setup has not been measured here.
+
+Other upstream limitations:
 
 * librqbit 9.0.1 implements the v1 peer protocol. V2-only `.torrent` files and
   `btmh` magnets with cached/HTTP metadata work through web seeds; v2-only swarm
@@ -207,10 +290,31 @@ lack source provenance. Pirate manifests require an explicit matching infohash, 
 v2-only torrents; a missing identity never matches. Missing hashes do not disable
 piece verification or claim whole-file verification.
 
-`TorrentMountSource::verified_file_sha256(path)` is the AI-BT2 publication hook:
-it returns a digest only after the full-file check succeeds. Publishing completed
-torrent files into the Hub cache remains AI-BT2 work. The existing `hf://` and
-`hf-cache://` sharing support is independent of this torrent hook.
+`TorrentMountSource::verified_file_sha256(path)` returns a digest only after the
+full-file check succeeds. For one unambiguous pinned Hub/Pirate Face repository
+identity, a matching Hub LFS or source-bound Pirate Face manifest observation
+also authorizes publication into the shared Hub cache. A metainfo `sha256`
+extension alone does not authorize a Hub snapshot mapping. Conflicting identities
+or independent hashes fail closed. Missing hashes retain piece verification.
+
+Publication streams into AI-HF3's existing installer: the same
+`$HF_HUB_CACHE/models--owner--repo/blobs/<sha256>`, snapshot symlink, file lock,
+atomic rename, digest check and `0666 & ~umask` permissions used by `hf://`.
+It creates no second completed-file spool. Busy blob locks and failed installs
+are retried by the background verifier at idle five-second intervals, without
+requiring another read; dropping the source stops further publication work. Once publication succeeds, redundant
+torrent range pieces are removed (cross-file v1 pieces wait for all their spans).
+Before fetching a file, its known SHA-256 is looked up in that repository's Hub
+cache and verified, including when `RATARMOUNT_HF_CACHE_VERIFY=0`. Hits serve
+locally without payload traffic or peer activation. An existing pinned Hub
+snapshot can supply the independent digest itself (including Python-populated
+caches), so a first torrent mount does not need a prior torrent checksum cache.
+When all files are available this also avoids checksum API traffic; a complete
+source-bound checksum observation plus cached blobs has the same effect. `hf://`
+and `hf-cache://` can read a blob installed by a torrent; partial or failed whole-file
+checks never publish a blob. For small non-LFS files whose Pirate Face digest is
+SHA-256 but whose Hub blob ID is Git SHA-1, the pinned snapshot can reuse either
+blob name after verifying the requested digest, without creating a duplicate. Transient protocol scratch remains until unmount.
 
 ## Nested archives and indexes
 
@@ -226,10 +330,14 @@ uncompressed TAR; other nested formats retain their existing index behavior.
 
 ## Testing
 
-Normal tests use loopback HTTP and two in-process librqbit sessions with DHT,
-trackers and LSD disabled. Only the loopback test fixture session uploads; the
-production downloader always disables uploads. No public tracker or swarm is
-used by the default test suite.
+Normal tests use loopback HTTP and two in-process librqbit sessions, including
+opt-in production seeding, partial/corrupt cache bitfields, an enforced rate cap,
+listener shutdown and HF cache sharing in both directions. Direct loopback peers
+substitute for multicast discovery in deterministic tests; one auto-policy test
+also enables local LSD. No public tracker or swarm is used by the default suite.
+The real two-session multicast tests are gated by `RATARMOUNT_TEST_LSD=1` and still
+disable public discovery; they cover both `.torrent` payload reads and a bare
+magnet resolving metadata from an already-running donor. It needs a host/network namespace that supports multicast.
 
 ```sh
 cargo test -p ratarmount-remote --features bittorrent --lib torrent
@@ -239,6 +347,8 @@ cargo test -p ratarmount-remote --lib regression_torrent_remote_dispatch
 cargo test -p ratarmount --features bittorrent --bin ratarmount torrent_policy_tests
 cargo test -p ratarmount --bin ratarmount torrent_policy_tests
 ./packaging/test-bittorrent-features.sh
+RATARMOUNT_TEST_LSD=1 cargo test -p ratarmount-remote --features bittorrent \
+  --lib regression_real_lsd_ -- --nocapture
 ```
 
 The ignored `live_pirate_face_magnet` test additionally requires
