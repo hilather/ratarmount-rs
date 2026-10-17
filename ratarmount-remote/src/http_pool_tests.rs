@@ -1,7 +1,7 @@
 use super::*;
 use crate::{HttpRangeFile, SecretString};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Condvar;
 
@@ -1601,6 +1601,30 @@ fn regression_memory_budget_http_prefetch_degrades() {
     );
 }
 
+#[cfg(unix)]
+fn accept_retrying(
+    mut accept: impl FnMut() -> io::Result<(TcpStream, SocketAddr)>,
+) -> (TcpStream, SocketAddr) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match accept() {
+            Ok(pair) => return pair,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("accept: WouldBlock for 5s");
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn accept_with_deadline(listener: &TcpListener) -> (TcpStream, SocketAddr) {
+    accept_retrying(|| listener.accept())
+}
+
 /// Regression: inherited O_NONBLOCK must not truncate replies on macOS/BSD.
 #[cfg(unix)]
 #[test]
@@ -1610,14 +1634,56 @@ fn regression_accepted_socket_clears_inherited_nonblocking() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (stream, _) = listener.accept().unwrap();
-    // Linux does not inherit this flag; simulate the BSD accept result.
-    stream.set_nonblocking(true).unwrap();
+    let (stream, _) = accept_with_deadline(&listener);
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    {
+        // SAFETY: F_GETFL only reads flags from the live stream's descriptor.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )))]
+    {
+        // Linux does not inherit this flag; simulate the BSD accept result.
+        stream.set_nonblocking(true).unwrap();
+    }
     configure_accepted_stream(&stream).unwrap();
     // SAFETY: F_GETFL only reads flags from the live stream's descriptor.
     let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
     assert_ne!(flags, -1);
     assert_eq!(flags & libc::O_NONBLOCK, 0);
+}
+
+/// Regression: one WouldBlock from accept is retried until the queued client is taken.
+#[cfg(unix)]
+#[test]
+fn regression_accept_retries_one_wouldblock() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _client = TcpStream::connect(addr).unwrap();
+    let mut first = true;
+    let (stream, _) = accept_retrying(|| {
+        if first {
+            first = false;
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "shim"))
+        } else {
+            listener.accept()
+        }
+    });
+    assert_eq!(stream.local_addr().unwrap(), addr);
 }
 
 /// Regression: forward TAR header seeks bypassed read-ahead, including on redirected URLs.
