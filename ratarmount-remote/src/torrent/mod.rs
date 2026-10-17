@@ -1,10 +1,12 @@
 //! Lazy torrent trees. HTTP payloads are never cached until the entire piece verifies.
 
+mod cache;
 mod checksums;
 mod metadata;
 mod metainfo;
 mod pieces;
 mod scratch;
+mod seeding;
 mod swarm;
 mod verification;
 
@@ -92,7 +94,15 @@ type HttpSources = BTreeMap<(usize, usize), Arc<HttpRangeSource>>;
 struct Data {
     meta: Metainfo,
     options: TorrentOptions,
+    self_ref: std::sync::Weak<Data>,
+    seed_pending: Mutex<std::collections::BTreeSet<u64>>,
+    stopped: AtomicBool,
+    lan_probe_done: AtomicBool,
+    lan_retry_at: Mutex<Option<std::time::Instant>>,
+    swarm_gate: Mutex<()>,
+    hub: cache::HubFiles,
     swarm: Mutex<Option<Arc<Swarm>>>,
+    seeder: Mutex<Option<Arc<Swarm>>>,
     sources: Mutex<HttpSources>,
     pieces: Mutex<pieces::Pieces>,
     verification: Vec<Mutex<Verification>>,
@@ -107,24 +117,43 @@ pub struct TorrentMountSource {
 }
 
 impl TorrentMountSource {
-    pub fn open(input: &str, options: TorrentOptions) -> io::Result<Self> {
-        Self::from_metainfo(metadata::resolve(input, &options)?, options)
+    pub fn open(input: &str, mut options: TorrentOptions) -> io::Result<Self> {
+        options.swarm.validate()?;
+        Self::from_metainfo(metadata::resolve(input, &mut options)?, options)
     }
 
     pub fn from_bytes(bytes: Vec<u8>, options: TorrentOptions) -> io::Result<Self> {
+        options.swarm.validate()?;
         let meta = Metainfo::parse(bytes)?;
         Self::from_metainfo(meta, options)
     }
 
     fn from_metainfo(meta: Metainfo, options: TorrentOptions) -> io::Result<Self> {
+        let hub = cache::HubFiles::new(&meta);
+        Self::with_hub(meta, options, hub)
+    }
+
+    fn with_hub(meta: Metainfo, options: TorrentOptions, hub: cache::HubFiles) -> io::Result<Self> {
+        options.swarm.validate()?;
+        if options.swarm.seed && meta.v1_hash.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "librqbit 9.0.1 cannot seed v2-only torrents",
+            ));
+        }
         let mut entries = BTreeMap::new();
         entries.insert("/".to_string(), create_root_file_info());
+        let known = checksums::cached_only(&meta, &options.metadata_dir);
         let verification = meta
             .files
             .iter()
             .map(|f| {
                 Mutex::new(Verification {
-                    expected: f.sha256,
+                    expected: f.sha256.or_else(|| known.get(&f.path).copied()),
+                    bad: f
+                        .sha256
+                        .zip(known.get(&f.path).copied())
+                        .is_some_and(|(a, b)| a != b),
                     ..Default::default()
                 })
             })
@@ -167,17 +196,30 @@ impl TorrentMountSource {
                 });
         }
         let (verify_tx, verify_rx) = mpsc::channel();
-        let data = Arc::new(Data {
+        let data = Arc::new_cyclic(|weak| Data {
             meta,
             options,
+            self_ref: weak.clone(),
+            seed_pending: Mutex::default(),
+            stopped: AtomicBool::new(false),
+            lan_probe_done: AtomicBool::new(false),
+            lan_retry_at: Mutex::default(),
+            swarm_gate: Mutex::new(()),
+            hub,
             swarm: Mutex::new(None),
+            seeder: Mutex::new(None),
             sources: Mutex::new(BTreeMap::new()),
             pieces: Mutex::default(),
             verification,
             verify_tx,
         });
         verification::start(&data, verify_rx)?;
-        if data.options.swarm.policy == TorrentSwarmPolicy::Always {
+        if data.options.swarm.seed {
+            data.start_seed()?;
+        } else if matches!(
+            data.options.swarm.policy,
+            TorrentSwarmPolicy::Always | TorrentSwarmPolicy::Lan
+        ) {
             data.start_swarm()?;
         }
         Ok(Self {
@@ -191,8 +233,7 @@ impl TorrentMountSource {
         self.data.meta.identity()
     }
 
-    /// AI-BT2 hook: only files that passed the independent whole-file digest are
-    /// eligible for Hub blob publication. The caller can read through this source.
+    /// Independent whole-file digest, available after its background check succeeds.
     pub fn verified_file_sha256(&self, path: &str) -> Option<String> {
         let fi = self.lookup(path, 0)?;
         let id = file_id(&fi).ok()?;
@@ -203,6 +244,17 @@ impl TorrentMountSource {
             .complete
             .then(|| state.expected.map(hex::encode))
             .flatten()
+    }
+}
+
+impl Drop for TorrentMountSource {
+    fn drop(&mut self) {
+        self.data.stopped.store(true, Ordering::Release);
+        for slot in [&self.data.swarm, &self.data.seeder] {
+            if let Some(swarm) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                swarm.stop();
+            }
+        }
     }
 }
 
@@ -329,6 +381,37 @@ impl Data {
         Some(out)
     }
 
+    fn available_piece(&self, key: Piece) -> Option<Arc<Vec<u8>>> {
+        if let Some(bytes) = self
+            .pieces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+        {
+            return Some(bytes);
+        }
+        let bytes = self.cached(key).or_else(|| self.hub.piece(self, key))?;
+        self.verify_piece(key, &bytes).ok()?;
+        let bytes = Arc::new(bytes);
+        self.pieces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, bytes.clone());
+        Some(bytes)
+    }
+
+    fn notify_seed(&self, key: Piece) {
+        if self.options.swarm.seed {
+            let index = key.file.map_or(key.index, |f| {
+                self.meta.files[f].offset / self.meta.piece_len + key.index
+            });
+            self.seed_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(index);
+        }
+    }
+
     fn store(&self, key: Piece, bytes: &[u8]) {
         if let Some(cache) = &self.options.range_cache {
             for (chunk, data) in bytes.chunks(cache.chunk_size() as usize).enumerate() {
@@ -380,11 +463,27 @@ impl Data {
     }
 
     fn produce_piece(&self, key: Piece, allow_swarm: bool) -> io::Result<Vec<u8>> {
-        let bytes = if let Some(bytes) = self.cached(key) {
+        let bytes = if let Some(bytes) = self.cached(key).or_else(|| self.hub.piece(self, key)) {
             bytes
         } else {
-            let mut good = None;
+            let mut good = if allow_swarm && self.options.swarm.policy == TorrentSwarmPolicy::Lan {
+                match self.swarm_piece(key).and_then(|b| {
+                    self.verify_piece(key, &b)?;
+                    Ok(b)
+                }) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        log::debug!("torrent LAN peer unavailable: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             for seed in 0..self.meta.web_seeds.len() {
+                if good.is_some() {
+                    break;
+                }
                 match self.http_piece(key, seed).and_then(|b| {
                     self.verify_piece(key, &b)?;
                     Ok(b)
@@ -402,11 +501,21 @@ impl Data {
             }
             let bytes = match good {
                 Some(b) => b,
-                None if allow_swarm => self.swarm_piece(key)?,
+                None if allow_swarm && self.options.swarm.policy != TorrentSwarmPolicy::Lan => {
+                    self.swarm_piece(key)?
+                }
+                None if allow_swarm => {
+                    return Err(io::Error::other(
+                        "no verified piece available from LAN peers or web seeds",
+                    ))
+                }
                 None => return Err(io::Error::other("no verified HTTP piece for prefetch")),
             };
             self.verify_piece(key, &bytes)?;
             self.store(key, &bytes);
+            if self.options.swarm.seed {
+                self.notify_seed(key);
+            }
             bytes
         };
         Ok(bytes)
@@ -453,12 +562,32 @@ impl Data {
     }
 
     fn start_swarm(&self) -> io::Result<Arc<Swarm>> {
-        let mut slot = self.swarm.lock().unwrap_or_else(|e| e.into_inner());
+        self.start_session(false)
+    }
+
+    fn start_seed(&self) -> io::Result<Arc<Swarm>> {
+        self.start_session(true)
+    }
+
+    fn start_session(&self, seed: bool) -> io::Result<Arc<Swarm>> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "torrent source unmounted",
+            ));
+        }
+        // A downloader can read incomplete scratch blocks internally. Keep that
+        // protocol storage separate from the upload session's verified-cache view.
+        let slot = if seed { &self.seeder } else { &self.swarm };
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
         if slot.is_none() {
-            *slot = Some(Arc::new(Swarm::new(
-                self.options.swarm.clone(),
+            let mut options = self.options.swarm.clone();
+            options.seed = seed;
+            *slot = Some(Arc::new(Swarm::with_cache(
+                options,
                 self.options.metadata_dir.join("scratch"),
                 self.meta.identity(),
+                self.self_ref.clone(),
             )?));
         }
         Ok(slot.as_ref().unwrap().clone())
@@ -484,23 +613,120 @@ impl Data {
     }
 
     fn swarm_piece(&self, key: Piece) -> io::Result<Vec<u8>> {
+        let lan = self.options.swarm.policy == TorrentSwarmPolicy::Lan;
+        let _gate = if lan && !self.meta.web_seeds.is_empty() {
+            // Another LAN attempt must never hold unrelated web-seed reads up.
+            self.swarm_gate.try_lock().map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "LAN probe already running")
+            })?
+        } else {
+            self.swarm_gate.lock().unwrap_or_else(|e| e.into_inner())
+        };
+        if lan
+            && self
+                .lan_retry_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|at| std::time::Instant::now() < at)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "LAN peers unavailable; discovery backoff",
+            ));
+        }
         if self.meta.v1_hash.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "v2 web seeds failed; librqbit 9.0.1 has no v2 swarm support",
             ));
         }
-        let swarm = self.start_swarm()?;
         let index = key.file.map_or(key.index, |f| {
             self.meta.files[f].offset / self.meta.piece_len + key.index
         });
-        let spans = self
+        let spans: Vec<_> = self
             .meta
             .spans(index)
             .into_iter()
             .map(|(f, offset, len)| ((!self.meta.files[f].padding).then_some(f), offset, len))
             .collect();
-        let bytes = swarm.read(&self.meta.bytes, spans)?;
+        let auto_lan = self.options.swarm.policy == TorrentSwarmPolicy::Auto
+            && self.options.swarm.lsd
+            && !self.options.swarm.seed;
+        let probe = auto_lan && !self.lan_probe_done.swap(true, Ordering::AcqRel);
+        if probe {
+            let mut options = self.options.swarm.clone();
+            options.policy = TorrentSwarmPolicy::Lan;
+            options.announced = Arc::default();
+            // Explicit peer overrides must also stay inside the LAN probe's policy.
+            options
+                .initial_peers
+                .retain(|peer| swarm::is_lan(peer.ip()));
+            if let Ok(local) = Swarm::with_cache(
+                options,
+                self.options.metadata_dir.join("scratch"),
+                self.meta.identity(),
+                self.self_ref.clone(),
+            ) {
+                let local = Arc::new(local);
+                {
+                    let mut slot = self.swarm.lock().unwrap_or_else(|e| e.into_inner());
+                    if self.stopped.load(Ordering::Acquire) {
+                        local.stop();
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "torrent source unmounted",
+                        ));
+                    }
+                    // Register the probe before waiting, so unmount cancels it too.
+                    *slot = Some(local.clone());
+                }
+                let result = local.read_with_timeout(
+                    &self.meta.bytes,
+                    spans.clone(),
+                    Some(
+                        self.options
+                            .swarm
+                            .timeout
+                            .min(std::time::Duration::from_secs(3)),
+                    ),
+                );
+                if let Ok(bytes) = result {
+                    self.verify_piece(Piece { file: None, index }, &bytes)?;
+                    return Ok(bytes[..self.size(key) as usize].to_vec());
+                }
+                local.stop();
+                self.swarm.lock().unwrap_or_else(|e| e.into_inner()).take();
+            }
+        }
+        let swarm = self.start_swarm()?;
+        let result = if lan {
+            swarm.read_with_timeout(
+                &self.meta.bytes,
+                spans.clone(),
+                Some(
+                    self.options
+                        .swarm
+                        .timeout
+                        .min(std::time::Duration::from_secs(2)),
+                ),
+            )
+        } else {
+            swarm.read(&self.meta.bytes, spans.clone())
+        };
+        if lan {
+            *self.lan_retry_at.lock().unwrap_or_else(|e| e.into_inner()) = result
+                .is_err()
+                .then(|| std::time::Instant::now() + std::time::Duration::from_secs(60));
+        }
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(_) if auto_lan && swarm.lan_only => {
+                swarm.stop();
+                self.swarm.lock().unwrap_or_else(|e| e.into_inner()).take();
+                self.start_swarm()?.read(&self.meta.bytes, spans)?
+            }
+            Err(e) => return Err(e),
+        };
         self.verify_piece(Piece { file: None, index }, &bytes)?;
         Ok(bytes[..self.size(key) as usize].to_vec())
     }

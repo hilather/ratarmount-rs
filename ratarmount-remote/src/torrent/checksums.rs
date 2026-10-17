@@ -12,6 +12,14 @@ use super::metainfo::{invalid, Metainfo};
 use super::{hub_file, web_seed_url};
 use crate::HfRepo;
 
+pub(super) type HubHashes = BTreeMap<(String, String), (u64, String)>;
+
+#[derive(Default)]
+pub(super) struct Observations {
+    pub checks: Hashes,
+    pub hub: HubHashes,
+}
+
 type Hashes = BTreeMap<String, [u8; 32]>;
 const MAX_HASHES: u64 = 64 * 1024 * 1024;
 
@@ -83,7 +91,7 @@ fn cached(meta: &Metainfo, dir: &Path, source: &str) -> Hashes {
     read().unwrap_or_default()
 }
 
-fn save(meta: &Metainfo, dir: &Path, source: &str, hashes: &Hashes) -> io::Result<()> {
+pub(super) fn save(meta: &Metainfo, dir: &Path, source: &str, hashes: &Hashes) -> io::Result<()> {
     if hashes.is_empty() {
         return Ok(());
     }
@@ -123,8 +131,9 @@ fn load_with(meta: &Metainfo, dir: &Path, mut fetch: impl FnMut(&str, bool) -> H
     for (source, (pirate, paths)) in sources {
         let mut hashes = cached(meta, dir, &source);
         // A partial observation must not permanently suppress later discoveries.
-        if paths.iter().any(|(_, p)| !hashes.contains_key(p)) {
-            hashes.extend(fetch(&source, pirate));
+        let fresh = fetch(&source, pirate);
+        if !fresh.is_empty() {
+            hashes.extend(fresh);
             if let Err(e) = save(meta, dir, &source, &hashes) {
                 log::warn!("torrent checksum cache: {e}");
             }
@@ -138,14 +147,24 @@ fn load_with(meta: &Metainfo, dir: &Path, mut fetch: impl FnMut(&str, bool) -> H
     result
 }
 
-pub(super) fn load(meta: &Metainfo, dir: &Path) -> Hashes {
-    load_with(meta, dir, |repo_url, pirate| {
+pub(super) fn cached_only(meta: &Metainfo, dir: &Path) -> Hashes {
+    load_with(meta, dir, |_, _| Hashes::new())
+}
+
+pub(super) fn load(meta: &Metainfo, dir: &Path) -> Observations {
+    let mut hub = HubHashes::new();
+    let checks = load_with(meta, dir, |repo_url, pirate| {
         let mut hashes: Hashes =
-            match HfRepo::resolve(repo_url).and_then(|repo| repo.torrent_sha256s()) {
-                Ok(hashes) => hashes
-                    .into_iter()
-                    .filter_map(|(p, h)| Some((p, digest(&h)?)))
-                    .collect(),
+            match HfRepo::resolve(repo_url).and_then(|repo| repo.torrent_oids()) {
+                Ok(oids) => {
+                    hub.extend(
+                        oids.iter()
+                            .map(|(path, oid)| ((repo_url.into(), path.clone()), oid.clone())),
+                    );
+                    oids.into_iter()
+                        .filter_map(|(path, (_, oid))| Some((path, digest(&oid)?)))
+                        .collect()
+                }
                 Err(e) => {
                     log::warn!("torrent Hub checksum lookup: {e}");
                     Hashes::new()
@@ -167,7 +186,8 @@ pub(super) fn load(meta: &Metainfo, dir: &Path) -> Hashes {
             }
         }
         hashes
-    })
+    });
+    Observations { checks, hub }
 }
 
 #[cfg(test)]
@@ -230,10 +250,7 @@ mod tests {
         });
         assert_eq!(calls, 1);
         assert_eq!(hashes["file"], [3; 32]);
-        assert_eq!(
-            load_with(&meta, dir.path(), |_, _| panic!("complete cache refetched")),
-            hashes
-        );
+        assert_eq!(load_with(&meta, dir.path(), |_, _| Hashes::new()), hashes);
     }
 
     /// Regression: absent v1 identity and an absent manifest infohash matched for a v2-only torrent.

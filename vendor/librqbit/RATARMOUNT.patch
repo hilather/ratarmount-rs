@@ -1,0 +1,100 @@
+--- a/src/storage/mod.rs
++++ b/src/storage/mod.rs
+@@ -118,6 +118,12 @@
+ }
+ 
+ pub trait TorrentStorage: Send + Sync {
++    /// Cache-backed seed storage starts with no HAVE bits and imports individual
++    /// pieces with TorrentStateLive::recheck_external_piece. Never enables downloads.
++    fn externally_populated(&self) -> bool {
++        false
++    }
++
+     // Create/open files etc.
+     fn init(
+         &mut self,
+@@ -171,6 +177,10 @@
+ }
+ 
+ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
++    fn externally_populated(&self) -> bool {
++        (**self).externally_populated()
++    }
++
+     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+         (**self).pread_exact(file_id, offset, buf)
+     }
+--- a/src/torrent_state/initializing.rs
++++ b/src/torrent_state/initializing.rs
+@@ -217,8 +217,23 @@
+                     .shared
+                     .spawner
+                     .block_in_place_with_semaphore(|| {
+-                        FileOps::new(&self.metadata.info, &self.files, &self.metadata.file_infos)
++                        if self.files.externally_populated() {
++                            anyhow::ensure!(
++                                self.only_files.as_ref().is_some_and(|f| f.is_empty()),
++                                "external cache requires no selected downloads"
++                            );
++                            Ok(crate::type_aliases::BF::from_boxed_slice(
++                                vec![0; self.metadata.lengths().piece_bitfield_bytes()]
++                                    .into_boxed_slice(),
++                            ))
++                        } else {
++                            FileOps::new(
++                                &self.metadata.info,
++                                &self.files,
++                                &self.metadata.file_infos,
++                            )
+                             .initial_check(&self.checked_bytes, &self.pause_requested)
++                        }
+                     })
+                     .await?;
+                 bitv_factory
+--- a/src/torrent_state/live/mod.rs
++++ b/src/torrent_state/live/mod.rs
+@@ -693,6 +693,44 @@
+         self.peers.with_peer_mut(handle, "set_peer_live", |p| {
+             p.connecting_to_live(h.peer_id, &self.peers, connection_kind);
+         });
++    }
++
++    /// Import one externally populated seed piece without resetting the torrent.
++    /// Hashes through storage before setting HAVE; existing HAVE bits are untouched.
++    /// Caller must use this only for read-only external storage with no downloads.
++    pub fn recheck_external_piece(&self, index: u32) -> anyhow::Result<bool> {
++        anyhow::ensure!(
++            self.files.externally_populated(),
++            "not external seed storage"
++        );
++        let id = self.lengths.try_validate_piece_index(index)?;
++        {
++            let g = self.lock_read("external_piece");
++            let chunks = g.get_chunks()?;
++            anyhow::ensure!(
++                !chunks.get_selected_pieces().any(),
++                "external seed has selected downloads"
++            );
++            if chunks.is_piece_have(id) {
++                return Ok(false);
++            }
++        }
++        if !self.file_ops().check_piece(id)? {
++            return Ok(false);
++        }
++        {
++            let mut g = self.lock_write("external_piece");
++            if g.get_chunks()?.is_piece_have(id) {
++                return Ok(false);
++            }
++            g.get_pieces_mut()?.mark_piece_hash_ok(id);
++        }
++        self.stats
++            .have_bytes
++            .fetch_add(self.lengths.piece_length(id) as u64, Ordering::Relaxed);
++        self.on_piece_completed(id)?;
++        self.transmit_haves(id);
++        Ok(true)
+     }
+ 
+     pub fn get_uploaded_bytes(&self) -> u64 {

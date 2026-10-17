@@ -69,6 +69,15 @@ impl Pieces {
         if bytes.len() > CAP {
             return;
         }
+        if let Some(index) = self
+            .values
+            .iter()
+            .position(|(existing, _)| *existing == key)
+        {
+            if let Some((_, old)) = self.values.remove(index) {
+                self.bytes -= old.len();
+            }
+        }
         while self.values.len() >= 4 || self.bytes + bytes.len() > CAP {
             if let Some((_, bytes)) = self.values.pop_front() {
                 self.bytes -= bytes.len();
@@ -76,5 +85,24 @@ impl Pieces {
         }
         self.bytes += bytes.len();
         self.values.push_back((key, bytes));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Regression: concurrent seed/cache checks duplicated a piece and inflated the working-set byte count.
+    #[test]
+    fn regression_seed_cache_insert_replaces_existing_piece() {
+        let key = Piece {
+            file: None,
+            index: 0,
+        };
+        let mut pieces = Pieces::default();
+        pieces.insert(key, Arc::new(vec![1; 7]));
+        pieces.insert(key, Arc::new(vec![2; 3]));
+        assert_eq!(pieces.bytes, 3);
+        assert_eq!(pieces.values.len(), 1);
+        assert_eq!(pieces.get(key).unwrap().as_slice(), &[2; 3]);
     }
 }

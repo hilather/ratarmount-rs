@@ -414,19 +414,63 @@ fn torrent_auth(config: &Config, url: &str) -> HttpAuthOptions {
 impl HfRepo {
     /// Torrent verification shares the pinned tree API and Hub credential rules.
     #[cfg(feature = "bittorrent")]
-    pub(crate) fn torrent_sha256s(&self) -> Result<BTreeMap<String, String>> {
-        let Some(tree) = self.tree()? else {
+    pub(crate) fn torrent_oids(&self) -> Result<BTreeMap<String, (u64, String)>> {
+        if self.commit != self.location.revision
+            || !(self.commit.len() == 40 && self.commit.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(error(
+                "torrent Hub authorization requires the exact pinned commit",
+            ));
+        }
+        // Authorization must be a fresh authenticated Hub observation. The tree
+        // cache and torrent checksum caches are useful for reads, not publication.
+        let mut fresh = self.clone();
+        fresh.config.cache = None;
+        let Some(tree) = fresh.tree()? else {
             return Ok(BTreeMap::new());
         };
-        let _ = HfListing::new(self.clone(), &tree)?;
-        Ok(self
-            .hashes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|((commit, _), _)| commit == &self.commit)
-            .map(|((_, path), hash)| (path.clone(), hash.clone()))
+        entries(&tree)?;
+        Ok(tree
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                if item["type"].as_str()? != "file" {
+                    return None;
+                }
+                let lfs = !item["lfs"].is_null();
+                let oid = if lfs {
+                    item["lfs"]["oid"].as_str()?
+                } else {
+                    item["oid"].as_str()?
+                };
+                let oid = oid.strip_prefix("sha256:").unwrap_or(oid);
+                if oid.len() != if lfs { 64 } else { 40 }
+                    || !oid.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return None;
+                }
+                Some((
+                    item["path"].as_str()?.into(),
+                    (item["size"].as_u64()?, oid.to_ascii_lowercase()),
+                ))
+            })
             .collect())
+    }
+
+    #[cfg(all(test, feature = "bittorrent"))]
+    pub(crate) fn torrent_test_repo(input: &str, endpoint: &str) -> Result<Self> {
+        Self::with_config(
+            parse_hf_url(input)?,
+            Config {
+                endpoint: Url::parse(endpoint).unwrap(),
+                token: Some(SecretString::new("hf_test_secret".into())),
+                cache: None,
+                offline: false,
+                hub_cache: None,
+                range_cache: None,
+            },
+        )
     }
 
     #[cfg(all(test, feature = "bittorrent"))]

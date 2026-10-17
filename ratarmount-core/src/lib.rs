@@ -20,6 +20,8 @@ pub enum TorrentSwarmPolicy {
     #[default]
     Auto,
     Always,
+    /// Discover peers only on the LAN, before trying web seeds.
+    Lan,
     Never,
 }
 
@@ -29,8 +31,9 @@ impl std::str::FromStr for TorrentSwarmPolicy {
         match value {
             "auto" => Ok(Self::Auto),
             "always" => Ok(Self::Always),
+            "lan" => Ok(Self::Lan),
             "never" => Ok(Self::Never),
-            _ => Err("expected auto, always or never".into()),
+            _ => Err("expected auto, always, lan or never".into()),
         }
     }
 }
@@ -539,6 +542,12 @@ pub struct OpenOptions {
     pub torrent_swarm: TorrentSwarmPolicy,
     /// Maximum scratch bytes written by one torrent swarm session.
     pub torrent_scratch_bytes: u64,
+    /// Local service discovery is used only while a swarm session is active.
+    pub torrent_lsd: bool,
+    /// Opt in to uploads of verified pieces until the source is dropped.
+    pub torrent_seed: bool,
+    pub torrent_seed_upload_limit: u32,
+    pub torrent_listen_port: u16,
     /// Speculative decoded zstd bytes per reader; zero disables decode-ahead.
     pub zstd_readahead_bytes: u64,
     /// Drop consumed local archive pages where the backend supports advice.
@@ -587,6 +596,10 @@ impl Default for OpenOptions {
             readahead_bytes: 0,
             torrent_swarm: TorrentSwarmPolicy::Auto,
             torrent_scratch_bytes: 2 * 1024 * 1024 * 1024,
+            torrent_lsd: true,
+            torrent_seed: false,
+            torrent_seed_upload_limit: 1024 * 1024,
+            torrent_listen_port: 0,
             zstd_readahead_bytes: 16 * 1024 * 1024,
             direct_io: false,
             encoding: "utf-8".into(),
@@ -631,6 +644,10 @@ impl fmt::Debug for OpenOptions {
             .field("readahead_bytes", &self.readahead_bytes)
             .field("torrent_swarm", &self.torrent_swarm)
             .field("torrent_scratch_bytes", &self.torrent_scratch_bytes)
+            .field("torrent_lsd", &self.torrent_lsd)
+            .field("torrent_seed", &self.torrent_seed)
+            .field("torrent_seed_upload_limit", &self.torrent_seed_upload_limit)
+            .field("torrent_listen_port", &self.torrent_listen_port)
             .field("encoding", &self.encoding)
             .field("gzip_seek_point_spacing", &self.gzip_seek_point_spacing)
             .field(

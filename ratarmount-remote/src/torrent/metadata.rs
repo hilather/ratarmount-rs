@@ -152,7 +152,7 @@ pub(crate) fn save(meta: &Metainfo, dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn resolve(input: &str, options: &TorrentOptions) -> io::Result<Metainfo> {
+pub(crate) fn resolve(input: &str, options: &mut TorrentOptions) -> io::Result<Metainfo> {
     if input
         .get(..7)
         .is_some_and(|s| s.eq_ignore_ascii_case("magnet:"))
@@ -167,13 +167,23 @@ pub(crate) fn resolve(input: &str, options: &TorrentOptions) -> io::Result<Metai
             {
                 if let Ok(meta) = Metainfo::parse(bytes) {
                     if magnet.matches(&meta) {
-                        found = Some(meta);
-                        break;
+                        let preferred = magnet.v2.is_none() || meta.complete_v2();
+                        if found.is_none() || preferred {
+                            found = Some(meta);
+                        }
+                        if preferred {
+                            break;
+                        }
                     }
                 }
             }
         }
-        if found.is_none() {
+        if found
+            .as_ref()
+            .is_none_or(|m| magnet.v2.is_some() && !m.complete_v2())
+        {
+            // A hybrid's v1 exchange can omit v2 layers; keep it as fallback,
+            // but first try available full metadata when the magnet offers btmh.
             // BEP 19 ws is a payload base, not a metadata endpoint. Only probe ws
             // when it explicitly names a .torrent; never download a weight file.
             for url in magnet.sources.iter().chain(
@@ -184,8 +194,13 @@ pub(crate) fn resolve(input: &str, options: &TorrentOptions) -> io::Result<Metai
             ) {
                 if let Ok(meta) = fetch(url, options.swarm.timeout).and_then(Metainfo::parse) {
                     if magnet.matches(&meta) {
-                        found = Some(meta);
-                        break;
+                        let preferred = magnet.v2.is_none() || meta.complete_v2();
+                        if found.is_none() || preferred {
+                            found = Some(meta);
+                        }
+                        if preferred {
+                            break;
+                        }
                     }
                 }
             }
@@ -199,13 +214,7 @@ pub(crate) fn resolve(input: &str, options: &TorrentOptions) -> io::Result<Metai
                         "--torrent-swarm never: magnet metadata unavailable from cache/xs/web seed",
                     ));
                 }
-                let swarm_url = magnet.swarm_url()?;
-                let swarm = Swarm::new(
-                    options.swarm.clone(),
-                    options.metadata_dir.join("scratch"),
-                    magnet.v1.as_deref().unwrap_or("v2"),
-                )?;
-                let meta = Metainfo::parse(swarm.resolve(swarm_url)?)?;
+                let meta = Metainfo::parse(resolve_swarm(&magnet, options)?)?;
                 if !magnet.matches(&meta) {
                     return Err(invalid("magnet metadata infohash mismatch"));
                 }
@@ -246,6 +255,41 @@ pub(crate) fn resolve(input: &str, options: &TorrentOptions) -> io::Result<Metai
         }
         Ok(meta)
     }
+}
+
+fn resolve_swarm(magnet: &Magnet, options: &mut TorrentOptions) -> io::Result<Vec<u8>> {
+    let wire = magnet.swarm_url()?;
+    let mut config = options.swarm.clone();
+    config.seed = false; // metadata must authenticate before any seeding listener is started
+    if config.policy == super::TorrentSwarmPolicy::Auto && config.lsd {
+        let mut local = config.clone();
+        local.policy = super::TorrentSwarmPolicy::Lan;
+        local.announced = std::sync::Arc::default();
+        local
+            .initial_peers
+            .retain(|peer| super::swarm::is_lan(peer.ip()));
+        if let Ok(swarm) = Swarm::new(
+            local,
+            options.metadata_dir.join("scratch"),
+            magnet.v1.as_deref().unwrap(),
+        ) {
+            if let Ok(bytes) = swarm.resolve_with_timeout(
+                wire.clone(),
+                Some(config.timeout.min(std::time::Duration::from_secs(3))),
+            ) {
+                options.swarm.initial_peers.extend(swarm.metadata_peers());
+                return Ok(bytes);
+            }
+        }
+    }
+    let swarm = Swarm::new(
+        config,
+        options.metadata_dir.join("scratch"),
+        magnet.v1.as_deref().unwrap(),
+    )?;
+    let bytes = swarm.resolve(wire)?;
+    options.swarm.initial_peers.extend(swarm.metadata_peers());
+    Ok(bytes)
 }
 
 fn string(out: &mut Vec<u8>, value: &[u8]) {

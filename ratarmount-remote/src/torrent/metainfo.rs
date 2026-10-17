@@ -568,6 +568,17 @@ impl Metainfo {
         Ok(())
     }
 
+    pub fn complete_v2(&self) -> bool {
+        self.v2_hash.is_some()
+            && self
+                .files
+                .iter()
+                .filter(|f| !f.padding && f.len != 0)
+                .all(|f| f.v2.is_some())
+    }
+
+    /// Prefer the authenticated v2 identity for hybrid metadata and cache keys;
+    /// the v1 hash is retained for rqbit's v1 wire protocol only.
     pub fn identity(&self) -> &str {
         self.v2_hash.as_ref().or(self.v1_hash.as_ref()).unwrap()
     }
