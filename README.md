@@ -18,7 +18,7 @@
 
 ```bash
 ratarmount archive.tar.gz mnt/                                                # a local archive
-ratarmount -r hf://datasets/RealMattbrewer/oxford-iiit-pet-webdataset pets/   # a Hugging Face dataset
+ratarmount -r hf://datasets/RealMattBrewer/oxford-iiit-pet-webdataset pets/   # a Hugging Face dataset
 ls pets/train/train-000000.tar/ | head                                        # shards open as folders
 ```
 
@@ -59,7 +59,7 @@ read at once. That is the case ratarmount-rs is tuned for.
 ### Datasets straight from the Hub
 
 ```bash
-ratarmount -r hf://datasets/RealMattbrewer/oxford-iiit-pet-webdataset pets/
+ratarmount -r hf://datasets/RealMattBrewer/oxford-iiit-pet-webdataset pets/
 cat pets/train/train-000000.tar/Abyssinian_1.json
 ```
 
@@ -71,7 +71,7 @@ request. On a laptop with empty caches the repository mounts in 0.16 s and a
 Publish an index for your own dataset once with
 `ratarmount --publish-index hf://datasets/you/name@main/shard.tar` and every
 downloader gets the same zero-scan mount.
-[Hugging Face guide](docs/remote-hf.md) · [publish an index](docs/recipes/publish-hf-index.md) · [the demo dataset](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
+[Hugging Face guide](docs/remote-hf.md) · [publish an index](docs/recipes/publish-hf-index.md) · [the demo dataset](https://huggingface.co/datasets/RealMattBrewer/oxford-iiit-pet-webdataset)
 
 ### Models without the download
 
@@ -143,7 +143,7 @@ library, a FUSE mount, or any WebDataset reader.
 import ratarmount_rs
 from ratarmount_rs.webdataset import samples
 
-shard = ratarmount_rs.open("hf://datasets/RealMattbrewer/oxford-iiit-pet-webdataset/train/train-000000.tar")
+shard = ratarmount_rs.open("hf://datasets/RealMattBrewer/oxford-iiit-pet-webdataset/train/train-000000.tar")
 jpeg = shard.read("/Abyssinian_1.jpg")                 # one range request, no scan
 for sample in samples(["shard-0.tar.zst", "shard-1.tar.zst"], shuffle=True, seed=42):
     sample["jpg"], sample["json"]
@@ -474,7 +474,7 @@ described in [packaging](docs/packaging.md).
 
 - The Python original: [mxmlnkn/ratarmount](https://github.com/mxmlnkn/ratarmount)
 - Releases: [hilather/ratarmount-rs/releases](https://github.com/hilather/ratarmount-rs/releases)
-- Demo dataset with published indexes: [RealMattbrewer/oxford-iiit-pet-webdataset](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
+- Demo dataset with published indexes: [RealMattBrewer/oxford-iiit-pet-webdataset](https://huggingface.co/datasets/RealMattBrewer/oxford-iiit-pet-webdataset)
 
 ## License
 

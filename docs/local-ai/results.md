@@ -64,7 +64,7 @@ unmounting a real repository checkout under load.
 `benchmarks/ai/hf-dataset.py` on 2026-10-17, release build, three runs, each
 with fresh ratarmount and Hub caches and a private `HOME` so that no local
 index or token exists; one-minute load 3 to 4; run `647657dac03a`. The dataset
-is [`RealMattbrewer/oxford-iiit-pet-webdataset`](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
+is [`RealMattBrewer/oxford-iiit-pet-webdataset`](https://huggingface.co/datasets/RealMattBrewer/oxford-iiit-pet-webdataset)
 at commit `90c62369`, and the shard is `train/train-000000.tar` (128 MiB,
 3,954 members).
 

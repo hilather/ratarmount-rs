@@ -2334,7 +2334,7 @@ mod tests {
             "HF_TOKEN_PATH",
             dir.path().join("no-token").to_str().unwrap(),
         );
-        let url = "hf://datasets/RealMattbrewer/oxford-iiit-pet-webdataset";
+        let url = "hf://datasets/RealMattBrewer/oxford-iiit-pet-webdataset";
         let mut opts = OpenOptions {
             index_folders: empty_index_folders(dir.path()),
             ..Default::default()
