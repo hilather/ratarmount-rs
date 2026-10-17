@@ -26,6 +26,8 @@ pub type OpenNestedFn = Arc<dyn Fn(&Path) -> io::Result<Arc<dyn MountSource>> + 
 /// Context for nested reader open (identity + durable outer index home).
 #[derive(Clone, Debug)]
 pub struct NestedOpenContext {
+    /// True when the member is in the original source, not another nested archive.
+    pub parent_is_root: bool,
     /// Uncompressed nested member size from the parent file table.
     pub member_size: u64,
     /// Parent index `offsetheader` when available.
@@ -44,6 +46,7 @@ pub struct NestedOpenContext {
 impl Default for NestedOpenContext {
     fn default() -> Self {
         Self {
+            parent_is_root: false,
             member_size: 0,
             offsetheader: None,
             member_path: String::new(),
@@ -79,6 +82,8 @@ const TAG_PREFIX: &str = "automount:";
 pub struct AutoMountOptions {
     /// Mount on first access instead of scanning the whole tree up front.
     pub lazy: bool,
+    /// List remote shards without opening all their indexes; open on lookup only.
+    pub lazy_listing: bool,
     /// Mount `archive.tar` at `archive/` (strip last archive-like extension).
     pub strip_recursive_extension: bool,
     /// `(pattern, replacement)` applied to the full archive path for the mount point.
@@ -454,6 +459,7 @@ pub struct AutoMountLayer {
     /// Optional no-tmp nested open (TAR/7z/ZIP from parent member stream).
     open_nested_reader: Option<OpenNestedReaderFn>,
     lazy: bool,
+    lazy_listing: bool,
     strip_ext: bool,
     ext_set: RecursiveExtSet,
     transform: Option<(Regex, String)>,
@@ -518,6 +524,7 @@ impl AutoMountLayer {
             open_nested,
             open_nested_reader,
             lazy: opts.lazy,
+            lazy_listing: opts.lazy_listing,
             strip_ext: opts.strip_recursive_extension,
             ext_set: opts.recursive_extensions,
             transform,
@@ -789,6 +796,7 @@ impl AutoMountLayer {
                             _ => None,
                         });
                         let ctx = NestedOpenContext {
+                            parent_is_root: mp == "/",
                             member_size: fi.size,
                             offsetheader: oh,
                             member_path: rest.clone(),
@@ -931,72 +939,34 @@ impl AutoMountLayer {
         if !self.lazy {
             return;
         }
+        // Open outer archives before their children. Walking parents backwards
+        // misses inner.tar on the first lookup of outer.tar/inner.tar/member.
         let path = normpath(path);
-        if path == "/" {
-            return;
-        }
-        {
-            let mounted = self.mounted.lock().expect("automount mutex");
-            if mounted.contains_key(&path) {
-                return;
+        let mut prefix = String::new();
+        for name in path.split('/').filter(|name| !name.is_empty()) {
+            prefix.push('/');
+            prefix.push_str(name);
+            if !is_archive_filename_with(name, &self.ext_set) {
+                continue;
             }
-            // Also check if any parent path is already a mount and path is inside it.
-        }
-        let name = Path::new(&path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if !is_archive_filename_with(name, &self.ext_set) {
-            // Path might be inside an unmounted archive: try each path prefix that is an archive.
-            let mut prefix = path.clone();
-            while let Some(idx) = prefix.rfind('/') {
-                if idx == 0 {
-                    break;
-                }
-                let cand = &prefix[..=idx.min(prefix.len() - 1)];
-                let _ = cand;
-                // walk parents
-                let parent = &prefix[..idx];
-                let pname = Path::new(parent)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-                if is_archive_filename_with(pname, &self.ext_set) {
-                    let depth = self.depth_at(parent);
-                    if depth < self.max_depth {
-                        self.try_mount_file(parent, depth + 1);
-                    }
-                }
-                prefix = parent.to_string();
-                if prefix.is_empty() || prefix == "/" {
-                    break;
-                }
+            if self
+                .mounted
+                .lock()
+                .expect("automount mutex")
+                .contains_key(&prefix)
+            {
+                continue;
             }
-            return;
-        }
-        let depth = self.depth_at(&path);
-        if depth >= self.max_depth {
-            return;
-        }
-        // Parent depth
-        let parent = Path::new(&path)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "/".into());
-        let parent = if parent.is_empty() {
-            "/".to_string()
-        } else {
-            parent
-        };
-        let depth = self.depth_at(&parent);
-        if depth < self.max_depth {
-            self.try_mount_file(&path, depth + 1);
+            let depth = self.depth_at(&prefix);
+            if depth < self.max_depth {
+                self.try_mount_file(&prefix, depth + 1);
+            }
         }
     }
 
     /// Lazy: when listing a directory, mount archive children so they appear as dirs.
     fn ensure_lazy_children(&self, path: &str) {
-        if !self.lazy {
+        if !self.lazy || self.lazy_listing {
             return;
         }
         let depth = self.depth_at(path);
@@ -1067,6 +1037,23 @@ impl AutoMountLayer {
                 };
             }
         }
+        let (mp, _) = mounted.find_mounted_in(parent);
+        let depth = mounted.get(mp).map_or(0, |m| m.depth);
+        if self.lazy_listing
+            && depth < self.max_depth
+            && mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFDIR
+            && is_archive_filename_with(&name, &self.ext_set)
+        {
+            return CheapDirent {
+                name: if self.strip_ext {
+                    strip_archive_extension(&name)
+                } else {
+                    name
+                },
+                mode: (mode & 0o7777) | ratarmount_core::S_IFDIR,
+                size: 0,
+            };
+        }
         CheapDirent { name, mode, size }
     }
 }
@@ -1100,44 +1087,22 @@ impl MountSource for AutoMountLayer {
                 // If strip_ext, rename archive keys to stripped names when mounted there.
                 let mut remapped = std::collections::BTreeMap::new();
                 for (name, mut fi) in map {
-                    let full = join(&path, &name);
-                    let mut key = name;
-                    if mounted.contains_key(&full) {
-                        fi.mode = (fi.mode & 0o7777) | ratarmount_core::S_IFDIR;
-                        fi.size = 0;
-                    } else if self.strip_ext && is_archive_filename_with(&key, &self.ext_set) {
-                        let stripped = strip_archive_extension(&key);
-                        let alt = join(&path, &stripped);
-                        if mounted.contains_key(&alt) {
-                            key = stripped;
-                            fi.mode = (fi.mode & 0o7777) | ratarmount_core::S_IFDIR;
-                            fi.size = 0;
-                        }
-                    }
-                    remapped.insert(key, Self::tag(fi, mp));
+                    let child = self.remap_child(name, fi.mode, fi.size, &path, &mounted);
+                    fi.mode = child.mode;
+                    fi.size = child.size;
+                    remapped.insert(child.name, Self::tag(fi, mp));
                 }
                 Some(ListResult::Infos(remapped))
             }
             ListResult::Names(names) => {
                 let mut map = std::collections::BTreeMap::new();
                 for name in names {
-                    let full = join(&path, &name);
                     let child_rest = join(&rest, &name);
                     if let Some(mut fi) = src.lookup(&child_rest, 0) {
-                        let mut key = name;
-                        if mounted.contains_key(&full) {
-                            fi.mode = (fi.mode & 0o7777) | ratarmount_core::S_IFDIR;
-                            fi.size = 0;
-                        } else if self.strip_ext && is_archive_filename_with(&key, &self.ext_set) {
-                            let stripped = strip_archive_extension(&key);
-                            let alt = join(&path, &stripped);
-                            if mounted.contains_key(&alt) {
-                                key = stripped;
-                                fi.mode = (fi.mode & 0o7777) | ratarmount_core::S_IFDIR;
-                                fi.size = 0;
-                            }
-                        }
-                        map.insert(key, Self::tag(fi, mp));
+                        let child = self.remap_child(name, fi.mode, fi.size, &path, &mounted);
+                        fi.mode = child.mode;
+                        fi.size = child.size;
+                        map.insert(child.name, Self::tag(fi, mp));
                     }
                 }
                 Some(ListResult::Infos(map))
@@ -2037,6 +2002,44 @@ mod tests {
         assert_eq!(opened.load(Ordering::SeqCst), 2);
         assert!(layer.lookup("/late.tar", 0).is_some());
         assert!(layer.lookup("/also.tar", 0).is_some());
+    }
+
+    /// Regression: listing a remote folder opened every shard before first access.
+    #[test]
+    fn regression_lazy_listing_opens_only_the_accessed_archive() {
+        for strip in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            for name in ["one.tar", "two.tar"] {
+                fs::write(dir.path().join(name), b"x").unwrap();
+            }
+            let opened = Arc::new(AtomicUsize::new(0));
+            let count = opened.clone();
+            let root = Arc::new(crate::folder::FolderMountSource::new(dir.path()).unwrap());
+            let layer = AutoMountLayer::new_with_options(
+                root,
+                1,
+                Arc::new(move |_| {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    Ok(Arc::new(EmptyNested))
+                }),
+                AutoMountOptions {
+                    lazy: true,
+                    lazy_listing: true,
+                    strip_recursive_extension: strip,
+                    ..Default::default()
+                },
+            );
+            let dents = layer.list_dirents("/").unwrap();
+            let name = if strip { "one" } else { "one.tar" };
+            assert!(dents
+                .iter()
+                .any(|d| d.name == name
+                    && d.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR));
+            assert!(layer.list("/").is_some());
+            assert_eq!(opened.load(Ordering::Relaxed), 0);
+            assert!(layer.lookup(&format!("/{name}"), 0).is_some());
+            assert_eq!(opened.load(Ordering::Relaxed), 1);
+        }
     }
 
     /// Nested content under parallel-mounted archives is still reachable.

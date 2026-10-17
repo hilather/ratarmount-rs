@@ -868,13 +868,29 @@ fn open_hf_input(
     opts: &mut OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
+    nested: &mut Option<ratarmount_compositing::OpenNestedReaderFn>,
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
     let repo = ratarmount_remote::HfRepo::resolve(input).map_err(|e| e.to_string())?;
     eprintln!("hf: {input} commit {}", repo.commit);
     let label = repo.resolve_url(&repo.location.path);
     if let Some(source) = repo.folder().map_err(|e| e.to_string())? {
+        *nested = Some(folder_nested_reader_fn(
+            FolderRemote::Hf(Box::new(repo)),
+            opts.clone(),
+            recreate,
+        ));
         return Ok((PathBuf::from(label), source));
     }
+    open_hf_file(&repo, opts, recreate, remotes)
+}
+
+fn open_hf_file(
+    repo: &ratarmount_remote::HfRepo,
+    opts: &mut OpenOptions,
+    recreate: bool,
+    remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
+) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+    let label = repo.resolve_url(&repo.location.path);
     let range = repo
         .open_file(&repo.location.path)
         .map_err(|e| e.to_string())?;
@@ -904,7 +920,7 @@ fn open_hf_input(
             .as_ref()
             .is_some_and(|p| path_is_nonempty_file(p))
     {
-        apply_hf_index_discovery(&repo, opts, len, index_path.as_deref())?;
+        apply_hf_index_discovery(repo, opts, len, index_path.as_deref())?;
     }
     let opened = open_from_live_range(range, len, &label, opts, rebuild, "HF Range", || {
         repo.open_file(&repo.location.path)
@@ -935,7 +951,10 @@ fn open_hf_input(
     }
     Ok((
         path,
-        Arc::new(ratarmount_remote::HfMountSource::new(source, repo.commit)),
+        Arc::new(ratarmount_remote::HfMountSource::new(
+            source,
+            repo.commit.clone(),
+        )),
     ))
 }
 
@@ -1025,11 +1044,22 @@ fn apply_hf_index_discovery(
 }
 
 /// Open a remote URL: folder probe, live Range, OCI layer union, else materialize.
+#[cfg(test)]
 pub(super) fn open_remote_input(
     input: &str,
     opts: &mut OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
+) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+    open_remote_input_with_nested(input, opts, recreate, remotes, &mut None)
+}
+
+pub(super) fn open_remote_input_with_nested(
+    input: &str,
+    opts: &mut OpenOptions,
+    recreate: bool,
+    remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
+    nested: &mut Option<ratarmount_compositing::OpenNestedReaderFn>,
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
     use ratarmount_remote::{
         open_azure_range, open_ftp_range, open_gcs_range, open_ipfs, open_rclone, open_s3_range,
@@ -1077,7 +1107,7 @@ pub(super) fn open_remote_input(
     }
 
     if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf") {
-        return open_hf_input(input, opts, recreate, remotes);
+        return open_hf_input(input, opts, recreate, remotes, nested);
     }
 
     if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("restic") {
@@ -1085,6 +1115,16 @@ pub(super) fn open_remote_input(
     }
 
     if let Some(ms) = try_open_remote_folder_url(input)? {
+        if matches!(
+            ratarmount_remote::remote_url_scheme(input).as_deref(),
+            Some("s3" | "http" | "https")
+        ) {
+            *nested = Some(folder_nested_reader_fn(
+                FolderRemote::Url(input.to_owned()),
+                opts.clone(),
+                recreate,
+            ));
+        }
         return Ok((PathBuf::from(input), ms));
     }
 
@@ -1417,6 +1457,76 @@ pub(super) fn try_open_dropbox_folder(input: &str) -> Result<Option<Arc<dyn Moun
             Ok(None)
         }
     }
+}
+
+enum FolderRemote {
+    Hf(Box<ratarmount_remote::HfRepo>),
+    Url(String),
+}
+
+/// Keep the resolved repo (and its probe/redirect cache) alive across lazy shard opens.
+fn folder_nested_reader_fn(
+    remote: FolderRemote,
+    options: OpenOptions,
+    recreate: bool,
+) -> ratarmount_compositing::OpenNestedReaderFn {
+    let fallback = super::open_nested_reader_fn(options.clone());
+    Arc::new(move |mut reader, label, ctx| {
+        if !ctx.parent_is_root {
+            return fallback(reader, label, ctx);
+        }
+        // Only route formats handled by the live-range opener through remote
+        // discovery. Other formats keep their no-spool nested reader instead
+        // of first downloading an unnecessary whole-file temporary copy.
+        let mut magic = [0; 512];
+        let n = reader.read(&mut magic)?;
+        reader.seek(SeekFrom::Start(0))?;
+        if !matches!(
+            super::probe_archive_magic(&magic[..n]),
+            "tar" | "zip" | "gzip" | "bzip2" | "xz" | "zstd"
+        ) {
+            return fallback(reader, label, ctx);
+        }
+        let mut opts = options.clone();
+        // A folder's explicit index belongs to no individual shard. Resolve each
+        // member independently; never overwrite one shard with another's table.
+        opts.index_file_path = None;
+        opts.index_compact_only = false;
+        opts.index_build.cancel = None;
+        let mut remotes = Vec::new();
+        let opened = match &remote {
+            FolderRemote::Hf(repo) => {
+                let mut member = repo.clone();
+                member.location.path = [
+                    repo.location.path.trim_matches('/'),
+                    ctx.member_path.trim_start_matches('/'),
+                ]
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+                open_hf_file(&member, &mut opts, recreate, &mut remotes)
+            }
+            FolderRemote::Url(root) => {
+                let url = format!(
+                    "{}/{}",
+                    root.trim_end_matches('/'),
+                    ctx.member_path.trim_start_matches('/')
+                );
+                open_remote_input_with_nested(&url, &mut opts, recreate, &mut remotes, &mut None)
+            }
+        };
+        match opened {
+            Ok((_, source)) if remotes.is_empty() => Ok(source),
+            // Formats requiring materialization retain the normal AutoMount
+            // spool owner, whose lifetime is tied to the nested mount.
+            Ok(_) => fallback(reader, label, ctx),
+            Err(error) => {
+                log::debug!("remote nested opener for {}: {error}", label.display());
+                fallback(reader, label, ctx)
+            }
+        }
+    })
 }
 
 /// Torrent siblings are already authenticated by the parent piece hashes. Only
@@ -1832,6 +1942,9 @@ mod tests {
     fn bind_hf(http: &IndexHttp, cache: &Path) -> SmbEnv {
         let env = SmbEnv::acquire(&[
             "HF_ENDPOINT",
+            "XDG_CACHE_HOME",
+            "HF_HUB_CACHE",
+            "RATARMOUNT_HF_SHARE_CACHE",
             "HF_TOKEN",
             "HUGGING_FACE_HUB_TOKEN",
             "HF_TOKEN_PATH",
@@ -1840,6 +1953,9 @@ mod tests {
             "TRANSFORMERS_OFFLINE",
             "RATARMOUNT_HF_TREE_CACHE",
         ]);
+        env.set("XDG_CACHE_HOME", cache.join("xdg"));
+        env.set("HF_HUB_CACHE", cache.join("hub"));
+        env.set("RATARMOUNT_HF_SHARE_CACHE", "0");
         env.set("HF_ENDPOINT", format!("http://{}", http.addr));
         env.set("HF_TOKEN_PATH", cache.join("no-token"));
         env.set("RATARMOUNT_HF_TREE_CACHE", cache.join("tree"));
@@ -1876,6 +1992,383 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         bytes
+    }
+
+    fn many_member_tar() -> Vec<u8> {
+        let mut tar = Vec::new();
+        let bytes = vec![42; 32 * 1024];
+        for i in 0..3000 {
+            ratarmount_formats_tar::write_ustar_members(
+                &mut tar,
+                &[ratarmount_formats_tar::UstarMember {
+                    xattrs: &[],
+                    path: &format!("sample-{i:04}.bin"),
+                    payload: ratarmount_formats_tar::UstarPayload::File { bytes: &bytes },
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                }],
+            )
+            .unwrap();
+        }
+        ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
+        tar
+    }
+
+    /// Regression: remote TAR seeks issued one GET per header instead of one per chunk.
+    #[test]
+    fn regression_remote_tar_3000_headers_use_chunk_requests() {
+        for hf in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let tar = many_member_tar();
+            let size = tar.len();
+            let path = if hf {
+                format!("/datasets/org/data/resolve/{HF_SHA}/a.tar")
+            } else {
+                "/a.tar".into()
+            };
+            let objects = std::collections::HashMap::from([(
+                "/api/datasets/org/data/revision/main".into(),
+                format!(r#"{{"sha":"{HF_SHA}"}}"#).into_bytes(),
+            )]);
+            let http = spawn_index_http(&path, tar, objects, None, None);
+            let _env = bind_hf(&http, dir.path());
+            let url = if hf {
+                "hf://datasets/org/data/a.tar".into()
+            } else {
+                format!("http://{}/a.tar", http.addr)
+            };
+            let mut opts = OpenOptions {
+                index_in_memory: true,
+                write_index: false,
+                ..Default::default()
+            };
+            let bundle =
+                super::super::build_mount_source(&[PathBuf::from(url)], &mut opts, true, false)
+                    .unwrap();
+            assert!(bundle.source.lookup("/sample-2999.bin", 0).is_some());
+            let requests = http
+                .range_gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == &path)
+                .count();
+            eprintln!(
+                "remote TAR hf={hf}: {size} bytes, 3000 members, {requests} archive Range GETs"
+            );
+            assert!(
+                requests <= 2 * size.div_ceil(4 * 1024 * 1024) + 12,
+                "{requests} requests for {size} bytes"
+            );
+        }
+    }
+
+    /// Regression: repo mounts scanned shards and ignored published sibling indexes.
+    #[test]
+    fn regression_hf_repo_published_index_lazy_zero_scan() {
+        for pointer in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let tar = dir.path().join("shard.tar");
+            fs::write(&tar, hf_tar("hello.txt", b"published shard")).unwrap();
+            let sidecar = dir.path().join("published.sqlite");
+            super::super::open_path(
+                &tar,
+                &OpenOptions {
+                    index_file_path: Some(sidecar.clone()),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+            let bytes = fs::read(sidecar).unwrap();
+            let body = fs::read(&tar).unwrap();
+            let path = format!("/datasets/org/data/resolve/{HF_SHA}/train/shard.tar");
+            let sibling = if pointer {
+                format!(
+                    "{path}.index.{}.sqlite",
+                    ratarmount_index::sha256_hex(&bytes)
+                )
+            } else {
+                format!("{path}.index.sqlite")
+            };
+            let mut objects = std::collections::HashMap::from([
+                ("/api/datasets/org/data/revision/main".into(), format!(r#"{{"sha":"{HF_SHA}"}}"#).into_bytes()),
+                (format!("/api/datasets/org/data/tree/{HF_SHA}"), format!(r#"[{{"type":"file","path":"train/shard.tar","size":{}}},{{"type":"file","path":"train/untouched.tar","size":{}}}]"#, body.len(), body.len()).into_bytes()),
+                (sibling.clone(), bytes.clone()),
+            ]);
+            if pointer {
+                objects.insert(format!("{path}.index.ptr"), pointer_json_for_blob(&bytes));
+                let tree = objects[&format!("/api/datasets/org/data/tree/{HF_SHA}")].clone();
+                objects.insert(format!("/api/datasets/org/data/tree/{HF_SHA}/train"), tree);
+            }
+            let input = if pointer {
+                "hf://datasets/org/data/train"
+            } else {
+                "hf://datasets/org/data"
+            };
+            let folder = if pointer { "/" } else { "/train" };
+            let member = if pointer {
+                "/shard.tar/hello.txt"
+            } else {
+                "/train/shard.tar/hello.txt"
+            };
+            let http = spawn_index_http(&path, body, objects, None, None);
+            let _env = bind_hf(&http, dir.path());
+            let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = builds.clone();
+            let mut options = OpenOptions {
+                index_folders: empty_index_folders(dir.path()),
+                ..Default::default()
+            };
+            options.index_build.on_progress = Some(Arc::new(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }));
+            let bundle =
+                super::super::build_mount_source(&[input.into()], &mut options, false, true)
+                    .unwrap();
+            let dents = bundle.source.list_dirents(folder).unwrap();
+            assert!(dents.iter().any(|d| d.name == "shard.tar"
+                && d.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR));
+            assert!(
+                !http
+                    .gets
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.contains("/resolve/")),
+                "mount/list must not open any shard"
+            );
+            let fi = bundle.source.lookup(member, 0).unwrap();
+            let mut read = bundle.source.open(&fi, 0).unwrap();
+            let mut got = Vec::new();
+            read.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"published shard");
+            assert_eq!(
+                builds.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "published index must avoid every index build"
+            );
+            let gets = http.gets.lock().unwrap();
+            assert!(gets.contains(&sibling));
+            assert!(!gets.iter().any(|p| p.contains("untouched")));
+            assert_eq!(gets.iter().filter(|p| p.contains("/revision/")).count(), 1);
+            let downloads = gets.iter().filter(|p| *p == &sibling).count();
+            drop(gets);
+            drop(read);
+            drop(bundle);
+            // Force metadata-cache reuse rather than just the installed local index.
+            for file in fs::read_dir(&options.index_folders[0]).unwrap() {
+                fs::remove_file(file.unwrap().path()).unwrap();
+            }
+            let warm = super::super::build_mount_source(&[input.into()], &mut options, false, true)
+                .unwrap();
+            assert!(warm.source.lookup(member, 0).is_some());
+            assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert_eq!(
+                http.gets
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|p| *p == &sibling)
+                    .count(),
+                downloads
+            );
+        }
+    }
+
+    /// Regression: HTTP folder shards bypassed sibling discovery, including stale-index validation.
+    #[test]
+    fn regression_http_folder_sibling_index_validated_without_scanning() {
+        for stale in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let tar = dir.path().join("shard.tar");
+            fs::write(&tar, hf_tar("hello.txt", b"original")).unwrap();
+            let index = dir.path().join("published.sqlite");
+            super::super::open_path(
+                &tar,
+                &OpenOptions {
+                    index_file_path: Some(index.clone()),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+            let body = hf_tar("hello.txt", if stale { b"replaced" } else { b"original" });
+            let objects = std::collections::HashMap::from([
+                ("/repo/".into(), br#"<html><title>Index of /repo/</title><a href="shard.tar">shard.tar</a> 2048</html>"#.to_vec()),
+                ("/repo/shard.tar.index.sqlite".into(), fs::read(index).unwrap()),
+            ]);
+            let http = spawn_index_http("/repo/shard.tar", body, objects, None, None);
+            let _env = bind_hf(&http, dir.path());
+            let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = builds.clone();
+            let mut opts = OpenOptions {
+                index_folders: empty_index_folders(dir.path()),
+                ..Default::default()
+            };
+            opts.index_build.on_progress = Some(Arc::new(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }));
+            let bundle = super::super::build_mount_source(
+                &[format!("http://{}/repo/", http.addr).into()],
+                &mut opts,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(bundle
+                .source
+                .list_dirents("/")
+                .unwrap()
+                .iter()
+                .any(|d| d.name == "shard.tar"));
+            assert!(!http
+                .gets
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.contains("shard.tar")));
+            let fi = bundle.source.lookup("/shard.tar/hello.txt", 0).unwrap();
+            assert_eq!(
+                bundle.source.read(&fi, 8, 0).unwrap(),
+                if stale { b"replaced" } else { b"original" }
+            );
+            assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed) > 0, stale);
+        }
+    }
+
+    /// Regression: deeper archives must not be mistaken for siblings in the remote repository.
+    #[test]
+    fn regression_hf_repo_nested_archive_keeps_parent_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = hf_tar("inner.tar", &hf_tar("hello.txt", b"deep member"));
+        let path = format!("/datasets/org/data/resolve/{HF_SHA}/shard.tar");
+        let objects = std::collections::HashMap::from([
+            (
+                "/api/datasets/org/data/revision/main".into(),
+                format!(r#"{{"sha":"{HF_SHA}"}}"#).into_bytes(),
+            ),
+            (
+                format!("/api/datasets/org/data/tree/{HF_SHA}"),
+                format!(
+                    r#"[{{"type":"file","path":"shard.tar","size":{}}}]"#,
+                    body.len()
+                )
+                .into_bytes(),
+            ),
+        ]);
+        let http = spawn_index_http(&path, body, objects, None, None);
+        let _env = bind_hf(&http, dir.path());
+        let session =
+            crate::Session::open(hf_request("hf://datasets/org/data", None, true)).unwrap();
+        assert_eq!(
+            hf_read(&session, "/shard.tar/inner.tar/hello.txt"),
+            b"deep member"
+        );
+        assert!(!http
+            .gets
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.contains("/resolve/") && p.contains("inner.tar")));
+    }
+
+    /// Regression: unsupported live-range formats must keep the nested reader, not download a temp copy.
+    #[cfg(feature = "ar")]
+    #[test]
+    fn regression_remote_folder_ar_keeps_reader_without_download() {
+        let mut ar = b"!<arch>\n".to_vec();
+        ar.extend_from_slice(
+            format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                "hello.txt/", 0, 0, 0, "100644", 8
+            )
+            .as_bytes(),
+        );
+        ar.extend_from_slice(b"original");
+        let http = spawn_index_http("/repo/a.ar", ar.clone(), Default::default(), None, None);
+        let opener = folder_nested_reader_fn(
+            FolderRemote::Url(format!("http://{}/repo/", http.addr)),
+            OpenOptions::default(),
+            false,
+        );
+        let source = opener(
+            Box::new(std::io::Cursor::new(ar.clone())),
+            Path::new("a.ar"),
+            ratarmount_compositing::NestedOpenContext {
+                parent_is_root: true,
+                member_path: "/a.ar".into(),
+                member_size: ar.len() as u64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fi = source.lookup("/hello.txt", 0).unwrap();
+        assert_eq!(source.read(&fi, 8, 0).unwrap(), b"original");
+        assert!(http.gets.lock().unwrap().is_empty());
+    }
+
+    /// Regression: real Hub repo recursion must discover indexes and cold scans stay bounded.
+    #[test]
+    #[ignore = "public Hub network/timing test; set RATARMOUNT_TEST_HFREPO=1"]
+    fn regression_hf_repo_live_published_and_recreate_under_60_seconds() {
+        if std::env::var("RATARMOUNT_TEST_HFREPO").as_deref() != Ok("1") {
+            eprintln!("skip: set RATARMOUNT_TEST_HFREPO=1 to read the public Hub dataset");
+            return;
+        }
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[
+            "HF_ENDPOINT",
+            "HF_HUB_CACHE",
+            "HF_HOME",
+            "RATARMOUNT_HF_SHARE_CACHE",
+            "RATARMOUNT_HF_TREE_CACHE",
+            "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
+            "HF_TOKEN_PATH",
+        ]);
+        _env.set("RATARMOUNT_HF_SHARE_CACHE", "0");
+        let dir = tempfile::tempdir().unwrap();
+        _env.set(
+            "HF_TOKEN_PATH",
+            dir.path().join("no-token").to_str().unwrap(),
+        );
+        let url = "hf://datasets/RealMattbrewer/oxford-iiit-pet-webdataset";
+        let mut opts = OpenOptions {
+            index_folders: empty_index_folders(dir.path()),
+            ..Default::default()
+        };
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = builds.clone();
+        opts.index_build.on_progress = Some(Arc::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        let start = std::time::Instant::now();
+        let bundle =
+            super::super::build_mount_source(&[url.into()], &mut opts, false, true).unwrap();
+        let entries = bundle
+            .source
+            .list_dirents("/train/train-000000.tar")
+            .unwrap();
+        assert!(!entries.is_empty());
+        assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 0);
+        eprintln!("published nested shard: {:?}", start.elapsed());
+        assert!(start.elapsed() < std::time::Duration::from_secs(8));
+        drop(bundle);
+        opts.index_file_path = Some(dir.path().join("rebuilt.sqlite"));
+        let start = std::time::Instant::now();
+        let bundle = super::super::build_mount_source(
+            &[format!("{url}/train/train-000000.tar").into()],
+            &mut opts,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(!bundle.source.list_dirents("/").unwrap().is_empty());
+        assert!(builds.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        eprintln!("cold recreated shard: {:?}", start.elapsed());
+        assert!(start.elapsed() < std::time::Duration::from_secs(60));
     }
 
     /// Regression: offline Hub snapshots were treated as local paths; recursive shards must use their blob in place.
@@ -2654,7 +3147,18 @@ mod tests {
     struct IndexHttp {
         addr: std::net::SocketAddr,
         gets: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        _join: std::thread::JoinHandle<()>,
+        range_gets: Arc<std::sync::Mutex<Vec<String>>>,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for IndexHttp {
+        fn drop(&mut self) {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = std::net::TcpStream::connect(self.addr);
+            self.join.take().unwrap().join().unwrap();
+        }
     }
 
     fn spawn_index_http(
@@ -2701,10 +3205,17 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let gets = Arc::new(Mutex::new(Vec::new()));
         let gets_c = Arc::clone(&gets);
+        let range_gets = Arc::new(Mutex::new(Vec::new()));
+        let ranges = range_gets.clone();
         let archive_path = archive_path.to_string();
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = stopped.clone();
         let join = thread::spawn(move || {
             listener.set_nonblocking(false).ok();
-            for stream in listener.incoming().take(64) {
+            for stream in listener.incoming() {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let Ok(mut stream) = stream else { continue };
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut request_line = String::new();
@@ -2763,6 +3274,9 @@ mod tests {
                     gets_c.lock().unwrap().push(path.clone());
                 }
                 let is_head = request_line.starts_with("HEAD ");
+                if !is_head && range_hdr.is_some() {
+                    ranges.lock().unwrap().push(path.clone());
+                }
                 let is_archive = path == archive_path;
                 let body: &[u8] = if is_archive {
                     &archive_bytes
@@ -2780,7 +3294,7 @@ mod tests {
                     }
                     continue;
                 };
-                let body_owned = body.to_vec();
+                let body_owned = body;
                 let mut range_off: Option<(usize, usize)> = None;
                 if !ignore_range {
                     if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
@@ -2803,7 +3317,7 @@ mod tests {
                 }
                 let slice = match range_off {
                     Some((s, e)) => &body_owned[s..=e],
-                    None => body_owned.as_slice(),
+                    None => body_owned,
                 };
                 let status = if range_off.is_some() {
                     "206 Partial Content"
@@ -2835,7 +3349,9 @@ mod tests {
         IndexHttp {
             addr,
             gets,
-            _join: join,
+            range_gets,
+            stopped,
+            join: Some(join),
         }
     }
 
@@ -2885,7 +3401,7 @@ mod tests {
         };
         apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
             .unwrap();
-        drop(http._join);
+
         let got = opts
             .index_file_path
             .as_ref()
@@ -2931,7 +3447,7 @@ mod tests {
         };
         apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
             .unwrap();
-        drop(http._join);
+
         let got = opts
             .index_file_path
             .as_ref()
@@ -2977,7 +3493,7 @@ mod tests {
         };
         apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
             .unwrap();
-        drop(http._join);
+
         assert!(
             opts.index_file_path.is_some(),
             "describedby must still install after pointer 404"
@@ -3013,7 +3529,7 @@ mod tests {
             };
             apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
                 .unwrap();
-            drop(http._join);
+
             let got = opts
                 .index_file_path
                 .as_ref()
@@ -3066,7 +3582,7 @@ mod tests {
         };
         apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
             .unwrap();
-        drop(http._join);
+
         assert!(
             opts.index_file_path.is_some(),
             "cookie-gated pointer+blob must install"
@@ -3106,7 +3622,7 @@ mod tests {
         };
         apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
             .unwrap();
-        drop(http._join);
+
         let got = opts
             .index_file_path
             .as_ref()
@@ -3146,7 +3662,7 @@ mod tests {
         let gets = Arc::new(Mutex::new(Vec::new()));
         let gets_c = Arc::clone(&gets);
         let join = thread::spawn(move || {
-            for stream in listener.incoming().take(64) {
+            for stream in listener.incoming().take(100_000) {
                 let Ok(mut stream) = stream else { continue };
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut request_line = String::new();
@@ -3548,7 +4064,6 @@ mod tests {
                 gets2, gets1,
                 "second remount must not GET the sidecar again"
             );
-            drop(http._join);
         });
     }
 
@@ -3580,7 +4095,6 @@ mod tests {
                 .unwrap();
             let gets2 = well_known_sqlite_gets(&http.gets.lock().unwrap(), "/archive.tar");
             assert_eq!(gets2, gets1, "local nonempty sidecar must skip remote GET");
-            drop(http._join);
         });
     }
 
@@ -3623,7 +4137,6 @@ mod tests {
                 !path_is_nonempty_file(&first),
                 "stale local sidecar must be dropped so factory cannot warm-open it"
             );
-            drop(http._join);
         });
     }
 
@@ -3662,7 +4175,6 @@ mod tests {
                 !path_is_nonempty_file(dest),
                 "hash-mismatched local sidecar must be dropped"
             );
-            drop(http._join);
         });
     }
 
@@ -3810,7 +4322,6 @@ mod tests {
                 path_is_nonempty_file(dest),
                 "matching sidecar must survive HTTP 200 / ignored Range"
             );
-            drop(http._join);
         });
     }
 
@@ -3938,7 +4449,6 @@ mod tests {
                 gets2 > gets1,
                 "gzip tarstats fail must invalidate XDG and GET again (got {gets1} then {gets2})"
             );
-            drop(http._join);
         });
     }
 
@@ -3985,7 +4495,7 @@ mod tests {
                 Some(v) => std::env::set_var(ratarmount_index::LOCAL_INDEX_DIR_ENV, v),
                 None => std::env::remove_var(ratarmount_index::LOCAL_INDEX_DIR_ENV),
             }
-            drop(http._join);
+
             let got = got.expect("UserCache dest must still receive the sidecar");
             assert_eq!(got, dest, "{}", got.display());
             assert!(got.is_file(), "{}", got.display());

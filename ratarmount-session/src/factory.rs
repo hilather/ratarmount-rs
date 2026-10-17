@@ -4024,6 +4024,7 @@ pub struct CompositingOptions {
 ///
 /// `archive_path` is the outer archive path used to resolve the default on-disk
 /// index location for durable nested indexes (`nestedindexes` side table).
+#[allow(clippy::too_many_arguments)]
 fn apply_compositing(
     mut src: Arc<dyn MountSource>,
     opts: &OpenOptions,
@@ -4032,13 +4033,15 @@ fn apply_compositing(
     n_sources: usize,
     folder_hint: &str,
     archive_path: &Path,
+    folder_opener: Option<OpenNestedReaderFn>,
 ) -> Result<Arc<dyn MountSource>, String> {
     if let Some((ref pat, ref rep)) = comp.transform {
         src = Arc::new(TransformMountSource::new(pat, rep, src)?);
     }
     if comp.recursive {
         let opener = open_nested_fn(opts.clone());
-        let reader_opener = open_nested_reader_fn(opts.clone());
+        let remote_folder = folder_opener.is_some();
+        let reader_opener = folder_opener.unwrap_or_else(|| open_nested_reader_fn(opts.clone()));
         #[cfg(feature = "bittorrent")]
         let reader_opener = if archive_path.to_string_lossy().starts_with("torrent:") {
             remote_open::torrent_nested_reader_fn(src.clone(), opts.clone())
@@ -4072,7 +4075,8 @@ fn apply_compositing(
             opener,
             Some(reader_opener),
             AutoMountOptions {
-                lazy: comp.lazy,
+                lazy: comp.lazy || remote_folder,
+                lazy_listing: remote_folder,
                 strip_recursive_extension: comp.strip_recursive_extension,
                 transform: comp.transform_recursive.clone(),
                 recursive_extensions: ext_set.clone(),
@@ -4658,6 +4662,7 @@ pub fn build_mount_source_with_bindings(
             source_count,
             "corpus",
             Path::new(""),
+            None,
         )?);
     }
     let mut remotes = Vec::new();
@@ -4698,6 +4703,7 @@ pub fn build_mount_source_with_bindings(
                 source_count,
                 "dropbox",
                 Path::new(""),
+                None,
             )?;
             sources.push(match mount_path {
                 Some(prefix) => {
@@ -4709,8 +4715,15 @@ pub fn build_mount_source_with_bindings(
         }
 
         let remote = ratarmount_remote::is_remote_url(&input);
+        let mut folder_opener = None;
         let (local_path, mut src) = if remote {
-            remote_open::open_remote_input(input.as_ref(), &mut opts, recreate_src, &mut remotes)?
+            remote_open::open_remote_input_with_nested(
+                input.as_ref(),
+                &mut opts,
+                recreate_src,
+                &mut remotes,
+                &mut folder_opener,
+            )?
         } else {
             let local_path = p.clone();
             let mut plain_tar = false;
@@ -4744,6 +4757,7 @@ pub fn build_mount_source_with_bindings(
             source_count,
             folder_hint,
             &local_path,
+            folder_opener,
         )?;
         sources.push(match mount_path {
             Some(prefix) => Arc::new(PrefixMountSource::new(prefix, src)) as Arc<dyn MountSource>,
@@ -7887,6 +7901,7 @@ mod tests {
             member_path: "inner-durable.zip".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            parent_is_root: false,
             body_seek_is_cheap: true,
         };
         let cold = opener(
@@ -7980,6 +7995,7 @@ mod tests {
             member_path: "inner-durable.tar".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            parent_is_root: false,
             body_seek_is_cheap: true,
         };
         let cold = opener(
@@ -8047,6 +8063,7 @@ mod tests {
             member_path: "inner.zip".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            parent_is_root: false,
             body_seek_is_cheap: true,
         };
         let _ = opener(
@@ -8127,6 +8144,7 @@ mod tests {
                 member_path: "inner.zip".into(),
                 outer_index_path: Some(outer_idx.clone()),
                 write_nested_index: false,
+                parent_is_root: false,
                 body_seek_is_cheap: true,
             },
         )
@@ -8154,6 +8172,7 @@ mod tests {
                 member_path: "inner.zip".into(),
                 outer_index_path: None,
                 write_nested_index: true,
+                parent_is_root: false,
                 body_seek_is_cheap: true,
             },
         )
@@ -8321,6 +8340,7 @@ mod tests {
             member_path: "inner-durable.7z".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            parent_is_root: false,
             body_seek_is_cheap: true,
         };
         let cold = opener(
@@ -8408,6 +8428,7 @@ mod tests {
             member_path: "inner.cpio".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            parent_is_root: false,
             body_seek_is_cheap: true,
         };
         let cold = opener(
@@ -8473,6 +8494,7 @@ mod tests {
             member_path: "inner.a".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            parent_is_root: false,
             body_seek_is_cheap: true,
         };
         let cold = opener(
@@ -8575,6 +8597,7 @@ mod tests {
                 member_path: "inner.7z".into(),
                 outer_index_path: Some(outer_idx.clone()),
                 write_nested_index: false,
+                parent_is_root: false,
                 body_seek_is_cheap: true,
             },
         )
@@ -8596,6 +8619,7 @@ mod tests {
             member_path: "inner.7z".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            parent_is_root: false,
             body_seek_is_cheap: true,
         };
         let _ = opener(

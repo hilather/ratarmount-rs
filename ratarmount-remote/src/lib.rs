@@ -1132,6 +1132,7 @@ pub struct HttpRangeFile {
     buffered: Option<Arc<Vec<u8>>>,
     memory: Option<Arc<ratarmount_core::budget::Reservation>>,
     disk: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+    forward_window: Box<http_pool::ForwardReadWindow>,
     last_read_end: Option<u64>,
     sequential_bytes: u64,
     last_read_size: usize,
@@ -1208,6 +1209,7 @@ impl HttpRangeFile {
             buffered,
             memory: None,
             disk: None,
+            forward_window: Default::default(),
             last_read_end: None,
             sequential_bytes: 0,
             last_read_size: 0,
@@ -1234,6 +1236,7 @@ impl HttpRangeFile {
     /// Attach an identity verified by a backend, such as a resolved Hub commit.
     pub fn with_content_token(mut self, token: ContentToken) -> Self {
         self.prefetch = None;
+        self.forward_window = Default::default();
         self.source.set_content_token(token);
         self
     }
@@ -1420,6 +1423,12 @@ impl Read for HttpRangeFile {
             let start = self.pos as usize;
             let n = buf.len().min(data.len() - start);
             buf[..n].copy_from_slice(&data[start..start + n]);
+            n
+        } else if let Some(n) = self
+            .forward_window
+            .read(&self.source, self.pos, self.size, buf)?
+        {
+            self.prefetch = None;
             n
         } else {
             if self.parallel > 1

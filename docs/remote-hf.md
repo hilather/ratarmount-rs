@@ -46,6 +46,43 @@ changes. A branch or tag can move between mounts: use the printed **full SHA** i
 the URL to obtain the same bytes on a later mount. A pinned mount does not follow
 new commits while it is open.
 
+## Recursive repository indexes and cold TAR scans
+
+`-r hf://datasets/org/name` and repository subfolder mounts open archive shards
+on first access. Mounting or listing a folder does not probe every shard's index.
+For each accessed shard, ratarmount discovers `.index.ptr` and its immutable
+`.index.<sha256>.sqlite` blob, then the well-known `.index.sqlite` siblings,
+at the repository's pinned commit. It validates the index against that shard's
+size and content fingerprints and caches the metadata. Invalid or missing
+sidecars fall back to building the index. `--recreate-index` skips discovery.
+Each shard has its own local index; a folder-level explicit index path is not
+shared among shards. Archives inside a shard still use the normal nested reader.
+HTTP autoindex and S3 folder mounts use their existing remote sibling discovery
+through the same lazy archive opener.
+
+Cold uncompressed TAR scans recognize repeated nearby forward header reads.
+After three forward skips of at most 1 MiB, the HTTP reader fetches one aligned
+4 MiB window (the configured range-cache chunk size when available), reusing it
+across seeks. Isolated probes and large sparse jumps remain small Range requests.
+The window also works without a persistent cache or ETag, is private to its
+reader, and falls back to exact reads when the memory budget cannot reserve it.
+The shared HTTP connection pool and resolved CDN URL remain in use.
+
+A 3,000-member, 99,841,024-byte mock TAR measured 9,005 → 55 Range GETs
+for HTTP without an ETag, and 9,006 → 29 for pinned HF with chunk caching.
+The parser performs GNU incremental detection, indexing, and nested-TAR magic
+probes; cached chunks serve these repeated small reads. On 2026-10-16, the
+public Oxford pet shard opened through its repository's published index in
+2.28 seconds and rebuilt cold in 26.51 seconds (debug build, this machine/network).
+These timings are observations, not a network latency guarantee.
+
+The opt-in network/timing regression reads the public Oxford pet dataset:
+
+```sh
+RATARMOUNT_TEST_HFREPO=1 cargo test -p ratarmount-session --lib regression_hf_repo_live -- --ignored --nocapture
+```
+
+
 ## Authentication and mirrors
 
 Token lookup order is:
