@@ -90,18 +90,22 @@ tensor is a file, so you can inspect a checkpoint without loading it.
 ### BitTorrent and Pirate Face
 
 ```bash
-ratarmount 'magnet:?xt=urn:btih:<infohash>&ws=<web-seed-url>' model/
-ratarmount --torrent-swarm lan ./model.torrent model/    # share between your own machines only
+ratarmount ./model.torrent model/                              # web seeds only: no peers, trackers or DHT
+ratarmount --torrent-swarm auto 'magnet:?xt=urn:btih:<infohash>&ws=<web-seed-url>' model/   # allow peers as a fallback
+ratarmount --torrent-swarm lan --seed ./model.torrent donor/   # share with your own machines only
 ```
 
 [Pirate Face](https://pirateface.co/how-it-works) mirrors hundreds of thousands
 of permissively licensed Hugging Face models and datasets as magnet links that
 can carry a Hugging Face web seed. ratarmount mounts the torrent's file tree
-immediately and fetches pieces on read: web seeds first, so a mount works with
-zero peers, and the swarm only when a seed fails. Every piece is checked against
-the torrent hash, and whole files against the Hub's SHA-256 when it is known.
-On a LAN, one machine can seed a large model to the next without touching the
-internet, and nothing is uploaded to the public swarm unless you pass `--seed`.
+immediately and fetches pieces on read. By default it talks only to HTTP web
+seeds and cached metadata: no peers, trackers, DHT or local discovery, so the
+mount is invisible to any swarm. Pass `--torrent-swarm auto` to fall back to
+peers when a seed cannot supply a verified piece (a bare magnet needs this,
+because its metadata comes from peers unless an `xs` URL is given), `lan` to
+move a model between your own machines without public discovery, and `--seed`
+with one of those policies to upload. Every piece is checked against the
+torrent hash, and whole files against the Hub's SHA-256 when it is known.
 BitTorrent is on in the release packages; cargo builds need `--features bittorrent`.
 [BitTorrent guide](docs/remote-bittorrent.md)
 
@@ -250,7 +254,7 @@ measured numbers: [Supported formats](docs/formats.md).
 | Scheme | Source |
 |---|---|
 | `hf://`, `hf-cache://` | Hugging Face Hub repositories pinned to a commit; the local Hub cache offline |
-| `magnet:`, `.torrent` | BitTorrent with web seeds first and verified pieces (release packages) |
+| `magnet:`, `.torrent` | BitTorrent: verified pieces from web seeds by default, peers only with `--torrent-swarm` (release packages) |
 | `http(s)://` | Range requests, Basic, Cookie and Bearer auth, autoindex folders |
 | `s3://`, `gs://`, `az://` | Object stores with folder listings and index publishing |
 | `ssh://`, `sftp://`, `ftp(s)://`, `webdav(s)://`, `smb://`, `dropbox://` | File servers and shares |

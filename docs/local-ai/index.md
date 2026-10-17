@@ -52,7 +52,8 @@ RAM.
 ## Pirate Face and BitTorrent
 
 ```bash
-ratarmount 'magnet:?xt=urn:btih:<infohash>&ws=<web-seed>' model/
+ratarmount ./model.torrent model/                                # default: web seeds and cache only, no peers
+ratarmount --torrent-swarm auto 'magnet:?xt=urn:btih:<infohash>&ws=<web-seed>' model/   # magnets need peers for their metadata
 ratarmount --torrent-swarm lan --seed ./model.torrent donor/     # machine A: share what it has cached
 ratarmount --torrent-swarm lan ./model.torrent model/            # machine B: fetch from A over the LAN
 ```
@@ -60,13 +61,15 @@ ratarmount --torrent-swarm lan ./model.torrent model/            # machine B: fe
 [Pirate Face](https://pirateface.co/how-it-works) publishes magnet links for
 permissively licensed Hub models and datasets, with the Hub as a web seed.
 ratarmount shows the torrent's files immediately and fetches pieces as they
-are read, from the web seed first and from peers only when a seed cannot
-supply a verified piece, so a mount works with zero peers and never joins the
-public swarm unless it has to. Pieces are checked against the torrent hashes
-and whole files against the Hub's SHA-256 where it is known. Between your own
-machines, `--torrent-swarm lan` moves a model over the local network without
-trackers or DHT. Seeding is off unless you pass `--seed`. The feature is
-compiled into the release packages; cargo builds add `--features bittorrent`.
+are read. The default policy, `never`, uses only HTTP web seeds and cached
+metadata, so a `.torrent` with a web seed mounts without any peer, tracker or
+DHT traffic. `--torrent-swarm auto` adds the swarm as a fallback when a seed
+cannot supply a verified piece, or when a magnet's metadata is not available
+over HTTP; `lan` keeps peers on your own network with no trackers or DHT.
+Pieces are checked against the torrent hashes and whole files against the
+Hub's SHA-256 where it is known. Seeding is off unless you pass `--seed`
+together with a policy that allows peers. The feature is compiled into the
+release packages; cargo builds add `--features bittorrent`.
 
 - [BitTorrent sources](../remote-bittorrent.md): policies, verification, LAN setup, what was checked against Pirate Face.
 

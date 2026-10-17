@@ -15,13 +15,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// When a torrent may contact peers, trackers and the DHT.
+///
+/// The default is [`Self::Never`]: no peer, tracker, DHT or LSD traffic unless
+/// the user opts in with `auto`, `lan` or `always`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TorrentSwarmPolicy {
-    #[default]
+    /// Fall back to the public swarm (DHT and trackers) when the cache, metadata
+    /// sources and web seeds cannot serve a request.
     Auto,
+    /// Start the swarm at mount time.
     Always,
     /// Discover peers only on the LAN, before trying web seeds.
     Lan,
+    /// Cache, `xs` metainfo and web seeds only; never open a peer socket.
+    #[default]
     Never,
 }
 
@@ -594,7 +601,7 @@ impl Default for OpenOptions {
             gnu_incremental: None,
             parallelization: ParallelizationSpec::default(),
             readahead_bytes: 0,
-            torrent_swarm: TorrentSwarmPolicy::Auto,
+            torrent_swarm: TorrentSwarmPolicy::default(),
             torrent_scratch_bytes: 2 * 1024 * 1024 * 1024,
             torrent_lsd: true,
             torrent_seed: false,
@@ -940,6 +947,26 @@ mod tests {
         let n = read_exact_or_short(&mut r, &mut buf).unwrap();
         assert_eq!(n, 4);
         assert_eq!(&buf, b"abcd");
+    }
+
+    /// Regression: packaged builds joined the public DHT/tracker swarm without
+    /// the user asking because the default policy was `auto`.
+    #[test]
+    fn regression_torrent_swarm_default_never() {
+        assert_eq!(TorrentSwarmPolicy::default(), TorrentSwarmPolicy::Never);
+        assert_eq!(
+            OpenOptions::default().torrent_swarm,
+            TorrentSwarmPolicy::Never
+        );
+        for (text, policy) in [
+            ("auto", TorrentSwarmPolicy::Auto),
+            ("always", TorrentSwarmPolicy::Always),
+            ("lan", TorrentSwarmPolicy::Lan),
+            ("never", TorrentSwarmPolicy::Never),
+        ] {
+            assert_eq!(text.parse::<TorrentSwarmPolicy>(), Ok(policy));
+        }
+        assert!("public".parse::<TorrentSwarmPolicy>().is_err());
     }
 
     #[test]

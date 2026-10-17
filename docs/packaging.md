@@ -111,7 +111,10 @@ Uses [nfpm](https://nfpm.goreleaser.com/) for `.deb`/`.rpm` (auto-downloaded if 
 | [`packaging/build-macos-tarball.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-macos-tarball.sh) | `--features nfsv4,sftp-russh,bittorrent` (rustup **stable**; workspace MSRV 1.90) |
 
 The CLI and library crates keep `bittorrent` off by default; Cargo users opt in
-with `--features bittorrent`. Default CI does not compile librqbit. See [BitTorrent sources](remote-bittorrent.md)
+with `--features bittorrent`. Packages compile `bittorrent`, but a torrent mount
+contacts no trackers, DHT or LSD peers unless the user opts in with
+`--torrent-swarm auto|lan|always` (the default is `never`: cache, `xs` metainfo
+and web seeds only). Default CI does not compile librqbit. See [BitTorrent sources](remote-bittorrent.md)
 for verification, uploads-disabled behavior, and upstream v2/swarm limitations.
 The feature-list regression is `./packaging/test-bittorrent-features.sh`.
 

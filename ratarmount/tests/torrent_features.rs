@@ -13,6 +13,7 @@ fn regression_torrent_feature_diagnostics() {
     if cfg!(feature = "bittorrent") {
         assert!(stdout.contains("bittorrent: compiled"));
         assert!(stdout.contains("uploads disabled"));
+        assert!(stdout.contains("peer discovery off by default (--torrent-swarm never)"));
         let output = Command::new(binary)
             .arg("--oss-attributions")
             .output()

@@ -111,7 +111,7 @@ ratarmount 'ssh://user@host//abs/path/a.tar' mnt/   # ssh_config is honoured, in
 ratarmount 'rclone+gdrive:bucket/path.tar' mnt/     # anything rclone can reach
 ratarmount docker://ubuntu:24.04 mnt/               # OCI image, layers unioned
 ratarmount -r hf://datasets/org/name@main mnt/      # Hugging Face repository, shards as folders
-ratarmount 'magnet:?xt=urn:btih:…&ws=…' mnt/        # BitTorrent (release packages)
+ratarmount dataset.torrent mnt/                     # BitTorrent: web seeds only by default; --torrent-swarm auto allows peers
 export RESTIC_PASSWORD='…'
 ratarmount restic:/var/backup/repo mnt/             # restic snapshots
 ratarmount --password secret encrypted.7z mnt/      # or --password-file

@@ -164,6 +164,8 @@ fn options(dir: &std::path::Path) -> TorrentOptions {
             4096,
         )),
         swarm: SwarmOptions {
+            // Loopback swarm-fallback tests opt in; public discovery stays off below.
+            policy: TorrentSwarmPolicy::Auto,
             dht: false,
             trackers: false,
             lsd: false,
@@ -595,7 +597,10 @@ fn live_pirate_face_magnet() {
     };
     let dir = tempfile::tempdir().unwrap();
     let mut opts = options(dir.path());
-    opts.swarm = SwarmOptions::default();
+    opts.swarm = SwarmOptions {
+        policy: TorrentSwarmPolicy::Auto,
+        ..Default::default()
+    };
     let source = TorrentMountSource::open(&magnet, opts).unwrap();
     assert!(!source.list_dirents("/").unwrap().is_empty());
 }
@@ -1057,6 +1062,32 @@ fn regression_swarm_policy_auto_never_always() {
     assert!(error.to_string().contains("metadata unavailable"));
 }
 
+/// Regression: the default policy was `auto`, so a torrent without a working
+/// web seed (or a magnet without `xs`) joined the public swarm unasked.
+#[test]
+fn regression_default_policy_never_refuses_swarm_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path());
+    opts.swarm.policy = TorrentSwarmPolicy::default();
+    opts.range_cache = None;
+    let source = TorrentMountSource::from_bytes(single_file_fixture(), opts.clone()).unwrap();
+    let error = read(&source, "/file").unwrap_err().to_string();
+    assert!(error.contains("--torrent-swarm never"), "{error}");
+    assert!(error.contains("lan or auto"), "{error}");
+    assert!(!opts.swarm.announced.load(Ordering::Relaxed));
+    assert!(source.data.swarm.lock().unwrap().is_none());
+    let error = TorrentMountSource::open(
+        "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+        opts.clone(),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(error.contains("metadata unavailable"), "{error}");
+    assert!(error.contains("lan or auto"), "{error}");
+    assert!(!opts.swarm.announced.load(Ordering::Relaxed));
+}
+
 /// Regression: whole-file completion held the read mutex while re-fetching an evicted prefix.
 #[test]
 fn regression_whole_file_hashing_never_blocks_reader_mutex() {
@@ -1429,8 +1460,11 @@ fn regression_seed_upload_limit_and_unmount_stop_listener() {
 fn regression_seed_policy_limits_and_lsd_defaults() {
     let defaults = SwarmOptions::default();
     assert!(swarm::session_options(&defaults).disable_upload);
-    assert!(!swarm::session_options(&defaults).disable_local_service_discovery);
+    // The default policy is `never`, which never announces on the LAN either.
+    assert!(swarm::session_options(&defaults).disable_local_service_discovery);
     let mut opts = defaults.clone();
+    opts.policy = TorrentSwarmPolicy::Auto;
+    assert!(!swarm::session_options(&opts).disable_local_service_discovery);
     opts.policy = TorrentSwarmPolicy::Never;
     assert!(swarm::session_options(&opts).disable_local_service_discovery);
     opts.seed = true;

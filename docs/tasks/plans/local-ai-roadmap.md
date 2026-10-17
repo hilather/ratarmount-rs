@@ -179,10 +179,13 @@ or documentation (no new code, per the document): teacher logits as shards
 - **AI-CM1:** the append path must be crash-safe at every syscall boundary.
   The journal is fsynced before the first byte is appended; recovery runs on
   mount and before the next commit.
-- **AI-BT1 swarm policy (decided at review):** `--torrent-swarm auto` (default)
+- **AI-BT1 swarm policy (decided at review):** `--torrent-swarm auto` (originally the default; now `never`, see below)
   starts DHT/tracker activity only when metadata or a web seed cannot serve a
   request, logging that the IP becomes visible; `never` disables the swarm;
   the `bittorrent` cargo feature is off by default and on in package builds.
+  *Superseded (PR #110 review, 2026-10-17):* the default is now `never`, so
+  package builds contact no peers, trackers, DHT or LSD unless the user passes
+  `--torrent-swarm auto|lan|always`; `--seed` requires an explicit policy.
 - **AI-BT1 / AI-BT2:** no test touches the public swarm or a public tracker;
   live runs are opt-in by env var. Seeding is never on by default and never
   enabled by the orchestrator on this machine. Piece verification happens
