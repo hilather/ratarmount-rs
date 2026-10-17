@@ -50,6 +50,11 @@ pub(super) fn validate_socket_path(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// macOS/BSD accept inherits O_NONBLOCK; handlers use blocking I/O.
+fn configure_accepted_stream(stream: &UnixStream) -> io::Result<()> {
+    stream.set_nonblocking(false)
+}
+
 pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Inspector> {
     validate_socket_path(path)?;
     let parent = fs::symlink_metadata(
@@ -74,6 +79,10 @@ pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Insp
         while !stopping.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    if let Err(error) = configure_accepted_stream(&stream) {
+                        log::warn!("cannot configure inspection socket: {error}");
+                        continue;
+                    }
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                     let mut command = String::new();
@@ -127,4 +136,30 @@ pub fn deleted_paths(attempt: &Attempt) -> io::Result<Vec<String>> {
         ));
     }
     serde_json::from_slice(&line).map_err(io::Error::other)
+}
+
+#[cfg(test)]
+mod accepted_socket_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    /// Regression: inherited O_NONBLOCK must not abort a delayed request or reply.
+    #[test]
+    fn regression_accepted_socket_clears_inherited_nonblocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join("socket")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _client = std::os::unix::net::UnixStream::connect(
+            listener.local_addr().unwrap().as_pathname().unwrap(),
+        )
+        .unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        // Linux does not inherit this flag; simulate the BSD accept result.
+        stream.set_nonblocking(true).unwrap();
+        configure_accepted_stream(&stream).unwrap();
+        // SAFETY: F_GETFL only reads flags from the live stream's descriptor.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+    }
 }

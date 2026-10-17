@@ -73,6 +73,8 @@ impl Registry {
                     }
                     Err(e) => panic!("registry accept: {e}"),
                 };
+                // macOS/BSD accept inherits the listener's O_NONBLOCK.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
