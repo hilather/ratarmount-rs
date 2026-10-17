@@ -1,5 +1,6 @@
 //! `embednfs::FileSystem` on `MountSource`, with optional write overlay.
 
+use ratarmount_compositing::{overlay_atime, OverlayMetadata};
 use ratarmount_core::AttributeMapping;
 use std::io;
 use std::os::unix::io::FromRawFd;
@@ -92,7 +93,11 @@ impl RatarmountNfs4 {
     fn file_info_for_id(&self, id: u64) -> FsResult<FileInfo> {
         let path = self.inodes.path_for_id(id).ok_or(FsError::Stale)?;
         if path == "/" {
-            let fi = ratarmount_core::create_root_file_info();
+            let fi = self
+                .overlay
+                .as_ref()
+                .and_then(|ov| ov.lookup("/", 0))
+                .unwrap_or_else(ratarmount_core::create_root_file_info);
             self.inodes.store_lookup_fi(id, fi.clone());
             return Ok(fi);
         }
@@ -118,7 +123,7 @@ impl RatarmountNfs4 {
             mode: self.attribute_mapping.mode(fi.mode) & 0o7777,
             uid: self.attribute_mapping.uid(fi.uid),
             gid: self.attribute_mapping.gid(fi.gid),
-            atime: t,
+            atime: unix_float_to_timestamp(overlay_atime(fi)),
             mtime: t,
             ctime: t,
             birthtime: t,
@@ -359,8 +364,31 @@ impl RatarmountNfs4 {
     pub fn setattr_sync(&self, id: u64, attrs: &SetAttrs) -> FsResult<Attrs> {
         let ov = self.overlay()?;
         let path = self.inodes.path_for_id(id).ok_or(FsError::Stale)?;
-        if let Some(sz) = attrs.size {
-            ov.truncate(&path, sz).map_err(overlay_to_fs)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let time = |t: &embednfs::SetTime| match t {
+            embednfs::SetTime::ServerNow => now,
+            embednfs::SetTime::Client(t) => t.seconds as f64 + t.nanos as f64 / 1e9,
+        };
+        let metadata = OverlayMetadata {
+            mode: attrs.mode,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            atime: attrs.atime.as_ref().map(time),
+            mtime: attrs.mtime.as_ref().map(time),
+        };
+        if !metadata.is_empty() || attrs.size.is_some() {
+            ov.set_attributes(&path, attrs.size, &metadata)
+                .map_err(|e| match &e {
+                    ratarmount_compositing::OverlayError::Io(io)
+                        if io.raw_os_error() == Some(libc::EPERM) =>
+                    {
+                        FsError::PermissionDenied
+                    }
+                    _ => overlay_to_fs(e),
+                })?;
             self.bump_after_mutate(id);
         }
         self.getattr_sync(id)
@@ -1270,6 +1298,67 @@ mod tests {
         let got = FileSystem::read(&nfs, &c, &id, 0, 16).await.unwrap();
         assert_eq!(&got.data[..], b"hello");
         assert!(got.eof);
+    }
+
+    /// Regression: NFSv4 SETATTR mode and time were silently ignored.
+    #[test]
+    fn regression_overlay_chmod_nfsv4_setattr() {
+        let (_td, nfs) = overlay_export(Synth::new());
+        assert_eq!(
+            nfs.setattr_sync(
+                1,
+                &SetAttrs {
+                    mode: Some(0o751),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .mode,
+            0o751
+        );
+        let id = nfs
+            .create_sync(
+                1,
+                "built",
+                CreateRequest {
+                    kind: CreateKind::File,
+                    attrs: SetAttrs {
+                        mode: Some(0o644),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap()
+            .handle;
+        let attrs = nfs
+            .setattr_sync(
+                id,
+                &SetAttrs {
+                    mode: Some(0o755),
+                    atime: Some(embednfs::SetTime::Client(Timestamp {
+                        seconds: 12,
+                        nanos: 250_000_000,
+                    })),
+                    mtime: Some(embednfs::SetTime::Client(Timestamp {
+                        seconds: 34,
+                        nanos: 500_000_000,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(attrs.mode, 0o755);
+        assert_eq!(attrs.atime.seconds, 12);
+        assert_eq!(attrs.mtime.seconds, 34);
+        assert!(nfs
+            .setattr_sync(
+                id,
+                &SetAttrs {
+                    uid: Some(123),
+                    ..Default::default()
+                }
+            )
+            .is_err());
     }
 
     fn overlay_export(base: Synth) -> (tempfile::TempDir, RatarmountNfs4) {

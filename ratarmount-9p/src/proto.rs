@@ -65,6 +65,14 @@ pub const DT_LNK: u8 = 10;
 
 /// `P9_GETATTR_BASIC` — fields up through `BLOCKS`.
 pub const GETATTR_BASIC: u64 = 0x0000_07ff;
+/// Linux 9P2000.L Tsetattr validity bits.
+pub const SETATTR_MODE: u32 = 0x0000_0001;
+pub const SETATTR_UID: u32 = 0x0000_0002;
+pub const SETATTR_GID: u32 = 0x0000_0004;
+pub const SETATTR_ATIME: u32 = 0x0000_0010;
+pub const SETATTR_MTIME: u32 = 0x0000_0020;
+pub const SETATTR_ATIME_SET: u32 = 0x0000_0080;
+pub const SETATTR_MTIME_SET: u32 = 0x0000_0100;
 /// `P9_SETATTR_SIZE`.
 pub const SETATTR_SIZE: u32 = 0x0000_0008;
 /// Linux `AT_REMOVEDIR`.

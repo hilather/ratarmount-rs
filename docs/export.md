@@ -115,7 +115,7 @@ sftp -P 20222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 127.0.
 |------|----------|
 | Auth (TCP) | Public-key from `--sftp-authorized-keys` or `RATARMOUNT_SFTP_AUTHORIZED_KEYS`, and/or password from `RATARMOUNT_SFTP_USER` / `RATARMOUNT_SFTP_PASSWORD`. Loopback defaults to `~/.ssh/authorized_keys`. **Non-loopback needs an explicit keys file or password env** (else exit 2; does not expose `$HOME` keys on `0.0.0.0`) |
 | Host key | `RATARMOUNT_SFTP_HOST_KEY` or ephemeral ed25519 |
-| Protocol | SFTP v3 REALPATH, STAT/LSTAT, OPENDIR/READDIR, OPEN/READ/CLOSE, READLINK. With `-w`: MKDIR, REMOVE, RMDIR, RENAME, OPEN-write, SETSTAT size |
+| Protocol | SFTP v3 REALPATH, STAT/LSTAT, OPENDIR/READDIR, OPEN/READ/CLOSE, READLINK. With `-w`: MKDIR, REMOVE, RMDIR, RENAME, OPEN-write, SETSTAT size/mode/atime/mtime (ownership changes return a permission error) |
 | `--sftp-subsystem` | Stdio SFTP v3; exclusive with `--sftp`; ignores bind/keys; no SSH auth |
 
 `--print-features` prints `sftp-russh: compiled` on packaged binaries.
