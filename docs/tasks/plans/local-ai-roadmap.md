@@ -139,8 +139,10 @@ cross-format benchmark sweep (`benchmarks/compare-formats.sh`, 2026-10-17):
 its root JSON files because tensor parent directories had no index rows;
 **bzip2 truncation** (fix on `fix/bzip2-many-blocks`, pre-existing on `main`)
 — a bzip2 TAR with about a thousand blocks was indexed only up to member 760;
-ISO 9660 names are plain upper-case 8.3 because Rock Ridge and Joliet are not
-parsed (documented in `docs/formats.md`, not fixed).
+**ISO 9660 names** (fix on `fix/iso9660-rock-ridge-joliet`, pre-existing on
+`main`) — names were plain upper-case 8.3 because Rock Ridge and Joliet were not
+parsed; the reader now uses Rock Ridge names, modes, symlinks and times, then
+Joliet, then the ISO names.
 
 Deferred on the roadmap's own condition: **`io_uring` for backend reads**
 (§8 "once the rest is measured"). Measured here: library-mode Session reads of a

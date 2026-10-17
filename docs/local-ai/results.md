@@ -82,8 +82,11 @@ TAR headers through HTTP range requests coalesced into 4 MiB windows. The
 published index turns a 17 s open into about 1.3 s, and the whole-repository
 mount opens shards without scanning them. One earlier attempt of this
 benchmark, before `HOME` was isolated, stalled for fifteen minutes while
-listing the shard with the daemon idle; it did not recur in six later runs and
-is recorded here as an open question rather than a known cause.
+listing the shard with the daemon idle. It did not recur in eighteen later
+runs, including a twelve-run loop with debug mount logs and stack capture
+armed (the slowest remote scan in that loop took 40.6 s, the slowest shard
+open 1.7 s), so it is recorded here as an open question rather than a known
+cause.
 
 ## What the numbers do and do not say
 

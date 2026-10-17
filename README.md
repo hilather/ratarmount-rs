@@ -399,7 +399,7 @@ The honest list, with what is planned, is in [Supported formats](docs/formats.md
 and the [parity checklist](docs/parity-todo.md). The short version:
 
 - Gzip throughput is below Python's rapidgzip on small `.tar.gz` files; `--repack-seekable` or multi-frame zstd is the fix for archives you own.
-- Some formats are read-only or partial: NTFS compression, HFS+/APFS inside DMG, WIM LZX, QCOW2 zstd clusters, differencing VHD, ESXi VMDK, classic SquashFS LZMA, pure RAR. ISO 9660 images show upper-case 8.3 names because Rock Ridge and Joliet are not read yet.
+- Some formats are read-only or partial: NTFS compression, HFS+/APFS inside DMG, WIM LZX, QCOW2 zstd clusters, differencing VHD, ESXi VMDK, classic SquashFS LZMA, pure RAR.
 - Writes commit TAR variants and ZIP; live commits cover uncompressed TAR and `.tar.zst` only, and ZIP commits rebuild the archive.
 - NFS has no Kerberos; SMB has no Kerberos or DFS; exports bind to localhost unless you say otherwise.
 - macOS is first-class on Apple silicon only; the CLI does not build for Windows (the core library crates do).
