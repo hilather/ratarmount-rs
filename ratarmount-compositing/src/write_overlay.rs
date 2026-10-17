@@ -5233,7 +5233,7 @@ fn persist_provenance_plan(
         let host = root.join(path);
         if let Ok(meta) = fs::symlink_metadata(&host) {
             pending.extend(collect_ustar_pending_at(
-                root,
+                &root,
                 &[(path.clone(), meta.is_dir())],
             )?);
             continue;
