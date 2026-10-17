@@ -36,7 +36,50 @@ fn request(socket: &Path, endpoint: &str, body: Value) -> Value {
     serde_json::from_str(bytes.split_once("\r\n\r\n").unwrap().1).unwrap()
 }
 
+/// Set `FD_CLOEXEC` on every inherited fd above stderr.
+///
+/// Async-signal-safe for `pre_exec`: a stack `rlimit`, `getrlimit`, and `fcntl`
+/// only. No allocation, `/proc` walk, or `sysconf`. `EBADF` is ignored. Fds 0-2
+/// stay as they are.
+fn scrub_inherited_fds() -> std::io::Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes a stack `rlimit` and is async-signal-safe.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let end = limit.rlim_cur.min(65_536);
+    let mut fd: libc::c_int = 3;
+    while (fd as libc::rlim_t) < end {
+        // SAFETY: `F_GETFD` / `F_SETFD` only read or replace the descriptor flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        // A closed fd must not be passed to `F_SETFD`; errno stays the `F_GETFD` error.
+        let rc = if flags < 0 {
+            flags
+        } else {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) }
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EBADF) {
+                return Err(err);
+            }
+        }
+        fd += 1;
+    }
+    Ok(())
+}
+
 /// Regression: standalone and systemd sockets must serve HTTP without leaking tokens or listener fds to the child.
+///
+/// Both arms scrub before exec, setting `FD_CLOEXEC` on fds `3..min(RLIMIT_NOFILE, 65536)`
+/// with a stack-only `fcntl` loop (`EBADF` ignored, fds 0-2 untouched). That drops an
+/// inheritable non-listener left on fd 3. The systemd arm scrubs at the start of the same
+/// `pre_exec` that then `dup2`s the listener onto fd 3 and clears cloexec; a later hook would
+/// mark that listener cloexec again. The `socket:` check still fails if an inheritable
+/// listener is left on fd 3.
 #[test]
 fn regression_server_socket_activation_and_environment_only_credentials() {
     for activated in [false, true] {
@@ -58,8 +101,11 @@ fn regression_server_socket_activation_and_environment_only_credentials() {
                 .arg(env!("CARGO_BIN_EXE_ratarmount-volume-plugin"))
                 .env("LISTEN_FDS", "1");
             // SAFETY: only async-signal-safe descriptor operations after fork.
+            // Scrub in this hook, before dup2: a later pre_exec would set FD_CLOEXEC
+            // on the listener that this hook just placed on fd 3.
             unsafe {
                 command.pre_exec(move || {
+                    scrub_inherited_fds()?;
                     if libc::dup2(descriptor, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -68,7 +114,12 @@ fn regression_server_socket_activation_and_environment_only_credentials() {
             }
             command
         } else {
-            Command::new(env!("CARGO_BIN_EXE_ratarmount-volume-plugin"))
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount-volume-plugin"));
+            // SAFETY: only async-signal-safe descriptor operations after fork.
+            unsafe {
+                command.pre_exec(scrub_inherited_fds);
+            }
+            command
         };
         let mut child = Guard(
             command
