@@ -28,6 +28,10 @@ changes and provenance attributes, and a marker file,
 `.ratarmount-overlay.used`. Both names are hidden inside the mount and cannot
 be created, deleted or renamed through it at any depth, ignoring ASCII case;
 an archive member with one of those names is hidden too.
+Copy-on-write stages each copy in a `.ratarmount.overlay.cow-*` temp next to
+its destination, hidden the same way (ASCII case ignored); `--commit-overlay`
+never picks a temp up, an archive member with that prefix is hidden but stays in
+the archive unchanged, and the next open removes leftover temps it can reach.
 
 The marker is a safety device. A marked overlay whose database is missing, is
 a directory, or lacks its `files` table is refused for mounting and for
