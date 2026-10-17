@@ -10,7 +10,6 @@
 #[macro_use]
 extern crate ratarmount_core;
 
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -27,7 +26,10 @@ use thiserror::Error;
 
 pub const BACKEND_NAME: &str = "ISO9660MountSource";
 const SECTOR: u64 = 2048;
-const PVD_OFFSET: u64 = 16 * SECTOR;
+mod iso;
+
+// Reject old sidecars that contain only ISO aliases and default metadata.
+const ISO_METADATA_VERSION: &str = "rock-ridge-joliet-v1";
 
 #[derive(Debug, Error)]
 pub enum IsoError {
@@ -221,6 +223,14 @@ impl Iso9660MountSource {
         // index for a replaced archive before trusting files rows / extent opens.
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
+        if index
+            .metadata()?
+            .get("isoMetadataVersion")
+            .map(String::as_str)
+            != Some(ISO_METADATA_VERSION)
+        {
+            return Err(IsoError::Msg("ISO name/metadata parser changed".into()));
+        }
         // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
         // Missing tarstats still Ok (legacy indexes).
         index.check_tarstats_matches_archive(archive_path)?;
@@ -316,6 +326,12 @@ impl MountSource for Iso9660MountSource {
                 "is a directory",
             ));
         }
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFLNK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot open an ISO symlink as file data",
+            ));
+        }
         let ud = userdata(file_info).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "missing iso9660 userdata")
         })?;
@@ -340,14 +356,6 @@ impl MountSource for Iso9660MountSource {
     }
 }
 
-struct DirRec {
-    length: usize,
-    extent: u32,
-    size: u32,
-    is_dir: bool,
-    name: Option<String>,
-}
-
 enum StatsSource<'a> {
     Path(&'a Path),
     Synthetic(u64),
@@ -361,22 +369,46 @@ fn build_iso_index<R: Read + Seek>(
     product_version: &str,
     stats: StatsSource<'_>,
 ) -> Result<SqliteIndex> {
-    file.seek(SeekFrom::Start(PVD_OFFSET))?;
-    let mut pvd = vec![0u8; SECTOR as usize];
-    file.read_exact(&mut pvd)?;
-    if pvd.first() != Some(&1) || pvd.get(1..6) != Some(b"CD001") {
-        return Err(IsoError::Msg(
-            "Not a valid ISO 9660 image (missing primary volume descriptor)".into(),
-        ));
-    }
-
-    let root = parse_directory_record(&pvd, 156)
-        .ok_or_else(|| IsoError::Msg("ISO 9660 PVD has no root directory".into()))?;
-
+    let entries = iso::read_entries(file)?;
     let index = SqliteIndex::create_writable_for_open(index_path, options)?;
     index.begin_write()?;
-    let mut seen = HashSet::new();
-    walk_directory(file, root.extent, root.size, "", &index, &mut seen)?;
+    let mut paths = vec![String::new(); entries.len()];
+    for (id, node) in entries.iter().enumerate().skip(1) {
+        let rec = &node.record;
+        let Some(name) = rec.rr.name.as_ref().or(rec.name.as_ref()) else {
+            continue;
+        };
+        let full = format!("{}/{name}", paths[node.parent]);
+        let (path, base) = split_name(&normpath(&full));
+        let data_off = i64::from(rec.extent) * SECTOR as i64;
+        let link = rec.rr.link.as_deref().unwrap_or("");
+        let size = if rec.rr.link.is_some() {
+            link.len() as i64
+        } else if rec.is_dir {
+            0
+        } else {
+            i64::from(rec.size)
+        };
+        index.insert_file(
+            &path,
+            &base,
+            data_off,
+            data_off,
+            size,
+            rec.rr.mtime.unwrap_or(rec.mtime),
+            i64::from(rec.mode()),
+            0,
+            link,
+            i64::from(rec.rr.uid),
+            i64::from(rec.rr.gid),
+            false,
+            false,
+            false,
+            0,
+        )?;
+        paths[id] = full;
+    }
+    index.store_metadata_key_value("isoMetadataVersion", ISO_METADATA_VERSION)?;
 
     index.store_versions(product_version)?;
     index.store_metadata_key_value("backendName", BACKEND_NAME)?;
@@ -386,140 +418,6 @@ fn build_iso_index<R: Read + Seek>(
     }
     index.commit_write()?;
     Ok(index.into_read_only()?)
-}
-
-fn read_both_endian_u32(data: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-    ])
-}
-
-fn parse_directory_record(data: &[u8], offset: usize) -> Option<DirRec> {
-    if offset >= data.len() {
-        return None;
-    }
-    let length = data[offset] as usize;
-    if length == 0 {
-        return None;
-    }
-    if offset + length > data.len() {
-        return None;
-    }
-    let rec = &data[offset..offset + length];
-    let extent = read_both_endian_u32(rec, 2);
-    let size = read_both_endian_u32(rec, 10);
-    let flags = rec[25];
-    let name_len = rec[32] as usize;
-    let name_bytes = &rec[33..33 + name_len.min(rec.len().saturating_sub(33))];
-    let name = if name_bytes == b"\x00" || name_bytes == b"\x01" {
-        None
-    } else {
-        let raw = String::from_utf8_lossy(name_bytes);
-        // Strip ISO version suffix ";1"
-        let stripped = raw.split(';').next().unwrap_or(&raw).trim_end_matches('.');
-        Some(stripped.to_string())
-    };
-    Some(DirRec {
-        length,
-        extent,
-        size,
-        is_dir: flags & 0x02 != 0,
-        name,
-    })
-}
-
-fn read_sector<R: Read + Seek>(file: &mut R, sector: u32) -> Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(u64::from(sector) * SECTOR))?;
-    let mut data = vec![0u8; SECTOR as usize];
-    file.read_exact(&mut data)?;
-    Ok(data)
-}
-
-fn walk_directory<R: Read + Seek>(
-    file: &mut R,
-    extent: u32,
-    size: u32,
-    path_prefix: &str,
-    index: &SqliteIndex,
-    seen: &mut HashSet<u32>,
-) -> Result<()> {
-    if !seen.insert(extent) {
-        return Ok(());
-    }
-    let mut remaining = size as i64;
-    let mut sector = extent;
-    while remaining > 0 {
-        let data = read_sector(file, sector)?;
-        let to_parse = (SECTOR as i64).min(remaining) as usize;
-        let mut offset = 0usize;
-        while offset < to_parse {
-            if data[offset] == 0 {
-                break;
-            }
-            let Some(rec) = parse_directory_record(&data, offset) else {
-                break;
-            };
-            offset += rec.length;
-            let Some(name) = rec.name else {
-                continue;
-            };
-            let full = if path_prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{path_prefix}/{name}")
-            };
-            let full = full.trim_start_matches('/').to_string();
-            let nfull = normpath(&full);
-            let (path, base) = split_name(&nfull);
-            let data_off = u64::from(rec.extent) * SECTOR;
-            if rec.is_dir {
-                let mode = (ratarmount_core::S_IFDIR | 0o755) as i64;
-                index.insert_file(
-                    &path,
-                    &base,
-                    data_off as i64,
-                    data_off as i64,
-                    0,
-                    0.0,
-                    mode,
-                    0,
-                    "",
-                    0,
-                    0,
-                    false,
-                    false,
-                    false,
-                    0,
-                )?;
-                walk_directory(file, rec.extent, rec.size, &full, index, seen)?;
-            } else {
-                let mode = (ratarmount_core::S_IFREG | 0o644) as i64;
-                index.insert_file(
-                    &path,
-                    &base,
-                    data_off as i64,
-                    data_off as i64,
-                    rec.size as i64,
-                    0.0,
-                    mode,
-                    0,
-                    "",
-                    0,
-                    0,
-                    false,
-                    false,
-                    false,
-                    0,
-                )?;
-            }
-        }
-        remaining -= SECTOR as i64;
-        sector += 1;
-    }
-    Ok(())
 }
 
 fn split_name(full: &str) -> (String, String) {
@@ -582,6 +480,9 @@ fn store_stats_size(index: &SqliteIndex, size: u64) -> Result<()> {
     index.store_metadata_key_value("tarstats", &json)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {
