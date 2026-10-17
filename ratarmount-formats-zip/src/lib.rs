@@ -2388,28 +2388,150 @@ fn ensure_parent_dirs(
     }
 }
 
+/// DOS Y-M-D h:m:s is local civil time. The result is UTC Unix seconds.
+///
+/// Only the DOS input is limited to 1980–2107 (and a real month/day/time).
+/// [`civil_seconds`] accepts any year, so a zone behind UTC can land on
+/// 1979-12-31 and a zone ahead of UTC can land in 2108. Unix calls
+/// `localtime_r` (NULL is failure). Windows calls `localtime_s` (non-zero
+/// `errno_t` is failure). Either failure, an invalid field, or a
+/// spring-forward hole that never reaches a fixed point returns `0.0`.
+/// The old `mktime` path normalized that hole and used `SystemTime::now()`
+/// when `t < 0`. A fall-back fold may differ by 3600s from glibc. Windows
+/// follows the CRT DST rules.
 fn msdos_to_unix(year: u16, month: u8, day: u8, hour: u8, min: u8, sec: u8) -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Approximate via chrono-less conversion: use libc mktime
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        tm.tm_year = year as i32 - 1900;
-        tm.tm_mon = month as i32 - 1;
-        tm.tm_mday = day as i32;
-        tm.tm_hour = hour as i32;
-        tm.tm_min = min as i32;
-        tm.tm_sec = sec as i32;
-        tm.tm_isdst = -1;
-        let t = libc::mktime(&mut tm);
-        if t < 0 {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0)
-        } else {
-            t as f64
-        }
+    msdos_to_unix_with((year, month, day, hour, min, sec), local_minus_utc)
+}
+
+/// `offset_at(unix)` is local-civil-as-UTC minus `unix` (`None` if unknown).
+/// Starts from the fields read as UTC and iterates `guess = naive - offset(guess)`
+/// at most three times. Returns that guess only when it is a fixed point.
+fn msdos_to_unix_with(
+    fields: (u16, u8, u8, u8, u8, u8),
+    offset_at: impl Fn(i64) -> Option<i32>,
+) -> f64 {
+    let (year, month, day, hour, min, sec) = fields;
+    // Year gate is DOS-only. `civil_seconds` still accepts 1979 and 2108.
+    if !(1980..=2107).contains(&year) {
+        return 0.0;
     }
+    let Some(naive) = civil_seconds(
+        i32::from(year),
+        i32::from(month),
+        i32::from(day),
+        i32::from(hour),
+        i32::from(min),
+        i32::from(sec),
+    ) else {
+        return 0.0;
+    };
+    let mut guess = naive;
+    for _ in 0..3 {
+        let Some(offset) = offset_at(guess) else {
+            return 0.0;
+        };
+        let Some(next) = naive.checked_sub(i64::from(offset)) else {
+            return 0.0;
+        };
+        if next == guess {
+            return next as f64;
+        }
+        guess = next;
+    }
+    // Not a fixed point. Do not return the last guess.
+    let _ = guess;
+    0.0
+}
+
+/// Local civil time minus UTC, in seconds, at Unix time `unix`.
+///
+/// The tm fields go through [`civil_seconds`] (`tm_year + 1900`, `tm_mon + 1`),
+/// which is not limited to 1980–2107.
+fn local_minus_utc(unix: i64) -> Option<i32> {
+    let tm = local_tm(unix)?;
+    let civil = civil_seconds(
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+    )?;
+    i32::try_from(civil.checked_sub(unix)?).ok()
+}
+
+fn local_tm(unix: i64) -> Option<libc::tm> {
+    let t = libc::time_t::try_from(unix).ok()?;
+    // Safety: `libc::tm` is a plain C struct. All-zero is a valid bit pattern;
+    // the CRT call below overwrites every field this function reads back.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
+    {
+        // Safety: `t` is a live `time_t` and `tm` is writable for the call.
+        // `localtime_r` does not retain either pointer. NULL means failure.
+        if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            return None;
+        }
+        Some(tm)
+    }
+    #[cfg(windows)]
+    {
+        // Safety: `localtime_s` writes `tm` from `t` and does not retain the
+        // pointers. A non-zero `errno_t` means failure.
+        if unsafe { libc::localtime_s(&mut tm, &t) } != 0 {
+            return None;
+        }
+        Some(tm)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (&t, &mut tm);
+        None
+    }
+}
+
+/// UTC Unix seconds for a civil Y-M-D h:m:s. Any year, including 1979 and 2108.
+/// `None` when month, day, or the clock time is not a real civil time.
+/// A leap second (`sec == 60`) counts as 60 seconds.
+fn civil_seconds(year: i32, month: i32, day: i32, hour: i32, min: i32, sec: i32) -> Option<i64> {
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0..=60).contains(&sec) {
+        return None;
+    }
+    let dim = days_in_month(year, month)?;
+    if !(1..=dim).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    days.checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3_600)?
+        .checked_add(i64::from(min) * 60)?
+        .checked_add(i64::from(sec))
+}
+
+fn days_in_month(year: i32, month: i32) -> Option<i32> {
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_gregorian_leap(year) => 29,
+        2 => 28,
+        _ => return None,
+    };
+    Some(days)
+}
+
+fn is_gregorian_leap(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+/// Howard Hinnant `days_from_civil`: days since 1970-01-01.
+/// `m` is 1–12 and `d` is a day of that month. CAB keeps its own copy.
+fn days_from_civil(y: i32, m: i32, d: i32) -> i64 {
+    let y = y - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) as u32 + 2) / 5 + d as u32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era as i64) * 146097 + doe as i64 - 719468
 }
 
 #[cfg(test)]
@@ -3109,6 +3231,197 @@ mod tests {
             assert_eq!(len, fi.size);
             assert_eq!(len, payload.len() as u64);
         }
+    }
+
+    fn two_stored_members(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let mut buf = io::Cursor::new(Vec::new());
+        {
+            let mut zw = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zw.start_file("first.bin", opts).unwrap();
+            zw.write_all(first).unwrap();
+            zw.start_file("second.bin", opts).unwrap();
+            zw.write_all(second).unwrap();
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// `open` returns `Box<dyn ArchiveRead>`, so this pins seek-from-end through
+    /// that reader: end is the member length, and a read past it is EOF.
+    fn assert_seek_from_end_stops_at_first_member(
+        src: &ZipMountSource,
+        first: &[u8],
+        second: &[u8],
+    ) {
+        assert!(first.len() > 4 && second.len() > 4);
+        assert_ne!(&first[first.len() - 4..], &second[second.len() - 4..]);
+        let fi = src.lookup("/first.bin", 0).expect("lookup first");
+        assert_eq!(fi.size, first.len() as u64);
+        let mut reader = src.open(&fi, 0).expect("open first stored member");
+        assert_eq!(reader.seek(SeekFrom::End(0)).unwrap(), fi.size);
+        assert_eq!(reader.seek(SeekFrom::End(-4)).unwrap(), fi.size - 4);
+        let mut tail = [0u8; 4];
+        reader.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, &first[first.len() - 4..]);
+        assert_eq!(reader.seek(SeekFrom::End(1)).unwrap(), fi.size + 1);
+        let mut buf = [0u8; 16];
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        assert_eq!(
+            reader.seek(SeekFrom::Start(fi.size + 1)).unwrap(),
+            fi.size + 1
+        );
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+    }
+
+    /// Regression: file-backed Stored `seek(End)` is the member, not the archive.
+    /// `PositionalFile::seek(End)` uses the archive length and would read the next member.
+    #[test]
+    fn regression_stored_member_seek_from_end_stops_at_member() {
+        let first = b"FIRST-payload-WXYZ";
+        let second = b"SECOND-payload-ABCD";
+        let bytes = two_stored_members(first, second);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seek-end.zip");
+        std::fs::write(&path, &bytes).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).unwrap();
+        assert!(matches!(src.backend, ZipBackend::File { .. }));
+        assert_seek_from_end_stops_at_first_member(&src, first, second);
+    }
+
+    /// Regression: `ZipBackend::Shared` / `SharedSeekRegion` seek-from-end stops
+    /// at the member. Payloads differ in the last 4 bytes.
+    #[test]
+    fn regression_stored_member_seek_from_end_shared_stops_at_member() {
+        let first = b"FIRST-payload-WXYZ";
+        let second = b"SECOND-payload-ABCD";
+        let bytes = two_stored_members(first, second);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open_from_reader(
+            io::Cursor::new(bytes),
+            Path::new("memory://seek-end.zip"),
+            None,
+            &opts,
+            "test",
+        )
+        .expect("open_from_reader");
+        assert!(matches!(src.backend, ZipBackend::Shared(_)));
+        assert_seek_from_end_stops_at_first_member(&src, first, second);
+    }
+
+    /// Regression: DOS fields are local civil time. A constant −5h offset shifts
+    /// 1980-01-01 00:00:00 by +5h (315532800 + 18000). Plain UTC stays at 315532800.
+    /// An offset that never repeats is not a fixed point and is 0.0.
+    #[test]
+    fn regression_msdos_local_offset_not_utc() {
+        let got = msdos_to_unix_with((1980, 1, 1, 0, 0, 0), |_| Some(-5 * 3600));
+        assert_eq!(got, (315_532_800 + 5 * 3600) as f64);
+
+        let tick = std::cell::Cell::new(0i32);
+        let got = msdos_to_unix_with((1980, 1, 1, 0, 0, 0), |_| {
+            let n = tick.get() + 1;
+            tick.set(n);
+            Some(-3600 * n)
+        });
+        assert_eq!(got, 0.0);
+    }
+
+    /// Regression: invalid DOS fields are 0.0, not `SystemTime::now()` and not
+    /// `mktime`'s normalized spill. Month 0 and 31 February are the cases zip
+    /// rejects; years outside 1980–2107 are rejected on the DOS input only.
+    #[test]
+    fn regression_msdos_invalid_is_zero_not_now() {
+        assert_eq!(msdos_to_unix(1980, 0, 1, 0, 0, 0), 0.0);
+        assert_eq!(msdos_to_unix(1980, 2, 31, 0, 0, 0), 0.0);
+        assert_eq!(msdos_to_unix(1979, 12, 31, 23, 0, 0), 0.0);
+        assert_eq!(msdos_to_unix(2108, 1, 1, 0, 0, 0), 0.0);
+    }
+
+    /// Regression: the index mtime is `msdos_to_unix` of the central-directory
+    /// DOS time. TZ-independent: both sides use the same helper.
+    #[test]
+    fn regression_msdos_index_uses_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mtime.zip");
+        {
+            let file = File::create(&path).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let dt = zip::DateTime::from_date_and_time(2020, 1, 15, 12, 0, 0).unwrap();
+            let opts = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Stored)
+                .last_modified_time(dt);
+            zw.start_file("member.bin", opts).unwrap();
+            zw.write_all(b"payload").unwrap();
+            zw.finish().unwrap();
+        }
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).unwrap();
+        let fi = src.lookup("/member.bin", 0).unwrap();
+        assert_eq!(fi.mtime, msdos_to_unix(2020, 1, 15, 12, 0, 0));
+    }
+
+    /// Regression: unambiguous local noon matches `mktime` with `tm_isdst = -1`.
+    /// Do not set `TZ` (process-global under parallel tests). Vacuous on UTC.
+    #[cfg(unix)]
+    #[test]
+    fn regression_msdos_matches_mktime_unambiguous() {
+        for (year, month, day) in [(2020u16, 1u8, 15u8), (2020, 7, 15)] {
+            let ours = msdos_to_unix(year, month, day, 12, 0, 0);
+            // Safety: `tm` is a writable `libc::tm`. `mktime` reads those fields
+            // (`tm_isdst = -1` lets libc pick DST) and does not retain `tm`.
+            let libc_t = unsafe {
+                let mut tm: libc::tm = std::mem::zeroed();
+                tm.tm_year = i32::from(year) - 1900;
+                tm.tm_mon = i32::from(month) - 1;
+                tm.tm_mday = i32::from(day);
+                tm.tm_hour = 12;
+                tm.tm_isdst = -1;
+                libc::mktime(&mut tm)
+            };
+            assert!(libc_t >= 0, "mktime failed for {year}-{month}-{day}");
+            assert_eq!(ours, libc_t as f64);
+        }
+    }
+
+    /// Regression: `local_minus_utc` converts tm fields with production
+    /// `civil_seconds`, which must accept 1979. tm 1979-12-31 19:00:00 versus
+    /// unix 315532800 is −18000. A 1980–2107 gate on that conversion fails here.
+    /// The same −5h stub resolves DOS 1980-01-01 00:00:00 to 315532800+18000.
+    #[test]
+    fn regression_msdos_offset_from_1979_breakdown() {
+        assert_eq!(
+            civil_seconds(1979, 12, 31, 19, 0, 0).map(|secs| secs - 315_532_800),
+            Some(-18_000)
+        );
+        assert_eq!(
+            msdos_to_unix_with((1980, 1, 1, 0, 0, 0), |_| Some(-5 * 3600)),
+            (315_532_800 + 18_000) as f64
+        );
+    }
+
+    /// Regression: tm fields 2108-01-01 08:59:58 versus the naive instant of
+    /// DOS 2107-12-31 23:59:58 are +9h. `civil_seconds` must accept 2108.
+    /// A +9h stub resolves that DOS instant (no year-range rejection).
+    #[test]
+    fn regression_msdos_offset_into_2108() {
+        let naive = civil_seconds(2107, 12, 31, 23, 59, 58);
+        let local = civil_seconds(2108, 1, 1, 8, 59, 58);
+        assert_eq!(naive.zip(local).map(|(n, l)| l - n), Some(9 * 3600));
+        let naive = naive.expect("naive DOS 2107-12-31 23:59:58");
+        assert_eq!(
+            msdos_to_unix_with((2107, 12, 31, 23, 59, 58), |_| Some(9 * 3600)),
+            (naive - 9 * 3600) as f64
+        );
     }
 
     /// Regression: `read_file_range_at_into` treated `ErrorKind::Interrupted` as fatal.

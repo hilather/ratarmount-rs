@@ -453,6 +453,9 @@ jobs:
           fi
           cargo check -p ratarmount-session --all-targets
 
+      - name: cargo check zip + tar
+        run: cargo check -p ratarmount-formats-zip -p ratarmount-formats-tar --all-targets
+
   # Declared workspace MSRV (Cargo.toml rust-version). Default `check` stays
   # on stable and does not compile embednfs; this job checks the lockfile on
   # the declared toolchain.
