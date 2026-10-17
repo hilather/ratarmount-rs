@@ -112,7 +112,7 @@ work), **luna** = `gpt-6-luna` (docs, packaging, scripts). Effort in brackets.
 | AI-SH | `ratarmount shard` + `export-index --format parquet\|jsonl` (§5) | 2 | sol [high] | new `ratarmount/src/shard.rs`, `export_index.rs`; parquet behind feature `export-parquet` (on in packages) | Packs a dir into N `.tar.zst` shards ≤ `--size`, seek table per shard, one index each, `shards.json` manifest; `--group-by-key` keeps WebDataset `basename.{jpg,json,txt}` in one frame; `--frame-per-sample`; sorted, reproducible bytes for the same input; parquet rows `path, shard, offset, size, frame, frame_offset` match index; README | done |
 | AI-PV | Provenance xattrs + sidecar manifest on commit (§7) | 2 | astra [high] | overlay xattr table + `setxattr`/`removexattr` in FUSE, `UstarMember` xattrs, index insert, `find --xattr` | `setfattr -n user.train_ok -v false` survives commit as PAX `SCHILY.xattr.user.*`, reindex, remount; `find --xattr train_ok=false`; only `user.*` writable; each commit writes `archive.manifest.jsonl` (path, size, sha256, xattrs, commit id) atomically | done |
 | AI-PY2 | fsspec `ratar://` + chained URLs, torch Dataset, WebDataset reader, wheel CI (§5, §10) — **cuttable** | 2 | sol [high] | `ratarmount-python/python/**`, `.github/workflows/python.yml` | `fsspec.open("ratar::hf://...")` and `ratar://path.tar.zst::member`; registered via entry point; `datasets` webdataset load test against a local shard set (skip if package absent); torch `Dataset` + WebDataset-style iterator over AI-SH shards; manylinux x86_64/aarch64 + macOS arm64 wheels built in CI; installed-wheel smoke test | done |
-| AI-BT2 | LAN sharing (BEP 14), opt-in `--seed` with upload cap, one cache with `hf://`, v2 preference (BitTorrent §5–7, caveats) | 3 | sol [xhigh] | `ratarmount-remote/src/torrent/**`, cache glue with AI-RC / AI-HF3 | LSD on by default for magnet mounts with `--no-lsd` to disable; two-session loopback test fetches from the LAN peer with the web seed disabled; `--seed` off by default, serves only verified pieces from the cache, `--seed-upload-limit` enforced (rate test); completed verified files stored in the Hub-style blob cache keyed by SHA-256 so `hf://` reuses them and vice versa (test both directions); BitTorrent v2 chosen when a magnet offers both v1 and v2 info hashes | todo |
+| AI-BT2 | LAN sharing (BEP 14), opt-in `--seed` with upload cap, one cache with `hf://`, v2 preference (BitTorrent §5–7, caveats) | 3 | sol [xhigh] | `ratarmount-remote/src/torrent/**`, cache glue with AI-RC / AI-HF3 | LSD on by default for magnet mounts with `--no-lsd` to disable; two-session loopback test fetches from the LAN peer with the web seed disabled; `--seed` off by default, serves only verified pieces from the cache, `--seed-upload-limit` enforced (rate test); completed verified files stored in the Hub-style blob cache keyed by SHA-256 so `hf://` reuses them and vice versa (test both directions); BitTorrent v2 chosen when a magnet offers both v1 and v2 info hashes | done |
 | AI-CM2 | Rolling archives `--roll-every 1d\|20G` (§7) | 3 | sol [high] | roll policy module, union of series | New archive when the size/time limit is hit; series mounted as one tree; old archives removable while mounted; naming `name.000001.tar.zst`; tests for both triggers | done |
 | AI-UN | Per-source subpaths, image + repo union, `corpus` verb (§4.6, §5) | 3 | sol [high] | factory compositing glue, `main.rs` | `SRC::/repo` (or `--bind /repo=SRC`) wraps a source in `PrefixMountSource` before the union; `docker://img` + git repo at `/repo` test with a local OCI layout; `ratarmount corpus list.txt mnt/` mounts `repo@sha` lines at `org/name/`; recipe for bwrap/nspawn | done |
 | AI-SB4 | Sandbox API: `sandbox new\|list\|destroy` + Python client (§4.7) | 3 | astra [xhigh] | new `ratarmount/src/sandbox/**`, `clients/python/ratarmount_sandbox.py` | Daemon over a Unix socket (JSON lines, `0600`), one shared base per task, N overlay mounts per request, destroy unmounts and deletes; crash of an attempt mount does not affect siblings; pure-Python client (no binding) ~100 lines with a test; 64 parallel attempts integration test (FUSE, run by orchestrator) | done |
@@ -127,7 +127,10 @@ work), **luna** = `gpt-6-luna` (docs, packaging, scripts). Effort in brackets.
 | AI-CSI | CSI node plugin (§10, §later) | 4 | astra [xhigh] | new `ratarmount-csi/**` (own binary, not in default packages) | gRPC Identity + Node over a Unix socket; supervised `ratarmount` child per volume; persisted journal for idempotent publish/unpublish across restarts; secrets via env only; per-pod overlay; manifests in `packaging/csi/`; `csi-sanity` and kind test scripts (privileged, not default CI) | done |
 | AI-GZ | Parallel gzip in packaged builds (§later) | 4 | sol [medium] | packaging feature lists | Enable `gzip-rapidgzip` in package scripts if the A/B gate shows no regression; otherwise record the measured reason and leave off | done |
 
-Bug fixes found along the way (pre-existing on `main`): **AI-FIX-NESTPAR**
+Bug fixes found along the way: **AI-FIX-CHMOD** (done) — SETATTR ignored
+mode/times, so programs built inside a write overlay could not run (found by
+the build-in-sandbox benchmark); **AI-FIX-MACOS** (done) — macOS /var
+canonicalization and Darwin errno mapping; pre-existing on `main`: **AI-FIX-NESTPAR**
 (done) — concurrent readers of members of one uncompressed TAR shared an OS
 file cursor and could read a sibling's bytes on NFS/HTTP/SMB/SFTP/9P and the
 Session API; **AI-FIX-VHDX** — qemu-img 11 fixed VHDX rejected by the parser.
@@ -244,3 +247,19 @@ CSI, GZ. Waves differ from that order only where a prerequisite forces it
   python).
 - **Publishing.** Nothing is pushed until the user asks. When asked: one PR per
   wave (or per large task) against `main`, CI watched until green.
+
+## 8. Measured results (2026-10-16, this laptop, release build)
+
+| Benchmark | Result |
+|---|---|
+| WebDataset samples/s, 8 workers | extracted 4,249 · library mode 2,509 · FUSE 2,233 · `webdataset` on plain TAR 1,430 |
+| Sandbox setup+teardown, 64 parallel attempts (zlib) | ratarmount sandbox 5.2 s · `git worktree` 7.7 s · `docker cp` 8.1 s per attempt; tiny base: 26 ms setup / 97 ms teardown |
+| Build + test inside a sandbox (zlib) | 3.06 s vs native 2.45 s |
+| Cold open of shards | scan 0.086 s vs published index 0.016 s |
+| RSS, 32 mounts | 679 MiB total (≈21 MiB per mount) |
+| Model load (small safetensors) | `hf download` + load 1.35 s · `hf://` mount setup + first load 0.35 s · second load 5 ms |
+| zstd decode-ahead (256 MiB, loaded machine) | FUSE cat 129 → 218 MB/s with 4 threads; direct-I/O dd regressed 372 → 229 MB/s (needs an idle rerun) |
+| Live Hub | `--publish-index hf://` and overlay write-back verified against a private dataset repo |
+
+GB10 / DGX Spark and M5 numbers still need that hardware; FUSE passthrough's
+registered path needs a root run.
