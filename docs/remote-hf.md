@@ -496,3 +496,13 @@ its content token. `X-Linked-Etag` and tree `lfs.oid` additionally verify LFS
 completions. A new commit has a separate range identity. Non-Hub HTTP readers
 retain on-demand complete-file assembly; Hub sharing triggers assembly after
 all chunks have been observed and hands the verified result to the shared cache.
+
+## Example dataset
+
+[`RealMattbrewer/oxford-iiit-pet-webdataset`](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
+is a public dataset built with `ratarmount shard` and published with
+`ratarmount --publish-index hf://...`: seven uncompressed WebDataset shards,
+each with a published index. Measured from a laptop on a cold cache: the whole
+repository mounts with `-r` in 0.23 s, and one 128 MiB shard opens in
+1.2-1.5 s with its published index versus 16.5 s scanning it.
+

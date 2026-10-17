@@ -51,6 +51,9 @@ Use indexed model files, reproducible repository snapshots, and dataset shards
 without unpacking a separate copy for every experiment or agent attempt.
 Start with the [Local AI guide](docs/local-ai/index.md):
 
+Try it on a real dataset: [Oxford-IIIT Pet as indexed WebDataset shards](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
+mounts straight from the Hub with `ratarmount -r hf://datasets/RealMattbrewer/oxford-iiit-pet-webdataset pets/`.
+
 - [SWE-bench / mini-swe-agent sandboxes](docs/recipes/swe-bench-sandboxes.md): protect tests and export patches.
 - [OpenHands / SWE-smith rootfs](docs/recipes/sandbox-rootfs.md): combine an image and a repository.
 - [vLLM / llama.cpp models](docs/recipes/local-models.md): lazy remote reads and tensor inspection.
