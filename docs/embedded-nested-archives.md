@@ -10,6 +10,13 @@ This is the user-facing guide. Implementation / remaining work lives in [`tasks/
 
 ---
 
+Recursive HF repository, HTTP autoindex, and S3 folder mounts discover published
+sibling indexes lazily for each archive. Directory listing does not scan shards;
+opening a supported TAR/ZIP/compressed shard reuses the remote Range opener and
+validates its sidecar. HF discovery stays at the pinned commit. Archive payloads
+remain remote; only index metadata is downloaded. Deeper archive members retain
+the format-specific behavior below. See [remote HF](remote-hf.md#recursive-repository-indexes-and-cold-tar-scans).
+
 ## Short answers
 
 | Question | Answer |

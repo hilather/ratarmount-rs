@@ -1619,3 +1619,57 @@ fn regression_accepted_socket_clears_inherited_nonblocking() {
     assert_ne!(flags, -1);
     assert_eq!(flags & libc::O_NONBLOCK, 0);
 }
+
+/// Regression: forward TAR header seeks bypassed read-ahead, including on redirected URLs.
+#[test]
+fn regression_http_forward_headers_coalesce_and_reuse_redirect() {
+    for cached in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let count = gets.clone();
+        let size = 3000 * (32 * 1024 + 512);
+        let cdn = Server::spawn(move |req| {
+            if req.method == "GET" {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+            let mut response = Response::ranged(&req, size);
+            if cached {
+                response
+                    .headers
+                    .push(("ETag".into(), "\"forward-v1\"".into()));
+            }
+            response
+        });
+        let redirects = Arc::new(AtomicUsize::new(0));
+        let count = redirects.clone();
+        let target = cdn.url.clone();
+        let origin = Server::spawn(move |_| {
+            count.fetch_add(1, Ordering::Relaxed);
+            Response::redirect(target.clone())
+        });
+        let mut file =
+            file_with_cache(&origin, range_cache_in(temp.path(), 128 * HTTP_RANGE_CHUNK));
+        for i in 0..3000 {
+            let offset = i * (32 * 1024 + 512);
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            let mut bytes = [0; 512];
+            file.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes.as_slice(), pattern(offset, 512));
+        }
+        assert!(gets.load(Ordering::Relaxed) <= size.div_ceil(HTTP_RANGE_CHUNK) as usize + 3);
+        assert_eq!(redirects.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cdn.accepts.load(Ordering::Relaxed),
+            1,
+            "reuse pooled connection"
+        );
+        file.seek(SeekFrom::Start(1024)).unwrap();
+        let mut bytes = [0; 512];
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes.as_slice(), pattern(1024, 512));
+        assert!(
+            file.forward_window.bytes.is_empty(),
+            "backwards seek drops the window"
+        );
+    }
+}

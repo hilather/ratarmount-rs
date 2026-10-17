@@ -867,6 +867,75 @@ pub(crate) fn validate_content_range(
     Ok(total)
 }
 
+/// A bounded synchronous window for TAR-style header/forward-seek scans.
+/// Isolated probes and sparse jumps remain exact ranges. Unlike persistent
+/// caching this also works without an ETag, and never shares unverified bytes.
+#[derive(Default)]
+pub(crate) struct ForwardReadWindow {
+    last_end: Option<u64>,
+    run: u32,
+    start: u64,
+    bytes: Vec<u8>,
+    memory: Option<ratarmount_core::budget::Reservation>,
+}
+
+impl ForwardReadWindow {
+    pub(crate) fn read(
+        &mut self,
+        source: &HttpRangeSource,
+        start: u64,
+        size: u64,
+        buf: &mut [u8],
+    ) -> io::Result<Option<usize>> {
+        let nearby = self
+            .last_end
+            .is_some_and(|end| start >= end && start - end <= 1024 * 1024);
+        self.run = if !nearby {
+            0
+        } else if self.last_end != Some(start) {
+            self.run.saturating_add(1)
+        } else {
+            self.run
+        };
+        self.last_end = Some(start.saturating_add(buf.len() as u64).min(size));
+        if !nearby {
+            self.bytes = Vec::new();
+            self.memory = None;
+        }
+        if self.run < 3 || buf.len() > 64 * 1024 {
+            return Ok(None);
+        }
+        if self.bytes.is_empty()
+            || start < self.start
+            || start - self.start >= self.bytes.len() as u64
+        {
+            self.bytes = Vec::new();
+            self.memory = None;
+            let chunk = source
+                .cache
+                .as_ref()
+                .map_or(HTTP_RANGE_CHUNK, |c| c.chunk_size());
+            self.start = start / chunk * chunk;
+            let len = chunk.min(size - self.start);
+            let pool = ratarmount_core::budget::MemoryPool::global(
+                "http-forward-window",
+                64 * 1024 * 1024,
+                ratarmount_core::budget::Priority::Cache,
+            );
+            let Some(memory) = pool.reserve(len) else {
+                return Ok(None);
+            };
+            self.bytes = source.fetch(self.start, self.start + len - 1, size, None)?;
+            self.memory = Some(memory);
+        }
+        let offset = (start - self.start) as usize;
+        let n = buf.len().min(self.bytes.len() - offset);
+        buf[..n].copy_from_slice(&self.bytes[offset..offset + n]);
+        self.last_end = Some(start + n as u64);
+        Ok(Some(n))
+    }
+}
+
 // A permit covers a running worker AND its completed payload until consumed.
 // Detached workers retain their permits, so repeated seeks cannot evade the cap.
 struct PrefetchBudget {
