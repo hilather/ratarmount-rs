@@ -529,69 +529,6 @@ impl<R: Read + Seek> Seek for SegmentedFile<R> {
     }
 }
 
-/// Shared seekable archive fd for single-threaded FUSE (no `try_clone` per open).
-pub struct SharedArchiveFile {
-    inner: std::sync::Mutex<std::fs::File>,
-}
-
-impl SharedArchiveFile {
-    pub fn new(file: std::fs::File) -> Self {
-        Self {
-            inner: std::sync::Mutex::new(file),
-        }
-    }
-
-    /// View of `[file_offset, file_offset+len)` with independent logical position.
-    pub fn region(self: &std::sync::Arc<Self>, file_offset: u64, len: u64) -> SharedRegion {
-        SharedRegion {
-            shared: std::sync::Arc::clone(self),
-            file_offset,
-            len,
-            pos: 0,
-        }
-    }
-}
-
-/// Random-access slice of a [`SharedArchiveFile`].
-pub struct SharedRegion {
-    shared: std::sync::Arc<SharedArchiveFile>,
-    file_offset: u64,
-    len: u64,
-    pos: u64,
-}
-
-impl Read for SharedRegion {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.len || buf.is_empty() {
-            return Ok(0);
-        }
-        let max = ((self.len - self.pos) as usize).min(buf.len());
-        let mut guard = self.shared.inner.lock().expect("archive fd mutex");
-        guard.seek(SeekFrom::Start(self.file_offset + self.pos))?;
-        let n = guard.read(&mut buf[..max])?;
-        self.pos += n as u64;
-        Ok(n)
-    }
-}
-
-impl Seek for SharedRegion {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let new = match pos {
-            SeekFrom::Start(o) => o as i64,
-            SeekFrom::End(o) => self.len as i64 + o,
-            SeekFrom::Current(o) => self.pos as i64 + o,
-        };
-        if new < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek before start",
-            ));
-        }
-        self.pos = new as u64;
-        Ok(self.pos)
-    }
-}
-
 /// Stenciled view over one underlying reader (subset of Python StenciledFile).
 pub struct StenciledFile<R> {
     inner: R,

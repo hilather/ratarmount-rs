@@ -1,7 +1,8 @@
 //! ZIP archive mount source (`backendName=ZipMountSource`).
 //!
 //! Hot path avoids holding a process-wide `ZipArchive` lock and fully decompressing
-//! on every open: **Stored** members use `StenciledFile` random access; **Deflate**
+//! on every open: path-backed **Stored** members are a positional window on the
+//! archive file (`read_at` / `seek_read`, no shared cursor or mutex); **Deflate**
 //! members use a **single-flight shared inflate cache** keyed by central-directory
 //! header offset (FR-4 / [upstream #105](https://github.com/mxmlnkn/ratarmount/issues/105)):
 //!
@@ -13,10 +14,11 @@
 //!   path-backed backend (`read_file_range_at`, then an independent `flate2` decoder).
 //!   On the shared-stream backend, compressed bytes are read under the stream mutex
 //!   then inflated offline so decode still overlaps across members.
-//! * Stored members stay on `SharedArchiveFile` (random-access stencil). Encrypted
-//!   members and every method other than Stored or Deflate go through the `zip` crate:
-//!   file-backed opens use `PositionalFile`; `ZipBackend::Shared` stays on
-//!   `SharedSeekHandle`.
+//! * Path-backed Stored members are a positional window on `raw_file`
+//!   ([`PositionalRegion`]). `ZipBackend::Shared` Stored reads stay on
+//!   [`SharedSeekRegion`] (mutex `seek` + `read`). Encrypted members and every
+//!   method other than Stored or Deflate go through the `zip` crate: file-backed
+//!   opens use `PositionalFile`; `ZipBackend::Shared` stays on `SharedSeekHandle`.
 //!   Budgeted opens stream compressed input instead of retaining a second
 //!   member-sized buffer.
 //!
@@ -64,9 +66,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use ratarmount_compress::{
-    check_for_split_file_in_folder, materialize_joined_parts, SeekRead, SharedArchiveFile,
-};
+use ratarmount_compress::{check_for_split_file_in_folder, materialize_joined_parts, SeekRead};
 use ratarmount_core::{
     normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource,
     OpenOptions, SQLiteIndexedTarUserData, UserData,
@@ -436,10 +436,9 @@ struct OpenedArchive {
 
 /// Content backend for ZIP member open (path file vs generic Read+Seek).
 enum ZipBackend {
-    /// Path-based `Arc<File>` (multi-part join supported). Stored reads use
-    /// [`SharedArchiveFile`]. Zip-crate opens use [`PositionalFile`].
+    /// Path-based `Arc<File>` (multi-part join supported). Stored reads are a
+    /// positional window on `raw_file`. Zip-crate opens use [`PositionalFile`].
     File {
-        archive_file: Arc<SharedArchiveFile>,
         raw_file: Arc<File>,
         /// Keep multi-part join temp file from being deleted.
         _joined: Option<NamedTempFile>,
@@ -499,40 +498,40 @@ impl Seek for SharedSeekHandle {
     }
 }
 
+/// One positional read. A short read or `Interrupted` is returned as-is.
+/// `read_exact` / `read_to_end` retry `Interrupted`; this function does not.
+fn read_at(file: &File, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, pos)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        // seek_read changes the OS cursor, but every reader supplies its
+        // own offset and never relies on that shared cursor.
+        file.seek_read(buf, pos)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, pos, buf);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "positional file reads are unavailable on this platform",
+        ))
+    }
+}
+
 /// File reader with a private logical cursor and no shared seek state or lock.
 struct PositionalFile {
     file: Arc<File>,
     pos: u64,
 }
 
-impl PositionalFile {
-    fn read_at(&self, buf: &mut [u8]) -> io::Result<usize> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            self.file.read_at(buf, self.pos)
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::FileExt;
-            // seek_read changes the OS cursor, but every reader supplies its
-            // own offset and never relies on that shared cursor.
-            self.file.seek_read(buf, self.pos)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = buf;
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "positional file reads are unavailable on this platform",
-            ))
-        }
-    }
-}
-
 impl Read for PositionalFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.read_at(buf)?;
+        let n = read_at(&self.file, self.pos, buf)?;
         self.pos += n as u64;
         Ok(n)
     }
@@ -555,7 +554,7 @@ impl Seek for PositionalFile {
     }
 }
 
-/// Random-access slice of a shared zip reader (Stored members).
+/// Random-access slice of a mutex-shared zip reader (`ZipBackend::Shared`).
 struct SharedSeekRegion {
     shared: Arc<Mutex<Box<dyn SeekRead>>>,
     file_offset: u64,
@@ -606,6 +605,73 @@ impl Seek for SharedSeekRegion {
         }
         self.pos = new as u64;
         Ok(self.pos)
+    }
+}
+
+/// Positional window `[file_offset, file_offset+len)` on a shared archive file.
+///
+/// `SeekFrom::End` is relative to `len`, not the underlying file. The whole
+/// state is the `Arc<File>` plus the window and cursor: no mutex and no
+/// `File::seek`.
+struct PositionalRegion {
+    file: Arc<File>,
+    file_offset: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl Read for PositionalRegion {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let max = ((self.len - self.pos) as usize).min(buf.len());
+        let n = read_at(&self.file, self.file_offset + self.pos, &mut buf[..max])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for PositionalRegion {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::End(o) => self.len as i64 + o,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+/// Stored reader: path-backed positional window, or a mutex `seek`+`read` for
+/// generic `Read + Seek` backends that have no `read_at`.
+enum StoredReader {
+    File(PositionalRegion),
+    Shared(SharedSeekRegion),
+}
+
+impl Read for StoredReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::File(reader) => reader.read(buf),
+            Self::Shared(reader) => reader.read(buf),
+        }
+    }
+}
+
+impl Seek for StoredReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::File(reader) => reader.seek(pos),
+            Self::Shared(reader) => reader.seek(pos),
+        }
     }
 }
 
@@ -724,7 +790,6 @@ impl ZipMountSource {
         Ok(Self {
             archive_path: opened.user_path,
             backend: ZipBackend::File {
-                archive_file: Arc::new(SharedArchiveFile::new(opened.file.try_clone()?)),
                 raw_file: Arc::new(opened.file),
                 _joined: opened._joined,
             },
@@ -959,7 +1024,6 @@ impl ZipMountSource {
         Ok(Self {
             archive_path: opened.user_path,
             backend: ZipBackend::File {
-                archive_file: Arc::new(SharedArchiveFile::new(opened.file.try_clone()?)),
                 raw_file: Arc::new(opened.file),
                 _joined: opened._joined,
             },
@@ -1289,18 +1353,7 @@ fn read_file_range_at_into(file: &File, offset: u64, buf: &mut [u8]) -> io::Resu
     #[cfg(windows)]
     {
         use std::os::windows::fs::FileExt;
-        let mut done = 0usize;
-        while done < buf.len() {
-            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "zip read_file_range_at: unexpected EOF",
-                ));
-            }
-            done += n;
-        }
-        Ok(())
+        read_exact_via(|off, dst| file.seek_read(dst, off), offset, buf)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1308,6 +1361,34 @@ fn read_file_range_at_into(file: &File, offset: u64, buf: &mut [u8]) -> io::Resu
         f.seek(SeekFrom::Start(offset))?;
         f.read_exact(buf)
     }
+}
+
+/// Fill `buf` from `offset` via `read_at`. `Ok(0)` is unexpected EOF.
+/// `ErrorKind::Interrupted` retries the same offset and does not advance.
+#[cfg(any(windows, test))]
+fn read_exact_via(
+    mut read_at: impl FnMut(u64, &mut [u8]) -> io::Result<usize>,
+    mut offset: u64,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        match read_at(offset, &mut buf[done..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "zip read_file_range_at: unexpected EOF",
+                ));
+            }
+            Ok(n) => {
+                done += n;
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Decode an unencrypted Stored/Deflate member via position-independent archive reads.
@@ -1417,7 +1498,7 @@ impl MountSource for ZipMountSource {
             .unwrap_or(meta.data_start);
 
         match meta.method {
-            METHOD_STORED => self.open_stored(data_start, file_info.size),
+            METHOD_STORED => Ok(Box::new(self.open_stored(data_start, file_info.size))),
             METHOD_DEFLATE => self.open_deflate(header, meta, data_start, file_info.size),
             _ => self.open_via_zip_crate(meta),
         }
@@ -1443,20 +1524,17 @@ impl MountSource for ZipMountSource {
 }
 
 impl ZipMountSource {
-    fn open_stored(
-        &self,
-        data_start: u64,
-        size: u64,
-    ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+    fn open_stored(&self, data_start: u64, size: u64) -> StoredReader {
         match &self.backend {
-            ZipBackend::File { archive_file, .. } => {
-                Ok(Box::new(archive_file.region(data_start, size)))
+            ZipBackend::File { raw_file, .. } => StoredReader::File(PositionalRegion {
+                file: Arc::clone(raw_file),
+                file_offset: data_start,
+                len: size,
+                pos: 0,
+            }),
+            ZipBackend::Shared(shared) => {
+                StoredReader::Shared(SharedSeekRegion::new(Arc::clone(shared), data_start, size))
             }
-            ZipBackend::Shared(shared) => Ok(Box::new(SharedSeekRegion::new(
-                Arc::clone(shared),
-                data_start,
-                size,
-            ))),
         }
     }
 
@@ -1471,7 +1549,7 @@ impl ZipMountSource {
         let compressed_size = meta.compressed_size;
         let arc = self.inflate_cache.get_sized(header, size, || {
             if self.inflate_cache.pool.enabled() {
-                let compressed = self.open_stored(data_start, compressed_size)?;
+                let compressed = self.open_stored(data_start, compressed_size);
                 let mut decoder = flate2::read::DeflateDecoder::new(compressed).take(size);
                 let mut data = Vec::with_capacity(size as usize);
                 decoder.read_to_end(&mut data)?;
@@ -1507,7 +1585,7 @@ impl ZipMountSource {
             return Ok(Box::new(ArcBytes::new(arc)));
         }
         // An oversized member or refused reservation stays seekable on disk.
-        let compressed = self.open_stored(data_start, compressed_size)?;
+        let compressed = self.open_stored(data_start, compressed_size);
         let decoder = flate2::read::DeflateDecoder::new(compressed);
         let mut file = tempfile::tempfile()?;
         io::copy(&mut decoder.take(size), &mut file)?;
@@ -2918,6 +2996,187 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// Regression: concurrent Stored reads returned a sibling member's bytes when
+    /// `seek` moved one shared file cursor and `read` did not pass its own offset.
+    #[test]
+    fn regression_parallel_stored_member_reads_keep_own_bytes() {
+        const N: usize = 8;
+        const PREFIX: usize = 32;
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![b'A' + i as u8; 64 * 1024]).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parallel-stored.zip");
+        {
+            let file = File::create(&path).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            for (i, payload) in payloads.iter().enumerate() {
+                zw.start_file(format!("m{i}.bin"), opts).unwrap();
+                zw.write_all(payload).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).expect("open stored zip");
+        let infos: Vec<_> = (0..N)
+            .map(|i| {
+                let fi = src.lookup(&format!("/m{i}.bin"), 0).expect("lookup");
+                assert_eq!(fi.size, payloads[i].len() as u64);
+                fi
+            })
+            .collect();
+        let barrier = std::sync::Barrier::new(N);
+        std::thread::scope(|scope| {
+            for (i, fi) in infos.iter().enumerate() {
+                let src = &src;
+                let barrier = &barrier;
+                let expected = &payloads[i];
+                scope.spawn(move || {
+                    let mut reader = src.open(fi, 0).expect("open member");
+                    let mut prefix = Vec::with_capacity(PREFIX);
+                    for offset in 0..PREFIX as u64 {
+                        reader.seek(SeekFrom::Start(offset)).unwrap();
+                        // Every sibling has sought before any of them reads.
+                        barrier.wait();
+                        let mut byte = [0];
+                        reader.read_exact(&mut byte).unwrap();
+                        prefix.push(byte[0]);
+                        barrier.wait();
+                    }
+                    assert_eq!(prefix, &expected[..PREFIX], "member {i} prefix");
+                    reader.seek(SeekFrom::Start(0)).unwrap();
+                    barrier.wait();
+                    let mut actual = Vec::new();
+                    reader.read_to_end(&mut actual).unwrap();
+                    assert_eq!(actual, *expected, "member {i}");
+                });
+            }
+        });
+        assert_eq!(
+            src.inflate_cache.completed_len(),
+            0,
+            "stored members must stay off the inflate cache"
+        );
+    }
+
+    /// Regression: file-backed Stored readers must share `raw_file` and carry no mutex.
+    /// Regular-file syscalls cannot be paused portably, so pin the reader's entire
+    /// state to `Arc<File>` plus the window and cursor. A revert to `SharedArchiveFile`
+    /// fails this destructure.
+    #[test]
+    fn regression_stored_file_reader_shares_raw_file_without_mutex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stored-arc.zip");
+        let payload = b"stored-window";
+        write_sample_zip(&path, "a.bin", payload);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).unwrap();
+        let ZipBackend::File { raw_file, .. } = &src.backend else {
+            panic!("path-backed zip must use the file backend");
+        };
+        let fi = src.lookup("/a.bin", 0).unwrap();
+        let header = userdata(&fi)
+            .and_then(|u| u.offsetheader)
+            .expect("offsetheader");
+        let meta = src.members.get(header).expect("member meta");
+        let data_start = userdata(&fi)
+            .map(|u| u.offset)
+            .filter(|&o| o > 0)
+            .unwrap_or(meta.data_start);
+        for _ in 0..2 {
+            // Exhaustive destructuring rejects a shared lock. The annotation
+            // rejects `Arc<Mutex<File>>` or `Arc<SharedArchiveFile>`.
+            let StoredReader::File(PositionalRegion {
+                file,
+                file_offset,
+                len,
+                pos,
+            }) = src.open_stored(data_start, fi.size)
+            else {
+                panic!("file backend stored reader must be a positional region");
+            };
+            let file: Arc<File> = file;
+            assert!(Arc::ptr_eq(&file, raw_file));
+            assert_eq!(pos, 0);
+            assert_eq!(file_offset, data_start);
+            assert_eq!(len, fi.size);
+            assert_eq!(len, payload.len() as u64);
+        }
+    }
+
+    /// Regression: `read_file_range_at_into` treated `ErrorKind::Interrupted` as fatal.
+    #[test]
+    fn regression_read_exact_via_retries_interrupted() {
+        let mut buf = [0u8; 4];
+        let mut calls = Vec::new();
+        let mut step = 0u8;
+        read_exact_via(
+            |offset, dst| {
+                calls.push((offset, dst.len()));
+                step += 1;
+                match step {
+                    1 => Err(io::Error::new(io::ErrorKind::Interrupted, "again")),
+                    2 => {
+                        dst[0] = 0xA1;
+                        Ok(1)
+                    }
+                    3 => Err(io::Error::new(io::ErrorKind::Interrupted, "again")),
+                    4 => {
+                        dst[..3].copy_from_slice(&[0xB2, 0xB3, 0xB4]);
+                        Ok(3)
+                    }
+                    _ => panic!("too many reads"),
+                }
+            },
+            10,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(buf, [0xA1, 0xB2, 0xB3, 0xB4]);
+        // Interrupted retries the same offset and does not advance it.
+        assert_eq!(calls, vec![(10, 4), (10, 4), (11, 3), (11, 3)]);
+
+        let mut partial = [0u8; 4];
+        let mut step = 0u8;
+        let err = read_exact_via(
+            |offset, dst| {
+                step += 1;
+                match step {
+                    1 => {
+                        assert_eq!(offset, 5);
+                        dst[0] = 7;
+                        Ok(1)
+                    }
+                    2 => {
+                        assert_eq!(offset, 6);
+                        Ok(0)
+                    }
+                    _ => panic!("too many reads"),
+                }
+            },
+            5,
+            &mut partial,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "zip read_file_range_at: unexpected EOF");
+        assert_eq!(partial[0], 7);
+
+        let err = read_exact_via(
+            |_, _| Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            0,
+            &mut [0u8; 1],
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(err.to_string(), "denied");
     }
 
     /// Regression: positional ZIP cursors must preserve short-read, EOF and seek semantics.
