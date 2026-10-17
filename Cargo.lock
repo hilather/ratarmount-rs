@@ -3268,6 +3268,7 @@ dependencies = [
 name = "ratarmount-formats-tar"
 version = "0.1.34"
 dependencies = [
+ "bzip2",
  "encoding_rs",
  "libc",
  "log",
