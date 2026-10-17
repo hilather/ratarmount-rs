@@ -55,13 +55,23 @@ pub const OVERLAY_MARKER: &str = ".ratarmount-overlay.used";
 /// Marker name used before the rename; still accepted (never created).
 pub const LEGACY_OVERLAY_MARKER: &str = ".ratarmount.overlay.sqlite.used";
 
+/// Copy-on-write staging files. Not the final member name: a crash mid-copy
+/// leaves this prefix, which list, lookup, and commit ignore. ASCII case is
+/// ignored, same as [`HIDDEN_DB`].
+const COW_STAGING_PREFIX: &str = ".ratarmount.overlay.cow-";
+
+fn has_ascii_prefix(name: &str, prefix: &str) -> bool {
+    let n = name.as_bytes();
+    let p = prefix.as_bytes();
+    n.len() >= p.len() && n[..p.len()].eq_ignore_ascii_case(p)
+}
+
 /// Overlay bookkeeping names that never show up as overlay content.
 /// ASCII case is ignored: on a case-insensitive overlay folder (macOS,
 /// Windows shares) `/.RATARMOUNT.OVERLAY.SQLITE` is the real database.
 fn is_overlay_internal_name(name: &str) -> bool {
-    let n = name.as_bytes();
-    let db = HIDDEN_DB.as_bytes();
-    (n.len() >= db.len() && n[..db.len()].eq_ignore_ascii_case(db))
+    has_ascii_prefix(name, HIDDEN_DB)
+        || has_ascii_prefix(name, COW_STAGING_PREFIX)
         || name.eq_ignore_ascii_case(OVERLAY_MARKER)
 }
 
@@ -1117,6 +1127,12 @@ impl WriteOverlay {
                 }
             }
         }
+        // Exclusive lock is held. In-flight staging exists only after `new`
+        // returns, in this process, so a crash leftover is safe to unlink.
+        // A failed open above returns before this, including SQLITE_BUSY.
+        if let Err(e) = sweep_cow_staging(&root) {
+            return Err(OverlayError::Io(e));
+        }
         Ok(Self {
             policy: None,
             policy_gate: Mutex::new(()),
@@ -1513,14 +1529,12 @@ impl WriteOverlay {
             return Ok(());
         }
         let mut src = self.current_base().open(&without_overlay_meta(&fi), 0)?;
-        let mut opts = open_options_nofollow();
-        opts.write(true).create_new(true);
-        let mut dst = {
-            let _account = self.account_path(path);
-            opts.open(&real)?
-        };
+        let parent = real
+            .parent()
+            .ok_or_else(|| io::Error::other("copy-on-write target has no parent directory"))?;
+        let mut dst = create_cow_staging(parent)?;
         io::copy(&mut src, &mut dst)?;
-        set_host_metadata(&real, &metadata_from_info(&fi))?;
+        publish_cow_staging(dst, &real, &metadata_from_info(&fi), |_| Ok(()))?;
         Ok(())
     }
 
@@ -1591,12 +1605,10 @@ impl WriteOverlay {
             }
             Some(base.open(&without_overlay_meta(&fi), 0)?.take(limit))
         };
-        let mut dst = tempfile::Builder::new()
-            .prefix(HIDDEN_DB)
-            .make_in(&self.root, |path| {
-                let mut opts = open_options_nofollow();
-                opts.write(true).create_new(true).open(path)
-            })?;
+        let parent = real
+            .parent()
+            .ok_or_else(|| io::Error::other("copy-on-write target has no parent directory"))?;
+        let mut dst = create_cow_staging(parent)?;
         let copied: io::Result<()> = (|| {
             if let Some(src) = &mut src {
                 let mut buf = [0u8; 64 * 1024];
@@ -1625,20 +1637,27 @@ impl WriteOverlay {
             }
             Ok(())
         })();
+        // A short or failed copy must not be renamed into place. Drop refunds
+        // the whole charge, including any in-loop top-up.
+        copied.map_err(OverlayError::Io)?;
+        let actual = dst.as_file().metadata()?.len();
+        // Declared after `reservation` so this guard drops first. Drop of the
+        // reservation takes the same lock to refund; returning the parent
+        // fsync error must not deadlock on it.
         let _policy = self.policy_lock();
         self.ensure_under_root(&real)?;
-        set_host_metadata(dst.path(), &metadata_from_info(&fi))?;
-        let actual = dst.as_file().metadata()?.len();
-        match dst.persist_noclobber(&real) {
-            Ok(_) => {
-                policy.bytes_changed(&path, 0, reservation.bytes - actual);
-                reservation.bytes = 0;
-                policy.file_created(&path);
-            }
-            Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.error.into()),
-        }
-        copied.map_err(OverlayError::Io)
+        let attrs = metadata_from_info(&fi);
+        publish_cow_staging(dst, &real, &attrs, |_| {
+            // Unused reservation is slack (a short EOF stays charged at `actual`).
+            // Zero `bytes` before `file_created` so Drop cannot refund a file
+            // that already exists. `AlreadyExists` skips this closure and Drop
+            // refunds the whole charge.
+            policy.bytes_changed(&path, 0, reservation.bytes - actual);
+            reservation.bytes = 0;
+            policy.file_created(&path);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Last-wins overlay merge onto catalog locate hits (no [`FileInfo`]).
@@ -5740,6 +5759,94 @@ fn open_options_nofollow() -> FsOpenOptions {
     opts
 }
 
+fn create_cow_staging(parent: &Path) -> io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(COW_STAGING_PREFIX)
+        .make_in(parent, |path| {
+            let mut opts = open_options_nofollow();
+            opts.write(true).create_new(true).open(path)
+        })
+}
+
+/// Metadata, file fsync, and rename onto `real`, then fsync `real`'s parent.
+///
+/// `after_publish` runs once the final name exists and before the parent
+/// fsync. A parent-fsync error is returned after that, so settlement is not
+/// undone for a file that was already renamed into place. `AlreadyExists`
+/// leaves `real` untouched and does not call `after_publish`. Any error before
+/// the rename drops the temp.
+fn publish_cow_staging(
+    dst: tempfile::NamedTempFile,
+    real: &Path,
+    attrs: &OverlayMetadata,
+    after_publish: impl FnOnce(&File) -> Result<()>,
+) -> Result<()> {
+    set_host_metadata(dst.path(), attrs)?;
+    dst.as_file().sync_all()?;
+    match dst.persist_noclobber(real) {
+        Ok(published) => {
+            after_publish(&published)?;
+            if let Some(parent) = real.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        }
+        Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.error.into()),
+    }
+}
+
+/// Remove crash leftovers named [`COW_STAGING_PREFIX`]. Regular files only.
+/// Does not follow symlinks. `NotFound` is ignored. Bookkeeping that does not
+/// have this prefix (the database, its sidecars, both markers) is left alone.
+fn sweep_cow_staging(root: &Path) -> io::Result<()> {
+    sweep_cow_staging_dir(root, root)
+}
+
+fn sweep_cow_staging_dir(root: &Path, dir: &Path) -> io::Result<()> {
+    ensure_overlay_under_root(root, dir)?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for ent in entries {
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let path = ent.path();
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            sweep_cow_staging_dir(root, &path)?;
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if !has_ascii_prefix(&name, COW_STAGING_PREFIX) {
+            continue;
+        }
+        ensure_overlay_under_root(root, &path)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn overlay_symlink(target: &Path, dest: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -8142,7 +8249,7 @@ mod tests {
         ov.finish_owned_write_fd(file);
     }
 
-    /// Regression: a failed COW still charges bytes left by a partial copy.
+    /// Regression: a failed COW must not publish the short prefix or keep its quota (#126).
     #[test]
     fn regression_overlay_policy_accounts_partial_cow_failure() {
         struct PartialReader(io::Cursor<Vec<u8>>);
@@ -8179,11 +8286,266 @@ mod tests {
             }
         }
         let (td, ov, policy) = policy_overlay(Arc::new(PartialBase), 8);
-        assert!(ov.ensure_modifiable("/partial").is_err());
-        assert_eq!(fs::read(td.path().join("partial")).unwrap(), b"abc");
+        let host = td.path().join("partial");
+        let err = ov.ensure_modifiable("/partial");
+        let bytes = fs::read(&host).ok();
+        assert!(
+            err.is_err() && bytes.is_none() && policy.usage() == (0, 0),
+            "failed COW must drop the partial and refund; err={err:?} bytes={bytes:?} usage={:?}",
+            policy.usage()
+        );
+    }
+
+    /// Regression: a 6-byte member whose read returns 3 bytes then EOF keeps that
+    /// prefix and settles the unused reservation (`usage` is `(3, 1)`, not `(6, 1)`).
+    #[test]
+    fn regression_overlay_policy_accounts_short_cow_eof_slack() {
+        struct EofAfter3(io::Cursor<Vec<u8>>);
+        impl Read for EofAfter3 {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.position() >= 3 {
+                    return Ok(0);
+                }
+                let room = (3 - self.0.position()) as usize;
+                let n = room.min(buf.len());
+                self.0.read(&mut buf[..n])
+            }
+        }
+        impl Seek for EofAfter3 {
+            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+                self.0.seek(pos)
+            }
+        }
+        struct ShortBase;
+        impl MountSource for ShortBase {
+            fn list(&self, _: &str) -> Option<ListResult> {
+                None
+            }
+            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+                (path == "/short").then(|| mem_file_info(path, 6))
+            }
+            fn open(
+                &self,
+                _: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                Ok(Box::new(EofAfter3(io::Cursor::new(b"abcdef".to_vec()))))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+        let (td, ov, policy) = policy_overlay(Arc::new(ShortBase), 8);
+        ov.ensure_modifiable("/short").unwrap();
+        assert_eq!(fs::read(td.path().join("short")).unwrap(), b"abc");
         assert_eq!(policy.usage(), (3, 1));
-        ov.unlink("/partial").unwrap();
-        assert_eq!(policy.usage(), (0, 0));
+    }
+
+    fn name_has_cow_prefix(name: &str) -> bool {
+        has_ascii_prefix(name, COW_STAGING_PREFIX)
+    }
+
+    /// Regression: a reader that dies mid-copy must not leave the short bytes at
+    /// the final name, and a crashed `.ratarmount.overlay.cow-` temp must not be
+    /// committed (#126).
+    #[test]
+    fn regression_cow_crash_mid_copy_hides_partial_and_skips_commit() {
+        let original = b"abcdef";
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let mount_tar = dir.path().join("mount.tar");
+        let one_tar = dir.path().join("one.tar");
+        {
+            let mut f = File::create(&mount_tar).unwrap();
+            ratarmount_formats_tar::write_ustar_members(
+                &mut f,
+                &[
+                    ustar_file("big.bin", original),
+                    ustar_file("keep.txt", b"keep"),
+                ],
+            )
+            .unwrap();
+            ratarmount_formats_tar::write_tar_eof(&mut f).unwrap();
+        }
+        {
+            let mut f = File::create(&one_tar).unwrap();
+            ratarmount_formats_tar::write_ustar_members(&mut f, &[ustar_file("big.bin", original)])
+                .unwrap();
+            ratarmount_formats_tar::write_tar_eof(&mut f).unwrap();
+        }
+
+        struct CrashReader {
+            overlay: PathBuf,
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl Read for CrashReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= 3 {
+                    let host = self.overlay.join("big.bin");
+                    let staged = fs::read_dir(&self.overlay)
+                        .map(|rd| {
+                            rd.flatten()
+                                .any(|ent| name_has_cow_prefix(&ent.file_name().to_string_lossy()))
+                        })
+                        .unwrap_or(false);
+                    let bytes = fs::read(&host).ok();
+                    assert!(
+                        staged && !host.exists(),
+                        "mid-copy must stage a .ratarmount.overlay.cow- file and leave big.bin absent; staged={staged} big.bin={bytes:?}"
+                    );
+                    return Err(io::Error::other("injected read failure"));
+                }
+                let n = (3 - self.pos)
+                    .min(buf.len())
+                    .min(self.data.len() - self.pos);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+        impl Seek for CrashReader {
+            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+                let len = self.data.len() as i64;
+                let cur = self.pos as i64;
+                let next = match pos {
+                    SeekFrom::Start(n) => n as i64,
+                    SeekFrom::Current(n) => cur + n,
+                    SeekFrom::End(n) => len + n,
+                };
+                if next < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek before start",
+                    ));
+                }
+                self.pos = next as usize;
+                Ok(self.pos as u64)
+            }
+        }
+        struct CrashBase {
+            overlay: PathBuf,
+            big: Vec<u8>,
+        }
+        impl MountSource for CrashBase {
+            fn list(&self, path: &str) -> Option<ListResult> {
+                if path != "/" {
+                    return None;
+                }
+                let mut map = BTreeMap::new();
+                map.insert(
+                    "big.bin".into(),
+                    mem_file_info("/big.bin", self.big.len() as u64),
+                );
+                map.insert("keep.txt".into(), mem_file_info("/keep.txt", 4));
+                Some(ListResult::Infos(map))
+            }
+            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+                match path {
+                    "/" => Some(create_root_file_info()),
+                    "/big.bin" => Some(mem_file_info(path, self.big.len() as u64)),
+                    "/keep.txt" => Some(mem_file_info(path, 4)),
+                    _ => None,
+                }
+            }
+            fn open(
+                &self,
+                file_info: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                let path = file_info.userdata.iter().rev().find_map(|u| match u {
+                    UserData::Other(s) => s.strip_prefix("mem:"),
+                    _ => None,
+                });
+                if path == Some("/big.bin") {
+                    return Ok(Box::new(CrashReader {
+                        overlay: self.overlay.clone(),
+                        data: self.big.clone(),
+                        pos: 0,
+                    }));
+                }
+                Ok(Box::new(io::Cursor::new(b"keep".to_vec())))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+
+        let ov = WriteOverlay::new(
+            Arc::new(CrashBase {
+                overlay: overlay.clone(),
+                big: original.to_vec(),
+            }),
+            &overlay,
+        )
+        .unwrap();
+        ov.unlink("/keep.txt").unwrap();
+        assert!(ov.lookup("/keep.txt", 0).is_none());
+        let err = ov.ensure_modifiable("/big.bin");
+        assert!(err.is_err(), "{err:?}");
+        assert!(
+            !overlay.join("big.bin").exists(),
+            "host big.bin must be absent, got {:?}",
+            fs::read(overlay.join("big.bin")).ok()
+        );
+        assert!(
+            fs::read_dir(&overlay)
+                .unwrap()
+                .flatten()
+                .all(|ent| { !name_has_cow_prefix(&ent.file_name().to_string_lossy()) }),
+            "failed COW must drop its staging temp"
+        );
+        drop(ov);
+
+        fs::create_dir_all(overlay.join("sub")).unwrap();
+        fs::write(overlay.join(".ratarmount.overlay.cow-Ab12Cd"), b"short").unwrap();
+        fs::write(
+            overlay.join("sub").join(".ratarmount.overlay.cow-Ab12Cd"),
+            b"short",
+        )
+        .unwrap();
+        fs::write(
+            overlay.join("sub").join(".RATARMOUNT.OVERLAY.COW-Xy"),
+            b"short",
+        )
+        .unwrap();
+        let plan = collect_overlay_commit_plan(&overlay).unwrap();
+        assert!(
+            plan.append_entries
+                .iter()
+                .all(|(p, _)| { p != "big.bin" && !p.split('/').any(name_has_cow_prefix) }),
+            "commit plan must omit the partial and cow temps: {:?}",
+            plan.append_entries
+        );
+        match commit_overlay(&overlay, &one_tar, &yes_commit_opts()) {
+            Ok(_) => {
+                let src = open_uncompressed_tar_base(&one_tar, false);
+                assert_eq!(read_member(src.as_ref(), "/big.bin"), original);
+            }
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: commit_overlay needs GNU tar: {e}");
+            }
+            Err(e) => panic!("{e}"),
+        }
+
+        let ov =
+            WriteOverlay::new(open_uncompressed_tar_base(&mount_tar, false), &overlay).unwrap();
+        assert!(!overlay.join(".ratarmount.overlay.cow-Ab12Cd").exists());
+        assert!(!overlay
+            .join("sub")
+            .join(".ratarmount.overlay.cow-Ab12Cd")
+            .exists());
+        assert!(!overlay
+            .join("sub")
+            .join(".RATARMOUNT.OVERLAY.COW-Xy")
+            .exists());
+        assert!(overlay.join(HIDDEN_DB).is_file());
+        assert!(overlay.join(OVERLAY_MARKER).is_file());
+        assert!(ov.is_deleted("/keep.txt"));
+        assert!(ov.lookup("/keep.txt", 0).is_none());
+        let fi = ov.lookup("/big.bin", 0).unwrap();
+        assert_eq!(fi.size, original.len() as u64);
+        assert_eq!(ov.read(&fi, original.len(), 0).unwrap(), original);
     }
 
     /// Regression: read-only opens of an existing host file must not invoke a write policy.
@@ -10584,10 +10946,18 @@ mod tests {
             format!("/{OVERLAY_MARKER}"),
             format!("/{LEGACY_OVERLAY_MARKER}"),
             format!("/sub/{OVERLAY_MARKER}"),
+            format!("/{COW_STAGING_PREFIX}Ab12Cd"),
         ] {
             assert!(ov.lookup(&p, 0).is_none(), "{p}");
             assert!(!ov.has_file(&p), "{p}");
         }
+        // Planted after open, so startup sweep cannot remove it. Lookup and
+        // has_file still have to treat the staging prefix as bookkeeping.
+        let planted_name = format!("{COW_STAGING_PREFIX}Ab12Cd");
+        fs::write(overlay.join(&planted_name), b"short").unwrap();
+        let planted = format!("/{planted_name}");
+        assert!(ov.lookup(&planted, 0).is_none(), "{planted}");
+        assert!(!ov.has_file(&planted), "{planted}");
         // A base-archive member with the database name is hidden too.
         struct DbNamedBase;
         impl MountSource for DbNamedBase {
