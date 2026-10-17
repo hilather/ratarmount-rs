@@ -99,7 +99,7 @@ tables and hardware notes are in [Local AI results](local-ai/results.md).
 <!-- HF-DATASET: filled from benchmarks/ai/results (hf-dataset) -->
 
 `benchmarks/ai/hf-dataset.py` mounts the public
-[Oxford-IIIT Pet WebDataset](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
+[Oxford-IIIT Pet WebDataset](https://huggingface.co/datasets/RealMattBrewer/oxford-iiit-pet-webdataset)
 three ways with fresh caches each time (2026-10-17, release build, medians of
 three runs, run `647657dac03a`):
 

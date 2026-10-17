@@ -24,7 +24,7 @@ import urllib.request
 
 from common import Mount, Skip, add_mount_options, binary, fuse_available, main, mount_options, parser
 
-DATASET_REPO = "RealMattbrewer/oxford-iiit-pet-webdataset"
+DATASET_REPO = "RealMattBrewer/oxford-iiit-pet-webdataset"
 DATASET_REVISION = "90c62369d1501beb8c717a793dfef52d94d565e6"
 DATASET_SHARD = "train/train-000000.tar"
 DATASET_FILE = "Abyssinian_1.jpg"

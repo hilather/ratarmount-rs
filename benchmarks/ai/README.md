@@ -125,7 +125,7 @@ For separate configurations use separate output paths so summaries stay clear.
    index (mount startup and a read), and the same shard with `-c`, which
    ignores the published index and scans the remote TAR (mount startup and a
    read). Reads are hashed and must agree across mounts. The default is
-   `RealMattbrewer/oxford-iiit-pet-webdataset` at a pinned commit; network
+   `RealMattBrewer/oxford-iiit-pet-webdataset` at a pinned commit; network
    latency is part of every number. Offline or an unreachable Hub skips.
 
 Every row records hostname, kernel/architecture, load1, run ID, UTC timestamp,

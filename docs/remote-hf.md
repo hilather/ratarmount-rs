@@ -508,7 +508,7 @@ all chunks have been observed and hands the verified result to the shared cache.
 
 ## Example dataset
 
-[`RealMattbrewer/oxford-iiit-pet-webdataset`](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
+[`RealMattBrewer/oxford-iiit-pet-webdataset`](https://huggingface.co/datasets/RealMattBrewer/oxford-iiit-pet-webdataset)
 is a public dataset built with `ratarmount shard` and published with
 `ratarmount --publish-index hf://...`: seven uncompressed WebDataset shards,
 each with a published index. Measured from a laptop with fresh caches

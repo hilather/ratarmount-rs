@@ -14,7 +14,7 @@ one command that matters, and links to the page with the details.
 ## Datasets from the Hub, no download
 
 ```bash
-ratarmount -r hf://datasets/RealMattbrewer/oxford-iiit-pet-webdataset pets/
+ratarmount -r hf://datasets/RealMattBrewer/oxford-iiit-pet-webdataset pets/
 ls pets/train/train-000000.tar/ | head
 ```
 
@@ -29,7 +29,7 @@ twice, and `hf-cache://` browses that cache offline.
 
 - [Hugging Face Hub](../remote-hf.md): URLs, revisions, tokens, mirrors, the shared cache, offline mounts.
 - [Publish an index](../recipes/publish-hf-index.md): one command, every downloader skips the scan.
-- [The demo dataset](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset): 7,349 pet photos as indexed WebDataset shards, with a card that walks through every access path.
+- [The demo dataset](https://huggingface.co/datasets/RealMattBrewer/oxford-iiit-pet-webdataset): 7,349 pet photos as indexed WebDataset shards, with a card that walks through every access path.
 
 ## Models without the copy
 
