@@ -135,6 +135,14 @@ canonicalization and Darwin errno mapping; pre-existing on `main`: **AI-FIX-NEST
 file cursor and could read a sibling's bytes on NFS/HTTP/SMB/SFTP/9P and the
 Session API; **AI-FIX-VHDX** — qemu-img 11 fixed VHDX rejected by the parser.
 
+Deferred on the roadmap's own condition: **`io_uring` for backend reads**
+(§8 "once the rest is measured"). Measured here: library-mode Session reads of a
+256 MiB seekable-zstd member run at about the same speed as `zstd -d` on the
+same file (≈480 vs ≈430 MB/s, cold), and the FUSE request path, not the
+backend's `read` syscalls, is what separates FUSE from library throughput.
+`io_uring` would not move either number, so it stays out until a profile on
+the GB10 shows syscall overhead in the backend read path.
+
 Proposals that are already covered by existing features and need only a recipe
 or documentation (no new code, per the document): teacher logits as shards
 (§7, AI-DOCS + AI-SH), Common Crawl WARC (§5, AI-DOCS), checkpoint archives
