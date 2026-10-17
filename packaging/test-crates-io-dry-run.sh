@@ -33,8 +33,12 @@ CORE_TOML="$ROOT/ratarmount-core/Cargo.toml"
 INDEX_TOML="$ROOT/ratarmount-index/Cargo.toml"
 # Origin / docs / crates.io metadata. Do not inherit mxmlnkn/ratarmount-rs (404).
 WANT_REPO='https://github.com/hilather/ratarmount-rs'
-# Keep in sync with the workspace rust-version (checked by test-msrv-ci.sh).
-WANT_MSRV='1.90'
+WANT_MSRV="$(sed -nE 's/^rust-version = "([0-9]+\.[0-9]+(\.[0-9]+)?)"[[:space:]]*$/\1/p' "$ROOT/Cargo.toml")"
+n="$(printf '%s\n' "$WANT_MSRV" | grep -c . || true)"
+if [[ "$n" -ne 1 ]]; then
+    echo "FAIL: root Cargo.toml must contain exactly one rust-version = \"X.Y[.Z]\" (found ${n})" >&2
+    exit 1
+fi
 
 check_l0_manifest() {
     local name="$1"
@@ -97,11 +101,7 @@ fi
 if grep -qE 'mxmlnkn/ratarmount-rs' "$ROOT/Cargo.toml"; then
     fail "root Cargo.toml must not set repository to mxmlnkn/ratarmount-rs"
 fi
-if grep -qE "^rust-version = \"${WANT_MSRV}\"" "$ROOT/Cargo.toml"; then
-    pass "workspace rust-version is ${WANT_MSRV}"
-else
-    fail "root Cargo.toml rust-version must be ${WANT_MSRV}"
-fi
+pass "workspace rust-version is ${WANT_MSRV}"
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "skip: cargo not on PATH (manifest metadata already checked)" >&2
