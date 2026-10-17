@@ -4,7 +4,7 @@ Status: **boolean flags shipped** (`--http` / `--webdav` / `--smb` / `--ninep` /
 
 NFS stays in [`nfs-export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md). This page is the sibling adapters (`ratarmount-http`, `ratarmount-smb`, `ratarmount-9p`, `ratarmount-sftp`) plus shared bind/stop helpers in `ratarmount-export-core`. Roadmap: [`tasks/beyond-parity-roadmap.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/beyond-parity-roadmap.md) P-5 / P-6 / P-2 / P-7 / P-10 / G-1.
 
-There is **no** `ratarmount serve` subcommand. Combine flags on the existing CLI:
+The export booleans are the stable interface; `ratarmount serve --nfs --http ARCHIVE` is optional sugar for the same flags (at least one export is required and it cannot be combined with `--no-mount`). Combine flags on the existing CLI:
 
 ```bash
 ratarmount --nfs --http archive.tar.gz

@@ -39,6 +39,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 |---------------|----------|
 | BIG fixture builder missing tar.lz4 / multi-frame zstd | `./benchmarks/test-compare-fixtures.sh` |
 | Vector-wave fixture builder missing catalog tars | `./benchmarks/test-compare-vector-wave.sh` |
+| Format sweep fixture builder: missing-producer skips, corrupt or count-mismatched reads, `PREPARE_ONLY` / `NO_FUSE` regressions (AI-FMTBENCH) | `./benchmarks/test-compare-formats.sh` |
 | Fixture smoke dies without Python/binary (#9) | `./benchmarks/test-compare-prepare-env.sh` · `./benchmarks/test-compare-fixtures.sh` |
 | Truncated `.gz` / UnexpectedEof (FUSE short read = EOF) | `cargo test -p ratarmount-fuse --lib fill_read` · `cargo test -p ratarmount-compress --lib fuse_style` · `cargo test -p ratarmount-session --lib nested_large_plain_gzip` |
 | Nested gzip concurrent wrong/truncated data | `cargo test -p ratarmount-compress --lib shared_from_reader` · `cargo test -p ratarmount-compress --lib stenciled_fuse` |
@@ -78,15 +79,15 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Bzip2 block boundary truncates TAR listing / nested flattening / header detection; incomplete TAR header silently accepted | `cargo test -p ratarmount-formats-tar --lib regression_bzip2_block_boundary` · `cargo test -p ratarmount-formats-tar --lib regression_truncated_tar_header_is_an_error` |
 | G3 RGZI warm remount (plain `.gz` + tar.gz write_index) | `cargo test -p ratarmount-session --lib gzip_rgzi` · `cargo test -p ratarmount-session --lib plain_gzip_rgzi` · `cargo test -p ratarmount-session --lib plain_gzip` |
 | Single-frame `.zst` still full-decode after “repack” | `cargo test -p ratarmount-compress --lib repack_seekable` |
-| Already-seekable zstd copy does not change bytes | `cargo test -p ratarmount-compress --lib repack_already_seekable` |
-| `IN == OUT` already seekable (`DidNothing`) | `cargo test -p ratarmount-compress --lib repack_inplace_did_nothing` |
+| Already-seekable zstd copy does not change bytes | `cargo test -p ratarmount-compress --lib repack_copies_multiframe_with_seek_table` |
+| `IN == OUT` or an existing OUT is refused instead of rewritten | `cargo test -p ratarmount-compress --lib repack_refuses_same_path_and_existing_output` |
 | Multi-frame without table gets a footer; `kind` is `zstd-seek-table` | `cargo test -p ratarmount-compress --lib repack_appends_seek_table` |
-| Repack seek-table cSize ignores skippable gaps between frames | `cargo test -p ratarmount-compress --lib repack_appends_seek_table_skippable_gaps` |
-| Frame > u32 copies bytes, omits table; `--repack-force` recompresses | `cargo test -p ratarmount-compress --lib repack_drops_table_when_u32_overflow` |
-| Gzip sidecar RGZI via `export_seek_index_blob` round-trips import | `cargo test -p ratarmount-compress --lib repack_gzip_rgzi_sidecar` |
-| Clap `--repack-seekable IN OUT` does not steal OUT as mountpoint | `cargo test -p ratarmount --bin ratarmount repack_seekable_flag` |
+| Repack seek-table cSize ignores skippable gaps between frames | `cargo test -p ratarmount-compress --lib repack_skippable_gap_copies_without_footer` |
+| Frame size above u32 is rejected; `--repack-force` recompresses a single frame and round-trips | `cargo test -p ratarmount-compress --lib repack_rejects_frame_size_above_u32` · `cargo test -p ratarmount-compress --lib repack_recompresses_single_frame_and_roundtrips` |
+| Gzip sidecar RGZI via `export_seek_index_blob` round-trips import | `cargo test -p ratarmount-compress --lib repack_gzip_copy_writes_rgzi` · `cargo test -p ratarmount-compress --lib repack_gzip_copy_writes_gzidx_and_both` |
+| Clap `--repack-seekable IN OUT` does not steal OUT as mountpoint | `cargo test -p ratarmount --bin ratarmount repack_seekable_does_not_steal_output_path` · `cargo test -p ratarmount --bin ratarmount repack_seekable_frame_size_1m_does_not_steal_archive` |
 | `--repack-seekable` + `--nfs` / `-w` / mountpoint exits 2 | `cargo test -p ratarmount --bin ratarmount repack_incompatible_with_export` |
-| tar → tar.zst keeps member offset order (zero backward flatten seeks) | `cargo test -p ratarmount --bin ratarmount repack_preserves_tar_offset_order` |
+| tar → tar.zst keeps member offset order (zero backward flatten seeks) | `cargo test -p ratarmount-formats-tar --lib regression_offset_order_seeks` · `cargo test -p ratarmount --bin ratarmount repack_seekable_gzip_round_trip_without_external_zstd` |
 | G3 hard GZIDX import / export polish (G3-D/E) | `cargo test -p ratarmount-compress --lib gzip_seek` (filters: `g3_d_`, `g3_e_`) |
 | Warm index after archive replace (tarstats size/mtime/content) | `cargo test -p ratarmount-session --lib warm_index_rebuilds` · `cargo test -p ratarmount-index --lib check_tarstats` · `cargo test -p ratarmount-formats-tar --lib warm_index` · `cargo test -p ratarmount-formats-zip --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
 | Nested EXT4 / SquashFS no-tmp factory wire | `cargo test -p ratarmount-session --lib nested_ext4` · `cargo test -p ratarmount-session --lib nested_squashfs` · crate `open_from_reader` tests |
@@ -236,9 +237,9 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Remote sidecar XDG LRU remount 0 GET (no `.ptr`) | `cargo test -p ratarmount-index --lib meta_cache` · `cargo test -p ratarmount-index --lib remount_well_known` · `cargo test -p ratarmount-session --lib apply_remote_index` |
 | Local cached sidecar reused after remote archive replace (URL-label tarstats no-op) | `cargo test -p ratarmount-session --lib apply_remote_index_local_copy_rejects` · `cargo test -p ratarmount-session --lib cached_remote_index_is_stale` · `cargo test -p ratarmount-session --lib hash_http_range_window` · `cargo test -p ratarmount-session --lib apply_remote_index_read_only_stale` · `cargo test -p ratarmount-session --lib apply_remote_index_local_copy_keeps_match` |
 | Remote `{url}.index.ptr` then `{url}.index.{id}.sqlite` GET (HTTP/S3; 404/tarstats continue) | `cargo test -p ratarmount-session --lib apply_remote_index` · `cargo test -p ratarmount-remote --lib fetch_s3_pointer` · `cargo test -p ratarmount-index --lib sibling_index_pointer` |
-| S3 PutObject / multipart abort on error | `cargo test -p ratarmount-remote --lib s3_put` · `cargo test -p ratarmount-remote --lib s3_put_multipart` |
-| S3 V-2 pointer PUT blob-then-pointer / fail-closed leftover blob | `cargo test -p ratarmount-remote --lib s3_publish_index_blob_then_pointer` · `cargo test -p ratarmount-remote --lib s3_publish_index_fail_closed` |
-| S3 CreateMultipartUpload+abort write probe (F-7) | `cargo test -p ratarmount-remote --lib s3_multipart_create_abort_probe` |
+| S3 PutObject / multipart abort on error | `cargo test -p ratarmount-remote --lib s3_put_signs_body_hash_not_empty_payload` · `cargo test -p ratarmount-remote --lib s3_multipart_signs_partnumber_and_uploadid` · `cargo test -p ratarmount-remote --lib s3_second_put_aborts_without_complete` |
+| S3 V-2 pointer PUT blob-then-pointer / fail-closed leftover blob | `cargo test -p ratarmount-remote --lib put_s3_index_siblings_puts_blob_then_pointer` · `cargo test -p ratarmount-remote --lib put_s3_index_siblings_blob_500_does_not_put_pointer` · `cargo test -p ratarmount-remote --lib put_s3_index_siblings_multipart_blob_then_pointer` |
+| S3 write refused for anonymous credentials; a failed multipart completion aborts the upload (F-7 write probe) | `cargo test -p ratarmount-remote --lib s3_anonymous_put_errors` · `cargo test -p ratarmount-remote --lib s3_complete_error_body_aborts` |
 | Outbound GET index.sqlite Content-Type | `cargo test -p ratarmount-http --lib index_content_type` |
 | Local `oci:{digest}` cache skips referrer | `cargo test -p ratarmount-remote --lib oci_referrer_not_fetched_on_cache_hit` |
 | OCI referrer GET on miss | `cargo test -p ratarmount-remote --lib oci_referrer` |
@@ -381,10 +382,10 @@ README / parity tables stale.
 
 | Trigger | Update |
 |---------|--------|
-| New/removed/changed format, codec, remote, CLI flag, nested/tmp behavior | [`README.md`](README.md) feature tables + Gaps section if needed |
+| New/removed/changed format, codec, remote, CLI flag, nested/tmp behavior | [`docs/formats.md`](docs/formats.md) tables and its Known limits section; the grouped summary tables in [`README.md`](README.md) and the command tour in [`docs/getting-started.md`](docs/getting-started.md) when a user-visible command or format changes |
 | Parity status flip (`[x]` / `~` / residual) | [`docs/parity-todo.md`](docs/parity-todo.md) |
 | Mount option added/changed | [`docs/mount-options-parity.md`](docs/mount-options-parity.md) |
-| Nested open / temp spool | [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md) (+ README cheat sheet) |
+| Nested open / temp spool | [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md) (+ the nested summaries in `docs/formats.md` and the README) |
 | Dual-run / packaging product status | [`docs/phase12-dual-run.md`](docs/phase12-dual-run.md) / packaging notes |
 | Upstream-inspired feature (from mxmlnkn/ratarmount issues) | [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md) status row + README **Upstream** link |
 | New protocol / export / beyond-parity feature (P-/F-/G- IDs) | [`docs/tasks/beyond-parity-roadmap.md`](docs/tasks/beyond-parity-roadmap.md) status |
@@ -398,7 +399,7 @@ Skill for nested/tmp matrices: **`format-support-matrices`**.
 
 Tagging alone is not enough: **`Packages` must publish a GitHub Release with real
 assets** (`.deb` / `.rpm` / portable tarballs / cosign bundles). Workflow:
-[`.github/workflows/packages.yml`](`.github/workflows/packages.yml`).
+[`.github/workflows/packages.yml`](.github/workflows/packages.yml).
 
 **After every release tag, watch CI until settled** (fix failures, re-tag if needed).
 Full procedure: skill **`release-tag-ci-watch`** (`.grok/skills/release-tag-ci-watch/SKILL.md`).
@@ -467,7 +468,7 @@ Living parity: `docs/parity-todo.md`, `docs/tasks/gap-implementation-batch.md`, 
 | Doc | Role |
 |-----|------|
 | [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md) | **Canonical** nested no-tmp vs temp matrix + parent×nested behavior |
-| [`README.md`](README.md) | Short nested cheat sheet (must match the canonical doc) |
+| [`README.md`](README.md) · [`docs/formats.md`](docs/formats.md) | Short nested summaries (must match the canonical doc) |
 | [`docs/tasks/embedded-nested-random-access.md`](docs/tasks/embedded-nested-random-access.md) | Implementation checklist |
 
 Triggers: `open_nested_reader_fn`, AutoMount spool, format `MountSource::open`, materialize vs seekable body, TAR flatten limits.

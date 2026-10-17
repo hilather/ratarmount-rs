@@ -267,7 +267,7 @@ Primary URL **`rclone://remote:path`** (colon after remote name). Alias **`rclon
 - S3 credential **refresh after open** (anonymous + IMDS/ECS snapshot at open **are** shipped; live Range is the default path, not GetObject→temp)
 - rclone RC `--rc-serve` HTTP GET (`rclone+remote:path` **is** shipped)
 - OCI eStargz / SOCI / nydus / config JSON
-- GCS/Azure PUT; offline `--commit-overlay` + `s3://`; create-if-missing on remote URLs (F-7 live `s3://` TAR/ZST interval/on-exit **is** shipped)
+- Offline `--commit-overlay` on remote URLs (exits 2); create-if-missing on remote URLs. Live TAR/`.tar.zst` interval/on-exit commits and index publishing **are** shipped for `s3://`, `gs://`, `az://` and `hf://` (F-7)
 
 ## Usage
 
