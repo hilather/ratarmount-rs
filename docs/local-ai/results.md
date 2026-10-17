@@ -83,10 +83,11 @@ published index turns a 17 s open into about 1.3 s, and the whole-repository
 mount opens shards without scanning them. One earlier attempt of this
 benchmark, before `HOME` was isolated, stalled for fifteen minutes while
 listing the shard with the daemon idle. It did not recur in eighteen later
-runs, including a twelve-run loop with debug mount logs and stack capture
-armed (the slowest remote scan in that loop took 40.6 s, the slowest shard
-open 1.7 s), so it is recorded here as an open question rather than a known
-cause.
+runs: three whose table survives only in a log, the three recorded above, and
+a twelve-run loop with debug mount logs and stack capture armed, recorded in
+[`brewtop-2026-10-17-hf-repro.csv`](../../benchmarks/ai/results/brewtop-2026-10-17-hf-repro.csv)
+(slowest remote scan 40.6 s, slowest shard open 1.7 s). It is recorded here
+as an open question rather than a known cause.
 
 ## What the numbers do and do not say
 
