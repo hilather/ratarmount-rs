@@ -1,190 +1,210 @@
 date,host,version,git_rev,load1,fixture,format,size_bytes,metric,value,unit,status,note
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,fixture,,,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,fixture,,,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.bz2,tar.bz2,75929794,fixture,,,ok,bzip2 -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,fixture,,,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,fixture,,,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,fixture,,,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,fixture,,,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,fixture,,,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,fixture,,,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,fixture,,,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.iso,iso,100354048,fixture,,,ok,xorriso Rock Ridge
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,fixture,,,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,fixture,,,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,fixture,,,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.safetensors,safetensors,67112968,fixture,,,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.gguf,gguf,67111232,fixture,,,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,fixture,,,ok,tar of zip + tar.gz; -r
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.7z,7z,,fixture,,,skip,missing 7z / 7za / 7zz
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.squashfs,squashfs,,fixture,,,skip,missing mksquashfs
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.fat,fat,,fixture,,,skip,missing mformat
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.exfat,exfat,,fixture,,,skip,missing guestfish
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,index_cold_s,0.31274955603294075,s,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,mount_cold_s,0.12794208526611328,s,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,mount_cold_rss_kib,22392,KiB,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,mount_warm_s,0.05806398391723633,s,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,mount_warm_rss_kib,22264,KiB,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,members,1001,files,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,rand_cat_ms,2.0537939853966236,ms,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,rand_pread_64k_ms,0.09738816879689693,ms,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,seq_mib_s,10559.059231057392,MiB/s,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,verify_sha256,,,ok,tar; fixed mtime/owner; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar,tar,100403200,find_ms,7.805312983691692,ms,ok,tar; fixed mtime/owner
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,index_cold_s,0.2362085748463869,s,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,mount_cold_s,0.26554393768310547,s,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,mount_cold_rss_kib,26096,KiB,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,mount_warm_s,0.11509108543395996,s,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,mount_warm_rss_kib,20892,KiB,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,members,1001,files,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,rand_cat_ms,10.265554999932647,ms,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,rand_pread_64k_ms,4.126368090510368,ms,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,seq_mib_s,10766.752593903107,MiB/s,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,verify_sha256,,,ok,gzip -n -1 -c; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.gz,tar.gz,71605168,find_ms,6.078340113162994,ms,ok,gzip -n -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.bz2,tar.bz2,75929794,index_cold_s,26.88353876909241,s,ok,bzip2 -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.bz2,tar.bz2,75929794,mount_cold_s,18.58261513710022,s,ok,bzip2 -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.bz2,tar.bz2,75929794,mount_cold_rss_kib,169580,KiB,ok,bzip2 -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.bz2,tar.bz2,75929794,mount_warm_s,0.1390979290008545,s,ok,bzip2 -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.bz2,tar.bz2,75929794,mount_warm_rss_kib,94424,KiB,ok,bzip2 -1 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.bz2,tar.bz2,75929794,members,761,files,error,bzip2 -1 -c; expected 1001 regular files
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,index_cold_s,0.37417953298427165,s,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,mount_cold_s,0.3826310634613037,s,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,mount_cold_rss_kib,33428,KiB,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,mount_warm_s,0.013456106185913086,s,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,mount_warm_rss_kib,20684,KiB,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,members,1001,files,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,rand_cat_ms,39.238512981683016,ms,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,rand_pread_64k_ms,5.49757806584239,ms,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,seq_mib_s,17270.342029514366,MiB/s,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,verify_sha256,,,ok,xz -1 -T0 --block-size=4MiB -c; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.xz,tar.xz,71298560,find_ms,3.1105168163776398,ms,ok,xz -1 -T0 --block-size=4MiB -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,index_cold_s,0.07348388293758035,s,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,mount_cold_s,0.06764721870422363,s,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,mount_cold_rss_kib,30720,KiB,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,mount_warm_s,0.06630802154541016,s,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,mount_warm_rss_kib,20456,KiB,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,members,1001,files,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,rand_cat_ms,2.817864064127207,ms,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,rand_pread_64k_ms,1.9107928965240717,ms,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,seq_mib_s,14784.2640052494,MiB/s,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,verify_sha256,,,ok,ratarmount --repack-seekable (seek table); bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.zst,tar.zst,71229733,find_ms,3.0949029605835676,ms,ok,ratarmount --repack-seekable (seek table)
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,index_cold_s,0.07011432899162173,s,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,mount_cold_s,0.06690502166748047,s,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,mount_cold_rss_kib,48440,KiB,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,mount_warm_s,0.06814289093017578,s,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,mount_warm_rss_kib,40700,KiB,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,members,1001,files,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,rand_cat_ms,2.0177168771624565,ms,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,rand_pread_64k_ms,0.8272840641438961,ms,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,seq_mib_s,18297.126004975034,MiB/s,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,verify_sha256,,,ok,lz4 -1 -B7 -c; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.tar.lz4,tar.lz4,71366260,find_ms,2.947293920442462,ms,ok,lz4 -1 -B7 -c
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,index_cold_s,0.03248600289225578,s,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,mount_cold_s,0.0666351318359375,s,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,mount_cold_rss_kib,21504,KiB,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,mount_warm_s,0.06694197654724121,s,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,mount_warm_rss_kib,21140,KiB,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,members,1001,files,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,rand_cat_ms,1.0697341058403254,ms,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,rand_pread_64k_ms,0.04874705336987972,ms,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,seq_mib_s,17922.10533555075,MiB/s,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,verify_sha256,,,ok,zip deflate; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.zip,zip-deflate,71617985,find_ms,2.8613428585231304,ms,ok,zip deflate
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,index_cold_s,0.04324659309349954,s,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,mount_cold_s,0.06727004051208496,s,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,mount_cold_rss_kib,21668,KiB,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,mount_warm_s,0.06632208824157715,s,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,mount_warm_rss_kib,20744,KiB,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,members,1001,files,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,rand_cat_ms,1.0869118850678205,ms,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,rand_pread_64k_ms,0.0580870546400547,ms,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,seq_mib_s,16665.360549345103,MiB/s,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,verify_sha256,,,ok,zip stored; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-store.zip,zip-store,99979818,find_ms,3.83877195417881,ms,ok,zip stored
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,index_cold_s,0.03240445489063859,s,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,mount_cold_s,0.06744003295898438,s,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,mount_cold_rss_kib,20556,KiB,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,mount_warm_s,0.06770110130310059,s,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,mount_warm_rss_kib,20500,KiB,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,members,1001,files,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,rand_cat_ms,1.0777730494737625,ms,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,rand_pread_64k_ms,0.05588098429143429,ms,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,seq_mib_s,16886.561225032037,MiB/s,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,verify_sha256,,,ok,cpio newc; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.cpio,cpio,100001280,find_ms,3.2044961117208004,ms,ok,cpio newc
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,index_cold_s,0.03508072183467448,s,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,mount_cold_s,0.06984281539916992,s,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,mount_cold_rss_kib,22088,KiB,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,mount_warm_s,0.0176699161529541,s,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,mount_warm_rss_kib,21680,KiB,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,members,1001,files,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,rand_cat_ms,1.008559949696064,ms,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,rand_pread_64k_ms,0.060555990785360336,ms,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,seq_mib_s,16954.20762092748,MiB/s,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,verify_sha256,,,ok,ar rc; flat unique basenames; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ar,ar,99936996,find_ms,2.584859961643815,ms,ok,ar rc; flat unique basenames
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.iso,iso,100354048,index_cold_s,0.03337813215330243,s,ok,xorriso Rock Ridge
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.iso,iso,100354048,mount_cold_s,0.06730818748474121,s,ok,xorriso Rock Ridge
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.iso,iso,100354048,mount_cold_rss_kib,21012,KiB,ok,xorriso Rock Ridge
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.iso,iso,100354048,mount_warm_s,0.01497793197631836,s,ok,xorriso Rock Ridge
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.iso,iso,100354048,mount_warm_rss_kib,20788,KiB,ok,xorriso Rock Ridge
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.iso,iso,100354048,members,1001,files,ok,xorriso Rock Ridge
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.iso,iso,100354048,reads,,,error,xorriso Rock Ridge; missing bandwidth member /home/brewerm/.cache/claude-tmp/fmtbench-tmp/ratarmount-formats.IEJum7/mnt.h9ACwq/blob.bin
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,index_cold_s,0.008380039129406214,s,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,mount_cold_s,0.014129161834716797,s,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,mount_cold_rss_kib,18804,KiB,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,mount_warm_s,0.014542102813720703,s,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,mount_warm_rss_kib,18820,KiB,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,members,1001,files,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,rand_cat_ms,1.2622480280697346,ms,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,rand_pread_64k_ms,0.05836086347699165,ms,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,seq_mib_s,1133.1879941495097,MiB/s,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,verify_sha256,,,ok,mkfs.ext4 -d; 152 MiB; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.ext4,ext4,159383552,find_ms,7.1674520149827,ms,ok,mkfs.ext4 -d; 152 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,index_cold_s,0.009277736069634557,s,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,mount_cold_s,0.015074014663696289,s,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,mount_cold_rss_kib,19020,KiB,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,mount_warm_s,0.014216899871826172,s,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,mount_warm_rss_kib,18800,KiB,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,members,1001,files,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,rand_cat_ms,1.282986020669341,ms,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,rand_pread_64k_ms,0.06232387386262417,ms,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,seq_mib_s,1138.3158073783543,MiB/s,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,verify_sha256,,,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus-mbr.img,mbr/ext4,160432128,find_ms,6.454975111410022,ms,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,index_cold_s,0.009472600882872939,s,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,mount_cold_s,0.01947617530822754,s,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,mount_cold_rss_kib,19084,KiB,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,mount_warm_s,0.018187999725341797,s,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,mount_warm_rss_kib,19120,KiB,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,members,1001,files,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,rand_cat_ms,1.3854359276592731,ms,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,rand_pread_64k_ms,0.07647089660167694,ms,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,seq_mib_s,985.9070880871471,MiB/s,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,verify_sha256,,,ok,qemu-img convert; p1/ext4; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,corpus.qcow2,qcow2/ext4,101056512,find_ms,7.872762857005,ms,ok,qemu-img convert; p1/ext4
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.safetensors,safetensors,67112968,index_cold_s,0.03599874093197286,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.safetensors,safetensors,67112968,mount_cold_s,0.06689095497131348,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.safetensors,safetensors,67112968,mount_cold_rss_kib,22352,KiB,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.safetensors,safetensors,67112968,mount_warm_s,0.014540910720825195,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.safetensors,safetensors,67112968,mount_warm_rss_kib,21652,KiB,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.safetensors,safetensors,67112968,members,2,files,error,python3 stdlib; 48 F16 tensors; 64 MiB payload; expected 98 regular files
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.gguf,gguf,67111232,index_cold_s,0.029428104171529412,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.gguf,gguf,67111232,mount_cold_s,0.06712603569030762,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.gguf,gguf,67111232,mount_cold_rss_kib,22092,KiB,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.gguf,gguf,67111232,mount_warm_s,0.015240192413330078,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.gguf,gguf,67111232,mount_warm_rss_kib,21336,KiB,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,model.gguf,gguf,67111232,members,1,files,error,python3 stdlib; 48 F16 tensors; 64 MiB payload; expected 97 regular files
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,index_cold_s,0.11467973096296191,s,ok,tar of zip + tar.gz; -r
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,mount_cold_s,0.13126611709594727,s,ok,tar of zip + tar.gz; -r
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,mount_cold_rss_kib,31044,KiB,ok,tar of zip + tar.gz; -r
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,mount_warm_s,0.1327981948852539,s,ok,tar of zip + tar.gz; -r
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,mount_warm_rss_kib,29804,KiB,ok,tar of zip + tar.gz; -r
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,members,2002,files,ok,tar of zip + tar.gz; -r
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,rand_cat_ms,1.1256521102041006,ms,ok,tar of zip + tar.gz; -r
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,rand_pread_64k_ms,0.051002949476242065,ms,ok,tar of zip + tar.gz; -r
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,seq_mib_s,16436.588175540368,MiB/s,ok,tar of zip + tar.gz; -r
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,verify_sha256,,,ok,tar of zip + tar.gz; -r; bandwidth member SHA-256 matches source
-2026-10-17T09:26:40+00:00,brewtop,ratarmount 0.1.34,c5414bade48e04d2ac34ec8b6e6cde9167f37d43,12.11279296875,nested.tar,nested-tar,143226880,find_ms,5.022512981668115,ms,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,fixture,,,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,fixture,,,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,fixture,,,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,fixture,,,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,fixture,,,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,fixture,,,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,fixture,,,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,fixture,,,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,fixture,,,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,fixture,,,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,fixture,,,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,fixture,,,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,fixture,,,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,fixture,,,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,fixture,,,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,fixture,,,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,fixture,,,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.7z,7z,,fixture,,,skip,missing 7z / 7za / 7zz
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.squashfs,squashfs,,fixture,,,skip,missing mksquashfs
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.fat,fat,,fixture,,,skip,missing mformat
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.exfat,exfat,,fixture,,,skip,missing guestfish
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,index_cold_s,0.06894193589687347,s,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,mount_cold_s,0.0644681453704834,s,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,mount_cold_rss_kib,22596,KiB,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,mount_warm_s,0.06427288055419922,s,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,mount_warm_rss_kib,22300,KiB,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,members,1001,files,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,rand_cat_ms,0.8927879389375448,ms,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,rand_pread_64k_ms,0.05019805394113064,ms,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,seq_mib_s,19248.560054452104,MiB/s,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,verify_sha256,,,ok,tar; fixed mtime/owner; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar,tar,100403200,find_ms,2.7034590020775795,ms,ok,tar; fixed mtime/owner
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,index_cold_s,0.1060001899022609,s,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,mount_cold_s,0.12663888931274414,s,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,mount_cold_rss_kib,26192,KiB,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,mount_warm_s,0.06484603881835938,s,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,mount_warm_rss_kib,21116,KiB,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,members,1001,files,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,rand_cat_ms,4.705651197582483,ms,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,rand_pread_64k_ms,2.0663810428231955,ms,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,seq_mib_s,19488.96292545401,MiB/s,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,verify_sha256,,,ok,gzip -n -1 -c; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.gz,tar.gz,71605168,find_ms,2.5709678884595633,ms,ok,gzip -n -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,index_cold_s,9.433186972048134,s,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,mount_cold_s,10.123036861419678,s,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,mount_cold_rss_kib,169916,KiB,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,mount_warm_s,0.06363296508789062,s,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,mount_warm_rss_kib,94680,KiB,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,members,1001,files,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,rand_cat_ms,4.528611898422241,ms,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,rand_pread_64k_ms,12.173651019111276,ms,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,seq_mib_s,19529.111438840693,MiB/s,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,verify_sha256,,,ok,bzip2 -1 -c; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.bz2,tar.bz2,75929794,find_ms,3.253171918913722,ms,ok,bzip2 -1 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,index_cold_s,0.34424656303599477,s,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,mount_cold_s,0.3772571086883545,s,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,mount_cold_rss_kib,33720,KiB,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,mount_warm_s,0.011682987213134766,s,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,mount_warm_rss_kib,20428,KiB,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,members,1001,files,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,rand_cat_ms,35.332257859408855,ms,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,rand_pread_64k_ms,5.02936914563179,ms,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,seq_mib_s,19268.82543066903,MiB/s,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,verify_sha256,,,ok,xz -1 -T0 --block-size=4MiB -c; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.xz,tar.xz,71298560,find_ms,3.070521866902709,ms,ok,xz -1 -T0 --block-size=4MiB -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,index_cold_s,0.04869235190562904,s,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,mount_cold_s,0.06471896171569824,s,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,mount_cold_rss_kib,30852,KiB,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,mount_warm_s,0.06400084495544434,s,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,mount_warm_rss_kib,20456,KiB,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,members,1001,files,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,rand_cat_ms,2.489095088094473,ms,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,rand_pread_64k_ms,1.8637101165950298,ms,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,seq_mib_s,18805.244036568707,MiB/s,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,verify_sha256,,,ok,ratarmount --repack-seekable (seek table); bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.zst,tar.zst,71229733,find_ms,2.5845509953796864,ms,ok,ratarmount --repack-seekable (seek table)
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,index_cold_s,0.054524702951312065,s,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,mount_cold_s,0.06500101089477539,s,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,mount_cold_rss_kib,48416,KiB,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,mount_warm_s,0.06552481651306152,s,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,mount_warm_rss_kib,40660,KiB,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,members,1001,files,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,rand_cat_ms,1.4286059886217117,ms,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,rand_pread_64k_ms,0.6108470261096954,ms,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,seq_mib_s,19408.195700043656,MiB/s,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,verify_sha256,,,ok,lz4 -1 -B7 -c; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.tar.lz4,tar.lz4,71366260,find_ms,3.026170888915658,ms,ok,lz4 -1 -B7 -c
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,index_cold_s,0.03631310421042144,s,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,mount_cold_s,0.06416916847229004,s,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,mount_cold_rss_kib,21436,KiB,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,mount_warm_s,0.06384015083312988,s,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,mount_warm_rss_kib,20984,KiB,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,members,1001,files,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,rand_cat_ms,0.9651370346546173,ms,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,rand_pread_64k_ms,0.04095491021871567,ms,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,seq_mib_s,22334.218833785442,MiB/s,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,verify_sha256,,,ok,zip deflate; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.zip,zip-deflate,71617985,find_ms,2.7200859040021896,ms,ok,zip deflate
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,index_cold_s,0.036858756095170975,s,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,mount_cold_s,0.06402111053466797,s,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,mount_cold_rss_kib,20976,KiB,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,mount_warm_s,0.06413078308105469,s,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,mount_warm_rss_kib,20852,KiB,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,members,1001,files,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,rand_cat_ms,1.0370239615440369,ms,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,rand_pread_64k_ms,0.06686709821224213,ms,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,seq_mib_s,19632.06502742532,MiB/s,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,verify_sha256,,,ok,zip stored; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-store.zip,zip-store,99979818,find_ms,2.8931559063494205,ms,ok,zip stored
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,index_cold_s,0.03518434800207615,s,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,mount_cold_s,0.0639188289642334,s,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,mount_cold_rss_kib,20776,KiB,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,mount_warm_s,0.011742115020751953,s,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,mount_warm_rss_kib,20544,KiB,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,members,1001,files,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,rand_cat_ms,0.9063321631401777,ms,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,rand_pread_64k_ms,0.045656925067305565,ms,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,seq_mib_s,20646.85873198719,MiB/s,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,verify_sha256,,,ok,cpio newc; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.cpio,cpio,100001280,find_ms,2.622965956106782,ms,ok,cpio newc
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,index_cold_s,0.0344225000590086,s,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,mount_cold_s,0.06619095802307129,s,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,mount_cold_rss_kib,21740,KiB,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,mount_warm_s,0.012794971466064453,s,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,mount_warm_rss_kib,21964,KiB,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,members,1001,files,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,rand_cat_ms,0.9298361837863922,ms,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,rand_pread_64k_ms,0.04553794860839844,ms,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,seq_mib_s,17793.135165096865,MiB/s,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,verify_sha256,,,ok,ar rc; flat unique basenames; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ar,ar,99936996,find_ms,2.0939919631928205,ms,ok,ar rc; flat unique basenames
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,index_cold_s,0.02902158093638718,s,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,mount_cold_s,0.0638730525970459,s,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,mount_cold_rss_kib,20432,KiB,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,mount_warm_s,0.06415009498596191,s,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,mount_warm_rss_kib,20520,KiB,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,members,1001,files,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,member_names,1,case-folded,ok,xorriso Rock Ridge; member resolved case-insensitively: BLOB.BIN
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,rand_cat_ms,0.8842470124363899,ms,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,rand_pread_64k_ms,0.045239925384521484,ms,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,seq_mib_s,19429.081682211654,MiB/s,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,verify_sha256,,,ok,xorriso Rock Ridge; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.iso,iso,100354048,find_ms,2.6312400586903095,ms,ok,xorriso Rock Ridge
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,index_cold_s,0.007065426092594862,s,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,mount_cold_s,0.011179924011230469,s,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,mount_cold_rss_kib,18660,KiB,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,mount_warm_s,0.011520862579345703,s,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,mount_warm_rss_kib,18540,KiB,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,members,1001,files,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,rand_cat_ms,0.9807120077311993,ms,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,rand_pread_64k_ms,0.050100963562726974,ms,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,seq_mib_s,1321.123290285684,MiB/s,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,verify_sha256,,,ok,mkfs.ext4 -d; 152 MiB; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.ext4,ext4,159383552,find_ms,5.371293984353542,ms,ok,mkfs.ext4 -d; 152 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,index_cold_s,0.007398040033876896,s,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,mount_cold_s,0.011060953140258789,s,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,mount_cold_rss_kib,18840,KiB,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,mount_warm_s,0.010998964309692383,s,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,mount_warm_rss_kib,18968,KiB,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,members,1001,files,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,rand_cat_ms,0.99585996940732,ms,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,rand_pread_64k_ms,0.04163011908531189,ms,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,seq_mib_s,1367.3091975025725,MiB/s,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,verify_sha256,,,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus-mbr.img,mbr/ext4,160432128,find_ms,5.22016710601747,ms,ok,mkfs.ext4 -d; 152 MiB; sfdisk; p1 at 1 MiB
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,index_cold_s,0.0070387800224125385,s,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,mount_cold_s,0.011014938354492188,s,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,mount_cold_rss_kib,18980,KiB,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,mount_warm_s,0.011193037033081055,s,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,mount_warm_rss_kib,19068,KiB,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,members,1001,files,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,rand_cat_ms,0.9460737928748131,ms,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,rand_pread_64k_ms,0.03996607847511768,ms,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,seq_mib_s,1223.070685271727,MiB/s,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,verify_sha256,,,ok,qemu-img convert; p1/ext4; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,corpus.qcow2,qcow2/ext4,101056512,find_ms,4.9342019483447075,ms,ok,qemu-img convert; p1/ext4
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,index_cold_s,0.025095955934375525,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,mount_cold_s,0.06432485580444336,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,mount_cold_rss_kib,22100,KiB,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,mount_warm_s,0.011138916015625,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,mount_warm_rss_kib,21764,KiB,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,members,98,files,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,rand_cat_ms,0.9763918351382017,ms,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,rand_pread_64k_ms,0.05153985694050789,ms,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,seq_mib_s,6486.219956264876,MiB/s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,verify_sha256,,,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.safetensors,safetensors,67112968,find_ms,4.63309814222157,ms,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,index_cold_s,0.02526822593063116,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,mount_cold_s,0.06434297561645508,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,mount_cold_rss_kib,22328,KiB,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,mount_warm_s,0.011193037033081055,s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,mount_warm_rss_kib,21852,KiB,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,members,97,files,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,rand_cat_ms,0.8658668957650661,ms,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,rand_pread_64k_ms,0.04054303281009197,ms,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,seq_mib_s,7038.956777690189,MiB/s,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,verify_sha256,,,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,model.gguf,gguf,67111232,find_ms,4.1893471498042345,ms,ok,python3 stdlib; 48 F16 tensors; 64 MiB payload
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,index_cold_s,0.10661691310815513,s,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,mount_cold_s,0.1262800693511963,s,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,mount_cold_rss_kib,30900,KiB,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,mount_warm_s,0.1247100830078125,s,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,mount_warm_rss_kib,29996,KiB,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,members,2002,files,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,rand_cat_ms,0.9189548436552286,ms,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,rand_pread_64k_ms,0.04646903835237026,ms,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,seq_mib_s,20050.23296639941,MiB/s,ok,tar of zip + tar.gz; -r
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,verify_sha256,,,ok,tar of zip + tar.gz; -r; bandwidth member SHA-256 matches source
+2026-10-17T10:00:05+00:00,brewtop,ratarmount 0.1.34,09d6e67f1b9a3d5623845161822cade0f4b680b9,4.7080078125,nested.tar,nested-tar,143226880,find_ms,4.160913173109293,ms,ok,tar of zip + tar.gz; -r

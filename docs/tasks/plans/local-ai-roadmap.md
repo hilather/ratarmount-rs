@@ -133,7 +133,14 @@ the build-in-sandbox benchmark); **AI-FIX-MACOS** (done) — macOS /var
 canonicalization and Darwin errno mapping; pre-existing on `main`: **AI-FIX-NESTPAR**
 (done) — concurrent readers of members of one uncompressed TAR shared an OS
 file cursor and could read a sibling's bytes on NFS/HTTP/SMB/SFTP/9P and the
-Session API; **AI-FIX-VHDX** — qemu-img 11 fixed VHDX rejected by the parser.
+Session API; **AI-FIX-VHDX** — qemu-img 11 fixed VHDX rejected by the parser. Found by the
+cross-format benchmark sweep (`benchmarks/compare-formats.sh`, 2026-10-17):
+**AI-FIX-TENSORS** (done) — a standalone safetensors/GGUF mount listed only
+its root JSON files because tensor parent directories had no index rows;
+**bzip2 truncation** (fix on `fix/bzip2-many-blocks`, pre-existing on `main`)
+— a bzip2 TAR with about a thousand blocks was indexed only up to member 760;
+ISO 9660 names are plain upper-case 8.3 because Rock Ridge and Joliet are not
+parsed (documented in `docs/formats.md`, not fixed).
 
 Deferred on the roadmap's own condition: **`io_uring` for backend reads**
 (§8 "once the rest is measured"). Measured here: library-mode Session reads of a
