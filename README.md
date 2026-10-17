@@ -285,6 +285,11 @@ allows. Kubernetes gets an in-tree CSI node driver, Docker and Podman a volume
 plugin, and HPC hosts a `mount.fuse.ratarmount` helper for fstab, systemd and
 autofs. [NFS](docs/nfs-export.md) · [other exports](docs/export.md) · [CSI](docs/csi.md) · [volume plugin](docs/docker-volume-plugin.md) · [systemd](docs/systemd-mount.md)
 
+```bash
+# /etc/fstab, read-only via mount.fuse.ratarmount (see docs/systemd-mount.md)
+# s3://bucket/dataset.tar.zst  /mnt/archives/dataset  fuse.ratarmount  ro,allow_other,_netdev,x-systemd.mount-timeout=infinity  0  0
+```
+
 **Tuning.** `--memory-budget` caps the daemon's own pools, `--direct-io` keeps
 one-pass training reads out of the page cache, `--readahead` widens sequential
 windows, and on Linux 6.9+ a privileged mount can hand eligible files to the
