@@ -18,7 +18,7 @@
 //! kernel device node. The ISO data length is kept. Joliet names are used when
 //! that tree parses and no Rock Ridge `NM` exists. A damaged Joliet tree logs
 //! one warning and the index keeps the primary tree. Sidecar
-//! `isoMetadataVersion` is `rock-ridge-joliet-v3`.
+//! `isoMetadataVersion` is `rock-ridge-joliet-v4`.
 // #102: shadow std print macros so a closed pipe does not panic (exit 101).
 #[macro_use]
 extern crate ratarmount_core;
@@ -42,7 +42,7 @@ const SECTOR: u64 = 2048;
 mod iso;
 
 // Reject old sidecars that contain only ISO aliases and default metadata.
-const ISO_METADATA_VERSION: &str = "rock-ridge-joliet-v3";
+const ISO_METADATA_VERSION: &str = "rock-ridge-joliet-v4";
 
 #[derive(Debug, Error)]
 pub enum IsoError {

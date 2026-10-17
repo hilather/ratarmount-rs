@@ -1,8 +1,11 @@
 #![allow(dead_code)]
 use ratarmount_csi::{csi::*, options::MountSpec, Mounter};
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tonic::Status;
 
 #[derive(Default)]
@@ -65,5 +68,35 @@ pub fn request(target: &str) -> NodePublishVolumeRequest {
             }),
         }),
         ..Default::default()
+    }
+}
+
+pub fn write_fake_mounter(dir: &Path, body: &str) -> PathBuf {
+    let script = dir.join("fake-mounter");
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    script
+}
+
+#[allow(clippy::result_large_err)] // same Status as Mounter::mount
+pub async fn mount_retrying_spawn(
+    mounter: &impl Mounter,
+    spec: &MountSpec,
+    env: BTreeMap<String, String>,
+) -> Result<(), Status> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let result = mounter.mount(spec, env.clone()).await;
+        let retry = matches!(
+            &result,
+            Err(err)
+                if err.code() == tonic::Code::Internal
+                    && err.message() == "cannot spawn ratarmount"
+                    && Instant::now() < deadline
+        );
+        if !retry {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
