@@ -527,6 +527,14 @@ def metrics(name, mp):
         record(name, 'members', len(files), 'files')
         prefix = 'p1/' if name in ('corpus-mbr.img', 'corpus.qcow2') else 'corpus.zip/' if name == 'nested.tar' else ''
         blob = Path(mp) / prefix / ('layer/47/weight' if model else 'blob.bin')
+        if not blob.is_file():
+            # ISO 9660 without Rock Ridge names shows upper-case 8.3 names (BLOB.BIN):
+            # resolve the member case-insensitively and record that in the CSV note.
+            wanted = str(blob.relative_to(mp)).lower()
+            folded = {str(f.relative_to(mp)).lower(): f for f in files}
+            if wanted in folded:
+                blob = folded[wanted]
+                record(name, 'member_names', 1, 'case-folded', note='member resolved case-insensitively: ' + str(blob.relative_to(mp)))
         if model:
             candidates = [p for p in files if p.name == 'weight' and p.stat().st_size == 65536]
             wanted_sha = meta['tensor_sha256']

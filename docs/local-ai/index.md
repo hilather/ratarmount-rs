@@ -36,7 +36,7 @@ twice, and `hf-cache://` browses that cache offline.
 ```bash
 ratarmount hf://Qwen/Qwen3.8-27B@main model/            # serve the repository to vLLM or llama.cpp
 ratarmount -r hf://Qwen/Qwen3.8-27B@main model/         # each .safetensors file becomes a folder of tensors
-cat model/model-00001-of-00012.safetensors/__metadata__.json
+cat model/<shard>.safetensors/__metadata__.json
 ```
 
 Loaders read a mounted model like any directory while ratarmount fetches

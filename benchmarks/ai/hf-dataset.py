@@ -14,6 +14,9 @@ Every read hashes the bytes and all reads of the same file must agree.
 from contextlib import contextmanager
 import hashlib
 import os
+import shutil
+import signal
+import subprocess
 import sys
 import time
 import urllib.error
@@ -42,9 +45,25 @@ def run(r, work):
     expected = {}
 
     def isolated(tag):
-        base = work / tag
-        return dict(os.environ, HF_HOME=str(base / "hf"), HF_HUB_CACHE=str(base / "hf" / "hub"),
-                    XDG_CACHE_HOME=str(base / "xdg"), RATARMOUNT_PAYLOAD_CACHE_DIR=str(base / "payload"))
+        # A private HOME hides ~/.ratarmount (the default --index-folders entry) and the
+        # Hub token file, so every mount is anonymous and starts without any index.
+        base = work / f"env-{tag}"
+        (base / "home").mkdir(parents=True)
+        return dict(os.environ, HOME=str(base / "home"), HF_HOME=str(base / "hf"),
+                    HF_HUB_CACHE=str(base / "hf" / "hub"), XDG_CACHE_HOME=str(base / "xdg"),
+                    RATARMOUNT_PAYLOAD_CACHE_DIR=str(base / "payload"))
+
+    @contextmanager
+    def deadline(seconds, what):
+        def expired(*_):
+            raise TimeoutError(f"{what} did not finish within {seconds} s")
+        previous = signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        try:
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
 
     def read(path, key):
         data = path.read_bytes()
@@ -55,7 +74,8 @@ def run(r, work):
 
     def timed_read(case, path, key, **metadata):
         start = time.perf_counter()
-        size = read(path, key)
+        with deadline(a.timeout, f"{case}: reading {path.name}"):
+            size = read(path, key)
         seconds = time.perf_counter() - start
         r.emit(case, seconds=round(seconds, 6), value=round(seconds, 6), unit="seconds", bytes=size, **metadata)
 
@@ -67,6 +87,17 @@ def run(r, work):
             r.emit(case, seconds=round(seconds, 6), value=round(seconds, 6), unit="seconds", cache=COLD, note=note)
             yield mount
 
+    def dump_stacks(mount, label):
+        """Save the daemon's thread stacks when a read stalls, so a hang can be diagnosed."""
+        pid = mount.process.pid
+        for argv in (["eu-stack", "-p", str(pid)], ["gdb", "--batch", "-ex", "thread apply all bt", "-p", str(pid)]):
+            if shutil.which(argv[0]) is None:
+                continue
+            out = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+            (work / f"{label}-stacks.txt").write_text(out.stdout)
+            return
+        (work / f"{label}-stacks.txt").write_text("neither eu-stack nor gdb is installed\n")
+
     for n in range(a.runs):
         def repository():
             source = f"hf://datasets/{a.repo}@{a.revision}"
@@ -74,7 +105,12 @@ def run(r, work):
                              isolated(f"repo-{n}"), "whole repository with -r; revision pinned; no shard opened yet") as m:
                 shard = m.path / a.shard
                 start = time.perf_counter()
-                names = sorted(os.listdir(shard))
+                try:
+                    with deadline(a.timeout, "repo-shard-open: listing the shard"):
+                        names = sorted(os.listdir(shard))
+                except TimeoutError:
+                    dump_stacks(m, f"repo-{n}")
+                    raise
                 seconds = time.perf_counter() - start
                 r.emit("repo-shard-open", seconds=round(seconds, 6), value=round(seconds, 6), unit="seconds",
                        items=len(names), cache=COLD,
@@ -113,5 +149,6 @@ if __name__ == "__main__":
     p.add_argument("--revision", default=DATASET_REVISION, help="commit SHA to pin")
     p.add_argument("--shard", default=DATASET_SHARD, help="TAR shard path inside the repository")
     p.add_argument("--file", default=DATASET_FILE, help="member of that shard to read")
+    p.add_argument("--timeout", type=float, default=300, help="seconds allowed for one listing or read before the case is an error")
     add_mount_options(p)
     sys.exit(main("hf-dataset", p.parse_args(), run))

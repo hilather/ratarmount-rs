@@ -57,7 +57,7 @@ sample in its own frame. See [Zstd random access](zstd-random-access.md).
 
 | Format | Random access | Nested | Notes |
 |---|---|---|---|
-| **ISO 9660** | Direct | Yes | Rock Ridge and Joliet names |
+| **ISO 9660** | Direct | Yes | Extents are read in place; no image copy. Names come from the plain ISO 9660 directory records, so Rock Ridge and Joliet long names are not read yet and files appear in their upper-case 8.3 form (`BLOB.BIN`) |
 | **UDF** | Direct | Yes | NSR02 and NSR03; probed before ISO so mixed discs show the UDF view. UDF 2.50 metadata partitions are not supported |
 | **SquashFS** | Block, in process | Yes | gzip, zstd, lz4, lzo, xz and uncompressed images, including AppImage payloads and `.snap`. Classic LZMA images fall back to `unsquashfs` with a temporary copy |
 | **EXT2/3/4** | Direct | Yes | Pure Rust reader; `debugfs` fallback for images it cannot parse |
@@ -95,9 +95,9 @@ opens without a temporary copy.
 
 | Format | What you get |
 |---|---|
-| **PDF** | Attachments and embedded images (JPEG, JPEG 2000, Flate as PNG; CMYK, indexed and ICC colour). Separation and Lab colour spaces are not converted |
-| **OGG** | The logical streams as files |
-| **HTML** | Embedded resources as files |
+| **PDF** | File attachments at their original paths, and page images under `images/pageN-imgM.<ext>` (JPEG, JPEG 2000, Flate as PNG; CMYK, indexed and ICC colour). Separation and Lab colour spaces are not converted |
+| **OGG** | Each logical stream (by serial number) as a file of raw Ogg pages |
+| **HTML** | Every `data:` URL embedded in the page, decoded into a file |
 
 ## Indexes
 
@@ -150,7 +150,9 @@ The complete status against the Python original is in the
    Python. The opt-in `gzip-rapidgzip` build feature is a partial answer; the
    complete one is to repack archives you own with `--repack-seekable`. Exotic
    xz filters and single-frame zstd larger than RAM decode in full.
-2. **Formats that are partial.** Classic SquashFS LZMA (spools through
+2. **Formats that are partial.** ISO 9660 images show ISO-level upper-case
+   8.3 names because Rock Ridge and Joliet extensions are not parsed yet.
+   Classic SquashFS LZMA (spools through
    `unsquashfs`), pure RAR (libarchive only), encrypted SQLAR without
    sqlcipher, PDF Separation and Lab colour, LVM/RAID/Btrfs inside disk images,
    HFS+/APFS/encrypted DMG, WIM LZX/LZMS/WIMBoot and later images, QCOW2 zstd

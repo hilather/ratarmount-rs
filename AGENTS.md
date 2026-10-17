@@ -39,6 +39,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 |---------------|----------|
 | BIG fixture builder missing tar.lz4 / multi-frame zstd | `./benchmarks/test-compare-fixtures.sh` |
 | Vector-wave fixture builder missing catalog tars | `./benchmarks/test-compare-vector-wave.sh` |
+| Format sweep fixture builder: missing-producer skips, corrupt or count-mismatched reads, `PREPARE_ONLY` / `NO_FUSE` regressions (AI-FMTBENCH) | `./benchmarks/test-compare-formats.sh` |
 | Fixture smoke dies without Python/binary (#9) | `./benchmarks/test-compare-prepare-env.sh` · `./benchmarks/test-compare-fixtures.sh` |
 | Truncated `.gz` / UnexpectedEof (FUSE short read = EOF) | `cargo test -p ratarmount-fuse --lib fill_read` · `cargo test -p ratarmount-compress --lib fuse_style` · `cargo test -p ratarmount-session --lib nested_large_plain_gzip` |
 | Nested gzip concurrent wrong/truncated data | `cargo test -p ratarmount-compress --lib shared_from_reader` · `cargo test -p ratarmount-compress --lib stenciled_fuse` |
@@ -373,10 +374,10 @@ README / parity tables stale.
 
 | Trigger | Update |
 |---------|--------|
-| New/removed/changed format, codec, remote, CLI flag, nested/tmp behavior | [`README.md`](README.md) feature tables + Gaps section if needed |
+| New/removed/changed format, codec, remote, CLI flag, nested/tmp behavior | [`docs/formats.md`](docs/formats.md) tables and its Known limits section; the grouped summary tables in [`README.md`](README.md) and the command tour in [`docs/getting-started.md`](docs/getting-started.md) when a user-visible command or format changes |
 | Parity status flip (`[x]` / `~` / residual) | [`docs/parity-todo.md`](docs/parity-todo.md) |
 | Mount option added/changed | [`docs/mount-options-parity.md`](docs/mount-options-parity.md) |
-| Nested open / temp spool | [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md) (+ README cheat sheet) |
+| Nested open / temp spool | [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md) (+ the nested summaries in `docs/formats.md` and the README) |
 | Dual-run / packaging product status | [`docs/phase12-dual-run.md`](docs/phase12-dual-run.md) / packaging notes |
 | Upstream-inspired feature (from mxmlnkn/ratarmount issues) | [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md) status row + README **Upstream** link |
 | New protocol / export / beyond-parity feature (P-/F-/G- IDs) | [`docs/tasks/beyond-parity-roadmap.md`](docs/tasks/beyond-parity-roadmap.md) status |
@@ -390,7 +391,7 @@ Skill for nested/tmp matrices: **`format-support-matrices`**.
 
 Tagging alone is not enough: **`Packages` must publish a GitHub Release with real
 assets** (`.deb` / `.rpm` / portable tarballs / cosign bundles). Workflow:
-[`.github/workflows/packages.yml`](`.github/workflows/packages.yml`).
+[`.github/workflows/packages.yml`](.github/workflows/packages.yml).
 
 **After every release tag, watch CI until settled** (fix failures, re-tag if needed).
 Full procedure: skill **`release-tag-ci-watch`** (`.grok/skills/release-tag-ci-watch/SKILL.md`).
@@ -459,7 +460,7 @@ Living parity: `docs/parity-todo.md`, `docs/tasks/gap-implementation-batch.md`, 
 | Doc | Role |
 |-----|------|
 | [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md) | **Canonical** nested no-tmp vs temp matrix + parent×nested behavior |
-| [`README.md`](README.md) | Short nested cheat sheet (must match the canonical doc) |
+| [`README.md`](README.md) · [`docs/formats.md`](docs/formats.md) | Short nested summaries (must match the canonical doc) |
 | [`docs/tasks/embedded-nested-random-access.md`](docs/tasks/embedded-nested-random-access.md) | Implementation checklist |
 
 Triggers: `open_nested_reader_fn`, AutoMount spool, format `MountSource::open`, materialize vs seekable body, TAR flatten limits.

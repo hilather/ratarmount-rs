@@ -66,7 +66,9 @@ cat pets/train/train-000000.tar/Abyssinian_1.json
 The repository mounts in a fraction of a second, pinned to one commit. Each
 WebDataset shard opens as a folder on first access using the index published
 next to it, so no shard is ever scanned, and every file read is one HTTP range
-request. Publish an index for your own dataset once with
+request. On a laptop with empty caches the repository mounts in 0.16 s and a
+128 MiB shard opens in 1.5 s; scanning that shard instead takes 17 s.
+Publish an index for your own dataset once with
 `ratarmount --publish-index hf://datasets/you/name@main/shard.tar` and every
 downloader gets the same zero-scan mount.
 [Hugging Face guide](docs/remote-hf.md) · [publish an index](docs/recipes/publish-hf-index.md) · [the demo dataset](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
@@ -306,7 +308,7 @@ The biggest wins are on large `.tar.zst` and `.tar.lz4` archives, where
 random reads run tens of times faster. Python still wins small `.tar.gz` reads
 and the cold mount of one 640 MiB `.tar.zst`.
 
-**Local AI workloads** (this laptop, release build, 2026-10-16):
+**Local AI workloads** (a six-core laptop, release build, October 2026):
 
 | Workload | Result |
 |---|---|

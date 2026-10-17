@@ -98,8 +98,22 @@ tables and hardware notes are in [Local AI results](local-ai/results.md).
 
 <!-- HF-DATASET: filled from benchmarks/ai/results (hf-dataset) -->
 
-Pending: `benchmarks/ai/hf-dataset.py` results for
-`RealMattbrewer/oxford-iiit-pet-webdataset`.
+`benchmarks/ai/hf-dataset.py` mounts the public
+[Oxford-IIIT Pet WebDataset](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
+three ways with fresh caches each time (2026-10-17, release build, medians of
+three runs, run `647657dac03a`):
+
+| Case | Median |
+|---|---:|
+| Mount the whole repository with `-r` | 0.16 s |
+| Open the first 128 MiB shard (3,954 members) through its published index | 1.46 s |
+| Read one 125 KiB file from it, first and second read | 0.10 s / 0.11 s |
+| Mount one shard with its published index | 1.17 s |
+| Mount the same shard with `-c`, scanning the remote TAR instead | 16.8 s |
+
+Everything but the scan is network round trips. The published index replaces
+a 17 s scan with a 1.2–1.5 s open, and the repository mount never scans a
+shard. Per-run values and caveats: [Local AI results](local-ai/results.md#a-public-dataset-from-the-hub).
 
 ## Every format
 

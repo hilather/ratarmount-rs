@@ -511,7 +511,10 @@ all chunks have been observed and hands the verified result to the shared cache.
 [`RealMattbrewer/oxford-iiit-pet-webdataset`](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
 is a public dataset built with `ratarmount shard` and published with
 `ratarmount --publish-index hf://...`: seven uncompressed WebDataset shards,
-each with a published index. Measured from a laptop on a cold cache: the whole
-repository mounts with `-r` in 0.23 s, and one 128 MiB shard opens in
-1.2-1.5 s with its published index versus 16.5 s scanning it.
+each with a published index. Measured from a laptop with fresh caches
+(2026-10-17, medians of three runs): the whole repository mounts with `-r` in
+0.16 s, the first 128 MiB shard then opens through its published index in
+1.5 s (1.2 s when that shard is mounted on its own), and the same shard takes
+16.8 s to open when the index is ignored and the archive is scanned. Details
+and per-run values: [Local AI results](local-ai/results.md#a-public-dataset-from-the-hub).
 

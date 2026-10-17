@@ -666,19 +666,19 @@ Existing catalog rows that must stay green (run filters separately): `scan_glob`
 
 ## References
 
-- [`docs/tasks/vectorize-steal-patterns.md`](docs/tasks/vectorize-steal-patterns.md) — V-1..V-5 systems steal (not ANN)
-- [`docs/tasks/vectors-optimization.md`](docs/tasks/vectors-optimization.md) — density backlog
-- [`docs/tasks/plans/v1-cheap-scan-refine.md`](docs/tasks/plans/v1-cheap-scan-refine.md)
-- [`docs/tasks/plans/v5-offset-order-locality.md`](docs/tasks/plans/v5-offset-order-locality.md) §9
-- [`docs/tasks/plans/p2-sqlite-bulk-staging.md`](docs/tasks/plans/p2-sqlite-bulk-staging.md) residuals
-- [`docs/tasks/plans/p2-overlay-cookies.md`](docs/tasks/plans/p2-overlay-cookies.md)
-- [`docs/tasks/plans/p2-fingerprint-windows.md`](docs/tasks/plans/p2-fingerprint-windows.md)
-- [`docs/tasks/plans/p2-parallel-nested-pools.md`](docs/tasks/plans/p2-parallel-nested-pools.md) Phase 1 gated
-- [`docs/tasks/plans/p2-bulk-simd.md`](docs/tasks/plans/p2-bulk-simd.md)
-- [`docs/tasks/beyond-parity-roadmap.md`](docs/tasks/beyond-parity-roadmap.md) G-2/G-3/F-2/F-3/F-7/F-9
-- [`docs/tasks/tar-zst-live-commit-design.md`](docs/tasks/tar-zst-live-commit-design.md)
-- [`docs/phase10-remote.md`](docs/phase10-remote.md)
-- [`benchmarks/vector-wave-v0.1.27-vs-0.1.28.md`](benchmarks/vector-wave-v0.1.27-vs-0.1.28.md)
+- [`docs/tasks/vectorize-steal-patterns.md`](../../../docs/tasks/vectorize-steal-patterns.md) — V-1..V-5 systems steal (not ANN)
+- [`docs/tasks/vectors-optimization.md`](../../../docs/tasks/vectors-optimization.md) — density backlog
+- [`docs/tasks/plans/v1-cheap-scan-refine.md`](../../../docs/tasks/plans/v1-cheap-scan-refine.md)
+- [`docs/tasks/plans/v5-offset-order-locality.md`](../../../docs/tasks/plans/v5-offset-order-locality.md) §9
+- [`docs/tasks/plans/p2-sqlite-bulk-staging.md`](../../../docs/tasks/plans/p2-sqlite-bulk-staging.md) residuals
+- [`docs/tasks/plans/p2-overlay-cookies.md`](../../../docs/tasks/plans/p2-overlay-cookies.md)
+- [`docs/tasks/plans/p2-fingerprint-windows.md`](../../../docs/tasks/plans/p2-fingerprint-windows.md)
+- [`docs/tasks/plans/p2-parallel-nested-pools.md`](../../../docs/tasks/plans/p2-parallel-nested-pools.md) Phase 1 gated
+- [`docs/tasks/plans/p2-bulk-simd.md`](../../../docs/tasks/plans/p2-bulk-simd.md)
+- [`docs/tasks/beyond-parity-roadmap.md`](../../../docs/tasks/beyond-parity-roadmap.md) G-2/G-3/F-2/F-3/F-7/F-9
+- [`docs/tasks/tar-zst-live-commit-design.md`](../../../docs/tasks/tar-zst-live-commit-design.md)
+- [`docs/phase10-remote.md`](../../../docs/phase10-remote.md)
+- [`benchmarks/vector-wave-v0.1.27-vs-0.1.28.md`](../../../benchmarks/vector-wave-v0.1.27-vs-0.1.28.md)
 - Code: `ratarmount-core/src/lib.rs` (`search_cheap`, `InodeAttrCookie`, `CheapSearchHit`); `ratarmount-index/src/{mem,search,dirent_order,lib,location}.rs`; `ratarmount-compositing/src/{write_overlay,control,search_cheap,union,folder,oci_whiteout}.rs`; `ratarmount/src/{overlay_commit,remote_open,main,publish_index,factory}.rs` (`open_or_create_writable_index`); `ratarmount-fuse/src/lib.rs`; `ratarmount-nfs/src/{inode,reader,vfs,v4/adapter}.rs`; `ratarmount-export-core/src/{inode,reader}.rs`
 
 ---
