@@ -330,7 +330,7 @@ fn attrs_from_fi(fi: &FileInfo, mapping: ratarmount_core::AttributeMapping) -> F
         uid: Some(mapping.uid(fi.uid)),
         gid: Some(mapping.gid(fi.gid)),
         permissions: Some(mapping.mode(sftp_permissions(fi))),
-        atime: Some(unix_mtime_u32(fi.mtime)),
+        atime: Some(unix_mtime_u32(ratarmount_compositing::overlay_atime(fi))),
         mtime: Some(unix_mtime_u32(fi.mtime)),
         ..FileAttributes::default()
     };
@@ -351,6 +351,7 @@ fn flags_to_mode(pflags: OpenFlags) -> OpenMode {
         create: pflags.contains(OpenFlags::CREATE),
         truncate: pflags.contains(OpenFlags::TRUNCATE),
         exclusive: pflags.contains(OpenFlags::EXCLUDE),
+        permissions: None,
     }
 }
 
@@ -439,9 +440,10 @@ impl Handler for SftpSession {
         id: u32,
         filename: String,
         pflags: OpenFlags,
-        _attrs: FileAttributes,
+        attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
-        let mode = flags_to_mode(pflags);
+        let mut mode = flags_to_mode(pflags);
+        mode.permissions = attrs.permissions;
         let fid = self.fs.open_path(&filename, mode).map_err(map_err)?;
         let handle = self.alloc_handle(SftpHandle::File {
             id: fid,
@@ -532,11 +534,16 @@ impl Handler for SftpSession {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        if let Some(size) = attrs.size {
-            self.fs.setstat_size(&path, size).map_err(map_err)?;
-        } else if !self.fs.writable() {
-            return Err(StatusCode::PermissionDenied.into());
-        }
+        let metadata = ratarmount_compositing::OverlayMetadata {
+            mode: attrs.permissions,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            atime: attrs.atime.map(f64::from),
+            mtime: attrs.mtime.map(f64::from),
+        };
+        self.fs
+            .setstat(&path, attrs.size, &metadata)
+            .map_err(map_err)?;
         Ok(Self::ok(id))
     }
 

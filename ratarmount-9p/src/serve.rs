@@ -22,6 +22,10 @@ use crate::proto::{
     TREADLINK, TREMOVE, TRENAMEAT, TSETATTR, TSTATFS, TSYMLINK, TUNLINKAT, TVERSION, TWALK, TWRITE,
     VERSION,
 };
+use crate::proto::{
+    SETATTR_ATIME, SETATTR_ATIME_SET, SETATTR_GID, SETATTR_MODE, SETATTR_MTIME, SETATTR_MTIME_SET,
+    SETATTR_SIZE, SETATTR_UID,
+};
 use crate::vfs::{root_id, Ratarmount9p};
 
 /// `127.0.0.1:20493` — empty-string result of [`parse_ninep_bind`].
@@ -343,15 +347,54 @@ impl Session {
             TSETATTR => {
                 let fid = d.u32()?;
                 let valid = d.u32()?;
-                let _mode = d.u32()?;
-                let _uid = d.u32()?;
-                let _gid = d.u32()?;
+                let mode = d.u32()?;
+                let uid = d.u32()?;
+                let gid = d.u32()?;
                 let size = d.u64()?;
+                let atime_sec = d.u64()?;
+                let atime_nsec = d.u64()?;
+                let mtime_sec = d.u64()?;
+                let mtime_nsec = d.u64()?;
+                if (valid & (SETATTR_ATIME | SETATTR_ATIME_SET)
+                    == (SETATTR_ATIME | SETATTR_ATIME_SET)
+                    && atime_nsec >= 1_000_000_000)
+                    || (valid & (SETATTR_MTIME | SETATTR_MTIME_SET)
+                        == (SETATTR_MTIME | SETATTR_MTIME_SET)
+                        && mtime_nsec >= 1_000_000_000)
+                {
+                    return Ok(rlerror(tag, libc::EINVAL));
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                let attrs = ratarmount_compositing::OverlayMetadata {
+                    mode: (valid & SETATTR_MODE != 0).then_some(mode),
+                    uid: (valid & SETATTR_UID != 0).then_some(uid),
+                    gid: (valid & SETATTR_GID != 0).then_some(gid),
+                    atime: (valid & SETATTR_ATIME != 0).then_some(
+                        if valid & SETATTR_ATIME_SET != 0 {
+                            atime_sec as f64 + atime_nsec as f64 / 1e9
+                        } else {
+                            now
+                        },
+                    ),
+                    mtime: (valid & SETATTR_MTIME != 0).then_some(
+                        if valid & SETATTR_MTIME_SET != 0 {
+                            mtime_sec as f64 + mtime_nsec as f64 / 1e9
+                        } else {
+                            now
+                        },
+                    ),
+                };
                 let id = match self.fid_id(fid) {
                     Ok(id) => id,
                     Err(e) => return Ok(rlerror(tag, e)),
                 };
-                match self.fs.setattr_size(id, valid, size) {
+                match self
+                    .fs
+                    .setattr(id, (valid & SETATTR_SIZE != 0).then_some(size), &attrs)
+                {
                     Ok(()) => Ok(empty_reply(RSETATTR, tag)),
                     Err(e) => Ok(rlerror(tag, e)),
                 }
@@ -909,6 +952,43 @@ mod tests {
         assert_eq!(a.port(), 20493);
         assert_eq!(a, DEFAULT_NINEP_BIND);
         assert_ne!(a.port(), 20490);
+    }
+
+    /// Regression: Tsetattr decoded mode/owners then discarded the timestamps.
+    #[test]
+    fn regression_overlay_chmod_ninep_wire_times() {
+        let td = tempfile::tempdir().unwrap();
+        let ov = Arc::new(WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap());
+        let fs = Arc::new(Ratarmount9p::with_overlay(
+            ov.clone(),
+            0,
+            8,
+            Some(ov.clone()),
+        ));
+        let (id, _) = fs.lcreate(1, "built", 0o644).unwrap();
+        let mut session = Session {
+            fs,
+            fids: HashMap::from([(1, Fid { id })]),
+            msize: DEFAULT_MSIZE,
+        };
+        let mut e = Encoder::reply(TSETATTR, 1);
+        e.u32(1);
+        e.u32(SETATTR_MODE | SETATTR_ATIME | SETATTR_MTIME | SETATTR_ATIME_SET | SETATTR_MTIME_SET);
+        e.u32(0o755);
+        e.u32(0);
+        e.u32(0);
+        e.u64(0);
+        e.u64(12);
+        e.u64(250_000_000);
+        e.u64(34);
+        e.u64(500_000_000);
+        let frame = e.finish();
+        let reply = session.dispatch(&frame).unwrap();
+        assert_eq!(split_frame(&reply).unwrap().0, RSETATTR);
+        let fi = ov.lookup("/built", 0).unwrap();
+        assert_eq!(fi.mode & 0o7777, 0o755);
+        assert_eq!(fi.mtime, 34.5);
+        assert_eq!(ratarmount_compositing::overlay_atime(&fi), 12.25);
     }
 
     #[test]

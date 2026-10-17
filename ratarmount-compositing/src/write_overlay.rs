@@ -142,6 +142,12 @@ CREATE TABLE IF NOT EXISTS "files" (
     "deleted" BOOL,
     PRIMARY KEY (path, name)
 );
+CREATE TABLE IF NOT EXISTS overlay_metadata (
+    path TEXT PRIMARY KEY,
+    mode INTEGER,
+    atime REAL,
+    mtime REAL
+);
 CREATE TABLE IF NOT EXISTS xattrs (
     path TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -149,6 +155,48 @@ CREATE TABLE IF NOT EXISTS xattrs (
     PRIMARY KEY (path, name)
 );
 "#;
+
+/// Optional metadata changes. Missing times mean UTIME_OMIT; frontends resolve
+/// UTIME_NOW once per request. Ownership changes are refused with EPERM.
+#[derive(Clone, Debug, Default)]
+pub struct OverlayMetadata {
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub atime: Option<f64>,
+    pub mtime: Option<f64>,
+}
+
+impl OverlayMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none()
+            && self.uid.is_none()
+            && self.gid.is_none()
+            && self.atime.is_none()
+            && self.mtime.is_none()
+    }
+}
+
+/// Access time carried separately because archive FileInfo only has mtime.
+pub fn overlay_atime(fi: &FileInfo) -> f64 {
+    fi.userdata
+        .iter()
+        .find_map(|data| match data {
+            UserData::Other(s) => s
+                .strip_prefix("overlay-atime:")
+                .and_then(|s| s.parse().ok()),
+            _ => None,
+        })
+        .unwrap_or(fi.mtime)
+}
+
+fn set_info_atime(fi: &mut FileInfo, atime: f64) {
+    fi.userdata
+        .retain(|data| !matches!(data, UserData::Other(s) if s.starts_with("overlay-atime:")));
+    let index = fi.userdata.len().saturating_sub(1);
+    fi.userdata
+        .insert(index, UserData::Other(format!("overlay-atime:{atime}")));
+}
 
 #[derive(Debug, Error)]
 pub enum OverlayError {
@@ -1435,13 +1483,15 @@ impl WriteOverlay {
         }
         self.check_mutation(OverlayMutation::CopyOnWrite, &[path])?;
         self.ensure_parent(path)?;
-        let Some(fi) = self.current_base().lookup(path, 0) else {
+        let Some(mut fi) = self.current_base().lookup(path, 0) else {
             // New file: just ensure parent
             return Ok(());
         };
+        self.apply_metadata(path, &mut fi);
         self.remember_base_xattrs(path, self.current_base().as_ref(), &fi)?;
         if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             fs::create_dir_all(&real)?;
+            set_host_metadata(&real, &metadata_from_info(&fi))?;
             return Ok(());
         }
         if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFLNK {
@@ -1453,9 +1503,16 @@ impl WriteOverlay {
                 fs::create_dir_all(parent)?;
             }
             overlay_symlink(Path::new(&fi.linkname), &real)?;
+            set_host_metadata(
+                &real,
+                &OverlayMetadata {
+                    mode: None,
+                    ..metadata_from_info(&fi)
+                },
+            )?;
             return Ok(());
         }
-        let mut src = self.current_base().open(&fi, 0)?;
+        let mut src = self.current_base().open(&without_overlay_meta(&fi), 0)?;
         let mut opts = open_options_nofollow();
         opts.write(true).create_new(true);
         let mut dst = {
@@ -1463,6 +1520,7 @@ impl WriteOverlay {
             opts.open(&real)?
         };
         io::copy(&mut src, &mut dst)?;
+        set_host_metadata(&real, &metadata_from_info(&fi))?;
         Ok(())
     }
 
@@ -1482,18 +1540,27 @@ impl WriteOverlay {
             }
             self.check_mutation(OverlayMutation::CopyOnWrite, &[&path])?;
             self.ensure_parent(&path)?;
-            let Some(fi) = base.lookup(&path, 0) else {
+            let Some(mut fi) = base.lookup(&path, 0) else {
                 return Ok(());
             };
+            self.apply_metadata(&path, &mut fi);
             self.remember_base_xattrs(&path, base.as_ref(), &fi)?;
             if ratarmount_core::is_dir_mode(fi.mode) {
                 fs::create_dir_all(&real)?;
+                set_host_metadata(&real, &metadata_from_info(&fi))?;
                 return Ok(());
             }
             if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFLNK {
                 policy.check_write(&path, 0, fi.linkname.len() as u64, 0)?;
                 let _account = self.account_path(&path);
                 overlay_symlink(Path::new(&fi.linkname), &real)?;
+                set_host_metadata(
+                    &real,
+                    &OverlayMetadata {
+                        mode: None,
+                        ..metadata_from_info(&fi)
+                    },
+                )?;
                 return Ok(());
             }
             self.check_mutation(OverlayMutation::Write, &[&path])?;
@@ -1522,7 +1589,7 @@ impl WriteOverlay {
                     hook();
                 }
             }
-            Some(base.open(&fi, 0)?.take(limit))
+            Some(base.open(&without_overlay_meta(&fi), 0)?.take(limit))
         };
         let mut dst = tempfile::Builder::new()
             .prefix(HIDDEN_DB)
@@ -1560,6 +1627,7 @@ impl WriteOverlay {
         })();
         let _policy = self.policy_lock();
         self.ensure_under_root(&real)?;
+        set_host_metadata(dst.path(), &metadata_from_info(&fi))?;
         let actual = dst.as_file().metadata()?.len();
         match dst.persist_noclobber(&real) {
             Ok(_) => {
@@ -1880,6 +1948,10 @@ impl WriteOverlay {
             }
             let _account = self.account_path(path);
             let f = opts.open(&real)?;
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
+            }
             let fd = {
                 use std::os::unix::io::IntoRawFd;
                 f.into_raw_fd()
@@ -1890,12 +1962,17 @@ impl WriteOverlay {
     }
 
     pub fn open_overlay_fd(&self, path: &str, flags: i32) -> Result<i32> {
+        self.open_overlay_fd_with_mode(path, flags, 0o644)
+    }
+
+    /// `mode` has already been masked by the client's umask.
+    pub fn open_overlay_fd_with_mode(&self, path: &str, flags: i32, mode: u32) -> Result<i32> {
         if is_overlay_internal_path(path) {
             return Err(internal_name_refused(path));
         }
         #[cfg(not(unix))]
         {
-            let _ = (self, path, flags);
+            let _ = (self, path, flags, mode);
             return Err(overlay_fd_unsupported());
         }
         #[cfg(unix)]
@@ -1906,6 +1983,11 @@ impl WriteOverlay {
                 self.check_mutation(OverlayMutation::OpenWrite, &[path])?;
             }
             drop(_policy);
+            if flags & (libc::O_CREAT | libc::O_EXCL) == (libc::O_CREAT | libc::O_EXCL)
+                && self.lookup(path, 0).is_some()
+            {
+                return Err(io::Error::from_raw_os_error(libc::EEXIST).into());
+            }
             let truncate = (flags & libc::O_TRUNC != 0 && flags & libc::O_EXCL == 0).then_some(0);
             self.ensure_modifiable_inner(path, truncate)?;
             let _policy = self.policy_lock();
@@ -1915,10 +1997,12 @@ impl WriteOverlay {
             // returns an owned raw fd (`into_raw_fd`); discarding it leaked one
             // descriptor per call. Interval persist wipes the overlay host file,
             // so the next FUSE/NFS/9P/SMB/SFTP rewrite hits this every time.
+            let mut flags = flags;
             if fs::symlink_metadata(&real).is_err()
                 && (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT)) != 0
             {
-                let leftover = self.create_file_inner(path, 0o644)?;
+                let leftover = self.create_file_inner(path, mode)?;
+                flags &= !(libc::O_CREAT | libc::O_EXCL);
                 // This temporary descriptor has never been registered.
                 unsafe {
                     libc::close(leftover);
@@ -1947,7 +2031,7 @@ impl WriteOverlay {
             // must perform permission and O_EXCL checks before changing data.
             let fd = {
                 let _account = self.account_path(path);
-                unsafe { libc::open(c_path(&real)?.as_ptr(), flags, 0o644) }
+                unsafe { libc::open(c_path(&real)?.as_ptr(), flags, mode & 0o7777) }
             };
             if fd < 0 {
                 return Err(OverlayError::Io(io::Error::last_os_error()));
@@ -1991,7 +2075,7 @@ impl WriteOverlay {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&real, fs::Permissions::from_mode(mode & 0o7777));
+            fs::set_permissions(&real, fs::Permissions::from_mode(mode & 0o7777))?;
         }
         self.mark_present(path, mode | ratarmount_core::S_IFDIR)?;
         Ok(())
@@ -2691,6 +2775,159 @@ impl WriteOverlay {
         Ok(flag)
     }
 
+    /// Apply a protocol SETATTR request. Explicit times are applied after the
+    /// truncate, which itself changes mtime. Refused ownership must not truncate.
+    pub fn set_attributes(
+        &self,
+        path: &str,
+        size: Option<u64>,
+        attrs: &OverlayMetadata,
+    ) -> Result<()> {
+        if !attrs.is_empty() {
+            let _policy = self.policy_lock();
+            self.check_mutation(OverlayMutation::Write, &[path])?;
+            validate_metadata(attrs)?;
+        }
+        if let Some(size) = size {
+            self.truncate(path, size)?;
+        }
+        if !attrs.is_empty() {
+            self.set_metadata(path, attrs)?;
+        }
+        Ok(())
+    }
+
+    /// Change metadata through the same policy gate as data writes. Archive-only
+    /// members retain their original read cookie and never copy payload data.
+    pub fn set_metadata(&self, path: &str, attrs: &OverlayMetadata) -> Result<()> {
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
+        let _policy = self.policy_lock();
+        let path = normpath(path);
+        self.check_mutation(OverlayMutation::Write, &[&path])?;
+        if is_overlay_internal_path(&path) {
+            return Err(internal_name_refused(&path));
+        }
+        if self.rolling.is_some() && !self.has_file(&path) {
+            self.refuse_sealed_delete(&path)?;
+        }
+        let fi = self
+            .lookup(&path, 0)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        validate_metadata(attrs)?;
+        if attrs.mode.is_some() && ratarmount_core::is_lnk_mode(fi.mode) {
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP).into());
+        }
+        if attrs.is_empty() {
+            return Ok(());
+        }
+        self.replay_pending_rows()?;
+        let pending = self.pending_rows.lock().expect("overlay pending rows");
+        if !pending.is_empty() {
+            return Err(
+                io::Error::new(io::ErrorKind::WouldBlock, "overlay name updates pending").into(),
+            );
+        }
+        let real = self.realpath(&path);
+        self.ensure_under_root(if path == "/" {
+            &real
+        } else {
+            real.parent().expect("overlay parent")
+        })?;
+        if fs::symlink_metadata(&real).is_ok() {
+            set_host_metadata(&real, attrs)?;
+        }
+        let db = self.db.lock().expect("overlay db");
+        let tx = db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO overlay_metadata(path,mode,atime,mtime) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(path) DO UPDATE SET mode=COALESCE(excluded.mode,mode),
+             atime=COALESCE(excluded.atime,atime), mtime=COALESCE(excluded.mtime,mtime)",
+            params![
+                path,
+                attrs.mode.map(|m| m & 0o7777),
+                attrs.atime,
+                attrs.mtime
+            ],
+        )?;
+        let (folder, name) = Self::split(&path);
+        tx.execute(
+            "INSERT INTO files(path,name,mode,mtime,uid,gid,deleted) VALUES (?1,?2,?3,?4,?5,?6,0)
+             ON CONFLICT(path,name) DO UPDATE SET mode=excluded.mode,mtime=excluded.mtime",
+            params![
+                folder,
+                name,
+                (fi.mode & !0o7777) | attrs.mode.unwrap_or(fi.mode) & 0o7777,
+                attrs.mtime.unwrap_or(fi.mtime),
+                fi.uid,
+                fi.gid
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Descriptor metadata changes for detached FUSE inodes. No path rows are
+    /// changed: that name may already refer to an entirely different inode.
+    #[cfg(unix)]
+    pub fn set_metadata_file(
+        &self,
+        file: &File,
+        path: &str,
+        attrs: &OverlayMetadata,
+    ) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
+        let _policy = self.policy_lock();
+        self.check_mutation(OverlayMutation::Write, &[path])?;
+        validate_metadata(attrs)?;
+        if let Some(mode) = attrs.mode {
+            file.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
+        }
+        if attrs.atime.is_some() || attrs.mtime.is_some() {
+            let times = metadata_times(attrs);
+            if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    fn metadata_for_path(&self, path: &str) -> Option<OverlayMetadata> {
+        self.db
+            .lock()
+            .expect("overlay db")
+            .query_row(
+                "SELECT mode,atime,mtime FROM overlay_metadata WHERE path=?1",
+                [normpath(path)],
+                |r| {
+                    Ok(OverlayMetadata {
+                        mode: r.get(0)?,
+                        atime: r.get(1)?,
+                        mtime: r.get(2)?,
+                        ..Default::default()
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    fn apply_metadata(&self, path: &str, fi: &mut FileInfo) {
+        if let Some(attrs) = self.metadata_for_path(path) {
+            if let Some(mode) = attrs.mode {
+                fi.mode = (fi.mode & !0o7777) | (mode & 0o7777);
+            }
+            if let Some(mtime) = attrs.mtime {
+                fi.mtime = mtime;
+            }
+            if let Some(atime) = attrs.atime {
+                set_info_atime(fi, atime);
+            }
+        }
+    }
+
     /// Set before sharing the overlay with frontends. Copy is the default.
     /// Xattr metadata is separate from host files: setting it never copies payload data.
     /// NULL values mask archive attributes. Xattr bytes have their own caps and are
@@ -2847,7 +3084,7 @@ impl WriteOverlay {
                 defer |= series.active_source().exists(&archive_lookup_path(path));
             }
         }
-        for path in plan.xattrs.keys() {
+        for path in plan.xattrs.keys().chain(plan.metadata.keys()) {
             if !plan.append_entries.iter().any(|(p, _)| p == path) {
                 self.refuse_sealed_delete(path)?;
                 defer = true;
@@ -3579,7 +3816,7 @@ impl WriteOverlay {
                             self.db
                                 .lock()
                                 .expect("overlay db")
-                                .execute_batch("DELETE FROM files; DELETE FROM xattrs;")?;
+                                .execute_batch("DELETE FROM files; DELETE FROM xattrs; DELETE FROM overlay_metadata;")?;
                             Ok(())
                         });
                         if wiped.is_ok() {
@@ -3636,8 +3873,12 @@ impl WriteOverlay {
         plan: &OverlayCommitPlan,
         dropped_rows: &mut Vec<String>,
     ) -> Result<()> {
-        for path in plan.xattrs.keys() {
+        for path in plan.xattrs.keys().chain(plan.metadata.keys()) {
             db.execute("DELETE FROM xattrs WHERE path=?1", [normpath(path)])?;
+            db.execute(
+                "DELETE FROM overlay_metadata WHERE path=?1",
+                [normpath(path)],
+            )?;
         }
         let mut dirs: Vec<&str> = Vec::new();
         for (rel, is_dir) in &plan.append_entries {
@@ -3730,7 +3971,7 @@ impl WriteOverlay {
         };
         let hash_payloads =
             manifest_plan.is_some() && self.manifest_hashes.as_deref() != Some("none");
-        let (window, prefix) = if plan.has_xattr_changes() || hash_payloads {
+        let (window, prefix) = if plan.has_metadata_changes() || hash_payloads {
             (
                 persist_provenance_plan(
                     archive,
@@ -4039,7 +4280,9 @@ impl WriteOverlay {
             let mut pending = self.pending_rows.lock().expect("overlay pending rows");
             pending.clear();
             let db = self.db.lock().expect("overlay db");
-            db.execute_batch("DELETE FROM files; DELETE FROM xattrs;")?;
+            db.execute_batch(
+                "DELETE FROM files; DELETE FROM xattrs; DELETE FROM overlay_metadata;",
+            )?;
         }
         self.tombstone_clear();
         Ok(())
@@ -4061,6 +4304,89 @@ impl Drop for WriteOverlay {
     }
 }
 
+fn validate_metadata(attrs: &OverlayMetadata) -> io::Result<()> {
+    if attrs.uid.is_some() || attrs.gid.is_some() {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+    for time in [attrs.atime, attrs.mtime].into_iter().flatten() {
+        if !time.is_finite() || !(-9e15..9e15).contains(&time) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+    }
+    Ok(())
+}
+
+fn metadata_from_info(fi: &FileInfo) -> OverlayMetadata {
+    OverlayMetadata {
+        mode: Some(fi.mode),
+        atime: Some(overlay_atime(fi)),
+        mtime: Some(fi.mtime),
+        ..Default::default()
+    }
+}
+
+#[cfg(unix)]
+fn metadata_times(attrs: &OverlayMetadata) -> [libc::timespec; 2] {
+    [attrs.atime, attrs.mtime].map(|t| match t {
+        Some(t) => libc::timespec {
+            tv_sec: t.floor() as libc::time_t,
+            tv_nsec: ((t - t.floor()) * 1e9) as libc::c_long,
+        },
+        None => libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+    })
+}
+
+fn set_host_metadata(path: &Path, attrs: &OverlayMetadata) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        // Never chmod through a symlink, even one pointing back into the overlay.
+        if let Some(mode) = attrs.mode {
+            if fs::symlink_metadata(path)?.file_type().is_symlink() {
+                return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+            }
+            let path = c_path(path)?;
+            if unsafe {
+                libc::fchmodat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    (mode & 0o7777) as libc::mode_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if attrs.atime.is_some() || attrs.mtime.is_some() {
+            let times = metadata_times(attrs);
+            let path = c_path(path)?;
+            if unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, attrs);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "overlay metadata requires Unix",
+        ))
+    }
+}
+
 fn file_info_from_overlay_meta(path: &str, host: &Path, meta: &fs::Metadata) -> FileInfo {
     let linkname = if meta.file_type().is_symlink() {
         fs::read_link(host)
@@ -4069,7 +4395,7 @@ fn file_info_from_overlay_meta(path: &str, host: &Path, meta: &fs::Metadata) -> 
     } else {
         String::new()
     };
-    FileInfo {
+    let mut fi = FileInfo {
         size: meta.len(),
         mtime: metadata_mtime_secs(meta) as f64,
         mode: metadata_mode(meta),
@@ -4077,7 +4403,17 @@ fn file_info_from_overlay_meta(path: &str, host: &Path, meta: &fs::Metadata) -> 
         uid: metadata_uid(meta),
         gid: metadata_gid(meta),
         userdata: vec![UserData::Other(format!("overlay:{path}"))],
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fi.mtime = meta.mtime() as f64 + meta.mtime_nsec() as f64 / 1e9;
+        set_info_atime(
+            &mut fi,
+            meta.atime() as f64 + meta.atime_nsec() as f64 / 1e9,
+        );
     }
+    fi
 }
 
 fn parked_meta(last_fi: FileInfo) -> Parked {
@@ -4453,6 +4789,7 @@ impl MountSource for WriteOverlay {
         if path == "/" || !map.is_empty() || self.current_base().is_dir(&path) {
             for (name, fi) in &mut map {
                 if overlay_info_path(fi).is_none() {
+                    self.apply_metadata(&join(&path, name), fi);
                     fi.userdata.push(UserData::Other(format!(
                         "overlay-meta:{}",
                         join(&path, name)
@@ -4477,8 +4814,13 @@ impl MountSource for WriteOverlay {
         let mut by_name: BTreeMap<String, CheapDirent> = BTreeMap::new();
 
         if let Some(base_dents) = self.current_base().list_dirents(&path) {
-            for d in base_dents {
+            for mut d in base_dents {
                 if !deleted.contains(&d.name) && !is_overlay_internal_name(&d.name) {
+                    if let Some(attrs) = self.metadata_for_path(&join(&path, &d.name)) {
+                        if let Some(mode) = attrs.mode {
+                            d.mode = (d.mode & !0o7777) | (mode & 0o7777);
+                        }
+                    }
                     by_name.insert(d.name.clone(), d);
                 }
             }
@@ -4538,6 +4880,7 @@ impl MountSource for WriteOverlay {
         if path == "/" {
             let mut fi = create_root_file_info();
             fi.userdata.push(UserData::Other("overlay-meta:/".into()));
+            self.apply_metadata(&path, &mut fi);
             return Some(fi);
         }
         if self.is_deleted(&path) {
@@ -4549,6 +4892,7 @@ impl MountSource for WriteOverlay {
         self.current_base()
             .lookup(&path, file_version)
             .map(|mut fi| {
+                self.apply_metadata(&path, &mut fi);
                 fi.userdata
                     .push(UserData::Other(format!("overlay-meta:{path}")));
                 fi
@@ -4803,6 +5147,8 @@ fn overlay_info_path(fi: &FileInfo) -> Option<&str> {
 
 fn without_overlay_meta(fi: &FileInfo) -> FileInfo {
     let mut fi = fi.clone();
+    fi.userdata
+        .retain(|d| !matches!(d, UserData::Other(s) if s.starts_with("overlay-atime:")));
     if matches!(fi.userdata.last(), Some(UserData::Other(s)) if s.starts_with("overlay-meta:")) {
         fi.userdata.pop();
     }
@@ -4877,13 +5223,21 @@ fn persist_provenance_plan(
     let base = provenance_base(archive, encoding)?;
     let mut pending = collect_ustar_pending_at(root, &plan.append_entries)?;
     let mut spools = Vec::new();
-    for path in plan.xattrs.keys() {
+    for path in plan.xattrs.keys().chain(plan.metadata.keys()) {
         if pending.iter().any(|p| &p.path == path) {
+            continue;
+        }
+        let host = root.join(path);
+        if let Ok(meta) = fs::symlink_metadata(&host) {
+            pending.extend(collect_ustar_pending_at(
+                root,
+                &[(path.clone(), meta.is_dir())],
+            )?);
             continue;
         }
         let fi = base
             .lookup(&archive_lookup_path(path), 0)
-            .ok_or_else(|| OverlayError::Msg(format!("xattr member disappeared: {path}")))?;
+            .ok_or_else(|| OverlayError::Msg(format!("metadata member disappeared: {path}")))?;
         let (host, kind) = if ratarmount_core::is_dir_mode(fi.mode) {
             (PathBuf::new(), PendingKind::Directory)
         } else if ratarmount_core::is_lnk_mode(fi.mode) {
@@ -4898,7 +5252,7 @@ fn persist_provenance_plan(
             let mut reader = base.open(&fi, 0)?;
             if io::copy(&mut reader, tmp.as_file_mut())? != fi.size {
                 return Err(
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "short xattr member").into(),
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "short metadata member").into(),
                 );
             }
             let host = tmp.path().to_path_buf();
@@ -4906,7 +5260,7 @@ fn persist_provenance_plan(
             (host, PendingKind::FileOnDisk { size: fi.size })
         } else {
             return Err(OverlayError::Msg(format!(
-                "xattr commit unsupported member type: {path}"
+                "metadata commit unsupported member type: {path}"
             )));
         };
         pending.push(PendingUstar {
@@ -4922,6 +5276,16 @@ fn persist_provenance_plan(
         });
     }
     for p in &mut pending {
+        if fs::symlink_metadata(root.join(&p.path)).is_err() {
+            if let Some(metadata) = plan.metadata.get(&p.path) {
+                if let Some(mode) = metadata.mode {
+                    p.mode = mode & 0o7777;
+                }
+                if let Some(mtime) = metadata.mtime {
+                    p.mtime = mtime.max(0.0) as u64;
+                }
+            }
+        }
         let mut attrs = base
             .lookup(&archive_lookup_path(&p.path), 0)
             .map(|fi| source_xattrs(&base, &fi))
@@ -4947,7 +5311,12 @@ fn persist_provenance_plan(
     }
     let mut deleted = HashSet::new();
     let mut offsets = Vec::new();
-    for path in plan.deleted_paths.iter().chain(plan.xattrs.keys()) {
+    for path in plan
+        .deleted_paths
+        .iter()
+        .chain(plan.xattrs.keys())
+        .chain(plan.metadata.keys())
+    {
         let ohs = match all_tar_offsetheaders(&base, path) {
             Ok(ohs) => ohs,
             Err(_)
@@ -5616,7 +5985,7 @@ pub fn commit_overlay(
         .manifest_hashes
         .as_deref()
         .is_some_and(|mode| mode != "none");
-    if plan.has_xattr_changes() || hash_payloads {
+    if plan.has_metadata_changes() || hash_payloads {
         if plan.is_empty() {
             return Ok(false);
         }
@@ -5671,19 +6040,25 @@ struct OverlayCommitPlan {
     /// Overlay entries to add: `(relative path, is_directory)`.
     append_entries: Vec<(String, bool)>,
     xattrs: BTreeMap<String, BTreeMap<String, Option<Vec<u8>>>>,
+    metadata: BTreeMap<String, OverlayMetadata>,
     known_hashes: BTreeMap<String, String>,
     written_hashes: BTreeMap<String, String>,
 }
 
 impl OverlayCommitPlan {
-    fn has_xattr_changes(&self) -> bool {
-        self.xattrs
-            .values()
-            .any(|attrs| attrs.keys().any(|name| !name.is_empty()))
+    fn has_metadata_changes(&self) -> bool {
+        !self.metadata.is_empty()
+            || self
+                .xattrs
+                .values()
+                .any(|attrs| attrs.keys().any(|name| !name.is_empty()))
     }
 
     fn is_empty(&self) -> bool {
-        self.deleted_paths.is_empty() && self.append_entries.is_empty() && self.xattrs.is_empty()
+        self.deleted_paths.is_empty()
+            && self.append_entries.is_empty()
+            && self.xattrs.is_empty()
+            && self.metadata.is_empty()
     }
 }
 
@@ -5851,8 +6226,38 @@ fn collect_overlay_commit_plan_from_conn(
         }
     }
 
+    let mut metadata = BTreeMap::new();
     let mut xattrs = BTreeMap::<String, BTreeMap<String, Option<Vec<u8>>>>::new();
     if let Some(conn) = conn {
+        let has_metadata: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='overlay_metadata')", [], |r| r.get(0),
+        )?;
+        if has_metadata {
+            let mut stmt = conn.prepare("SELECT path,mode,atime,mtime FROM overlay_metadata")?;
+            for row in stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    OverlayMetadata {
+                        mode: r.get(1)?,
+                        atime: r.get(2)?,
+                        mtime: r.get(3)?,
+                        ..Default::default()
+                    },
+                ))
+            })? {
+                let (path, attrs) = row?;
+                let rel = normalize_archive_rel_path(&path);
+                let removed =
+                    deleted_paths.contains(&rel) && !append_entries.iter().any(|(p, _)| p == &rel);
+                if !removed
+                    && !skipped.contains(&rel)
+                    && !rel.is_empty()
+                    && !is_overlay_internal_path(&rel)
+                {
+                    metadata.insert(rel, attrs);
+                }
+            }
+        }
         let has_xattrs: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='xattrs')",
             [],
@@ -5880,6 +6285,7 @@ fn collect_overlay_commit_plan_from_conn(
     Ok(OverlayCommitPlan {
         known_hashes: BTreeMap::new(),
         written_hashes: BTreeMap::new(),
+        metadata,
         xattrs,
         deletions_nul,
         appends_nul,
@@ -6030,6 +6436,11 @@ fn apply_files_op_sql(conn: &Connection, op: &PendingFilesOp) -> Result<()> {
             hides_from,
             xattrs,
         } => {
+            conn.execute("DELETE FROM overlay_metadata WHERE path=?1", [to])?;
+            conn.execute(
+                "UPDATE overlay_metadata SET path=?1 WHERE path=?2",
+                params![to, from],
+            )?;
             conn.execute("DELETE FROM xattrs WHERE path=?1", [to])?;
             conn.execute("DELETE FROM xattrs WHERE path=?1", [from])?;
             conn.execute(
@@ -6049,8 +6460,8 @@ fn apply_files_op_sql(conn: &Connection, op: &PendingFilesOp) -> Result<()> {
                 params![to_folder, to_name, *mode as i64],
             )?;
             conn.execute(
-                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
-                params![to_folder, to_name],
+                r#"UPDATE "files" SET deleted = 0, mode = ?3 WHERE path = ?1 AND name = ?2"#,
+                params![to_folder, to_name, *mode as i64],
             )?;
             if *hides_from {
                 conn.execute(
@@ -6065,6 +6476,7 @@ fn apply_files_op_sql(conn: &Connection, op: &PendingFilesOp) -> Result<()> {
             }
         }
         PendingFilesOp::Deleted { path, hides_base } => {
+            conn.execute("DELETE FROM overlay_metadata WHERE path=?1", [path])?;
             conn.execute("DELETE FROM xattrs WHERE path=?1", [path])?;
             conn.execute(
                 "INSERT INTO xattrs(path,name,value) VALUES (?1,'',NULL)",
@@ -6084,14 +6496,15 @@ fn apply_files_op_sql(conn: &Connection, op: &PendingFilesOp) -> Result<()> {
             }
         }
         PendingFilesOp::Present { path, mode } => {
+            conn.execute("DELETE FROM overlay_metadata WHERE path=?1", [path])?;
             let (folder, name) = WriteOverlay::split(path);
             conn.execute(
                 r#"INSERT OR IGNORE INTO "files" (path,name,mode,deleted) VALUES (?1,?2,?3,0)"#,
                 params![folder, name, *mode as i64],
             )?;
             conn.execute(
-                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
-                params![folder, name],
+                r#"UPDATE "files" SET deleted = 0, mode = ?3 WHERE path = ?1 AND name = ?2"#,
+                params![folder, name, *mode as i64],
             )?;
         }
         PendingFilesOp::ClearDeleted { path } => {
@@ -6182,6 +6595,10 @@ fn tombstone_set_from_conn(conn: &Connection) -> rusqlite::Result<HashSet<String
 }
 
 fn delete_overlay_files_row(db: &Connection, rel: &str) -> Result<()> {
+    db.execute(
+        "DELETE FROM overlay_metadata WHERE path=?1",
+        [normpath(rel)],
+    )?;
     db.execute("DELETE FROM xattrs WHERE path=?1", [normpath(rel)])?;
     let (folder, name) = WriteOverlay::split(rel);
     db.execute(
@@ -8014,6 +8431,7 @@ mod tests {
         let plan = OverlayCommitPlan {
             known_hashes: BTreeMap::new(),
             written_hashes: BTreeMap::new(),
+            metadata: BTreeMap::new(),
             xattrs: BTreeMap::new(),
             deletions_nul: Vec::new(),
             appends_nul: Vec::new(),
@@ -10562,6 +10980,7 @@ mod tests {
         let plan = OverlayCommitPlan {
             known_hashes: BTreeMap::new(),
             written_hashes: BTreeMap::new(),
+            metadata: BTreeMap::new(),
             xattrs: BTreeMap::new(),
             deletions_nul: Vec::new(),
             appends_nul: Vec::new(),
@@ -11654,6 +12073,7 @@ mod tests {
         let plan = OverlayCommitPlan {
             known_hashes: BTreeMap::new(),
             written_hashes: BTreeMap::new(),
+            metadata: BTreeMap::new(),
             xattrs: BTreeMap::new(),
             deletions_nul: Vec::new(),
             appends_nul: Vec::new(),
@@ -11683,6 +12103,7 @@ mod tests {
         let plan = OverlayCommitPlan {
             known_hashes: BTreeMap::new(),
             written_hashes: BTreeMap::new(),
+            metadata: BTreeMap::new(),
             xattrs: BTreeMap::new(),
             deletions_nul: Vec::new(),
             appends_nul: Vec::new(),
@@ -11704,6 +12125,7 @@ mod tests {
         let plan = OverlayCommitPlan {
             known_hashes: BTreeMap::new(),
             written_hashes: BTreeMap::new(),
+            metadata: BTreeMap::new(),
             xattrs: BTreeMap::new(),
             deletions_nul: Vec::new(),
             appends_nul: Vec::new(),
@@ -11916,7 +12338,7 @@ mod tests {
         put_overlay_bytes(&ov, "/new", b"new payload");
         drop(ov);
         let mut plan = collect_overlay_commit_plan(&root).unwrap();
-        assert!(!plan.has_xattr_changes());
+        assert!(!plan.has_metadata_changes());
         let mut hashes = BTreeMap::new();
         persist_provenance_plan(
             &archive,
@@ -11951,6 +12373,336 @@ mod tests {
             write_single_frame_tar_zst(path, &[member]);
         } else {
             fs::write(path, pack_tar(&[member])).unwrap();
+        }
+    }
+
+    /// Regression: chmod/utimens must not copy archive bytes, and mode/mtime
+    /// must survive reopen and TAR commit for both archive and overlay files.
+    #[test]
+    fn regression_overlay_chmod_metadata_only_reopen_commit() {
+        for compressed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join(if compressed {
+                "base.tar.zst"
+            } else {
+                "base.tar"
+            });
+            provenance_fixture(&archive, compressed);
+            let root = dir.path().join("overlay");
+            let base = Arc::new(provenance_base(&archive, "utf-8").unwrap());
+            let ov = WriteOverlay::new(base.clone(), &root).unwrap();
+            let fd = ov.create_file("/built", 0o600).unwrap();
+            ov.close_overlay_fd(fd);
+            let attrs = OverlayMetadata {
+                mode: Some(0o751),
+                atime: Some(1234.25),
+                mtime: Some(5678.5),
+                ..Default::default()
+            };
+            for path in ["/trace", "/built"] {
+                ov.set_metadata(path, &attrs).unwrap();
+                let fi = ov.lookup(path, 0).unwrap();
+                assert_eq!(fi.mode & 0o7777, 0o751);
+                assert_eq!(fi.mtime, 5678.5);
+                assert_eq!(overlay_atime(&fi), 1234.25);
+            }
+            assert!(!root.join("trace").exists(), "chmod copied archive payload");
+            assert_eq!(read_member(&ov, "/trace"), b"training payload");
+            let modes: Vec<_> = ov
+                .list_dirents("/")
+                .unwrap()
+                .into_iter()
+                .map(|d| d.mode & 0o7777)
+                .collect();
+            assert_eq!(modes, [0o751, 0o751]);
+            drop(ov);
+            let ov = WriteOverlay::new(base, &root).unwrap();
+            assert_eq!(ov.lookup("/trace", 0).unwrap().mode & 0o7777, 0o751);
+            assert_eq!(overlay_atime(&ov.lookup("/trace", 0).unwrap()), 1234.25);
+            // Omitted timestamps are unchanged by a later chmod.
+            ov.set_metadata(
+                "/trace",
+                &OverlayMetadata {
+                    mode: Some(0o755),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(ov.lookup("/trace", 0).unwrap().mtime, 5678.5);
+            assert!(ov
+                .commit_live(&archive, |p| Ok(Arc::new(provenance_base(p, "utf-8")?)))
+                .unwrap());
+            assert!(ov.metadata_for_path("/trace").is_none());
+            let committed = provenance_base(&archive, "utf-8").unwrap();
+            assert_eq!(committed.lookup("/trace", 0).unwrap().mode & 0o7777, 0o755);
+            assert_eq!(committed.lookup("/built", 0).unwrap().mode & 0o7777, 0o751);
+            assert_eq!(committed.lookup("/trace", 0).unwrap().mtime, 5678.0);
+            assert_eq!(read_member(&committed, "/trace"), b"training payload");
+        }
+    }
+
+    /// Regression: a nested archive-only chmod must not require materialized
+    /// parent directories; creation modes must not be masked by the daemon.
+    #[test]
+    fn regression_overlay_chmod_nested_and_create_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(&archive, pack_tar(&[ustar_file("sub/script", b"payload")])).unwrap();
+        let root = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
+            .unwrap();
+        ov.set_metadata(
+            "/sub/script",
+            &OverlayMetadata {
+                mode: Some(0o755),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!root.join("sub").exists());
+        assert_eq!(read_member(&ov, "/sub/script"), b"payload");
+        ov.set_metadata(
+            "/",
+            &OverlayMetadata {
+                mode: Some(0o751),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ov.lookup("/", 0).unwrap().mode & 0o7777, 0o751);
+        let fd = ov
+            .open_overlay_fd_with_mode("/built", libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o777)
+            .unwrap();
+        ov.close_overlay_fd(fd);
+        assert_eq!(ov.lookup("/built", 0).unwrap().mode & 0o7777, 0o777);
+        assert!(ov
+            .open_overlay_fd_with_mode("/built", libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600)
+            .is_err());
+        ov.mkdir("/dir", 0o777).unwrap();
+        let fd = ov.create_file("/dir/child", 0o751).unwrap();
+        ov.close_overlay_fd(fd);
+        ov.set_metadata(
+            "/dir",
+            &OverlayMetadata {
+                mode: Some(0o750),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| Ok(Arc::new(provenance_base(p, "utf-8")?)))
+            .unwrap());
+        assert_eq!(ov.lookup("/sub/script", 0).unwrap().mode & 0o7777, 0o755);
+        assert_eq!(ov.lookup("/dir", 0).unwrap().mode & 0o7777, 0o750);
+    }
+
+    /// Regression: a combined truncate/touch must keep the requested mtime;
+    /// failed chown must not truncate and chmod must never follow a host symlink.
+    #[test]
+    fn regression_overlay_chmod_setattr_order_and_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(
+            &archive,
+            pack_tar(&[
+                ustar_file("trace", b"training payload"),
+                ustar_symlink("archive-link", "trace"),
+            ]),
+        )
+        .unwrap();
+        let root = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
+            .unwrap();
+        ov.set_metadata(
+            "/archive-link",
+            &OverlayMetadata {
+                mtime: Some(1234.5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!root.join("archive-link").exists());
+        ov.rename("/archive-link", "/moved-link").unwrap();
+        assert_eq!(ov.lookup("/moved-link", 0).unwrap().mtime, 1234.5);
+        assert!(ov
+            .set_attributes(
+                "/trace",
+                Some(0),
+                &OverlayMetadata {
+                    uid: Some(123),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        assert_eq!(ov.lookup("/trace", 0).unwrap().size, 16);
+        ov.set_attributes(
+            "/trace",
+            Some(3),
+            &OverlayMetadata {
+                mode: Some(0o755),
+                mtime: Some(42.5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fi = ov.lookup("/trace", 0).unwrap();
+        assert_eq!(fi.size, 3);
+        assert_eq!(fi.mtime, 42.5);
+        assert_eq!(fi.mode & 0o7777, 0o755);
+        ov.create_symlink("/link", "trace").unwrap();
+        assert!(ov
+            .set_metadata(
+                "/link",
+                &OverlayMetadata {
+                    mode: Some(0o600),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        assert_eq!(ov.lookup("/trace", 0).unwrap().mode & 0o7777, 0o755);
+    }
+
+    /// Regression: metadata-only chmod is included in offline commit plans.
+    #[test]
+    fn regression_overlay_chmod_offline_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        provenance_fixture(&archive, false);
+        let root = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
+            .unwrap();
+        ov.set_metadata(
+            "/trace",
+            &OverlayMetadata {
+                mode: Some(0o755),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(ov);
+        assert!(commit_overlay(
+            &root,
+            &archive,
+            &CommitOverlayOptions {
+                yes: true,
+                ..Default::default()
+            }
+        )
+        .unwrap());
+        assert_eq!(
+            provenance_base(&archive, "utf-8")
+                .unwrap()
+                .lookup("/trace", 0)
+                .unwrap()
+                .mode
+                & 0o7777,
+            0o755
+        );
+    }
+
+    /// Regression: COW, rename and recreation must preserve or discard the
+    /// correct inode's mode rather than resurrect metadata from an old name.
+    #[test]
+    fn regression_overlay_chmod_copy_up_rename_recreate() {
+        for policy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("base.tar");
+            provenance_fixture(&archive, false);
+            let root = dir.path().join("ov");
+            let mut ov =
+                WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
+                    .unwrap();
+            if policy {
+                ov.set_policy(Some(Arc::new(CountingPolicy::new(u64::MAX))));
+            }
+            ov.set_metadata(
+                "/trace",
+                &OverlayMetadata {
+                    mode: Some(0o751),
+                    mtime: Some(1234.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let fd = ov.open_overlay_fd("/trace", libc::O_RDWR).unwrap();
+            ov.close_overlay_fd(fd);
+            assert_eq!(ov.lookup("/trace", 0).unwrap().mode & 0o7777, 0o751);
+            assert_eq!(ov.lookup("/trace", 0).unwrap().mtime, 1234.0);
+            let fd = ov.create_file("/moved", 0o600).unwrap();
+            ov.close_overlay_fd(fd);
+            ov.rename("/trace", "/moved").unwrap();
+            let mode: u32 = ov
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT mode FROM files WHERE name='moved'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(mode & 0o7777, 0o751);
+            assert_eq!(ov.lookup("/moved", 0).unwrap().mode & 0o7777, 0o751);
+            ov.unlink("/moved").unwrap();
+            let fd = ov.create_file("/moved", 0o640).unwrap();
+            ov.close_overlay_fd(fd);
+            assert_eq!(ov.lookup("/moved", 0).unwrap().mode & 0o7777, 0o640);
+            assert!(ov.metadata_for_path("/moved").is_none());
+        }
+    }
+
+    /// Regression: chmod and utimens must obey read-only globs; chown and
+    /// invalid times fail explicitly instead of reporting a successful no-op.
+    #[test]
+    fn regression_overlay_chmod_readonly_and_chown() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        provenance_fixture(&archive, false);
+        let mut ov = WriteOverlay::new(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            dir.path().join("ov"),
+        )
+        .unwrap();
+        let fd = ov.create_file("/host", 0o644).unwrap();
+        ov.close_overlay_fd(fd);
+        let err = ov
+            .set_metadata(
+                "/host",
+                &OverlayMetadata {
+                    uid: Some(123),
+                    mode: Some(0o777),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, OverlayError::Io(e) if e.raw_os_error() == Some(libc::EPERM)));
+        assert_eq!(ov.lookup("/host", 0).unwrap().mode & 0o7777, 0o644);
+        assert!(ov
+            .set_metadata(
+                "/host",
+                &OverlayMetadata {
+                    mtime: Some(f64::NAN),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        ov.set_policy(Some(Arc::new(
+            crate::overlay_policy::ReadOnlyGlobs::new(["trace", "host"]).unwrap(),
+        )));
+        for path in ["/trace", "/host"] {
+            for attrs in [
+                OverlayMetadata {
+                    mode: Some(0o755),
+                    ..Default::default()
+                },
+                OverlayMetadata {
+                    mtime: Some(10.0),
+                    ..Default::default()
+                },
+            ] {
+                let err = ov.set_metadata(path, &attrs).unwrap_err();
+                assert!(
+                    matches!(err, OverlayError::Io(e) if e.kind() == io::ErrorKind::ReadOnlyFilesystem)
+                );
+            }
         }
     }
 

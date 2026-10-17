@@ -1,5 +1,7 @@
 //! `NFSFileSystem` on `MountSource`, with optional write overlay.
 
+use nfsserve::nfs::{set_atime, set_gid3, set_mtime, set_uid3};
+use ratarmount_compositing::{overlay_atime, OverlayMetadata};
 use ratarmount_core::AttributeMapping;
 use std::io;
 use std::os::unix::io::FromRawFd;
@@ -71,7 +73,11 @@ impl RatarmountNfs {
     fn file_info_for_id(&self, id: fileid3) -> Result<FileInfo, nfsstat3> {
         let path = self.inodes.path_for_id(id).ok_or(nfsstat3::NFS3ERR_STALE)?;
         if path == "/" {
-            let fi = ratarmount_core::create_root_file_info();
+            let fi = self
+                .overlay
+                .as_ref()
+                .and_then(|ov| ov.lookup("/", 0))
+                .unwrap_or_else(ratarmount_core::create_root_file_info);
             self.inodes.store_lookup_fi(id, fi.clone());
             return Ok(fi);
         }
@@ -102,7 +108,7 @@ impl RatarmountNfs {
             rdev: specdata3::default(),
             fsid: 1,
             fileid: id,
-            atime: t,
+            atime: unix_float_to_nfs_time(overlay_atime(fi)),
             mtime: t,
             ctime: t,
         }
@@ -398,8 +404,55 @@ impl RatarmountNfs {
     pub fn setattr_sync(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let ov = self.overlay()?;
         let path = self.inodes.path_for_id(id).ok_or(nfsstat3::NFS3ERR_STALE)?;
-        if let set_size3::size(sz) = setattr.size {
-            ov.truncate(&path, sz).map_err(overlay_to_nfs)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let attrs = OverlayMetadata {
+            mode: match setattr.mode {
+                set_mode3::mode(v) => Some(v),
+                _ => None,
+            },
+            uid: match setattr.uid {
+                set_uid3::uid(v) => Some(v),
+                _ => None,
+            },
+            gid: match setattr.gid {
+                set_gid3::gid(v) => Some(v),
+                _ => None,
+            },
+            atime: match setattr.atime {
+                set_atime::DONT_CHANGE => None,
+                set_atime::SET_TO_SERVER_TIME => Some(now),
+                set_atime::SET_TO_CLIENT_TIME(t) => {
+                    Some(t.seconds as f64 + t.nseconds as f64 / 1e9)
+                }
+            },
+            mtime: match setattr.mtime {
+                set_mtime::DONT_CHANGE => None,
+                set_mtime::SET_TO_SERVER_TIME => Some(now),
+                set_mtime::SET_TO_CLIENT_TIME(t) => {
+                    Some(t.seconds as f64 + t.nseconds as f64 / 1e9)
+                }
+            },
+        };
+        if !attrs.is_empty() || matches!(setattr.size, set_size3::size(_)) {
+            ov.set_attributes(
+                &path,
+                match setattr.size {
+                    set_size3::size(sz) => Some(sz),
+                    _ => None,
+                },
+                &attrs,
+            )
+            .map_err(|e| match &e {
+                ratarmount_compositing::OverlayError::Io(io)
+                    if io.raw_os_error() == Some(libc::EPERM) =>
+                {
+                    nfsstat3::NFS3ERR_PERM
+                }
+                _ => overlay_to_nfs(e),
+            })?;
             self.bump_after_mutate(id);
         }
         self.getattr_sync(id)
@@ -763,6 +816,17 @@ mod tests {
         let file = nfs.lookup_sync(locked, &name("file")).unwrap();
         let quota = nfs.lookup_sync(1, &name("quota")).unwrap();
         let ro = nfsstat3::NFS3ERR_ROFS as u32;
+        assert_eq!(
+            nfs.setattr_sync(
+                file,
+                sattr3 {
+                    mode: set_mode3::mode(0o755),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err() as u32,
+            ro
+        );
         assert_eq!(nfs.write_sync(file, 0, b"x").unwrap_err() as u32, ro);
         assert_eq!(
             nfs.create_sync(locked, &name("new"), sattr3::default())
@@ -1186,6 +1250,61 @@ mod tests {
             Some(Arc::clone(&ov)),
         );
         (td, nfs)
+    }
+
+    /// Regression: NFS SETATTR mode/time requests must reach the overlay.
+    #[test]
+    fn regression_overlay_chmod_nfs_setattr() {
+        let (_td, nfs) = overlay_export(Synth::new());
+        assert_eq!(
+            nfs.setattr_sync(
+                1,
+                sattr3 {
+                    mode: set_mode3::mode(0o751),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .mode,
+            0o751
+        );
+        let (id, _) = nfs
+            .create_sync(1, &name("built"), sattr3::default())
+            .unwrap();
+        let attr = nfs
+            .setattr_sync(
+                id,
+                sattr3 {
+                    mode: set_mode3::mode(0o755),
+                    atime: set_atime::SET_TO_CLIENT_TIME(nfstime3 {
+                        seconds: 12,
+                        nseconds: 250_000_000,
+                    }),
+                    mtime: set_mtime::SET_TO_CLIENT_TIME(nfstime3 {
+                        seconds: 34,
+                        nseconds: 500_000_000,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(attr.mode, 0o755);
+        assert_eq!(attr.atime.seconds, 12);
+        assert_eq!(attr.atime.nseconds, 250_000_000);
+        assert_eq!(attr.mtime.seconds, 34);
+        assert_eq!(
+            stat_u32(
+                nfs.setattr_sync(
+                    id,
+                    sattr3 {
+                        uid: set_uid3::uid(123),
+                        ..Default::default()
+                    }
+                )
+                .unwrap_err()
+            ),
+            stat_u32(nfsstat3::NFS3ERR_PERM)
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! `MountSource` adapter for 9P2000.L (inode table + reader LRU + overlay).
 
+use ratarmount_compositing::{overlay_atime, OverlayMetadata};
 use ratarmount_core::AttributeMapping;
 use std::io;
 use std::os::unix::io::FromRawFd;
@@ -74,7 +75,11 @@ impl Ratarmount9p {
     pub fn file_info(&self, id: u64) -> Result<FileInfo, i32> {
         let path = self.inodes.path_for_id(id).ok_or(libc::ESTALE)?;
         if path == "/" {
-            let fi = create_root_file_info();
+            let fi = self
+                .overlay
+                .as_ref()
+                .and_then(|ov| ov.lookup("/", 0))
+                .unwrap_or_else(create_root_file_info);
             self.inodes.store_lookup_fi(id, fi.clone());
             return Ok(fi);
         }
@@ -358,6 +363,17 @@ impl Ratarmount9p {
         Ok(fi.linkname)
     }
 
+    pub fn setattr(&self, id: u64, size: Option<u64>, attrs: &OverlayMetadata) -> Result<(), i32> {
+        let ov = self.overlay()?;
+        let path = self.path_for_id(id)?;
+        ov.set_attributes(&path, size, attrs).map_err(|e| {
+            let e = overlay_to_io(e);
+            e.raw_os_error().unwrap_or_else(|| io_to_errno(&e))
+        })?;
+        self.bump(id);
+        Ok(())
+    }
+
     pub fn setattr_size(&self, id: u64, valid: u32, size: u64) -> Result<(), i32> {
         if valid & SETATTR_SIZE == 0 {
             if !self.writable() && valid != 0 {
@@ -462,6 +478,7 @@ fn unix_time(t: f64) -> (u64, u64) {
 
 fn attr_from(id: u64, fi: &FileInfo, mapping: AttributeMapping) -> Attr {
     let (sec, nsec) = unix_time(fi.mtime);
+    let (atime_sec, atime_nsec) = unix_time(overlay_atime(fi));
     let nlink = if is_dir_mode(fi.mode) { 2 } else { 1 };
     Attr {
         qid: qid_from(id, fi),
@@ -473,8 +490,8 @@ fn attr_from(id: u64, fi: &FileInfo, mapping: AttributeMapping) -> Attr {
         size: fi.size,
         blksize: 4096,
         blocks: fi.size.div_ceil(512),
-        atime_sec: sec,
-        atime_nsec: nsec,
+        atime_sec,
+        atime_nsec,
         mtime_sec: sec,
         mtime_nsec: nsec,
         ctime_sec: sec,
@@ -595,6 +612,18 @@ mod tests {
         let file = fs.inodes.id_for_path("/locked/file");
         let quota = fs.inodes.id_for_path("/quota");
         assert_eq!(fs.write(file, 0, b"x").unwrap_err(), libc::EROFS);
+        assert_eq!(
+            fs.setattr(
+                file,
+                None,
+                &OverlayMetadata {
+                    mode: Some(0o755),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
+            libc::EROFS
+        );
         assert_eq!(fs.lcreate(locked, "new", 0o644).unwrap_err(), libc::EROFS);
         assert_eq!(
             fs.setattr_size(file, SETATTR_SIZE, 3).unwrap_err(),
@@ -668,6 +697,51 @@ mod tests {
         assert_eq!(
             fs.require_write_open(libc::O_WRONLY as u32).unwrap_err(),
             libc::EROFS
+        );
+    }
+
+    /// Regression: Tsetattr mode/time updates must reach the write overlay.
+    #[test]
+    fn regression_overlay_chmod_ninep_setattr() {
+        let (_td, fs) = overlay_fs();
+        fs.setattr(
+            ROOT_FILEID,
+            None,
+            &OverlayMetadata {
+                mode: Some(0o751),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fs.getattr(ROOT_FILEID).unwrap().mode & 0o7777, 0o751);
+        let (id, _) = fs.lcreate(ROOT_FILEID, "built", 0o644).unwrap();
+        fs.setattr(
+            id,
+            None,
+            &OverlayMetadata {
+                mode: Some(0o755),
+                atime: Some(12.25),
+                mtime: Some(34.5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let attrs = fs.getattr(id).unwrap();
+        assert_eq!(attrs.mode & 0o7777, 0o755);
+        assert_eq!(attrs.atime_sec, 12);
+        assert_eq!(attrs.atime_nsec, 250_000_000);
+        assert_eq!(attrs.mtime_sec, 34);
+        assert_eq!(
+            fs.setattr(
+                id,
+                None,
+                &OverlayMetadata {
+                    gid: Some(123),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
+            libc::EPERM
         );
     }
 
