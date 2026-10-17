@@ -928,3 +928,73 @@ fn gguf_reserved_root_names_preserve_tensor_bytes_and_metadata() {
         json!({"general.name": "reserved-name model"})
     );
 }
+
+/// Regression: a standalone safetensors or GGUF mount listed only the root JSON
+/// files, and `ls mnt/layer` failed, because tensor parent directories had no
+/// index rows (only `/layer/0/weight` existed). Listing and lookups of every
+/// prefix must work in both the SQL and the compact index mode.
+#[test]
+fn regression_tensor_parent_directories_are_listed_and_looked_up() {
+    for compact in [false, true] {
+        let src = TensorsMountSource::open_from_reader(
+            Cursor::new(safetensors(
+                json!({"layer.0.weight":tensor("U8",&[4],0,4),
+                    "layer.1.weight":tensor("U8",&[4],4,8),
+                    "bias":tensor("U8",&[1],8,9)}),
+                b"abcdefghi",
+            )),
+            "nested",
+            None,
+            &OpenOptions {
+                index_compact_only: compact,
+                index_in_memory: !compact,
+                ..OpenOptions::default()
+            },
+            "test",
+        )
+        .unwrap();
+        let names = |path: &str| -> BTreeSet<String> {
+            src.list_dirents(path)
+                .unwrap_or_else(|| panic!("no listing for {path} (compact={compact})"))
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect()
+        };
+        assert_eq!(
+            names("/"),
+            [
+                "__header__.json",
+                "__metadata__.json",
+                "bias",
+                "bias.json",
+                "layer"
+            ]
+            .map(String::from)
+            .into()
+        );
+        assert_eq!(names("/layer"), ["0", "1"].map(String::from).into());
+        assert_eq!(
+            names("/layer/0"),
+            ["weight", "weight.json"].map(String::from).into()
+        );
+        for dir in ["/layer", "/layer/0", "/layer/1"] {
+            let info = src
+                .lookup(dir, 0)
+                .unwrap_or_else(|| panic!("missing {dir} (compact={compact})"));
+            assert!(
+                ratarmount_core::is_dir_mode(info.mode),
+                "{dir} must be a directory"
+            );
+        }
+        let layer = src
+            .list_dirents("/")
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "layer")
+            .unwrap();
+        assert!(ratarmount_core::is_dir_mode(layer.mode));
+        assert!(matches!(src.list("/layer"), Some(ListResult::Infos(m)) if m.len() == 2));
+        assert_eq!(read(&src, "/layer/1/weight"), b"efgh");
+        assert_eq!(read(&src, "/bias"), b"i");
+    }
+}
