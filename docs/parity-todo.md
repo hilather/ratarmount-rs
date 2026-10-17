@@ -20,7 +20,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Custom SevenZip random-access | yes (fork PR) | yes | `[x]` |
 | AR / CPIO newc/crc/odc/binary | yes | yes | `[x]` |
 | libarchive long-tail (RAR/LHA/…; CAB LZX) | yes | yes (sequential open) | `~` |
-| Stencil CAB / ISO / WARC / XAR (fork RA) | yes (custom) | yes (store/MSZIP CAB; LZX→libarchive) | `[x]` |
+| Stencil CAB / ISO / WARC / XAR (fork RA) | yes (custom) | yes (store/MSZIP CAB; LZX→libarchive; ISO Rock Ridge names/modes/symlinks/times + Joliet names) | `[x]` |
 | SevenZip BCJ2 + stream pack/AES + meta-only encrypt | yes | yes | `[x]` |
 | SquashFS | yes | yes (backhand in-process; xz via xz2; unsquashfs for classic lzma) | `[x]` / `~` classic lzma fallback |
 | EXT4 / FAT images | yes | EXT4 pure (`ext4-view`) + debugfs fallback; FAT pure | `[x]` EXT4 pure path |

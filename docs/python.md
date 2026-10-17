@@ -1,5 +1,14 @@
 # Python library
 
+Everything ratarmount can open, from Python and without FUSE: open an archive
+or a remote URL, read members by name, map uncompressed members with zero
+copies, iterate WebDataset samples, feed a PyTorch `DataLoader`, read through
+fsspec as `ratar://`, publish indexes, and mount through the installed CLI when
+a real directory is needed. Wheels are built in CI for Linux x86_64 and
+aarch64 and for macOS arm64; publication to PyPI is pending, so install a
+release artifact or build from source as shown below.
+
+
 The `ratarmount-rs` Python distribution imports as `ratarmount_rs`. It reads
 archives through the blocking Rust Session API without FUSE or a
 mount point. CPython 3.9+ is supported using PyO3's `abi3-py39` stable ABI.
