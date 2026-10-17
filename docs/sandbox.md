@@ -1,5 +1,13 @@
 # Write-overlay sandbox controls
 
+Run untrusted or automated writers on top of a read-only base. Each attempt
+gets its own overlay, chosen paths stay read-only, the amount an attempt may
+write is capped, ownership is mapped for containers, and a supervisor creates
+and destroys hundreds of attempts and exports each one's patch. The
+[SWE-bench recipe](recipes/swe-bench-sandboxes.md) is the worked example; this
+page is the reference.
+
+
 Protect source paths and bound a sandbox's writable content with a persistent
 or temporary write overlay:
 

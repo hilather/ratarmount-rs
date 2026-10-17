@@ -316,7 +316,7 @@ class BenchmarkRegressionTests(unittest.TestCase):
 
     def test_regression_scripts_have_runnable_help(self):
         scripts = ["samples.py", "sandbox-attempts.py", "build-test.py", "cold-index.py",
-                   "mount-memory.py", "model-load.py", "two_box_nfs.py"]
+                   "mount-memory.py", "model-load.py", "hf-dataset.py", "two_box_nfs.py"]
         for script in scripts:
             output = common.command([sys.executable, common.HERE / script, "--help"])
             self.assertIn("--output", output)

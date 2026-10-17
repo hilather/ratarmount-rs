@@ -13,6 +13,7 @@ python3 benchmarks/ai/build-test.py
 python3 benchmarks/ai/cold-index.py
 python3 benchmarks/ai/mount-memory.py
 python3 benchmarks/ai/model-load.py
+python3 benchmarks/ai/hf-dataset.py
 ./benchmarks/ai/two-box-nfs.sh loopback
 ```
 
@@ -45,6 +46,7 @@ unmounts preserve work directories for inspection. Avoid SIGKILL during a run.
 | `cold-index.py` | 0.015625 GiB of binary samples, 8 MiB shard limit | `--gib`, `--shard-size`, `--codec` |
 | `mount-memory.py` | 32 mounts of an 8 MiB plain-TAR sample set | `--mounts`, `--samples`, `--settle` |
 | `model-load.py` | Pinned public tiny BERT, ~0.5 MiB safetensors | `--repo`, `--revision`, `--file` (safetensors) |
+| `hf-dataset.py` | Public Oxford-IIIT Pet WebDataset shards with published indexes, pinned commit | `--repo`, `--revision`, `--shard`, `--file` |
 | `two-box-nfs.sh` | 16 MiB loopback payload, NFSv4.1 | `serve\|read\|loopback`, `--mib`, `--version 3\|4`, `--host`, `--local-file` |
 
 The samples, cold-index, mount-memory and model-load readers also accept
@@ -115,6 +117,16 @@ For separate configurations use separate output paths so summaries stay clear.
    `AI_OFFLINE=1` to skip explicitly. This measures I/O plus SHA-256, not model
    initialization, GPU transfer, inference or llama.cpp. Use a larger public
    safetensors file for hardware runs; pin its revision too.
+
+7. **Hub dataset:** three mounts of a public dataset whose shards carry
+   published indexes, each with fresh ratarmount and Hub caches: the whole
+   repository with `-r` (mount startup, then the first shard open through its
+   published index, then two file reads), one shard through its published
+   index (mount startup and a read), and the same shard with `-c`, which
+   ignores the published index and scans the remote TAR (mount startup and a
+   read). Reads are hashed and must agree across mounts. The default is
+   `RealMattbrewer/oxford-iiit-pet-webdataset` at a pinned commit; network
+   latency is part of every number. Offline or an unreachable Hub skips.
 
 Every row records hostname, kernel/architecture, load1, run ID, UTC timestamp,
 binary path/version and all command-line parameters. Repeat after other builds

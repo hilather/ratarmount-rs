@@ -1,5 +1,19 @@
 # BitTorrent sources
 
+Mount a magnet link or `.torrent` file and read the files inside it on demand.
+The file tree appears as soon as the torrent's metadata is known; pieces are
+fetched when something reads them, from HTTP web seeds first and from peers
+only when no seed can supply a verified piece. This is built for
+[Pirate Face](https://pirateface.co/how-it-works), which publishes magnet links
+for permissively licensed Hugging Face models and datasets with the Hub as a
+web seed, and for moving large models between your own machines over a LAN.
+Verification is layered: every piece against the torrent's hash, and every
+whole file against the Hub's SHA-256 when it is known. Nothing is uploaded
+unless you pass `--seed`. The section on
+[whole-file hashes and Pirate Face findings](#whole-file-hashes-and-pirate-face-findings)
+records exactly what was checked against the live service.
+
+
 The `bittorrent` feature mounts `magnet:?xt=…`, local `.torrent` files, and
 HTTP(S) URLs whose path ends in `.torrent`. Quote magnets so the shell does
 not interpret `&`. The feature is enabled in the three Linux/macOS release scripts listed in

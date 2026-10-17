@@ -1,5 +1,13 @@
 # Dataset shards and index export
 
+Turn a directory of samples into WebDataset-style TAR shards that stream fast
+and seek cheaply, each with a ratarmount index and a shared manifest, and
+export the member catalog as Parquet, JSONL or CSV. The shards are plain TAR,
+so any WebDataset reader or 🤗 `datasets` can consume them; the indexes let
+mounts and the Python library skip the scan. The
+[WebDataset recipe](recipes/webdataset-shards.md) walks through a full pipeline.
+
+
 `ratarmount shard` packs a directory into WebDataset-style TAR shards, with a
 standard ratarmount SQLite sidecar for each shard and a `shards.json` manifest.
 Neither this command nor `export-index` needs FUSE.

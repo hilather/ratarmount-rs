@@ -1,5 +1,14 @@
 # Hugging Face Hub (`hf://`)
 
+Mount any Hub repository as a directory and read only the bytes you touch.
+Datasets, models and Spaces all work; the revision is pinned to one commit for
+the life of the mount; archive shards open as folders through indexes published
+next to them; and complete files are shared with the standard `huggingface_hub`
+cache. Dataset authors can publish indexes and commit archive changes back to
+a branch. The [Local AI guide](local-ai/index.md) has the overview; this page
+is the reference.
+
+
 Mount Hub files, repositories, or directories through the blocking HTTP reader:
 
 ```sh

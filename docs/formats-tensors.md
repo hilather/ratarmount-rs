@@ -1,5 +1,11 @@
 # Safetensors and GGUF tensor mounts
 
+Open a checkpoint as a directory: every tensor is a file holding exactly its
+stored bytes, with a JSON sidecar for dtype and shape, so you can inspect,
+diff, hash or partially read weights without loading a model. Works on local
+files, on `hf://` mounts and inside TARs.
+
+
 `ratarmount-formats-tensors` exposes a single safetensors shard or a little-endian
 GGUF v2/v3 file as a read-only `MountSource`. Each tensor is a regular file
 containing its original stored bytes. Quantized GGUF tensors stay quantized;

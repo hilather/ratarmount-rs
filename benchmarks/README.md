@@ -266,10 +266,11 @@ RUN_FULL_BENCH=1 GENERATE_RESULTS=1 RATARMOUNT_PY_ROOT=../ratarmount \
 
 ## Local AI workloads
 
-The [AI suite](ai/README.md) has six parameterized laptop-scale benchmarks:
+The [AI suite](ai/README.md) has seven parameterized laptop-scale benchmarks:
 WebDataset sample throughput, 64 parallel sandbox attempts, sandbox build/test
-time, published-index cold opens/mounts, RSS for 32 mounts, and first/second
-Hugging Face model reads. Each appends CSV under `ai/results/` and prints a table;
+time, published-index cold opens/mounts, RSS for 32 mounts, first/second
+Hugging Face model reads, and a public Hub dataset mounted through its
+published indexes against a remote scan. Each appends CSV under `ai/results/` and prints a table;
 missing FUSE or optional tools produce explicit skips. It also includes a
 [two-box/loopback NFS benchmark](../docs/local-ai/two-box-nfs.md).
 
