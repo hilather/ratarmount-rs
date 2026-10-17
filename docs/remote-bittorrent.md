@@ -9,9 +9,13 @@ With the feature off, local `.torrent` files and HTTP URLs keep their ordinary
 file/HTTP behavior. Directories named `*.torrent` are always directories.
 
 ```sh
+# Default (--torrent-swarm never): reads are served only from the cache and the torrent's web seeds (url-list).
 ratarmount ./dataset.torrent mnt/
 ratarmount -r --readahead 8M 'https://example.org/dataset.torrent' mnt/
-ratarmount 'magnet:?xt=urn:btih:…&tr=…&ws=…' mnt/
+ratarmount 'magnet:?xt=urn:btih:…&xs=https://example.org/dataset.torrent' mnt/
+# No web seed, or a magnet with only tr=/ws=: opt in to peers.
+ratarmount --torrent-swarm auto ./peers-only.torrent mnt/
+ratarmount --torrent-swarm auto 'magnet:?xt=urn:btih:…&tr=…&ws=…' mnt/
 cargo build -p ratarmount                           # no BitTorrent dependency
 cargo build -p ratarmount --features bittorrent
 cargo build -p ratarmount-session --features bittorrent
@@ -20,16 +24,22 @@ cargo build -p ratarmount-session --features bittorrent
 Check the company network policy before running BitTorrent at work. Firewalls
 may block or flag the protocol regardless of the content being transferred.
 
-**Network policy: `--torrent-swarm auto|always|lan|never` defaults to `auto`.**
+**Network policy: `--torrent-swarm never|auto|lan|always` defaults to `never`.**
+Package builds compile BitTorrent, but a mount contacts no peers, trackers, DHT
+or LSD unless you pass `auto`, `lan` or `always`.
 
-* `auto` starts the swarm only if metadata cannot be obtained from the cache,
-  `xs` or metainfo file, or if no web seed can supply a verified requested piece.
+* `never` (default) allows the cache, `xs`/metainfo over HTTP(S), and web seeds
+  only; no peer socket is opened. Missing metadata or a piece that cannot be
+  obtained and verified fails with a `--torrent-swarm never` error that names
+  the opt-in (`pass --torrent-swarm lan or auto to allow peers`). A magnet with
+  no cached metadata and no `xs` URL therefore fails at mount.
+* `auto` (opt-in; **joins public DHT/trackers** on fallback) starts the swarm
+  only if metadata cannot be obtained from the cache, `xs` or metainfo file, or
+  if no web seed can supply a verified requested piece.
   Available metadata plus a working web seed means **no DHT socket, tracker
   announce, LSD multicast, or peer connection**. After web seeds fail, an LSD-enabled
   mount gives LAN peers a three-second first attempt before public discovery.
   Checksum discovery can still use HTTPS APIs. `--seed` explicitly activates a session.
-* `never` allows cache and web seeds only. Missing metadata or a piece that
-  cannot be obtained and verified fails with a `--torrent-swarm never` error.
 * `always` creates the swarm runtime at mount time, including DHT when enabled.
   Torrent peer streaming and tracker requests begin when the swarm is used.
 * `lan` creates a session with **no DHT and no tracker requests**, and tries local
@@ -57,8 +67,9 @@ determine the default interface: librqbit binds DHT on all interfaces. Use `neve
 if that is unacceptable. UPnP port mapping remains disabled.
 
 `--torrent-lsd on|off` defaults to `on`, and only takes effect while a swarm
-session exists. BEP 14 multicasts stay on the local network. `auto` with working
-web seeds and `never` create no LSD socket. Public `auto`/`always` downloader
+session exists, so under the default `never` policy it sends nothing. BEP 14
+multicasts stay on the local network. `auto` with working web seeds and `never`
+create no LSD socket; `lan` multicasts the infohash at mount time. Public `auto`/`always` downloader
 sessions never accept incoming TCP connections. LAN-only sessions can use an
 ephemeral protocol listener bound to a private local address to solicit prompt
 LSD replies; payload uploads still require `--seed`. LAN activation logs explicitly state that
@@ -66,7 +77,7 @@ DHT and trackers are disabled. `--torrent-lsd off` disables multicast; library
 users can still provide explicit private peer addresses.
 
 ```sh
-ratarmount --torrent-swarm never ./dataset.torrent mnt/
+ratarmount ./dataset.torrent mnt/                     # never: cache + web seeds only
 ratarmount --torrent-swarm auto --torrent-scratch-limit 2GiB ./dataset.torrent mnt/
 ```
 
@@ -84,7 +95,9 @@ for metainfo and individual pieces, and 64 bencode nesting levels.
 Magnets first consult the platform cache's `ratarmount/torrent-v1/`, keyed by
 the exact info dictionary hash. They then try HTTP(S) `xs` metadata URLs (also
 `ws` URLs explicitly ending in `.torrent`), then librqbit metadata exchange
-using the magnet's policy-permitted discovery methods. LAN metadata exchange
+using the magnet's policy-permitted discovery methods. Under the default `never`
+policy there is no metadata exchange: a magnet that misses the cache and has no
+working `xs` URL fails with `metadata unavailable` and the opt-in hint. LAN metadata exchange
 actively solicits a BEP 14 reply from an existing donor and retains that donor's
 address for the subsequent payload session. Auto gives this local attempt a
 three-second grace period before starting public discovery. Swarm operations time out after 30 seconds
@@ -173,7 +186,8 @@ temporary-file fallback.
 `--seed` is off by default. It activates the selected swarm policy immediately,
 accepts incoming IPv4 and IPv6 connections on `--torrent-listen-port` (default `0`,
 which selects an available port for each mount), and logs **BITTORRENT SEEDING ENABLED**, the listener
-and upload cap. `--seed --torrent-swarm never` is an error. `--seed` also requires
+and upload cap. `--seed` needs an explicit `--torrent-swarm lan|auto|always`:
+with the default `never` (or an explicit `never`) it is an error. `--seed` also requires
 a build with `--features bittorrent`. Use `--torrent-swarm lan` on both machines
 to share without announcing to internet trackers or DHT peers. With `auto` or
 `always`, **`--seed` joins public DHT/trackers at mount time**, including when
@@ -270,7 +284,9 @@ Read-only inspection on 2026-10-16 found this concrete Pirate Face format:
   `Qwen/Qwen3.8-27B`, infohash
   `d394d1807bc3d6407b6bbb04da24094d69277f86`, with UDP/HTTP tracker parameters
   and `ws=https://pirateface.co/api/ws/Qwen/Qwen3.8-27B/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/`.
-  This is a proxy web-seed base, not a direct Hub URL or metadata endpoint.
+  This is a proxy web-seed base, not a direct Hub URL or metadata endpoint, so
+  under the default `never` policy such a magnet needs cached metadata, an `xs`
+  URL, or an explicit `--torrent-swarm auto`.
 * [`/api/torrents?repo=Qwen/Qwen3.8-27B`](https://pirateface.co/api/torrents?repo=Qwen%2FQwen3.8-27B)
   returned `repoId`, `revision`, `infohash`, `magnet` and
   `files: [{ "path": "…", "sha256": "…" }]`. The response included hashes for
@@ -362,6 +378,7 @@ disable public discovery; they cover both `.torrent` payload reads and a bare
 magnet resolving metadata from an already-running donor. It needs a host/network namespace that supports multicast.
 
 ```sh
+cargo test -p ratarmount-core --lib regression_torrent_swarm_default_never
 cargo test -p ratarmount-remote --features bittorrent --lib torrent
 cargo test -p ratarmount-session --features bittorrent --lib regression_torrent
 cargo test -p ratarmount-session --lib regression_built_without_bittorrent

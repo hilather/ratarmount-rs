@@ -211,7 +211,7 @@ pub(crate) fn resolve(input: &str, options: &mut TorrentOptions) -> io::Result<M
                 if options.swarm.policy == super::TorrentSwarmPolicy::Never {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        "--torrent-swarm never: magnet metadata unavailable from cache/xs/web seed",
+                        "--torrent-swarm never: magnet metadata unavailable from cache/xs/web seed; pass --torrent-swarm lan or auto to allow peers",
                     ));
                 }
                 let meta = Metainfo::parse(resolve_swarm(&magnet, options)?)?;

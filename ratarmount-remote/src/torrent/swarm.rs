@@ -42,7 +42,7 @@ impl Default for SwarmOptions {
             trackers: true,
             initial_peers: Vec::new(),
             timeout: Duration::from_secs(30),
-            policy: TorrentSwarmPolicy::Auto,
+            policy: TorrentSwarmPolicy::default(),
             scratch_bytes: 2 * 1024 * 1024 * 1024,
             lsd: true,
             seed: false,
@@ -59,7 +59,7 @@ impl SwarmOptions {
         if self.seed && self.policy == TorrentSwarmPolicy::Never {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "--seed conflicts with --torrent-swarm never",
+                "--seed conflicts with --torrent-swarm never (the default); pass --torrent-swarm lan, auto or always",
             ));
         }
         if self.policy == TorrentSwarmPolicy::Lan
@@ -284,7 +284,7 @@ impl Swarm {
         options.validate()?;
         if options.policy == TorrentSwarmPolicy::Never {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied,
-                "--torrent-swarm never: metadata or a verified piece is unavailable from cache/web seeds"));
+                "--torrent-swarm never: metadata or a verified piece is unavailable from cache/web seeds; pass --torrent-swarm lan or auto to allow peers"));
         }
         if !options.announced.swap(true, Ordering::Relaxed) {
             if options.policy == TorrentSwarmPolicy::Lan {
@@ -717,6 +717,7 @@ mod lan_tests {
         ] {
             let options = SwarmOptions {
                 seed: true,
+                policy: TorrentSwarmPolicy::Lan,
                 upload_limit: requested,
                 ..Default::default()
             };
@@ -735,10 +736,12 @@ mod lan_tests {
         }
         let options = SwarmOptions {
             seed: true,
+            policy: TorrentSwarmPolicy::Lan,
             upload_limit: 1_000_000_001,
             ..Default::default()
         };
-        assert!(options.validate().is_err());
+        let err = options.validate().unwrap_err();
+        assert!(err.to_string().contains("--seed-upload-limit"), "{err}");
     }
 
     /// Regression: unmount left a seed runtime waiting forever for a canceled initial cache scan.
@@ -829,6 +832,20 @@ mod lan_tests {
 #[cfg(test)]
 mod listener_tests {
     use super::*;
+
+    /// Regression: the default policy was `auto`, so a failed web seed joined
+    /// the public DHT/tracker swarm without the user asking.
+    #[test]
+    fn regression_swarm_options_default_never() {
+        let options = SwarmOptions::default();
+        assert_eq!(options.policy, TorrentSwarmPolicy::Never);
+        assert!(!options.public_discovery());
+        let config = session_options(&options);
+        assert!(config.listen.is_none());
+        assert!(config.dht.is_none());
+        assert!(config.disable_trackers);
+        assert!(config.disable_local_service_discovery);
+    }
 
     /// Regression: default LSD enabled an inbound listener on public downloader sessions.
     #[test]

@@ -345,8 +345,8 @@ struct Args {
     #[arg(long, value_name = "SIZE", value_parser = parse_byte_size)]
     memory_budget: Option<u64>,
 
-    /// Torrent peer discovery: auto starts only when metadata/web seeds cannot serve a request.
-    #[arg(long, default_value = "auto", value_name = "auto|always|lan|never")]
+    /// Torrent peer discovery (default never: cache and web seeds only; auto falls back to public DHT/trackers; lan uses local peers only; always starts the swarm at mount).
+    #[arg(long, default_value = "never", value_name = "never|auto|lan|always")]
     torrent_swarm: ratarmount_core::TorrentSwarmPolicy,
 
     /// Maximum swarm scratch disk usage per torrent session (web seed reads use the range cache).
@@ -783,7 +783,7 @@ where
     if args.seed && args.torrent_swarm == ratarmount_core::TorrentSwarmPolicy::Never {
         return Err(clap::Error::raw(
             clap::error::ErrorKind::ArgumentConflict,
-            "--seed conflicts with --torrent-swarm never",
+            "--seed conflicts with --torrent-swarm never (the default); pass --torrent-swarm lan, auto or always",
         ));
     }
     if args.seed && !cfg!(feature = "bittorrent") {
@@ -3420,7 +3420,7 @@ fn print_features() {
     #[cfg(not(feature = "sftp-russh"))]
     println!("  sftp-russh: not compiled");
     #[cfg(feature = "bittorrent")]
-    println!("  bittorrent: compiled (magnet/.torrent; web seeds first (LAN mode available); uploads disabled by default; seeding opt-in)");
+    println!("  bittorrent: compiled (magnet/.torrent; web seeds first (LAN mode available); peer discovery off by default (--torrent-swarm never); uploads disabled by default; seeding opt-in)");
     #[cfg(not(feature = "bittorrent"))]
     println!("  bittorrent: not compiled");
     println!(
@@ -7027,7 +7027,7 @@ mod torrent_policy_tests {
         let defaults = Args::try_parse_from(["ratarmount", "source.tar", "mnt"]).unwrap();
         assert_eq!(
             defaults.torrent_swarm,
-            ratarmount_core::TorrentSwarmPolicy::Auto
+            ratarmount_core::TorrentSwarmPolicy::Never
         );
         assert_eq!(defaults.torrent_scratch_limit, 2 * 1024 * 1024 * 1024);
         for policy in ["auto", "always", "lan", "never"] {
@@ -7101,10 +7101,73 @@ mod torrent_policy_tests {
             Args::try_parse_from(["ratarmount", "--torrent-lsd", "bad", "file.torrent"]).is_err()
         );
         #[cfg(not(feature = "bittorrent"))]
-        assert!(parse_args_from(["ratarmount", "--seed", "file.torrent"])
-            .unwrap_err()
-            .to_string()
-            .contains("requires"));
+        assert!(parse_args_from([
+            "ratarmount",
+            "--seed",
+            "--torrent-swarm",
+            "lan",
+            "file.torrent"
+        ])
+        .unwrap_err()
+        .to_string()
+        .contains("requires"));
+    }
+
+    /// Regression: packaged builds joined the public DHT/tracker swarm unasked
+    /// because `--torrent-swarm` defaulted to `auto`.
+    #[test]
+    fn regression_torrent_swarm_default_never() {
+        let defaults = parse_args_from(["ratarmount", "source.torrent", "mnt"]).unwrap();
+        assert_eq!(
+            defaults.torrent_swarm,
+            ratarmount_core::TorrentSwarmPolicy::Never
+        );
+        assert_eq!(
+            defaults.torrent_swarm,
+            ratarmount_core::TorrentSwarmPolicy::default()
+        );
+        // The mount copies `args.torrent_swarm` into `OpenOptions` verbatim.
+        assert_eq!(defaults.torrent_swarm, OpenOptions::default().torrent_swarm);
+        let auto = parse_args_from([
+            "ratarmount",
+            "--torrent-swarm",
+            "auto",
+            "source.torrent",
+            "mnt",
+        ])
+        .unwrap();
+        assert_eq!(
+            auto.torrent_swarm,
+            ratarmount_core::TorrentSwarmPolicy::Auto
+        );
+    }
+
+    /// Regression: `--seed` without a policy would have to join a swarm the
+    /// user never chose; it must name the opt-in instead.
+    #[test]
+    fn regression_seed_requires_explicit_swarm_policy() {
+        for verb in [None, Some("serve"), Some("find")] {
+            let mut argv = vec!["ratarmount"];
+            argv.extend(verb);
+            argv.extend(["--seed", "source.torrent"]);
+            let error = parse_args_from(argv).unwrap_err().to_string();
+            assert!(error.contains("conflicts"), "{error}");
+            assert!(error.contains("--torrent-swarm lan"), "{error}");
+        }
+        #[cfg(feature = "bittorrent")]
+        for policy in ["lan", "auto"] {
+            let args = parse_args_from([
+                "ratarmount",
+                "--seed",
+                "--torrent-swarm",
+                policy,
+                "source.torrent",
+                "mnt",
+            ])
+            .unwrap();
+            assert!(args.seed);
+            assert_eq!(args.torrent_swarm, policy.parse().unwrap());
+        }
     }
 
     /// Regression: a mountpoint directory named x.torrent was taken as another mount input.
