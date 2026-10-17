@@ -147,6 +147,36 @@ fn assert_file(src: &Iso9660MountSource, path: &str) -> FileInfo {
     fi
 }
 
+fn sl(target: &str) -> Vec<u8> {
+    let mut payload = vec![0, 0, u8::try_from(target.len()).unwrap()];
+    payload.extend(target.as_bytes());
+    entry(b"SL", &payload)
+}
+
+fn listed_mode(src: &Iso9660MountSource, dir: &str, name: &str) -> u32 {
+    src.list_dirents(dir)
+        .unwrap_or_else(|| panic!("missing dir {dir}"))
+        .into_iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| panic!("missing {dir}/{name}"))
+        .mode
+}
+
+fn open_mem(bytes: Vec<u8>) -> Result<Iso9660MountSource> {
+    let opts = OpenOptions {
+        index_in_memory: true,
+        ..OpenOptions::default()
+    };
+    Iso9660MountSource::open_from_reader(Cursor::new(bytes), "test.iso", None, &opts, "test")
+}
+
+fn assert_is_directory(src: &Iso9660MountSource, fi: &FileInfo) {
+    match src.open(fi, 0) {
+        Err(err) => assert_eq!(err.kind(), io::ErrorKind::IsADirectory),
+        Ok(_) => panic!("directory opened as a file"),
+    }
+}
+
 /// Regression: uppercase/truncated ISO identifiers replace the actual RR names.
 #[test]
 fn regression_rock_ridge_names_replace_8_3_names() {
@@ -614,14 +644,318 @@ fn regression_directory_metadata_read_once() {
     assert!(!reads.contains_key(&(30 * SECTOR)));
 }
 
+/// Regression: PX type bits retype a directory record (file as directory, directory as file, SL directory drops its child).
+#[test]
+fn regression_rock_ridge_type_follows_directory_flag() {
+    check_sources(
+        image(
+            true,
+            &[record(
+                30,
+                false,
+                b"FILE.;1",
+                &px(ratarmount_core::S_IFDIR | 0o4755, false),
+            )],
+            None,
+        ),
+        |src| {
+            let fi = assert_file(src, "/FILE");
+            assert_eq!(fi.mode, ratarmount_core::S_IFREG | 0o4755);
+            assert_eq!(fi.linkname, "");
+            assert!(src.list_dirents("/FILE").is_none());
+            assert_eq!(listed_mode(src, "/", "FILE"), fi.mode);
+        },
+    );
+
+    let mut dir_as_file = image(
+        true,
+        &[record(
+            22,
+            true,
+            b"D00",
+            &[nm(0, "dir"), px(ratarmount_core::S_IFREG | 0o2755, false)].concat(),
+        )],
+        None,
+    );
+    directory(
+        &mut dir_as_file,
+        22,
+        &[],
+        &[record(30, false, b"CHILD.;1", &nm(0, "child"))],
+    );
+    check_sources(dir_as_file, |src| {
+        let fi = src.lookup("/dir", 0).unwrap();
+        assert_eq!(fi.mode, ratarmount_core::S_IFDIR | 0o2755);
+        assert_eq!(fi.linkname, "");
+        assert_eq!(fi.size, 0);
+        assert_is_directory(src, &fi);
+        assert_eq!(listed_mode(src, "/", "dir"), fi.mode);
+        assert_eq!(names(src, "/dir"), ["child"]);
+        assert_file(src, "/dir/child");
+    });
+
+    let mut sl_dir = image(
+        true,
+        &[record(
+            22,
+            true,
+            b"DIR",
+            &[
+                nm(0, "dir"),
+                px(ratarmount_core::S_IFLNK | 0o750, false),
+                sl("link"),
+            ]
+            .concat(),
+        )],
+        None,
+    );
+    directory(
+        &mut sl_dir,
+        22,
+        &[],
+        &[record(30, false, b"CHILD.;1", &nm(0, "child"))],
+    );
+    check_sources(sl_dir, |src| {
+        let fi = src.lookup("/dir", 0).unwrap();
+        assert_eq!(fi.mode, ratarmount_core::S_IFDIR | 0o750);
+        assert_eq!(fi.linkname, "");
+        assert_eq!(fi.size, 0);
+        assert_is_directory(src, &fi);
+        assert_eq!(names(src, "/dir"), ["child"]);
+        assert_file(src, "/dir/child");
+    });
+
+    check_sources(
+        image(
+            true,
+            &[record(
+                30,
+                false,
+                b"FILE.;1",
+                &px(ratarmount_core::S_IFLNK | 0o700, false),
+            )],
+            None,
+        ),
+        |src| {
+            let fi = assert_file(src, "/FILE");
+            assert_eq!(fi.mode, ratarmount_core::S_IFREG | 0o700);
+            assert_eq!(fi.linkname, "");
+            assert_eq!(listed_mode(src, "/", "FILE"), fi.mode);
+        },
+    );
+}
+
+/// Regression: Rock Ridge character/block devices, FIFOs and sockets are shown as device nodes.
+#[test]
+fn regression_rock_ridge_device_fifo_socket_are_regular_files() {
+    let pn = entry(b"PN", &[both(1), both(3)].concat());
+    let cases = [
+        ("CHR.;1", "CHR", ratarmount_core::S_IFCHR | 0o620),
+        ("BLK.;1", "BLK", ratarmount_core::S_IFBLK | 0o660),
+        ("FIFO.;1", "FIFO", ratarmount_core::S_IFIFO | 0o640),
+        ("SOCK.;1", "SOCK", ratarmount_core::S_IFSOCK | 0o600),
+    ];
+    let records: Vec<_> = cases
+        .iter()
+        .map(|(iso, _, mode)| {
+            record(
+                30,
+                false,
+                iso.as_bytes(),
+                &[px(*mode, false), pn.clone()].concat(),
+            )
+        })
+        .collect();
+    check_sources(image(true, &records, None), |src| {
+        for (_, name, mode) in cases {
+            let fi = assert_file(src, &format!("/{name}"));
+            let expect = ratarmount_core::S_IFREG | (mode & 0o7777);
+            assert_eq!(fi.mode, expect, "{name}");
+            assert_eq!(fi.linkname, "");
+            assert_eq!(listed_mode(src, "/", name), fi.mode);
+        }
+    });
+}
+
+/// Regression: a Joliet-selected SL directory missing from Joliet is dropped with its children.
+#[test]
+fn regression_joliet_selected_sl_directory_grafts_children() {
+    let primary = [record(
+        22,
+        true,
+        b"D",
+        &[px(ratarmount_core::S_IFLNK | 0o750, false), sl("elsewhere")].concat(),
+    )];
+    let supplementary = [record(31, false, &joliet("Joliet Only;1"), &[])];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(&mut bytes, 22, &[], &[record(30, false, b"F.;1", &[])]);
+    check_sources(bytes, |src| {
+        assert_eq!(names(src, "/"), ["D", "Joliet Only"]);
+        let d = src.lookup("/D", 0).unwrap();
+        assert_eq!(d.mode, ratarmount_core::S_IFDIR | 0o750);
+        assert_eq!(d.linkname, "");
+        assert_eq!(d.size, 0);
+        assert_is_directory(src, &d);
+        assert_eq!(listed_mode(src, "/", "D"), d.mode);
+        assert_eq!(names(src, "/D"), ["F"]);
+        assert_file(src, "/D/F");
+    });
+}
+
+/// Regression: one-to-one unmatched-directory pairing binds an SL directory to the only other Joliet directory and drops its children.
+#[test]
+fn regression_joliet_unmatched_directory_pairing_skips_sl_directories() {
+    let primary = [record(
+        22,
+        true,
+        b"D",
+        &[px(ratarmount_core::S_IFDIR | 0o755, false), sl("elsewhere")].concat(),
+    )];
+    let supplementary = [record(23, true, &joliet("Other"), &[])];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(&mut bytes, 22, &[], &[record(30, false, b"F.;1", &[])]);
+    check_sources(bytes, |src| {
+        assert_eq!(names(src, "/"), ["D", "Other"]);
+        let d = src.lookup("/D", 0).unwrap();
+        assert_eq!(d.mode, ratarmount_core::S_IFDIR | 0o755);
+        assert_eq!(d.linkname, "");
+        assert_eq!(d.size, 0);
+        assert_eq!(names(src, "/D"), ["F"]);
+        assert_file(src, "/D/F");
+        assert_eq!(
+            src.lookup("/Other", 0).unwrap().mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFDIR
+        );
+    });
+}
+
+/// Regression: a damaged Joliet tree fails the image or replaces the ISO 9660 names.
+#[test]
+fn regression_damaged_joliet_falls_back_to_iso() {
+    let mut past_eof = image(
+        true,
+        &[record(30, false, b"FILE.;1", &nm(0, "Real Name"))],
+        Some(&[]),
+    );
+    past_eof[17 * BLOCK + 158..17 * BLOCK + 166].copy_from_slice(&both(1000));
+    check_sources(past_eof, |src| {
+        assert_eq!(names(src, "/"), ["Real Name"]);
+        assert_file(src, "/Real Name");
+    });
+
+    let primary = [record(30, false, b"FILE.;1", &[])];
+    let looped = [
+        record(21, true, &joliet("LoopDir"), &[]),
+        record(30, false, &joliet("Joliet Name;1"), &[]),
+    ];
+    check_sources(image(true, &primary, Some(&looped)), |src| {
+        assert_eq!(names(src, "/"), ["FILE"]);
+        assert_file(src, "/FILE");
+    });
+
+    let mut truncated = image(true, &primary, Some(&[]));
+    truncated[21 * BLOCK] = 10;
+    check_sources(truncated, |src| {
+        assert_eq!(names(src, "/"), ["FILE"]);
+        assert_file(src, "/FILE");
+    });
+
+    let mut primary_past_eof = image(true, &primary, Some(&[]));
+    primary_past_eof[16 * BLOCK + 158..16 * BLOCK + 166].copy_from_slice(&both(1000));
+    match open_mem(primary_past_eof) {
+        Err(err) => assert!(err.to_string().contains("extends beyond image"), "{err}"),
+        Ok(_) => panic!("primary extent past the image was accepted"),
+    }
+}
+
+/// Regression: Joliet with no Rock Ridge and a damaged Joliet root drops the primary tree.
+#[test]
+fn regression_damaged_joliet_without_rock_ridge_falls_back_to_iso() {
+    let mut bytes = image(false, &[record(30, false, b"FILE.;1", &[])], Some(&[]));
+    bytes[17 * BLOCK + 158..17 * BLOCK + 166].copy_from_slice(&both(1000));
+    check_sources(bytes, |src| {
+        assert_eq!(names(src, "/"), ["FILE"]);
+        assert_file(src, "/FILE");
+    });
+}
+
+/// Regression: a rock-ridge-joliet-v1 sidecar keeps a PX directory type for a file.
+#[test]
+fn regression_iso_metadata_v1_rebuilds_after_type_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1.iso");
+    let index_path = default_index_path(&path);
+    let bytes = image(
+        true,
+        &[record(
+            30,
+            false,
+            b"PLAIN;1",
+            &[
+                px(ratarmount_core::S_IFDIR | 0o750, false),
+                nm(0, "Real Name"),
+            ]
+            .concat(),
+        )],
+        None,
+    );
+    std::fs::write(&path, bytes).unwrap();
+    let index =
+        SqliteIndex::create_writable_for_open(Some(&index_path), &OpenOptions::default()).unwrap();
+    index.begin_write().unwrap();
+    index
+        .insert_file(
+            "",
+            "PLAIN",
+            30 * BLOCK as i64,
+            30 * BLOCK as i64,
+            4,
+            0.0,
+            i64::from(ratarmount_core::S_IFDIR | 0o755),
+            0,
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+    index
+        .store_metadata_key_value("isoMetadataVersion", "rock-ridge-joliet-v1")
+        .unwrap();
+    index
+        .store_metadata_key_value("backendName", BACKEND_NAME)
+        .unwrap();
+    index.store_tarstats_for_path(&path).unwrap();
+    index.commit_write().unwrap();
+    drop(index.into_read_only().unwrap());
+    let src = Iso9660MountSource::open(
+        &path,
+        Some(&index_path),
+        &OpenOptions::default(),
+        "test",
+        false,
+    )
+    .unwrap();
+    assert_eq!(names(&src, "/"), ["Real Name"]);
+    let fi = assert_file(&src, "/Real Name");
+    assert_eq!(fi.mode, ratarmount_core::S_IFREG | 0o750);
+}
+
 /// Regression: real mkisofs -R -J output keeps mixed case, executable modes and symlinks.
 #[cfg(unix)]
 #[test]
 fn regression_xorriso_rock_ridge_joliet() {
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::process::Command;
-    match Command::new("xorriso").arg("-version").output() {
+    let bin = std::env::var("RATARMOUNT_XORRISO").unwrap_or_else(|_| "xorriso".to_string());
+    match Command::new(&bin).arg("-version").output() {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if std::env::var("RATARMOUNT_REQUIRE_XORRISO").ok().as_deref() == Some("1") {
+                panic!("xorriso not on PATH (RATARMOUNT_REQUIRE_XORRISO=1; binary {bin})");
+            }
             eprintln!("skip: xorriso not on PATH");
             return;
         }
@@ -641,7 +975,7 @@ fn regression_xorriso_rock_ridge_joliet() {
     std::fs::write(tree.join("MixedCaseDirectory/Child Name.txt"), b"data").unwrap();
     symlink(format!("../{long}"), tree.join("MixedCaseDirectory/Link")).unwrap();
     let iso = dir.path().join("real.iso");
-    let output = Command::new("xorriso")
+    let output = Command::new(&bin)
         .args(["-as", "mkisofs", "-R", "-J", "-o"])
         .arg(&iso)
         .arg(&tree)

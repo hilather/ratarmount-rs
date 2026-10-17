@@ -1,13 +1,13 @@
 //! Directory decoding shared by path and seekable-reader opens.
 use super::{IsoError, Result, SECTOR};
-use ratarmount_core::{S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
+use ratarmount_core::{S_IFDIR, S_IFLNK, S_IFREG};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 
 const MAX_CE_HOPS: usize = 64;
 const MAX_CE_BYTES: usize = 1024 * 1024;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct RockRidge {
     pub name: Option<String>,
     pub mode: Option<u32>,
@@ -21,6 +21,7 @@ pub(super) struct RockRidge {
     child: Option<u32>,
 }
 
+#[derive(Clone)]
 pub(super) struct Record {
     length: usize,
     pub extent: u32,
@@ -33,21 +34,34 @@ pub(super) struct Record {
 }
 
 impl Record {
+    /// File type comes from the ISO 9660 directory flag, never from PX `S_IFMT`.
+    ///
+    /// PX contributes only permission bits (`0o7777`: rwx, setuid, setgid, sticky).
+    /// Missing PX keeps directory `0o755` and anything else `0o644`. `SL` on a
+    /// non-directory is a symlink. `SL` on a directory is cleared before the index
+    /// is stored, so the directory and its children stay. PX `S_IFLNK` with no `SL`
+    /// is a regular file. Character/block devices, FIFOs, sockets, and `PN` are
+    /// regular files: `FileInfo` has no device number, and those types would ask
+    /// FUSE for a kernel device node. A directory flag still wins over a PX device
+    /// type. The ISO extent and data length are left unchanged.
     pub fn mode(&self) -> u32 {
-        let default = if self.is_dir {
-            S_IFDIR | 0o755
+        let perms = self
+            .rr
+            .mode
+            .map(|mode| mode & 0o7777)
+            .unwrap_or(if self.is_dir { 0o755 } else { 0o644 });
+        let kind = if self.is_dir {
+            S_IFDIR
+        } else if self.rr.link.is_some() {
+            S_IFLNK
         } else {
-            S_IFREG | 0o644
+            S_IFREG
         };
-        let mode = self.rr.mode.unwrap_or(default);
-        if self.rr.link.is_some() {
-            (mode & !S_IFMT) | S_IFLNK
-        } else {
-            mode
-        }
+        kind | perms
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Node {
     pub parent: usize,
     pub record: Record,
@@ -366,9 +380,10 @@ fn sector<R: Read + Seek>(file: &mut R, block: u32) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// One work queue visits each directory once, across the primary and optional
-/// Joliet namespaces. No name-detection prewalk: parent IDs retain the metadata
-/// until we know whether *any* NM exists, including in the last subdirectory.
+/// Walk the primary tree to completion, then the optional Joliet tree.
+/// A damaged Joliet tree is discarded with one warning; the primary tree stands.
+/// No name-detection prewalk: parent IDs retain the metadata until we know
+/// whether *any* NM exists, including in the last subdirectory.
 /// Only directory metadata (not member contents) is retained.
 pub(super) fn read_entries<R: Read + Seek>(file: &mut R) -> Result<Vec<Node>> {
     let image_size = file.seek(SeekFrom::End(0))?;
@@ -381,6 +396,7 @@ pub(super) fn read_entries<R: Read + Seek>(file: &mut R) -> Result<Vec<Node>> {
     let root = parse_record(&pvd[156..], false)
         .ok_or_else(|| IsoError::Msg("ISO 9660 PVD has no root directory".into()))?;
     let mut joliet_root = None;
+    let mut joliet_warning: Option<&str> = None;
     // Descriptor sequences are bounded even on images without a terminator.
     for block in 17..(image_size / SECTOR).min(16 + 256) as u32 {
         let vd = sector(file, block)?;
@@ -388,9 +404,21 @@ pub(super) fn read_entries<R: Read + Seek>(file: &mut R) -> Result<Vec<Node>> {
             break;
         }
         if vd[0] == 2 && matches!(&vd[88..91], b"%/@" | b"%/C" | b"%/E") {
-            joliet_root = parse_record(&vd[156..], true);
+            // A later valid Joliet SVD replaces an earlier failure.
+            match parse_record(&vd[156..], true) {
+                Some(parsed) => {
+                    joliet_root = Some(parsed);
+                    joliet_warning = None;
+                }
+                None => {
+                    joliet_root = None;
+                    joliet_warning = Some("Joliet supplementary descriptor has no root directory");
+                }
+            }
         }
     }
+    // Fail the image before the pre-read when the primary root itself is past EOF.
+    directory_fits(root.extent, root.size, image_size)?;
     let first = sector(file, root.extent)?;
     let skip = if first.get(32..34) == Some(&[1, 0]) {
         parse_record(&first, false).as_ref().and_then(susp_skip)
@@ -398,36 +426,104 @@ pub(super) fn read_entries<R: Read + Seek>(file: &mut R) -> Result<Vec<Node>> {
         None
     };
     let mut cached = HashMap::from([(root.extent, first)]);
-    let mut trees = [
-        vec![Node {
-            parent: 0,
-            record: root,
-        }],
-        Vec::new(),
-    ];
-    let mut pending = Vec::new();
-    if skip.is_some() || joliet_root.is_none() {
-        pending.push((0, 0));
+    let mut primary = vec![Node {
+        parent: 0,
+        record: root,
+    }];
+    // Always walk the primary tree, including when Rock Ridge SP is absent.
+    walk_tree(file, &mut primary, false, skip, &mut cached, image_size)?;
+    let Some(jroot) = joliet_root else {
+        if let Some(reason) = joliet_warning {
+            warn_damaged_joliet(reason);
+        }
+        clear_directory_links(&mut primary);
+        return Ok(primary);
+    };
+    let mut joliet = vec![Node {
+        parent: 0,
+        record: jroot,
+    }];
+    if let Err(err) = walk_tree(file, &mut joliet, true, None, &mut cached, image_size) {
+        warn_damaged_joliet(err);
+        clear_directory_links(&mut primary);
+        return Ok(primary);
     }
-    if let Some(root) = joliet_root {
-        trees[1].push(Node {
-            parent: 0,
-            record: root,
-        });
-        pending.push((1, 0));
+    if !joliet.is_empty() {
+        let mut matches = apply_joliet_fallback(&mut primary, &joliet);
+        if !primary.iter().any(|node| node.record.rr.name.is_some()) {
+            // Record grafted ids before non-directory SL injection so a
+            // descendant symlink is not pushed twice.
+            graft_unmatched_sl_directories(&primary, &mut joliet, &mut matches);
+            // Joliet supplies the namespace, but SUSP may still carry POSIX
+            // attributes without a single NM. Keep those attributes and links
+            // omitted from the Joliet namespace (which cannot encode symlinks).
+            for (id, node) in primary.into_iter().enumerate().skip(1) {
+                if let Some(j) = matches[id] {
+                    joliet[j].record.rr = node.record.rr;
+                } else if node.record.rr.link.is_some() {
+                    if let Some(parent) = matches[node.parent] {
+                        joliet.push(Node {
+                            parent,
+                            record: node.record,
+                        });
+                    }
+                }
+            }
+            clear_directory_links(&mut joliet);
+            return Ok(joliet);
+        }
     }
-    let mut seen = [HashSet::new(), HashSet::new()];
-    while let Some((tree, parent)) = pending.pop() {
-        let dir = &trees[tree][parent].record;
-        let extent = dir.extent;
-        let size = u64::from(dir.size);
-        if !seen[tree].insert(extent) {
+    clear_directory_links(&mut primary);
+    Ok(primary)
+}
+
+fn directory_fits(extent: u32, size: u32, image_size: u64) -> Result<()> {
+    if u64::from(extent) * SECTOR + u64::from(size) > image_size {
+        return Err(IsoError::Msg("ISO directory extends beyond image".into()));
+    }
+    Ok(())
+}
+
+fn warn_damaged_joliet(reason: impl std::fmt::Display) {
+    eprintln!("warning: damaged Joliet tree ({reason}); using the ISO 9660 directory");
+}
+
+fn clear_directory_links(nodes: &mut [Node]) {
+    for node in nodes {
+        if node.record.is_dir {
+            node.record.rr.link = None;
+        }
+    }
+}
+
+/// Walk one namespace. `joliet` selects UCS-2 names and turns a repeated extent
+/// or a truncated record into an error. SUSP, including CL, stays on the primary
+/// walk. Directory records are enqueued even when they carry SL, so their
+/// children can be grafted into a Joliet tree that omitted the directory.
+fn walk_tree<R: Read + Seek>(
+    file: &mut R,
+    nodes: &mut Vec<Node>,
+    joliet: bool,
+    skip: Option<usize>,
+    cached: &mut HashMap<u32, Vec<u8>>,
+    image_size: u64,
+) -> Result<()> {
+    let mut pending = vec![0usize];
+    let mut seen = HashSet::new();
+    while let Some(parent) = pending.pop() {
+        let (extent, dir_size) = {
+            let dir = &nodes[parent].record;
+            (dir.extent, dir.size)
+        };
+        let size = u64::from(dir_size);
+        if !seen.insert(extent) {
+            if joliet {
+                return Err(IsoError::Msg("already seen extent".into()));
+            }
             continue;
         }
-        if u64::from(extent) * SECTOR + size > image_size {
-            return Err(IsoError::Msg("ISO directory extends beyond image".into()));
-        }
-        let mut consumed = 0;
+        directory_fits(extent, dir_size, image_size)?;
+        let mut consumed = 0u64;
         while consumed < size {
             let block = extent + (consumed / SECTOR) as u32;
             let data = match cached.remove(&block) {
@@ -437,14 +533,17 @@ pub(super) fn read_entries<R: Read + Seek>(file: &mut R) -> Result<Vec<Node>> {
             let data = &data[..(size - consumed).min(SECTOR) as usize];
             let mut offset = 0;
             while offset < data.len() && data[offset] != 0 {
-                let Some(mut rec) = parse_record(&data[offset..], tree == 1) else {
+                let Some(mut rec) = parse_record(&data[offset..], joliet) else {
+                    if joliet {
+                        return Err(IsoError::Msg("truncated directory record".into()));
+                    }
                     break;
                 };
                 offset += rec.length;
                 if rec.name.is_none() {
                     continue;
                 }
-                if tree == 0 {
+                if !joliet {
                     if let Some(area) = skip.and_then(|n| rec.system_use.get(n..)) {
                         rec.rr = parse_susp(file, area, image_size).unwrap_or_default();
                     }
@@ -479,11 +578,11 @@ pub(super) fn read_entries<R: Read + Seek>(file: &mut R) -> Result<Vec<Node>> {
                     }
                 }
                 rec.system_use.clear();
-                let id = trees[tree].len();
-                if rec.is_dir && rec.rr.link.is_none() {
-                    pending.push((tree, id));
+                let id = nodes.len();
+                if rec.is_dir {
+                    pending.push(id);
                 }
-                trees[tree].push(Node {
+                nodes.push(Node {
                     parent,
                     record: rec,
                 });
@@ -491,29 +590,64 @@ pub(super) fn read_entries<R: Read + Seek>(file: &mut R) -> Result<Vec<Node>> {
             consumed += SECTOR;
         }
     }
-    let [mut primary, mut joliet] = trees;
-    if !joliet.is_empty() {
-        let matches = apply_joliet_fallback(&mut primary, &joliet);
-        if !primary.iter().any(|node| node.record.rr.name.is_some()) {
-            // Joliet supplies the namespace, but SUSP may still carry POSIX
-            // attributes without a single NM. Keep those attributes and links
-            // omitted from the Joliet namespace (which cannot encode symlinks).
-            for (id, node) in primary.into_iter().enumerate().skip(1) {
-                if let Some(j) = matches[id] {
-                    joliet[j].record.rr = node.record.rr;
-                } else if node.record.rr.link.is_some() {
-                    if let Some(parent) = matches[node.parent] {
-                        joliet.push(Node {
-                            parent,
-                            record: node.record,
-                        });
-                    }
-                }
+    Ok(())
+}
+
+/// Joliet-selected trees omit directories that carried SL. Append each such
+/// directory and its unmatched primary descendants, rewriting parents onto the
+/// new Joliet ids. Already-matched descendants stay where Joliet put them.
+fn graft_unmatched_sl_directories(
+    primary: &[Node],
+    joliet: &mut Vec<Node>,
+    matches: &mut [Option<usize>],
+) {
+    let mut grafted = vec![false; primary.len()];
+    for id in 1..primary.len() {
+        if grafted[id] || matches[id].is_some() {
+            continue;
+        }
+        let rec = &primary[id].record;
+        if !(rec.is_dir && rec.rr.link.is_some()) {
+            continue;
+        }
+        if matches[primary[id].parent].is_none() {
+            continue;
+        }
+        let mut group = vec![id];
+        grafted[id] = true;
+        for desc in (id + 1)..primary.len() {
+            if matches[desc].is_some() || grafted[desc] {
+                continue;
             }
-            return Ok(joliet);
+            let mut parent = primary[desc].parent;
+            let mut under = false;
+            let mut guard = 0;
+            while parent != 0 && guard < primary.len() {
+                if parent == id || grafted[parent] {
+                    under = true;
+                    break;
+                }
+                parent = primary[parent].parent;
+                guard += 1;
+            }
+            if under {
+                group.push(desc);
+                grafted[desc] = true;
+            }
+        }
+        for gid in group {
+            let parent_id = primary[gid].parent;
+            let Some(parent) = matches[parent_id] else {
+                continue;
+            };
+            let new_id = joliet.len();
+            joliet.push(Node {
+                parent,
+                record: primary[gid].record.clone(),
+            });
+            matches[gid] = Some(new_id);
         }
     }
-    Ok(primary)
 }
 
 /// File data extents are shared by both namespaces; directory extents are not.
@@ -606,7 +740,12 @@ fn apply_joliet_fallback(primary: &mut [Node], joliet: &[Node]) -> Vec<Option<us
         let unmatched_primary: Vec<_> = pchildren
             .iter()
             .copied()
-            .filter(|&p| primary[p].record.is_dir && matches[p].is_none())
+            .filter(|&p| {
+                let rec = &primary[p].record;
+                // An SL directory is grafted later. Pairing it with the only
+                // other unmatched Joliet directory would hide its children.
+                rec.is_dir && matches[p].is_none() && rec.rr.link.is_none()
+            })
             .collect();
         let used: HashSet<_> = pchildren.iter().filter_map(|&p| matches[p]).collect();
         let unmatched_joliet: Vec<_> = jchildren

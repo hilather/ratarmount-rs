@@ -20,7 +20,7 @@ jobs:
         run: |
           sudo apt-get update -o Acquire::Retries=5
           sudo apt-get install -y -o Acquire::Retries=5 \
-            libfuse3-dev fuse3 pkg-config libarchive-dev zlib1g-dev
+            libfuse3-dev fuse3 pkg-config libarchive-dev zlib1g-dev xorriso
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -46,6 +46,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
+        env:
+          RATARMOUNT_REQUIRE_XORRISO: "1"
         run: cargo test --workspace
 
       - name: packaging systemd/autofs helper
@@ -94,6 +96,43 @@ jobs:
         run: |
           chmod +x packaging/test-nfsv4-features.sh
           ./packaging/test-nfsv4-features.sh
+
+  # BitTorrent feature tests. `regression_torrent_swarm_default_never` is
+  # omitted because the workspace tests on `check` already run it. Package
+  # builds already compile `--features bittorrent`; this job runs the
+  # feature-gated tests those builds do not. No public swarm
+  # (`RATARMOUNT_TEST_LSD` / `RATARMOUNT_TEST_MAGNET` stay unset).
+  bittorrent:
+    name: bittorrent feature tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Same as packages.yml: -Dwarnings on this job would also cover
+      # dependencies pulled in by the bittorrent feature.
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y -o Acquire::Retries=5 \
+            libfuse3-dev fuse3 pkg-config libarchive-dev zlib1g-dev
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bittorrent
+
+      - name: cargo test (bittorrent)
+        run: |
+          cargo test -p ratarmount --features bittorrent --bin ratarmount torrent_policy_tests
+          cargo test -p ratarmount-remote --features bittorrent --lib torrent
+          cargo test -p ratarmount --features bittorrent --test torrent_features
+          ./packaging/test-bittorrent-features.sh
 
   # Pure-Rust cold-index microbench from benchmarks/baselines/rust-gates.json.
   # No /dev/fuse and no Python required at runtime (--no-mount only).
@@ -242,7 +281,7 @@ jobs:
           set -euo pipefail
           # Avoid full `brew update` (slow + flaky on GHA). Only refresh if formulas missing.
           need_update=0
-          for f in pkgconf libarchive gnu-tar zstd bzip2 p7zip; do
+          for f in pkgconf libarchive gnu-tar zstd bzip2 p7zip xorriso; do
             brew list --versions "$f" >/dev/null 2>&1 || need_update=1
           done
           if [[ "$need_update" -eq 1 ]]; then
@@ -250,7 +289,7 @@ jobs:
           fi
           # Core link deps + CLIs used by unit tests (zstd/bzip2/p7zip/gzip).
           # Without zstd/bzip2, factory side-table tests used to panic on spawn.
-          brew install pkgconf libarchive gnu-tar zstd bzip2 p7zip
+          brew install pkgconf libarchive gnu-tar zstd bzip2 p7zip xorriso
           brew install --cask macfuse
 
           # Optional runtime for smoke mounts (best-effort).
@@ -341,6 +380,8 @@ jobs:
       - name: cargo test
         # Single-threaded default avoids SQLite side-table races under load; workers
         # still parallelize within crates when safe. --no-fail-fast surfaces all fails.
+        env:
+          RATARMOUNT_REQUIRE_XORRISO: "1"
         run: |
           set +e
           cargo test --workspace --no-fail-fast -- --test-threads=2 2>&1 | tee /tmp/cargo-macos-test.log

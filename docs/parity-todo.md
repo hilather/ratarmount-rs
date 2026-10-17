@@ -206,7 +206,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 
 - Design: `../ratarmount/docs/design-rust-rewrite.md` (or copy into this repo later)
 - Benchmarks: [benchmarks/python-vs-rust-results.md](../benchmarks/python-vs-rust-results.md) (v0.1.27 BIG suite vs Python 1.3.0, 2026-08-27; re-run `BIG=1 ./benchmarks/compare-python-vs-rust.sh`)
-- Format notes: `docs/phase9-formats.md`, `docs/phase10-remote.md`, `docs/tasks/sevenzip-random-access.md`
+- Format notes: `docs/phase9-formats.md`, `docs/formats.md` (ISO 9660 Rock Ridge/Joliet contract), `docs/phase10-remote.md`, `docs/tasks/sevenzip-random-access.md`
 - **Fork → Rust task list:** [`docs/tasks/python-fork-parity.md`](tasks/python-fork-parity.md) (hilather sevenzip-random-access + stencil/stream codecs)
 - **Upstream feature requests:** [`docs/tasks/upstream-feature-requests.md`](tasks/upstream-feature-requests.md) (mxmlnkn/ratarmount issues → implementable FR list)
 - **Upstream bugs inspected + fixed (2026-07-28):** [`docs/tasks/upstream-bugs-inspection.md`](tasks/upstream-bugs-inspection.md) / [`upstream-bug-fix-batch.md`](tasks/upstream-bug-fix-batch.md) — **B-4** union dir>symlink, **B-8** sparse>8GiB test, **B-10** dumpdir delete MVP, **B-119** index-min-count, **B-2** lazy-recursive docs. Optional residual: multi-archive GNU incremental `.snar` union
