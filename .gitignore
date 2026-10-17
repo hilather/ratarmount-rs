@@ -16,3 +16,7 @@ benchmarks/nested-durable-results/
 benchmarks/vector-wave-results/
 *.log
 .cargo-cache/
+
+# Python bytecode
+__pycache__/
+*.pyc
