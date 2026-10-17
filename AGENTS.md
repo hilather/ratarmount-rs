@@ -170,6 +170,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | SMB CREATE lease grants R/RH | `cargo test -p ratarmount-smb --lib lease` |
 | SMB LEASE_BREAK on conflicting open/write | `cargo test -p ratarmount-smb --lib lease_break` |
 | 9P Tread fill-loop truncated | `cargo test -p ratarmount-9p --lib fill_read_ninep` |
+| macOS/BSD: accepted 9P/SMB sockets inherit O_NONBLOCK from the listener, so large replies fail with EAGAIN or are cut short | `cargo test -p ratarmount-9p --lib regression_accepted_socket_clears_inherited_nonblocking` · `cargo test -p ratarmount-smb --lib regression_accepted_socket_clears_inherited_nonblocking` |
 | `docker://ubuntu:24.04` treated as a local path | `cargo test -p ratarmount-session --lib docker_ubuntu` · `cargo test -p ratarmount-remote --lib docker_ubuntu` |
 | restic URL parser (absolute / extra slash / S3 residual; not a local colon name) | `cargo test -p ratarmount-formats-restic --lib parse_restic` · `cargo test -p ratarmount-remote --lib restic` · `cargo test -p ratarmount-session --lib restic` |
 | restic snapshot browser (two snapshots, 1 KiB pack read, password Debug, v2 zstd fixture, RESTIC_PASSWORD_FILE) | `cargo test -p ratarmount-formats-restic --lib restic` · `cargo test -p ratarmount-session --lib restic_open` |
