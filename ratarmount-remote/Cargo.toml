@@ -5,13 +5,20 @@ edition.workspace = true
 license.workspace = true
 description = "Remote URL fetch (HTTP, S3, SSH/SFTP, WebDAV, SMB, Dropbox) for ratarmount-rs"
 
+[features]
+default = []
+bittorrent = ["dep:librqbit", "dep:librqbit-lsd", "dep:futures-lite", "dep:tokio", "dep:anyhow"]
+
 [dependencies]
 ratarmount-core.workspace = true
+ratarmount-index.workspace = true
 thiserror.workspace = true
 log.workspace = true
+libc.workspace = true
 tempfile.workspace = true
 ureq = { version = "2", default-features = true, features = ["tls"] }
 url = "2"
+secrecy = "0.8"
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 hmac = "0.12"
 sha1 = "0.10"
@@ -23,8 +30,17 @@ hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Dropbox list_folder / metadata JSON (also used by other crates in the workspace).
 serde_json = "1"
+base64 = "0.22"
 # Pre-landed for P-4 FTP (`suppaftp` rustls) and P-3 GCS ADC RS256 JWT.
 # Unused until those inbound PRs `use` them. Do not add `native-tls`.
 # 6.2.1+ rust-version is 1.80.1; pin 6.2.0 written for the former 1.74 MSRV.
 suppaftp = { version = "=6.2.0", default-features = false, features = ["rustls"] }
 jsonwebtoken = "9"
+librqbit = { path = "../vendor/librqbit", version = "=9.0.1", optional = true, default-features = false, features = ["rust-tls", "disable-upload"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "sync", "time", "io-util", "macros"] }
+
+anyhow = { version = "1", optional = true }
+
+# Already transitive rqbit dependencies; used for active LAN-only metadata discovery.
+librqbit-lsd = { version = "=9.0.1", optional = true }
+futures-lite = { version = "2", optional = true }

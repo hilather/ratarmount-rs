@@ -411,7 +411,7 @@ fn index_blob_from_artifact(manifest: &Value) -> Option<(String, u64)> {
 }
 
 fn registry_get_bytes(url: &str, bearer: Option<&str>, hint_size: u64) -> Result<Vec<u8>> {
-    let mut req = ureq::get(url).set("User-Agent", USER_AGENT);
+    let mut req = crate::http_pool::get(url).set("User-Agent", USER_AGENT);
     if let Some(t) = bearer {
         req = req.set("Authorization", &format!("Bearer {t}"));
     }
@@ -779,7 +779,7 @@ fn registry_get_json(
     bearer: Option<&str>,
     accept: &str,
 ) -> std::result::Result<Value, FetchErr> {
-    let mut req = ureq::get(url)
+    let mut req = crate::http_pool::get(url)
         .set("User-Agent", USER_AGENT)
         .set("Accept", accept);
     if let Some(t) = bearer {
@@ -840,7 +840,7 @@ fn fetch_bearer_token(
         .append_pair("service", &service)
         .append_pair("scope", &scope);
     let url = token_url.to_string();
-    let mut req = ureq::get(&url).set("User-Agent", USER_AGENT);
+    let mut req = crate::http_pool::get(&url).set("User-Agent", USER_AGENT);
     if let Some(c) = creds {
         req = req.set(
             "Authorization",
@@ -1169,7 +1169,7 @@ impl Read for OciBlobRangeFile {
             return Ok(0);
         }
         let range = format!("bytes={}-{}", self.pos, end - 1);
-        let mut req = ureq::get(&self.url)
+        let mut req = crate::http_pool::get(&self.url)
             .set("User-Agent", USER_AGENT)
             .set("Range", &range);
         if let Some(t) = &self.bearer {

@@ -12,6 +12,7 @@ description = "In-process Session API for ratarmount-rs embedders (no FUSE)"
 # so in-tree nested factory tests still run. Probe order of enabled backends
 # stays DEFAULT_FORMAT_PROBE_ORDER (do not reorder).
 default = ["formats-all"]
+bittorrent = ["ratarmount-remote/bittorrent"]
 # Historical PR1/PR2 name; alias so `default = ["formats"]` still means full L2.
 formats = ["formats-all"]
 formats-all = [
@@ -34,6 +35,7 @@ formats-all = [
   "qcow2",
   "sqlar",
   "squashfs",
+  "tensors",
   "udf",
   "vhd",
   "vmdk",
@@ -60,6 +62,7 @@ pdf = ["dep:ratarmount-formats-pdf"]
 qcow2 = ["dep:ratarmount-formats-qcow2"]
 sqlar = ["dep:ratarmount-formats-sqlar"]
 squashfs = ["dep:ratarmount-formats-squashfs"]
+tensors = ["dep:ratarmount-formats-tensors"]
 udf = ["dep:ratarmount-formats-udf"]
 vhd = ["dep:ratarmount-formats-vhd"]
 vmdk = ["dep:ratarmount-formats-vmdk"]
@@ -107,6 +110,7 @@ ratarmount-formats-pdf = { workspace = true, optional = true }
 ratarmount-formats-qcow2 = { workspace = true, optional = true }
 ratarmount-formats-sqlar = { workspace = true, optional = true }
 ratarmount-formats-squashfs = { workspace = true, optional = true }
+ratarmount-formats-tensors = { workspace = true, optional = true }
 ratarmount-formats-udf = { workspace = true, optional = true }
 ratarmount-formats-vhd = { workspace = true, optional = true }
 ratarmount-formats-vmdk = { workspace = true, optional = true }
@@ -115,6 +119,11 @@ ratarmount-formats-wim = { workspace = true, optional = true }
 ratarmount-formats-xar = { workspace = true, optional = true }
 
 [dev-dependencies]
+git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
 url = "2"
 rusqlite.workspace = true
 libc.workspace = true
+
+[[example]]
+name = "ai-zstd-read"
+path = "../benchmarks/ai/session-read.rs"

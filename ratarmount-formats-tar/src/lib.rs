@@ -143,9 +143,9 @@ pub type Result<T> = std::result::Result<T, TarError>;
 mod write;
 pub use write::{
     find_first_valid_header_from, find_last_tar_eof, normalize_archive_rel_path,
-    rewrite_tar_suffix, window_has_member_boundary, write_tar_eof, write_ustar_members,
-    RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor, TarRawMember, UstarMember,
-    UstarPayload,
+    rewrite_tar_suffix, tar_append_offset, window_has_member_boundary, write_tar_eof,
+    write_ustar_members, RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor, TarRawMember,
+    UstarMember, UstarPayload,
 };
 
 /// File reader with a private logical cursor and no shared seek state or lock.
@@ -933,6 +933,36 @@ impl MountSource for SqliteIndexedTar {
         )))
     }
 
+    fn supports_backing_extents(&self) -> bool {
+        matches!(self.backend, ContentBackend::File { _keep: None, .. })
+            && self.archive_path == self.data_path
+    }
+
+    fn backing_extent(&self, fi: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        let ContentBackend::File { file, _keep: None } = &self.backend else {
+            return None;
+        };
+        if self.archive_path != self.data_path
+            || fi.mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFREG
+            || !fi.linkname.is_empty()
+        {
+            return None;
+        }
+        let ud = tar_userdata(fi)?;
+        if ud.issparse || ud.isgenerated || ud.recursiondepth != 0 || ud.offsetheader.is_none() {
+            return None;
+        }
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || ud.offset.checked_add(fi.size)? > meta.len() {
+            return None;
+        }
+        Some(ratarmount_core::BackingExtent {
+            file: file.as_ref().try_clone().ok()?,
+            offset: ud.offset,
+            len: fi.size,
+        })
+    }
+
     fn is_immutable(&self) -> bool {
         true
     }
@@ -1417,6 +1447,27 @@ fn sparse_map_from_pax(pax: &PaxParsed) -> Vec<(u64, u64)> {
     Vec::new()
 }
 
+/// Fill a TAR record across short reads (e.g. bzip2 block boundaries).
+/// Only EOF before any bytes is a clean end; a partial record is truncated.
+fn read_tar_header<R: Read>(reader: &mut R, header: &mut [u8; 512]) -> io::Result<bool> {
+    let mut filled = 0;
+    while filled < header.len() {
+        match reader.read(&mut header[filled..]) {
+            Ok(0) if filled == 0 => return Ok(false),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("truncated TAR header: {filled} of 512 bytes"),
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
 /// Scan headers for GNU dumpdir typeflag `D` (Python `_detect_gnu_incremental`).
 fn detect_gnu_incremental<R: Read + Seek>(reader: &mut R, ignore_zeros: bool) -> Result<bool> {
     let old_pos = reader.stream_position()?;
@@ -1432,8 +1483,7 @@ fn detect_gnu_incremental<R: Read + Seek>(reader: &mut R, ignore_zeros: bool) ->
                 return Ok(false);
             }
             reader.seek(SeekFrom::Start(pos))?;
-            let n = reader.read(&mut header)?;
-            if n < 512 {
+            if !read_tar_header(reader, &mut header)? {
                 return Ok(false);
             }
 
@@ -1441,8 +1491,7 @@ fn detect_gnu_incremental<R: Read + Seek>(reader: &mut R, ignore_zeros: bool) ->
                 pos += BLOCK_SIZE;
                 reader.seek(SeekFrom::Start(pos))?;
                 let mut next = [0u8; 512];
-                let n2 = reader.read(&mut next)?;
-                if n2 < 512 || next.iter().all(|&b| b == 0) {
+                if !read_tar_header(reader, &mut next)? || next.iter().all(|&b| b == 0) {
                     if ignore_zeros {
                         continue;
                     }
@@ -1636,11 +1685,7 @@ fn parse_tar_from<R: Read + Seek>(
             bytes_total_hint,
         );
         reader.seek(SeekFrom::Start(pos))?;
-        let n = reader.read(&mut header)?;
-        if n == 0 {
-            break;
-        }
-        if n < 512 {
+        if !read_tar_header(reader, &mut header)? {
             break;
         }
 
@@ -1652,8 +1697,7 @@ fn parse_tar_from<R: Read + Seek>(
             pos += BLOCK_SIZE;
             reader.seek(SeekFrom::Start(pos))?;
             let mut next = [0u8; 512];
-            let n2 = reader.read(&mut next)?;
-            if n2 < 512 || next.iter().all(|&b| b == 0) {
+            if !read_tar_header(reader, &mut next)? || next.iter().all(|&b| b == 0) {
                 break;
             }
             break;
@@ -2155,8 +2199,7 @@ fn walk_tar_region<R: Read + Seek>(
             break;
         }
         reader.seek(SeekFrom::Start(pos))?;
-        let n = reader.read(&mut header)?;
-        if n < 512 {
+        if !read_tar_header(reader, &mut header)? {
             break;
         }
 
@@ -2170,8 +2213,7 @@ fn walk_tar_region<R: Read + Seek>(
             if next_pos + BLOCK_SIZE <= region_end {
                 reader.seek(SeekFrom::Start(next_pos))?;
                 let mut next = [0u8; 512];
-                let n2 = reader.read(&mut next)?;
-                if n2 < 512 || next.iter().all(|&b| b == 0) {
+                if !read_tar_header(reader, &mut next)? || next.iter().all(|&b| b == 0) {
                     break;
                 }
             }
@@ -2463,11 +2505,10 @@ fn peek_tar_magic_at<R: Read + Seek>(reader: &mut R, data_off: u64) -> Result<bo
         return Ok(false);
     }
     let mut magic = [0u8; 5];
-    let n = match reader.read(&mut magic) {
-        Ok(n) => n,
-        Err(_) => return Ok(false),
-    };
-    Ok(n == 5 && (&magic == b"ustar" || &magic == b"GNU  " || magic.starts_with(b"ustar")))
+    if reader.read_exact(&mut magic).is_err() {
+        return Ok(false);
+    }
+    Ok(&magic == b"ustar" || &magic == b"GNU  ")
 }
 
 fn store_nested_tar_members(index: &SqliteIndex, members: &[NestedTarMember]) -> Result<()> {
@@ -3189,6 +3230,93 @@ mod tests {
     use std::io::{Read, Seek, Write};
     use std::process::Command;
 
+    /// Regression: passthrough must expose member bytes, never a TAR header or stale path.
+    #[test]
+    fn backing_extent_stored_member_pins_file_and_rejects_noncontiguous_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.tar");
+        std::fs::write(&path, synthetic_ustar("member", b"payload")).unwrap();
+        let source = SqliteIndexedTar::create_index(
+            &path,
+            &path,
+            None,
+            &OpenOptions::default(),
+            "test",
+            &mut None,
+        )
+        .unwrap();
+        assert!(source.supports_backing_extents());
+        let fi = source.lookup("/member", 0).unwrap();
+        let mut reader = source.open(&fi, 0).unwrap();
+        let mut first = [0; 2];
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"pa");
+        let mut extent = source.backing_extent(&fi).unwrap();
+        assert_eq!(extent.offset, 512);
+        assert_eq!(extent.len, 7);
+        std::fs::rename(&path, dir.path().join("old.tar")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        extent.file.seek(SeekFrom::Start(extent.offset)).unwrap();
+        let mut bytes = [0; 7];
+        extent.file.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"payload");
+        // Seeking the duplicated archive fd must not move an existing reader.
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).unwrap();
+        assert_eq!(remaining, b"yload");
+        for kind in 0..7 {
+            let mut bad = fi.clone();
+            let UserData::Tar(ud) = &mut bad.userdata[0] else {
+                panic!("TAR row");
+            };
+            match kind {
+                0 => ud.issparse = true,
+                1 => ud.isgenerated = true,
+                2 => ud.recursiondepth = 1,
+                3 => ud.offsetheader = None,
+                4 => ud.offset = u64::MAX,
+                5 => bad.linkname = "target".into(),
+                _ => bad.mode = ratarmount_core::S_IFDIR | 0o755,
+            }
+            assert!(source.backing_extent(&bad).is_none(), "kind={kind}");
+        }
+    }
+
+    /// Regression: compressed and materialized TAR bodies must not masquerade as stored bytes.
+    #[test]
+    fn backing_extent_compressed_tar_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compressed.tar.zst");
+        let bytes = synthetic_ustar("member", b"payload");
+        std::fs::write(
+            &path,
+            ratarmount_compress::encode_zstd_frame(&bytes, 1).unwrap(),
+        )
+        .unwrap();
+        let body = ratarmount_compress::open_seekable_zstd_with_threads(&path, 1).unwrap();
+        let source =
+            SqliteIndexedTar::create_index_body(&path, body, None, &OpenOptions::default(), "test")
+                .unwrap();
+        assert!(source
+            .backing_extent(&source.lookup("/member", 0).unwrap())
+            .is_none());
+        assert!(!source.supports_backing_extents());
+        let plain = dir.path().join("materialized.tar");
+        std::fs::write(&plain, bytes).unwrap();
+        let source = SqliteIndexedTar::create_index(
+            &path,
+            &plain,
+            None,
+            &OpenOptions::default(),
+            "test",
+            &mut None,
+        )
+        .unwrap();
+        assert!(source
+            .backing_extent(&source.lookup("/member", 0).unwrap())
+            .is_none());
+    }
+
     /// Regression: parallel TAR member reads used a sibling's seek position.
     #[test]
     fn regression_parallel_member_readers_keep_independent_positions() {
@@ -3308,6 +3436,7 @@ mod tests {
                 write_ustar_members(
                     &mut f,
                     &[UstarMember {
+                        xattrs: &[],
                         path: "hello.txt",
                         payload: UstarPayload::File {
                             bytes: b"hello world\n",
@@ -3447,6 +3576,7 @@ mod tests {
             write_ustar_members(
                 &mut f,
                 &[UstarMember {
+                    xattrs: &[],
                     path: "big.bin",
                     payload: UstarPayload::File { bytes: &payload },
                     mode: 0o644,
@@ -3850,6 +3980,133 @@ mod tests {
         // two zero blocks
         out.extend(std::iter::repeat_n(0u8, 1024));
         out
+    }
+
+    /// Two independently compressed blocks put a restart exactly where requested.
+    /// The production failure needs only a header crossing a block boundary, not
+    /// 1,000 blocks: these tiny concatenated streams exercise the same reader.
+    fn bzip2_body_split_at(bytes: &[u8], split: usize) -> Arc<dyn SeekableBody> {
+        use bzip2::{write::BzEncoder, Compression};
+        let mut compressed = Vec::new();
+        for part in [&bytes[..split], &bytes[split..]] {
+            let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(part).unwrap();
+            compressed.extend(encoder.finish().unwrap());
+        }
+        let body = ratarmount_compress::open_seekable_bzip2_from_reader(
+            std::io::Cursor::new(compressed),
+            "memory://boundary.tar.bz2",
+        )
+        .unwrap();
+        assert_eq!(body.size(), bytes.len() as u64);
+        assert_eq!(body.checkpoint_count(), 2);
+        body
+    }
+
+    fn two_member_tar() -> Vec<u8> {
+        let mut bytes = synthetic_ustar("first.bin", b"first payload");
+        bytes.truncate(bytes.len() - 1024);
+        bytes.extend(synthetic_ustar("last.bin", b"last payload"));
+        bytes
+    }
+
+    /// Regression: bzip2 short reads at block boundaries silently lose TAR members.
+    #[test]
+    fn regression_bzip2_block_boundary_indexes_every_member() {
+        let bytes = two_member_tar();
+        let body = bzip2_body_split_at(&bytes, 1024 + 123);
+        let mut reader = body.open_reader().unwrap();
+        reader.seek(SeekFrom::Start(1024)).unwrap();
+        assert_eq!(reader.read(&mut [0; 512]).unwrap(), 123);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let tar = SqliteIndexedTar::create_index_body(
+            body.path(),
+            Arc::clone(&body),
+            None,
+            &opts,
+            "test",
+        )
+        .unwrap();
+        for (name, expected) in [
+            ("first.bin", b"first payload".as_slice()),
+            ("last.bin", b"last payload"),
+        ] {
+            let fi = tar.lookup(&format!("/{name}"), 0).expect(name);
+            let mut data = Vec::new();
+            tar.open(&fi, 0).unwrap().read_to_end(&mut data).unwrap();
+            assert_eq!(data, expected);
+        }
+    }
+
+    /// Regression: a bzip2 boundary inside a nested TAR header truncates flattening.
+    #[test]
+    fn regression_bzip2_block_boundary_indexes_every_nested_member() {
+        let bytes = synthetic_ustar("inner.tar", &two_member_tar());
+        let body = bzip2_body_split_at(&bytes, 512 + 1024 + 123);
+        let tar = SqliteIndexedTar::create_index_body(
+            body.path(),
+            Arc::clone(&body),
+            None,
+            &OpenOptions {
+                index_in_memory: true,
+                ..OpenOptions::default()
+            },
+            "test",
+        )
+        .unwrap();
+        let fi = tar
+            .lookup("/inner.tar/last.bin", 0)
+            .expect("last nested member");
+        let mut data = Vec::new();
+        tar.open(&fi, 0).unwrap().read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"last payload");
+    }
+
+    /// Regression: the incremental detector mistakes a short header read for EOF.
+    #[test]
+    fn regression_bzip2_block_boundary_detects_gnu_incremental() {
+        let mut bytes = synthetic_ustar("dumpdir/", b"Yfile\0\0");
+        bytes[156] = b'D';
+        bytes[148..156].fill(b' ');
+        let sum: u32 = bytes[..512].iter().map(|&b| u32::from(b)).sum();
+        bytes[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        let body = bzip2_body_split_at(&bytes, 123);
+        let mut reader = body.open_reader().unwrap();
+        reader.seek(SeekFrom::Start(37)).unwrap();
+        assert!(detect_gnu_incremental(&mut reader, false).unwrap());
+        assert_eq!(reader.stream_position().unwrap(), 37);
+    }
+
+    /// Regression: a block boundary in ustar magic hides a nested TAR.
+    #[test]
+    fn regression_bzip2_block_boundary_detects_nested_tar_magic() {
+        let bytes = synthetic_ustar("inner.tar", &two_member_tar());
+        let body = bzip2_body_split_at(&bytes, 512 + 257 + 2);
+        assert!(peek_tar_magic_at(&mut body.open_reader().unwrap(), 512).unwrap());
+    }
+
+    /// Regression: an incomplete header must not publish a successful partial index.
+    #[test]
+    fn regression_truncated_tar_header_is_an_error() {
+        let mut bytes = two_member_tar();
+        bytes.truncate(1024 + 123);
+        let result = SqliteIndexedTar::open_from_reader(
+            std::io::Cursor::new(bytes),
+            "memory://truncated.tar",
+            None,
+            &OpenOptions {
+                index_in_memory: true,
+                gnu_incremental: Some(false),
+                ..OpenOptions::default()
+            },
+            "test",
+        );
+        assert!(
+            matches!(result, Err(TarError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof)
+        );
     }
 
     #[test]
@@ -5116,7 +5373,8 @@ mod tests {
             Path::new("virtual.bin"),
             "test",
             payload.to_vec(),
-        );
+        )
+        .unwrap();
         let src = SingleFileMountSource::from_seekable_body("payload.bin".into(), body)
             .expect("from_seekable_body");
 
@@ -5179,7 +5437,8 @@ mod tests {
             Path::new("virtual.bin"),
             "test",
             payload.to_vec(),
-        );
+        )
+        .unwrap();
         let src = SingleFileMountSource::from_seekable_body("payload.bin".into(), body)
             .expect("from_seekable_body");
 
@@ -5198,6 +5457,7 @@ mod tests {
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,

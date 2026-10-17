@@ -20,6 +20,7 @@ mod meta_cache;
 mod nested;
 mod patch;
 mod payload_cache;
+mod range_cache;
 mod search;
 
 pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
@@ -56,12 +57,13 @@ pub use payload_cache::{
     PAYLOAD_CACHE_BYTES_ENV, PAYLOAD_CACHE_DIR_ENV, PAYLOAD_CACHE_MEMBER_MAX_DEFAULT,
     PAYLOAD_CACHE_MEMBER_MAX_ENV,
 };
+pub use range_cache::{ContentToken, RangeCache, RANGE_CACHE_CHUNK_DEFAULT};
 pub use search::{locate_pattern_matches, FindAfter, SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ratarmount_core::{
     create_root_file_info, query_normpath, FileInfo, IndexBuildHooks, IndexBuildTick,
@@ -454,6 +456,90 @@ pub fn serialize_tarstats(stats: &TarStats) -> String {
     obj.to_string()
 }
 
+struct BudgetConnection {
+    inner: Arc<Mutex<Connection>>,
+    memory: Arc<Mutex<Option<ratarmount_core::budget::Reservation>>>,
+    bytes: u64,
+    _shrink: Option<ratarmount_core::budget::PressureHook>,
+}
+
+impl BudgetConnection {
+    fn new(conn: Connection) -> Result<Self> {
+        let pool = ratarmount_core::budget::MemoryPool::global(
+            "sqlite",
+            64 * 1024 * 1024 + 256 * 1024 * 1024,
+            ratarmount_core::budget::Priority::Sqlite,
+        );
+        let preferred = if pool.enabled() {
+            let cache_size: i64 = conn.query_row("PRAGMA cache_size", [], |row| row.get(0))?;
+            let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+            if cache_size < 0 {
+                cache_size.unsigned_abs().saturating_mul(1024)
+            } else {
+                (cache_size as u64).saturating_mul(page_size)
+            }
+        } else {
+            0
+        };
+        let mut bytes = pool.cap().min(preferred).min(64 * 1024 * 1024) / 1024 * 1024;
+        let reservation = if pool.enabled() {
+            pool.reserve(bytes)
+        } else {
+            None
+        };
+        if reservation.is_none() {
+            bytes = 0;
+        }
+        if pool.enabled() {
+            Self::configure(&conn, bytes)?;
+        }
+        let inner = Arc::new(Mutex::new(conn));
+        let memory = Arc::new(Mutex::new(reservation));
+        let weak_conn = Arc::downgrade(&inner);
+        let weak_memory = Arc::downgrade(&memory);
+        let shrink = if pool.enabled() {
+            Some(pool.on_pressure(move || {
+                if let (Some(conn), Some(memory)) = (weak_conn.upgrade(), weak_memory.upgrade()) {
+                    if let (Ok(conn), Ok(mut memory)) = (conn.try_lock(), memory.try_lock()) {
+                        if Self::configure(&conn, 0).is_ok() {
+                            memory.take();
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        Ok(Self {
+            inner,
+            memory,
+            bytes,
+            _shrink: shrink,
+        })
+    }
+    fn configure(conn: &Connection, bytes: u64) -> Result<()> {
+        conn.execute_batch(&format!(
+            "PRAGMA cache_size = {}; PRAGMA mmap_size = 0; PRAGMA shrink_memory;",
+            -(bytes as i64 / 1024)
+        ))?;
+        Ok(())
+    }
+    fn enforce(&self, conn: &Connection) -> Result<()> {
+        if ratarmount_core::budget::MemoryBudget::global().enabled() {
+            let bytes = if self.memory.lock().unwrap().is_some() {
+                self.bytes
+            } else {
+                0
+            };
+            Self::configure(conn, bytes)?;
+        }
+        Ok(())
+    }
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Connection>> {
+        self.inner.lock()
+    }
+}
+
 /// Open and query an existing ratarmount SQLite index.
 ///
 /// Connection is behind a `Mutex` so the type is `Sync` for FUSE multi-threaded callbacks.
@@ -462,7 +548,7 @@ pub fn serialize_tarstats(stats: &TarStats) -> String {
 /// [`MemIndexBuilder`] so seal does not re-scan SQLite into fat `FileInfo` maps.
 pub struct SqliteIndex {
     path: Option<PathBuf>,
-    conn: Mutex<Connection>,
+    conn: BudgetConnection,
     read_only: bool,
     mem: Option<MemIndex>,
     /// Populated during [`create_writable`] inserts; taken at seal into [`Self::mem`].
@@ -477,6 +563,8 @@ pub struct SqliteIndex {
     build_entries: AtomicU64,
     build_bytes_scanned: AtomicU64,
     build_bytes_total_hint: Mutex<Option<u64>>,
+    /// Lazy archive-order optimization, attempted at most once per catalog.
+    offset_order_index: OnceLock<()>,
 }
 
 /// Monotonic suffix so two [`SqliteIndex::create_writable`] calls in one process
@@ -638,7 +726,7 @@ impl SqliteIndex {
         )?;
         let mut idx = Self {
             path: Some(path.to_path_buf()),
-            conn: Mutex::new(conn),
+            conn: BudgetConnection::new(conn)?,
             read_only: true,
             mem: None,
             mem_builder: Mutex::new(None),
@@ -648,6 +736,7 @@ impl SqliteIndex {
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
             build_bytes_total_hint: Mutex::new(None),
+            offset_order_index: OnceLock::new(),
         };
         idx.validate_loaded()?;
         if load_mem {
@@ -709,7 +798,7 @@ impl SqliteIndex {
         conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
         Ok(Self {
             path: path_buf,
-            conn: Mutex::new(conn),
+            conn: BudgetConnection::new(conn)?,
             read_only: false,
             mem: None,
             mem_builder: Mutex::new(Some(MemIndexBuilder::new())),
@@ -719,6 +808,7 @@ impl SqliteIndex {
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
             build_bytes_total_hint: Mutex::new(None),
+            offset_order_index: OnceLock::new(),
         })
     }
 
@@ -733,7 +823,7 @@ impl SqliteIndex {
         conn.execute_batch(CREATE_TABLES_SQL)?;
         Ok(Self {
             path: None,
-            conn: Mutex::new(conn),
+            conn: BudgetConnection::new(conn)?,
             read_only: false,
             mem: None,
             mem_builder: Mutex::new(Some(MemIndexBuilder::new())),
@@ -743,6 +833,7 @@ impl SqliteIndex {
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
             build_bytes_total_hint: Mutex::new(None),
+            offset_order_index: OnceLock::new(),
         })
     }
 
@@ -1025,7 +1116,7 @@ impl SqliteIndex {
         conn.execute_batch(CREATE_TABLES_SQL)?;
         Ok(Self {
             path: None,
-            conn: Mutex::new(conn),
+            conn: BudgetConnection::new(conn)?,
             read_only: true,
             mem: Some(mem),
             mem_builder: Mutex::new(None),
@@ -1035,6 +1126,7 @@ impl SqliteIndex {
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
             build_bytes_total_hint: Mutex::new(None),
+            offset_order_index: OnceLock::new(),
         })
     }
 
@@ -1368,6 +1460,7 @@ impl SqliteIndex {
                 PRAGMA mmap_size = 268435456;
                 "#,
             )?;
+            self.conn.enforce(&guard)?;
         }
         self.read_only = true;
         Ok(())
@@ -1437,6 +1530,7 @@ impl SqliteIndex {
                     PRAGMA mmap_size = 268435456;
                     "#,
                         )?;
+                        self.conn.enforce(&guard)?;
                     } else {
                         // Pure :memory: — keep the same connection; no second openers.
                         self.with_conn(|conn| {
@@ -1447,6 +1541,7 @@ impl SqliteIndex {
                     PRAGMA cache_size = -65536;
                     "#,
                             )?;
+                            self.conn.enforce(conn)?;
                             Ok(())
                         })?;
                     }
@@ -2313,7 +2408,7 @@ impl SqliteIndex {
         conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
         let idx = Self {
             path: Some(path.to_path_buf()),
-            conn: Mutex::new(conn),
+            conn: BudgetConnection::new(conn)?,
             read_only: false,
             mem: None,
             // Existing DB: do not build MemIndex on write; open_read_only loads it.
@@ -2324,6 +2419,7 @@ impl SqliteIndex {
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
             build_bytes_total_hint: Mutex::new(None),
+            offset_order_index: OnceLock::new(),
         };
         idx.validate_loaded()?;
         Ok(idx)
@@ -5087,5 +5183,104 @@ mod tests {
         assert!(leftover.is_empty(), "tmp leftovers: {leftover:?}");
         let after = std::fs::read(&dest).unwrap();
         assert_eq!(before, after, "dest sidecar must stay the previous file");
+    }
+}
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::*;
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_sqlite_shrinks() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(65536).unwrap();
+
+        let conn = BudgetConnection::new(Connection::open_in_memory().unwrap()).unwrap();
+        let guard = conn.lock().unwrap();
+        let cache: i64 = guard
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cache, -8);
+        guard
+            .execute_batch("CREATE TABLE sample(x); INSERT INTO sample VALUES(42);")
+            .unwrap();
+        drop(guard);
+        let pool = ratarmount_core::budget::MemoryPool::global(
+            "sqlite",
+            320 * 1024 * 1024,
+            ratarmount_core::budget::Priority::Sqlite,
+        );
+        let reservation = pool.reserve(8192).unwrap();
+        assert!(conn.memory.lock().unwrap().is_none());
+        let guard = conn.lock().unwrap();
+        assert_eq!(
+            guard
+                .query_row("PRAGMA cache_size", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            guard
+                .query_row("SELECT x FROM sample", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+        drop(reservation);
+        assert!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .high_water
+                <= 65536
+        );
+    }
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_sqlite_never_enlarges_existing_cache() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(536870912).unwrap();
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let raw = Connection::open(file.path()).unwrap();
+        raw.execute_batch("PRAGMA cache_size=-1024; PRAGMA mmap_size=268435456;")
+            .unwrap();
+        let conn = BudgetConnection::new(raw).unwrap();
+        let guard = conn.lock().unwrap();
+        assert_eq!(
+            guard
+                .query_row("PRAGMA cache_size", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            -1024
+        );
+        assert_eq!(
+            guard
+                .query_row("PRAGMA mmap_size", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .reserved,
+            1024 * 1024
+        );
     }
 }

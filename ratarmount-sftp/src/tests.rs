@@ -64,6 +64,7 @@ fn tar_source() -> Arc<dyn MountSource> {
     write_ustar_members(
         &mut buf,
         &[UstarMember {
+            xattrs: &[],
             path: "hello.txt",
             payload: UstarPayload::File {
                 bytes: b"hello sftp\n",
@@ -130,6 +131,8 @@ fn sftp_batch(
 ) -> Option<(bool, String)> {
     let sftp = which("sftp")?;
     let mut cmd = Command::new(sftp);
+    // Regression: host SSH config permissions and includes must not affect loopback tests.
+    cmd.args(["-F", "/dev/null"]);
     cmd.arg("-P")
         .arg(port.to_string())
         .arg("-o")

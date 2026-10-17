@@ -300,6 +300,7 @@ fn write_split_tar_zst(dir: &Path, first: &[(&str, &[u8])], last: &[(&str, &[u8]
         let ustar: Vec<ratarmount_formats_tar::UstarMember<'_>> = members
             .iter()
             .map(|(n, b)| ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: n,
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: b },
                 mode: 0o644,
@@ -1285,6 +1286,7 @@ fn spawn_s3_live_ex(
 fn s3_interval_uploads_once() {
     let dir = tempfile::tempdir().unwrap();
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.txt",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
         mode: 0o644,
@@ -1507,6 +1509,7 @@ fn s3_interval_uploads_once() {
 fn gs_interval_uploads_once() {
     let dir = tempfile::tempdir().unwrap();
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.txt",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
         mode: 0o644,
@@ -1993,6 +1996,7 @@ fn az_env(cmd: &mut Command, addr: std::net::SocketAddr, secret_b64: &str, cache
 fn az_interval_uploads_once() {
     let dir = tempfile::tempdir().unwrap();
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.txt",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
         mode: 0o644,
@@ -2190,6 +2194,7 @@ fn az_interval_uploads_once() {
 fn az_pointer_put_failure_keeps_overlay() {
     let dir = tempfile::tempdir().unwrap();
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.txt",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
         mode: 0o644,
@@ -2306,6 +2311,7 @@ fn az_block_list_failure_keeps_overlay() {
         *b = (state >> 24) as u8;
     }
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.bin",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: &payload },
         mode: 0o644,
@@ -2456,6 +2462,7 @@ fn ustar_name_count(tar: &[u8], name: &str) -> usize {
 fn etag_mismatch_landed_put_keeps_one_member() {
     let dir = tempfile::tempdir().unwrap();
     let member = ratarmount_formats_tar::UstarMember {
+        xattrs: &[],
         path: "seed.txt",
         payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
         mode: 0o644,
@@ -2596,4 +2603,299 @@ fn etag_mismatch_landed_put_keeps_one_member() {
         nix::sys::signal::Signal::SIGTERM,
     );
     let _ = child.wait();
+}
+
+/// Regression: an append interval must keep the inode and refresh FUSE readers
+/// after its suffix/seek-table replacement. Run on the host with /dev/fuse.
+#[cfg(target_os = "linux")]
+#[test]
+fn commit_overlay_live_append_fuse_inode_and_readers() {
+    use std::io::{Read, Seek};
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Child;
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skip: /dev/fuse unavailable");
+        return;
+    }
+    if Command::new("fusermount3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skip: fusermount3 unavailable");
+        return;
+    }
+    struct Mounted {
+        child: Child,
+        path: PathBuf,
+    }
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            if let Ok(mut unmount) = Command::new("fusermount3")
+                .args(["-u", "-z"])
+                .arg(&self.path)
+                .spawn()
+            {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(5) {
+                    if unmount.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                let _ = unmount.kill();
+                let _ = unmount.wait();
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+    for zstd in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join(if zstd { "a.tar.zst" } else { "a.tar" });
+        let old = vec![0x71; 128 * 1024];
+        let mut plain = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(
+            &mut plain,
+            &[ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
+                path: "old",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: &old },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut plain).unwrap();
+        let bytes = if zstd {
+            let mut compressed = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
+            compressed.extend(ratarmount_compress::build_seek_table_skippable(&[(
+                compressed.len() as u32,
+                plain.len() as u32,
+            )]));
+            compressed
+        } else {
+            plain
+        };
+        fs::write(&archive, bytes).unwrap();
+        let inode = fs::metadata(&archive).unwrap().ino();
+        let ov = dir.path().join("ov");
+        let mnt = dir.path().join("mnt");
+        fs::create_dir(&mnt).unwrap();
+        let log_path = dir.path().join("fuse.log");
+        let log = fs::File::create(&log_path).unwrap();
+        let child = Command::new(bin())
+            .args([
+                "-f",
+                "--commit-overlay-mode",
+                "append",
+                "--commit-overlay-interval",
+                "1s",
+                "-w",
+            ])
+            .arg(&ov)
+            .arg(&archive)
+            .arg(&mnt)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        let guard = Mounted {
+            child,
+            path: mnt.clone(),
+        };
+        let start = Instant::now();
+        loop {
+            let mounted = fs::read_to_string("/proc/self/mountinfo")
+                .unwrap()
+                .lines()
+                .any(|l| l.split_whitespace().nth(4) == mnt.to_str());
+            if mounted {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "mount timeout: {}",
+                fs::read_to_string(&log_path).unwrap()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_ov = ov.clone();
+        let worker = thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                let mut held = fs::File::open(mnt.join("old")).unwrap();
+                let mut first = [0; 512];
+                held.read_exact(&mut first).unwrap();
+                let new = vec![0x92; 150_000];
+                fs::write(mnt.join("new"), &new).unwrap();
+                let start = Instant::now();
+                while worker_ov.join("new").exists() {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(20),
+                        "interval did not commit"
+                    );
+                    thread::sleep(Duration::from_millis(100));
+                }
+                assert_eq!(fs::read(mnt.join("new")).unwrap(), new);
+                assert_eq!(fs::read(mnt.join("old")).unwrap(), old);
+                held.rewind().unwrap();
+                let mut got = Vec::new();
+                held.read_to_end(&mut got).unwrap();
+                assert_eq!(got, old);
+            });
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(Duration::from_secs(35)) {
+            Ok(Ok(())) => {
+                worker.join().unwrap();
+            }
+            Ok(Err(panic)) => {
+                drop(guard);
+                std::panic::resume_unwind(panic);
+            }
+            Err(_) => {
+                drop(guard);
+                panic!("append FUSE operations timed out");
+            }
+        }
+        assert_eq!(fs::metadata(&archive).unwrap().ino(), inode);
+        drop(guard);
+    }
+}
+
+/// Regression: startup tried to parse/create a truncated archive before rollback.
+#[cfg(unix)]
+#[test]
+fn commit_overlay_append_recovery_before_mount_open() {
+    use std::io::{Read, Write};
+    for (zstd, writable) in [(false, false), (true, false), (false, true), (true, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join(if zstd { "a.tar.zst" } else { "a.tar" });
+        let mut plain = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(
+            &mut plain,
+            &[ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
+                path: "old",
+                payload: ratarmount_formats_tar::UstarPayload::File {
+                    bytes: b"old contents",
+                },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut plain).unwrap();
+        let bytes = if zstd {
+            ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap()
+        } else {
+            plain
+        };
+        fs::write(&archive, &bytes).unwrap();
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(b"incomplete new archive").unwrap();
+        assert!(
+            ratarmount_compress::commit_journal::replace_suffix_with_hook(
+                &archive,
+                0,
+                &mut suffix,
+                &mut |step| {
+                    if step == "archive truncate" {
+                        Err(std::io::Error::other("crash"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(fs::metadata(&archive).unwrap().len(), 0);
+        let mut command = Command::new(bin());
+        command.args(["--no-mount", "--index-file", ":memory:"]);
+        if writable {
+            command.arg("-w").arg(dir.path().join("ov"));
+        }
+        let out = command.arg(&archive).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut got = Vec::new();
+        fs::File::open(&archive)
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, bytes);
+        assert!(!ratarmount_compress::commit_journal::journal_path(&archive).exists());
+    }
+}
+
+/// Regression: offline append must print the members it will commit.
+#[cfg(unix)]
+#[test]
+fn commit_overlay_append_prints_plan() {
+    for zstd in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join(if zstd { "a.tar.zst" } else { "a.tar" });
+        let mut plain = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(
+            &mut plain,
+            &[ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
+                path: "old",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"old" },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut plain).unwrap();
+        if zstd {
+            // A seek table is required to take the append path.
+            let frame = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
+            let mut bytes = frame.clone();
+            bytes.extend_from_slice(&ratarmount_compress::build_seek_table_skippable(&[(
+                frame.len() as u32,
+                plain.len() as u32,
+            )]));
+            fs::write(&archive, bytes).unwrap();
+        } else {
+            fs::write(&archive, plain).unwrap();
+        }
+        let overlay = dir.path().join("ov");
+        fs::create_dir(&overlay).unwrap();
+        fs::write(overlay.join("new-member"), b"new").unwrap();
+        let output = Command::new(bin())
+            .args([
+                "--commit-overlay",
+                "--commit-overlay-mode",
+                "append",
+                "--yes",
+                "-w",
+            ])
+            .arg(&overlay)
+            .arg(&archive)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let plan = String::from_utf8_lossy(&output.stdout);
+        assert!(plan.contains("new-member"), "missing append plan: {plan}");
+        assert!(
+            !plan.contains("bytes copied"),
+            "append claimed a prefix copy: {plan}"
+        );
+    }
 }

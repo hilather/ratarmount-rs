@@ -1,0 +1,25 @@
+{
+  "Description": "Read-only sources and copy-on-write sandboxes using the ratarmount CLI",
+  "Documentation": "https://github.com/hilather/ratarmount-rs/blob/main/docs/docker-volume-plugin.md",
+  "Interface": {
+    "Socket": "ratarmount.sock",
+    "Types": ["docker.volumedriver/1.0"]
+  },
+  "Entrypoint": ["/usr/bin/ratarmount-volume-plugin"],
+  "Network": {"Type": "host"},
+  "PropagatedMount": "/var/lib/ratarmount-volume-plugin",
+  "Linux": {
+    "Capabilities": ["CAP_SYS_ADMIN"],
+    "Devices": [{"Path": "/dev/fuse"}]
+  },
+  "Mounts": [
+    {
+      "Name": "ram-overlay",
+      "Description": "RAM backing for overlay=tmpfs; tune size for your workload",
+      "Type": "tmpfs",
+      "Source": "",
+      "Destination": "/dev/shm",
+      "Options": ["size=1g", "mode=1777", "nosuid", "nodev"]
+    }
+  ]
+}

@@ -9,9 +9,11 @@ mod control;
 mod empty_archive;
 mod folder;
 mod oci_whiteout;
+mod overlay_policy;
 mod path_intern;
 mod payload;
 mod prefix;
+mod rolling;
 mod transform;
 mod union;
 mod versioning;
@@ -35,15 +37,21 @@ pub use empty_archive::{
 };
 pub use folder::FolderMountSource;
 pub use oci_whiteout::OciImageMountSource;
+pub use overlay_policy::{
+    parse_overlay_size, CompositeOverlayPolicy, OverlayQuota, OverlayStats, OverlayUsage,
+    QuotaUsage, ReadOnlyGlobs,
+};
 pub use payload::{maybe_wrap_payload_cache, PayloadCacheLayer};
-pub use prefix::PrefixMountSource;
+pub use prefix::{validate_mount_path, PrefixMountSource, SourceBind};
+pub use rolling::{RollPolicy, RollingMountSource, SeriesName};
 pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};
 pub use versioning::FileVersionLayer;
 pub use write_overlay::{
-    commit_overlay, live_commit_is_supported, name_suggests_tar_zst, overlay_only_names,
-    patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitOutcome,
-    CommitOverlayOptions, IndexPatchWindow, OverlayError, Parked, RemoteDownload, RemoteObjectHead,
+    commit_overlay, is_overlay_internal_path, live_commit_is_supported, name_suggests_tar_zst,
+    overlay_atime, overlay_only_names, patch_sidecar_if_present, sidecar_path_for_patch,
+    CommitKind, CommitMode, CommitOutcome, CommitOverlayOptions, IndexPatchWindow, OverlayError,
+    OverlayMetadata, OverlayMutation, OverlayPolicy, Parked, RemoteDownload, RemoteObjectHead,
     RemotePublishError, RemotePublishRequest, WriteOverlay, HIDDEN_DB, LEGACY_OVERLAY_MARKER,
     OVERLAY_MARKER,
 };

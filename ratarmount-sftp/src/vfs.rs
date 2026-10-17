@@ -1,6 +1,7 @@
 //! `MountSource` adapter for SFTP v3 (inode table + reader LRU + overlay).
 
-use std::io::{self, Seek, SeekFrom, Write};
+use ratarmount_core::AttributeMapping;
+use std::io;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ pub struct OpenMode {
     pub create: bool,
     pub truncate: bool,
     pub exclusive: bool,
+    pub permissions: Option<u32>,
 }
 
 /// One OPEN/OPENDIR handle owned by a session.
@@ -41,6 +43,7 @@ pub enum SftpHandle {
 
 /// Userspace SFTP view of a factory-built [`MountSource`].
 pub struct RatarmountSftp {
+    attribute_mapping: AttributeMapping,
     source: Arc<dyn MountSource>,
     overlay: Option<Arc<WriteOverlay>>,
     inodes: Arc<InodeTable>,
@@ -49,6 +52,16 @@ pub struct RatarmountSftp {
 }
 
 impl RatarmountSftp {
+    /// Map protocol attributes only; source and overlay metadata stay unchanged.
+    pub fn with_attribute_mapping(mut self, mapping: AttributeMapping) -> Self {
+        self.attribute_mapping = mapping;
+        self
+    }
+
+    pub fn attribute_mapping(&self) -> AttributeMapping {
+        self.attribute_mapping
+    }
+
     pub fn new(source: Arc<dyn MountSource>, readahead_bytes: usize, reader_slots: usize) -> Self {
         Self::with_overlay(source, readahead_bytes, reader_slots, None)
     }
@@ -61,6 +74,7 @@ impl RatarmountSftp {
     ) -> Self {
         let overlay_set = overlay.is_some();
         Self {
+            attribute_mapping: AttributeMapping::default(),
             source,
             overlay,
             inodes: Arc::new(InodeTable::with_overlay(overlay_set)),
@@ -93,7 +107,11 @@ impl RatarmountSftp {
     pub fn file_info_at(&self, path: &str) -> Result<FileInfo, i32> {
         let path = self.realpath(path);
         if path == "/" {
-            let fi = create_root_file_info();
+            let fi = self
+                .overlay
+                .as_ref()
+                .and_then(|ov| ov.lookup("/", 0))
+                .unwrap_or_else(create_root_file_info);
             let id = self.inodes.id_for_path("/");
             self.inodes.store_lookup_fi(id, fi.clone());
             return Ok(fi);
@@ -217,7 +235,8 @@ impl RatarmountSftp {
             return Err(libc::EEXIST);
         }
         if mode.create && !exists {
-            let fd = overlay_create_file(ov, path, 0o644).map_err(|e| io_to_errno(&e))?;
+            let fd = overlay_create_file(ov, path, mode.permissions.unwrap_or(0o644))
+                .map_err(|e| io_to_errno(&e))?;
             ov.close_overlay_fd(fd);
         } else if !exists {
             return Err(libc::ENOENT);
@@ -237,10 +256,8 @@ impl RatarmountSftp {
         let fd = ov
             .open_overlay_fd(&path, flags)
             .map_err(|e| io_to_errno(&overlay_to_io(e)))?;
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let wrote = file
-            .seek(SeekFrom::Start(offset))
-            .and_then(|_| file.write_all(data));
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let wrote = ov.write_all_at(&file, &path, offset, data);
         ov.finish_owned_write_fd(file);
         wrote.map_err(|e| io_to_errno(&e))?;
         self.bump(id);
@@ -291,6 +308,31 @@ impl RatarmountSftp {
         overlay_rename(ov, &from, &to).map_err(|e| io_to_errno(&e))?;
         self.inodes.rebind_path(from_id, &to);
         self.bump(from_id);
+        Ok(())
+    }
+
+    pub fn setstat_metadata(
+        &self,
+        path: &str,
+        attrs: &ratarmount_compositing::OverlayMetadata,
+    ) -> Result<(), i32> {
+        self.setstat(path, None, attrs)
+    }
+
+    pub fn setstat(
+        &self,
+        path: &str,
+        size: Option<u64>,
+        attrs: &ratarmount_compositing::OverlayMetadata,
+    ) -> Result<(), i32> {
+        let ov = self.overlay()?;
+        let path = self.realpath(path);
+        ov.set_attributes(&path, size, attrs).map_err(|e| {
+            let e = overlay_to_io(e);
+            e.raw_os_error().unwrap_or_else(|| io_to_errno(&e))
+        })?;
+        let id = self.inodes.id_for_path(&path);
+        self.bump(id);
         Ok(())
     }
 
@@ -391,6 +433,144 @@ mod tests {
     use ratarmount_core::{create_root_file_info, ListResult, S_IFREG};
     use ratarmount_export_core::fill_read;
 
+    /// Regression: SFTP SETSTAT mode and times must not be silently discarded.
+    #[test]
+    fn regression_overlay_chmod_sftp_setstat() {
+        let td = tempfile::tempdir().unwrap();
+        let ov = Arc::new(WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap());
+        let fd = ov.create_file("/built", 0o644).unwrap();
+        ov.close_overlay_fd(fd);
+        let fs = RatarmountSftp::with_overlay(ov.clone(), 0, 8, Some(ov.clone()));
+        fs.setstat_metadata(
+            "/",
+            &ratarmount_compositing::OverlayMetadata {
+                mode: Some(0o751),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fs.file_info_at("/").unwrap().mode & 0o7777, 0o751);
+        fs.open_path(
+            "/created",
+            OpenMode {
+                write: true,
+                create: true,
+                permissions: Some(0o777),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ov.lookup("/created", 0).unwrap().mode & 0o7777, 0o777);
+        fs.setstat_metadata(
+            "/built",
+            &ratarmount_compositing::OverlayMetadata {
+                mode: Some(0o755),
+                atime: Some(12.0),
+                mtime: Some(34.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fi = ov.lookup("/built", 0).unwrap();
+        assert_eq!(fi.mode & 0o7777, 0o755);
+        assert_eq!(fi.mtime, 34.0);
+        assert_eq!(ratarmount_compositing::overlay_atime(&fi), 12.0);
+    }
+
+    struct TestPolicy;
+    impl ratarmount_compositing::OverlayPolicy for TestPolicy {
+        fn check_mutation(
+            &self,
+            _: ratarmount_compositing::OverlayMutation,
+            paths: &[&str],
+        ) -> io::Result<()> {
+            if paths
+                .iter()
+                .any(|p| *p == "/locked" || p.starts_with("/locked/"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ReadOnlyFilesystem,
+                    "policy read-only path",
+                ));
+            }
+            Ok(())
+        }
+        fn check_write(
+            &self,
+            path: &str,
+            offset: u64,
+            len: u64,
+            current_size: u64,
+        ) -> io::Result<()> {
+            if path == "/quota" && offset.saturating_add(len) > current_size.max(2) {
+                return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "policy quota"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression: SFTP v3 VFS keeps policy errors for its status adapter.
+    #[test]
+    fn regression_overlay_policy_denials() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        ov.mkdir("/locked/empty", 0o755).unwrap();
+        for path in ["/locked/file", "/outside", "/quota"] {
+            let fd = ov.create_file(path, 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+        }
+        ov.set_policy(Some(Arc::new(TestPolicy)));
+        let ov = Arc::new(ov);
+
+        let fs = RatarmountSftp::with_overlay(ov.clone(), 0, 8, Some(ov));
+        let file = fs.inodes.id_for_path("/locked/file");
+        let quota = fs.inodes.id_for_path("/quota");
+        assert_eq!(fs.write(file, 0, b"x").unwrap_err(), libc::EROFS);
+        assert_eq!(
+            fs.setstat_metadata(
+                "/locked/file",
+                &ratarmount_compositing::OverlayMetadata {
+                    mode: Some(0o755),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.open_path(
+                "/locked/new",
+                OpenMode {
+                    write: true,
+                    create: true,
+                    ..OpenMode::default()
+                }
+            )
+            .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(fs.setstat_size("/locked/file", 3).unwrap_err(), libc::EROFS);
+        assert_eq!(
+            fs.rename("/locked/file", "/moved").unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.rename("/outside", "/locked/file").unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(fs.remove("/locked/file").unwrap_err(), libc::EROFS);
+        assert_eq!(fs.mkdir("/locked/newdir", 0o755).unwrap_err(), libc::EROFS);
+        assert_eq!(fs.rmdir("/locked/empty").unwrap_err(), libc::EROFS);
+        assert_eq!(
+            fs.symlink("/locked/link", "target").unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(fs.write(quota, 0, b"abc").unwrap_err(), libc::EDQUOT);
+        assert_eq!(fs.write(quota, 0, b"ab").unwrap(), 2);
+        assert_eq!(fs.read(quota, 0, 8).unwrap(), b"ab");
+    }
+
     struct EmptyFs;
     impl MountSource for EmptyFs {
         fn list(&self, path: &str) -> Option<ListResult> {
@@ -424,8 +604,8 @@ mod tests {
             self.0.read(&mut buf[..1])
         }
     }
-    impl Seek for ShortRead {
-        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    impl io::Seek for ShortRead {
+        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
             self.0.seek(pos)
         }
     }

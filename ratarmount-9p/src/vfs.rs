@@ -1,6 +1,8 @@
 //! `MountSource` adapter for 9P2000.L (inode table + reader LRU + overlay).
 
-use std::io::{self, Seek, SeekFrom, Write};
+use ratarmount_compositing::{overlay_atime, OverlayMetadata};
+use ratarmount_core::AttributeMapping;
+use std::io;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 
@@ -21,6 +23,7 @@ const MAX_NAME_LEN: usize = 255;
 
 /// Userspace 9P2000.L view of a factory-built [`MountSource`].
 pub struct Ratarmount9p {
+    attribute_mapping: AttributeMapping,
     source: Arc<dyn MountSource>,
     overlay: Option<Arc<WriteOverlay>>,
     inodes: Arc<InodeTable>,
@@ -29,6 +32,12 @@ pub struct Ratarmount9p {
 }
 
 impl Ratarmount9p {
+    /// Map protocol attributes only; source and overlay metadata stay unchanged.
+    pub fn with_attribute_mapping(mut self, mapping: AttributeMapping) -> Self {
+        self.attribute_mapping = mapping;
+        self
+    }
+
     pub fn new(source: Arc<dyn MountSource>, readahead_bytes: usize, reader_slots: usize) -> Self {
         Self::with_overlay(source, readahead_bytes, reader_slots, None)
     }
@@ -41,6 +50,7 @@ impl Ratarmount9p {
     ) -> Self {
         let overlay_set = overlay.is_some();
         Self {
+            attribute_mapping: AttributeMapping::default(),
             source,
             overlay,
             inodes: Arc::new(InodeTable::with_overlay(overlay_set)),
@@ -65,7 +75,11 @@ impl Ratarmount9p {
     pub fn file_info(&self, id: u64) -> Result<FileInfo, i32> {
         let path = self.inodes.path_for_id(id).ok_or(libc::ESTALE)?;
         if path == "/" {
-            let fi = create_root_file_info();
+            let fi = self
+                .overlay
+                .as_ref()
+                .and_then(|ov| ov.lookup("/", 0))
+                .unwrap_or_else(create_root_file_info);
             self.inodes.store_lookup_fi(id, fi.clone());
             return Ok(fi);
         }
@@ -130,7 +144,7 @@ impl Ratarmount9p {
 
     pub fn getattr(&self, id: u64) -> Result<Attr, i32> {
         let fi = self.file_info(id)?;
-        Ok(attr_from(id, &fi))
+        Ok(attr_from(id, &fi, self.attribute_mapping))
     }
 
     pub fn read(&self, id: u64, offset: u64, count: u32) -> Result<Vec<u8>, i32> {
@@ -349,6 +363,17 @@ impl Ratarmount9p {
         Ok(fi.linkname)
     }
 
+    pub fn setattr(&self, id: u64, size: Option<u64>, attrs: &OverlayMetadata) -> Result<(), i32> {
+        let ov = self.overlay()?;
+        let path = self.path_for_id(id)?;
+        ov.set_attributes(&path, size, attrs).map_err(|e| {
+            let e = overlay_to_io(e);
+            e.raw_os_error().unwrap_or_else(|| io_to_errno(&e))
+        })?;
+        self.bump(id);
+        Ok(())
+    }
+
     pub fn setattr_size(&self, id: u64, valid: u32, size: u64) -> Result<(), i32> {
         if valid & SETATTR_SIZE == 0 {
             if !self.writable() && valid != 0 {
@@ -370,10 +395,8 @@ impl Ratarmount9p {
         let fd = ov
             .open_overlay_fd(&path, flags)
             .map_err(|e| io_to_errno(&overlay_to_io(e)))?;
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let wrote = file
-            .seek(SeekFrom::Start(offset))
-            .and_then(|_| file.write_all(data));
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let wrote = ov.write_all_at(&file, &path, offset, data);
         ov.finish_owned_write_fd(file);
         wrote.map_err(|e| io_to_errno(&e))?;
         self.bump(id);
@@ -453,21 +476,22 @@ fn unix_time(t: f64) -> (u64, u64) {
     (secs as u64, (t.fract() * 1e9) as u64)
 }
 
-fn attr_from(id: u64, fi: &FileInfo) -> Attr {
+fn attr_from(id: u64, fi: &FileInfo, mapping: AttributeMapping) -> Attr {
     let (sec, nsec) = unix_time(fi.mtime);
+    let (atime_sec, atime_nsec) = unix_time(overlay_atime(fi));
     let nlink = if is_dir_mode(fi.mode) { 2 } else { 1 };
     Attr {
         qid: qid_from(id, fi),
-        mode: fi.mode,
-        uid: fi.uid,
-        gid: fi.gid,
+        mode: mapping.mode(fi.mode),
+        uid: mapping.uid(fi.uid),
+        gid: mapping.gid(fi.gid),
         nlink,
         rdev: 0,
         size: fi.size,
         blksize: 4096,
         blocks: fi.size.div_ceil(512),
-        atime_sec: sec,
-        atime_nsec: nsec,
+        atime_sec,
+        atime_nsec,
         mtime_sec: sec,
         mtime_nsec: nsec,
         ctime_sec: sec,
@@ -514,6 +538,122 @@ mod tests {
 
     use ratarmount_core::ListResult;
 
+    struct TestPolicy;
+    impl ratarmount_compositing::OverlayPolicy for TestPolicy {
+        fn check_mutation(
+            &self,
+            _: ratarmount_compositing::OverlayMutation,
+            paths: &[&str],
+        ) -> io::Result<()> {
+            if paths
+                .iter()
+                .any(|p| *p == "/locked" || p.starts_with("/locked/"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ReadOnlyFilesystem,
+                    "policy read-only path",
+                ));
+            }
+            Ok(())
+        }
+        fn check_write(
+            &self,
+            path: &str,
+            offset: u64,
+            len: u64,
+            current_size: u64,
+        ) -> io::Result<()> {
+            if path == "/quota" && offset.saturating_add(len) > current_size.max(2) {
+                return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "policy quota"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression: policy errors from every 9P mutator retain EROFS/EDQUOT.
+    #[test]
+    fn regression_overlay_policy_denials() {
+        overlay_policy_denials(false);
+    }
+
+    /// Regression: real sandbox globs and quotas retain protocol EROFS/EDQUOT errors.
+    #[test]
+    fn regression_sandbox_policy_denials() {
+        overlay_policy_denials(true);
+    }
+
+    fn overlay_policy_denials(real: bool) {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        ov.mkdir("/locked/empty", 0o755).unwrap();
+        for path in ["/locked/file", "/outside", "/quota"] {
+            let fd = ov.create_file(path, 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+        }
+        if real {
+            use ratarmount_compositing::{CompositeOverlayPolicy, OverlayQuota, ReadOnlyGlobs};
+            ov.set_policy(Some(Arc::new(CompositeOverlayPolicy(vec![
+                Arc::new(
+                    ReadOnlyGlobs::new(["locked/**"])
+                        .unwrap()
+                        .with_overlay_root(td.path())
+                        .unwrap(),
+                ),
+                Arc::new(OverlayQuota::new(td.path(), Some(2), None).unwrap()),
+            ]))));
+        } else {
+            ov.set_policy(Some(Arc::new(TestPolicy)));
+        }
+        let ov = Arc::new(ov);
+
+        let fs = Ratarmount9p::with_overlay(ov.clone(), 0, 8, Some(ov));
+        let locked = fs.inodes.id_for_path("/locked");
+        let file = fs.inodes.id_for_path("/locked/file");
+        let quota = fs.inodes.id_for_path("/quota");
+        assert_eq!(fs.write(file, 0, b"x").unwrap_err(), libc::EROFS);
+        assert_eq!(
+            fs.setattr(
+                file,
+                None,
+                &OverlayMetadata {
+                    mode: Some(0o755),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(fs.lcreate(locked, "new", 0o644).unwrap_err(), libc::EROFS);
+        assert_eq!(
+            fs.setattr_size(file, SETATTR_SIZE, 3).unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.renameat(locked, "file", ROOT_FILEID, "moved")
+                .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.renameat(ROOT_FILEID, "outside", locked, "file")
+                .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(fs.unlinkat(locked, "file", 0).unwrap_err(), libc::EROFS);
+        assert_eq!(fs.mkdir(locked, "newdir", 0o755).unwrap_err(), libc::EROFS);
+        assert_eq!(
+            fs.unlinkat(locked, "empty", AT_REMOVEDIR).unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.symlink(locked, "link", "target").unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(fs.write(quota, 0, b"abc").unwrap_err(), libc::EDQUOT);
+        assert_eq!(fs.write(quota, 0, b"ab").unwrap(), 2);
+        assert_eq!(fs.read(quota, 0, 8).unwrap(), b"ab");
+    }
+
     struct EmptyFs;
     impl MountSource for EmptyFs {
         fn list(&self, path: &str) -> Option<ratarmount_core::ListResult> {
@@ -557,6 +697,51 @@ mod tests {
         assert_eq!(
             fs.require_write_open(libc::O_WRONLY as u32).unwrap_err(),
             libc::EROFS
+        );
+    }
+
+    /// Regression: Tsetattr mode/time updates must reach the write overlay.
+    #[test]
+    fn regression_overlay_chmod_ninep_setattr() {
+        let (_td, fs) = overlay_fs();
+        fs.setattr(
+            ROOT_FILEID,
+            None,
+            &OverlayMetadata {
+                mode: Some(0o751),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fs.getattr(ROOT_FILEID).unwrap().mode & 0o7777, 0o751);
+        let (id, _) = fs.lcreate(ROOT_FILEID, "built", 0o644).unwrap();
+        fs.setattr(
+            id,
+            None,
+            &OverlayMetadata {
+                mode: Some(0o755),
+                atime: Some(12.25),
+                mtime: Some(34.5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let attrs = fs.getattr(id).unwrap();
+        assert_eq!(attrs.mode & 0o7777, 0o755);
+        assert_eq!(attrs.atime_sec, 12);
+        assert_eq!(attrs.atime_nsec, 250_000_000);
+        assert_eq!(attrs.mtime_sec, 34);
+        assert_eq!(
+            fs.setattr(
+                id,
+                None,
+                &OverlayMetadata {
+                    gid: Some(123),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
+            libc::EPERM
         );
     }
 
@@ -608,5 +793,39 @@ mod tests {
             fs.inodes.cached_lookup_fi(id).is_none(),
             "overlay child must not keep a fat FileInfo"
         );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_attr_tests {
+    use super::*;
+
+    /// Regression: 9P Rgetattr must map owners without masking the file type.
+    #[test]
+    fn regression_mapped_attrs_include_unset() {
+        for mode in [0o100777, 0o040777, 0o120777] {
+            let mut fi = create_root_file_info();
+            fi.mode = mode;
+            fi.uid = 42;
+            fi.gid = 43;
+            let attr = attr_from(
+                7,
+                &fi,
+                AttributeMapping::parse("uid=12345,gid=23456,umask=027").unwrap(),
+            );
+            assert_eq!(
+                (attr.uid, attr.gid, attr.mode),
+                (12345, 23456, mode & !0o027)
+            );
+            let attr = attr_from(7, &fi, AttributeMapping::default());
+            assert_eq!((attr.uid, attr.gid, attr.mode), (42, 43, mode));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source =
+            Arc::new(ratarmount_compositing::FolderMountSource::new(directory.path()).unwrap());
+        let fs = Ratarmount9p::new(source, 0, 8)
+            .with_attribute_mapping(AttributeMapping::parse("uid=12345,gid=23456").unwrap());
+        let attr = fs.getattr(root_id()).unwrap();
+        assert_eq!((attr.uid, attr.gid), (12345, 23456));
     }
 }

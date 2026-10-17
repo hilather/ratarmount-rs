@@ -26,7 +26,9 @@
 //! * [`ParallelizationSpec`] parses Python-style `-P` backend matrices.
 
 mod bzip2_seek;
+pub mod commit_journal;
 mod compress_z_seek;
+pub mod fastcopy;
 #[cfg(feature = "gzip-rapidgzip")]
 mod gzip_rapidgzip;
 mod gzip_seek;
@@ -88,7 +90,7 @@ pub use lzo_seek::{lzo_available, open_seekable_lzo, open_seekable_lzo_with_thre
 /// Re-export for `-P` / backend matrix parsing at the compress boundary.
 pub use ratarmount_core::ParallelizationSpec;
 pub use repack_seekable::{
-    repack_seekable, GzipSidecar, RepackAction, RepackOptions, RepackReport,
+    repack_seekable, GzipSidecar, RepackAction, RepackOptions, RepackReport, ZstdFrameWriter,
     DEFAULT_REPACK_FRAME_SIZE, DEFAULT_REPACK_ZSTD_LEVEL,
 };
 pub use seekable_body::{
@@ -105,9 +107,12 @@ pub use zstd_seek::{
     open_seekable_zstd_from_reader, open_seekable_zstd_with_threads,
     open_seekable_zstd_with_threads_from_reader, open_seekable_zstd_with_zstd_blocks,
     open_seekable_zstd_with_zstd_blocks_from_reader, scan_zstd_frames, scan_zstd_frames_path,
-    SeekableZstd, ZstdFrameInfo, ZstdFrameMap,
+    zstd_decode_stats, SeekableZstd, ZstdDecodeStats, ZstdFrameInfo, ZstdFrameMap, ZstdReadOptions,
 };
-pub use zstd_splice::{splice_zstd_last_frames, splice_zstd_last_frames_replace, SpliceStats};
+pub use zstd_splice::{
+    splice_zstd_last_frames, splice_zstd_last_frames_append, splice_zstd_last_frames_replace,
+    write_zstd_splice_suffix, SpliceStats,
+};
 
 use std::fs::File;
 use std::io::{self, copy, BufReader, Read, Seek, SeekFrom, Write};

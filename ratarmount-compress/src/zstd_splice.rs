@@ -65,6 +65,33 @@ where
         )));
     }
 
+    write_zstd_splice_suffix(src, map, from_idx, transform, dst)
+}
+
+/// Encode only the replacement suffix and seek table. The caller preserves the
+/// prefix, either by copying it or by journaled in-place replacement.
+pub fn write_zstd_splice_suffix<R, W, F>(
+    src: &mut R,
+    map: &ZstdFrameMap,
+    from_idx: usize,
+    transform: F,
+    dst: &mut W,
+) -> Result<SpliceStats>
+where
+    R: Read + Seek,
+    W: Write,
+    F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
+{
+    let prefix_len = map
+        .frames
+        .get(from_idx)
+        .ok_or_else(|| {
+            CompressError::Msg(format!(
+                "splice from_idx {from_idx} past {} frames",
+                map.frames.len()
+            ))
+        })?
+        .compressed_offset;
     let mut suffix = spill_sink();
     decode_zstd_frames_to(src, map, from_idx, &mut suffix)?;
     suffix.seek(SeekFrom::Start(0))?;
@@ -107,14 +134,26 @@ pub fn splice_zstd_last_frames_replace<F>(
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp = match parent {
-        Some(dir) => NamedTempFile::new_in(dir)?,
-        None => NamedTempFile::new()?,
-    };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tmp = NamedTempFile::new_in(parent)?;
     let mut src = File::open(path)?;
     let map = scan_zstd_frames(&mut src)?;
-    let stats = splice_zstd_last_frames(&mut src, &map, from_idx, transform, tmp.as_file_mut())?;
+    let prefix = map
+        .frames
+        .get(from_idx)
+        .ok_or_else(|| {
+            CompressError::Msg(format!(
+                "splice from_idx {from_idx} past {} frames",
+                map.frames.len()
+            ))
+        })?
+        .compressed_offset;
+    let method = crate::fastcopy::copy_range(&mut src, 0, tmp.as_file_mut(), 0, prefix)?;
+    crate::fastcopy::log_commit_copy(prefix, method);
+    let stats = write_zstd_splice_suffix(&mut src, &map, from_idx, transform, tmp.as_file_mut())?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| {
         CompressError::Msg(format!(
@@ -123,6 +162,60 @@ where
             e.error
         ))
     })?;
+    Ok(stats)
+}
+
+/// Journaled in-place splice. Requires a seek table and stages only the suffix.
+pub fn splice_zstd_last_frames_append<F>(
+    path: &Path,
+    from_idx: usize,
+    transform: F,
+) -> Result<SpliceStats>
+where
+    F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
+{
+    let mut src = File::open(path)?;
+    let original = src.metadata()?;
+    let map = scan_zstd_frames(&mut src)?;
+    if map.seek_table.is_none() {
+        return Err(CompressError::Msg(
+            "append splice requires a zstd seek table".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tail = NamedTempFile::new_in(parent)?;
+    let stats = write_zstd_splice_suffix(&mut src, &map, from_idx, transform, tail.as_file_mut())?;
+    if !stats.wrote_seek_table {
+        // A new frame may exceed the seek-table u32 limit. Keep the existing
+        // no-size-refusal rule: publish the staged suffix through copy/rename.
+        let mut tmp = NamedTempFile::new_in(parent)?;
+        let method = crate::fastcopy::copy_range(
+            &mut src,
+            0,
+            tmp.as_file_mut(),
+            0,
+            stats.prefix_compressed_bytes,
+        )?;
+        crate::fastcopy::log_commit_copy(stats.prefix_compressed_bytes, method);
+        tail.as_file_mut().rewind()?;
+        io::copy(tail.as_file_mut(), tmp.as_file_mut())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(path).map_err(|e| e.error)?;
+        return Ok(stats);
+    }
+    crate::commit_journal::replace_suffix_if_unchanged(
+        path,
+        stats.prefix_compressed_bytes,
+        tail.as_file_mut(),
+        &original,
+    )?;
+    log::info!(
+        "commit: prefix {:.1} GiB retained via append",
+        stats.prefix_compressed_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
     Ok(stats)
 }
 

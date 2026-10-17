@@ -4,7 +4,6 @@
 //! Overlay `userdata` (`overlay:`) is never cached (write overlay must stay
 //! immediately consistent). Skip `:memory:` via [`maybe_wrap_payload_cache`].
 
-use std::fs::File;
 use std::io;
 use std::sync::Arc;
 
@@ -98,12 +97,17 @@ impl MountSource for PayloadCacheLayer {
         match self.cache.get_or_fill(&sha, file_info.size, || {
             self.inner.open(file_info, buffering)
         }) {
-            Ok(path) => match File::open(&path) {
-                Ok(f) => Ok(Box::new(f) as Box<dyn ratarmount_core::ArchiveRead>),
-                Err(_) => self.inner.open(file_info, buffering),
-            },
+            Ok(file) => Ok(Box::new(file) as Box<dyn ratarmount_core::ArchiveRead>),
             Err(_) => self.inner.open(file_info, buffering),
         }
+    }
+
+    fn supports_backing_extents(&self) -> bool {
+        self.inner.supports_backing_extents()
+    }
+
+    fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        self.inner.backing_extent(file_info)
     }
 
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
@@ -399,10 +403,11 @@ mod tests {
             opens_after_cache,
             "overlay open must not refill from the archive"
         );
-        let cached = cache.lookup(&sha).expect("base blob stays");
+        let mut cached = cache.lookup(&sha).expect("base blob stays");
+        let mut bytes = Vec::new();
+        cached.read_to_end(&mut bytes).unwrap();
         assert_eq!(
-            std::fs::read(cached).unwrap(),
-            base_body,
+            bytes, base_body,
             "overlay bytes must not replace the sha256 blob"
         );
     }

@@ -266,6 +266,36 @@ where
     Ok(stats)
 }
 
+/// Classify an adds-only plan and locate a safe append boundary without reading
+/// member payloads. Unlike a backwards zero scan, this preserves zero-tail data.
+/// `None` requests the copy path (existing names, sparse/global-PAX layout, or
+/// no complete terminal EOF). Interior EOFs are walked like the commit index.
+pub fn tar_append_offset<R: Read + Seek>(
+    reader: &mut R,
+    touched: &HashSet<String>,
+    encoding: &str,
+) -> io::Result<Option<u64>> {
+    let len = reader.seek(SeekFrom::End(0))?;
+    let mut cursor = TarMemberCursor::new(reader, 0, 0, encoding);
+    while let Some(member) = cursor.next_member()? {
+        if member.raw_end > len || matches!(member.typeflag, b'g' | b'S') {
+            return Ok(None);
+        }
+        if touched.iter().any(|p| {
+            member.logical_path == *p
+                || member
+                    .logical_path
+                    .strip_prefix(p)
+                    .is_some_and(|s| s.starts_with('/'))
+        }) {
+            return Ok(None);
+        }
+    }
+    Ok(cursor
+        .stream_eof_offset()
+        .filter(|off| len.saturating_sub(*off) >= 1024))
+}
+
 /// Read-only walker over last-window TAR headers (no index inserts / sparse maps).
 pub struct TarMemberCursor<R> {
     reader: R,
@@ -522,6 +552,8 @@ pub struct UstarMember<'a> {
     pub uid: u32,
     pub gid: u32,
     pub mtime: u64,
+    /// Raw SCHILY PAX values; binary bytes are preserved by record lengths.
+    pub xattrs: &'a [(String, Vec<u8>)],
 }
 
 /// Body of a [`UstarMember`].
@@ -535,6 +567,8 @@ pub enum UstarPayload<'a> {
     FileOnDisk {
         path: &'a Path,
         size: u64,
+        /// Optional digest output, populated only after the complete payload is written.
+        sha256: Option<&'a std::sync::Mutex<Option<String>>>,
     },
     Directory,
     Symlink {
@@ -881,6 +915,7 @@ fn write_member_headers<W: Write>(
         || need_pax_uid
         || need_pax_gid
         || need_pax_mtime
+        || !member.xattrs.is_empty()
     {
         let mut pax_body = Vec::new();
         if need_pax_path {
@@ -910,6 +945,15 @@ fn write_member_headers<W: Write>(
         if need_pax_mtime {
             mtime_txt = member.mtime.to_string();
             pax_body.extend(encode_pax_record("mtime", mtime_txt.as_bytes())?);
+        }
+        for (name, value) in member.xattrs {
+            if name.contains(['=', '\0', '\n']) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid xattr name",
+                ));
+            }
+            pax_body.extend(encode_pax_record(&format!("SCHILY.xattr.{name}"), value)?);
         }
         let pax_name = pax_header_name(path);
         write_raw_ustar_header(
@@ -962,12 +1006,19 @@ fn write_member_body<W: Write>(out: &mut W, member: &UstarMember<'_>) -> io::Res
             out.write_all(bytes)?;
             write_padding(out, bytes.len() as u64)
         }
-        UstarPayload::FileOnDisk { path, size } => write_file_on_disk(out, path, size),
+        UstarPayload::FileOnDisk { path, size, sha256 } => {
+            write_file_on_disk(out, path, size, sha256)
+        }
         UstarPayload::Directory | UstarPayload::Symlink { .. } => Ok(()),
     }
 }
 
-fn write_file_on_disk<W: Write>(out: &mut W, path: &Path, size: u64) -> io::Result<()> {
+fn write_file_on_disk<W: Write>(
+    out: &mut W,
+    path: &Path,
+    size: u64,
+    sha256: Option<&std::sync::Mutex<Option<String>>>,
+) -> io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     // WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no nofollow bit
@@ -978,19 +1029,46 @@ fn write_file_on_disk<W: Write>(out: &mut W, path: &Path, size: u64) -> io::Resu
         opts.custom_flags(libc::O_NOFOLLOW);
     }
     let f = opts.open(path)?;
-    if size > 0 {
-        let n = io::copy(&mut f.take(size), out)?;
-        if n != size {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "overlay file {} ended after {n} bytes, expected {size}",
-                    path.display()
-                ),
-            ));
-        }
+    let (n, digest) = if sha256.is_some() {
+        let mut tee = HashingCopy {
+            input: f.take(size),
+            out: &mut *out,
+            copied: 0,
+        };
+        let digest = ratarmount_index::sha256_hex_stream(&mut tee).map_err(io::Error::other)?;
+        (tee.copied, Some(digest))
+    } else {
+        (io::copy(&mut f.take(size), out)?, None)
+    };
+    if n != size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "overlay file {} ended after {n} bytes, expected {size}",
+                path.display()
+            ),
+        ));
+    }
+    if let Some(sha256) = sha256 {
+        *sha256.lock().expect("TAR payload digest") = digest;
     }
     write_padding(out, size)
+}
+
+/// Hash the same payload bytes sent to the archive writer, excluding TAR padding.
+struct HashingCopy<'a, R, W> {
+    input: R,
+    out: &'a mut W,
+    copied: u64,
+}
+
+impl<R: Read, W: Write> Read for HashingCopy<'_, R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.input.read(buf)?;
+        self.out.write_all(&buf[..n])?;
+        self.copied += n as u64;
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -1003,8 +1081,47 @@ mod tests {
 
     use crate::SqliteIndexedTar;
 
+    /// Regression: SCHILY values are binary PAX records, not lossy UTF-8 strings.
+    #[test]
+    fn regression_provenance_pax_binary_values() {
+        let attrs = vec![("user.binary".into(), vec![255, 0, b'\n', b'='])];
+        let mut member = member_file("trace", b"payload");
+        member.xattrs = &attrs;
+        let bytes = pack(&[member]);
+        assert_eq!(bytes[156], b'x');
+        let size = parse_octal(&bytes[124..136]).unwrap() as usize;
+        let parsed = parse_pax_records(&bytes[512..512 + size]);
+        assert_eq!(parsed.fs_xattrs["user.binary"], attrs[0].1);
+    }
+
+    /// Regression: streamed manifest hashes must exclude padding and refuse short payloads.
+    #[test]
+    fn regression_provenance_streamed_payload_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload");
+        std::fs::write(&path, b"payload").unwrap();
+        let digest = std::sync::Mutex::new(None);
+        let member = UstarMember {
+            path: "payload",
+            payload: UstarPayload::FileOnDisk {
+                path: &path,
+                size: 7,
+                sha256: Some(&digest),
+            },
+            ..member_file("payload", b"")
+        };
+        let bytes = pack(&[member]);
+        assert_eq!(&bytes[512..519], b"payload");
+        let expected = ratarmount_index::sha256_hex_stream(&mut &b"payload"[..]).unwrap();
+        assert_eq!(*digest.lock().unwrap(), Some(expected));
+        *digest.lock().unwrap() = None;
+        assert!(write_file_on_disk(&mut Vec::new(), &path, 8, Some(&digest)).is_err());
+        assert!(digest.lock().unwrap().is_none());
+    }
+
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,
@@ -1014,8 +1131,53 @@ mod tests {
         }
     }
 
+    /// Regression: append boundary must not eat zero-filled member payloads.
+    #[test]
+    fn append_offset_preserves_zero_tail_payload() {
+        let payload = vec![0; 8192];
+        let bytes = pack(&[member_file("old", &payload)]);
+        let touched = HashSet::from(["new".to_string()]);
+        assert_eq!(
+            tar_append_offset(&mut std::io::Cursor::new(&bytes), &touched, "utf-8").unwrap(),
+            Some(512 + 8192)
+        );
+        let replaced = HashSet::from(["old".to_string()]);
+        assert_eq!(
+            tar_append_offset(&mut std::io::Cursor::new(&bytes), &replaced, "utf-8").unwrap(),
+            None
+        );
+        assert_eq!(
+            tar_append_offset(
+                &mut std::io::Cursor::new(&bytes[..bytes.len() - 1024]),
+                &touched,
+                "utf-8"
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    /// Regression: a name after an interior TAR EOF is a replacement, not an add.
+    #[test]
+    fn append_offset_detects_concatenated_replacement() {
+        let mut bytes = pack(&[member_file("first", b"first")]);
+        bytes.extend(pack(&[member_file("dir/last", b"last")]));
+        for path in ["dir/last", "dir"] {
+            assert_eq!(
+                tar_append_offset(
+                    &mut std::io::Cursor::new(&bytes),
+                    &HashSet::from([path.to_string()]),
+                    "utf-8"
+                )
+                .unwrap(),
+                None
+            );
+        }
+    }
+
     fn member_dir(path: &str) -> UstarMember<'_> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::Directory,
             mode: 0o755,
@@ -1027,6 +1189,7 @@ mod tests {
 
     fn member_symlink<'a>(path: &'a str, target: &'a str) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::Symlink { target },
             mode: 0o777,
@@ -1248,8 +1411,10 @@ mod tests {
         std::fs::write(&real, payload).unwrap();
 
         let on_disk = UstarMember {
+            xattrs: &[],
             path: "copied.txt",
             payload: UstarPayload::FileOnDisk {
+                sha256: None,
                 path: &real,
                 size: payload.len() as u64,
             },
@@ -1267,8 +1432,10 @@ mod tests {
             let link = dir.path().join("link.txt");
             std::os::unix::fs::symlink(&real, &link).unwrap();
             let sneaky = [UstarMember {
+                xattrs: &[],
                 path: "escaped.txt",
                 payload: UstarPayload::FileOnDisk {
+                    sha256: None,
                     path: &link,
                     size: payload.len() as u64,
                 },
@@ -1594,6 +1761,7 @@ mod tests {
         let gid = uid + 1;
         let mtime = octal_digit_max(11) + 1;
         let member = UstarMember {
+            xattrs: &[],
             path: "wide.bin",
             payload: UstarPayload::File { bytes: b"x" },
             mode: 0o644,

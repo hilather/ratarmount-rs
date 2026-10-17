@@ -62,8 +62,8 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     # NFSv4.1 via embednfs. Packages.yml installs rustup stable (rustc ≥ 1.88
     # assumed). If a macOS builder is ever pinned below 1.88, drop this feature
     # and document in docs/packaging.md.
-    echo "==> cargo build --release -p ratarmount --features nfsv4,sftp-russh"
-    cargo build --release -p ratarmount --features nfsv4,sftp-russh
+    echo "==> cargo build --release -p ratarmount --features nfsv4,sftp-russh,bittorrent"
+    cargo build --release -p ratarmount --features nfsv4,sftp-russh,bittorrent
 fi
 test -x target/release/ratarmount
 

@@ -1,15 +1,20 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/librqbit"]
 members = [
     "ratarmount",
     "ratarmount-core",
     "ratarmount-index",
     "ratarmount-session",
+    "ratarmount-python",
+    "ratarmount-volume-plugin",
+    "ratarmount-csi",
     "ratarmount-fuse",
     "ratarmount-compress",
     "ratarmount-formats-tar",
     "ratarmount-formats-zip",
     "ratarmount-formats-ar",
+    "ratarmount-formats-tensors",
     "ratarmount-formats-cpio",
     "ratarmount-formats-iso9660",
     "ratarmount-formats-warc",
@@ -63,6 +68,7 @@ ratarmount-compress = { path = "ratarmount-compress" }
 ratarmount-formats-tar = { path = "ratarmount-formats-tar" }
 ratarmount-formats-zip = { path = "ratarmount-formats-zip" }
 ratarmount-formats-ar = { path = "ratarmount-formats-ar" }
+ratarmount-formats-tensors = { path = "ratarmount-formats-tensors" }
 ratarmount-formats-cpio = { path = "ratarmount-formats-cpio" }
 ratarmount-formats-iso9660 = { path = "ratarmount-formats-iso9660" }
 ratarmount-formats-warc = { path = "ratarmount-formats-warc" }

@@ -1,0 +1,6 @@
+.cache/
+__pycache__/
+# CSV snapshots are small and intentionally reviewable; fixtures stay in .cache.
+
+# Short private sandbox state; retained only if cleanup fails.
+.s????????/

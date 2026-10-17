@@ -1,6 +1,11 @@
 //! Core types and the `MountSource` trait (mirrors Python `ratarmountcore.mountsource`).
 
+mod atomic_update;
+mod attribute_mapping;
+pub mod budget;
 mod quiet_print;
+pub use atomic_update::{try_update_u64, try_update_usize};
+pub use attribute_mapping::AttributeMapping;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -8,6 +13,37 @@ use std::io::{self, Read, Seek};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// When a torrent may contact peers, trackers and the DHT.
+///
+/// The default is [`Self::Never`]: no peer, tracker, DHT or LSD traffic unless
+/// the user opts in with `auto`, `lan` or `always`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TorrentSwarmPolicy {
+    /// Fall back to the public swarm (DHT and trackers) when the cache, metadata
+    /// sources and web seeds cannot serve a request.
+    Auto,
+    /// Start the swarm at mount time.
+    Always,
+    /// Discover peers only on the LAN, before trying web seeds.
+    Lan,
+    /// Cache, `xs` metainfo and web seeds only; never open a peer socket.
+    #[default]
+    Never,
+}
+
+impl std::str::FromStr for TorrentSwarmPolicy {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            "lan" => Ok(Self::Lan),
+            "never" => Ok(Self::Never),
+            _ => Err("expected auto, always, lan or never".into()),
+        }
+    }
+}
 
 /// Whole-sidecar blob cap (bytes).
 ///
@@ -508,6 +544,21 @@ pub struct OpenOptions {
     pub gnu_incremental: Option<bool>,
     /// Decompression parallelization matrix (Python `-P backend:n` / integer default).
     pub parallelization: ParallelizationSpec,
+    /// Remote torrent piece readahead in bytes (zero disables HTTP prefetch).
+    pub readahead_bytes: u64,
+    pub torrent_swarm: TorrentSwarmPolicy,
+    /// Maximum scratch bytes written by one torrent swarm session.
+    pub torrent_scratch_bytes: u64,
+    /// Local service discovery is used only while a swarm session is active.
+    pub torrent_lsd: bool,
+    /// Opt in to uploads of verified pieces until the source is dropped.
+    pub torrent_seed: bool,
+    pub torrent_seed_upload_limit: u32,
+    pub torrent_listen_port: u16,
+    /// Speculative decoded zstd bytes per reader; zero disables decode-ahead.
+    pub zstd_readahead_bytes: u64,
+    /// Drop consumed local archive pages where the backend supports advice.
+    pub direct_io: bool,
     /// Character encoding for TAR (and similar) member names (`-e` / `--encoding`).
     pub encoding: String,
     pub gzip_seek_point_spacing: u64,
@@ -519,6 +570,12 @@ pub struct OpenOptions {
     pub read_only_index: bool,
     /// Force folder index usage (`--force-folder-index`); folders still bind-mount live.
     pub force_folder_index: bool,
+    /// Select a committed Git tree instead of the live working directory.
+    pub git: bool,
+    pub git_ref: Option<String>,
+    pub git_prefix: Option<String>,
+    /// Expose a history-free `.git` backed by the synthetic repository cache.
+    pub git_synthetic_head: bool,
     /// Content hash algorithms to compute and store as index xattrs (`--hashes`).
     /// Values match Python CLI names, e.g. `crc32`, `md5`, `sha1`, `sha256`.
     pub hashes: Vec<String>,
@@ -543,12 +600,25 @@ impl Default for OpenOptions {
             ignore_zeros: false,
             gnu_incremental: None,
             parallelization: ParallelizationSpec::default(),
+            readahead_bytes: 0,
+            torrent_swarm: TorrentSwarmPolicy::default(),
+            torrent_scratch_bytes: 2 * 1024 * 1024 * 1024,
+            torrent_lsd: true,
+            torrent_seed: false,
+            torrent_seed_upload_limit: 1024 * 1024,
+            torrent_listen_port: 0,
+            zstd_readahead_bytes: 16 * 1024 * 1024,
+            direct_io: false,
             encoding: "utf-8".into(),
             gzip_seek_point_spacing: 16 * 1024 * 1024,
             passwords: Vec::new(),
             use_backends: Vec::new(),
             read_only_index: false,
             force_folder_index: false,
+            git: false,
+            git_ref: None,
+            git_prefix: None,
+            git_synthetic_head: false,
             hashes: Vec::new(),
             index_build: IndexBuildHooks::default(),
         }
@@ -578,6 +648,13 @@ impl fmt::Debug for OpenOptions {
             .field("ignore_zeros", &self.ignore_zeros)
             .field("gnu_incremental", &self.gnu_incremental)
             .field("parallelization", &self.parallelization)
+            .field("readahead_bytes", &self.readahead_bytes)
+            .field("torrent_swarm", &self.torrent_swarm)
+            .field("torrent_scratch_bytes", &self.torrent_scratch_bytes)
+            .field("torrent_lsd", &self.torrent_lsd)
+            .field("torrent_seed", &self.torrent_seed)
+            .field("torrent_seed_upload_limit", &self.torrent_seed_upload_limit)
+            .field("torrent_listen_port", &self.torrent_listen_port)
             .field("encoding", &self.encoding)
             .field("gzip_seek_point_spacing", &self.gzip_seek_point_spacing)
             .field(
@@ -587,6 +664,10 @@ impl fmt::Debug for OpenOptions {
             .field("use_backends", &self.use_backends)
             .field("read_only_index", &self.read_only_index)
             .field("force_folder_index", &self.force_folder_index)
+            .field("git", &self.git)
+            .field("git_ref", &self.git_ref)
+            .field("git_prefix", &self.git_prefix)
+            .field("git_synthetic_head", &self.git_synthetic_head)
             .field("hashes", &self.hashes)
             .field("index_build", &self.index_build)
             .finish()
@@ -597,6 +678,19 @@ impl fmt::Debug for OpenOptions {
 pub trait ArchiveRead: Read + Seek + Send {}
 
 impl<T: Read + Seek + Send> ArchiveRead for T {}
+
+/// Contiguous, uncompressed bytes in an open host file.
+///
+/// The descriptor pins the file even if its pathname is replaced. A whole-file
+/// extent (`offset == 0`, `len == file.metadata().len()`) can back kernel I/O
+/// directly, including completed cache files. A subrange needs a separate file
+/// starting at byte zero before it can be used for FUSE passthrough.
+#[derive(Debug)]
+pub struct BackingExtent {
+    pub file: std::fs::File,
+    pub offset: u64,
+    pub len: u64,
+}
 
 /// Generic mount point API (sync, FUSE-friendly). Paths use a leading `/`.
 pub trait MountSource: Send + Sync {
@@ -663,6 +757,20 @@ pub trait MountSource: Send + Sync {
     }
 
     fn open(&self, file_info: &FileInfo, buffering: i32) -> io::Result<Box<dyn ArchiveRead>>;
+
+    /// Whether this source can supply backing extents for any regular files.
+    /// This conservative hint avoids negotiating kernel stacking limits for
+    /// sources which can never use passthrough. Wrappers forward the hint.
+    fn supports_backing_extents(&self) -> bool {
+        false
+    }
+
+    /// Optional backing for regular file bytes. Compressed, sparse, generated,
+    /// or otherwise transformed content must return `None`. Errors discovering
+    /// an extent also return `None`; callers retain the ordinary read path.
+    fn backing_extent(&self, _fi: &FileInfo) -> Option<BackingExtent> {
+        None
+    }
 
     /// When false, the body from [`Self::open`] is a progressive/compressed
     /// stream: mid/tail seeks fully decompress the member. Default is cheap
@@ -841,6 +949,26 @@ mod tests {
         assert_eq!(&buf, b"abcd");
     }
 
+    /// Regression: packaged builds joined the public DHT/tracker swarm without
+    /// the user asking because the default policy was `auto`.
+    #[test]
+    fn regression_torrent_swarm_default_never() {
+        assert_eq!(TorrentSwarmPolicy::default(), TorrentSwarmPolicy::Never);
+        assert_eq!(
+            OpenOptions::default().torrent_swarm,
+            TorrentSwarmPolicy::Never
+        );
+        for (text, policy) in [
+            ("auto", TorrentSwarmPolicy::Auto),
+            ("always", TorrentSwarmPolicy::Always),
+            ("lan", TorrentSwarmPolicy::Lan),
+            ("never", TorrentSwarmPolicy::Never),
+        ] {
+            assert_eq!(text.parse::<TorrentSwarmPolicy>(), Ok(policy));
+        }
+        assert!("public".parse::<TorrentSwarmPolicy>().is_err());
+    }
+
     #[test]
     fn parallelization_plain_int() {
         let p = ParallelizationSpec::parse("8").unwrap();
@@ -918,7 +1046,8 @@ mod tests {
         );
     }
 
-    /// Regression: default list_dirents derives from list_mode with size=0.
+    /// Regression: default list_dirents derives from list_mode with size=0;
+    /// backends without an extent implementation must not opt into passthrough.
     #[test]
     fn regression_default_list_dirents_size_zero() {
         struct Dummy;
@@ -956,6 +1085,8 @@ mod tests {
                 true
             }
         }
+        assert!(Dummy.backing_extent(&create_root_file_info()).is_none());
+        assert!(!Dummy.supports_backing_extents());
         let dents = Dummy.list_dirents("/").expect("dirents");
         assert_eq!(dents.len(), 1);
         assert_eq!(dents[0].name, "a");

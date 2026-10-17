@@ -53,6 +53,60 @@ fn fuse_rename_cached_source_to_uncached_name_stays_fresh() {
 /// Mount the fixture with `-w`, run `cases(<mnt>/d, <overlay dir>)` with a
 /// deadline, and unmount. A stuck case lazy-unmounts and SIGKILLs the daemon.
 fn with_mount(prefix: &str, cases: fn(&Path, &Path)) {
+    with_mount_options(prefix, cases, &[]);
+}
+
+/// Regression: sandbox policies must preserve EROFS and EDQUOT through kernel FUSE requests.
+#[test]
+fn fuse_sandbox_readonly_and_quota() {
+    with_mount_options(
+        "rrs-sandbox-",
+        |d, _| {
+            use std::io::Write;
+            let mnt = d.parent().unwrap();
+            let error = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(mnt.join("t/x"))
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EROFS));
+            let mut file = File::create(mnt.join("output")).unwrap();
+            let error = file.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EDQUOT));
+        },
+        &["--overlay-readonly", "t/**", "--overlay-quota", "1M"],
+    );
+}
+
+/// Regression: uid/gid/umask mapping must reach stat(2) for archive and overlay files.
+#[test]
+fn fuse_sandbox_mapped_owners() {
+    with_mount_options(
+        "rrs-sandbox-owner-",
+        |directory, _| {
+            use std::os::unix::fs::MetadataExt;
+            let root = directory.parent().unwrap();
+            for path in [
+                root.to_path_buf(),
+                directory.to_path_buf(),
+                directory.join("a1"),
+            ] {
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                assert_eq!((metadata.uid(), metadata.gid()), (12345, 23456));
+                assert_eq!(metadata.mode() & 0o027, 0);
+            }
+            let created = root.join("mapped-new");
+            fs::write(&created, "payload").unwrap();
+            let metadata = fs::metadata(created).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), (12345, 23456));
+            assert_eq!(metadata.mode() & 0o027, 0);
+        },
+        &["-o", "uid=12345,gid=23456,umask=027"],
+    );
+}
+
+fn with_mount_options(prefix: &str, cases: fn(&Path, &Path), options: &[&str]) {
     if let Some(msg) = skip_reason() {
         eprintln!("{msg}");
         return;
@@ -70,7 +124,7 @@ fn with_mount(prefix: &str, cases: fn(&Path, &Path)) {
     let mnt = mnt_raw.canonicalize().expect("canonicalize mnt");
     let daemon_log = root.join("daemon.log");
 
-    let mut guard = MountGuard::spawn(&ratarmount_bin(), &ov, &tar, &mnt, &daemon_log);
+    let mut guard = MountGuard::spawn(&ratarmount_bin(), &ov, &tar, &mnt, &daemon_log, options);
     if let Err(e) = guard.wait_mounted() {
         panic!("{e}");
     }
@@ -415,11 +469,13 @@ fn build_fixture(root: &Path) -> PathBuf {
     fs::write(src.join("s1"), "stable-one-1\n").expect("s1");
     fs::write(src.join("s2"), "stable-two-2\n").expect("s2");
     fs::write(src.join("s3"), "stable-three\n").expect("s3");
+    fs::create_dir_all(root.join("src/t")).unwrap();
+    fs::write(root.join("src/t/seed"), b"protected").unwrap();
     let tar = root.join("a.tar");
     let status = Command::new("tar")
         .args(["-C", root.join("src").to_str().expect("src utf8"), "-cf"])
         .arg(&tar)
-        .arg("d")
+        .args(["d", "t"])
         .status()
         .expect("spawn tar");
     assert!(status.success(), "tar -cf failed: {status}");
@@ -441,9 +497,17 @@ impl Drop for MountGuard {
 }
 
 impl MountGuard {
-    fn spawn(bin: &Path, ov: &Path, tar: &Path, mnt: &Path, log_path: &Path) -> Self {
+    fn spawn(
+        bin: &Path,
+        ov: &Path,
+        tar: &Path,
+        mnt: &Path,
+        log_path: &Path,
+        options: &[&str],
+    ) -> Self {
         let log = File::create(log_path).expect("daemon log");
         let daemon = Command::new(bin)
+            .args(options)
             .arg("-f")
             .arg("-w")
             .arg(ov)

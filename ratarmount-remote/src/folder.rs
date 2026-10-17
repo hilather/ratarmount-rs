@@ -734,10 +734,10 @@ fn webdav_url_with_userinfo(url: &str, loc: &WebDavLocation) -> String {
 }
 
 fn apply_http_headers(
-    mut req: ureq::Request,
+    mut req: crate::http_pool::HttpRequest,
     auth: Option<&HttpAuth>,
     cookie: Option<&str>,
-) -> ureq::Request {
+) -> crate::http_pool::HttpRequest {
     if let Some(a) = auth {
         req = req.set("Authorization", &a.authorization_header());
     }
@@ -754,7 +754,11 @@ fn http_head_content_type(
     auth: Option<&HttpAuth>,
     cookie: Option<&str>,
 ) -> Result<Option<String>> {
-    let req = apply_http_headers(ureq::head(url).set("User-Agent", USER_AGENT), auth, cookie);
+    let req = apply_http_headers(
+        crate::http_pool::head(url).set("User-Agent", USER_AGENT),
+        auth,
+        cookie,
+    );
     match req.call() {
         Ok(resp) => Ok(resp.header("Content-Type").map(|s| s.to_string())),
         Err(ureq::Error::Status(_, resp)) => Ok(resp.header("Content-Type").map(|s| s.to_string())),
@@ -765,7 +769,11 @@ fn http_head_content_type(
 const HTTP_INDEX_BODY_CAP: u64 = 1024 * 1024;
 
 fn http_get_body(url: &str, auth: Option<&HttpAuth>, cookie: Option<&str>) -> Result<String> {
-    let req = apply_http_headers(ureq::get(url).set("User-Agent", USER_AGENT), auth, cookie);
+    let req = apply_http_headers(
+        crate::http_pool::get(url).set("User-Agent", USER_AGENT),
+        auth,
+        cookie,
+    );
     let resp = req.call().map_err(|e| RemoteError::Http(e.to_string()))?;
     if !(200..300).contains(&resp.status()) {
         return Err(RemoteError::Http(format!(

@@ -440,7 +440,7 @@ fn probe_dropbox_download(
         "dropbox probe POST {} Dropbox-API-Arg={} Range=bytes=0-0 (token redacted)",
         api_url, api_arg
     );
-    let resp = match ureq::post(api_url)
+    let resp = match crate::http_pool::post(api_url)
         .set("User-Agent", USER_AGENT)
         .set("Authorization", &auth)
         .set("Dropbox-API-Arg", &api_arg)
@@ -581,7 +581,7 @@ fn fetch_dropbox_full_body(
         api_url, api_arg
     );
 
-    let resp = match ureq::post(api_url)
+    let resp = match crate::http_pool::post(api_url)
         .set("User-Agent", USER_AGENT)
         .set("Authorization", &auth)
         .set("Dropbox-API-Arg", &api_arg)
@@ -649,7 +649,7 @@ fn dropbox_download_request(
         api_url, api_arg, range
     );
 
-    let mut req = ureq::post(api_url)
+    let mut req = crate::http_pool::post(api_url)
         .set("User-Agent", USER_AGENT)
         .set("Authorization", &auth)
         .set("Dropbox-API-Arg", &api_arg)
@@ -786,7 +786,7 @@ fn metadata_url(rpc_base: &str) -> String {
 fn dropbox_rpc_post(url: &str, token: &str, body: &str) -> Result<String> {
     let auth = format!("Bearer {token}");
     debug!("dropbox RPC POST {url} body={body} (token redacted)");
-    let resp = ureq::post(url)
+    let resp = crate::http_pool::post(url)
         .set("User-Agent", USER_AGENT)
         .set("Authorization", &auth)
         .set("Content-Type", "application/json")

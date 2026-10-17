@@ -34,14 +34,34 @@ cat mnt/file     # true random access — even inside compressed streams
 |---|---|
 | **~5.2× faster cold mounts** | Index + mount in a fraction of the Python baseline (~6.8× warm) |
 | **~4–6.5× lower peak RSS** | Typical **18–22 MiB** vs ~121 MiB for Python ratarmount |
-| **One binary** | No interpreter, no wheel hell — deb / rpm / portable tarballs / macOS arm64 (Homebrew tap cask) |
+| **One binary** | CLI needs no interpreter — deb / rpm / portable tarballs / macOS arm64 (Homebrew tap cask) |
 | **Shared SQLite index** | Interoperable 0.7.x schema with upstream for TAR / ZIP / 7z. Portable blob media type `application/vnd.ratarmount.index.v1+sqlite` (not SOCI); auto-discover via `{url}.index.ptr` + `{url}.index.{id}.sqlite`, archive `Link:`, http(s)/S3/GCS/Azure well-known sibling, OCI referrer on local miss; `--publish-index` always writes `{archive}.index.ptr`; remount a previous snapshot with `--index-id HEX` |
 | **Nested without `/tmp`** | Most embedded archives open from the parent stream — no spool |
-| **Remote-first** | `http(s)`, S3, GCS, Azure, FTP, SSH, OCI, IPFS, rclone, WebDAV, SMB, Dropbox, local restic repos (`restic:/abs/path`) |
+| **Remote-first** | `hf://`, offline `hf-cache://`, `magnet:` / `.torrent` (package builds; peer discovery off by default), `http(s)`, S3, GCS, Azure, FTP, SSH, OCI, IPFS, rclone, WebDAV, SMB, Dropbox, local restic repos (`restic:/abs/path`) |
 
 > Prefer Python when you need rapidgzip-class throughput or the widest fsspec surface. Prefer **Rust** when mounts are frequent, memory is tight, or you want a static-friendly binary.
 
 Full methodology and fixtures: [benchmarks/python-vs-rust-results.md](benchmarks/python-vs-rust-results.md) · harness: [benchmarks/compare-python-vs-rust.sh](benchmarks/compare-python-vs-rust.sh) · re-run: `BIG=1 ./benchmarks/compare-python-vs-rust.sh`
+
+---
+
+## Local AI
+
+Use indexed model files, reproducible repository snapshots, and dataset shards
+without unpacking a separate copy for every experiment or agent attempt.
+Start with the [Local AI guide](docs/local-ai/index.md):
+
+Try it on a real dataset: [Oxford-IIIT Pet as indexed WebDataset shards](https://huggingface.co/datasets/RealMattbrewer/oxford-iiit-pet-webdataset)
+mounts straight from the Hub with `ratarmount -r hf://datasets/RealMattbrewer/oxford-iiit-pet-webdataset pets/`.
+
+- [SWE-bench / mini-swe-agent sandboxes](docs/recipes/swe-bench-sandboxes.md): protect tests and export patches.
+- [OpenHands / SWE-smith rootfs](docs/recipes/sandbox-rootfs.md): combine an image and a repository.
+- [vLLM / llama.cpp models](docs/recipes/local-models.md): lazy remote reads and tensor inspection.
+- [WebDataset / img2dataset shards](docs/recipes/webdataset-shards.md): pack, index, and stream samples.
+- [Teacher logits](docs/recipes/teacher-logits.md), [Common Crawl WARC](docs/recipes/common-crawl-warc.md), and [checkpoint archives](docs/recipes/checkpoint-archives.md).
+- [Python library](docs/python.md): member reads, mmap, fsspec, torch, and WebDataset without FUSE.
+- [Sandbox controls and supervisor](docs/sandbox.md): quotas, read-only paths, RAM overlays, and a Python client.
+- [Hugging Face sources and publishing](docs/remote-hf.md): pinned revisions, offline snapshots, and shared caches.
 
 ---
 
@@ -67,6 +87,10 @@ mkdir -p "$(brew --repo hilather/ratarmount)/Casks"
 cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
 brew install --cask hilather/ratarmount/ratarmount
 ```
+
+Portable Linux tarballs now vendor OpenSSL statically. AUR, Nix flake, conda,
+and Homebrew core formula contributions are **drafts, not published**; see
+[additional package drafts](docs/packaging.md#additional-package-drafts).
 
 See [`docs/packaging.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) for verification and package layout. macOS FUSE + cask: [`docs/macos.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md).
 
@@ -162,9 +186,9 @@ ratarmount --nfs archive.tar.gz
 #   Linux: mount -t nfs -o vers=4.1,tcp,port=20490,sec=sys 127.0.0.1:/ mnt
 # Loopback kernel client verified via privileged Docker (./test-harness/nfs-docker/run.sh).
 # Uncompressed TAR or .tar.zst: --commit-overlay-on-exit / --commit-overlay-interval (durable -w).
-# Last-frame rewrite (does not recompress the prefix). Persist still copies the compressed
-# prefix. On-disk sidecar is patched so remount does not rescan prefix frames.
-# Plan 2× compressed disk headroom.
+# Last-frame rewrite does not recompress the prefix; copy mode uses reflink/kernel copy
+# where supported. Eligible add-only commits can opt into journaled append.
+# Copy fallback needs 2× compressed disk headroom. Sidecars are patched for warm remounts.
 # Never refuses on size; warns when the last zstd frame is larger than 64 MiB
 # uncompressed. Gzip stays rejected. Live ticks reject prefix-frame mutate;
 # offline --commit-overlay splices .tar.zst from the affected frame.
@@ -172,7 +196,8 @@ ratarmount --nfs archive.tar.gz
 # HPC / systemd / autofs (RO). Helper argv has no secrets — inherit AWS_* / RESTIC_*.
 # s3://bucket/dataset.tar.zst  /mnt/archives/dataset  fuse.ratarmount  ro,allow_other,_netdev,x-systemd.mount-timeout=infinity  0  0
 # Type=fuse.ratarmount → /usr/sbin/mount.fuse.ratarmount
-# CSI is spec-only (separate repo). See docs/systemd-mount.md · docs/csi.md
+# In-tree CSI node driver: ratarmount-csi (separate binary, not in default packages).
+# See docs/systemd-mount.md · docs/csi.md
 
 # Unmount
 ratarmount -u mnt/
@@ -187,7 +212,7 @@ ratarmount --print-features
 
 ### Archives & disk images
 
-TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · UDF (NSR02/NSR03; mixed-disc before ISO) · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · exFAT · NTFS (read-only; LZNT1/EFS residual) · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · UDIF DMG (inner FAT/ISO/exFAT/NTFS; HFS+/APFS residual) · WIM (uncompressed + XPRESS, first image; LZX/LZMS residual) · QCOW2 v2/v3 (zlib clusters; local backing; zstd residual) · VHD/VHDX (differencing residual) · VMDK (KDMV sparse; compressed/ESXi residual) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
+TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · UDF (NSR02/NSR03; mixed-disc before ISO) · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · exFAT · NTFS (read-only; LZNT1/EFS residual) · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · UDIF DMG (inner FAT/ISO/exFAT/NTFS; HFS+/APFS residual) · WIM (uncompressed + XPRESS, first image; LZX/LZMS residual) · QCOW2 v2/v3 (zlib clusters; local backing; zstd residual) · VHD/VHDX (differencing residual) · VMDK (KDMV sparse; compressed/ESXi residual) · SQLAR · PDF · OGG · HTML · Git · safetensors / GGUF v2–v3 (little-endian GGUF; tensor byte ranges + JSON metadata; [guide](docs/formats-tensors.md)) · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
 
 ### Seekable compression
 
@@ -200,24 +225,52 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | Recursive automount (`-r`) | Nested open **without `/tmp`** for most stencil formats — [guide](docs/embedded-nested-archives.md) |
 | Lazy mount (`-l`) | Open nested archives on first access — preferred for huge trees |
 | Union of sources | Directory wins over symlink; optional multi-hop resolve |
-| Write overlay (`-w`, `:temp:`) | Full overlay + offline `--commit-overlay` (gzip/bzip2/xz TAR + ZIP + `.tar.zst` splice including earlier-frame delete). A missing uncompressed `.tar` or `.tar.zst` is created as an empty archive when `-w` is set (single local path). The overlay folder keeps a `.ratarmount-overlay.used` marker (leave it in place; the older name `.ratarmount.overlay.sqlite.used` is still honored): a marked folder whose `.ratarmount.overlay.sqlite` is missing (or is a directory), or a database without its `files` table, is refused for mounting and `--commit-overlay` instead of recreated, because recreating it would drop every deletion. To discard that overlay's deletions on purpose, remove the marker; the error message names every marker present. The database and marker names are hidden in the mount and cannot be created, deleted or renamed through it (permission denied), at any depth and ignoring ASCII case; an archive member with one of these names is hidden too, at any depth inside the archive. An overlay from an older build gets the marker on its first open (and its legacy marker is removed); deleting its database before that is not detected. Offline `--commit-overlay` create-if-missing is uncompressed `.tar` only. Live `--commit-overlay-on-exit` / `--commit-overlay-interval` for uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed prefix; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` / discarded sidecar still full-rebuild; 2× compressed disk headroom). Interval commits files that have not been modified for `DURATION` (still-hot writes, including files still open for write, stay in the overlay). Gzip stays rejected. Live ticks reject prefix-frame `.tar.zst` mutate; offline `--commit-overlay` is the escape hatch. Warns when the last zstd frame is larger than 64 MiB uncompressed. |
+| Write overlay (`-w`, `:temp:`) | Full overlay + offline `--commit-overlay` (gzip/bzip2/xz TAR + ZIP + `.tar.zst` splice including earlier-frame delete). A missing uncompressed `.tar` or `.tar.zst` is created as an empty archive when `-w` is set (single local path). The overlay folder keeps a `.ratarmount-overlay.used` marker (leave it in place; the older name `.ratarmount.overlay.sqlite.used` is still honored): a marked folder whose `.ratarmount.overlay.sqlite` is missing (or is a directory), or a database without its `files` table, is refused for mounting and `--commit-overlay` instead of recreated, because recreating it would drop every deletion. To discard that overlay's deletions on purpose, remove the marker; the error message names every marker present. The database and marker names are hidden in the mount and cannot be created, deleted or renamed through it (permission denied), at any depth and ignoring ASCII case; an archive member with one of these names is hidden too, at any depth inside the archive. An overlay from an older build gets the marker on its first open (and its legacy marker is removed); deleting its database before that is not detected. Offline `--commit-overlay` create-if-missing is uncompressed `.tar` only. Live `--commit-overlay-on-exit` / `--commit-overlay-interval` for uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; default copy mode uses reflink / `copy_file_range` with a streaming-copy fallback; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` / discarded sidecar still full-rebuild; copy fallback needs 2× compressed disk headroom). Interval commits files that have not been modified for `DURATION` (still-hot writes, including files still open for write, stay in the overlay). Gzip stays rejected. Live ticks reject prefix-frame `.tar.zst` mutate; offline `--commit-overlay` is the escape hatch. Warns when the last zstd frame is larger than 64 MiB uncompressed. |
+| Git snapshots | `--git`, `--git-ref REV` / `repo@REV`, `--git-prefix`, and `--git-synthetic-head` (one history-free commit; overlay makes edits private); `corpus` mounts a manifest of pinned repos — [guide](docs/git-mounts.md) |
+| Sandbox policy | `--overlay-readonly GLOBS`, `--overlay-quota SIZE`, `--overlay-quota-files N`; `-o uid=,gid=,umask=`; Linux `--sandbox` / `--overlay-tmpfs[=SIZE]`; `--bind /PATH=SOURCE` — [guide](docs/sandbox.md) |
+| Overlay inspection | `overlay-stats OVERLAY [--json]`; `diff OVERLAY --base SOURCE [--git]` exports changes without FUSE; `sandbox daemon\|new\|list\|destroy` manages attempts, with a standard-library Python client — [guide](docs/sandbox.md) |
+| Commit outputs | `--commit-overlay-mode copy\|append\|auto` (default `copy`; journaled append for eligible add-only TAR / seek-table zstd); `--roll-every 1d\|20G` produces a numbered union — [commit modes](docs/zstd-random-access.md) · [rolling](docs/rolling-archives.md) |
+| Provenance | Writable FUSE `user.*` xattrs persist in TAR PAX; `find --xattr train_ok=false`; opt-in `--commit-manifest` writes JSONL — [guide](docs/provenance.md) |
+| Dataset tools | `shard` writes reproducible TAR/zstd shards, indexes and `shards.json`; `export-index --format parquet\|jsonl\|csv` exports member offsets (Parquet via default feature `export-parquet`) — [guide](docs/shards.md) |
+| Snapshot helper | `snapshot add\|list` wraps the external restic CLI — [recipe](docs/recipes/dedup-snapshots.md) |
+| Python / library | `ratarmount-rs` / `ratarmount_rs`: Session reads, stored-member mmap, fsspec `ratar`, torch Dataset, WebDataset iterator, `mount()` and `index.publish()`; source/wheel artifacts available, PyPI publication pending — [guide](docs/python.md) |
 | File versions | `.versions/` by default (`--no-file-versions`) |
 | Strip / transform / prefix | Path rewriting on mount |
 | Control plane | Unix socket **and** in-FS `/.ratarmount-control/` (read-only `search/<pattern>` glob locate; quote globs). Live `-w` control/socket last-wins overlay creates/COW/tombstones; CLI `find` stays sidecar SQL and rejects `-w`. `ratarmount find '*.fits' ARCHIVE` (no FUSE; `--fts` / `--offset-order` are find-argv only) |
 | Seekable producer | `--repack-seekable IN OUT` writes multi-frame zstd + official seek table (default 8 MiB frames; `num_args = 2`; IN OUT must immediately follow the flag). Already-seekable inputs are copied. Helpers (`--repack-keep-gzip` → `OUT.rgzi`; `--repack-gzidx`; `--repack-force`) go **before** `--repack-seekable` or **after** IN OUT. Local files only; exclusive with export / `-w` / a FUSE mountpoint. [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) |
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
+| FUSE / memory tuning | `--passthrough auto\|on\|off` (Linux ≥6.9 + effective initial-namespace `CAP_SYS_ADMIN`); `--direct-io`; negotiated requests up to 1 MiB on 4 KiB-page kernels; zstd decode-ahead (CLI parallelization defaults to min(cores, 4)); `--memory-budget SIZE` caps managed RAM pools, excluding kernel pages — [tuning](docs/fuse-kernel-tuning.md) · [budget](docs/memory-budget.md) |
 | Depth control | `--recursion-depth`, `--no-mount` |
 | NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; Linux kernel client **verified** on loopback via privileged Docker `test-harness/nfs-docker`; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
-| HPC / systemd / autofs | RO `Type=fuse.ratarmount` via `/usr/sbin/mount.fuse.ratarmount` (fstab / systemd `.mount` / autofs). Helper argv has **no** secrets (env / `EnvironmentFile=`). CSI is **spec-only** (separate repo; no kube crates). `-w` StorageClass residual — [systemd](https://github.com/hilather/ratarmount-rs/blob/main/docs/systemd-mount.md) · [CSI spec](https://github.com/hilather/ratarmount-rs/blob/main/docs/csi.md) |
+| HPC / containers | RO systemd/autofs helper (`Type=fuse.ratarmount`, credentials in env); in-tree `ratarmount-csi` node driver and `ratarmount-volume-plugin` Docker/Podman plugin support per-volume overlays. Privileged kind/csi-sanity validation remains pending — [systemd](docs/systemd-mount.md) · [CSI](docs/csi.md) · [volume plugin](docs/docker-volume-plugin.md) |
 | Other exports | `--http` (`127.0.0.1:20491`, GET/HEAD of the **indexed tree**, not host archive bytes; optional `GET /.ratarmount-control/index.sqlite`) · `--webdav` (`:20492`, class 2 LOCK/COPY/Basic; mux residual) · `--smb` (`:20445`, signing when password; 3.1.1 preauth + optional GCM/CCM encrypt; Finder residual) · `--ninep` (`:20493`, TCP; not `--9p`) · `--sftp` (`:20222`, `--sftp-subsystem` stdio, `--features sftp-russh`, russh MSRV 1.85). Bind flags take a required value (`num_args = 1`). Combine with `--nfs` in one process. `--http --no-mount` exits 2. Optional `ratarmount serve --nfs --http ARCHIVE` sugar (requires ≥1 export; incompatible with `--no-mount`; booleans remain the stable interface) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md) |
 
 ### Remote backends
 
-`file://` · `http(s)://` (Range + Basic/Cookie auth; autoindex folders; `{url}.index.ptr` then `{url}.index.{id}.sqlite`, archive `Link: describedby`, well-known sibling `.index.sqlite`) · `s3://` (SigV4 / IMDS / anonymous; prefix folders; sibling pointer/blob/well-known GET; **PUT** of archive + blob-then-pointer; live overlay commit for TAR/ZST) · `gs://` (GOOG1 HMAC; same sibling GET; PUT residual) · `az://` (same sibling GET; PUT residual) · `ftp://` / `ftps://` (REST + LIST/MLSD folders; implicit :990 residual) · `ssh://` / `sftp://` (SFTP `readdir` folders) · WebDAV (Depth-1 collections) · `smb://` (live Range + F-1 folders; `smbclient` fallback) · Dropbox · `oci://` / `docker://` / `ghcr://` (overlayfs layer union; `oci:{digest}` cache then OCI 1.1 referrer) · `ipfs://` / `ipns://` · `rclone://remote:path` · `rclone+remote:path` · `restic:/abs/path` (local snapshot browser; [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/restic.md); S3 restic / borg / kopia residual)
+`file://` · `http(s)://` (pooled Range + Basic/Cookie/Bearer auth; autoindex folders; `{url}.index.ptr` then `{url}.index.{id}.sqlite`, archive `Link: describedby`, well-known sibling `.index.sqlite`) · `s3://` (SigV4 / IMDS / anonymous; prefix folders; sibling pointer/blob/well-known GET; **PUT** of archive + blob-then-pointer; live overlay commit for TAR/ZST) · `gs://` (GOOG1 HMAC; same sibling GET + live archive/index PUT) · `az://` (same sibling GET + live archive/index PUT) · `ftp://` / `ftps://` (REST + LIST/MLSD folders; implicit :990 residual) · `ssh://` / `sftp://` (SFTP `readdir` folders) · WebDAV (Depth-1 collections) · `smb://` (live Range + F-1 folders; `smbclient` fallback) · Dropbox · `oci://` / `docker://` / `ghcr://` (overlayfs layer union; `oci:{digest}` cache then OCI 1.1 referrer) · `ipfs://` / `ipns://` · `rclone://remote:path` · `rclone+remote:path` · `magnet:` / `.torrent` (`bittorrent` feature, on in package builds: lazy file tree, verified web-seed pieces first, no peers by default (`--torrent-swarm never`); opt in with `auto|lan|always`, opt-in `--seed`; [guide](docs/remote-bittorrent.md)) · `restic:/abs/path` (local snapshot browser; [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/restic.md); S3 restic / borg / kopia residual)
+
+`hf://[datasets/|spaces/]org/name[@REV]/path` resolves a revision to one commit,
+uses paginated tree listings, and reads Xet-backed files through HTTP Range.
+Tokens follow `HF_TOKEN` (legacy `HUGGING_FACE_HUB_TOKEN` fallback),
+`HF_TOKEN_PATH`, `$HF_HOME/token`, then the default Hub token file;
+credentials stay at the Hub endpoint. `hf-cache://` browses cached snapshots
+**offline**. Optional `huggingface_hub` cache sharing reuses verified complete
+blobs and publishes complete downloads in its standard layout
+(`HF_HUB_CACHE`; `RATARMOUNT_HF_SHARE_CACHE` controls sharing). `--publish-index`
+supports `hf://`, `s3://`, `gs://`, and `az://` destinations; live `-w` interval /
+on-exit commits also support existing Hub TAR/`.tar.zst` archives on branches.
+See [Hub authentication, Xet, caches, and write-back](docs/remote-hf.md).
+
+HTTP uses pooled connections and bounded parallel prefetch
+(`RATARMOUNT_HTTP_PARALLEL`, `RATARMOUNT_HTTP_PREFETCH_LIMIT`). Verified content
+ranges persist under `payload-v1/range-v1/`, sharing the
+`RATARMOUNT_PAYLOAD_CACHE_BYTES` cap with decompressed members (`0` disables
+both); range caching does not require member hashes. See
+[remote cache configuration](docs/phase10-remote.md#persistent-remote-range-cache-ai-rc).
 
 Remote sidecar **downloads** (whole SQLite blob ≤ 64 MiB, not archive Range I/O) are cached under `$XDG_CACHE_HOME/ratarmount/meta-v3/` (default `~/.cache/...` **even on macOS**; not migrated). Cap: `RATARMOUNT_META_CACHE_BYTES` (default 256 MiB; `=0` disables). Lookup is the sidecar URL — a remount does not need `.ptr`. HPC home-quota: point `XDG_CACHE_HOME` at scratch. `file://` / `:memory:` / an already-local sidecar are not stored again.
 
-`payload-v1/` (decompressed member bodies keyed by sha256) and `local-index-v1/` (UserCache sidecars) are **siblings** under `platform_cache_root()` (`$XDG_CACHE_HOME/ratarmount/` on Linux, `~/Library/Caches/ratarmount/` on macOS unless `XDG_CACHE_HOME` is set, `%LOCALAPPDATA%\ratarmount\` on Windows). `payload-v1` is never nested under `local-index-v1`. Payload cap: `RATARMOUNT_PAYLOAD_CACHE_BYTES` (default 4 GiB; `=0` disables) and `RATARMOUNT_PAYLOAD_CACHE_DIR`. Members larger than 64 MiB are not cached (`RATARMOUNT_PAYLOAD_CACHE_MEMBER_MAX`). Default-on when the sidecar has `user.hash.sha256` (`--hashes sha256`); skipped for `:memory:` indexes and overlay writes. Residual: CDC chunking of large members.
+`payload-v1/` (decompressed member bodies keyed by sha256) and `local-index-v1/` (UserCache sidecars) are **siblings** under `platform_cache_root()` (`$XDG_CACHE_HOME/ratarmount/` on Linux, `~/Library/Caches/ratarmount/` on macOS unless `XDG_CACHE_HOME` is set, `%LOCALAPPDATA%\ratarmount\` on Windows). `payload-v1` is never nested under `local-index-v1`. Shared payload/range cap: `RATARMOUNT_PAYLOAD_CACHE_BYTES` (default 4 GiB; `=0` disables) and `RATARMOUNT_PAYLOAD_CACHE_DIR`. Members larger than 64 MiB are not cached (`RATARMOUNT_PAYLOAD_CACHE_MEMBER_MAX`). Default-on when the sidecar has `user.hash.sha256` (`--hashes sha256`); skipped for `:memory:` indexes and overlay writes. Residual: CDC chunking of large members.
 
 Local-archive **user-cache** indexes (`IndexPolicy::UserCache` / GUI “save in user cache”) live under `platform_cache_root()/local-index-v1/` (macOS `~/Library/Caches/ratarmount/local-index-v1/` unless `XDG_CACHE_HOME` or `RATARMOUNT_LOCAL_INDEX_DIR` is set; Windows `%LOCALAPPDATA%\ratarmount\local-index-v1\`). Files are `{sha256}.sqlite` + `{sha256}.json`. Cap: `RATARMOUNT_LOCAL_INDEX_CACHE_BYTES` (default 2 GiB; `=0` disables). This is **not** `meta-v3/` — remote sidecar downloads stay in the 256 MiB V-3 LRU.
 
@@ -285,6 +338,8 @@ flowchart LR
 | Crate | Role |
 |-------|------|
 | `ratarmount` | CLI binary |
+| `ratarmount-python` | Optional PyO3 library / `ratarmount_rs` Python package |
+| `ratarmount-csi` / `ratarmount-volume-plugin` | CSI node driver / Docker-compatible volume plugin (separate binaries) |
 | `ratarmount-session` | In-process Session API for embedders (**no FUSE**; optional `http-export`) |
 | `ratarmount-core` | `MountSource` trait & options |
 | `ratarmount-index` | SQLite 0.7.x index |
@@ -298,7 +353,7 @@ flowchart LR
 | `ratarmount-compress` | Seekable codecs + stencils |
 | `ratarmount-formats-*` | TAR, ZIP, 7z, ISO, SquashFS, EXT4, … |
 | `ratarmount-compositing` | Folder, union, automount, overlay, OCI whiteouts |
-| `ratarmount-remote` | HTTP, S3, GCS, Azure, FTP, SSH, OCI, IPFS, rclone, WebDAV, SMB, Dropbox |
+| `ratarmount-remote` | Hugging Face + offline Hub cache, HTTP, S3, GCS, Azure, FTP, SSH, OCI, IPFS, rclone, WebDAV, SMB, Dropbox |
 
 ```
 ratarmount/                 # CLI
@@ -333,6 +388,7 @@ Recursive mounts (`-r`) open nested members from a **seekable parent stream** wh
 | `.tar` / `.tar.gz` / `.zip` / `.7z` inside ZIP · TAR · 7z | **No** |
 | CPIO · AR · ISO · UDF · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · exFAT · NTFS · GPT/MBR (`pN/`) · UDIF DMG · WIM (LZX/LZMS residual) · QCOW2 · VHD/VHDX · VMDK (KDMV sparse) | **No** |
 | SquashFS (none/gzip/zstd/lz4/lzo/xz) · EXT4 (pure path) | **No** |
+| safetensors · GGUF (little-endian v2–v3; parent seek cost applies) | **No** |
 | Unencrypted SQLAR · plain nested `.gz`/`.zst`/… | **No** |
 | CAB LZX · classic SquashFS LZMA · RAR nested | Often yes (fallback) |
 
@@ -341,6 +397,10 @@ ratarmount -r archive.zip mnt/           # mnt/inner.tar/file.txt — no /tmp fo
 ratarmount -r -l big.deb mnt/            # large trees: lazy nested open
 RUST_LOG=debug ratarmount -r -d 2 …      # “nested reader” vs “temp spool” in logs
 ```
+
+Concurrent file-backed TAR member readers use positional I/O with independent
+positions, including parallel nested opens. ZIP deflate parents may still inflate
+the nested body to RAM or a temporary file; see the canonical matrix.
 
 On enormous packages (e.g. `linux-source-*.deb`), prefer **`-l` / `--lazy`** and optionally **`--recursion-depth`**. Details: [`docs/embedded-nested-archives.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/embedded-nested-archives.md).
 
@@ -353,12 +413,12 @@ Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-fe
 1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs default G3 + Python — [perf batch](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/rapidgzip-perf-batch.md), [binding decision](https://github.com/hilather/ratarmount-rs/blob/main/docs/gzip-binding-decision.md)); exotic xz filters; single-frame zstd full decode (prefer [`--repack-seekable`](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) or multi-frame).
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual); UDIF DMG inner FAT/ISO/exFAT/NTFS (HFS+/APFS/encrypted residual); WIM LZX/LZMS / WIMBoot / later images; QCOW2 zstd clusters / HTTP backing; VHD/VHDX differencing; VMDK compressed/ESXi grains; NTFS LZNT1/EFS.
 3. **7z solids** — AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive (BCJ/Delta is sequential-from-0 + LRU; no dict-reset resume). BCJ2 / multi-pack still full-folder. Progressive pure LZMA2 is bounded but not free.
-4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. A missing uncompressed `.tar` / `.tar.zst` is created as an empty write-mount base when `-w` is set. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed prefix; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; 2× compressed disk headroom; never refuse on size; warn when the last frame is larger than 64 MiB uncompressed). `--commit-overlay-interval` persists files that have not been modified for `DURATION`. Gzip stays rejected. Offline `--commit-overlay` splices `.tar.zst` (last-window or rewrite from the affected frame through EOF, including earlier-frame delete). Live interval/on-exit still **rejects** prefix-frame mutate. Create-if-missing is uncompressed `.tar` only.
+4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. A missing uncompressed `.tar` / `.tar.zst` is created as an empty write-mount base when `-w` is set. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; default copy mode uses reflink / `copy_file_range` with a streaming-copy fallback; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; copy fallback needs 2× compressed disk headroom; never refuse on size; warn when the last frame is larger than 64 MiB uncompressed). `--commit-overlay-interval` persists files that have not been modified for `DURATION`. Gzip stays rejected. Offline `--commit-overlay` splices `.tar.zst` (last-window or rewrite from the affected frame through EOF, including earlier-frame delete). Live interval/on-exit still **rejects** prefix-frame mutate. Create-if-missing is uncompressed `.tar` only.
 5. **Remote** — HTTP Basic + Cookie env auth done; `ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/**ProxyJump**/**Include** done; `gs://` / `az://` / `ftp://` / `smb://` (live Range + F-1 folders) / `oci://` / `ipfs://` / `rclone://` / `rclone+` + F-1 prefix folders shipped (FTP LIST/MLSD; GCS GOOG1 HMAC); local **restic** snapshot browser (`restic:/abs/path`, [restic.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/restic.md)). Residual: full browser cookie jar; ssh_config **ProxyCommand** / **Match**; implicit FTPS :990; rclone RC `--rc-serve`; SMB 3.x / Kerberos / `smbclient` listing; S3 restic / borg / kopia. [phase10-remote.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase10-remote.md).
 6. **Platforms** — macOS is **first-class on Apple Silicon** (signed `macos-arm64` tarball on tags; [Homebrew tap cask](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb); [docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md)). Intel package deferred (no GHA Intel runner). WinFsp / Homebrew-core residual (F-5 `partial`).
 7. **NFS** — v3 default; v4.1 opt-in in Linux/macOS packages. Linux kernel client **verified** on loopback (privileged Docker `./test-harness/nfs-docker/run.sh`; not default CI). No Kerberos, LAN, Windows, or v3/v4 mux. Idle TTL is not CLOSE. [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
-8. **Other exports** — HTTP GET/HEAD `done`; WebDAV class 2 `done` (mux residual; Finder/Explorer not in CI); SMB **P-2 `done`** (signing + NTLMv2 when password set; 3.1.1 preauth + optional AES-128-GCM/CCM encrypt; leases + durable-handle-v1; Finder/Explorer not in CI; Kerberos/guest encrypt/WAN residual); 9P TCP `done` (virtio residual); SFTP `done` (password env + `--sftp-subsystem`; needs `--features sftp-russh` — packages enable it; default CI does not). No `serve` subcommand. [export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
-9. **HPC / K8s** — systemd `.mount` + autofs + `mount.fuse.ratarmount` shipped (RO). CSI driver is spec-only (separate repo; no kube crates). `-w` overlay StorageClass residual. [systemd-mount.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/systemd-mount.md) · [csi.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/csi.md).
+8. **Other exports** — HTTP GET/HEAD `done`; WebDAV class 2 `done` (mux residual; Finder/Explorer not in CI); SMB **P-2 `done`** (signing + NTLMv2 when password set; 3.1.1 preauth + optional AES-128-GCM/CCM encrypt; leases + durable-handle-v1; Finder/Explorer not in CI; Kerberos/guest encrypt/WAN residual); 9P TCP `done` (virtio residual); SFTP `done` (password env + `--sftp-subsystem`; needs `--features sftp-russh` — packages enable it; default CI does not). `serve` is optional CLI sugar for the export booleans. [export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
+9. **HPC / K8s** — systemd `.mount` + autofs + `mount.fuse.ratarmount` shipped (RO). In-tree CSI node driver and Docker/Podman volume plugin implemented; privileged kind/csi-sanity validation pending. [systemd-mount.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/systemd-mount.md) · [csi.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/csi.md).
 
 ---
 
@@ -382,6 +442,7 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 
 | Document | Topic |
 |----------|--------|
+| [docs/local-ai/index.md](docs/local-ai/index.md) | Local AI recipes, model data, sandboxes, and Python |
 | [docs/session-api.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/session-api.md) | In-process Session API for embedders (no FUSE) |
 | [docs/parity-todo.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/parity-todo.md) | Full feature + test parity checklist |
 | [docs/embedded-nested-archives.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/embedded-nested-archives.md) | Nested / no-tmp matrix |
@@ -391,7 +452,7 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 | [docs/fuse-kernel-tuning.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/fuse-kernel-tuning.md) | FUSE mount / kernel tuning + fair disk baseline |
 | [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) | NFSv3 default + opt-in NFSv4.1 (`--nfs-vers 4`) |
 | [docs/systemd-mount.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/systemd-mount.md) | fstab / systemd `.mount` / autofs (`Type=fuse.ratarmount`) |
-| [docs/csi.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/csi.md) | Kubernetes CSI spec (no in-tree driver) |
+| [docs/csi.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/csi.md) | In-tree Kubernetes CSI node driver and validation limits |
 | [docs/export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md) | HTTP / WebDAV / SMB / 9P / SFTP userspace exports |
 | [docs/packaging.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) | Packages + cosign verify |
 | [docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md) | macOS FUSE / FSKit |

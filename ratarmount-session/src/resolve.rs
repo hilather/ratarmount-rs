@@ -93,6 +93,7 @@ mod tests {
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,
@@ -118,6 +119,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate,
         }
     }
@@ -161,6 +163,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate,
         }
     }
@@ -285,6 +288,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("CliCompat memory last resort should still open");
@@ -424,6 +428,7 @@ mod tests {
                 password: None,
                 recursive: false,
                 recursion_depth: None,
+                parallelization: Default::default(),
                 recreate: Recreate::IfInvalid,
             }) {
                 Err(e) => e,
@@ -490,6 +495,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         }) {
             Err(e) => e,

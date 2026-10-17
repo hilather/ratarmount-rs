@@ -14,7 +14,7 @@ use russh::{Channel, ChannelId};
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
-use russh_sftp::server::Handler;
+use russh_sftp::server::{Handler, StatusReply};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 
@@ -308,23 +308,29 @@ impl SftpSession {
     }
 }
 
-fn map_err(e: i32) -> StatusCode {
-    match e {
+fn map_err(e: i32) -> StatusReply {
+    if e == libc::EDQUOT || e == libc::ENOSPC {
+        // SFTP v3 has no dedicated capacity statuses. Preserve the cause in
+        // the SSH_FXP_STATUS message, including errors from OPEN/COW.
+        return StatusCode::Failure.with_message(io::Error::from_raw_os_error(e).to_string());
+    }
+    let code = match e {
         libc::ENOENT | libc::ESTALE => StatusCode::NoSuchFile,
         libc::EACCES | libc::EPERM | libc::EROFS => StatusCode::PermissionDenied,
         libc::ENOSYS | libc::EOPNOTSUPP => StatusCode::OpUnsupported,
         libc::EINVAL => StatusCode::BadMessage,
         _ => StatusCode::Failure,
-    }
+    };
+    code.into()
 }
 
-fn attrs_from_fi(fi: &FileInfo) -> FileAttributes {
+fn attrs_from_fi(fi: &FileInfo, mapping: ratarmount_core::AttributeMapping) -> FileAttributes {
     let mut a = FileAttributes {
         size: Some(fi.size),
-        uid: Some(fi.uid),
-        gid: Some(fi.gid),
-        permissions: Some(sftp_permissions(fi)),
-        atime: Some(unix_mtime_u32(fi.mtime)),
+        uid: Some(mapping.uid(fi.uid)),
+        gid: Some(mapping.gid(fi.gid)),
+        permissions: Some(mapping.mode(sftp_permissions(fi))),
+        atime: Some(unix_mtime_u32(ratarmount_compositing::overlay_atime(fi))),
         mtime: Some(unix_mtime_u32(fi.mtime)),
         ..FileAttributes::default()
     };
@@ -345,14 +351,15 @@ fn flags_to_mode(pflags: OpenFlags) -> OpenMode {
         create: pflags.contains(OpenFlags::CREATE),
         truncate: pflags.contains(OpenFlags::TRUNCATE),
         exclusive: pflags.contains(OpenFlags::EXCLUDE),
+        permissions: None,
     }
 }
 
 impl Handler for SftpSession {
-    type Error = StatusCode;
+    type Error = StatusReply;
 
     fn unimplemented(&self) -> Self::Error {
-        StatusCode::OpUnsupported
+        StatusCode::OpUnsupported.into()
     }
 
     async fn init(
@@ -375,7 +382,7 @@ impl Handler for SftpSession {
         let fi = self.fs.file_info_at(&path).map_err(map_err)?;
         Ok(Attrs {
             id,
-            attrs: attrs_from_fi(&fi),
+            attrs: attrs_from_fi(&fi, self.fs.attribute_mapping()),
         })
     }
 
@@ -391,7 +398,7 @@ impl Handler for SftpSession {
         };
         Ok(Attrs {
             id,
-            attrs: attrs_from_fi(&fi),
+            attrs: attrs_from_fi(&fi, self.fs.attribute_mapping()),
         })
     }
 
@@ -399,7 +406,7 @@ impl Handler for SftpSession {
         let path = self.fs.realpath(&path);
         let fi = self.fs.file_info_at(&path).map_err(map_err)?;
         if !is_dir_mode(fi.mode) {
-            return Err(StatusCode::NoSuchFile);
+            return Err(StatusCode::NoSuchFile.into());
         }
         let handle = self.alloc_handle(SftpHandle::Dir {
             path,
@@ -412,10 +419,10 @@ impl Handler for SftpSession {
         let h = self.handles.get_mut(&handle).ok_or(StatusCode::Failure)?;
         let (path, exhausted) = match h {
             SftpHandle::Dir { path, exhausted } => (path.clone(), *exhausted),
-            SftpHandle::File { .. } => return Err(StatusCode::Failure),
+            SftpHandle::File { .. } => return Err(StatusCode::Failure.into()),
         };
         if exhausted {
-            return Err(StatusCode::Eof);
+            return Err(StatusCode::Eof.into());
         }
         if let SftpHandle::Dir { exhausted, .. } = self.handles.get_mut(&handle).unwrap() {
             *exhausted = true;
@@ -423,7 +430,7 @@ impl Handler for SftpSession {
         let ents = self.fs.readdir(&path).map_err(map_err)?;
         let files = ents
             .into_iter()
-            .map(|(name, fi)| File::new(name, attrs_from_fi(&fi)))
+            .map(|(name, fi)| File::new(name, attrs_from_fi(&fi, self.fs.attribute_mapping())))
             .collect();
         Ok(Name { id, files })
     }
@@ -433,9 +440,10 @@ impl Handler for SftpSession {
         id: u32,
         filename: String,
         pflags: OpenFlags,
-        _attrs: FileAttributes,
+        attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
-        let mode = flags_to_mode(pflags);
+        let mut mode = flags_to_mode(pflags);
+        mode.permissions = attrs.permissions;
         let fid = self.fs.open_path(&filename, mode).map_err(map_err)?;
         let handle = self.alloc_handle(SftpHandle::File {
             id: fid,
@@ -454,11 +462,11 @@ impl Handler for SftpSession {
         let h = self.handles.get(&handle).ok_or(StatusCode::Failure)?;
         let fid = match h {
             SftpHandle::File { id, .. } => *id,
-            SftpHandle::Dir { .. } => return Err(StatusCode::Failure),
+            SftpHandle::Dir { .. } => return Err(StatusCode::Failure.into()),
         };
         let data = self.fs.read(fid, offset, len).map_err(map_err)?;
         if data.is_empty() && len > 0 {
-            return Err(StatusCode::Eof);
+            return Err(StatusCode::Eof.into());
         }
         Ok(Data { id, data })
     }
@@ -474,11 +482,11 @@ impl Handler for SftpSession {
         let fid = match h {
             SftpHandle::File { id, write } => {
                 if !*write {
-                    return Err(StatusCode::PermissionDenied);
+                    return Err(StatusCode::PermissionDenied.into());
                 }
                 *id
             }
-            SftpHandle::Dir { .. } => return Err(StatusCode::Failure),
+            SftpHandle::Dir { .. } => return Err(StatusCode::Failure.into()),
         };
         self.fs.write(fid, offset, &data).map_err(map_err)?;
         Ok(Self::ok(id))
@@ -526,11 +534,16 @@ impl Handler for SftpSession {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        if let Some(size) = attrs.size {
-            self.fs.setstat_size(&path, size).map_err(map_err)?;
-        } else if !self.fs.writable() {
-            return Err(StatusCode::PermissionDenied);
-        }
+        let metadata = ratarmount_compositing::OverlayMetadata {
+            mode: attrs.permissions,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            atime: attrs.atime.map(f64::from),
+            mtime: attrs.mtime.map(f64::from),
+        };
+        self.fs
+            .setstat(&path, attrs.size, &metadata)
+            .map_err(map_err)?;
         Ok(Self::ok(id))
     }
 
@@ -629,4 +642,52 @@ pub fn serve_stdio_russh(source: Arc<dyn MountSource>, opts: SftpOptions) -> io:
         let _ = done_rx.await;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod policy_status_tests {
+    use super::*;
+
+    /// Regression: v3 capacity errors retain a useful message instead of bare Failure.
+    #[test]
+    fn regression_overlay_policy_sftp_status_messages() {
+        assert_eq!(
+            map_err(libc::EROFS).status_code,
+            StatusCode::PermissionDenied
+        );
+        for errno in [libc::EDQUOT, libc::ENOSPC] {
+            let reply = map_err(errno);
+            assert_eq!(reply.status_code, StatusCode::Failure);
+            assert_eq!(
+                reply.error_message.as_deref(),
+                Some(io::Error::from_raw_os_error(errno).to_string().as_str())
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_attr_tests {
+    use super::*;
+    use ratarmount_core::AttributeMapping;
+
+    /// Regression: SFTP STAT/FSTAT/READDIR must report the same mapped Unix attributes.
+    #[test]
+    fn regression_mapped_attrs_include_unset() {
+        for mode in [0o100777, 0o040777, 0o120777] {
+            let mut fi = ratarmount_core::create_root_file_info();
+            fi.mode = mode;
+            fi.uid = 42;
+            fi.gid = 43;
+            let attr = attrs_from_fi(
+                &fi,
+                AttributeMapping::parse("uid=12345,gid=23456,umask=027").unwrap(),
+            );
+            assert_eq!((attr.uid, attr.gid), (Some(12345), Some(23456)));
+            assert_eq!(attr.permissions.unwrap() & 0o777, 0o750);
+            let attr = attrs_from_fi(&fi, AttributeMapping::default());
+            assert_eq!((attr.uid, attr.gid), (Some(42), Some(43)));
+            assert_eq!(attr.permissions.unwrap() & 0o777, 0o777);
+        }
+    }
 }

@@ -89,6 +89,7 @@ mod tests {
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,
@@ -117,6 +118,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open")
@@ -189,8 +191,10 @@ mod tests {
             write_ustar_members(
                 &mut f,
                 &[UstarMember {
+                    xattrs: &[],
                     path: "big.bin",
                     payload: UstarPayload::FileOnDisk {
+                        sha256: None,
                         path: &payload,
                         size: BIG,
                     },
@@ -213,6 +217,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("open 100 MiB member tar");
@@ -475,6 +480,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("metadata-only 7z open");

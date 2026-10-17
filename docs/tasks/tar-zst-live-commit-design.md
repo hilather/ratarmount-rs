@@ -1110,3 +1110,131 @@ Each PR is independently reviewable and mergeable. Library PRs first; CLI last. 
 | 12–15 | PR 5 (CLI + docs + bin test) **∥ PR 6** (NFS test) |
 
 PR 7 (offline `--commit-overlay` for `.tar.zst`) is **done**.
+
+## AI-CM1: accelerated copy and opt-in append persistence
+
+`--commit-overlay-mode copy|append|auto` defaults to **copy**. The mode applies
+both to local offline commits and to live interval/on-exit commits. `append`
+uses in-place suffix replacement for adds-only uncompressed TAR and seek-table
+`.tar.zst`; other plans retain the copy path. `auto` additionally requires the
+archive to have exactly one hard link. Explicit `append` can change all hard
+links to the archive. Remote publication continues to use its staged copy path.
+
+Copy persistence attempts Linux `FICLONERANGE` on the aligned middle, copying
+unaligned head/tail fragments; offsets with different block alignment cannot
+be reflinked. It then tries `copy_file_range` (including short-copy loops), and
+finally exact-length `io::copy`. Whole-file TAR copies on macOS attempt
+`fclonefileat` into a private sibling directory. Partial zstd prefixes on macOS
+use the stream copy. One info message records the method, for example
+`commit: prefix 12.3 GiB via reflink`. See the
+[Linux clone ABI](https://www.man7.org/linux/man-pages/man2/ioctl_ficlone.2.html)
+and [Apple clone API manual](https://keith.github.io/xcode-man-pages/clonefile.2.html).
+
+Append classification reuses the commit plan: overlay files are initially
+represented as delete+append, so a nonempty deletion set alone does not imply
+a replacement. TAR walks member headers (skipping payloads) and checks every
+touched name, including directory descendants and concatenated TARs. The cut
+is the **parsed terminal EOF**, never a backward zero-run cut into payload.
+GNU sparse/global-PAX TAR layouts conservatively use copy. Zstd uses the
+existing full-frame classification, including versions after interior EOFs;
+actual deletes/replacements keep the previous copy behavior and live prefix
+mutation restrictions. Only the affected zstd suffix is staged and journaled;
+its new frame and rebuilt seek table use the existing splice encoder.
+
+### Crash protocol
+
+Append requires a local filesystem with durable file/directory fsync and atomic
+extended-attribute updates (Linux/macOS). The canonical archive path determines
+`<archive>.ratarmount-commit-journal`. The inode's
+`user.ratarmount.commit-journal` xattr holds its locator, state, and CRC, so
+hard-link and bind-mount aliases discover it too. If the recorded location is
+inaccessible through another mount namespace, opening fails with that path and
+recovery instructions. Filesystems without writable user xattrs cannot append;
+`auto` falls back to copy. Concurrent independent copy/rename writers or
+writers ignoring the advisory inode lock remain unsupported.
+
+1. Stage the replacement suffix. Under the inode lock, check that the archive
+   still matches the metadata snapshot from preparation.
+2. Write and fsync an immutable temporary journal: version, device/inode hints,
+   original/new lengths, cut, original mtime, SHA-256 of the first and last
+   64 KiB of the preserved prefix, old tail, new tail, and a CRC over the whole
+   record. Both tails are streamed, so memory use is bounded. Keeping the new
+   bytes allows exact comparison even after a short write in the middle of a
+   block. Prefix sampling avoids rereading a 200 GB prefix; it does not detect
+   an unrelated edit wholly outside the two sampled prefix regions.
+3. Atomically set and fsync the inode locator in **preparing** state. Publish
+   the journal without replacing another journal, then fsync its directory.
+   Atomically set and fsync the locator in **active** state before mutation.
+4. Truncate to the cut and fsync, then write the suffix and fsync the archive.
+5. Atomically set and fsync the locator in **complete** state: this is the
+   commit point. Atomic xattr replacement exposes either the old or new state;
+   a CRC rejects corrupt locators. There is no mutable journal completion byte.
+   Remove the journal, fsync its directory, remove the locator, and fsync the
+   archive. A cleanup failure after completion must not retry the append.
+6. Patch the existing F-2 sidecar, reopen/swap the mounted source, advance its
+   generation, and clean up committed overlay entries. Offline commits validate
+   the sidecar against the archive **before** mutation; stale/missing-tarstats
+   indexes are removed instead of patching stale prefix offsets.
+
+Every CLI/local factory open and `Session::open` checks recovery before probing
+archive bytes or trusting an index, including read-only opens. Recovery needs
+write access; otherwise opening refuses with the journal path and instructions.
+Direct users of format-crate constructors must still call
+`ratarmount_compress::commit_journal::recover` before constructing their source.
+
+Preparing without a published journal means no mutation occurred. An active
+locator without its journal refuses recovery. With a journal, validate its CRC,
+lengths and prefix fingerprint, then compare the current suffix byte-for-byte
+with a prefix of the recorded new tail or old tail (an interrupted rollback).
+An external replacement or reused inode with different bytes is refused; the
+error names the journal and explains restoring the matching backup or verifying
+the replacement before removing the journal and locator. Device/inode changes
+alone do not block recovery. A complete locator keeps the new archive, verifying
+its full expected length and tail when the journal remains.
+
+Before completion, rollback truncates and fsyncs the cut **before** writing the
+old tail. Thus a second crash leaves a prefix of the old tail rather than mixed
+old/new bytes. After restoring the old tail/length and mtime, fsync, mark the
+locator preparing, and remove/fsync the journal and locator. EPERM restoring
+mtime is tolerated for non-owner writers: normal tarstats validation rebuilds
+an index whose mtime no longer matches. Other failures retain the journal.
+Ordinary append errors run recovery immediately while the live commit gate is
+held. If recovery fails, or persistence succeeds but reopen fails, the mount
+refuses base reads and disables intervals until remount. Harmless preparation
+errors keep intervals enabled: `append` logs and retries next tick; `auto`
+tries copy for that commit. Fault tests cover every persistence boundary,
+partial writes, repeated rollback, aliases, external changes and corrupt CRCs.
+
+The journal format is `RMCJ0002`. Earlier experimental `RMCJ0001` journals lack
+content fingerprints and are refused: recover them with the matching older
+binary before upgrading, or restore a matching backup. Do not discard an
+unrecovered journal merely to make the new opener proceed.
+
+### Cost and readers
+
+Append preserves the archive inode and needs staging/journal space proportional
+to the replaced suffix plus new data, not a second archive. Zstd still decodes
+and re-encodes the last N frames, and its existing full-frame plan classification
+can scan the TAR; this change does not promise a one-second end-to-end commit on
+all 200 GB inputs. A single-frame archive still has a whole-archive suffix.
+
+Copy/rename keeps existing readers on the old inode. Append mutates the inode:
+other mounts, hard links, and processes can observe a temporarily truncated or
+partially written suffix. Even readers on this mount can overlap that write;
+after a successful commit its normal reopen/generation refresh serves the new
+bytes. Choose copy when readers require a consistent snapshot throughout a
+commit. Recoverable errors roll back before returning; failures that leave the
+base unavailable require remount. This is why **copy remains the default**.
+Append does not add cross-process reader exclusion or change the existing overlay retention after on-exit/crash.
+
+Per append, let O be the old suffix length and N the new suffix length. The
+staged suffix uses N bytes and the journal uses O + N + 100 bytes; worst-case
+additional temporary/journal storage is O + 2N + 100 bytes, plus filesystem
+metadata and the archive's growth. A single-frame zstd suffix can be the entire
+archive. Process death can leave that journal and the N-byte staging temporary;
+death before publication can instead leave the O + N + 100-byte private journal
+temporary. Repeated crashes can accumulate these private `.tmp*` files; after
+successful recovery they may be removed once no commit owns them. Never delete
+a published journal or its inode locator merely to free space. Copy fallback
+can leave a whole-archive temporary and requires space for a full replacement
+when reflinks are unavailable.

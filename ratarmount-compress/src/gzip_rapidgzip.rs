@@ -777,6 +777,12 @@ fn make_decoder(
         spacing as usize
     };
 
+    let pool = ratarmount_core::budget::MemoryPool::global(
+        "rapidgzip",
+        RAPIDGZIP_SEEK_CACHE_BYTES as u64,
+        ratarmount_core::budget::Priority::Cache,
+    );
+    let budgeted = pool.enabled();
     Decoder::builder()
         .decoder_threads(threads)
         .keep_index(keep_index)
@@ -786,10 +792,22 @@ fn make_decoder(
         // keep_index RSS: zlib-compress predecessor windows when smaller.
         .compress_index_windows(true)
         // Per-open IndexedReader LRU (FUSE sequential + random mix).
-        .seek_cache_chunks(RAPIDGZIP_SEEK_CACHE_CHUNKS)
-        .seek_cache_bytes(RAPIDGZIP_SEEK_CACHE_BYTES)
-        .seek_readahead(true)
-        .seek_prefetch_windows(RAPIDGZIP_SEEK_PREFETCH_WINDOWS)
+        .seek_cache_chunks(if budgeted {
+            0
+        } else {
+            RAPIDGZIP_SEEK_CACHE_CHUNKS
+        })
+        .seek_cache_bytes(if budgeted {
+            0
+        } else {
+            RAPIDGZIP_SEEK_CACHE_BYTES
+        })
+        .seek_readahead(!budgeted)
+        .seek_prefetch_windows(if budgeted {
+            0
+        } else {
+            RAPIDGZIP_SEEK_PREFETCH_WINDOWS
+        })
         .build()
         .map_err(|e| CompressError::Msg(format!("rapidgzip decoder config: {e}")))
 }
@@ -817,6 +835,40 @@ fn import_index_blob(blob: &[u8], archive_size: Option<u64>) -> Result<GzipIndex
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_rapidgzip_minimal_reader() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(64).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.gz");
+        let bytes = vec![41; 256 * 1024];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&bytes).unwrap();
+        std::fs::write(&path, encoder.finish().unwrap()).unwrap();
+        let body = SharedRapidgzip::open_with_threads(&path, 0, 1).unwrap();
+        let mut reader = body.reader().unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, bytes);
+        assert_eq!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .reserved,
+            0
+        );
+    }
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;

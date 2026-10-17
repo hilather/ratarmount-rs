@@ -43,8 +43,20 @@ pub struct DecodedBody {
 }
 
 enum DecodedInner {
-    Memory(Arc<Vec<u8>>),
+    Memory(Arc<MemoryBody>),
     Temp(Arc<NamedTempFile>),
+}
+
+struct MemoryBody {
+    data: Vec<u8>,
+    _reservation: ratarmount_core::budget::Reservation,
+}
+
+impl std::ops::Deref for MemoryBody {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
 }
 
 impl DecodedBody {
@@ -58,7 +70,13 @@ impl DecodedBody {
         let mut tmp = NamedTempFile::new()?;
         let size = copy(&mut decoder, &mut tmp)?;
         tmp.flush()?;
-        if size <= memory_cap {
+        let pool = ratarmount_core::budget::MemoryPool::global(
+            "seekable-body",
+            DEFAULT_MEMORY_CAP,
+            ratarmount_core::budget::Priority::Cache,
+        );
+        let reservation = (size <= memory_cap).then(|| pool.reserve(size)).flatten();
+        if let Some(reservation) = reservation {
             let mut data = Vec::with_capacity(size as usize);
             tmp.as_file_mut().seek(SeekFrom::Start(0))?;
             tmp.as_file_mut().read_to_end(&mut data)?;
@@ -66,7 +84,10 @@ impl DecodedBody {
                 path: path.to_path_buf(),
                 size,
                 kind,
-                inner: DecodedInner::Memory(Arc::new(data)),
+                inner: DecodedInner::Memory(Arc::new(MemoryBody {
+                    data,
+                    _reservation: reservation,
+                })),
             }))
         } else {
             tmp.as_file().seek(SeekFrom::Start(0))?;
@@ -79,14 +100,26 @@ impl DecodedBody {
         }
     }
 
-    pub fn from_bytes(path: &Path, kind: &'static str, data: Vec<u8>) -> Arc<Self> {
+    pub fn from_bytes(path: &Path, kind: &'static str, data: Vec<u8>) -> Result<Arc<Self>> {
         let size = data.len() as u64;
-        Arc::new(Self {
-            path: path.to_path_buf(),
-            size,
-            kind,
-            inner: DecodedInner::Memory(Arc::new(data)),
-        })
+        let pool = ratarmount_core::budget::MemoryPool::global(
+            "seekable-body",
+            DEFAULT_MEMORY_CAP,
+            ratarmount_core::budget::Priority::Cache,
+        );
+        if let Some(reservation) = pool.reserve(data.capacity() as u64) {
+            Ok(Arc::new(Self {
+                path: path.to_path_buf(),
+                size,
+                kind,
+                inner: DecodedInner::Memory(Arc::new(MemoryBody {
+                    data,
+                    _reservation: reservation,
+                })),
+            }))
+        } else {
+            Self::from_decoder(path, kind, Cursor::new(data), 0)
+        }
     }
 }
 
@@ -118,7 +151,7 @@ impl SeekableBody for DecodedBody {
 }
 
 struct ArcBytesReader {
-    data: Arc<Vec<u8>>,
+    data: Arc<MemoryBody>,
     pos: u64,
 }
 
@@ -169,4 +202,64 @@ pub fn body_looks_like_tar(body: &Arc<dyn SeekableBody>) -> Result<bool> {
 #[allow(dead_code)]
 pub fn cursor(data: Vec<u8>) -> Cursor<Vec<u8>> {
     Cursor::new(data)
+}
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::*;
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_seekable_spills_and_keeps_bytes() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(64).unwrap();
+
+        let bytes = vec![42; 8192];
+        let body = DecodedBody::from_decoder(
+            Path::new("test"),
+            "test",
+            bytes.as_slice(),
+            DEFAULT_MEMORY_CAP,
+        )
+        .unwrap();
+        assert!(matches!(body.inner, DecodedInner::Temp(_)));
+        let mut reader = body.open_reader().unwrap();
+        drop(body);
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, bytes);
+        let body = DecodedBody::from_bytes(Path::new("test"), "test", bytes).unwrap();
+        assert!(matches!(body.inner, DecodedInner::Temp(_)));
+        assert_eq!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .reserved,
+            0
+        );
+        let body = DecodedBody::from_bytes(Path::new("small"), "test", vec![9; 4]).unwrap();
+        let reader = body.open_reader().unwrap();
+        drop(body);
+        assert_eq!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .reserved,
+            4
+        );
+        drop(reader);
+        assert_eq!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .reserved,
+            0
+        );
+    }
 }

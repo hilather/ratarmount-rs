@@ -27,6 +27,9 @@ xz2 = { version = "0.1", features = ["static"] }
 zstd = "0.13"
 tempfile.workspace = true
 log.workspace = true
+libc.workspace = true
+crc32fast = "1"
+sha2 = "0.10"
 lz4_flex = "0.11"
 lzma-rs = { version = "0.3", features = ["raw_decoder"] }
 newtua-lzw-z = "0.1"

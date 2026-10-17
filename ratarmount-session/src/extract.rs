@@ -569,6 +569,7 @@ mod tests {
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,
@@ -597,6 +598,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open")
@@ -654,6 +656,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open of header-size > body TAR");
@@ -748,6 +751,7 @@ mod tests {
 
     fn member_symlink<'a>(path: &'a str, target: &'a str) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::Symlink { target },
             mode: 0o777,
@@ -1104,8 +1108,10 @@ mod tests {
             write_ustar_members(
                 &mut f,
                 &[UstarMember {
+                    xattrs: &[],
                     path: "big.bin",
                     payload: UstarPayload::FileOnDisk {
+                        sha256: None,
                         path: &payload,
                         size: BIG,
                     },
@@ -1128,6 +1134,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .unwrap();
@@ -1178,8 +1185,10 @@ mod tests {
             write_ustar_members(
                 &mut f,
                 &[UstarMember {
+                    xattrs: &[],
                     path: "big.bin",
                     payload: UstarPayload::FileOnDisk {
+                        sha256: None,
                         path: &payload,
                         size: BIG,
                     },
@@ -1202,6 +1211,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .unwrap();
@@ -1267,8 +1277,10 @@ mod tests {
             write_ustar_members(
                 &mut f,
                 &[UstarMember {
+                    xattrs: &[],
                     path: "big.bin",
                     payload: UstarPayload::FileOnDisk {
+                        sha256: None,
                         path: &payload,
                         size: BIG,
                     },
@@ -1291,6 +1303,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .unwrap();
@@ -1386,6 +1399,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open of raw tar")
@@ -1568,6 +1582,7 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
+            parallelization: Default::default(),
             recreate: Recreate::IfInvalid,
         })
         .expect("metadata-only 7z open");

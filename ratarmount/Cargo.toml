@@ -11,7 +11,10 @@ name = "ratarmount"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["export-parquet"]
+bittorrent = ["ratarmount-session/bittorrent", "ratarmount-remote/bittorrent"]
+# Arrow/Parquet 60 require Rust 1.88 (workspace MSRV: 1.90).
+export-parquet = ["dep:arrow", "dep:parquet"]
 # Path-backed rapidgzip gzip backend (requires rustc ≥ 1.87). See docs/gzip-binding-decision.md.
 # Forward onto the session crate so factory `#[cfg(feature = "gzip-rapidgzip")]` compiles in.
 gzip-rapidgzip = [
@@ -31,6 +34,12 @@ nfsv4 = ["ratarmount-nfs/nfsv4"]
 sftp-russh = ["ratarmount-sftp/sftp-russh"]
 
 [dependencies]
+arrow = { version = "60", optional = true, default-features = false }
+parquet = { version = "60", optional = true, default-features = false, features = ["arrow"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rusqlite.workspace = true
 ratarmount-core.workspace = true
 ratarmount-index.workspace = true
 # CLI always wants the full factory matrix. Session default is formats-all
@@ -71,9 +80,11 @@ log.workspace = true
 url = "2"
 nix = { version = "0.29", features = ["process", "signal"] }
 libc.workspace = true
+flate2 = "1"
+sha1 = "0.10"
 
 [dev-dependencies]
-rusqlite.workspace = true
+git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
 tempfile.workspace = true
 nix = { version = "0.29", features = ["signal"] }
 ratarmount-compress.workspace = true

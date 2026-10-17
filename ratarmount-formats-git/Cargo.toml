@@ -11,6 +11,9 @@ thiserror.workspace = true
 log.workspace = true
 libc.workspace = true
 git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
+flate2 = "1"
+sha1 = "0.10"
+errno = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -9,7 +9,8 @@
 //!   - **Cookie:** env [`HTTP_COOKIE_ENV`] (raw Cookie header) or
 //!     [`HTTP_COOKIE_FILE_ENV`] (Netscape jar / simple cookie lines) → `Cookie: …`
 //!
-//!   Both may be sent together on HEAD, GET, and Range requests. Not a browser cookie
+//!   Explicit [`HttpAuthOptions`] add secret Bearer authentication for API callers.
+//!   Basic or Bearer may combine with Cookie on HEAD, GET, and Range requests. Not a browser cookie
 //!   jar (no `Set-Cookie` persistence / per-domain store).
 //! - `s3://bucket/key` → GetObject to temp with prefer-range for large objects
 //!   (env keys → ECS/IMDS role → optional anonymous); live Range via [`open_s3_range`] / [`S3RangeFile`]
@@ -33,6 +34,7 @@
 pub(crate) static SMB_CLIENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 mod dropbox;
+mod http_pool;
 mod index_sibling;
 mod s3;
 mod smb;
@@ -41,7 +43,15 @@ mod ssh;
 mod webdav;
 
 // --- inbound protocol modules (worktree PRs: one `mod` + `pub use` pair only) ---
+mod hf;
+pub use hf::{open_hf_range, parse_hf_url, HfLocation, HfMountSource, HfRepo};
+mod hf_cache;
+pub use hf_cache::HfCacheMountSource;
+mod hf_commit;
+pub use hf_commit::{HfCommitFile, HfCommitResult};
 mod folder;
+#[cfg(feature = "bittorrent")]
+pub mod torrent;
 pub use folder::{try_open_remote_folder, RemoteDirent, RemoteFolderMountSource, RemoteListing};
 mod ftp;
 pub use ftp::{
@@ -81,6 +91,12 @@ pub use ipfs::{
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+pub use http_pool::HttpRangeSource;
+use http_pool::Prefetch;
+pub use ratarmount_index::ContentToken;
+use secrecy::SecretString;
 
 use log::debug;
 use sha2::{Digest, Sha256};
@@ -101,7 +117,7 @@ pub use dropbox::{
 pub(crate) use gcs::fetch_gcs_bytes_capped;
 pub use index_sibling::{
     fetch_index_sibling_bytes_capped, fetch_index_sibling_to_temp, is_object_store_archive_url,
-    put_s3_index_siblings, S3IndexSiblingPut,
+    put_object_store_index_siblings, put_s3_index_siblings, S3IndexSiblingPut,
 };
 pub(crate) use s3::fetch_s3_bytes_capped;
 pub use s3::{
@@ -127,7 +143,7 @@ pub use webdav::{
     WebDavLocation,
 };
 
-/// Chunk size for sequential Range GET materialization (4 MiB).
+/// Chunk size for sequential HTTP readahead and Range materialization (4 MiB).
 pub const HTTP_RANGE_CHUNK: u64 = 4 * 1024 * 1024;
 
 /// Env: HTTP Basic username when the URL has no userinfo (FR-2 / #157).
@@ -169,6 +185,15 @@ impl std::fmt::Debug for HttpAuth {
             .field("password", &self.password.as_ref().map(|_| "***"))
             .finish()
     }
+}
+
+/// Explicit HTTP authentication options for callers with a token (e.g. a remote backend).
+///
+/// A Bearer token takes precedence over Basic credentials from the URL/environment.
+/// Cookies still apply independently. Tokens are redacted by `SecretString` in Debug.
+#[derive(Clone, Debug, Default)]
+pub struct HttpAuthOptions {
+    pub bearer_token: Option<SecretString>,
 }
 
 /// HTTP(S) request target: clean URL (no userinfo) + optional Basic auth and/or Cookie.
@@ -349,10 +374,10 @@ fn load_http_cookie() -> Result<Option<String>> {
 
 /// Attach Basic `Authorization` and/or `Cookie` headers for HTTP(S) requests.
 fn apply_http_auth(
-    mut req: ureq::Request,
+    mut req: http_pool::HttpRequest,
     auth: Option<&HttpAuth>,
     cookie: Option<&str>,
-) -> ureq::Request {
+) -> http_pool::HttpRequest {
     if let Some(a) = auth {
         req = req.set("Authorization", &a.authorization_header());
     }
@@ -365,6 +390,7 @@ fn apply_http_auth(
 }
 
 fn http_unauthorized(url: &str) -> RemoteError {
+    let url = http_pool::redacted_url(url);
     RemoteError::Http(format!(
         "HTTP 401 Unauthorized for {url}; provide credentials via URL userinfo \
          (https://user:pass@host/...), {HTTP_USER_ENV}/{HTTP_PASSWORD_ENV}, \
@@ -376,15 +402,23 @@ fn http_status_err(status: u16, url: &str) -> RemoteError {
     if status == 401 {
         http_unauthorized(url)
     } else {
-        RemoteError::Http(format!("HTTP {status} for {url}"))
+        RemoteError::Http(format!(
+            "HTTP {status} for {}",
+            http_pool::redacted_url(url)
+        ))
     }
 }
 
 fn map_ureq_http_error(err: ureq::Error, url: &str) -> RemoteError {
     match err {
         ureq::Error::Status(401, _) => http_unauthorized(url),
-        ureq::Error::Status(code, _) => RemoteError::Http(format!("HTTP {code} for {url}")),
-        other => RemoteError::Http(other.to_string()),
+        ureq::Error::Status(code, _) => http_status_err(code, url),
+        // Transport Display (and its source chain) may contain a signed CDN URL.
+        ureq::Error::Transport(err) => RemoteError::Http(format!(
+            "HTTP {:?} for {}",
+            err.kind(),
+            http_pool::redacted_url(url)
+        )),
     }
 }
 
@@ -394,6 +428,14 @@ pub enum RemoteError {
     Io(#[from] io::Error),
     #[error("url: {0}")]
     Url(String),
+    #[error("hf: {0}")]
+    Hf(String),
+    #[error("hf: {message}")]
+    HfStatus {
+        status: u16,
+        code: Option<String>,
+        message: String,
+    },
     #[error("http: {0}")]
     Http(String),
     #[error("s3: {0}")]
@@ -432,13 +474,22 @@ pub type Result<T> = std::result::Result<T, RemoteError>;
 const REMOTE_SCHEMES: &[&str] = &[
     "http", "https", "file", "ftp", "ftps", "s3", "gs", "az", "azure", "ssh", "sftp", "scp", "smb",
     "webdav", "webdavs", "dropbox", "oci", "docker", "ghcr", "ipfs", "ipns", "rclone", "restic",
+    "hf", "hf-cache", "magnet", "torrent",
 ];
 
-/// ASCII-lowercase scheme before the first `://`, if any.
+/// ASCII-lowercase remote scheme, including magnets and local torrent metainfo.
 ///
 /// `rclone+remote:path` has no `://`; the `rclone+` prefix (case-insensitive)
 /// is still scheme `rclone` so [`is_remote_url`] does not treat it as a local path.
 pub fn remote_url_scheme(s: &str) -> Option<String> {
+    if s.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("magnet:"))
+    {
+        return Some("magnet".into());
+    }
+    if is_torrent_input(s) {
+        return Some("torrent".into());
+    }
     if s.len() >= 7 && s[..7].eq_ignore_ascii_case("rclone+") {
         return Some("rclone".into());
     }
@@ -451,6 +502,37 @@ pub fn remote_url_scheme(s: &str) -> Option<String> {
         return None;
     }
     Some(scheme.to_ascii_lowercase())
+}
+
+/// Torrent metainfo is a lazy remote tree even when the metainfo file is local.
+pub fn is_torrent_input(s: &str) -> bool {
+    if s.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("magnet:"))
+    {
+        return true;
+    }
+    #[cfg(not(feature = "bittorrent"))]
+    {
+        false
+    }
+    #[cfg(feature = "bittorrent")]
+    {
+        if s.contains("://") {
+            return Url::parse(s).is_ok_and(|u| {
+                u.path().to_ascii_lowercase().ends_with(".torrent")
+                    && match u.scheme() {
+                        "http" | "https" => true,
+                        "file" => u.to_file_path().is_ok_and(|p| p.is_file()),
+                        _ => false,
+                    }
+            });
+        }
+        let path = Path::new(s);
+        path.is_file()
+            && path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+    }
 }
 
 fn is_known_remote_scheme(scheme: &str) -> bool {
@@ -483,6 +565,17 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
     }
     let scheme = remote_url_scheme(input).unwrap_or_default();
     match scheme.as_str() {
+        "magnet" | "torrent" => {
+            #[cfg(not(feature = "bittorrent"))]
+            return Err(RemoteError::Url(
+                "built without bittorrent support; rebuild with --features bittorrent".into(),
+            ));
+            #[cfg(feature = "bittorrent")]
+            return Err(RemoteError::Url(
+                "torrent inputs are directory mounts; use TorrentMountSource or Session".into(),
+            ));
+        }
+        "hf" => keep_from_reader(input, open_hf_range(input)?),
         "file" => {
             let url = Url::parse(input).map_err(|e| RemoteError::Url(e.to_string()))?;
             let path = url
@@ -564,7 +657,11 @@ fn keep_fetched(input: &str, tmp: NamedTempFile, size: u64) -> Result<RemoteLoca
         .into_temp_path()
         .keep()
         .map_err(|e| RemoteError::Io(e.error))?;
-    debug!("fetched {input} -> {} ({size} bytes)", path.display());
+    debug!(
+        "fetched {} -> {} ({size} bytes)",
+        http_pool::redacted_url(input),
+        path.display()
+    );
     Ok(RemoteLocal::Fetched { path, size })
 }
 
@@ -654,15 +751,14 @@ pub fn probe_http(url: &str) -> Result<HttpProbe> {
 }
 
 fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
-    let url = loc.url.as_str();
+    let source = HttpRangeSource::new(loc.clone(), HttpAuthOptions::default());
+    probe_http_source(&source)
+}
+
+fn probe_http_source(source: &HttpRangeSource) -> Result<HttpProbe> {
+    let url = source.url();
     let mut link = None;
-    match apply_http_auth(
-        ureq::head(url).set("User-Agent", USER_AGENT),
-        loc.auth.as_ref(),
-        loc.cookie.as_deref(),
-    )
-    .call()
-    {
+    match source.request("HEAD", None) {
         Ok(resp) if (200..300).contains(&resp.status()) => {
             link = resp
                 .header("Link")
@@ -682,7 +778,7 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
             }
             if accept_ranges {
                 // Ranges OK but size unknown — try Content-Range probe.
-                if let Some(mut probe) = probe_range_size(loc)? {
+                if let Some(mut probe) = probe_range_size(source)? {
                     if probe.link.is_none() {
                         probe.link = link;
                     }
@@ -698,7 +794,7 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
                 });
             }
             // Fall through to range probe when length missing or ambiguous.
-            if let Some(mut probe) = probe_range_size(loc)? {
+            if let Some(mut probe) = probe_range_size(source)? {
                 if probe.link.is_none() {
                     probe.link = link;
                 }
@@ -714,17 +810,24 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
             return Err(http_unauthorized(url));
         }
         Ok(resp) => {
-            debug!("HEAD {url} -> {}, probing with Range GET", resp.status());
+            debug!(
+                "HEAD {} -> {}, probing with Range GET",
+                http_pool::redacted_url(url),
+                resp.status()
+            );
         }
         Err(ureq::Error::Status(401, _)) => {
             return Err(http_unauthorized(url));
         }
         Err(e) => {
-            debug!("HEAD {url} failed: {e}, probing with Range GET");
+            debug!(
+                "HEAD failed: {}, probing with Range GET",
+                map_ureq_http_error(e, url)
+            );
         }
     }
 
-    if let Some(mut probe) = probe_range_size(loc)? {
+    if let Some(mut probe) = probe_range_size(source)? {
         if probe.link.is_none() {
             probe.link = link;
         }
@@ -740,30 +843,35 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
 }
 
 /// Issue `GET` with `Range: bytes=0-0`. Returns probe meta on 206; `None` if ranges unusable.
-fn probe_range_size(loc: &HttpLocation) -> Result<Option<HttpProbe>> {
-    let url = loc.url.as_str();
-    let resp = match apply_http_auth(
-        ureq::get(url)
-            .set("User-Agent", USER_AGENT)
-            .set("Range", "bytes=0-0"),
-        loc.auth.as_ref(),
-        loc.cookie.as_deref(),
-    )
-    .call()
-    {
+fn probe_range_size(source: &HttpRangeSource) -> Result<Option<HttpProbe>> {
+    let url = source.url();
+    let resp = match source.request("GET", Some((0, 0))) {
         Ok(r) => r,
         Err(ureq::Error::Status(401, _)) => {
             return Err(http_unauthorized(url));
         }
         Err(e) => {
-            debug!("Range probe {url} failed: {e}");
+            debug!("Range probe failed: {}", map_ureq_http_error(e, url));
             return Ok(None);
         }
     };
     let status = resp.status();
     if status == 206 {
         // Prefer Content-Range total (Content-Length on 206 is only the partial length).
-        let total = parse_content_range_total(resp.header("Content-Range"));
+        let total = http_pool::validate_content_range(&resp, 0, 0, None)?;
+        if let Some(size) = total {
+            source.observe_identity(&resp, size);
+        }
+        // Consume the probe body so the connection returns to the shared pool.
+        let mut byte = [0];
+        let mut reader = resp.into_reader();
+        reader.read_exact(&mut byte)?;
+        if reader.read(&mut byte)? != 0 {
+            return Err(RemoteError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "extra range probe bytes",
+            )));
+        }
         return Ok(Some(HttpProbe {
             content_length: total,
             accept_ranges: true,
@@ -784,7 +892,10 @@ fn probe_range_size(loc: &HttpLocation) -> Result<Option<HttpProbe>> {
             link: None,
         }));
     }
-    debug!("Range probe {url} -> HTTP {status}");
+    debug!(
+        "Range probe {} -> HTTP {status}",
+        http_pool::redacted_url(url)
+    );
     Ok(None)
 }
 
@@ -793,7 +904,7 @@ pub fn fetch_http_range_bytes(url: &str, start: u64, end_inclusive: u64) -> Resu
     let loc = parse_http_url(url)?;
     let range = format!("bytes={start}-{end_inclusive}");
     let resp = apply_http_auth(
-        ureq::get(loc.url.as_str())
+        http_pool::get(loc.url.as_str())
             .set("User-Agent", USER_AGENT)
             .set("Range", &range),
         loc.auth.as_ref(),
@@ -804,6 +915,9 @@ pub fn fetch_http_range_bytes(url: &str, start: u64, end_inclusive: u64) -> Resu
     let status = resp.status();
     if status != 206 && !(200..300).contains(&status) {
         return Err(http_status_err(status, loc.url.as_str()));
+    }
+    if status == 206 {
+        http_pool::validate_content_range(&resp, start, end_inclusive, None)?;
     }
     let mut reader = resp.into_reader();
     let mut buf = Vec::new();
@@ -822,7 +936,7 @@ pub fn hash_http_range_sha256(url: &str, start: u64, end_inclusive: u64) -> Resu
     let loc = parse_http_url(url)?;
     let range = format!("bytes={start}-{end_inclusive}");
     let resp = apply_http_auth(
-        ureq::get(loc.url.as_str())
+        http_pool::get(loc.url.as_str())
             .set("User-Agent", USER_AGENT)
             .set("Range", &range),
         loc.auth.as_ref(),
@@ -833,6 +947,9 @@ pub fn hash_http_range_sha256(url: &str, start: u64, end_inclusive: u64) -> Resu
     let status = resp.status();
     if status != 206 && !(200..300).contains(&status) {
         return Err(http_status_err(status, loc.url.as_str()));
+    }
+    if status == 206 {
+        http_pool::validate_content_range(&resp, start, end_inclusive, None)?;
     }
     let mut reader = resp.into_reader();
     let mut hasher = Sha256::new();
@@ -857,17 +974,22 @@ pub fn fetch_http_to_temp(url: &str) -> Result<(NamedTempFile, u64)> {
 ///
 /// Used for `{url}.index.ptr` so a cache-miss mount cannot slurp an unbounded object.
 pub fn fetch_http_bytes_capped(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
-    let loc = parse_http_url(url)?;
-    let resp = apply_http_auth(
-        ureq::get(loc.url.as_str()).set("User-Agent", USER_AGENT),
-        loc.auth.as_ref(),
-        loc.cookie.as_deref(),
-    )
-    .call()
-    .map_err(|e| map_ureq_http_error(e, loc.url.as_str()))?;
+    fetch_http_bytes_capped_with_auth(url, max_bytes, HttpAuthOptions::default())
+}
+
+/// Bounded GET with explicit secret Bearer authentication.
+pub fn fetch_http_bytes_capped_with_auth(
+    url: &str,
+    max_bytes: u64,
+    options: HttpAuthOptions,
+) -> Result<Vec<u8>> {
+    let source = HttpRangeSource::new(parse_http_url(url)?, options);
+    let resp = source
+        .request("GET", None)
+        .map_err(|e| map_ureq_http_error(e, source.url()))?;
     let status = resp.status();
     if !(200..300).contains(&status) {
-        return Err(http_status_err(status, loc.url.as_str()));
+        return Err(http_status_err(status, source.url()));
     }
     let buf = read_at_most(&mut resp.into_reader(), max_bytes)?;
     if buf.len() as u64 > max_bytes {
@@ -889,12 +1011,17 @@ pub(crate) fn read_at_most(reader: &mut impl Read, max_bytes: u64) -> io::Result
 /// factory changes. Matches the Python fsspec-style prefer-range path.
 pub fn fetch_http_to_temp_prefer_range(url: &str) -> Result<(NamedTempFile, u64)> {
     let loc = parse_http_url(url)?;
-    let probe = probe_http_location(&loc)?;
+    let source = Arc::new(HttpRangeSource::new(
+        loc.clone(),
+        HttpAuthOptions::default(),
+    ));
+    let probe = probe_http_source(&source)?;
     if probe.accept_ranges {
         if let Some(size) = probe.content_length {
             debug!(
                 "HTTP prefer-range: downloading {} ({size} bytes) in {}-byte chunks",
-                loc.url, HTTP_RANGE_CHUNK
+                http_pool::redacted_url(&loc.url),
+                HTTP_RANGE_CHUNK
             );
             match fetch_http_via_ranges(&loc, size) {
                 Ok(v) => return Ok(v),
@@ -905,7 +1032,7 @@ pub fn fetch_http_to_temp_prefer_range(url: &str) -> Result<(NamedTempFile, u64)
                     }
                     debug!(
                         "HTTP range download failed for {}: {e}; falling back to full GET",
-                        loc.url
+                        http_pool::redacted_url(&loc.url)
                     );
                 }
             }
@@ -913,14 +1040,14 @@ pub fn fetch_http_to_temp_prefer_range(url: &str) -> Result<(NamedTempFile, u64)
     }
     debug!(
         "HTTP full GET for {} (ranges unavailable or incomplete probe)",
-        loc.url
+        http_pool::redacted_url(&loc.url)
     );
     fetch_http_full_get(&loc)
 }
 
 fn fetch_http_full_get(loc: &HttpLocation) -> Result<(NamedTempFile, u64)> {
     let resp = apply_http_auth(
-        ureq::get(&loc.url).set("User-Agent", USER_AGENT),
+        http_pool::get(&loc.url).set("User-Agent", USER_AGENT),
         loc.auth.as_ref(),
         loc.cookie.as_deref(),
     )
@@ -948,7 +1075,7 @@ fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile
     for (start, end) in range_chunk_windows(size, HTTP_RANGE_CHUNK) {
         let range = format!("bytes={start}-{end}");
         let resp = apply_http_auth(
-            ureq::get(&loc.url)
+            http_pool::get(&loc.url)
                 .set("User-Agent", USER_AGENT)
                 .set("Range", &range),
             loc.auth.as_ref(),
@@ -958,6 +1085,7 @@ fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile
         .map_err(|e| map_ureq_http_error(e, &loc.url))?;
         let status = resp.status();
         if status == 206 {
+            http_pool::validate_content_range(&resp, start, end, Some(size))?;
             let mut reader = resp.into_reader();
             let expected = end - start + 1;
             let n = io::copy(&mut reader, &mut tmp)?;
@@ -994,24 +1122,31 @@ fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile
 /// Prefer [`open_http_range`] / [`resolve_http`] for the public entry points.
 /// [`resolve_to_local`] still fully materializes HTTP(S) for path-based openers.
 ///
-/// Basic auth and/or Cookie from the open URL / env are retained for subsequent Range GETs.
+/// Credentials are retained for the origin; redirected targets receive no origin credentials.
+/// Sequential reads use bounded parallel readahead; `RATARMOUNT_HTTP_PARALLEL=1` disables it.
 pub struct HttpRangeFile {
-    /// Wire URL without userinfo.
-    url: String,
-    auth: Option<HttpAuth>,
-    cookie: Option<String>,
+    source: Arc<HttpRangeSource>,
     size: u64,
     pos: u64,
-    /// Optional fully buffered body if ranges unavailable
-    buffered: Option<Vec<u8>>,
+    /// Optional fully buffered body if ranges unavailable.
+    buffered: Option<Arc<Vec<u8>>>,
+    memory: Option<Arc<ratarmount_core::budget::Reservation>>,
+    disk: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+    forward_window: Box<http_pool::ForwardReadWindow>,
+    last_read_end: Option<u64>,
+    sequential_bytes: u64,
+    last_read_size: usize,
+    parallel: usize,
+    prefetch: Option<Prefetch>,
 }
 
 impl std::fmt::Debug for HttpRangeFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpRangeFile")
-            .field("url", &self.url)
-            .field("auth", &self.auth)
-            .field("cookie", &self.cookie.as_deref().map(redact_cookie_header))
+            .field("url", &self.source.url())
+            .field("auth", &self.source.location.auth)
+            .field("options", &self.source.options)
+            .field("cookie", &self.cookie().map(redact_cookie_header))
             .field("size", &self.size)
             .field("pos", &self.pos)
             .field("uses_ranges", &self.uses_ranges())
@@ -1021,64 +1156,115 @@ impl std::fmt::Debug for HttpRangeFile {
 
 impl HttpRangeFile {
     /// Open `url`, using live Range GETs when the server supports ranges and size is known.
-    ///
     /// Without usable ranges, buffers the full response body in memory.
     pub fn open(url: &str) -> Result<Self> {
-        let loc = parse_http_url(url)?;
-        let probe = probe_http_location(&loc)?;
-        if probe.accept_ranges {
-            if let Some(size) = probe.content_length {
-                return Ok(Self::from_location(loc, size, None));
-            }
-        }
-
-        // Fallback: full download into memory (fine for test fixtures / small objects)
-        let (mut tmp, size) = fetch_http_full_get(&loc)?;
-        let mut buf = Vec::with_capacity(size as usize);
-        tmp.read_to_end(&mut buf)?;
-        Ok(Self::from_location(loc, buf.len() as u64, Some(buf)))
+        Self::open_with_auth(url, HttpAuthOptions::default())
     }
 
-    fn from_location(loc: HttpLocation, size: u64, buffered: Option<Vec<u8>>) -> Self {
+    /// Open with explicit secret Bearer authentication, retaining URL/env Basic and Cookies.
+    pub fn open_with_auth(url: &str, options: HttpAuthOptions) -> Result<Self> {
+        let source = Arc::new(HttpRangeSource::new(parse_http_url(url)?, options));
+        let probe = probe_http_source(&source)?;
+        if probe.accept_ranges {
+            if let Some(size) = probe.content_length {
+                return Ok(Self::from_source(source, size, None));
+            }
+        }
+        let resp = source
+            .request("GET", None)
+            .map_err(|e| map_ureq_http_error(e, source.url()))?;
+        if !(200..300).contains(&resp.status()) {
+            return Err(http_status_err(resp.status(), source.url()));
+        }
+        if ratarmount_core::budget::MemoryBudget::global().enabled() {
+            let _pool = ratarmount_core::budget::MemoryPool::global(
+                "http-fallback",
+                64 * 1024 * 1024,
+                ratarmount_core::budget::Priority::Cache,
+            );
+            let mut file = tempfile::tempfile()?;
+            let size = io::copy(&mut resp.into_reader(), &mut file)?;
+            let mut reader = Self::from_source(source, size, None);
+            reader.disk = Some(Arc::new(std::sync::Mutex::new(file)));
+            return Ok(reader);
+        }
+        let mut buf = Vec::new();
+        resp.into_reader().read_to_end(&mut buf)?;
+        Ok(Self::from_source(
+            source,
+            buf.len() as u64,
+            Some(Arc::new(buf)),
+        ))
+    }
+
+    fn from_source(
+        source: Arc<HttpRangeSource>,
+        size: u64,
+        buffered: Option<Arc<Vec<u8>>>,
+    ) -> Self {
         Self {
-            url: loc.url,
-            auth: loc.auth,
-            cookie: loc.cookie,
+            source,
             size,
             pos: 0,
             buffered,
+            memory: None,
+            disk: None,
+            forward_window: Default::default(),
+            last_read_end: None,
+            sequential_bytes: 0,
+            last_read_size: 0,
+            parallel: http_pool::parallelism(),
+            prefetch: None,
         }
     }
 
-    /// Construct a live Range-backed reader (no probe; caller must know size).
-    ///
-    /// Parses Basic auth and Cookie from URL userinfo / env the same way as [`open`].
+    /// Construct a live Range-backed reader without probing; caller must know the size.
     pub fn range_backed(url: &str, size: u64) -> Self {
-        match parse_http_url(url) {
-            Ok(loc) => Self::from_location(loc, size, None),
-            Err(_) => Self {
-                url: url.to_string(),
-                auth: None,
-                cookie: None,
-                size,
-                pos: 0,
-                buffered: None,
-            },
-        }
+        Self::range_backed_with_auth(url, size, HttpAuthOptions::default())
     }
 
+    /// Construct an unprobed reader with explicit secret Bearer authentication.
+    pub fn range_backed_with_auth(url: &str, size: u64, options: HttpAuthOptions) -> Self {
+        let loc = parse_http_url(url).unwrap_or_else(|_| HttpLocation {
+            url: url.to_string(),
+            auth: None,
+            cookie: None,
+        });
+        Self::from_source(Arc::new(HttpRangeSource::new(loc, options)), size, None)
+    }
+
+    /// Attach an identity verified by a backend, such as a resolved Hub commit.
+    pub fn with_content_token(mut self, token: ContentToken) -> Self {
+        self.prefetch = None;
+        self.forward_window = Default::default();
+        self.source.set_content_token(token);
+        self
+    }
+
+    /// A contiguous verified local file. Hub-backed files become available
+    /// after background publication completes; this does not wait for it.
+    pub fn complete_file(&self) -> Option<PathBuf> {
+        self.source.complete_file(self.size)
+    }
+
+    /// Descriptor verified at open or by background Hub-cache publication.
+    pub fn backing_file(&self) -> Option<std::fs::File> {
+        self.source.backing_file(self.size)
+    }
+
+    /// Origin URL, with userinfo removed.
     pub fn url(&self) -> &str {
-        &self.url
+        self.source.url()
     }
 
-    /// Basic auth retained for live Range GETs, if any.
+    /// Basic auth retained for the origin, if any.
     pub fn auth(&self) -> Option<&HttpAuth> {
-        self.auth.as_ref()
+        self.source.location.auth.as_ref()
     }
 
-    /// Cookie header retained for live Range GETs, if any.
+    /// Cookie header retained for the origin, if any.
     pub fn cookie(&self) -> Option<&str> {
-        self.cookie.as_deref()
+        self.source.location.cookie.as_deref()
     }
 
     pub fn len(&self) -> u64 {
@@ -1091,7 +1277,7 @@ impl HttpRangeFile {
 
     /// True when reads issue live Range GETs (not a fully buffered body).
     pub fn uses_ranges(&self) -> bool {
-        self.buffered.is_none()
+        self.buffered.is_none() && self.disk.is_none()
     }
 }
 
@@ -1154,18 +1340,25 @@ impl RemoteHttp {
 /// [`resolve_to_local`] remains the full-materialize path for path-based openers.
 pub fn resolve_http(url: &str) -> Result<RemoteHttp> {
     let loc = parse_http_url(url)?;
-    let probe = probe_http_location(&loc)?;
+    let source = Arc::new(HttpRangeSource::new(
+        loc.clone(),
+        HttpAuthOptions::default(),
+    ));
+    let probe = probe_http_source(&source)?;
     if probe.accept_ranges {
         if let Some(size) = probe.content_length {
-            debug!("HTTP live Range for {} ({size} bytes)", loc.url);
-            return Ok(RemoteHttp::Range(HttpRangeFile::from_location(
-                loc, size, None,
+            debug!(
+                "HTTP live Range for {} ({size} bytes)",
+                http_pool::redacted_url(&loc.url)
+            );
+            return Ok(RemoteHttp::Range(HttpRangeFile::from_source(
+                source, size, None,
             )));
         }
     }
     debug!(
         "HTTP materialize for {} (ranges unavailable or size unknown)",
-        loc.url
+        http_pool::redacted_url(&loc.url)
     );
     let (tmp, size) = fetch_http_full_get(&loc)?;
     Ok(RemoteHttp::Materialized(keep_fetched(url, tmp, size)?))
@@ -1220,87 +1413,96 @@ impl Read for HttpRangeFile {
         if self.pos >= self.size || buf.is_empty() {
             return Ok(0);
         }
-        if let Some(data) = &self.buffered {
+        let n = if let Some(file) = &self.disk {
+            let mut file = file
+                .lock()
+                .map_err(|_| io::Error::other("HF spool mutex poisoned"))?;
+            file.seek(SeekFrom::Start(self.pos))?;
+            file.read(buf)?
+        } else if let Some(data) = &self.buffered {
             let start = self.pos as usize;
-            let end = (self.pos as usize + buf.len()).min(data.len());
-            let n = end - start;
-            buf[..n].copy_from_slice(&data[start..end]);
-            self.pos += n as u64;
-            return Ok(n);
-        }
-        let end = (self.pos + buf.len() as u64).min(self.size);
-        if end <= self.pos {
-            return Ok(0);
-        }
-        // Inclusive Range end
-        let range = format!("bytes={}-{}", self.pos, end - 1);
-        let resp = apply_http_auth(
-            ureq::get(&self.url)
-                .set("User-Agent", USER_AGENT)
-                .set("Range", &range),
-            self.auth.as_ref(),
-            self.cookie.as_deref(),
-        )
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::Status(401, _) => io::Error::other(format!(
-                "HTTP 401 Unauthorized for {}; check URL userinfo, {}/{}, or Cookie via {}/{}",
-                self.url, HTTP_USER_ENV, HTTP_PASSWORD_ENV, HTTP_COOKIE_ENV, HTTP_COOKIE_FILE_ENV
-            )),
-            other => io::Error::other(other.to_string()),
-        })?;
-        let status = resp.status();
-        if status == 206 {
-            let mut reader = resp.into_reader();
-            let mut chunk = vec![0u8; (end - self.pos) as usize];
-            reader.read_exact(&mut chunk)?;
-            let n = chunk.len().min(buf.len());
-            buf[..n].copy_from_slice(&chunk[..n]);
-            self.pos += n as u64;
-            return Ok(n);
-        }
-        if status == 200 {
-            // Server ignored Range and returned the full body; skip to pos then read.
-            let mut reader = resp.into_reader();
-            let skip = self.pos;
-            if skip > 0 {
-                io::copy(&mut reader.by_ref().take(skip), &mut io::sink())?;
+            let n = buf.len().min(data.len() - start);
+            buf[..n].copy_from_slice(&data[start..start + n]);
+            n
+        } else if let Some(n) = self
+            .forward_window
+            .read(&self.source, self.pos, self.size, buf)?
+        {
+            self.prefetch = None;
+            n
+        } else {
+            if self.parallel > 1
+                && self.last_read_end == Some(self.pos)
+                && (self.sequential_bytes >= 1024 * 1024 || self.last_read_size >= 64 * 1024)
+                && self.prefetch.is_none()
+            {
+                self.prefetch = Some(Prefetch::new(
+                    Arc::clone(&self.source),
+                    self.pos,
+                    self.size,
+                    self.parallel,
+                ));
             }
-            let need = (end - self.pos) as usize;
-            let mut chunk = vec![0u8; need];
-            reader.read_exact(&mut chunk)?;
-            let n = chunk.len().min(buf.len());
-            buf[..n].copy_from_slice(&chunk[..n]);
-            self.pos += n as u64;
-            return Ok(n);
-        }
-        if status == 401 {
-            return Err(io::Error::other(format!(
-                "HTTP 401 Unauthorized for {}; check URL userinfo, {}/{}, or Cookie via {}/{}",
-                self.url, HTTP_USER_ENV, HTTP_PASSWORD_ENV, HTTP_COOKIE_ENV, HTTP_COOKIE_FILE_ENV
-            )));
-        }
-        Err(io::Error::other(format!(
-            "HTTP {status} for range {range} on {}",
-            self.url
-        )))
+            let prefetched = match &mut self.prefetch {
+                Some(prefetch) => match prefetch.read(self.pos, buf) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        self.prefetch = None;
+                        self.last_read_end = None;
+                        self.sequential_bytes = 0;
+                        self.last_read_size = 0;
+                        return Err(err);
+                    }
+                },
+                None => None,
+            };
+            match prefetched {
+                Some(n) => n,
+                None => {
+                    self.prefetch = None;
+                    self.source.read_into_with_pattern(
+                        self.pos,
+                        self.size,
+                        buf,
+                        self.last_read_end == Some(self.pos)
+                            && (self.sequential_bytes >= 1024 * 1024
+                                || self.last_read_size >= 64 * 1024),
+                    )?
+                }
+            }
+        };
+        self.sequential_bytes = if self.last_read_end == Some(self.pos) {
+            self.sequential_bytes.saturating_add(n as u64)
+        } else {
+            n as u64
+        };
+        self.last_read_size = n;
+        self.pos += n as u64;
+        self.last_read_end = Some(self.pos);
+        Ok(n)
     }
 }
 
 impl Seek for HttpRangeFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let new = match pos {
-            SeekFrom::Start(o) => o as i64,
-            SeekFrom::End(o) => self.size as i64 + o,
-            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::Start(o) => i128::from(o),
+            SeekFrom::End(o) => i128::from(self.size) + i128::from(o),
+            SeekFrom::Current(o) => i128::from(self.pos) + i128::from(o),
         };
-        if new < 0 {
-            return Err(io::Error::new(
+        let new = u64::try_from(new).map_err(|_| {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "seek before start",
-            ));
+                "seek outside HTTP file offset range",
+            )
+        })?;
+        if new != self.pos {
+            self.prefetch = None;
+            self.last_read_end = None;
+            self.sequential_bytes = 0;
+            self.last_read_size = 0;
+            self.pos = new;
         }
-        self.pos = new as u64;
         Ok(self.pos)
     }
 }
@@ -1312,6 +1514,30 @@ pub fn materialize_input(input: &str) -> Result<RemoteLocal> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_http_ignored_range_spills() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(64).unwrap();
+
+        http_range_file_fallback_buffer();
+        let snapshot = ratarmount_core::budget::MemoryBudget::global().snapshot();
+        assert_eq!(snapshot.reserved, 0);
+        assert!(snapshot
+            .pools
+            .iter()
+            .any(|pool| pool.name == "http-fallback"));
+    }
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
@@ -2656,5 +2882,57 @@ mod tests {
     fn webdav_parse_maps_webdavs() {
         let loc = parse_webdav_url("webdavs://files.example.com/vault/x.tar").unwrap();
         assert_eq!(loc.http_url, "https://files.example.com/vault/x.tar");
+    }
+}
+
+#[cfg(test)]
+mod torrent_dispatch_tests {
+    /// Regression: a minimal remote library returned a generic unsupported-scheme error.
+    #[cfg(not(feature = "bittorrent"))]
+    #[test]
+    fn regression_built_without_bittorrent_error() {
+        {
+            let input = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
+            assert!(super::resolve_to_local(input)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("built without bittorrent"));
+        }
+    }
+    /// Regression: suffix detection treated torrent directories as remote inputs, even feature-off.
+    #[test]
+    fn regression_torrent_remote_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.TORRENT");
+        let mount = dir.path().join("mount.torrent");
+        std::fs::write(&file, b"metadata").unwrap();
+        std::fs::create_dir(&mount).unwrap();
+        assert!(!super::is_torrent_input(mount.to_str().unwrap()));
+        assert!(!super::is_remote_url(mount.to_str().unwrap()));
+        assert!(!super::is_torrent_input("missing.torrent"));
+        for input in [file.to_str().unwrap(), "https://example/a.torrent?token=x"] {
+            assert_eq!(super::is_torrent_input(input), cfg!(feature = "bittorrent"));
+        }
+        assert_eq!(
+            super::remote_url_scheme("https://example/a.torrent").as_deref(),
+            Some(if cfg!(feature = "bittorrent") {
+                "torrent"
+            } else {
+                "https"
+            })
+        );
+        assert!(super::is_torrent_input(
+            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
+        ));
+        for input in [
+            "a.torrent.tar",
+            "a.torrent/child",
+            "a.txt",
+            "https://example/a.tar?name=a.torrent",
+            "s3://bucket/a.torrent",
+        ] {
+            assert!(!super::is_torrent_input(input), "{input}");
+        }
     }
 }

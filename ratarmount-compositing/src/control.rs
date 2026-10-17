@@ -127,6 +127,7 @@ pub struct ControlFolderMountSource {
     label: Option<String>,
     on_unmount: Option<Arc<dyn Fn() + Send + Sync>>,
     on_search: Option<OnSearch>,
+    on_status: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 impl ControlFolderMountSource {
@@ -138,6 +139,7 @@ impl ControlFolderMountSource {
             label: options.label,
             on_unmount: options.on_unmount,
             on_search: options.on_search,
+            on_status: None,
         }
     }
 
@@ -243,6 +245,15 @@ impl ControlFolderMountSource {
         Some(percent_decode_component(rest))
     }
 
+    /// Append live policy accounting to the virtual status file.
+    pub fn with_on_status(
+        mut self,
+        callback: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    ) -> Self {
+        self.on_status = callback;
+        self
+    }
+
     fn status_text(&self) -> String {
         let mut s = String::new();
         match &self.label {
@@ -250,6 +261,10 @@ impl ControlFolderMountSource {
             None => s.push_str("mounted\n"),
         }
         s.push_str(&format!("pid {}\n", std::process::id()));
+        s.push_str(&ratarmount_core::budget::MemoryBudget::global().status_text());
+        if let Some(callback) = &self.on_status {
+            s.push_str(&callback());
+        }
         if let Some(dents) = self.inner.list_dirents("/") {
             s.push_str("root:\n");
             for d in dents.iter().take(128) {
@@ -579,6 +594,17 @@ impl MountSource for ControlFolderMountSource {
         self.inner.content_generation()
     }
 
+    fn supports_backing_extents(&self) -> bool {
+        self.inner.supports_backing_extents()
+    }
+
+    fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        if Self::control_tag(file_info).is_some() {
+            return None;
+        }
+        self.inner.backing_extent(file_info)
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         if Self::control_tag(file_info).is_some() {
             return true;
@@ -700,6 +726,7 @@ mod tests {
         }
     }
 
+    /// Regression: virtual status includes global memory pools and accounting.
     #[test]
     fn status_and_pid_readable() {
         let dir = tempfile::tempdir().unwrap();
@@ -711,7 +738,14 @@ mod tests {
             ControlFolderOptions::enabled().with_label("/mnt/test"),
         );
 
+        let _pool = ratarmount_core::budget::MemoryPool::global(
+            "status-test",
+            1,
+            ratarmount_core::budget::Priority::Cache,
+        );
         let status = read_all(&ms, &format!("{CONTROL_DIR_PATH}/status"));
+        assert!(status.contains("memory_budget unlimited"));
+        assert!(status.contains("memory_pool status-test"));
         assert!(status.contains("mounted /mnt/test"), "{status}");
         assert!(
             status.contains(&format!("pid {}", std::process::id())),

@@ -5,8 +5,10 @@
 //! members use a **single-flight shared inflate cache** keyed by central-directory
 //! header offset (FR-4 / [upstream #105](https://github.com/mxmlnkn/ratarmount/issues/105)):
 //!
-//! * Concurrent `open` of the **same** Deflate member runs **one** inflate; waiters
-//!   share the resulting `Arc<Vec<u8>>` (zero-copy `ArcBytes` views).
+//! * Cacheable Deflate members are capped at 64 MiB total retained bytes. Larger
+//!   members, or refused global-budget reservations, stream into a temporary file.
+//! * Concurrent `open` of the **same cacheable** Deflate member runs **one** inflate; waiters
+//!   share the resulting `Arc<InflateBytes>` (zero-copy `ArcBytes` views).
 //! * Concurrent `open` of **distinct** Deflate members inflates in parallel on the
 //!   path-backed backend (`read_file_range_at`, then an independent `flate2` decoder).
 //!   On the shared-stream backend, compressed bytes are read under the stream mutex
@@ -15,6 +17,8 @@
 //!   members and every method other than Stored or Deflate go through the `zip` crate:
 //!   file-backed opens use `PositionalFile`; `ZipBackend::Shared` stays on
 //!   `SharedSeekHandle`.
+//!   Budgeted opens stream compressed input instead of retaining a second
+//!   member-sized buffer.
 //!
 //! # Multi-disk / multi-part ZIP
 //!
@@ -82,11 +86,24 @@ const ZIP_BATCH_FLUSH: usize = 512;
 
 /// Soft cap on completed inflate-cache entries (evict completed when exceeded).
 const INFLATE_CACHE_MAX_ENTRIES: usize = 256;
+const INFLATE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+struct InflateBytes {
+    data: Vec<u8>,
+    _memory: ratarmount_core::budget::Reservation,
+}
+impl std::ops::Deref for InflateBytes {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
 
 /// Single-flight Deflate inflate slot. Only **successful** results are retained
 /// permanently; on failure the slot is removed from the map so the next open can
 /// retry (transient I/O must not poison a member for the mount lifetime).
-type InflateOnce = OnceLock<std::result::Result<Arc<Vec<u8>>, String>>;
+type InflateOnce = OnceLock<std::result::Result<Option<Arc<InflateBytes>>, String>>;
 
 /// Single-flight shared decode cache for ZIP Deflate members (FR-4).
 ///
@@ -94,13 +111,35 @@ type InflateOnce = OnceLock<std::result::Result<Arc<Vec<u8>>, String>>;
 /// the same key share one `OnceLock` so only a single `flate2` inflate runs.
 /// Failed inflates are not sticky: the map entry is dropped so a later open retries.
 struct InflateCache {
-    slots: Mutex<HashMap<u64, Arc<InflateOnce>>>,
+    slots: Arc<Mutex<HashMap<u64, Arc<InflateOnce>>>>,
+    pool: ratarmount_core::budget::MemoryPool,
+    _shrink: ratarmount_core::budget::PressureHook,
 }
 
 impl InflateCache {
     fn new() -> Self {
+        Self::with_pool(ratarmount_core::budget::MemoryPool::global(
+            "zip-inflate",
+            INFLATE_CACHE_MAX_BYTES,
+            ratarmount_core::budget::Priority::Cache,
+        ))
+    }
+
+    fn with_pool(pool: ratarmount_core::budget::MemoryPool) -> Self {
+        let slots: Arc<Mutex<HashMap<u64, Arc<InflateOnce>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let weak = Arc::downgrade(&slots);
+        let shrink = pool.on_pressure(move || {
+            if let Some(slots) = weak.upgrade() {
+                if let Ok(mut slots) = slots.try_lock() {
+                    slots.retain(|_, s| s.get().is_none());
+                }
+            }
+        });
         Self {
-            slots: Mutex::new(HashMap::new()),
+            slots,
+            pool,
+            _shrink: shrink,
         }
     }
 
@@ -108,15 +147,29 @@ impl InflateCache {
     ///
     /// On error the slot is removed so the next call re-runs `inflate` instead of
     /// returning a permanently cached failure.
+    #[cfg(test)]
     fn get_or_insert_with(
         &self,
         header: u64,
         inflate: impl FnOnce() -> io::Result<Vec<u8>>,
-    ) -> io::Result<Arc<Vec<u8>>> {
+    ) -> io::Result<Arc<InflateBytes>> {
+        self.get_sized(header, 0, inflate)?
+            .ok_or_else(|| io::Error::other("test cache refused"))
+    }
+
+    fn get_sized(
+        &self,
+        header: u64,
+        size: u64,
+        inflate: impl FnOnce() -> io::Result<Vec<u8>>,
+    ) -> io::Result<Option<Arc<InflateBytes>>> {
+        if size > self.pool.cap() {
+            return Ok(None);
+        }
         let slot = {
             let mut guard = self.slots.lock().expect("zip inflate cache");
             // Evict completed entries when over cap; keep in-flight slots.
-            if guard.len() > INFLATE_CACHE_MAX_ENTRIES {
+            if guard.len() >= INFLATE_CACHE_MAX_ENTRIES {
                 guard.retain(|_, s| s.get().is_none());
             }
             // Drop any prior failed slot that raced before removal (should be rare).
@@ -132,9 +185,36 @@ impl InflateCache {
             )
         };
         // Single-flight: concurrent waiters share one inflate invocation.
-        let res = slot.get_or_init(|| inflate().map(Arc::new).map_err(|e| e.to_string()));
+        let res = slot.get_or_init(|| {
+            let Some(memory) = self.pool.reserve(size) else {
+                return Ok(None);
+            };
+            inflate()
+                .map(|data| {
+                    Some(Arc::new(InflateBytes {
+                        data,
+                        _memory: memory,
+                    }))
+                })
+                .map_err(|e| e.to_string())
+        });
         match res {
-            Ok(bytes) => Ok(Arc::clone(bytes)),
+            Ok(bytes) => {
+                let mut slots = self.slots.lock().expect("zip inflate cache");
+                let retained: u64 = slots
+                    .values()
+                    .filter_map(|s| {
+                        s.get()
+                            .and_then(|r| r.as_ref().ok())
+                            .and_then(|v| v.as_ref())
+                    })
+                    .map(|v| v.capacity() as u64)
+                    .sum();
+                if retained > self.pool.cap() || bytes.is_none() {
+                    slots.retain(|_, s| s.get().is_none());
+                }
+                Ok(bytes.as_ref().map(Arc::clone))
+            }
             Err(msg) => {
                 // Do not permanently poison this member: remove our failed slot so
                 // the next open can retry (e.g. transient remote / Shared I/O).
@@ -1242,7 +1322,7 @@ fn decode_plain_member_from_file(
         METHOD_STORED => read_file_range_at(file, meta.data_start, size),
         METHOD_DEFLATE => {
             let compressed = read_file_range_at(file, meta.data_start, meta.compressed_size)?;
-            let mut dec = flate2::read::DeflateDecoder::new(compressed.as_slice());
+            let mut dec = flate2::read::DeflateDecoder::new(compressed.as_slice()).take(size);
             let mut data = Vec::with_capacity(size as usize);
             dec.read_to_end(&mut data)
                 .map_err(|e| io::Error::other(format!("zip deflate: {e}")))?;
@@ -1389,7 +1469,14 @@ impl ZipMountSource {
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
         // Single-flight: concurrent openers of this member share one inflate.
         let compressed_size = meta.compressed_size;
-        let arc = self.inflate_cache.get_or_insert_with(header, || {
+        let arc = self.inflate_cache.get_sized(header, size, || {
+            if self.inflate_cache.pool.enabled() {
+                let compressed = self.open_stored(data_start, compressed_size)?;
+                let mut decoder = flate2::read::DeflateDecoder::new(compressed).take(size);
+                let mut data = Vec::with_capacity(size as usize);
+                decoder.read_to_end(&mut data)?;
+                return Ok(data);
+            }
             let compressed = match &self.backend {
                 // pread-style: concurrent distinct members do not race on file offset.
                 ZipBackend::File { raw_file, .. } => {
@@ -1407,7 +1494,7 @@ impl ZipMountSource {
                     buf
                 }
             };
-            let mut dec = flate2::read::DeflateDecoder::new(compressed.as_slice());
+            let mut dec = flate2::read::DeflateDecoder::new(compressed.as_slice()).take(size);
             let mut data = Vec::with_capacity(size as usize);
             dec.read_to_end(&mut data)
                 .map_err(|e| io::Error::other(format!("zip deflate: {e}")))?;
@@ -1416,7 +1503,16 @@ impl ZipMountSource {
             }
             Ok(data)
         })?;
-        Ok(Box::new(ArcBytes::new(arc)))
+        if let Some(arc) = arc {
+            return Ok(Box::new(ArcBytes::new(arc)));
+        }
+        // An oversized member or refused reservation stays seekable on disk.
+        let compressed = self.open_stored(data_start, compressed_size)?;
+        let decoder = flate2::read::DeflateDecoder::new(compressed);
+        let mut file = tempfile::tempfile()?;
+        io::copy(&mut decoder.take(size), &mut file)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(Box::new(file))
     }
 
     fn open_via_zip_crate(
@@ -1467,12 +1563,12 @@ impl ZipMountSource {
 
 /// Zero-copy view of cached inflated ZIP member bytes.
 struct ArcBytes {
-    data: Arc<Vec<u8>>,
+    data: Arc<InflateBytes>,
     pos: u64,
 }
 
 impl ArcBytes {
-    fn new(data: Arc<Vec<u8>>) -> Self {
+    fn new(data: Arc<InflateBytes>) -> Self {
         Self { data, pos: 0 }
     }
 }
@@ -3666,6 +3762,85 @@ mod tests {
             name_back >= 1,
             "name-order control must have ≥1 backward Start (fixture shuffled), starts={:?}",
             name_reader.starts
+        );
+    }
+}
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::*;
+
+    /// Regression: entry-count limits allowed unbounded retained ZIP bytes.
+    #[test]
+    fn regression_zip_inflate_cache_byte_bound() {
+        for limit in [None, Some(8192)] {
+            let budget = ratarmount_core::budget::MemoryBudget::new(limit);
+            let cache = InflateCache::with_pool(budget.register(
+                "test",
+                0,
+                1024,
+                ratarmount_core::budget::Priority::Cache,
+            ));
+            for i in 0..32 {
+                let value = cache
+                    .get_sized(i, 64, || Ok(vec![i as u8; 64]))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(value.as_slice(), &[i as u8; 64]);
+                assert!(budget.snapshot().reserved <= 1024);
+                assert!(cache.completed_len() <= 16);
+            }
+            assert!(cache
+                .get_sized(100, 1025, || panic!(
+                    "oversized member must spill before allocating"
+                ))
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_zip_spills_correct_bytes() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(64).unwrap();
+
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        writer
+            .start_file(
+                "member",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        let bytes = vec![29; 32768];
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let source =
+            ZipMountSource::open(&path, None, &OpenOptions::default(), "test", false).unwrap();
+        let info = source.lookup("/member", 0).unwrap();
+        let mut reader = source.open(&info, 0).unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, bytes);
+        assert_eq!(source.inflate_cache.completed_len(), 0);
+        assert!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .high_water
+                <= 64
         );
     }
 }

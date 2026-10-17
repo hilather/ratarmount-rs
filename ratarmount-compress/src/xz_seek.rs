@@ -192,7 +192,7 @@ fn full_decode_body(path: &Path, compressed: &[u8], threads: u32) -> Result<Arc<
     };
 
     if decoded.len() as u64 <= DEFAULT_MEMORY_CAP {
-        Ok(DecodedBody::from_bytes(path, "xz", decoded))
+        Ok(DecodedBody::from_bytes(path, "xz", decoded)?)
     } else {
         let cursor = std::io::Cursor::new(decoded);
         let body = DecodedBody::from_decoder(path, "xz", cursor, DEFAULT_MEMORY_CAP)?;

@@ -166,6 +166,7 @@ pub fn spawn_interval_commits(
                     LiveRemote::S3 => reopen_s3_mount(&remote_url, &opts),
                     LiveRemote::Gcs => reopen_gcs_mount(&remote_url, &opts),
                     LiveRemote::Azure => reopen_azure_mount(&remote_url, &opts),
+                    LiveRemote::Hf => ov.reopen_remote_live_commit(),
                     LiveRemote::Local => {
                         if let Some(window) = ov.last_patch_window() {
                             patch_sidecar_if_present(p, &window, &opts)?;
@@ -176,7 +177,7 @@ pub fn spawn_interval_commits(
             }) {
                 Ok(CommitOutcome::DidWork) => log::info!(
                     "interval overlay commit wrote idle files into {}",
-                    archive.display()
+                    overlay.commit_archive_path(&archive).display()
                 ),
                 Ok(CommitOutcome::Nothing) => {
                     log::debug!("interval overlay commit: nothing idle to do")
@@ -221,11 +222,25 @@ pub fn apply_live_commit(
         };
         if did && !remote_publish_patches_sidecar(live_remote_kind(&archive.to_string_lossy())) {
             if let Some(window) = overlay.last_patch_window() {
-                patch_sidecar_if_present(archive, &window, opts).map_err(|e| e.to_string())?;
+                patch_sidecar_if_present(&overlay.commit_archive_path(archive), &window, opts)
+                    .map_err(|e| e.to_string())?;
             }
         }
         Ok(did)
     }
+}
+
+pub fn open_rolling_series(
+    base: &Path,
+    policy: ratarmount_compositing::RollPolicy,
+    opts: &OpenOptions,
+) -> Result<Arc<ratarmount_compositing::RollingMountSource>, String> {
+    let opts = opts.clone();
+    ratarmount_compositing::RollingMountSource::open(base, policy, move |path| {
+        ratarmount_session::factory::open_path(path, &opts, false).map_err(OverlayError::Msg)
+    })
+    .map(Arc::new)
+    .map_err(|e| e.to_string())
 }
 
 fn reopen_live_archive(archive: &Path, opts: &OpenOptions) -> Result<Arc<dyn MountSource>, String> {
@@ -360,6 +375,19 @@ pub fn maybe_create_missing_write_base(
     maybe_create_empty_write_archive(path).map_err(|e| e.to_string())
 }
 
+/// Allow the publication flag for live Hub writes without requesting index-only publication.
+pub fn live_hf_create_pr(
+    inputs: &[PathBuf],
+    interval: &str,
+    on_exit: bool,
+    create_pr: bool,
+) -> bool {
+    create_pr
+        && (on_exit || parse_interval(interval).is_ok_and(|i| i.is_some()))
+        && inputs.len() == 1
+        && live_remote_kind(&inputs[0].to_string_lossy()) == LiveRemote::Hf
+}
+
 /// Startup gate: durable `-w` + a single uncompressed TAR or `.tar.zst`.
 pub fn validate_live_commit_args(
     write_overlay: Option<&Path>,
@@ -385,7 +413,7 @@ pub fn validate_live_commit_args(
     let shown = archive.to_string_lossy();
     if matches!(
         live_remote_kind(&shown),
-        LiveRemote::S3 | LiveRemote::Gcs | LiveRemote::Azure
+        LiveRemote::Hf | LiveRemote::S3 | LiveRemote::Gcs | LiveRemote::Azure
     ) {
         if !live_commit_archive_name(&shown) {
             return Err(format!(
@@ -410,7 +438,8 @@ pub fn validate_live_commit_args(
 /// Offline `--commit-overlay` on an object-store URL. Not a live-queue job.
 pub fn offline_remote_commit_error(archive: &Path) -> Option<&'static str> {
     let s = archive.to_string_lossy();
-    if ratarmount_remote::is_object_store_archive_url(&s) {
+    if live_remote_kind(&s) == LiveRemote::Hf || ratarmount_remote::is_object_store_archive_url(&s)
+    {
         Some(
             "offline --commit-overlay does not upload; use --commit-overlay-on-exit or --commit-overlay-interval",
         )
@@ -422,13 +451,16 @@ pub fn offline_remote_commit_error(archive: &Path) -> Option<&'static str> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LiveRemote {
     Local,
+    Hf,
     S3,
     Gcs,
     Azure,
 }
 
 fn live_remote_kind(url: &str) -> LiveRemote {
-    if url.starts_with("s3://") {
+    if ratarmount_remote::remote_url_scheme(url).as_deref() == Some("hf") {
+        LiveRemote::Hf
+    } else if url.starts_with("s3://") {
         LiveRemote::S3
     } else if url.starts_with("gs://") {
         LiveRemote::Gcs
@@ -440,7 +472,10 @@ fn live_remote_kind(url: &str) -> LiveRemote {
 }
 
 fn remote_publish_patches_sidecar(kind: LiveRemote) -> bool {
-    matches!(kind, LiveRemote::S3 | LiveRemote::Gcs | LiveRemote::Azure)
+    matches!(
+        kind,
+        LiveRemote::Hf | LiveRemote::S3 | LiveRemote::Gcs | LiveRemote::Azure
+    )
 }
 
 fn live_commit_archive_name(url: &str) -> bool {
@@ -480,17 +515,19 @@ pub fn install_s3_live_commit(overlay: &WriteOverlay, archive: &Path, opts: &Ope
     );
 }
 
-/// Wire one object-store archive into the live queue. Local paths are unchanged.
+/// Wire one remote archive into the live queue. Hub mounts require their pinned branch identity.
 /// The `gs://` arm calls [`publish_gcs`]. The `az://` arm calls [`publish_azure`].
 /// `-w` is not decided here.
 pub fn install_object_store_live_commit(
     overlay: &WriteOverlay,
     archive: &Path,
     opts: &OpenOptions,
-) {
+    create_pr: bool,
+) -> Result<(), String> {
     let url = archive.to_string_lossy().into_owned();
     match live_remote_kind(&url) {
         LiveRemote::Local => {}
+        LiveRemote::Hf => install_hf_live_commit(overlay, &url, opts, create_pr)?,
         LiveRemote::S3 => install_s3_live_commit(overlay, archive, opts),
         LiveRemote::Gcs => {
             let url_head = url.clone();
@@ -549,9 +586,257 @@ pub fn install_object_store_live_commit(
             );
         }
     }
+    Ok(())
 }
 
 const S3_PUT_SINGLE_MAX: u64 = 8 * 1024 * 1024;
+
+struct HfLiveCommit {
+    repo: ratarmount_remote::HfRepo,
+    revision: String,
+    create_pr: bool,
+    refused: bool,
+}
+
+impl HfLiveCommit {
+    fn ready(&self) -> Result<(), OverlayError> {
+        if self.refused {
+            Err(OverlayError::Msg(
+                "hf live commit disabled; remount required after a conflict or uncertain publication"
+                    .into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn install_hf_live_commit(
+    overlay: &WriteOverlay,
+    url: &str,
+    opts: &OpenOptions,
+    create_pr: bool,
+) -> Result<(), String> {
+    let mut repo = ratarmount_remote::HfRepo::resolve(url).map_err(|e| e.to_string())?;
+    let revision = repo.live_commit_branch().map_err(|e| e.to_string())?;
+    // The branch may have moved since the factory opened the base. Never adopt that push.
+    let root = overlay.lookup("/", 0).ok_or("Hub mount has no root")?;
+    let pinned = overlay
+        .get_xattr(&root, "user.hf.commit")
+        .ok_or("Hub mount has no pinned commit identity")?;
+    repo.commit = String::from_utf8(pinned).map_err(|_| "invalid Hub mount commit identity")?;
+    let state = Arc::new(std::sync::Mutex::new(HfLiveCommit {
+        repo,
+        revision,
+        create_pr,
+        refused: false,
+    }));
+    let head = state.clone();
+    let download = state.clone();
+    let publish = state.clone();
+    let opts_pub = opts.clone();
+    overlay.install_remote_live_commit_for(
+        url,
+        Box::new(move || {
+            let mut state = head.lock().expect("hf live commit");
+            state.ready()?;
+            let current = state.repo.at_revision(&state.revision)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            if current.commit != state.repo.commit {
+                state.refused = true;
+                log::error!("hf branch changed since the pinned commit; further commits refused; remount required");
+                return Err(OverlayError::Msg("hf branch changed; remount required".into()));
+            }
+            let range = state.repo.open_file(&state.repo.location.path)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            Ok(RemoteObjectHead { etag: Some(state.repo.commit.clone()), len: range.len() })
+        }),
+        Box::new(move || {
+            let state = download.lock().expect("hf live commit");
+            state.ready()?;
+            let mut range = state.repo.open_file(&state.repo.location.path)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            let mut file = tempfile::NamedTempFile::new()?;
+            let len = std::io::copy(&mut range, &mut file)?;
+            if len != range.len() {
+                return Err(OverlayError::Msg("short Hub archive download".into()));
+            }
+            Ok(RemoteDownload { file, len })
+        }),
+        Box::new(move |request| {
+            let mut state = publish.lock().expect("hf live commit");
+            publish_hf(&mut state, &opts_pub, request)
+        }),
+        Duration::from_secs(300),
+    );
+    let opts = opts.clone();
+    overlay.install_remote_reopen(Box::new(move || {
+        let state = state.lock().expect("hf live commit");
+        state.ready()?;
+        reopen_hf_mount(&state.repo, &opts)
+    }));
+    Ok(())
+}
+
+fn publish_hf(
+    state: &mut HfLiveCommit,
+    opts: &OpenOptions,
+    req: &RemotePublishRequest,
+) -> Result<(), RemotePublishError> {
+    let retryable = RemotePublishError::Retryable;
+    state.ready().map_err(|e| retryable(e.to_string()))?;
+    if req.etag_at_download.as_deref() != Some(&state.repo.commit) || req.skip_object_put {
+        state.refused = true;
+        return Err(retryable(
+            "Hub archive parent changed; remount required".into(),
+        ));
+    }
+    // Build a fresh snapshot without mutating the index still used by the pinned base.
+    // Even :memory: mounts publish all three names, and a failed upload leaves the old index usable.
+    let dir = tempfile::tempdir().map_err(|e| retryable(e.to_string()))?;
+    let sidecar = dir.path().join("index.sqlite");
+    let mut index_opts = opts.clone();
+    index_opts.index_in_memory = false;
+    index_opts.index_file_path = Some(sidecar.clone());
+    index_opts.write_index = true;
+    index_opts.read_only_index = false;
+    index_opts.ignore_zeros = true;
+    let source = match detect_compression(&req.staged).map_err(|e| retryable(e.to_string()))? {
+        CompressionFormat::Zstd => {
+            let body = open_seekable_zstd_with_threads(&req.staged, opts.threads_for("zstd"))
+                .map_err(|e| retryable(e.to_string()))?;
+            SqliteIndexedTar::create_index_body(
+                &req.staged,
+                body,
+                Some(&sidecar),
+                &index_opts,
+                env!("CARGO_PKG_VERSION"),
+            )
+        }
+        _ => SqliteIndexedTar::create_index(
+            &req.staged,
+            &req.staged,
+            Some(&sidecar),
+            &index_opts,
+            env!("CARGO_PKG_VERSION"),
+            &mut None,
+        ),
+    }
+    .map_err(|e| retryable(e.to_string()))?;
+    drop(source);
+    let index = SqliteIndex::open_writable(&sidecar).map_err(|e| retryable(e.to_string()))?;
+    index
+        .store_tarstats_for_path(&req.staged)
+        .map_err(|e| retryable(e.to_string()))?;
+    if url_is_tar_zst(&state.repo.location.path) {
+        let blocks = ratarmount_compress::export_zstd_blocks(&req.staged)
+            .map_err(|e| retryable(e.to_string()))?;
+        let blocks: Vec<_> = blocks
+            .into_iter()
+            .map(|(c, d)| (c as i64, d as i64))
+            .collect();
+        index
+            .set_zstd_blocks(&blocks)
+            .map_err(|e| retryable(e.to_string()))?;
+    }
+    index
+        .wal_checkpoint_truncate()
+        .map_err(|e| retryable(e.to_string()))?;
+    drop(index);
+    if std::fs::metadata(&sidecar)
+        .map_err(|e| retryable(e.to_string()))?
+        .len()
+        > META_SIDECAR_WHOLE_MAX
+    {
+        return Err(retryable(format!("Hub index exceeds publication limit ({META_SIDECAR_WHOLE_MAX} bytes); archive was not committed")));
+    }
+    let pointer = IndexPointer::for_blob(&sidecar, Some(&req.staged))
+        .map_err(|e| retryable(e.to_string()))?;
+    let json = index_pointer_to_json(&pointer).map_err(|e| retryable(e.to_string()))?;
+    let blob = std::fs::read(&sidecar).map_err(|e| retryable(e.to_string()))?;
+    let blob_path = format!(
+        "{}.index.{}.sqlite",
+        state.repo.location.path, pointer.index_id
+    );
+    let pointer_path = format!("{}.index.ptr", state.repo.location.path);
+    // A lost response can hide a successful commit/PR. Refuse all later writes until remount.
+    state.refused = true;
+    let result = state
+        .repo
+        .commit_archive(
+            &req.staged,
+            &[
+                ratarmount_remote::HfCommitFile {
+                    path: &blob_path,
+                    content: &blob,
+                },
+                ratarmount_remote::HfCommitFile {
+                    path: &pointer_path,
+                    content: json.as_bytes(),
+                },
+            ],
+            &state.revision,
+            state.create_pr,
+            &state.repo.commit,
+        )
+        .map_err(|e| {
+            log::error!("hf atomic commit failed; further commits refused; remount required: {e}");
+            retryable(e.to_string())
+        })?;
+    state.repo.commit = result.commit;
+    if state.create_pr {
+        let number = result
+            .pull_request_url
+            .as_deref()
+            .and_then(|url| url.trim_end_matches('/').rsplit('/').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| {
+                retryable(
+                    "Hub commit succeeded but returned no PR identity; remount required".into(),
+                )
+            })?;
+        state.revision = format!("refs/pr/{number}");
+        state.create_pr = false;
+        log::info!("hf live commit continues on {}", state.revision);
+    }
+    state.refused = false;
+    log::info!(
+        "hf archive and index committed atomically at {}",
+        state.repo.commit
+    );
+    Ok(())
+}
+
+fn reopen_hf_mount(
+    repo: &ratarmount_remote::HfRepo,
+    opts: &OpenOptions,
+) -> Result<Arc<dyn MountSource>, OverlayError> {
+    let range = repo
+        .open_file(&repo.location.path)
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    let label = PathBuf::from(repo.resolve_url(&repo.location.path));
+    let mut o = opts.clone();
+    o.index_in_memory = true;
+    o.index_file_path = None;
+    o.write_index = false;
+    o.ignore_zeros = true;
+    let tar = if url_is_tar_zst(&repo.location.path) {
+        let body = ratarmount_compress::open_seekable_zstd_with_threads_from_reader(
+            range,
+            o.threads_for("zstd"),
+            &label,
+        )
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+        SqliteIndexedTar::create_index_body(&label, body, None, &o, env!("CARGO_PKG_VERSION"))
+    } else {
+        SqliteIndexedTar::open_from_reader(range, &label, None, &o, env!("CARGO_PKG_VERSION"))
+    }
+    .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    Ok(Arc::new(ratarmount_remote::HfMountSource::new(
+        Arc::new(tar),
+        repo.commit.clone(),
+    )))
+}
 
 /// `ensure_s3_write_ok` formats `{op} HTTP 412 precondition failed: {body}`.
 /// The first ` HTTP ` status is the code. A 500 body that mentions 412 stays retryable.
@@ -1140,7 +1425,10 @@ pub fn maybe_commit_on_exit(
         return;
     };
     match apply_live_commit(ov, path, false, opts) {
-        Ok(true) => eprintln!("committed write overlay into {}", path.display()),
+        Ok(true) => eprintln!(
+            "committed write overlay into {}",
+            ov.commit_archive_path(path).display()
+        ),
         Ok(false) => log::debug!("on-exit overlay commit: nothing to do"),
         Err(e) => eprintln!("error: on-exit overlay commit failed: {e}"),
     }
@@ -1161,6 +1449,509 @@ pub(crate) fn term_flag_test_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: hf commit URLs must not be stat-ed as local filenames.
+    #[test]
+    fn regression_hf_commit_url_is_remote_and_offline_refused() {
+        let archive = std::path::PathBuf::from("hf://datasets/org/data/a.tar.zst");
+        let got = super::validate_live_commit_args(
+            Some(std::path::Path::new("overlay")),
+            std::slice::from_ref(&archive),
+        )
+        .unwrap();
+        assert_eq!(got, archive);
+        assert!(super::offline_remote_commit_error(&archive)
+            .unwrap()
+            .contains("offline --commit-overlay does not upload"));
+    }
+
+    fn hf_test_archive(compressed: bool) -> Vec<u8> {
+        let tar = crate::publish_index::tests::publish_tar();
+        if compressed {
+            ratarmount_compress::encode_zstd_frame(&tar, 3).unwrap()
+        } else {
+            tar
+        }
+    }
+
+    fn hf_test_overlay(url: &str, root: &Path, create_pr: bool) -> WriteOverlay {
+        let repo = ratarmount_remote::HfRepo::resolve(url).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let base = reopen_hf_mount(&repo, &opts).unwrap();
+        let overlay = WriteOverlay::new(base, root).unwrap();
+        install_object_store_live_commit(&overlay, Path::new(url), &opts, create_pr).unwrap();
+        overlay
+    }
+
+    fn hf_test_tick(overlay: &WriteOverlay, url: &str) -> Result<CommitOutcome, OverlayError> {
+        overlay.enqueue_commit(
+            Path::new(url),
+            CommitKind::IntervalIdle(Duration::ZERO),
+            |_| overlay.reopen_remote_live_commit(),
+        )
+    }
+
+    /// Regression: the production interval thread still refused hf:// after a successful publication.
+    #[test]
+    fn regression_hf_live_interval_thread_keeps_serving() {
+        use crate::publish_index::tests::{PublishEnv, PublishServer};
+        let _term = term_flag_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let server = PublishServer::live(hf_test_archive(true));
+        let _env = PublishEnv::new(&[
+            ("HF_ENDPOINT", &server.url),
+            ("HF_TOKEN", "hf-test"),
+            ("HF_HUB_OFFLINE", "0"),
+            ("RATARMOUNT_HF_SHARE_CACHE", "0"),
+            ("RATARMOUNT_PAYLOAD_CACHE_BYTES", "0"),
+        ]);
+        let url = "hf://datasets/org/data@main/a.tar.zst";
+        let overlay = Arc::new(hf_test_overlay(url, &dir.path().join("ov"), false));
+        std::fs::write(overlay.root().join("interval.txt"), b"interval output").unwrap();
+        set_term_flag_for_test(false);
+        let handle = spawn_interval_commits(
+            overlay.clone(),
+            PathBuf::from(url),
+            Duration::from_millis(1),
+            None,
+            OpenOptions::default(),
+        );
+        let start = Instant::now();
+        while overlay.commit_generation() == 0 && start.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        set_term_flag_for_test(true);
+        let joined = handle.join();
+        set_term_flag_for_test(false);
+        joined.unwrap();
+        assert_eq!(overlay.commit_generation(), 1, "interval did not publish");
+        let fi = overlay.lookup("/interval.txt", 0).unwrap();
+        assert_eq!(overlay.read(&fi, 100, 0).unwrap(), b"interval output");
+        assert!(!overlay.root().join("interval.txt").exists());
+    }
+
+    /// Regression: an interval published an archive without its matching index, or kept serving old bytes.
+    #[test]
+    fn regression_hf_live_atomic_archive_index_pointer_and_repinned_reads() {
+        use crate::publish_index::tests::{PublishEnv, PublishServer};
+        for compressed in [false, true] {
+            if !compressed
+                && !["gtar", "gnutar", "tar"].iter().any(|name| {
+                    std::process::Command::new(name)
+                        .arg("--version")
+                        .output()
+                        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("GNU tar"))
+                })
+            {
+                eprintln!("skip: GNU tar unavailable; tar.zst core regression still runs");
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let server = PublishServer::live(hf_test_archive(compressed));
+            let _env = PublishEnv::new(&[
+                ("HF_ENDPOINT", &server.url),
+                ("HF_TOKEN", "hf-test"),
+                ("HF_HUB_OFFLINE", "0"),
+                ("RATARMOUNT_HF_SHARE_CACHE", "0"),
+                ("RATARMOUNT_PAYLOAD_CACHE_BYTES", "0"),
+                ("XDG_CACHE_HOME", dir.path().join("cache").to_str().unwrap()),
+                (
+                    "RATARMOUNT_HF_TREE_CACHE",
+                    dir.path().join("trees").to_str().unwrap(),
+                ),
+            ]);
+            let name = if compressed { "a.tar.zst" } else { "a.tar" };
+            let url = format!("hf://datasets/org/data@main/{name}");
+            let overlay = hf_test_overlay(&url, &dir.path().join("ov"), false);
+            std::fs::write(overlay.root().join("hello.txt"), b"new bytes after commit").unwrap();
+            assert_eq!(
+                hf_test_tick(&overlay, &url).unwrap(),
+                CommitOutcome::DidWork
+            );
+            assert!(!overlay.root().join("hello.txt").exists());
+            let root = overlay.lookup("/", 0).unwrap();
+            assert_eq!(
+                overlay.get_xattr(&root, "user.hf.commit"),
+                Some("b".repeat(40).into_bytes())
+            );
+            let fi = overlay.lookup("/hello.txt", 0).unwrap();
+            assert_eq!(
+                overlay.read(&fi, 100, 0).unwrap(),
+                b"new bytes after commit"
+            );
+            {
+                let state = server.state.lock().unwrap();
+                let commits: Vec<_> = state
+                    .requests
+                    .iter()
+                    .filter(|(_, p, _)| p.contains("/commit/"))
+                    .collect();
+                assert_eq!(commits.len(), 1);
+                let ops: Vec<serde_json::Value> = std::str::from_utf8(&commits[0].2)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect();
+                assert_eq!(ops[0]["value"]["parentCommit"], "a".repeat(40));
+                assert_eq!(ops[1]["key"], "lfsFile");
+                assert_eq!(ops[1]["value"]["path"], name);
+                let ptr: serde_json::Value =
+                    serde_json::from_slice(&state.objects[&format!("{name}.index.ptr")]).unwrap();
+                let blob = &state.objects
+                    [&format!("{name}.index.{}.sqlite", ptr["index_id"].as_str().unwrap())];
+                assert_eq!(ptr["index_id"], ratarmount_index::sha256_hex(blob));
+                let archive = dir.path().join(name);
+                let index = dir.path().join("published.sqlite");
+                std::fs::write(&archive, &state.objects[name]).unwrap();
+                std::fs::write(&index, blob).unwrap();
+                let idx = SqliteIndex::open_read_only(&index).unwrap();
+                let actual = ratarmount_index::tar_stats_from_path(&archive).unwrap();
+                ratarmount_index::check_tarstats_matches_remote(
+                    &idx.tarstats().unwrap().unwrap(),
+                    actual.st_size,
+                    actual.prefix512_sha256.as_deref(),
+                    actual.suffix512_sha256.as_deref(),
+                    actual.full_sha256.as_deref(),
+                )
+                .unwrap();
+                if compressed {
+                    assert!(!idx.get_zstd_blocks().unwrap().is_empty());
+                }
+            }
+            let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bundle = crate::publish_index::tests::build_publish_index(
+                &url,
+                &dir.path().join("discovered.sqlite"),
+                scans.clone(),
+            );
+            assert_eq!(
+                scans.load(Ordering::Relaxed),
+                0,
+                "fresh remote index should avoid a rebuild"
+            );
+            let fi = bundle.source.lookup("/hello.txt", 0).unwrap();
+            assert_eq!(
+                bundle.source.read(&fi, 100, 0).unwrap(),
+                b"new bytes after commit"
+            );
+            drop(bundle);
+            // The next commit must use the previous result, never the mount's original SHA.
+            std::fs::write(overlay.root().join("second.txt"), b"second commit").unwrap();
+            assert_eq!(
+                hf_test_tick(&overlay, &url).unwrap(),
+                CommitOutcome::DidWork
+            );
+            let fi = overlay.lookup("/second.txt", 0).unwrap();
+            assert_eq!(overlay.read(&fi, 100, 0).unwrap(), b"second commit");
+            let state = server.state.lock().unwrap();
+            let last = state
+                .requests
+                .iter()
+                .rfind(|(_, p, _)| p.contains("/commit/"))
+                .unwrap();
+            let header: serde_json::Value = serde_json::from_str(
+                std::str::from_utf8(&last.2)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(header["value"]["parentCommit"], "b".repeat(40));
+        }
+    }
+
+    /// Regression: a concurrent parent update or lost commit response must never be retried or clobbered.
+    #[test]
+    fn regression_hf_live_parent_conflict_and_uncertain_response_stop_commits() {
+        use crate::publish_index::tests::{PublishEnv, PublishServer};
+        for failure in [
+            "during-setup",
+            "before-download",
+            "at-commit",
+            "lost-response",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = hf_test_archive(true);
+            let server = PublishServer::live(archive.clone());
+            let _env = PublishEnv::new(&[
+                ("HF_ENDPOINT", &server.url),
+                ("HF_TOKEN", "hf-test"),
+                ("HF_HUB_OFFLINE", "0"),
+                ("RATARMOUNT_HF_SHARE_CACHE", "0"),
+                ("RATARMOUNT_PAYLOAD_CACHE_BYTES", "0"),
+            ]);
+            let url = "hf://datasets/org/data@main/a.tar.zst";
+            let overlay = if failure == "during-setup" {
+                let repo = ratarmount_remote::HfRepo::resolve(url).unwrap();
+                let opts = OpenOptions {
+                    index_in_memory: true,
+                    ..Default::default()
+                };
+                let base = reopen_hf_mount(&repo, &opts).unwrap();
+                let overlay = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+                server.state.lock().unwrap().head = "f".repeat(40);
+                install_object_store_live_commit(&overlay, Path::new(url), &opts, false).unwrap();
+                overlay
+            } else {
+                hf_test_overlay(url, &dir.path().join("ov"), false)
+            };
+            std::fs::write(overlay.root().join("new.txt"), b"keep on failure").unwrap();
+            {
+                let mut state = server.state.lock().unwrap();
+                match failure {
+                    "before-download" => state.head = "f".repeat(40),
+                    "at-commit" => state.conflict_on_commit = true,
+                    "lost-response" => state.fail_commit_response = true,
+                    _ => {}
+                }
+            }
+            let err = hf_test_tick(&overlay, url).unwrap_err().to_string();
+            assert!(!err.contains("hf-test"), "token leaked: {err}");
+            assert!(overlay.root().join("new.txt").exists());
+            let requests = server.state.lock().unwrap().requests.len();
+            let err = hf_test_tick(&overlay, url).unwrap_err().to_string();
+            assert!(err.contains("remount required"), "{err}");
+            assert_eq!(
+                requests,
+                server.state.lock().unwrap().requests.len(),
+                "a refused mount must make no more requests"
+            );
+            assert!(overlay
+                .enqueue_commit(Path::new(url), CommitKind::OnExit, |_| unreachable!())
+                .is_err());
+            let state = server.state.lock().unwrap();
+            if failure != "lost-response" {
+                assert_eq!(state.objects["a.tar.zst"], archive);
+                assert!(!state.objects.contains_key("a.tar.zst.index.ptr"));
+            }
+        }
+    }
+
+    /// Regression: verbose live publication logs exposed the write token or a Hub error body.
+    #[test]
+    fn regression_hf_live_logs_do_not_contain_token() {
+        use crate::publish_index::tests::{PublishEnv, PublishServer};
+        struct Writer {
+            owner: thread::ThreadId,
+            bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if thread::current().id() == self.owner {
+                    self.bytes.lock().unwrap().extend_from_slice(bytes);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder = env_logger::Builder::new();
+        builder.parse_filters("debug,ureq::unit=trace");
+        crate::configure_http_logging(&mut builder);
+        builder.target(env_logger::Target::Pipe(Box::new(Writer {
+            owner: thread::current().id(),
+            bytes: bytes.clone(),
+        })));
+        log::set_boxed_logger(Box::new(builder.build())).expect("install live Hub test logger");
+        log::set_max_level(log::LevelFilter::Debug);
+        let dir = tempfile::tempdir().unwrap();
+        let server = PublishServer::live(hf_test_archive(true));
+        let _env = PublishEnv::new(&[
+            ("HF_ENDPOINT", &server.url),
+            ("HF_TOKEN", "hf-test"),
+            ("HF_HUB_OFFLINE", "0"),
+            ("RATARMOUNT_HF_SHARE_CACHE", "0"),
+            ("RATARMOUNT_PAYLOAD_CACHE_BYTES", "0"),
+        ]);
+        let url = "hf://datasets/org/data@main/a.tar.zst";
+        let overlay = hf_test_overlay(url, &dir.path().join("ov"), false);
+        std::fs::write(overlay.root().join("secret.txt"), b"output").unwrap();
+        server.state.lock().unwrap().conflict_on_commit = true;
+        assert!(hf_test_tick(&overlay, url).is_err());
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("further commits refused"), "{logs}");
+        assert!(!logs.contains("hf-test"), "token leaked: {logs}");
+        assert!(
+            !logs.contains("must never appear"),
+            "Hub response body leaked: {logs}"
+        );
+    }
+
+    /// Regression: --create-pr opened a fresh PR on every interval instead of continuing on its ref.
+    #[test]
+    fn regression_hf_live_create_pr_continues_same_pr_with_parent() {
+        use crate::publish_index::tests::{PublishEnv, PublishServer};
+        let dir = tempfile::tempdir().unwrap();
+        let server = PublishServer::live(hf_test_archive(true));
+        let _env = PublishEnv::new(&[
+            ("HF_ENDPOINT", &server.url),
+            ("HF_TOKEN", "hf-test"),
+            ("HF_HUB_OFFLINE", "0"),
+            ("RATARMOUNT_HF_SHARE_CACHE", "0"),
+            ("RATARMOUNT_PAYLOAD_CACHE_BYTES", "0"),
+        ]);
+        let url = "hf://datasets/org/data@dev/a.tar.zst";
+        let overlay = hf_test_overlay(url, &dir.path().join("ov"), true);
+        for name in ["first.txt", "second.txt"] {
+            std::fs::write(overlay.root().join(name), name).unwrap();
+            assert_eq!(hf_test_tick(&overlay, url).unwrap(), CommitOutcome::DidWork);
+        }
+        let state = server.state.lock().unwrap();
+        let commits: Vec<_> = state
+            .requests
+            .iter()
+            .filter(|(_, p, _)| p.contains("/commit/"))
+            .collect();
+        assert!(commits[0].1.ends_with("/dev?create_pr=1"));
+        assert!(commits[1].1.ends_with("/refs%2Fpr%2F7"));
+        assert!(!commits[1].1.contains("create_pr"));
+        assert_eq!(
+            state.head,
+            "a".repeat(40),
+            "PR must not change mounted branch"
+        );
+    }
+
+    /// Regression: SHA/tag mounts silently targeted main, or --create-pr was rejected for live Hub writes.
+    #[test]
+    fn regression_hf_live_branch_revision_and_create_pr_options() {
+        use crate::publish_index::tests::{PublishEnv, PublishServer};
+        let server = PublishServer::live(hf_test_archive(true));
+        let _env = PublishEnv::new(&[
+            ("HF_ENDPOINT", &server.url),
+            ("HF_TOKEN", "hf-test"),
+            ("HF_HUB_OFFLINE", "0"),
+            ("RATARMOUNT_HF_SHARE_CACHE", "0"),
+        ]);
+        for revision in ["main", "dev", "v1", &"a".repeat(40)] {
+            let repo = ratarmount_remote::HfRepo::resolve(&format!(
+                "hf://datasets/org/data@{revision}/a.tar.zst"
+            ))
+            .unwrap();
+            let result = repo.live_commit_branch();
+            assert_eq!(result.is_ok(), revision == "main" || revision == "dev");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("branch revision"));
+            }
+        }
+        let input = [PathBuf::from("hf://datasets/org/data@main/a.tar.zst")];
+        assert!(live_hf_create_pr(&input, "1s", false, true));
+        assert!(live_hf_create_pr(&input, "0", true, true));
+        assert!(!live_hf_create_pr(&input, "0", false, true));
+        assert!(!live_hf_create_pr(
+            &["s3://b/a.tar".into()],
+            "1s",
+            true,
+            true
+        ));
+    }
+
+    /// Regression: on-exit Hub commits must publish all siblings even with an in-memory mount index.
+    #[test]
+    fn regression_hf_live_on_exit_atomic_publication() {
+        use crate::publish_index::tests::{PublishEnv, PublishServer};
+        let dir = tempfile::tempdir().unwrap();
+        let server = PublishServer::live(hf_test_archive(true));
+        let _env = PublishEnv::new(&[
+            ("HF_ENDPOINT", &server.url),
+            ("HF_TOKEN", "hf-test"),
+            ("HF_HUB_OFFLINE", "0"),
+            ("RATARMOUNT_HF_SHARE_CACHE", "0"),
+            ("RATARMOUNT_PAYLOAD_CACHE_BYTES", "0"),
+        ]);
+        let url = "hf://datasets/org/data@main/a.tar.zst";
+        let overlay = hf_test_overlay(url, &dir.path().join("ov"), false);
+        std::fs::write(overlay.root().join("exit.txt"), b"flush on exit").unwrap();
+        assert!(
+            apply_live_commit(&overlay, Path::new(url), false, &OpenOptions::default()).unwrap()
+        );
+        let state = server.state.lock().unwrap();
+        assert!(state.objects.contains_key("a.tar.zst.index.ptr"));
+        assert_eq!(
+            state
+                .requests
+                .iter()
+                .filter(|(_, p, _)| p.contains("/commit/"))
+                .count(),
+            1
+        );
+    }
+
+    /// Regression: real Hub write-back must keep the mount readable at its newly committed SHA.
+    #[test]
+    #[ignore = "writes archive and sidecars to RATARMOUNT_TEST_HF_REPO; requires a write-scoped token"]
+    fn regression_hf_live_private_repo_writeback() {
+        let Ok(repo_id) = std::env::var("RATARMOUNT_TEST_HF_REPO") else {
+            eprintln!("skip: set RATARMOUNT_TEST_HF_REPO=org/private-test-repo and HF_TOKEN");
+            return;
+        };
+        if !["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"].iter().any(|key| {
+            std::env::var(key)
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty())
+        }) {
+            eprintln!("skip: live Hub write-back requires an explicit write-scoped HF_TOKEN");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!(
+            "ratarmount-tests/hfw-{}.tar.zst",
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+        let url = format!("hf://datasets/{repo_id}@main/{name}");
+        let repo = ratarmount_remote::HfRepo::resolve(&url).unwrap();
+        let archive = hf_test_archive(true);
+        repo.commit_files(
+            &[ratarmount_remote::HfCommitFile {
+                path: &name,
+                content: &archive,
+            }],
+            Some("main"),
+            false,
+            Some(&repo.commit),
+        )
+        .unwrap();
+        let overlay = hf_test_overlay(&url, &dir.path().join("ov"), false);
+        std::fs::write(
+            overlay.root().join("live.txt"),
+            b"private Hub overlay output",
+        )
+        .unwrap();
+        assert_eq!(
+            hf_test_tick(&overlay, &url).unwrap(),
+            CommitOutcome::DidWork
+        );
+        let fi = overlay.lookup("/live.txt", 0).unwrap();
+        assert_eq!(
+            overlay.read(&fi, 100, 0).unwrap(),
+            b"private Hub overlay output"
+        );
+        let repo = ratarmount_remote::HfRepo::resolve(&url).unwrap();
+        let pointer_url = repo.resolve_url(&format!("{name}.index.ptr"));
+        let bytes = repo.fetch_bytes(&pointer_url, 64 * 1024).unwrap();
+        let pointer =
+            ratarmount_index::parse_index_pointer_json(std::str::from_utf8(&bytes).unwrap())
+                .unwrap();
+        let blob = repo
+            .fetch_bytes(
+                &repo.resolve_url(&format!("{name}.index.{}.sqlite", pointer.index_id)),
+                META_SIDECAR_WHOLE_MAX,
+            )
+            .unwrap();
+        assert_eq!(ratarmount_index::sha256_hex(&blob), pointer.index_id);
+        eprintln!(
+            "live write-back retained test archive and sidecars at {url}, commit {}",
+            repo.commit
+        );
+    }
 
     #[test]
     fn parse_interval_off() {
@@ -1202,6 +1993,7 @@ mod tests {
     fn write_tiny_tar_zst(path: &std::path::Path) {
         let payload = b"x\n";
         let member = ratarmount_formats_tar::UstarMember {
+            xattrs: &[],
             path: "a.txt",
             payload: ratarmount_formats_tar::UstarPayload::File { bytes: payload },
             mode: 0o644,
@@ -1219,6 +2011,7 @@ mod tests {
     fn write_split_tar_zst(path: &std::path::Path, prefix: &[u8], last: &[u8]) {
         fn member<'a>(path: &'a str, bytes: &'a [u8]) -> ratarmount_formats_tar::UstarMember<'a> {
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path,
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes },
                 mode: 0o644,
@@ -1620,6 +2413,7 @@ mod tests {
         let dropped = b"drop-mount\n";
         let members = [
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "keep.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: keep },
                 mode: 0o644,
@@ -1628,6 +2422,7 @@ mod tests {
                 mtime: 0,
             },
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "drop.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: dropped },
                 mode: 0o644,
@@ -1662,6 +2457,7 @@ mod tests {
         let other = b"different-reget-bytes-not-the-mount\n";
         let spool_members = [
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "keep.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: other },
                 mode: 0o644,
@@ -1670,6 +2466,7 @@ mod tests {
                 mtime: 0,
             },
             ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: "drop.txt",
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes: other },
                 mode: 0o644,
@@ -1733,6 +2530,7 @@ mod tests {
 
     fn ustar_archive(name: &str, payload: &[u8]) -> Vec<u8> {
         let member = ratarmount_formats_tar::UstarMember {
+            xattrs: &[],
             path: name,
             payload: ratarmount_formats_tar::UstarPayload::File { bytes: payload },
             mode: 0o644,
@@ -1869,5 +2667,59 @@ mod tests {
             "PutObject HTTP 500: body mentions HTTP 412".into(),
         ));
         assert!(matches!(retry, RemotePublishError::Retryable(_)), "{retry}");
+    }
+}
+
+#[cfg(test)]
+mod rolling_tests {
+    use super::*;
+    use ratarmount_compositing::{CommitMode, RollPolicy, SeriesName};
+    use std::fs;
+
+    /// Regression: rolling must build/patch a distinct index and manifest for each generation.
+    #[test]
+    fn rolling_per_archive_sidecars_and_on_exit_patch() {
+        for suffix in ["tar", "tar.zst"] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join(format!("traces.{suffix}"));
+            let opts = OpenOptions {
+                write_index: true,
+                ..Default::default()
+            };
+            let series =
+                open_rolling_series(&base, "1B".parse::<RollPolicy>().unwrap(), &opts).unwrap();
+            let original = series.active_path();
+            let mut overlay =
+                WriteOverlay::new(series.clone(), dir.path().join("overlay")).unwrap();
+            overlay.set_rolling(series.clone());
+            overlay.set_commit_mode(CommitMode::Append);
+            overlay.set_manifest_hashes(Some("new".into()));
+            fs::write(overlay.root().join("one"), b"one").unwrap();
+            assert!(apply_live_commit(&overlay, &original, true, &opts).unwrap());
+            let names = SeriesName::new(&base).unwrap();
+            let first = names.generation(1).unwrap();
+            let first_sidecar = sidecar_path_for_patch(&first, &opts).expect("first index");
+            let first_bytes = fs::read(&first).unwrap();
+            let first_index_bytes = fs::read(&first_sidecar).unwrap();
+            fs::write(overlay.root().join("two"), b"two").unwrap();
+            assert!(apply_live_commit(&overlay, &original, false, &opts).unwrap());
+            let second = names.generation(2).unwrap();
+            assert_eq!(series.active_path(), second);
+            assert_eq!(fs::read(&first).unwrap(), first_bytes);
+            assert_eq!(fs::read(&first_sidecar).unwrap(), first_index_bytes);
+            for path in [&first, &second] {
+                let index = sidecar_path_for_patch(path, &opts).expect("per-archive index");
+                SqliteIndex::open_read_only(&index)
+                    .unwrap()
+                    .check_tarstats_matches_archive(path)
+                    .unwrap();
+                assert!(PathBuf::from(format!("{}.manifest.jsonl", path.display())).is_file());
+            }
+            drop(overlay);
+            drop(series);
+            let remount = open_rolling_series(&base, "1G".parse().unwrap(), &opts).unwrap();
+            assert!(remount.lookup("/one", 0).is_some());
+            assert!(remount.lookup("/two", 0).is_some());
+        }
     }
 }

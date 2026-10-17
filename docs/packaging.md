@@ -40,6 +40,10 @@ OpenSSL security advisory, rebuild and re-release the portable tarball.
 Users get those fixes by upgrading to the new tarball. Updating distro
 OpenSSL packages does not change an already-shipped portable tarball.
 
+The runtime still uses the host's `libarchive.so.13` and `libfuse3.so.3`, and
+their own dependencies come from those distro packages; on Arch the
+`libcrypto.so.3` seen in `ldd` comes from the host libarchive, not ratarmount.
+
 **Triggers**
 
 | Event | Result |
@@ -98,13 +102,21 @@ Uses [nfpm](https://nfpm.goreleaser.com/) for `.deb`/`.rpm` (auto-downloaded if 
 
 **NFS export** is userspace (`nfsserve` NFSv3 + optional `embednfs` NFSv4.1). Packages do **not** depend on `nfs-kernel-server`. Default listen port is **20490** (unprivileged). Binding **2049** needs root or `CAP_NET_BIND_SERVICE` (`--nfs-bind 2049`; already parsed). See [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 
-**`nfsv4` and `sftp-russh` are enabled in the package compile lines** — a stronger commitment than `gzip-rapidgzip` (still off). Editing only [`.github/workflows/packages.yml`](https://github.com/hilather/ratarmount-rs/blob/main/.github/workflows/packages.yml) does **not** compile either feature.
+**`nfsv4`, `sftp-russh`, and `bittorrent` are enabled in the package compile lines** — a stronger commitment than `gzip-rapidgzip` (still off). Editing only [`.github/workflows/packages.yml`](https://github.com/hilather/ratarmount-rs/blob/main/.github/workflows/packages.yml) does **not** change the scripts’ feature lists.
 
 | Script | `cargo build --release -p ratarmount` |
 |--------|----------------------------------------|
-| [`packaging/build-native-packages.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-native-packages.sh) (deb / rpm / portable) | `--features nfsv4,sftp-russh` |
-| [`packaging/build-appimage.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-appimage.sh) | `--features nfsv4,sftp-russh` |
-| [`packaging/build-macos-tarball.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-macos-tarball.sh) | `--features nfsv4,sftp-russh` (rustup **stable**; workspace MSRV 1.90) |
+| [`packaging/build-native-packages.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-native-packages.sh) (deb / rpm / portable) | `--features nfsv4,sftp-russh,bittorrent` |
+| [`packaging/build-appimage.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-appimage.sh) | `--features nfsv4,sftp-russh,bittorrent` |
+| [`packaging/build-macos-tarball.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-macos-tarball.sh) | `--features nfsv4,sftp-russh,bittorrent` (rustup **stable**; workspace MSRV 1.90) |
+
+The CLI and library crates keep `bittorrent` off by default; Cargo users opt in
+with `--features bittorrent`. Packages compile `bittorrent`, but a torrent mount
+contacts no trackers, DHT or LSD peers unless the user opts in with
+`--torrent-swarm auto|lan|always` (the default is `never`: cache, `xs` metainfo
+and web seeds only). Default CI does not compile librqbit. See [BitTorrent sources](remote-bittorrent.md)
+for verification, uploads-disabled behavior, and upstream v2/swarm limitations.
+The feature-list regression is `./packaging/test-bittorrent-features.sh`.
 
 Source builds without `--features nfsv4` leave `--nfs --nfs-vers 4` as exit 2 (`rebuild with --features nfsv4 (rustc >= 1.88)`). Without `--features sftp-russh`, `--sftp` exits 2 (`rebuild with --features sftp-russh`). Default `cargo test --workspace` compiles neither embednfs nor russh (opt-in features, not compiled by default CI). Current package jobs install rustup **stable**.
 
@@ -238,3 +250,75 @@ Prefer distro packages or the **portable-glibc2.31** tarball for production unti
 - Library crates (`ratarmount-core`, `ratarmount-index`, formats, …) may be published later for embedders under workspace lockstep versioning. L3.5 `ratarmount-session` stays path-depend until a freeze review.
 - Do **not** publish the `ratarmount` binary as a library API surface; `ratarmount-fuse` is the optional FUSE **adapter** library, not the CLI.
 - Dual-run and 1.0-class packaging do **not** require any crates.io publish.
+
+## Additional package drafts
+
+These formats are prepared for maintainers but are not published by CI.
+
+### Arch Linux (AUR)
+
+`packaging/aur/PKGBUILD` packages the portable release binary as
+`ratarmount-rs-bin` for x86_64 and aarch64, installs the FUSE mount helper,
+docs and license, and declares `fuse3` and `glibc`. An optional source-build
+recipe is in `packaging/aur/PKGBUILD.source`. Before updating a release, set
+`pkgver` to the release version and run `packaging/aur/update-sums.sh VERSION`
+after `SHA256SUMS` is available on GitHub. Regenerate `.SRCINFO` with
+`makepkg --printsrcinfo > .SRCINFO` from `packaging/aur/`.
+
+`packaging/test-aur.sh` checks shell syntax and generated metadata; `namcap`
+runs when installed. `ratarmount-rs-bin` sets `options=(!debug)` so makepkg does
+not emit an empty debug split package.
+
+### Nix
+
+The root `flake.nix` builds the Rust workspace binary with
+`nfsv4,sftp-russh`, exposes `packages.default`, an overlay and a development
+shell, and targets Linux. The package uses the checked-in Cargo lockfile.
+Validate with `packaging/test-nix.sh` (it skips when Nix is not installed).
+A `flake.lock` is not included until `nix flake lock` can be run against the
+selected nixpkgs input.
+
+### Conda-forge
+
+`packaging/conda/meta.yaml` is a staged-recipes starting point for the Python
+package `ratarmount-rs`. It builds the abi3 extension with maturin and Rust and
+tests the import. Review selectors and platform dependencies with conda-build
+before opening a conda-forge staged-recipes PR. This recipe does not produce a
+second CLI output.
+
+### Homebrew core formula draft
+
+`packaging/homebrew/Formula/ratarmount-rs.rb` is a Linux-only formula draft
+that builds the CLI from source. Homebrew core requires supported, declared
+dependencies. macFUSE cannot be a core dependency because it is proprietary,
+so this formula does not target macOS. A macOS core formula would need a
+supported open-source FUSE backend such as FUSE-T and a working core CI build.
+The existing macOS tap cask described above is unchanged. See [Homebrew's
+formula cookbook](https://docs.brew.sh/Formula-Cookbook) and [acceptable
+formula policy](https://docs.brew.sh/Acceptable-Formulae).
+
+### Python wheels on GitHub Releases
+
+`.github/workflows/python.yml` builds Linux x86_64/aarch64 and macOS arm64
+wheels as workflow artifacts. They are not attached to GitHub Releases here:
+Actions artifacts are scoped to their workflow run, while the package release
+job is a separate concurrent workflow. Cross-run artifact API logic would also
+need coordination to avoid racing a tag build. The workflow makes no PyPI
+publication. A later change can add a workflow-run handoff or coordinated
+release job; workflow artifacts are not release assets.
+
+### Manual publication steps
+
+Nothing in this task publishes packages. When a publication is approved:
+
+1. **AUR:** update the version and hashes, regenerate `.SRCINFO`, run
+   `packaging/test-aur.sh`, then commit and push the package files to the AUR
+   Git repository.
+2. **conda-forge:** build and validate the recipe with conda-build, add it to
+   `conda-forge/staged-recipes`, and open a PR for review.
+3. **Homebrew core:** validate the formula on supported Linux CI, update its
+   version and source checksum, then submit it to `Homebrew/homebrew-core`.
+   Keep the existing macOS cask in its tap.
+4. **PyPI:** download the intended wheels and sdist from the Python workflow,
+   verify their provenance and contents, then publish with
+   `python -m twine upload dist/*` using an authorized PyPI account.
