@@ -38,10 +38,27 @@ fn request(socket: &Path, endpoint: &str, body: Value) -> Value {
 
 /// Set `FD_CLOEXEC` on every inherited fd above stderr.
 ///
-/// Async-signal-safe for `pre_exec`: a stack `rlimit`, `getrlimit`, and `fcntl`
-/// only. No allocation, `/proc` walk, or `sysconf`. `EBADF` is ignored. Fds 0-2
-/// stay as they are.
+/// `pre_exec` helper. Tries `close_range` first. That Linux syscall wrapper is
+/// not a POSIX async-signal-safe function; on `ENOSYS` or `EINVAL` the child
+/// falls back to `getrlimit` and `fcntl`. Those libc calls are
+/// async-signal-safe. `io::Error::last_os_error` is not a POSIX
+/// async-signal-safe API; it only packages errno for `pre_exec`'s `Result` and
+/// must stay off the heap. No `/proc` walk and no `sysconf`. `EBADF` is ignored.
+/// Fds 0-2 stay as they are.
 fn scrub_inherited_fds() -> std::io::Result<()> {
+    // SAFETY: `close_range` only sets cloexec from fd 3 upward and does not
+    // close. It is a Linux syscall wrapper, not a POSIX async-signal-safe
+    // function. This file is Linux-only. Call it here, before any `dup2` onto
+    // fd 3, so the listener placed afterwards is not marked cloexec again.
+    let rc = unsafe { libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENOSYS) | Some(libc::EINVAL) => {}
+        _ => return Err(err),
+    }
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -74,12 +91,12 @@ fn scrub_inherited_fds() -> std::io::Result<()> {
 
 /// Regression: standalone and systemd sockets must serve HTTP without leaking tokens or listener fds to the child.
 ///
-/// Both arms scrub before exec, setting `FD_CLOEXEC` on fds `3..min(RLIMIT_NOFILE, 65536)`
-/// with a stack-only `fcntl` loop (`EBADF` ignored, fds 0-2 untouched). That drops an
-/// inheritable non-listener left on fd 3. The systemd arm scrubs at the start of the same
-/// `pre_exec` that then `dup2`s the listener onto fd 3 and clears cloexec; a later hook would
-/// mark that listener cloexec again. The `socket:` check still fails if an inheritable
-/// listener is left on fd 3.
+/// Both arms scrub before exec. `close_range(3, u32::MAX, CLOSE_RANGE_CLOEXEC)` sets
+/// cloexec without closing; `ENOSYS` and `EINVAL` fall back to a stack `fcntl` loop
+/// (`EBADF` ignored, fds 0-2 untouched). That drops an inheritable non-listener left on
+/// fd 3. The systemd arm scrubs at the start of the same `pre_exec` that then `dup2`s the
+/// listener onto fd 3 and clears cloexec; a later `close_range` would mark that listener
+/// cloexec again. The `socket:` check still fails if an inheritable listener is left on fd 3.
 #[test]
 fn regression_server_socket_activation_and_environment_only_credentials() {
     for activated in [false, true] {
@@ -100,9 +117,11 @@ fn regression_server_socket_activation_and_environment_only_credentials() {
                 .args(["-c", "LISTEN_PID=$$; export LISTEN_PID; exec \"$@\"", "sh"])
                 .arg(env!("CARGO_BIN_EXE_ratarmount-volume-plugin"))
                 .env("LISTEN_FDS", "1");
-            // SAFETY: only async-signal-safe descriptor operations after fork.
-            // Scrub in this hook, before dup2: a later pre_exec would set FD_CLOEXEC
-            // on the listener that this hook just placed on fd 3.
+            // SAFETY: Linux-only pre_exec. `close_range` is not POSIX
+            // async-signal-safe; `getrlimit` and `fcntl` are. `last_os_error`
+            // only packages errno and must stay off the heap. Scrub before
+            // dup2: a later close_range would set FD_CLOEXEC on the listener
+            // this hook places on fd 3.
             unsafe {
                 command.pre_exec(move || {
                     scrub_inherited_fds()?;
@@ -115,7 +134,9 @@ fn regression_server_socket_activation_and_environment_only_credentials() {
             command
         } else {
             let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount-volume-plugin"));
-            // SAFETY: only async-signal-safe descriptor operations after fork.
+            // SAFETY: Linux-only pre_exec. `close_range` is not POSIX
+            // async-signal-safe; `getrlimit` and `fcntl` are. `last_os_error`
+            // only packages errno and must stay off the heap.
             unsafe {
                 command.pre_exec(scrub_inherited_fds);
             }
