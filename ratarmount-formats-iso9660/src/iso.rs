@@ -699,15 +699,11 @@ fn apply_joliet_fallback(primary: &mut [Node], joliet: &[Node]) -> Vec<Option<us
             guard += 1;
         }
         let joliet_parent = joliet[j].parent;
-        // File under an SL run: one ghost hop for the whole run.
-        // Directory under an SL run: one hop. A second hop binds the plain ancestor too high.
-        // Every other matched node writes one joliet.parent onto that ancestor
-        // (normally its parent).
-        #[allow(clippy::if_same_then_else)]
+        // A directory under an SL run takes one hop. Only a non-directory
+        // under an SL run takes `joliet[joliet_parent].parent`. Every other
+        // matched node writes one `joliet.parent` onto that ancestor.
         let evidence = if !rec.is_dir && crossed_sl {
             joliet[joliet_parent].parent
-        } else if rec.is_dir && crossed_sl {
-            joliet_parent
         } else {
             joliet_parent
         };

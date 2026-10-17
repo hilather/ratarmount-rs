@@ -1159,6 +1159,146 @@ fn regression_joliet_sl_then_plain_dir_under_plain_parent() {
     });
 }
 
+/// Regression: a file hop and a directory hop through one SL run disagree, so the plain parent stays unbound and the SL directory is not grafted.
+///
+/// `/` is the synthetic index root (`S_IFDIR | 0o777`). Binding the plain parent onto the Joliet root does not change that mode; the failure is `/OUT` plus `/Parent` taking the sibling's mode.
+#[test]
+fn regression_joliet_sl_run_file_and_plain_dir_conflict() {
+    let primary = [
+        record(22, true, b"P", &px(ratarmount_core::S_IFDIR | 0o700, false)),
+        record(
+            28,
+            true,
+            b"SIB",
+            &px(ratarmount_core::S_IFDIR | 0o751, false),
+        ),
+    ];
+    let supplementary = [record(23, true, &joliet("Parent"), &[])];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(
+        &mut bytes,
+        22,
+        &[],
+        &[record(
+            24,
+            true,
+            b"OUT",
+            &[px(ratarmount_core::S_IFLNK | 0o750, false), sl("elsewhere")].concat(),
+        )],
+    );
+    // FILE before MID: the reverse walk applies MID first, then FILE.
+    directory(
+        &mut bytes,
+        24,
+        &[],
+        &[
+            record(32, false, b"FILE.;1", &[]),
+            record(
+                25,
+                true,
+                b"MID",
+                &px(ratarmount_core::S_IFDIR | 0o711, false),
+            ),
+        ],
+    );
+    directory(&mut bytes, 25, &[], &[record(30, false, b"KEEP.;1", &[])]);
+    directory(&mut bytes, 28, &[], &[]);
+    directory(
+        &mut bytes,
+        23,
+        &[],
+        &[
+            record(32, false, &joliet("Hoisted;1"), &[]),
+            record(26, true, &joliet("Other"), &[]),
+        ],
+    );
+    directory(
+        &mut bytes,
+        26,
+        &[],
+        &[record(30, false, &joliet("Kept;1"), &[])],
+    );
+    bytes[32 * BLOCK..32 * BLOCK + 4].copy_from_slice(b"data");
+    check_sources(bytes, |src| {
+        assert_eq!(
+            src.lookup("/", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o777
+        );
+        assert_eq!(
+            src.lookup("/Parent", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o755
+        );
+        assert!(src.lookup("/OUT", 0).is_none(), "/OUT exists");
+        assert!(src.lookup("/Parent/OUT", 0).is_none(), "/Parent/OUT exists");
+        assert_eq!(
+            src.lookup("/Parent/Other", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o711
+        );
+        assert_file(src, "/Parent/Hoisted");
+    });
+}
+
+/// Regression: an unmatched plain directory outside an SL subtree is not grafted.
+#[test]
+fn regression_joliet_unmatched_plain_dir_outside_sl_not_grafted() {
+    // D then P: walk_tree's stack yields D=1, P=2, and OUT's id is above D.
+    let primary = [
+        record(
+            22,
+            true,
+            b"D",
+            &[px(ratarmount_core::S_IFLNK | 0o750, false), sl("elsewhere")].concat(),
+        ),
+        record(24, true, b"P", &px(ratarmount_core::S_IFDIR | 0o700, false)),
+    ];
+    let supplementary = [record(23, true, &joliet("Parent"), &[])];
+    let mut bytes = image(true, &primary, Some(&supplementary));
+    directory(&mut bytes, 22, &[], &[record(32, false, b"ONLY.;1", &[])]);
+    directory(
+        &mut bytes,
+        24,
+        &[],
+        &[
+            record(30, false, b"KEEP.;1", &[]),
+            record(
+                25,
+                true,
+                b"OUT",
+                &px(ratarmount_core::S_IFDIR | 0o711, false),
+            ),
+        ],
+    );
+    directory(&mut bytes, 25, &[], &[]);
+    directory(
+        &mut bytes,
+        23,
+        &[],
+        &[
+            record(30, false, &joliet("Kept;1"), &[]),
+            record(26, true, &joliet("Extra1"), &[]),
+            record(27, true, &joliet("Extra2"), &[]),
+        ],
+    );
+    directory(&mut bytes, 26, &[], &[]);
+    directory(&mut bytes, 27, &[], &[]);
+    bytes[32 * BLOCK..32 * BLOCK + 4].copy_from_slice(b"data");
+    check_sources(bytes, |src| {
+        assert_eq!(names(src, "/"), ["D", "Parent"]);
+        assert_eq!(names(src, "/D"), ["ONLY"]);
+        assert_eq!(
+            src.lookup("/D", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o750
+        );
+        assert_file(src, "/D/ONLY");
+        assert_eq!(
+            src.lookup("/Parent", 0).unwrap().mode,
+            ratarmount_core::S_IFDIR | 0o700
+        );
+        assert!(src.lookup("/Parent/OUT", 0).is_none(), "/Parent/OUT exists");
+        assert_eq!(names(src, "/Parent"), ["Extra1", "Extra2", "Kept"]);
+    });
+}
+
 /// Regression: a plain directory between an SL directory and a matched file must not mis-bind or drop either file.
 #[test]
 fn regression_joliet_sl_directory_with_plain_dir_before_match() {
