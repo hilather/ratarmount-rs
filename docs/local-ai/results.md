@@ -49,7 +49,9 @@ multi-frame member, archive in page cache, machine idle, 2026-10-16): Session
 API 2,206 → 2,762 MB/s from one to four threads; `cat` through FUSE 852 →
 1,251 MB/s; `dd bs=1M` with `--direct-io` 1,253 → 1,633 MB/s; `zstd -d`
 1,631 MB/s. An earlier run under heavy load had shown a spurious direct-I/O
-regression that disappeared when the machine was idle.
+regression that disappeared when the machine was idle. Host `brewtop`,
+2026-10-16; raw rows in
+[`brewtop-2026-10-16-zstd-decode-ahead.csv`](../../benchmarks/ai/results/brewtop-2026-10-16-zstd-decode-ahead.csv).
 
 **Sandbox supervisor alone** (tiny base, warm): 64 attempts cost 26 ms to set
 up and 97 ms to tear down each; the 5.19 s above is dominated by mounting and

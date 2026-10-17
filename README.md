@@ -193,6 +193,14 @@ sudo apt install ./ratarmount_*.deb    # sudo dnf install ./ratarmount-*.rpm
 # macOS (Apple silicon): tarball, or the Homebrew tap cask
 brew install --cask macfuse            # or fuse-t
 tar xf ratarmount-*-macos-arm64.tar.gz && install -m 755 ratarmount-*/ratarmount ~/.local/bin/
+
+# macOS Apple Silicon — Homebrew tap cask (needs a clone; packaging/homebrew is not a git repo)
+# Fully-qualified: homebrew/core has a Linux Python formula also named ratarmount.
+# or: ./packaging/homebrew/install.sh
+brew tap-new hilather/ratarmount
+mkdir -p "$(brew --repo hilather/ratarmount)/Casks"
+cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
+brew install --cask hilather/ratarmount/ratarmount
 ```
 
 **From source** (Rust 1.90+, FUSE 3, libarchive and zlib headers):
@@ -205,6 +213,11 @@ cargo build --release -p ratarmount --features nfsv4,sftp-russh,bittorrent   # w
 Workspace MSRV is 1.90. On Linux, mounts that other users or containers must
 see need `user_allow_other` in `/etc/fuse.conf`. Details, verification and
 package layout: [packaging](docs/packaging.md) · [macOS](docs/macos.md).
+
+Portable tarballs vendor OpenSSL statically, so OpenSSL fixes arrive by
+upgrading the tarball, not the distro ([why](docs/packaging.md)); AUR, Nix,
+conda and Homebrew core formulas are
+[unpublished drafts](docs/packaging.md#additional-package-drafts).
 
 ---
 
