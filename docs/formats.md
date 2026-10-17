@@ -186,9 +186,11 @@ full `cat` of that member; find walks the whole tree.
 What the table says: every container with a real table of contents (TAR, ZIP,
 CPIO, AR, ISO, the filesystem images, safetensors, GGUF) indexes in tens of
 milliseconds and serves random reads in about a millisecond; the compressed
-TARs pay for their seek map once at indexing time and then differ mainly in
-how large a unit must be decoded per read (zstd frames and lz4 blocks are
-cheap, bzip2 and xz blocks cost more, single-stream gzip most). Sequential
+TARs pay for their seek map once at indexing time (bzip2 by far the most,
+because every 100 KiB block is decoded once) and then differ in how large a
+unit must be decoded per read: lz4 blocks and zstd frames cost a millisecond
+or two, gzip and bzip2 a few milliseconds, and xz blocks the most at tens of
+milliseconds. Sequential
 numbers through FUSE are page-cache speeds for a file that fits in RAM, not
 disk speeds. Full methodology, CSV and caveats:
 [benchmarks/format-results.md](../benchmarks/format-results.md).
