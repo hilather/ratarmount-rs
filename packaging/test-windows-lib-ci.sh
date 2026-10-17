@@ -28,6 +28,11 @@ if ! grep -q 'cargo check -p ratarmount-session --all-targets' "$WF"; then
   exit 1
 fi
 
+if ! grep -q 'cargo check -p ratarmount-formats-zip -p ratarmount-formats-tar --all-targets' "$WF"; then
+  echo "FAIL: windows-lib must cargo check -p ratarmount-formats-zip -p ratarmount-formats-tar --all-targets" >&2
+  exit 1
+fi
+
 # Job-level continue-on-error (4-space indent) hid the v0.1.30 E0658 failure.
 if awk '
   $0 ~ /^  windows-lib:/ { in_job=1; next }
@@ -78,4 +83,4 @@ if [[ -n "$banned" ]]; then
   exit 1
 fi
 
-echo "OK: windows-lib core+index is a merge gate; session skippable; no windows_by_handle APIs"
+echo "OK: windows-lib core+index is a merge gate; session skippable; zip+tar checked; no windows_by_handle APIs"
