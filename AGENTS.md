@@ -89,6 +89,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | `--repack-seekable` + `--nfs` / `-w` / mountpoint exits 2 | `cargo test -p ratarmount --bin ratarmount repack_incompatible_with_export` |
 | tar → tar.zst keeps member offset order (zero backward flatten seeks) | `cargo test -p ratarmount-formats-tar --lib regression_offset_order_seeks` · `cargo test -p ratarmount --bin ratarmount repack_seekable_gzip_round_trip_without_external_zstd` |
 | G3 hard GZIDX import / export polish (G3-D/E) | `cargo test -p ratarmount-compress --lib gzip_seek` (filters: `g3_d_`, `g3_e_`) |
+| G3-D hard-import test counter raced across parallel tests (macOS) | `cargo test -p ratarmount-compress --lib g3_d_` |
 | Warm index after archive replace (tarstats size/mtime/content) | `cargo test -p ratarmount-session --lib warm_index_rebuilds` · `cargo test -p ratarmount-index --lib check_tarstats` · `cargo test -p ratarmount-formats-tar --lib warm_index` · `cargo test -p ratarmount-formats-zip --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
 | Nested EXT4 / SquashFS no-tmp factory wire | `cargo test -p ratarmount-session --lib nested_ext4` · `cargo test -p ratarmount-session --lib nested_squashfs` · crate `open_from_reader` tests |
 | F-8 factory probe order (Udf before Iso; Block after Fat/Exfat/Ntfs) | `cargo test -p ratarmount-session --lib probe_order_f8` |
