@@ -204,8 +204,9 @@ is inside the directory. `ratarmount snapshot` prints an `archive_digest` that
 with its weak companion (`base_weak_digest`), so remounts still check the base
 cheaply. `ratarmount sandbox run --base-digest` passes the value to its mount.
 
-An overlay, `--journal` file or `--lower` layer inside a directory base is left
-out of the walk: the overlay is not part of the base. The excluded paths are
+An overlay, `--journal` file, `--lower` layer or FUSE mount point inside (or
+beside) a directory base is left out of the walk: none of them is part of the
+base, and the mount creates its mount point after the digest is taken. The excluded paths are
 recorded in `base_weak_excludes` (base-relative, append-only). When the
 overlay's parent does not exist yet (`-w BASE/new/ov`) the topmost new
 component (`new`) is recorded, because creating the overlay adds it. A later
@@ -214,9 +215,11 @@ exists is base content and is refused. Index and sidecar files that ratarmount
 itself writes beside an archive (`X.index.sqlite` and its `-wal`/`-shm`,
 `.index.ptr`, pinned `.index.<id>.sqlite`, `.rgzi`, `.gzidx`, commit journals,
 manifests, staging temp names) never count. Archives written, replaced or
-repacked inside the base are base content: the weak digest changes and the next
-remount of an older overlay is refused. Keep generated archives outside the
-base, or create a fresh overlay.
+repacked inside the base (for example `--repack-seekable` writing next to its
+input) are base content: the weak digest changes and the next remount of an
+older overlay is refused, naming `--force-base-mismatch`. The sidecars such a
+repack leaves (`.rgzi`, `.gzidx`, staging names) stay invisible. Keep generated
+archives outside the base, or create a fresh overlay.
 
 A Git base gets the selected tree id, including `--git-prefix`, and startup pins
 the resolved commit before opening the mount.

@@ -376,3 +376,63 @@ fn regression_run_stub_kill_removes_sleeping_process_group() {
     assert!(!wait(&mut child).success());
     assert!(!state.join("test").exists());
 }
+
+/// Regression: `sandbox run --top` inside a directory `--base` would change
+/// the base's identity; the CLI refuses before mounting anything.
+#[test]
+fn regression_run_refuses_top_inside_directory_base() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("f"), b"one").unwrap();
+    let top = base.join("top");
+    let output = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["sandbox", "run", "--base"])
+        .arg(&base)
+        .arg("--top")
+        .arg(&top)
+        .args(["--image", "busybox", "--", "true"])
+        .env("RATARMOUNT_SANDBOX_RUNTIME", stub())
+        .env("RATARMOUNT_STUB_STATE", temp.path().join("runtime"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("--top must be outside --base"), "{stderr}");
+    assert!(!top.exists(), "nothing was created under the base");
+    assert_eq!(fs::read_dir(&base).unwrap().count(), 1);
+}
+
+/// Regression: `sandbox run` had no `--base-digest`, so a directory or archive
+/// base was always re-measured per attempt. The supplied value is recorded.
+#[test]
+fn regression_run_base_digest_recorded() {
+    use sha2::{Digest, Sha256};
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let digest = format!(
+        "sha256:{}",
+        Sha256::digest(fs::read(&fixture.base).unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let report = fixture.run(&["--seal", "--base-digest", &digest], "printf x > out");
+    assert_eq!(report["patch_hash"]["base"], digest.as_str());
+    let home = fixture.temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["overlay", "info", "--json"])
+        .arg(&fixture.top)
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let info: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(info["base_digest"], digest.as_str());
+    assert_eq!(info["base_digest_source"], "supplied");
+    assert_eq!(info["base_digest_kind"], "strong");
+}

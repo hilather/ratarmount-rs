@@ -91,7 +91,7 @@ pub use lzo_seek::{lzo_available, open_seekable_lzo, open_seekable_lzo_with_thre
 pub use ratarmount_core::ParallelizationSpec;
 pub use repack_seekable::{
     repack_seekable, GzipSidecar, RepackAction, RepackOptions, RepackReport, ZstdFrameWriter,
-    DEFAULT_REPACK_FRAME_SIZE, DEFAULT_REPACK_ZSTD_LEVEL,
+    DEFAULT_REPACK_FRAME_SIZE, DEFAULT_REPACK_ZSTD_LEVEL, GZIDX_SIDECAR_EXT, RGZI_SIDECAR_EXT,
 };
 pub use seekable_body::{
     body_looks_like_tar, DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP,

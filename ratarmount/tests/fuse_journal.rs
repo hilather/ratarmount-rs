@@ -263,3 +263,55 @@ fn regression_fuse_journal_readonly_mark_reaches_root_control() {
         .success());
     no_journal.stop();
 }
+
+/// Regression: a directory base records a weak digest and the journal header
+/// copies it (`weak:`); a supplied digest is copied as given (`sha256:`).
+#[test]
+fn regression_fuse_journal_header_records_directory_base_digest_kinds() {
+    if !available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("input"), vec![b'x'; 8192]).unwrap();
+    let supplied = format!("sha256:{}", "ab".repeat(32));
+    for (name, flag, expected) in [
+        ("weak", None, "weak:"),
+        ("strong", Some(&supplied), "sha256:"),
+    ] {
+        let journal = dir.path().join(format!("{name}.jsonl"));
+        let overlay = dir.path().join(format!("{name}-overlay"));
+        let mount = dir.path().join(format!("{name}-mnt"));
+        fs::create_dir_all(&mount).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        command
+            .args(["-f", "--passthrough", "off", "--journal"])
+            .arg(&journal)
+            .arg("-w")
+            .arg(&overlay);
+        if let Some(digest) = flag {
+            command.args(["--base-digest", digest]);
+        }
+        let child = command
+            .arg(&base)
+            .arg(&mount)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut guard = Mount {
+            child,
+            path: mount.clone(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !mount.join("input").exists() {
+            assert!(guard.child.try_wait().unwrap().is_none(), "mount exited");
+            assert!(Instant::now() < deadline, "mount timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        guard.stop();
+        let header = &events(&journal)[0];
+        let recorded = header["base_digest"].as_str().unwrap_or("");
+        assert!(recorded.starts_with(expected), "{name}: {header}");
+    }
+}

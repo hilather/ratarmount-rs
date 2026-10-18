@@ -5240,7 +5240,7 @@ fn write_commit_manifest(
     }
     let source = provenance_base(archive, encoding)?;
     let mut name = archive.as_os_str().to_os_string();
-    name.push(".manifest.jsonl");
+    name.push(crate::base_sidecars::MANIFEST_SIDECAR_SUFFIX);
     let dest = PathBuf::from(name);
     let parent = dest
         .parent()

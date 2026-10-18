@@ -5,6 +5,9 @@
 //! file or journals a commit inside the base. One predicate, shared by both
 //! walks, decides which non-directory entries are invisible to the digest.
 
+/// Suffix of the provenance manifest written beside a committed archive.
+pub const MANIFEST_SIDECAR_SUFFIX: &str = ".manifest.jsonl";
+
 /// Pinned-snapshot index name `X.index.<64 lowercase hex>.sqlite`.
 fn is_index_snapshot(name: &str) -> bool {
     name.find(".index.").is_some_and(|at| {
@@ -72,7 +75,9 @@ pub fn is_ratarmount_sidecar_name(name: &str, sibling_exists: &dyn Fn(&str) -> b
     if name.starts_with("ratarmount-index-") && name.ends_with(".tmp.sqlite.index") {
         return true;
     }
-    for suffix in [".rgzi", ".gzidx", ".manifest.jsonl"] {
+    let rgzi = format!(".{}", ratarmount_compress::RGZI_SIDECAR_EXT);
+    let gzidx = format!(".{}", ratarmount_compress::GZIDX_SIDECAR_EXT);
+    for suffix in [rgzi.as_str(), gzidx.as_str(), MANIFEST_SIDECAR_SUFFIX] {
         if let Some(stem) = name.strip_suffix(suffix) {
             if !stem.is_empty() && sibling_exists(stem) {
                 return true;

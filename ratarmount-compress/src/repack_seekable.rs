@@ -344,11 +344,16 @@ fn parent_dir(path: &Path) -> &Path {
     }
 }
 
+/// Extension (no dot) of the default `{output}.rgzi` gzip sidecar.
+pub const RGZI_SIDECAR_EXT: &str = "rgzi";
+/// Extension (no dot) of the opt-in `{output}.gzidx` gzip sidecar.
+pub const GZIDX_SIDECAR_EXT: &str = "gzidx";
+
 fn gzip_sidecar_exts(kind: GzipSidecar) -> &'static [&'static str] {
     match kind {
-        GzipSidecar::Rgzi => &["rgzi"],
-        GzipSidecar::Gzidx => &["gzidx"],
-        GzipSidecar::Both => &["rgzi", "gzidx"],
+        GzipSidecar::Rgzi => &[RGZI_SIDECAR_EXT],
+        GzipSidecar::Gzidx => &[GZIDX_SIDECAR_EXT],
+        GzipSidecar::Both => &[RGZI_SIDECAR_EXT, GZIDX_SIDECAR_EXT],
     }
 }
 
@@ -483,8 +488,8 @@ fn repack_gzip_dest(
 /// `.rgzi` when the selection is gzidx, `.gzidx` when it is rgzi. `Both` keeps both.
 fn unselected_gzip_sidecar_ext(kind: GzipSidecar) -> Option<&'static str> {
     match kind {
-        GzipSidecar::Rgzi => Some("gzidx"),
-        GzipSidecar::Gzidx => Some("rgzi"),
+        GzipSidecar::Rgzi => Some(GZIDX_SIDECAR_EXT),
+        GzipSidecar::Gzidx => Some(RGZI_SIDECAR_EXT),
         GzipSidecar::Both => None,
     }
 }

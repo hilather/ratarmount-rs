@@ -1866,4 +1866,270 @@ mod tests {
         resolve_pending_base_digest(&conn).unwrap();
         assert!(ratarmount_index::sha256_stream_calls_this_thread() > before);
     }
+
+    fn dir_names(dir: &Path) -> std::collections::BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    /// Everything new or left over since `before`, except `declared`, must be
+    /// invisible to the digest according to the shared predicate.
+    fn assert_new_names_are_sidecars(
+        dir: &Path,
+        before: &std::collections::BTreeSet<String>,
+        declared: &[&str],
+        what: &str,
+    ) {
+        for name in dir_names(dir).difference(before) {
+            if declared.contains(&name.as_str()) {
+                continue;
+            }
+            assert!(
+                crate::base_sidecars::is_ratarmount_sidecar_name(name, &|stem| dir
+                    .join(stem)
+                    .exists()),
+                "{what}: {name} is written by ratarmount but the predicate does not hide it"
+            );
+        }
+    }
+
+    /// A directory base with an archive `a.tar`, a gzip `a.gz` and a plain file.
+    fn writer_base(root: &Path) -> PathBuf {
+        use std::io::Write;
+        let base = root.join("base");
+        fs::create_dir(&base).unwrap();
+        fs::write(base.join("a.tar"), vec![0u8; 2048]).unwrap();
+        fs::write(base.join("plain.txt"), b"plain").unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&b"hello world\n".repeat(4096)).unwrap();
+        fs::write(base.join("a.gz"), gz.finish().unwrap()).unwrap();
+        base
+    }
+
+    /// Run the real index writers inside `base` (publish, pointer, rotate and a
+    /// cold build observed mid-way), calling `check(label)` after each step.
+    fn run_index_writers(base: &Path, outside: &Path, check: &mut dyn FnMut(&str)) {
+        let archive = base.join("a.tar");
+        let dest = base.join("a.tar.index.sqlite");
+        let mut index = ratarmount_index::SqliteIndex::create_writable(Some(&dest)).unwrap();
+        check("cold build staging (mid-build)");
+        index.publish_tmp().unwrap();
+        drop(index);
+        check("index published");
+        for round in 0..3 {
+            let blob = outside.join(format!("blob{round}.sqlite"));
+            fs::copy(&dest, &blob).unwrap();
+            fs::write(
+                &blob,
+                [fs::read(&dest).unwrap(), vec![round as u8; 16]].concat(),
+            )
+            .unwrap();
+            ratarmount_index::publish_index_pointer(&archive, &blob, None).unwrap();
+            check(&format!("pointer publish/rotate {round}"));
+        }
+    }
+
+    /// Regression: every file a ratarmount writer leaves beside a base archive
+    /// (index, pointer, rotated snapshot, staging, commit journal, manifest,
+    /// every repack mode) must satisfy the predicate the digest walks use.
+    #[test]
+    fn regression_sidecar_predicate_covers_every_writer_output() {
+        let root = tempfile::tempdir().unwrap();
+        let base = writer_base(root.path());
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let mut before = dir_names(&base);
+        {
+            let b = base.clone();
+            run_index_writers(&base, &outside, &mut |what| {
+                assert_new_names_are_sidecars(&b, &before, &[], what);
+                before = dir_names(&b);
+            });
+        }
+        // Provenance manifest beside the archive.
+        let mut manifest = base.join("a.tar").into_os_string();
+        manifest.push(crate::base_sidecars::MANIFEST_SIDECAR_SUFFIX);
+        fs::write(&manifest, b"{}\n").unwrap();
+        assert_new_names_are_sidecars(&base, &before, &[], "manifest");
+        // The commit journal exists while a suffix replacement is in flight.
+        fs::copy(base.join("a.tar"), base.join("c.tar")).unwrap();
+        before = dir_names(&base);
+        let mut suffix = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut suffix, &[1u8; 512]).unwrap();
+        std::io::Seek::rewind(&mut suffix).unwrap();
+        let mut seen_journal = false;
+        let replaced = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+            &base.join("c.tar"),
+            512,
+            &mut suffix,
+            &mut |_phase| {
+                seen_journal |= dir_names(&base).iter().any(|n| {
+                    n.ends_with(ratarmount_compress::commit_journal::COMMIT_JOURNAL_SUFFIX)
+                });
+                assert_new_names_are_sidecars(&base, &before, &[], "commit journal");
+                Ok(())
+            },
+        );
+        match replaced {
+            Ok(()) => assert!(seen_journal, "the hook never saw the commit journal"),
+            Err(error) => eprintln!("skip: commit journal needs inode xattrs: {error}"),
+        }
+        assert_new_names_are_sidecars(&base, &before, &[], "after commit");
+        // Every repack mode: only the declared output may be new content.
+        use ratarmount_compress::{repack_seekable, GzipSidecar, RepackOptions};
+        let runs: [(&str, GzipSidecar, bool); 5] = [
+            ("o_rgzi.gz", GzipSidecar::Rgzi, false),
+            ("o_gzidx.gz", GzipSidecar::Gzidx, false),
+            ("o_both.gz", GzipSidecar::Both, false),
+            ("o_rgzi.gz", GzipSidecar::Both, true),
+            ("o_zstd.zst", GzipSidecar::Rgzi, false),
+        ];
+        for (out, sidecar, overwrite) in runs {
+            before = dir_names(&base);
+            let opts = RepackOptions {
+                gzip_sidecar: sidecar,
+                overwrite,
+                ..Default::default()
+            };
+            repack_seekable(&base.join("a.gz"), &base.join(out), &opts).unwrap();
+            assert_new_names_are_sidecars(&base, &before, &[out], &format!("repack {out}"));
+        }
+    }
+
+    /// Regression: index publish/rotate/staging inside a directory base moved
+    /// its digest (the plan's `.rgzi` gap). Part 1: sidecar-only writers leave
+    /// weak and strong digests unchanged and reopen passes. Part 2 (documented
+    /// behaviour, G6): a legitimate repack writes an archive, which IS base
+    /// content, so reopen is refused naming `--force-base-mismatch`, while the
+    /// sidecars it leaves stay invisible.
+    #[test]
+    fn regression_index_publish_and_rotate_inside_directory_base_keeps_reopen() {
+        use ratarmount_compress::{repack_seekable, GzipSidecar, RepackOptions};
+        let root = tempfile::tempdir().unwrap();
+        let base = writer_base(root.path());
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let none = BaseExcludes::default();
+        let weak = directory_weak_digest(&base, &none).unwrap();
+        let strong = directory_digest(&base).unwrap();
+        let ov_weak = root.path().join("ov_weak");
+        let ov_strong = root.path().join("ov_strong");
+        let strong_info = OverlayCreateInfo {
+            base_digest: BaseDigestRequest::Supplied(strong.clone()),
+            ..info(&base)
+        };
+        drop(open_dir_base(&base, &ov_weak, &info(&base)).unwrap());
+        drop(open_dir_base(&base, &ov_strong, &strong_info).unwrap());
+        let b = base.clone();
+        run_index_writers(&base, &outside, &mut |what| {
+            assert_eq!(directory_weak_digest(&b, &none).unwrap(), weak, "{what}");
+            assert_eq!(directory_digest(&b).unwrap(), strong, "{what}");
+        });
+        drop(open_dir_base(&base, &ov_weak, &info(&base)).unwrap());
+        drop(open_dir_base(&base, &ov_strong, &strong_info).unwrap());
+
+        // Part 2: baseline files the repack does not touch.
+        let stamp = |name: &str| {
+            let meta = fs::metadata(base.join(name)).unwrap();
+            (fs::read(base.join(name)).unwrap(), meta.modified().unwrap())
+        };
+        let baseline: Vec<_> = ["a.tar", "plain.txt", "a.gz"]
+            .iter()
+            .map(|n| (*n, stamp(n)))
+            .collect();
+        let runs: [(&str, GzipSidecar, bool); 4] = [
+            ("o_rgzi.gz", GzipSidecar::Rgzi, false),
+            ("o_gzidx.gz", GzipSidecar::Gzidx, false),
+            ("o_both.gz", GzipSidecar::Both, false),
+            ("o_rgzi.gz", GzipSidecar::Both, true),
+        ];
+        for (n, (out, sidecar, overwrite)) in runs.into_iter().enumerate() {
+            let overlay = root.path().join(format!("ov_repack{n}"));
+            let context = info(&base);
+            drop(open_dir_base(&base, &overlay, &context).unwrap());
+            let recorded = meta_of(&overlay).base_digest().unwrap().to_string();
+            let before = dir_names(&base);
+            let with_output = BaseExcludes::new([PathBuf::from(out)]);
+            let digest_before = directory_weak_digest(&base, &with_output).unwrap();
+            let opts = RepackOptions {
+                gzip_sidecar: sidecar,
+                overwrite,
+                ..Default::default()
+            };
+            repack_seekable(&base.join("a.gz"), &base.join(out), &opts).unwrap();
+            // (ii) every other new name is a sidecar and invisible to the digest.
+            assert_new_names_are_sidecars(&base, &before, &[out], out);
+            // (i) only the output body counts: the digest moved, the reopen refuses.
+            assert_ne!(
+                directory_weak_digest(&base, &none).unwrap(),
+                recorded,
+                "{out}"
+            );
+            let error = open_dir_base(&base, &overlay, &context)
+                .err()
+                .unwrap_or_else(|| panic!("repack {out} did not change the digest"))
+                .to_string();
+            assert!(error.contains("--force-base-mismatch"), "{error}");
+            let mut forced = context.clone();
+            forced.force_base_mismatch = true;
+            drop(open_dir_base(&base, &overlay, &forced).unwrap());
+            // Excluding just the output makes the walk identical to before the repack
+            // for a fresh output; an overwrite already counted the old body.
+            if !overwrite {
+                assert_eq!(
+                    directory_weak_digest(&base, &with_output).unwrap(),
+                    digest_before,
+                    "{out}: sidecars/staging names must not count"
+                );
+            }
+        }
+        // (iii) untouched baseline files are byte- and mtime-identical.
+        for (name, before) in baseline {
+            assert_eq!(stamp(name), before, "{name} was collateral damage");
+        }
+    }
+
+    /// Regression: a mount point created inside the base after the digest was
+    /// taken (or mounted over later) changed the weak digest on remount. The
+    /// caller passes it in `weak_exclude`; topmost-new records it.
+    #[test]
+    fn regression_mountpoint_inside_base_is_in_the_recorded_excluded_set() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir(&basedir).unwrap();
+        fs::write(basedir.join("f"), b"one").unwrap();
+        let expected = directory_weak_digest(&basedir, &BaseExcludes::default()).unwrap();
+        // Overlay beside the base, mount point inside it, not created yet.
+        let overlay = root.path().join("overlay");
+        let context = OverlayCreateInfo {
+            weak_exclude: vec![basedir.join("mnt")],
+            ..info(&basedir)
+        };
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        assert_eq!(
+            meta_of(&overlay).get("base_weak_excludes"),
+            Some(r#"["mnt"]"#)
+        );
+        // The mount creates the directory afterwards and writes through it.
+        fs::create_dir(basedir.join("mnt")).unwrap();
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        assert_eq!(meta_of(&overlay).base_digest(), Some(expected.as_str()));
+        // Overlay inside the base as well, mount point in a not-yet-existing parent.
+        let overlay = basedir.join(".ov");
+        let context = OverlayCreateInfo {
+            weak_exclude: vec![basedir.join("mounts/m1")],
+            ..info(&basedir)
+        };
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        assert_eq!(
+            meta_of(&overlay).get("base_weak_excludes"),
+            Some(r#"[".ov","mounts"]"#)
+        );
+        fs::create_dir_all(basedir.join("mounts/m1")).unwrap();
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        // A journal-free, mount-point-free remount still passes (recorded set).
+        drop(open_dir_base(&basedir, &overlay, &info(&basedir)).unwrap());
+    }
 }

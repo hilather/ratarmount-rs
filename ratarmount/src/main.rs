@@ -2147,12 +2147,14 @@ fn main() {
                 .then(|| index_sidecar.clone())
                 .flatten(),
             git_tree: overlay_git_tree,
-            // Journal and lower layers inside a directory base stay out of its digest.
+            // Journal, lower layers and the mount point inside a directory base
+            // stay out of its digest (a mount point is created after creation).
             weak_exclude: args
                 .journal
                 .iter()
                 .cloned()
                 .chain(lower_stack.records.iter().map(|r| r.path.clone()))
+                .chain(mount_point_exclusion(&args, mountpoint.as_deref(), &inputs))
                 .collect(),
             ..Default::default()
         };
@@ -4270,6 +4272,23 @@ fn split_inputs_mountpoint(paths: &[PathBuf], no_mount: bool) -> (Vec<PathBuf>, 
         return (paths.to_vec(), None);
     }
     (paths[..paths.len() - 1].to_vec(), Some(last.clone()))
+}
+
+/// The FUSE mount point a mount will use, for the weak digest's excluded set.
+/// None for `--no-mount`, export-only runs and unmounts.
+fn mount_point_exclusion(
+    args: &Args,
+    mountpoint: Option<&Path>,
+    inputs: &[PathBuf],
+) -> Option<PathBuf> {
+    if args.no_mount || args.unmount {
+        return None;
+    }
+    match mountpoint {
+        Some(mp) => Some(mp.to_path_buf()),
+        None if any_export(args) => None,
+        None => inputs.first().map(|input| default_mountpoint(input)),
+    }
 }
 
 fn default_mountpoint(archive: &Path) -> PathBuf {

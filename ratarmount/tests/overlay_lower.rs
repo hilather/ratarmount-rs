@@ -219,3 +219,43 @@ fn regression_cow_lower_fsck_cli_json_exit_codes_and_lock() {
     assert_eq!(fsck(&dir, true).status.code(), Some(2));
     success(fsck(&dir, false));
 }
+
+/// Regression: a top over a sealed lower on a directory base records its own
+/// weak measurement and a stack digest built from it, not the lower's value;
+/// a supplied `--base-digest` is recorded as given. Two tops over the same
+/// lower and base agree.
+#[test]
+fn regression_stack_top_over_lower_measures_own_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("f"), b"one").unwrap();
+    let lower = tmp.path().join("lower");
+    success(open(&base, Some(&lower), &[], &[]));
+    seal(&lower, "sha256:lower");
+    // Forge the lower's recorded identity: only the top's own measurement counts.
+    let conn = rusqlite::Connection::open(lower.join(HIDDEN_DB)).unwrap();
+    OverlayMeta::set(&conn, "base_digest", "sha256:forged").unwrap();
+    drop(conn);
+    let [a, b, c] = ["a", "b", "c"].map(|n| tmp.path().join(n));
+    success(open(&base, Some(&a), &[&lower], &[]));
+    success(open(&base, Some(&b), &[&lower], &[]));
+    let supplied = format!("sha256:{}", "cd".repeat(32));
+    success(open(
+        &base,
+        Some(&c),
+        &[&lower],
+        &["--base-digest", &supplied],
+    ));
+    let meta_a = OverlayMeta::read(&a).unwrap().unwrap();
+    let own = meta_a.base_digest().unwrap();
+    assert!(own.starts_with("weak:"), "{own}");
+    assert_eq!(
+        meta_a.stack_digest(),
+        Some(stack_digest(own, &["sha256:lower"]).as_str())
+    );
+    let meta_b = OverlayMeta::read(&b).unwrap().unwrap();
+    assert_eq!(meta_b.stack_digest(), meta_a.stack_digest());
+    let meta_c = OverlayMeta::read(&c).unwrap().unwrap();
+    assert_eq!(meta_c.base_digest(), Some(supplied.as_str()));
+}
