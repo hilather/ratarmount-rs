@@ -266,6 +266,9 @@ struct Prepared {
     /// Set when `--force-base-mismatch` overrode a changed base:
     /// (recorded digest, digest of the base actually diffed).
     forced_base: Option<(Option<String>, String)>,
+    /// A recorded row or an equal strong digest confirmed the base; false for
+    /// a remote base with nothing cheap to compare (recorded identity unconfirmed).
+    base_confirmed: bool,
 }
 
 fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
@@ -299,6 +302,7 @@ fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
             options,
             meta,
             forced_base: None,
+            base_confirmed: false,
         });
     };
     let lower_dirs = if args.lower.is_empty() {
@@ -342,17 +346,17 @@ fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
     }
     // Same cheap identity check as reopen and `--lower`: a base that is not the
     // one the overlay recorded must not be diffed silently.
-    let forced_base =
-        crate::overlay_cmd::gate_base(&args.directory, meta.as_ref(), base, &args.identity)
-            .map_err(io::Error::other)?
-            .and_then(|outcome| {
-                outcome.forced.map(|rows| {
-                    (
-                        outcome.recorded,
-                        rows.get("base_digest").cloned().unwrap_or_default(),
-                    )
-                })
-            });
+    let gate = crate::overlay_cmd::gate_base(&args.directory, meta.as_ref(), base, &args.identity)
+        .map_err(io::Error::other)?;
+    let base_confirmed = gate.as_ref().is_some_and(|outcome| outcome.confirmed);
+    let forced_base = gate.and_then(|outcome| {
+        outcome.forced.map(|rows| {
+            (
+                outcome.recorded,
+                rows.get("base_digest").cloned().unwrap_or_default(),
+            )
+        })
+    });
     let mut open = OpenOptions {
         write_index: false,
         index_in_memory: true,
@@ -380,6 +384,7 @@ fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
         options,
         meta,
         forced_base,
+        base_confirmed,
     })
 }
 
@@ -419,7 +424,7 @@ fn render(prepared: &Prepared, args: &DiffArgs, out: &mut dyn Write) -> io::Resu
             }
             serde_json::to_writer(
                 &mut *out,
-                &serde_json::json!({"patch":hash,"base":base,"base_forced":forced.is_some(),"base_recorded":forced.and_then(|(recorded, _)| recorded.as_deref()),"stack":stack,"files":prepared.changes.len(),"normalize":prepared.options.normalize.as_str(),"excludes":args.exclude,"algo":prepared.options.algo.as_str(),"sealed":meta.is_some_and(OverlayMeta::layer_sealed),"base_pending":pending,"base_digest_state":meta.map_or("none", OverlayMeta::base_digest_state)}),
+                &serde_json::json!({"patch":hash,"base":base,"base_forced":forced.is_some(),"base_identity":if forced.is_some() { "forced" } else if prepared.base_confirmed { "confirmed" } else { "unconfirmed" },"base_recorded":forced.and_then(|(recorded, _)| recorded.as_deref()),"stack":stack,"files":prepared.changes.len(),"normalize":prepared.options.normalize.as_str(),"excludes":args.exclude,"algo":prepared.options.algo.as_str(),"sealed":meta.is_some_and(OverlayMeta::layer_sealed),"base_pending":pending,"base_digest_state":meta.map_or("none", OverlayMeta::base_digest_state)}),
             )?;
             out.write_all(b"\n")?;
         } else {
@@ -500,6 +505,7 @@ pub(crate) fn render_source(
                 options,
                 meta: None,
                 forced_base: None,
+                base_confirmed: false,
             },
             args,
             &mut output,

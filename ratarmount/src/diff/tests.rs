@@ -820,6 +820,9 @@ fn regression_diff_hash_json_base_digest_state_present_and_none() {
         let (_tmp, mut args) = command_fixture();
         args.hash = true;
         args.json = true;
+        // A made-up strong digest cannot match the real base; the state is
+        // what is under test, so override the (intended) identity refusal.
+        args.identity.force_base_mismatch = kind == "strong";
         meta_set(
             &args.directory,
             &[("base_digest_kind", kind), ("base_digest", digest)],

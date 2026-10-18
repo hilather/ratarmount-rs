@@ -366,11 +366,16 @@ pub(super) struct GateOutcome {
     /// Set when `--force-base-mismatch` overrode a mismatch: the rows that
     /// describe the base actually used (`base_digest`, `stack_digest`, ...).
     pub forced: Option<std::collections::BTreeMap<String, String>>,
+    /// True when a recorded row (stamp, manifest, tree) or an equal strong
+    /// digest confirmed the base. False for a base with nothing cheap to
+    /// compare (remote): the recorded identity is then unconfirmed.
+    pub confirmed: bool,
 }
 
 /// Compare the base with the identity the overlay recorded, with the check the
 /// `--lower` mount uses (metadata only, no hashing). `Ok(None)` when there is
-/// nothing to compare (legacy overlay, kind `none`, remote base).
+/// nothing to compare (legacy overlay, kind `none`). A remote base compares only a
+/// supplied `--base-digest` against a strong record (never hashing).
 pub(super) fn gate_base(
     dir: &Path,
     meta: Option<&OverlayMeta>,
@@ -393,9 +398,6 @@ pub(super) fn gate_base(
     } else {
         None
     };
-    if git_tree.is_none() && !base.is_dir() && !base.is_file() {
-        return Ok(None);
-    }
     let index = meta.get("base_index_path").map(PathBuf::from).or_else(|| {
         base.is_file()
             .then(|| ratarmount_index::default_index_path(base))
@@ -410,9 +412,13 @@ pub(super) fn gate_base(
     let comparison = compare_base_identity(Some(meta), &probe)?;
     let recorded = meta.known_base_digest().map(str::to_owned);
     let Some(current) = &comparison.mismatch else {
+        let confirmed = comparison.compared
+            || (meta.base_digest_kind() == Some("strong")
+                && identity.base_digest.as_deref() == meta.base_digest());
         return Ok(Some(GateOutcome {
             recorded,
             forced: None,
+            confirmed,
         }));
     };
     if !identity.force_base_mismatch {
@@ -436,6 +442,7 @@ pub(super) fn gate_base(
     Ok(Some(GateOutcome {
         recorded,
         forced: Some(forced),
+        confirmed: false,
     }))
 }
 
@@ -1005,5 +1012,62 @@ mod tests {
         assert!(value["last_modified"].is_string());
         server.join().unwrap();
         assert_eq!(remote_base_token("hf://datasets/org/repo@main/a"), None);
+    }
+
+    fn strong_remote_meta(digest: &str) -> ratarmount_compositing::OverlayMeta {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        for (key, value) in [
+            ("format_version", "2"),
+            ("base_digest_kind", "strong"),
+            ("base_digest", digest),
+        ] {
+            conn.execute("INSERT INTO meta VALUES (?1, ?2)", [key, value])
+                .unwrap();
+        }
+        ratarmount_compositing::OverlayMeta::from_connection(&conn)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Regression (R4-S2): a remote base skipped the identity check, so a
+    /// supplied `--base-digest` contradicting the recorded strong digest was
+    /// ignored; with nothing cheap to compare the recorded identity is reported
+    /// unconfirmed, and only an equal supplied digest confirms it (no hashing).
+    #[test]
+    fn regression_gate_base_remote_checks_supplied_digest() {
+        let recorded = format!("sha256:{}", "a".repeat(64));
+        let other = format!("sha256:{}", "b".repeat(64));
+        let meta = strong_remote_meta(&recorded);
+        let url = Path::new("http://127.0.0.1:1/base.tar");
+        let args = |digest: Option<&str>, force: bool| BaseIdentityArgs {
+            force_base_mismatch: force,
+            base_digest: digest.map(str::to_owned),
+        };
+        let err = gate_base(Path::new("o"), Some(&meta), url, &args(Some(&other), false))
+            .err()
+            .expect("contradicting digest must be refused");
+        assert!(
+            err.contains("--force-base-mismatch") && err.contains("recorded"),
+            "{err}"
+        );
+        let nothing = gate_base(Path::new("o"), Some(&meta), url, &args(None, false))
+            .unwrap()
+            .unwrap();
+        assert!(!nothing.confirmed && nothing.forced.is_none());
+        let equal = gate_base(
+            Path::new("o"),
+            Some(&meta),
+            url,
+            &args(Some(&recorded), false),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(equal.confirmed);
+        let forced = gate_base(Path::new("o"), Some(&meta), url, &args(Some(&other), true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(forced.forced.unwrap()["base_digest"], other);
     }
 }
