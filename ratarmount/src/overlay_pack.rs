@@ -969,7 +969,7 @@ fn unpack_impl(bundle: &Path, directory: &Path, limits: Limits) -> io::Result<Un
 /// change follows the renamed inode.
 fn publish_layer(layer: &Path, directory: &Path) -> io::Result<()> {
     let root = host::open(layer, directory_flags(), Mode::empty())?;
-    let sealed = ratarmount_compositing::host_stat::fstat(&root)?.st_mode;
+    let sealed = ratarmount_compositing::host_stat::fstat_named(&root, layer)?.st_mode;
     host::fchmod(&root, Mode::from_raw_mode(sealed | 0o200))?;
     fs::rename(layer, directory)
         .map_err(|e| io::Error::new(e.kind(), format!("publish layer: {e}")))?;

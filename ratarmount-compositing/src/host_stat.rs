@@ -22,13 +22,81 @@ pub fn normalize_timespec(secs: i64, nsecs: i64) -> (i64, i64) {
     )
 }
 
-#[cfg(not(target_vendor = "apple"))]
+/// Test seam (unit tests, and CLI tests via the `test-hooks` feature): force a
+/// panic inside the guarded stat call for any path ending in the given suffix,
+/// standing in for the rustix macOS panic. The CLI reads the suffix from
+/// `RATARMOUNT_TEST_STAT_PANIC`.
+#[cfg(any(test, feature = "test-hooks"))]
+static PANIC_SUFFIX: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub fn set_panic_for_test(suffix: Option<&str>) {
+    *PANIC_SUFFIX.lock().unwrap() = suffix.map(str::to_owned);
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn panic_for_test(path: &str) {
+    let suffix = PANIC_SUFFIX
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .or_else(|| std::env::var("RATARMOUNT_TEST_STAT_PANIC").ok());
+    if suffix.is_some_and(|s| !s.is_empty() && path.ends_with(&s)) {
+        panic!("forced stat panic for {path}");
+    }
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn panic_for_test(_path: &str) {}
+
+/// Run a stat call so that a panic inside it (rustix 1.1 asserts on some
+/// macOS timestamps) is an `io::Error` naming the path, never an abort of the
+/// verb. The default panic hook still prints its one-line message.
+fn guarded<T>(path: &str, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        panic_for_test(path);
+        f()
+    }))
+    .unwrap_or_else(|_| {
+        Err(io::Error::other(format!(
+            "internal error reading file metadata (rustix panic) for {path}"
+        )))
+    })
+}
+
+fn arg_name<P: rustix::path::Arg>(path: &P) -> String {
+    path.as_cow_c_str()
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// `fstat` of an fd whose path the caller knows; the path only names the file
+/// in the error if the stat panics.
+pub fn fstat_named<Fd: AsFd>(fd: Fd, path: impl AsRef<std::path::Path>) -> io::Result<Stat> {
+    let path = path.as_ref().to_string_lossy();
+    guarded(&path, || fstat_raw(fd))
+}
+
 pub fn fstat<Fd: AsFd>(fd: Fd) -> io::Result<Stat> {
+    guarded("<open file>", || fstat_raw(fd))
+}
+
+pub fn statat<Fd: AsFd, P: rustix::path::Arg>(
+    dirfd: Fd,
+    path: P,
+    flags: AtFlags,
+) -> io::Result<Stat> {
+    let name = arg_name(&path);
+    guarded(&name, || statat_raw(dirfd, path, flags))
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn fstat_raw<Fd: AsFd>(fd: Fd) -> io::Result<Stat> {
     Ok(rustix::fs::fstat(fd)?)
 }
 
 #[cfg(not(target_vendor = "apple"))]
-pub fn statat<Fd: AsFd, P: rustix::path::Arg>(
+fn statat_raw<Fd: AsFd, P: rustix::path::Arg>(
     dirfd: Fd,
     path: P,
     flags: AtFlags,
@@ -51,7 +119,7 @@ fn normalized(mut st: Stat) -> Stat {
 }
 
 #[cfg(target_vendor = "apple")]
-pub fn fstat<Fd: AsFd>(fd: Fd) -> io::Result<Stat> {
+fn fstat_raw<Fd: AsFd>(fd: Fd) -> io::Result<Stat> {
     use std::os::fd::AsRawFd;
     // rustix::fs::Stat is libc::stat on Apple targets.
     let mut st = std::mem::MaybeUninit::<Stat>::uninit();
@@ -62,7 +130,7 @@ pub fn fstat<Fd: AsFd>(fd: Fd) -> io::Result<Stat> {
 }
 
 #[cfg(target_vendor = "apple")]
-pub fn statat<Fd: AsFd, P: rustix::path::Arg>(
+fn statat_raw<Fd: AsFd, P: rustix::path::Arg>(
     dirfd: Fd,
     path: P,
     flags: AtFlags,
@@ -118,5 +186,27 @@ mod tests {
             assert_eq!((secs, nsecs), (-1, 750_000_000));
         }
         assert!(statat(&dir, "missing", AtFlags::SYMLINK_NOFOLLOW).is_err());
+    }
+
+    /// Regression: a panic inside the stat call (rustix on macOS) becomes an
+    /// `io::Error` naming the path instead of unwinding into the verb.
+    #[test]
+    fn regression_host_stat_panic_becomes_io_error_naming_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("poisoned.bin"), b"x").unwrap();
+        fs::write(tmp.path().join("fine.bin"), b"x").unwrap();
+        let dir = fs::File::open(tmp.path()).unwrap();
+        let file = fs::File::open(tmp.path().join("poisoned.bin")).unwrap();
+        set_panic_for_test(Some("poisoned.bin"));
+        let at = statat(&dir, "poisoned.bin", AtFlags::SYMLINK_NOFOLLOW);
+        let named = fstat_named(&file, "overlay/poisoned.bin");
+        let ok = statat(&dir, "fine.bin", AtFlags::SYMLINK_NOFOLLOW);
+        set_panic_for_test(None);
+        let err = at.unwrap_err();
+        assert!(err.to_string().contains("poisoned.bin"), "{err}");
+        assert!(err.to_string().contains("rustix panic"), "{err}");
+        let err = named.unwrap_err();
+        assert!(err.to_string().contains("overlay/poisoned.bin"), "{err}");
+        assert!(ok.is_ok());
     }
 }

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Compositing MountSources: union, automount, folder"
 
+[features]
+# Test seams for CLI tests (host_stat panic injection). Enabled only through
+# the `ratarmount` dev-dependency, never in a normal build.
+test-hooks = []
+
 [dependencies]
 ratarmount-core.workspace = true
 ratarmount-compress.workspace = true

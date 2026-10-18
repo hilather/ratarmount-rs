@@ -557,6 +557,10 @@ On macOS, a timestamp between −1 s and 0 is reported as `{0 s, negative ns}`,
 and rustix 1.1's `stat` panics on it. Fsck, seal, verify, diff and pack therefore
 read metadata through `ratarmount_compositing::host_stat`, which calls libc on
 Apple platforms and normalizes such timestamps instead of crashing.
+As a backstop, every stat call there runs under `catch_unwind`: any other panic
+inside it becomes an error `internal error reading file metadata (rustix panic) for
+<path>` and the verb exits 2 (the code it already uses for an I/O error), never
+an abort with status 101. The default panic hook may still print one line first.
 
 `--normalize exact` hashes bytes as written. `strict` converts CRLF to LF, strips
 trailing ASCII whitespace per line (space, tab, CR, LF and form feed; not vertical

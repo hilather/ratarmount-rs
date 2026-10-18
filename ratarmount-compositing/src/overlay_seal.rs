@@ -127,7 +127,12 @@ fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
         if kind == libc::S_IFDIR {
             chmod_tree(&child, writable)?;
         } else {
-            host::fchmod(&child, change(crate::host_stat::fstat(&child)?.st_mode))?;
+            host::fchmod(
+                &child,
+                change(
+                    crate::host_stat::fstat_named(&child, name.to_string_lossy().as_ref())?.st_mode,
+                ),
+            )?;
         }
     }
     if !writable {
@@ -293,7 +298,10 @@ fn finish_sealed(dir: &Path, root: &OwnedFd, layer_digest: &str) -> io::Result<(
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
-        Ok(fd) if crate::host_stat::fstat(&fd)?.st_mode & libc::S_IFMT == libc::S_IFREG => {
+        Ok(fd)
+            if crate::host_stat::fstat_named(&fd, dir.join(SENTINEL))?.st_mode & libc::S_IFMT
+                == libc::S_IFREG =>
+        {
             use std::io::Read;
             let mut bytes = Vec::new();
             fs::File::from(fd)
@@ -397,7 +405,10 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
-        Ok(fd) if crate::host_stat::fstat(&fd)?.st_mode & libc::S_IFMT == libc::S_IFREG => {
+        Ok(fd)
+            if crate::host_stat::fstat_named(&fd, dir.join(SENTINEL))?.st_mode & libc::S_IFMT
+                == libc::S_IFREG =>
+        {
             use std::io::Read;
             let mut bytes = Vec::new();
             fs::File::from(fd)
