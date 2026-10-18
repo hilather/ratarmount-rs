@@ -58,8 +58,8 @@ pub use overlay_meta::{
     directory_weak_walks_this_thread, forced_base_record, record_base_digest,
     record_base_rows_offline, redact_meta_values, resolve_base_excludes,
     resolve_pending_base_digest, stack_digest, verify_base, BaseCheck, BaseComparison,
-    BaseDigestRequest, BaseExcludes, BaseProbe, BaseStrength, LowerLayerRecord, OverlayCreateInfo,
-    OverlayMeta, PendingBase, BASE_COMPARISON_KEYS,
+    BaseDigestRequest, BaseExcludes, BaseKind, BaseProbe, BaseStrength, LowerLayerRecord,
+    OverlayCreateInfo, OverlayMeta, PendingBase, BASE_COMPARISON_KEYS,
 };
 pub use overlay_policy::{
     parse_overlay_size, CompositeOverlayPolicy, OverlayQuota, OverlayStats, OverlayUsage,

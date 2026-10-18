@@ -392,9 +392,12 @@ pub(super) fn gate_base(
     // Classify the base actually given, whatever kind the overlay recorded: a
     // `git://` URL, `repo@rev` or bare repository is Git; a plain path is Git
     // only when the overlay recorded Git and the path is a repository. The
-    // tree is a lookup, nothing is hashed.
+    // tree is a lookup, nothing is hashed. `compare_base_identity` then
+    // applies the one kind rule (recorded kind == actual kind).
     let mut options = ratarmount_core::OpenOptions {
-        git: meta.get("base_git_tree").is_some() && ratarmount_formats_git::looks_like_git(base),
+        git: ratarmount_compositing::BaseKind::recorded(meta)
+            == Some(ratarmount_compositing::BaseKind::Git)
+            && ratarmount_formats_git::looks_like_git(base),
         ..Default::default()
     };
     let git_tree = super::overlay_cmd::pin_git_base(&mut [base.to_path_buf()], &mut options)?;

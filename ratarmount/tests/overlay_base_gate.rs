@@ -13,6 +13,9 @@ use std::process::{Command, Output};
 
 use ratarmount_compositing::{directory_weak_digest, BaseExcludes, OverlayMeta};
 
+#[path = "support/http_tar.rs"]
+mod http_tar;
+
 struct Env {
     root: tempfile::TempDir,
 }
@@ -701,5 +704,55 @@ fn regression_git_overlay_against_archive_base_is_refused() {
             .success());
         refused(&verb(&env, v, &overlay, &archive, &[]));
         assert!(!env.path("bundle.tar.zst").exists(), "{v:?} wrote a bundle");
+    }
+}
+
+const REMOTE_STRONG: &str =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// Regression (R5-1, round-4 skeptic G1): a remote-recorded overlay against a
+/// `git://` base (and the reverse) matched nothing locally, so seal, pack and
+/// diff found no mismatch. One rule: any change of base kind is refused unless
+/// `--force-base-mismatch`.
+#[test]
+fn regression_git_and_remote_kind_switch_is_refused_by_every_verb() {
+    let stub = http_tar::serve_tar_stub();
+    let url = format!("{stub}/base.tar");
+    for v in VERBS {
+        // remote -> Git
+        let env = Env::new();
+        let overlay = env.path("overlay");
+        env.ok(&[
+            "--no-mount",
+            "--index-file",
+            ":memory:",
+            "-w",
+            s(&overlay),
+            "--base-digest",
+            REMOTE_STRONG,
+            &url,
+        ]);
+        if !matches!(v, Verb::Seal) {
+            env.ok(&["overlay", "seal", s(&overlay)]);
+        }
+        let (git, _) = git_base(&env, "repo");
+        refused(&verb(&env, v, &overlay, Path::new(&git), &[]));
+        assert!(!env.path("bundle.tar.zst").exists(), "{v:?} wrote a bundle");
+        if matches!(v, Verb::Seal) {
+            assert!(!meta_of(&overlay).layer_sealed());
+        }
+        // Git -> remote
+        let env = Env::new();
+        let (git, _) = git_base(&env, "repo");
+        let overlay = env.path("overlay");
+        env.ok(&["--no-mount", "-w", s(&overlay), &git]);
+        if !matches!(v, Verb::Seal) {
+            env.ok(&["overlay", "seal", s(&overlay)]);
+        }
+        refused(&verb(&env, v, &overlay, Path::new(&url), &[]));
+        assert!(!env.path("bundle.tar.zst").exists(), "{v:?} wrote a bundle");
+        if matches!(v, Verb::Seal) {
+            assert!(!meta_of(&overlay).layer_sealed());
+        }
     }
 }

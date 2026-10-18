@@ -1106,6 +1106,20 @@ pub(crate) fn initialize(
     if let Some(tree) = &info.git_tree {
         values.insert("base_git_tree", tree.clone());
     }
+    // An overlay created without naming its base records no kind; the
+    // comparison rows then identify it.
+    if info.git_tree.is_some() || info.path().is_some() || !info.base_url.is_empty() {
+        let kind = if info.git_tree.is_some() {
+            BaseKind::Git
+        } else if info.path().is_some_and(Path::is_dir) {
+            BaseKind::Directory
+        } else if info.path().is_some_and(Path::is_file) {
+            BaseKind::Archive
+        } else {
+            BaseKind::Remote
+        };
+        values.insert("base_kind", kind.as_str().to_owned());
+    }
     if let Some(token) = &info.remote_token {
         values.insert("base_remote_token", token.clone());
     }
@@ -1172,6 +1186,7 @@ pub(crate) fn refresh_committed_base(conn: &Connection, archive: &Path) -> Resul
         ("base_committed_at", timestamp()),
         ("base_local_path", archive.to_string_lossy().into_owned()),
         ("base_index_path", index.to_string_lossy().into_owned()),
+        ("base_kind", BaseKind::Archive.as_str().to_owned()),
     ];
     OverlayMeta::set_many(
         conn,
@@ -1332,6 +1347,83 @@ pub struct BaseProbe<'a> {
     pub extra_excludes: &'a [PathBuf],
 }
 
+/// What a base is, for the one rule every base check shares: a change of kind
+/// is a different base (and is refused without `--force-base-mismatch`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseKind {
+    /// A local directory (weak manifest walk).
+    Directory,
+    /// A local archive file (size/mtime stamp).
+    Archive,
+    /// A pinned Git tree.
+    Git,
+    /// Anything else: an HTTP/S3/... URL or a composite of inputs.
+    Remote,
+}
+
+impl BaseKind {
+    /// Every kind. Exhaustiveness is checked where kinds are compared
+    /// (see `kind_name`) and by the table test over all pairs.
+    pub const ALL: [BaseKind; 4] = [
+        BaseKind::Directory,
+        BaseKind::Archive,
+        BaseKind::Git,
+        BaseKind::Remote,
+    ];
+
+    /// The value stored in the `base_kind` row.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BaseKind::Directory => "directory",
+            BaseKind::Archive => "archive",
+            BaseKind::Git => "git",
+            BaseKind::Remote => "remote",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == text)
+    }
+
+    /// The kind of the base `probe` describes.
+    pub fn of_probe(probe: &BaseProbe) -> Self {
+        if probe.git_tree.is_some() {
+            BaseKind::Git
+        } else if probe.path.is_some_and(Path::is_dir) {
+            BaseKind::Directory
+        } else if probe.path.is_some_and(Path::is_file) {
+            BaseKind::Archive
+        } else {
+            BaseKind::Remote
+        }
+    }
+
+    /// The kind an overlay recorded: the `base_kind` row, else (overlays made
+    /// before it existed) the comparison rows that identify it (a named base
+    /// with none of them is remote). `None` for a
+    /// recorded kind of `none` (or none at all): no identity to compare.
+    pub fn recorded(meta: &OverlayMeta) -> Option<Self> {
+        if meta.base_digest_kind().is_none_or(|k| k == "none") {
+            return None;
+        }
+        if let Some(kind) = meta.get("base_kind").and_then(Self::parse) {
+            return Some(kind);
+        }
+        if meta.get("base_git_tree").is_some() {
+            Some(BaseKind::Git)
+        } else if meta.get("base_weak_digest").is_some() {
+            Some(BaseKind::Directory)
+        } else if meta.get("base_size").is_some() || meta.get("base_local_path").is_some() {
+            Some(BaseKind::Archive)
+        } else if meta.base_url().is_some_and(|url| !url.is_empty()) {
+            Some(BaseKind::Remote)
+        } else {
+            // Nothing names the base: nothing to compare a kind with.
+            None
+        }
+    }
+}
+
 /// Result of [`compare_base_identity`].
 #[derive(Debug, Default)]
 pub struct BaseComparison {
@@ -1384,11 +1476,7 @@ pub fn compare_base_identity(
     if let Some(tree) = probe.git_tree {
         let current = format!("git-tree:{tree}");
         out.compared = recorded_tree.is_some();
-        if decidable
-            && (recorded_tree.is_some_and(|r| r != tree)
-                || recorded_weak.is_some()
-                || recorded_stamp.is_some())
-        {
+        if decidable && recorded_tree.is_some_and(|r| r != tree) {
             mismatch = Some(current.clone());
         }
         out.identity = current;
@@ -1412,7 +1500,7 @@ pub fn compare_base_identity(
         if decidable {
             let differs = match (recorded_weak, &out.weak) {
                 (Some(recorded), Some(now)) => recorded != now,
-                _ => recorded_stamp.is_some() || recorded_tree.is_some(),
+                _ => false,
             };
             if differs && !confirms(probe.supplied) {
                 mismatch = out.weak.clone().or_else(|| Some("a directory".into()));
@@ -1438,7 +1526,7 @@ pub fn compare_base_identity(
                 Some((size, mtime)) => {
                     stamp.size.to_string() != size || stamp.mtime_ns.to_string() != mtime
                 }
-                None => recorded_weak.is_some() || recorded_tree.is_some(),
+                None => false,
             };
             if differs && !confirms(probe.supplied) && !confirms(out.cached_digest.as_deref()) {
                 mismatch = Some(format!("size={},mtime_ns={}", stamp.size, stamp.mtime_ns));
@@ -1470,6 +1558,19 @@ pub fn compare_base_identity(
     if mismatch.is_none() && decidable && strong {
         if let Some(supplied) = probe.supplied.filter(|s| Some(*s) != recorded_digest) {
             mismatch = Some(supplied.to_owned());
+        }
+    }
+    // The one kind rule: a base of another kind than the recorded one is a
+    // different base, whatever else agrees. Compared with `==`, so a new kind
+    // cannot be skipped.
+    if mismatch.is_none() {
+        let actual = BaseKind::of_probe(probe);
+        if let Some(recorded) = meta.and_then(BaseKind::recorded).filter(|r| *r != actual) {
+            mismatch = Some(format!(
+                "a {} base (the overlay recorded a {} base)",
+                actual.as_str(),
+                recorded.as_str()
+            ));
         }
     }
     out.mismatch = mismatch;
@@ -1543,6 +1644,7 @@ pub fn forced_base_record(
             .map(|l| l.layer_digest.as_str())
             .collect::<Vec<_>>(),
     );
+    set("base_kind", BaseKind::of_probe(probe).as_str().to_owned());
     set("base_digest", digest);
     set("base_digest_kind", kind.to_owned());
     set("base_digest_source", source.to_owned());
@@ -1557,7 +1659,8 @@ pub fn forced_base_record(
 /// seal or pack replaces the record wholesale: rows of the previous base kind
 /// (an archive's stamp, a directory's walk, a Git tree, the old paths) must not
 /// survive to match the old base later.
-pub const BASE_COMPARISON_KEYS: [&str; 6] = [
+pub const BASE_COMPARISON_KEYS: [&str; 7] = [
+    "base_kind",
     "base_size",
     "base_mtime_ns",
     "base_local_path",
@@ -1760,6 +1863,98 @@ mod tests {
         );
     }
 
+    /// R5-1: the one kind rule over EVERY (recorded, actual) pair. Same kind is
+    /// no kind mismatch; any other pair is refused (and `forced_base_record`
+    /// then records the actual kind, so the next check agrees).
+    #[test]
+    fn regression_base_kind_table_every_pair() {
+        // Exhaustive: adding a `BaseKind` breaks this match until `ALL` and
+        // the fixtures below cover it.
+        for kind in BaseKind::ALL {
+            match kind {
+                BaseKind::Directory | BaseKind::Archive | BaseKind::Git | BaseKind::Remote => {}
+            }
+        }
+        assert_eq!(BaseKind::ALL.len(), 4);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), b"x").unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, b"bytes").unwrap();
+        let weak = directory_weak_digest(dir.path(), &BaseExcludes::default()).unwrap();
+        let stamp = ArchiveDigestStamp::read(&archive).unwrap();
+        let (size, mtime) = (stamp.size.to_string(), stamp.mtime_ns.to_string());
+        let probe_of = |kind: BaseKind| match kind {
+            BaseKind::Directory => probe(Some(dir.path()), None, None, None),
+            BaseKind::Archive => probe(Some(archive.as_path()), None, None, None),
+            BaseKind::Git => probe(None, Some("aaa"), None, None),
+            BaseKind::Remote => probe(None, None, None, None),
+        };
+        let record_of = |kind: BaseKind| {
+            let mut rows = vec![("base_kind", kind.as_str())];
+            match kind {
+                BaseKind::Directory => {
+                    rows.extend([
+                        ("base_digest_kind", "weak"),
+                        ("base_weak_digest", weak.as_str()),
+                    ]);
+                }
+                BaseKind::Archive => rows.extend([
+                    ("base_digest_kind", "weak"),
+                    ("base_size", size.as_str()),
+                    ("base_mtime_ns", mtime.as_str()),
+                ]),
+                BaseKind::Git => {
+                    rows.extend([("base_digest_kind", "git-tree"), ("base_git_tree", "aaa")])
+                }
+                BaseKind::Remote => rows.extend([
+                    ("base_digest_kind", "weak"),
+                    ("base_url", "http://example.invalid/b.tar"),
+                ]),
+            }
+            meta_with(&rows)
+        };
+        for recorded in BaseKind::ALL {
+            assert_eq!(BaseKind::recorded(&record_of(recorded)), Some(recorded));
+            for actual in BaseKind::ALL {
+                let meta = record_of(recorded);
+                let probe = probe_of(actual);
+                assert_eq!(BaseKind::of_probe(&probe), actual);
+                let out = compare_base_identity(Some(&meta), &probe).unwrap();
+                assert_eq!(
+                    out.mismatch.is_some(),
+                    recorded != actual,
+                    "recorded {recorded:?} vs actual {actual:?}: {:?}",
+                    out.mismatch
+                );
+                if recorded != actual {
+                    // Forced: the actual kind is recorded, and agrees next time.
+                    let forced = forced_base_record(&meta, &probe, &out);
+                    if let Ok(rows) = forced {
+                        assert_eq!(
+                            rows.get("base_kind").map(String::as_str),
+                            Some(actual.as_str())
+                        );
+                    } else {
+                        // Remote needs a supplied digest to record an identity.
+                        assert_eq!(actual, BaseKind::Remote);
+                    }
+                }
+            }
+        }
+        // Rows without a `base_kind` row (older overlays) derive the same kinds.
+        for kind in BaseKind::ALL {
+            let mut rows: Vec<(String, String)> = record_of(kind)
+                .values
+                .into_iter()
+                .filter(|(k, _)| k != "base_kind")
+                .collect();
+            rows.sort();
+            let refs: Vec<(&str, &str)> =
+                rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            assert_eq!(BaseKind::recorded(&meta_with(&refs)), Some(kind));
+        }
+    }
+
     /// Regression (R4-S3): a strong record with no stamp, manifest or tree (an
     /// overlay made over an HTTP base) was accepted over any unrelated local
     /// directory, archive or Git tree. Only the same strong digest, supplied or
@@ -1775,8 +1970,24 @@ mod tests {
         let record = meta_with(&[
             ("base_digest_kind", "strong"),
             ("base_digest", strong.as_str()),
+            ("base_kind", "remote"),
         ]);
+        // R5-1: a remote-kind record is never a local base, even if the same
+        // strong digest is supplied (kind change needs --force-base-mismatch).
         for path in [dir.path(), archive.as_path()] {
+            let ok =
+                compare_base_identity(Some(&record), &probe(Some(path), None, Some(&strong), None))
+                    .unwrap();
+            assert!(ok.mismatch.is_some(), "{path:?} remote record accepted");
+        }
+        // The same record taken over a directory / archive (kind row, no
+        // manifest or stamp) needs the digest to confirm.
+        for (path, kind) in [(dir.path(), "directory"), (archive.as_path(), "archive")] {
+            let record = meta_with(&[
+                ("base_digest_kind", "strong"),
+                ("base_digest", strong.as_str()),
+                ("base_kind", kind),
+            ]);
             let bad =
                 compare_base_identity(Some(&record), &probe(Some(path), None, None, None)).unwrap();
             assert!(bad.mismatch.is_some(), "{path:?} accepted unconfirmed");
@@ -1810,6 +2021,7 @@ mod tests {
             let mut rows = vec![
                 ("base_digest_kind", "strong"),
                 ("base_digest", strong.as_str()),
+                ("base_kind", "directory"),
             ];
             rows.extend_from_slice(extra);
             meta_with(&rows)
