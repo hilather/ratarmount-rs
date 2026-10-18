@@ -8,6 +8,9 @@ use std::sync::Arc;
 
 use ratarmount_compositing::{FolderMountSource, OverlayCreateInfo, WriteOverlay, HIDDEN_DB};
 
+#[path = "diff/cow.rs"]
+mod cow;
+
 fn command(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ratarmount"))
         .args(args)
@@ -38,16 +41,14 @@ fn fixture(root: &Path) -> (String, String) {
         },
     )
     .unwrap();
-    let fd = writer.create_file("/file", 0o644).unwrap();
-    writer.close_overlay_fd(fd);
-    fs::write(dir.join("file"), b"change\n").unwrap();
+    cow::cow_write(&writer, "/file", b"change\n");
     drop(writer);
     (base.to_str().unwrap().into(), dir.to_str().unwrap().into())
 }
 
 /// Regression: sealing must work through strict diff and the existing -w/--lower mount checks.
 #[test]
-fn regression_seal_cli_strict_diff_and_real_lower() {
+fn regression_cow_seal_cli_strict_diff_and_real_lower() {
     let tmp = tempfile::tempdir().unwrap();
     let (base, dir) = fixture(tmp.path());
     let text = expect(command(&["overlay", "seal", &dir, "--json"]), 0);
@@ -87,7 +88,7 @@ fn regression_seal_cli_strict_diff_and_real_lower() {
 
 /// Regression: verify must exit 1 naming altered content or the sentinel, without DB writes.
 #[test]
-fn regression_seal_cli_tamper_exit_one_names_path() {
+fn regression_cow_seal_cli_tamper_exit_one_names_path() {
     let tmp = tempfile::tempdir().unwrap();
     let (_, dir) = fixture(tmp.path());
     expect(command(&["overlay", "seal", &dir]), 0);

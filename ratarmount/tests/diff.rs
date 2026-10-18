@@ -8,6 +8,9 @@ use std::sync::Arc;
 use ratarmount_compositing::{FolderMountSource, WriteOverlay, HIDDEN_DB};
 use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
 
+#[path = "diff/cow.rs"]
+mod cow;
+
 fn run(overlay: &Path, base: Option<&Path>, flags: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
     cmd.arg("diff").arg(overlay);
@@ -15,6 +18,70 @@ fn run(overlay: &Path, base: Option<&Path>, flags: &[&str]) -> Output {
         cmd.arg("--base").arg(base);
     }
     cmd.args(flags).output().unwrap()
+}
+
+/// Regression: an existing file edited through the real COW path vanished from every diff mode.
+#[test]
+fn regression_cow_diff_name_manifest_hash_and_between() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("f"), b"base\n").unwrap();
+    let source = Arc::new(FolderMountSource::new(&base).unwrap());
+    let dir = tmp.path().join("cow");
+    let ov = WriteOverlay::new(source.clone(), &dir).unwrap();
+    cow::cow_write(&ov, "/f", b"changed\n");
+    drop(ov);
+    let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(conn);
+    let names = run(&dir, Some(&base), &["--name-status"]);
+    assert_eq!(names.status.code(), Some(1));
+    assert_eq!(names.stdout, b"M\tf\n");
+    let manifest = run(&dir, Some(&base), &["--manifest"]);
+    assert!(manifest.status.success());
+    let row: serde_json::Value = serde_json::from_slice(&manifest.stdout).unwrap();
+    assert_eq!(row["status"], "modified");
+    assert_eq!(row["path"], "f");
+    assert!(row["base_hash"].as_str().unwrap().starts_with("sha256:"));
+    let hash = run(&dir, Some(&base), &["--hash"]);
+    assert!(hash.status.success());
+    assert_ne!(
+        String::from_utf8_lossy(&hash.stdout).trim(),
+        ratarmount_compositing::overlay_changes::EMPTY_SHA256
+    );
+    let rowed = tmp.path().join("rowed");
+    let ov = WriteOverlay::new(source, &rowed).unwrap();
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    let mut file = unsafe { fs::File::from_raw_fd(ov.create_file("/f", 0o644).unwrap()) };
+    file.write_all(b"changed\n").unwrap();
+    ov.finish_owned_write_fd(file);
+    drop(ov);
+    assert_eq!(hash.stdout, run(&rowed, Some(&base), &["--hash"]).stdout);
+    let between = run(
+        &dir,
+        Some(&base),
+        &["--hash", "--between", rowed.to_str().unwrap()],
+    );
+    assert!(
+        between.status.success(),
+        "{}",
+        String::from_utf8_lossy(&between.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&between.stdout).trim(),
+        ratarmount_compositing::overlay_changes::EMPTY_SHA256
+    );
+    let manifest = run(&dir, None, &["--manifest"]);
+    assert!(manifest.status.success());
+    let row: serde_json::Value = serde_json::from_slice(&manifest.stdout).unwrap();
+    assert_eq!(row["status"], "written");
+    assert_eq!(row["path"], "f");
 }
 
 /// Regression: diff returns 0/1/2, does not create missing databases, and emits no progress on stdout.

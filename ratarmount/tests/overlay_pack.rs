@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 
 use ratarmount_compositing::{FolderMountSource, OverlayCreateInfo, WriteOverlay};
 
+#[path = "diff/cow.rs"]
+mod cow;
+
 fn command(args: &[&Path], cache: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ratarmount"))
         .env("XDG_CACHE_HOME", cache)
@@ -44,6 +47,8 @@ impl Fixture {
         let base = tmp.path().join("base");
         fs::create_dir(&base).unwrap();
         fs::write(base.join("deleted"), b"old").unwrap();
+        fs::write(base.join("payload"), b"original\n").unwrap();
+        fs::set_permissions(base.join("payload"), fs::Permissions::from_mode(0o751)).unwrap();
         let overlay = tmp.path().join("overlay");
         let source = Arc::new(FolderMountSource::new(&base).unwrap());
         let writer = WriteOverlay::new_with_create_info(
@@ -56,9 +61,7 @@ impl Fixture {
         )
         .unwrap();
         writer.unlink("/deleted").unwrap();
-        let fd = writer.create_file("/payload", 0o751).unwrap();
-        writer.close_overlay_fd(fd);
-        fs::write(overlay.join("payload"), b"bundle bytes\n").unwrap();
+        cow::cow_write(&writer, "/payload", b"bundle bytes\n");
         drop(writer);
         ratarmount_compositing::overlay_seal::seal(&overlay, source).unwrap();
         let bundle = tmp.path().join("bundle.tar.zst");
@@ -103,7 +106,7 @@ impl Drop for Fixture {
 /// Regression: pack/unpack and a bundle passed as --lower must work without a
 /// FUSE mount, keep the same seal, and reuse the digest cache across processes.
 #[test]
-fn regression_bundle_cli_roundtrip_and_lower_cache() {
+fn regression_cow_bundle_cli_roundtrip_and_lower_cache() {
     let f = Fixture::new();
     let restored = f.tmp.path().join("restored");
     let digest = expect(
@@ -262,11 +265,11 @@ impl Drop for Mount {
     }
 }
 
-/// Regression: a bundle must mount as an ordinary tar.zst showing its envelope,
-/// and as a lower showing the composed layer with tombstones applied.
+/// Regression: a COW bundle must mount as an ordinary tar.zst showing its envelope,
+/// and as a lower serving the edited payload with tombstones applied.
 #[test]
 #[cfg(target_os = "linux")]
-fn regression_fuse_bundle_direct_and_as_lower() {
+fn regression_cow_fuse_bundle_direct_and_as_lower() {
     if !Path::new("/dev/fuse").exists() {
         eprintln!("skip: /dev/fuse unavailable");
         return;

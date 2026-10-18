@@ -18,7 +18,7 @@ use ratarmount_session::factory;
 mod live;
 mod patch;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Debug, Parser)]
 #[command(name = "ratarmount diff", about = "Compare an overlay with its composed lower view (no mount required)",

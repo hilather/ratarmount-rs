@@ -6,17 +6,21 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use rusqlite::{params, Connection, OpenFlags};
-use rustix::fs::{self, AtFlags, Dir, Mode, OFlags, Stat};
+use rustix::fs::{self, AtFlags, Mode, OFlags, Stat};
 use serde::Serialize;
 
-use crate::{is_overlay_internal_path, OverlayError, OverlayMeta, HIDDEN_DB};
+use crate::overlay_changes::{internal_path, walk_host_entries};
+use crate::{OverlayError, OverlayMeta, HIDDEN_DB};
 
 /// Counts describe the initial check; `repaired` counts resolved findings, not
-/// SQL statements. A clean second check has all six category counts at zero.
+/// SQL statements. Unrowed host entries are normal COW content, not errors.
 #[derive(Debug, Default, Serialize)]
 pub struct FsckReport {
     pub missing_content: usize,
+    /// Compatibility field; always zero. See `unrowed` for host-only entries.
     pub orphan_content: usize,
+    /// Host entries without files rows, including implicit COW parent directories.
+    pub unrowed: usize,
     pub tombstone_content: usize,
     pub type_mismatch: usize,
     pub invalid_path: usize,
@@ -27,7 +31,6 @@ pub struct FsckReport {
 impl FsckReport {
     pub fn errors(&self) -> usize {
         self.missing_content
-            + self.orphan_content
             + self.tombstone_content
             + self.type_mismatch
             + self.invalid_path
@@ -78,15 +81,7 @@ fn relative_path(parent: &str, name: &str, metadata_only: bool) -> Option<String
         }
         format!("{parent}/{name}")
     };
-    (!internal(&path)).then_some(path)
-}
-
-fn internal(path: &str) -> bool {
-    is_overlay_internal_path(path)
-        || path.split('/').any(|part| {
-            part.eq_ignore_ascii_case(".ratarmount-sealed")
-                || part.to_ascii_lowercase().starts_with(".ratarmount-spool-")
-        })
+    (!internal_path(&path)).then_some(path)
 }
 
 fn directory_flags() -> OFlags {
@@ -108,36 +103,6 @@ fn open_directory(root: &OwnedFd, path: &str) -> io::Result<OwnedFd> {
         }
     }
     Ok(fd)
-}
-
-fn walk(fd: &OwnedFd, parent: &str, hosts: &mut BTreeMap<String, Stat>) -> io::Result<()> {
-    for entry in Dir::read_from(fd)? {
-        let entry = entry?;
-        let name = entry.file_name().to_str().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "overlay contains a non-UTF-8 name",
-            )
-        })?;
-        if name == "." || name == ".." {
-            continue;
-        }
-        let path = if parent.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{parent}/{name}")
-        };
-        if internal(&path) {
-            continue;
-        }
-        let stat = fs::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            let child = fs::openat(fd, name, directory_flags(), Mode::empty())?;
-            walk(&child, &path, hosts)?;
-        }
-        hosts.insert(path, stat);
-    }
-    Ok(())
 }
 
 fn split(path: &str) -> (&str, &str) {
@@ -255,7 +220,7 @@ pub(crate) fn check_connection(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(io::Error::other)?;
     let mut hosts = BTreeMap::new();
-    walk(root, "", &mut hosts)?;
+    walk_host_entries(root, "", &mut hosts)?;
     let mut report = FsckReport::default();
     let mut valid = BTreeMap::new();
     for row in &rows {
@@ -331,14 +296,10 @@ pub(crate) fn check_connection(
             report.missing_parent += 1;
         }
     }
-    for (path, stat) in &hosts {
-        if !valid.contains_key(path) && !hidden(path) {
-            report.orphan_content += 1;
-            if repair {
-                store_host(conn, path, stat)?;
-            }
-        }
-    }
+    report.unrowed = hosts
+        .keys()
+        .filter(|path| !valid.contains_key(*path) && !hidden(path))
+        .count();
     if repair {
         // Reverse lexical order puts descendants before their parents. Never
         // join a DB path to a host path or follow a symlink during removal.
@@ -395,10 +356,45 @@ mod tests {
         Connection::open(dir.join(HIDDEN_DB)).unwrap()
     }
 
-    /// Regression: killed writers leave host-only files, stale rows, and tombstone content.
+    /// Regression: normal COW content was an orphan error and repair invented files rows.
+    #[test]
+    fn regression_cow_fsck_clean_and_repair_preserves_unrowed_content() {
+        let (tmp, dir, source) = fixture();
+        host::create_dir(tmp.path().join("base/lib")).unwrap();
+        host::write(tmp.path().join("base/lib/f"), b"base").unwrap();
+        let ov = WriteOverlay::new(source.clone(), &dir).unwrap();
+        crate::overlay_changes::cow_write(&ov, "/lib/f", b"changed");
+        drop(ov);
+        for repair in [false, true] {
+            let report = fsck(&dir, repair).unwrap();
+            assert!(report.is_clean());
+            assert_eq!(report.result(), "ok");
+            assert_eq!(
+                (report.unrowed, report.orphan_content, report.repaired),
+                (2, 0, 0)
+            );
+            assert_eq!(
+                db(&dir)
+                    .query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        host::write(dir.join("lib/.ratarmount.overlay.cow-killed"), b"partial").unwrap();
+        assert!(fsck(&dir, true).unwrap().is_clean());
+        drop(WriteOverlay::new(source, &dir).unwrap());
+        assert!(!dir.join("lib/.ratarmount.overlay.cow-killed").exists());
+        assert_eq!(host::read(dir.join("lib/f")).unwrap(), b"changed");
+    }
+
+    /// Regression: killed writers leave stale rows and tombstone content; host-only COW is valid.
     #[test]
     fn regression_fsck_killed_writer_reports_and_repairs_each_category() {
-        let (_tmp, dir, _source) = fixture();
+        let (tmp, dir, source) = fixture();
+        host::write(tmp.path().join("base/cow"), b"base").unwrap();
+        let ov = WriteOverlay::new(source, &dir).unwrap();
+        crate::overlay_changes::cow_write(&ov, "/cow", b"changed");
+        drop(ov);
         let conn = db(&dir);
         conn.execute_batch(
             "INSERT INTO files(path,name,mode,deleted) VALUES
@@ -407,8 +403,8 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        // Crash after publishing the host file, before pending_rows reaches SQLite.
-        host::write(dir.join("orphan"), b"killed writer").unwrap();
+        // A crash during copy-up can leave staging files, which remain internal.
+        host::write(dir.join(".ratarmount.overlay.cow-killed"), b"partial").unwrap();
         host::write(dir.join("deleted"), b"must go").unwrap();
         host::write(dir.join("wrong-type"), b"file, not directory").unwrap();
         let report = fsck(&dir, false).unwrap();
@@ -421,31 +417,26 @@ mod tests {
                 report.invalid_path,
                 report.missing_parent
             ),
-            (1, 1, 1, 1, 1, 0)
+            (1, 0, 1, 1, 1, 0)
         );
-        assert_eq!(report.result(), "errors:5");
+        assert_eq!(report.result(), "errors:4");
         assert_eq!(
             OverlayMeta::read(&dir).unwrap().unwrap().get("fsck_result"),
-            Some("errors:5")
+            Some("errors:4")
         );
         let report = fsck(&dir, true).unwrap();
         assert!(report.is_clean());
-        assert_eq!(report.result(), "repaired:5");
+        assert_eq!(report.result(), "repaired:4");
         assert!(!dir.join("deleted").exists());
-        let stat = host::symlink_metadata(dir.join("orphan")).unwrap();
-        use std::os::unix::fs::MetadataExt;
-        let stored: (u32, f64, u32, u32) = db(&dir)
-            .query_row(
-                "SELECT mode,mtime,uid,gid FROM files WHERE name='orphan'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(stored.0, stat.mode());
-        assert!(
-            (stored.1 - (stat.mtime() as f64 + stat.mtime_nsec() as f64 / 1e9)).abs() < 0.000001
+        assert_eq!(report.unrowed, 1);
+        assert_eq!(host::read(dir.join("cow")).unwrap(), b"changed");
+        assert_eq!(
+            db(&dir)
+                .query_row("SELECT count(*) FROM files WHERE name='cow'", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
-        assert_eq!((stored.2, stored.3), (stat.uid(), stat.gid()));
         assert_eq!(fsck(&dir, false).unwrap().errors(), 0);
     }
 
@@ -535,10 +526,11 @@ mod tests {
             .unwrap();
         // A tombstone below what is now a symlink is stale but harmless; it is
         // not an error, and repair never traverses the link.
-        // (The fixture's link has no row, so it is a genuine orphan.)
+        // The link has no row, just like a normal COW host entry.
         let report = fsck(&dir, false).unwrap();
         assert_eq!((report.missing_parent, report.tombstone_content), (0, 0));
-        assert_eq!(report.orphan_content, 1);
+        assert_eq!(report.orphan_content, 0);
+        assert_eq!(report.unrowed, 1);
         fsck(&dir, true).unwrap();
         assert!(fsck(&dir, false).unwrap().is_clean());
         assert_eq!(host::read(outside.join("keep")).unwrap(), b"safe");
@@ -640,7 +632,7 @@ mod tests {
         );
     }
 
-    /// Regression: 10k recovered files must not require a directory walk for every row.
+    /// Regression: 10k host-only files need no invented rows or repeated directory walks.
     #[test]
     fn regression_fsck_ten_thousand_rows_single_scan() {
         let (_tmp, dir, _source) = fixture();
@@ -648,7 +640,15 @@ mod tests {
             host::write(dir.join(format!("file-{i}")), []).unwrap();
         }
         let start = std::time::Instant::now();
-        assert_eq!(fsck(&dir, true).unwrap().repaired, 10_000);
+        let report = fsck(&dir, true).unwrap();
+        assert_eq!(report.repaired, 0);
+        assert_eq!(report.unrowed, 10_000);
+        assert_eq!(
+            db(&dir)
+                .query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert!(fsck(&dir, false).unwrap().is_clean());
         assert!(
             start.elapsed() < std::time::Duration::from_secs(15),

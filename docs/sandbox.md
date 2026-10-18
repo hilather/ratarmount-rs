@@ -331,16 +331,23 @@ ratarmount overlay fsck attempt --repair
 
 Run this after unmounting, especially after a writer was killed before its
 pending database rows were saved. The checker makes one directory walk and one
-`files` scan. Reports contain `missing_content`, `orphan_content`,
+`files` scan. Reports contain `missing_content`, `unrowed`, `orphan_content`,
 `tombstone_content`, `type_mismatch`, `invalid_path`, `missing_parent`,
 `repaired`, and `result`. Category counts describe the state before repair;
 `repaired` counts resolved findings. Exit codes are 0 for clean or repaired,
 1 for unrepaired inconsistencies, and 2 for an operational error.
 
-Repair removes rows whose content disappeared, inserts orphan entries using
-host mode/mtime/uid/gid, corrects type mismatches, removes content under
-tombstones, and drops malformed path rows. Missing parents of tombstones are
-created where safe. Removal uses directory-relative, no-follow operations;
+Host entries without a `files` row are normal: copy-on-write edits of existing
+base or lower-layer files publish host content without inserting a row. Their
+count, including implicit parent directories, is informational (`unrowed`);
+the compatibility field `orphan_content`
+is always 0 and does not contribute to errors. Repair does not invent rows for
+these entries.
+
+Repair removes rows whose content disappeared, corrects type mismatches,
+removes content under tombstones, and drops malformed path rows. Only present
+rows require host parents; tombstones need none, and repair never creates
+directories for them. Removal uses directory-relative, no-follow operations;
 symlinks are entries, never traversal paths. Repair does not delete an external
 file named by a corrupt row. Invalid host UTF-8 names are reported as an error.
 Database files, overlay markers, COW/spool staging files and `.ratarmount-sealed`
@@ -489,9 +496,14 @@ comparisons require a base. `-o FILE` writes output to a file. Source-opening
 progress and warnings go to stderr. Output is withheld until rendering succeeds,
 so a limit failure does not publish a partial patch or truncate an existing output.
 
-The change set comes from `files` and metadata-only `overlay_metadata` mentions,
-resolved through the same read-only overlay layers as a mount. Orphan host files
-without a database mention do not enter an offline diff. Unchanged copy-ups,
+The change set comes from host entries together with `files` rows and
+metadata-only `overlay_metadata` mentions, resolved through the same read-only
+overlay layers as a mount. Copy-on-write edits enter diff, manifest, hash and
+seal even without a database row. The host walk never follows symlinks and
+skips overlay bookkeeping, COW/spool staging files, the seal sentinel and the
+in-use marker. Exclusions apply before any content read. Implicit host parent
+directories with the same mode as the lower view are unchanged; a host directory
+absent from the lower view is added. Unchanged copy-ups,
 write-then-revert and tombstones of nonexistent lower paths are omitted. Empty
 directories appear as `"type":"dir"` in the manifest; Git patches cannot create
 empty directories or preserve directory modes. Symlinks are target strings,

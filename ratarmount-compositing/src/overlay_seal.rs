@@ -12,10 +12,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use rustix::fs::{self as host, AtFlags, Dir, Mode, OFlags};
 
 use crate::overlay_changes::{self as changes, ChangeOptions};
-use crate::{
-    is_overlay_internal_path, Immutability, OverlayError, OverlayMeta, ReadOnlyOverlayLayer,
-    HIDDEN_DB,
-};
+use crate::{Immutability, OverlayError, OverlayMeta, ReadOnlyOverlayLayer, HIDDEN_DB};
 
 const SENTINEL: &str = ".ratarmount-sealed";
 const SEAL_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS seal_rows (path TEXT PRIMARY KEY, row_hash TEXT NOT NULL);
@@ -87,25 +84,9 @@ fn connection(dir: &Path, immutable: bool) -> io::Result<Connection> {
 // The directory FDs and no-follow opens keep chmod confined to the tree, even
 // for dangling links or links to a directory outside it. No symlink is chmodded.
 fn walk_modes(fd: &OwnedFd, parent: &str, modes: &mut BTreeMap<String, u32>) -> io::Result<()> {
-    for entry in Dir::read_from(fd)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
-            continue;
-        }
-        let name = name
-            .to_str()
-            .map_err(|_| io::Error::other("overlay contains a non-UTF-8 name"))?;
-        let path = if parent.is_empty() {
-            name.into()
-        } else {
-            format!("{parent}/{name}")
-        };
-        let stat = host::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            let child = host::openat(fd, name, directory_flags(), Mode::empty())?;
-            walk_modes(&child, &path, modes)?;
-        }
+    let mut hosts = BTreeMap::new();
+    changes::walk_host_entries(fd, parent, &mut hosts)?;
+    for (path, stat) in hosts {
         // mode_t is u16 on macOS, u32 on Linux.
         #[allow(clippy::unnecessary_cast)]
         modes.insert(path, stat.st_mode as u32);
@@ -165,10 +146,8 @@ fn digest_rows(
     dir: &Path,
     lower: Arc<dyn MountSource>,
     immutable: bool,
-    hosts: &BTreeMap<String, u32>,
 ) -> io::Result<(String, BTreeMap<String, String>)> {
-    // Include unindexed host entries so verification detects out-of-band additions.
-    let mut paths = changes::mentioned_paths_with_immutability(
+    let paths = changes::mentioned_paths_with_immutability(
         dir,
         if immutable {
             Immutability::Immutable
@@ -176,12 +155,6 @@ fn digest_rows(
             Immutability::Shared
         },
     )?;
-    paths.extend(
-        hosts
-            .keys()
-            .filter(|p| !is_overlay_internal_path(p))
-            .cloned(),
-    );
     let top = Arc::new(ReadOnlyOverlayLayer::new(
         lower.clone(),
         dir,
@@ -239,10 +212,10 @@ pub fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutc
     }
     let mut modes = BTreeMap::new();
     walk_modes(&root, "", &mut modes)?;
-    let (layer_digest, rows) = digest_rows(dir, lower_view, false, &modes)?;
+    let (layer_digest, rows) = digest_rows(dir, lower_view, false)?;
     let sealed_at = chrono::Utc::now().to_rfc3339();
     conn.execute_batch(SEAL_SCHEMA).map_err(sql_error)?;
-    for (path, mode) in modes.iter().filter(|(p, _)| !is_overlay_internal_path(p)) {
+    for (path, mode) in &modes {
         conn.execute(
             "INSERT INTO overlay_metadata(path,mode) VALUES (?1,?2)
             ON CONFLICT(path) DO UPDATE SET mode=COALESCE(overlay_metadata.mode,excluded.mode)",
@@ -333,9 +306,7 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         .map_err(sql_error)?
         .collect::<rusqlite::Result<BTreeMap<_, _>>>()
         .map_err(sql_error)?;
-    let mut modes = BTreeMap::new();
-    walk_modes(&root, "", &mut modes)?;
-    let (computed, current) = digest_rows(dir, lower_view, true, &modes)?;
+    let (computed, current) = digest_rows(dir, lower_view, true)?;
     let paths: BTreeSet<_> = rows.keys().chain(current.keys()).collect();
     let mismatched: Vec<_> = paths
         .into_iter()
@@ -445,6 +416,80 @@ mod tests {
         result
     }
 
+    /// Regression: seal refused COW payloads, lost their modes, or failed to detect tampering.
+    #[test]
+    fn regression_cow_seal_pins_modes_and_detects_tampering() {
+        let f = Fixture::new();
+        let base_dir = f._tmp.path().join("base/sub");
+        fs::create_dir(&base_dir).unwrap();
+        fs::write(base_dir.join("cow"), b"base bytes").unwrap();
+        fs::set_permissions(base_dir.join("cow"), fs::Permissions::from_mode(0o751)).unwrap();
+        let writer = WriteOverlay::new(f.base.clone(), &f.dir).unwrap();
+        changes::cow_write(&writer, "/sub/cow", b"changed\n");
+        let before = visible(&writer);
+        drop(writer);
+        assert_eq!(
+            connection(&f.dir, false)
+                .unwrap()
+                .query_row("SELECT count(*) FROM files WHERE name='cow'", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(crate::overlay_fsck::fsck(&f.dir, false).unwrap().is_clean());
+        let expected = changes::canonical_hash(
+            &changes::change_set(&f.dir, f.base.clone(), &options()).unwrap(),
+            &options(),
+        )
+        .unwrap();
+        // Staging payloads must not acquire pinned modes or enter the seal hash.
+        fs::write(f.dir.join("sub/.ratarmount-spool-test"), b"partial").unwrap();
+        let sealed = seal(&f.dir, f.base.clone()).unwrap();
+        assert_eq!(sealed.layer_digest, expected);
+        let layer =
+            ReadOnlyOverlayLayer::new(f.base.clone(), &f.dir, Immutability::Immutable).unwrap();
+        assert_eq!(layer.lookup("/sub/cow", 0).unwrap().mode, 0o100751);
+        // The staging name is outside the public change set; omit it from this listing comparison.
+        let mut after = visible(&layer);
+        after.retain(|(path, _)| !path.ends_with(".ratarmount-spool-test"));
+        assert_eq!(after, before);
+        let conn = connection(&f.dir, true).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT mode FROM overlay_metadata WHERE path='/sub/cow'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0o751
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM overlay_metadata WHERE path LIKE '%spool%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM seal_rows WHERE path='sub/cow'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        drop(conn);
+        assert!(verify(&f.dir, f.base.clone()).unwrap().ok);
+        fs::set_permissions(f.dir.join("sub/cow"), fs::Permissions::from_mode(0o751)).unwrap();
+        fs::write(f.dir.join("sub/cow"), b"tampered\n").unwrap();
+        let report = verify(&f.dir, f.base.clone()).unwrap();
+        assert!(!report.ok);
+        assert_eq!(report.mismatched, ["sub/cow"]);
+    }
+
     /// Regression: chmod -w changed lookup and readdir modes, and leaked the sentinel.
     #[test]
     fn regression_seal_preserves_lookup_and_listing_modes() {
@@ -547,7 +592,7 @@ mod tests {
                 .contains("in use by another ratarmount process"));
         }
         drop(writer);
-        fs::write(f.dir.join("orphan"), b"unindexed").unwrap();
+        fs::remove_file(f.dir.join("plain")).unwrap();
         assert!(seal(&f.dir, f.base.clone())
             .unwrap_err()
             .to_string()

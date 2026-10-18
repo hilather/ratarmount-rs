@@ -8,6 +8,9 @@ use std::sync::Arc;
 
 use ratarmount_compositing::{FolderMountSource, OverlayCreateInfo, OverlayMeta, WriteOverlay};
 
+#[path = "diff/cow.rs"]
+mod cow;
+
 fn import(base: &Path, dest: &Path, patch: &[u8], flags: &[&str]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
         .args(["overlay", "import", "--json"])
@@ -22,6 +25,105 @@ fn import(base: &Path, dest: &Path, patch: &[u8], flags: &[&str]) -> Output {
         .unwrap();
     child.stdin.take().unwrap().write_all(patch).unwrap();
     child.wait_with_output().unwrap()
+}
+
+/// Regression: COW edits of base files and prepared build outputs must survive diff/import/hash.
+#[test]
+fn regression_cow_git_import_hash_roundtrip_base_and_lower() {
+    use ratarmount_compositing::{compose_stack, Immutability};
+    use ratarmount_core::MountSource;
+    for layered in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        fs::create_dir_all(base.join("lib")).unwrap();
+        fs::write(base.join("lib/Foo.pm"), b"source\n").unwrap();
+        let source: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base).unwrap());
+        let prepared = root.path().join("prepared");
+        let lower = if layered {
+            let ov = WriteOverlay::new(source.clone(), &prepared).unwrap();
+            ov.mkdir("/blib", 0o755).unwrap();
+            use std::os::fd::FromRawFd;
+            let mut file =
+                unsafe { fs::File::from_raw_fd(ov.create_file("/blib/x", 0o644).unwrap()) };
+            file.write_all(b"built\n").unwrap();
+            ov.finish_owned_write_fd(file);
+            drop(ov);
+            ratarmount_compositing::overlay_seal::seal(&prepared, source.clone()).unwrap();
+            compose_stack(
+                source.clone(),
+                &[(prepared.clone(), Immutability::Immutable)],
+            )
+            .unwrap()
+        } else {
+            source
+        };
+        let attempt = root.path().join("attempt");
+        let ov = WriteOverlay::new(lower, &attempt).unwrap();
+        cow::cow_write(&ov, "/lib/Foo.pm", b"edited\n");
+        if layered {
+            cow::cow_write(&ov, "/blib/x", b"rebuilt\n");
+        }
+        drop(ov);
+        let conn =
+            rusqlite::Connection::open(attempt.join(ratarmount_compositing::HIDDEN_DB)).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(conn);
+        let flags = if layered {
+            vec!["--lower", prepared.to_str().unwrap()]
+        } else {
+            vec![]
+        };
+        let diff = |dir: &Path, mode: &str| {
+            Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+                .arg("diff")
+                .arg(dir)
+                .arg(&base)
+                .arg(mode)
+                .args(&flags)
+                .output()
+                .unwrap()
+        };
+        let names = diff(&attempt, "--name-status");
+        assert_eq!(
+            names.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&names.stderr)
+        );
+        assert_eq!(
+            names.stdout,
+            if layered {
+                b"M\tblib/x\nM\tlib/Foo.pm\n".as_slice()
+            } else {
+                b"M\tlib/Foo.pm\n"
+            }
+        );
+        let patch = diff(&attempt, "--git");
+        assert_eq!(patch.status.code(), Some(1));
+        let dest = root.path().join("imported");
+        let result = import(&base, &dest, &patch.stdout, &flags);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let original = diff(&attempt, "--hash");
+        let imported = diff(&dest, "--hash");
+        assert!(original.status.success() && imported.status.success());
+        assert_eq!(original.stdout, imported.stdout);
+        assert_ne!(
+            String::from_utf8_lossy(&original.stdout).trim(),
+            ratarmount_compositing::overlay_changes::EMPTY_SHA256
+        );
+        ratarmount_compositing::overlay_seal::unseal(&dest).unwrap();
+        if layered {
+            ratarmount_compositing::overlay_seal::unseal(&prepared).unwrap();
+        }
+    }
 }
 
 /// Regression: stdin must remain byte-oriented and JSON must be the only stdout.
@@ -117,11 +219,7 @@ fn regression_import_lower_stack_identity_and_unsealed_opt_in() {
         },
     )
     .unwrap();
-    let fd = ov.create_file("/a", 0o644).unwrap();
-    use std::os::fd::FromRawFd;
-    let mut file = unsafe { fs::File::from_raw_fd(fd) };
-    file.write_all(b"prepared\n").unwrap();
-    ov.finish_owned_write_fd(file);
+    cow::cow_write(&ov, "/a", b"prepared\n");
     drop(ov);
     let patch = b"--- a/a\n+++ b/a\n@@ -1 +1 @@\n-prepared\n+attempt\n";
     let fail = root.path().join("fail");

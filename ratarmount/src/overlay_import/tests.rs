@@ -4,6 +4,8 @@ use ratarmount_compositing::{Immutability, OverlayMeta, ReadOnlyOverlayLayer};
 use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
 use std::io::Write;
 
+use crate::diff::tests::cow;
+
 struct Fixture {
     temp: tempfile::TempDir,
     base: PathBuf,
@@ -127,7 +129,7 @@ fn roundtrip(case: &str) {
     let ov = WriteOverlay::new(f.source.clone(), &a).unwrap();
     match case {
         "added" => put(&ov, "/new", b"added\n", 0o644),
-        "modified" => put(&ov, "/a", b"one\nchanged\nthree\n", 0o644),
+        "modified" => cow::cow_write(&ov, "/a", b"one\nchanged\nthree\n"),
         "deleted" => ov.unlink("/delete").unwrap(),
         "type_changed" => {
             ov.unlink("/type").unwrap();
@@ -152,7 +154,7 @@ fn roundtrip(case: &str) {
                 },
             )
             .unwrap(),
-        "binary" => put(&ov, "/binary", b"\x00new\xffbinary\x01\x02", 0o644),
+        "binary" => cow::cow_write(&ov, "/binary", b"\x00new\xffbinary\x01\x02"),
         "binary_added" => put(&ov, "/new-bin", b"\x00binary added", 0o644),
         "binary_deleted" => ov.unlink("/binary").unwrap(),
         "nested" => {
@@ -160,9 +162,9 @@ fn roundtrip(case: &str) {
             ov.mkdir("/new-dir/sub", 0o755).unwrap();
             put(&ov, "/new-dir/sub/file", b"nested\n", 0o644);
         }
-        "crlf" => put(&ov, "/crlf", b"new\r\nsecond\r\n", 0o644),
-        "no_newline" => put(&ov, "/no-newline", b"new", 0o644),
-        "latin1" => put(&ov, "/latin", b"caf\xe9, d\xe9j\xe0 vu\n", 0o644),
+        "crlf" => cow::cow_write(&ov, "/crlf", b"new\r\nsecond\r\n"),
+        "no_newline" => cow::cow_write(&ov, "/no-newline", b"new"),
+        "latin1" => cow::cow_write(&ov, "/latin", b"caf\xe9, d\xe9j\xe0 vu\n"),
         "quoted" => put(&ov, "/caf\u{e9}\t\"\\.txt", b"quoted\n", 0o644),
         "empty_dir" => ov.mkdir("/empty-dir", 0o755).unwrap(),
         _ => unreachable!(),
