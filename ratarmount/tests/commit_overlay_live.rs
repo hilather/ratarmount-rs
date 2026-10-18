@@ -676,6 +676,7 @@ fn create_missing_existing_targz_zip_unchanged() {
         return;
     };
     let before_gz = fs::read(&gz).unwrap();
+    let ov = dir.path().join("ov-gzip");
     let out = Command::new(bin())
         .args(["-w"])
         .arg(&ov)

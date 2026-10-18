@@ -38,6 +38,7 @@ mod corpus;
 mod diff;
 mod export_index;
 mod find;
+mod overlay_cmd;
 mod overlay_commit;
 mod overlay_stats;
 mod publish_index;
@@ -492,6 +493,19 @@ struct Args {
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
 
+    /// Trust a known sha256:<hex> base digest, or skip hashing with none (warns).
+    #[arg(
+        long,
+        value_name = "sha256:HEX|none",
+        requires = "overlay_target",
+        conflicts_with = "commit_overlay"
+    )]
+    base_digest: Option<ratarmount_compositing::BaseDigestRequest>,
+
+    /// Allow a changed base on remount and record the override in overlay metadata.
+    #[arg(long, requires = "overlay_target", conflicts_with = "commit_overlay")]
+    force_base_mismatch: bool,
+
     /// Container-friendly ownership, allow_other/noatime, and a throwaway RAM overlay.
     #[arg(long)]
     sandbox: bool,
@@ -518,6 +532,9 @@ struct Args {
 
     #[arg(skip)]
     overlay_stats: Option<overlay_stats::StatsArgs>,
+
+    #[arg(skip)]
+    overlay: Option<overlay_cmd::OverlayArgs>,
 
     #[arg(skip)]
     diff: Option<diff::DiffArgs>,
@@ -729,6 +746,15 @@ where
         } else {
             args.export_index = Some(export_index::ExportArgs::try_parse_from(argv)?);
         }
+        return Ok(args);
+    }
+    if raw.get(1).is_some_and(|s| s == "overlay") {
+        let overlay = overlay_cmd::OverlayArgs::try_parse_from(
+            std::iter::once(OsString::from("ratarmount overlay"))
+                .chain(raw.iter().skip(2).cloned()),
+        )?;
+        let mut args = Args::try_parse_from(&raw[..1])?;
+        args.overlay = Some(overlay);
         return Ok(args);
     }
     if raw.get(1).is_some_and(|s| s == "overlay-stats") {
@@ -1217,6 +1243,16 @@ fn main() {
         return;
     }
 
+    if let Some(overlay) = &args.overlay {
+        match overlay_cmd::run(overlay) {
+            Ok(output) => println!("{}", output.trim_end()),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if let Some(stats) = &args.overlay_stats {
         match overlay_stats::run(stats) {
             Ok(output) => println!("{}", output.trim_end()),
@@ -1367,7 +1403,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    let (source_paths, mountpoint) = split_bound_inputs_mountpoint(&args);
+    let (mut source_paths, mountpoint) = split_bound_inputs_mountpoint(&args);
     // Metadata labels also include bound sources; factory gets positional paths
     // separately so every explicit bind is opened exactly once.
     let mut inputs = source_paths.clone();
@@ -1376,6 +1412,10 @@ fn main() {
             .iter()
             .map(|bind| PathBuf::from(&bind.source)),
     );
+    let overlay_base_url = inputs
+        .first()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let publishing = args.publish_index || args.publish_index_to.is_some();
     let live_hf_pr = !publishing
         && overlay_commit::live_hf_create_pr(
@@ -1624,6 +1664,14 @@ fn main() {
             }
         }
     }
+    let overlay_git_tree = if args.write_overlay.is_some() && args.source_binds.is_empty() {
+        overlay_cmd::pin_git_base(&mut source_paths, &mut open_opts).unwrap_or_else(|error| {
+            eprintln!("error resolving overlay base: {error}");
+            std::process::exit(1);
+        })
+    } else {
+        None
+    };
     let mut bundle = match factory::build_mount_source_with_bindings(
         if args.corpus_list.is_some() || rolling.is_some() {
             &[]
@@ -1796,7 +1844,44 @@ fn main() {
         } else {
             w.clone()
         };
-        match WriteOverlay::new(Arc::clone(&bundle.source), &overlay_path) {
+        let mut create_info = ratarmount_compositing::OverlayCreateInfo {
+            base_url: overlay_base_url,
+            base_digest: args.base_digest.clone().unwrap_or_default(),
+            force_base_mismatch: args.force_base_mismatch,
+            index_path: (!open_opts.read_only_index)
+                .then(|| index_sidecar.clone())
+                .flatten(),
+            git_tree: overlay_git_tree,
+            ..Default::default()
+        };
+        if create_info.base_digest == ratarmount_compositing::BaseDigestRequest::None {
+            eprintln!(
+                "warning: --base-digest none disables base identity verification for new overlays"
+            );
+        }
+        if inputs.len() > 1 || !args.source_binds.is_empty() {
+            create_info.remote_token = Some(serde_json::to_string(&inputs).expect("input paths"));
+        } else if create_info.base_digest == ratarmount_compositing::BaseDigestRequest::Compute
+            && !overlay_path.join(HIDDEN_DB).exists()
+            && ratarmount_remote::is_remote_url(&create_info.base_url)
+        {
+            create_info.remote_token = Some(
+                overlay_cmd::remote_base_token(&create_info.base_url)
+                    .unwrap_or_else(|| format!("url:{}", create_info.base_url)),
+            );
+        }
+        if inputs.len() == 1
+            && args.source_binds.is_empty()
+            && create_info.git_tree.is_none()
+            && !ratarmount_remote::is_remote_url(&create_info.base_url)
+        {
+            create_info.local_path = Some(inputs[0].clone());
+        }
+        match WriteOverlay::new_with_create_info(
+            Arc::clone(&bundle.source),
+            &overlay_path,
+            &create_info,
+        ) {
             Ok(mut ov) => {
                 if let Some(series) = &rolling {
                     ov.set_rolling(series.clone());
@@ -5414,7 +5499,8 @@ mod create_missing_cli_tests {
         if skip_no_bin() {
             return;
         }
-        let ov = dir.path().join("ov");
+        // This is a different base from the ZIP above; give it its own identity.
+        let ov = dir.path().join("ov-gz");
         let out = run_cli(
             &[
                 "-w",

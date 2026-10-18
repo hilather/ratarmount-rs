@@ -164,6 +164,10 @@ CREATE TABLE IF NOT EXISTS xattrs (
     value BLOB,
     PRIMARY KEY (path, name)
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 /// Optional metadata changes. Missing times mean UTIME_OMIT; frontends resolve
@@ -954,7 +958,25 @@ impl WriteOverlay {
     }
 
     pub fn new(base: Arc<dyn MountSource>, overlay: impl AsRef<Path>) -> Result<Self> {
-        let root = overlay.as_ref().to_path_buf();
+        Self::open_with_create_info(base, overlay.as_ref(), None)
+    }
+
+    /// Open with the original base identity. Existing overlays are verified
+    /// cheaply; only newly created overlays compute a content digest.
+    pub fn new_with_create_info(
+        base: Arc<dyn MountSource>,
+        overlay: impl AsRef<Path>,
+        info: &crate::OverlayCreateInfo,
+    ) -> Result<Self> {
+        Self::open_with_create_info(base, overlay.as_ref(), Some(info))
+    }
+
+    fn open_with_create_info(
+        base: Arc<dyn MountSource>,
+        overlay: &Path,
+        info: Option<&crate::OverlayCreateInfo>,
+    ) -> Result<Self> {
+        let root = overlay.to_path_buf();
         if root.exists() {
             if !root.is_dir() {
                 return Err(OverlayError::Msg(format!(
@@ -1067,11 +1089,15 @@ impl WriteOverlay {
                 }
             }
         }
-        let opened = conn
-            .execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")
-            .and_then(|_| conn.execute_batch(SCHEMA))
-            .and_then(|_| tombstone_set_from_conn(&conn))
-            .map_err(OverlayError::from);
+        let opened = (|| -> Result<HashSet<String>> {
+            conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
+            let transaction = conn.transaction()?;
+            transaction.execute_batch(SCHEMA)?;
+            crate::overlay_meta::initialize(&transaction, had_files, info, &root)?;
+            let tombstones = tombstone_set_from_conn(&transaction)?;
+            transaction.commit()?;
+            Ok(tombstones)
+        })();
         let mut tombstones = match opened {
             Ok(t) => t,
             Err(e) => {
@@ -4039,6 +4065,15 @@ impl WriteOverlay {
             }
         };
         if !self.remote_enabled() {
+            if let Err(error) = crate::overlay_meta::refresh_committed_base(
+                &self.db.lock().expect("overlay db"),
+                archive,
+            ) {
+                self.refuse_base_after_commit_failure();
+                return Err(OverlayError::Msg(format!(
+                    "archive committed; baseline refresh failed (remount required): {error}"
+                )));
+            }
             if let Some(hashes) = &self.manifest_hashes {
                 if let Err(e) = write_commit_manifest(
                     archive,
@@ -6182,6 +6217,7 @@ pub fn commit_overlay(
             opts.mode,
             hash_payloads.then_some(&mut written_hashes),
         )?;
+        crate::overlay_meta::refresh_committed_base_offline(write_overlay, archive_file)?;
         plan.written_hashes = written_hashes;
         let patch_opts = OpenOptions {
             encoding: opts.encoding.clone(),
@@ -6195,12 +6231,13 @@ pub fn commit_overlay(
         }
         return Ok(true);
     }
-    if is_zip_archive(archive_file)? {
-        return commit_overlay_zip(write_overlay, archive_file, opts);
-    }
-
-    let committed = commit_overlay_tar(write_overlay, archive_file, opts)?;
+    let committed = if is_zip_archive(archive_file)? {
+        commit_overlay_zip(write_overlay, archive_file, opts)?
+    } else {
+        commit_overlay_tar(write_overlay, archive_file, opts)?
+    };
     if committed {
+        crate::overlay_meta::refresh_committed_base_offline(write_overlay, archive_file)?;
         if let Some(hashes) = &opts.manifest_hashes {
             write_commit_manifest(archive_file, &plan, &opts.encoding, hashes)?;
         }
@@ -9137,6 +9174,161 @@ mod tests {
             zw.write_all(data).unwrap();
         }
         zw.finish().unwrap();
+    }
+
+    fn assert_committed_baseline(overlay: &Path, archive: &Path, info: &crate::OverlayCreateInfo) {
+        let meta = crate::OverlayMeta::read(overlay).unwrap().unwrap();
+        let stamp = ratarmount_index::ArchiveDigestStamp::read(archive).unwrap();
+        let digest = format!(
+            "sha256:{}",
+            ratarmount_index::sha256_hex(&fs::read(archive).unwrap())
+        );
+        assert_eq!(meta.base_digest(), Some(digest.as_str()));
+        assert_eq!(meta.base_digest_kind(), Some("strong"));
+        assert_eq!(meta.get("base_size"), Some(stamp.size.to_string().as_str()));
+        assert_eq!(
+            meta.get("base_mtime_ns"),
+            Some(stamp.mtime_ns.to_string().as_str())
+        );
+        assert_eq!(
+            meta.stack_digest(),
+            Some(crate::overlay_meta::stack_digest(&digest, &[]).as_str())
+        );
+        assert!(meta.get("base_committed_at").is_some());
+        assert!(meta.get("base_mismatch_forced_at").is_none());
+        let conn = Connection::open(info.index_path.as_ref().unwrap()).unwrap();
+        let cached: (String, String, String, String) = conn
+            .query_row(
+                "SELECT size, mtime_ns, inode, sha256 FROM overlay_base_digests",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            cached,
+            (
+                stamp.size.to_string(),
+                stamp.mtime_ns.to_string(),
+                stamp.inode.to_string(),
+                digest[7..].to_owned()
+            )
+        );
+        // Use the same default creation context as mount startup, with no override.
+        drop(WriteOverlay::new_with_create_info(Arc::new(NullBase), overlay, info).unwrap());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(archive)
+            .unwrap()
+            .write_all(b"external change")
+            .unwrap();
+        let error = WriteOverlay::new_with_create_info(Arc::new(NullBase), overlay, info)
+            .err()
+            .expect("external archive change must be refused");
+        assert!(error.to_string().contains("base mismatch"), "{error}");
+    }
+
+    fn commit_baseline_case(
+        extension: &str,
+        mode: CommitMode,
+        live: bool,
+        atomic: bool,
+        manifest: bool,
+    ) {
+        if extension == "tar" && mode == CommitMode::Copy {
+            if let Err(error) = ensure_gnu_tar() {
+                eprintln!("skip: {error}");
+                return;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join(format!("base.{extension}"));
+        let members = [ustar_file("old", b"original")];
+        match extension {
+            "zip" => write_sample_zip(&archive, &[("old", b"original", CompressionMethod::Stored)]),
+            "tar.zst" => {
+                fs::write(&archive, concat_zstd_frames(&[&pack_tar(&members)], true)).unwrap()
+            }
+            _ => fs::write(&archive, pack_tar(&members)).unwrap(),
+        }
+        let overlay = dir.path().join("overlay");
+        let index = dir.path().join("custom-index.sqlite");
+        Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT);")
+            .unwrap();
+        let info = crate::OverlayCreateInfo {
+            base_url: archive.to_str().unwrap().to_owned(),
+            index_path: Some(index),
+            ..Default::default()
+        };
+        let base = match extension {
+            "tar" => open_uncompressed_tar_base(&archive, false),
+            "tar.zst" => open_tar_zst_base(&archive, false),
+            _ => Arc::new(NullBase) as Arc<dyn MountSource>,
+        };
+        let mut ov = WriteOverlay::new_with_create_info(base, &overlay, &info).unwrap();
+        ov.set_commit_mode(mode);
+        fs::write(overlay.join("new"), b"new payload").unwrap();
+        if live {
+            assert!(ov
+                .commit_live_idle(&archive, Duration::ZERO, |path| {
+                    Ok(if extension == "tar" {
+                        open_uncompressed_tar_base(path, false)
+                    } else {
+                        open_tar_zst_base(path, false)
+                    })
+                })
+                .unwrap());
+            assert!(!overlay.join("new").exists());
+        } else if atomic {
+            assert!(ov.commit_atomic(&archive).unwrap());
+        } else {
+            drop(ov);
+            let opts = CommitOverlayOptions {
+                mode,
+                manifest_hashes: manifest.then(|| "all".to_owned()),
+                ..yes_commit_opts()
+            };
+            assert!(commit_overlay(&overlay, &archive, &opts).unwrap());
+            assert_committed_baseline(&overlay, &archive, &info);
+            return;
+        }
+        drop(ov);
+        assert_committed_baseline(&overlay, &archive, &info);
+    }
+
+    /// Regression: offline TAR commits left the overlay bound to the old archive bytes.
+    #[test]
+    fn regression_commit_overlay_tar_refreshes_baseline() {
+        for mode in [CommitMode::Copy, CommitMode::Append] {
+            commit_baseline_case("tar", mode, false, false, false);
+        }
+        commit_baseline_case("tar", CommitMode::Copy, false, false, true);
+    }
+
+    /// Regression: zstd splice and append commits caused a mismatch on remount.
+    #[test]
+    fn regression_commit_overlay_tar_zst_refreshes_baseline() {
+        for mode in [CommitMode::Copy, CommitMode::Append] {
+            commit_baseline_case("tar.zst", mode, false, false, false);
+        }
+    }
+
+    /// Regression: rebuilding ZIP left its recorded digest and size stale.
+    #[test]
+    fn regression_commit_overlay_zip_refreshes_baseline() {
+        commit_baseline_case("zip", CommitMode::Copy, false, false, false);
+    }
+
+    /// Regression: interval and on-exit commits required force-base-mismatch afterward.
+    #[test]
+    fn regression_live_commit_refreshes_baseline() {
+        for extension in ["tar", "tar.zst"] {
+            for mode in [CommitMode::Copy, CommitMode::Append] {
+                commit_baseline_case(extension, mode, true, false, false);
+                commit_baseline_case(extension, mode, false, true, false);
+            }
+        }
     }
 
     /// Regression: ZIP --commit-overlay add file (full rebuild) → reopen list/read.

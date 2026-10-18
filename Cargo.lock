@@ -4885,6 +4885,7 @@ dependencies = [
  "sha1 0.10.7",
  "sha2 0.10.9",
  "tempfile",
+ "ureq",
  "url",
 ]
 
@@ -4906,6 +4907,7 @@ name = "ratarmount-compositing"
 version = "0.1.35"
 dependencies = [
  "bzip2",
+ "chrono",
  "flate2",
  "libc",
  "log",
@@ -4917,7 +4919,9 @@ dependencies = [
  "ratarmount-index",
  "regex",
  "rusqlite",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "xz2",

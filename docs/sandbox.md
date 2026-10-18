@@ -123,6 +123,94 @@ overlay_quota_files 100000
 An absent limit is printed as `unlimited`. In-flight COW reservations are
 included in live usage; offline statistics describe named content only.
 
+## Overlay metadata
+
+New write overlays record their base identity in the `meta` table of
+`.ratarmount.overlay.sqlite`. Inspect it offline, without mounting or modifying
+the overlay:
+
+```bash
+ratarmount overlay info ./attempt
+ratarmount overlay info ./attempt --json
+ratarmount -w ./attempt --base-digest sha256:<64-hex-digits> snapshot.tar mnt/
+ratarmount -w ./throwaway --base-digest none snapshot.tar mnt/
+```
+
+The JSON object contains every stored metadata key (string values, including
+JSON-encoded `lower_layers`), plus the numeric `overlay-stats` fields
+`bytes_in_overlay`, `files_present`, `files_deleted`, `directories_created`, and
+`symlinks`. It also contains `tombstone_count` and the booleans `legacy`,
+`files_dir_writable`, and `db_opens_read_only`. Overlay files live directly in
+the overlay directory, so its permissions determine `files_dir_writable`.
+Success exits 0. Missing or damaged databases fail without being created or
+repaired. A mounted overlay's exclusive database lock is reported as "in use".
+
+| Key | Meaning |
+|---|---|
+| `format_version` | `2` for new overlays; `1` for migrated legacy overlays |
+| `ratarmount_version` | Creator's version |
+| `created_at` | Creation time, RFC 3339 UTC |
+| `base_url` | Original base positional |
+| `base_digest` | `sha256:<hex>`, `git-tree:<sha>`, `weak:<hex>`, or `none` |
+| `base_digest_kind` | `strong`, `git-tree`, `weak`, or `none` |
+| `base_size`, `base_mtime_ns` | Local archive size and modification time used for cheap remount checks |
+| `base_git_tree` | Selected Git tree, also retained when a SHA-256 digest was supplied |
+| `base_remote_token` | Available remote validators, or known multi-source inputs |
+| `lower_layers` | JSON array, bottom to top, of `{path, layer_digest, sealed_at}` records; empty for an ordinary mount |
+| `stack_digest` | SHA-256 of the base digest and ordered lower-layer digests, each followed by a newline |
+| `base_mismatch_forced_at` | Last explicit override of a failed base check, RFC 3339 UTC |
+| `sealed_at`, `layer_digest` | Reserved for sealing; absent on new writable overlays |
+| `journal_path` | Reserved for the last journal file used |
+| `fsck_at`, `fsck_result` | Reserved for consistency checks |
+
+A local archive gets a streaming SHA-256 of all file bytes at creation. If an
+existing writable archive index is available, a small cache reuses the digest
+for the same canonical path, size, nanosecond mtime, and inode. Hashing never
+creates an archive index. `--no-recreate-index` and immutable index snapshots
+are not modified for this cache.
+
+A directory gets a `strong` digest of a sorted manifest of relative path,
+mode, size and content SHA-256. The root and empty directories participate;
+directory sizes are zero. Symlinks hash their target bytes without following
+them; special files cannot be hashed. Paths are sorted as OS bytes and fields
+are length-framed, so names containing delimiters remain distinct. A Git base
+gets the selected tree id, including `--git-prefix`, and startup pins the
+resolved commit before opening the mount.
+
+For a computed directory digest, keep the overlay outside the base directory.
+Otherwise its own SQLite metadata would become part of the input being hashed;
+creation refuses that arrangement. A supplied digest or `none` allows it.
+
+Remote bases use a `weak` digest of the URL and cheaply available validators:
+HTTP HEAD ETag/Content-Length/Last-Modified or S3 ETag/size. Failed HEADs,
+redirects, and other schemes fall back to the known URL. This fallback does
+not detect changes behind a mutable URL. Multiple base inputs likewise get a
+weak identity of the ordered input names. Supply a known SHA-256 for these
+cases when stronger identity is required.
+
+`--base-digest sha256:<hex>` trusts the caller and skips base-content hashing.
+`--base-digest none` warns and disables identity checking for new overlays.
+Both it and `--force-base-mismatch` require `-w`, `--overlay-tmpfs`, or
+`--sandbox`. On remount, only local archive size/mtime and Git tree ids are
+checked; directory contents and remote objects are not rehashed. Deliberately
+preserving file size and mtime can therefore evade the cheap check. A mismatch
+refuses the mount; its message shows the recorded digest and current identity
+(stat values for a local archive, without recomputing SHA-256).
+`--force-base-mismatch` records the override time while preserving the original
+base and stack digests. Use it deliberately after an external base replacement.
+Successful local archive commits refresh the recorded size, mtime, base and
+stack digests, and record `base_committed_at`. Strong digests are recomputed
+and the writable index digest cache is refreshed. Reopening the same overlay
+after an offline, interval, on-exit, append, or rolling commit needs no override;
+a subsequent external archive change is still refused. Rolling mounts check
+the active generation. Legacy overlays remain legacy and digest kinds stay unchanged.
+
+Existing overlays without `meta` remain usable. Opening one with `-w` adds
+only `format_version=1`: it stays `legacy: true`, with no retroactively assigned
+digest or sealed state. Library callers using `WriteOverlay::new` without
+creation context create version 2 metadata with digest kind `none`; callers
+that know the base should use `new_with_create_info`.
+
 ## overlay-stats
 
 ```sh

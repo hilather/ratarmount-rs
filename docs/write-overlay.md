@@ -28,6 +28,13 @@ changes and provenance attributes, and a marker file,
 `.ratarmount-overlay.used`. Both names are hidden inside the mount and cannot
 be created, deleted or renamed through it at any depth, ignoring ASCII case;
 an archive member with one of those names is hidden too.
+The database has `files` for presence/tombstones, `overlay_metadata` for
+per-path chmod/utime, `xattrs` for extended attributes, and a separate `meta`
+key/value table for overlay identity. New overlays record format version 2,
+creation details, base and stack digests. Existing overlays without `meta`
+receive only `format_version=1` and remain legacy, without a fabricated base
+identity. See [Overlay metadata](sandbox.md#overlay-metadata) for keys, digest
+kinds, `--base-digest`, and cheap remount verification.
 Copy-on-write stages each copy in a `.ratarmount.overlay.cow-*` temp next to
 its destination, hidden the same way (ASCII case ignored); `--commit-overlay`
 never picks a temp up, an archive member with that prefix is hidden but stays in
@@ -45,6 +52,7 @@ Inspect an overlay without mounting:
 
 ```bash
 ratarmount overlay-stats ./changes --json
+ratarmount overlay info ./changes --json             # identity, metadata and counts
 ratarmount diff ./changes --base archive.tar          # what changed, as a listing
 ratarmount diff ./changes --base repo.git@<sha> --git # as a Git patch
 ```
@@ -63,6 +71,11 @@ ratarmount --commit-overlay --yes -w ./changes --commit-manifest archive.tar.zst
 | `.tar.zst` (multi-frame or seek table) | Spliced from the first affected frame to the end, including deletes in earlier frames |
 | `.zip` | Fully rebuilt (encrypted and multi-part ZIPs are not supported) |
 | Remote URLs (`s3://`, `hf://`, ...) | Not offline; exits 2. Use the live commits below |
+
+Successful local commits refresh the overlay's base size, mtime and digest,
+update its stack digest, and record `meta.base_committed_at`. Strong digests
+require one full read of the resulting archive and update its writable index
+cache. The overlay can then be reopened without `--force-base-mismatch`.
 
 `--commit-overlay-mode copy|append|auto` chooses between the safe copy
 (default), a journaled in-place append for eligible add-only commits to TAR
