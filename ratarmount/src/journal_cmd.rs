@@ -15,7 +15,7 @@ use serde_json::Value;
 #[command(
     name = "ratarmount journal",
     about = "Inspect operation journals or mark an agent turn",
-    after_help = "Exit codes: 0 success, 2 invalid arguments, journal data, or I/O error."
+    after_help = "Exit status:\n  0  Success.\n  2  Invalid arguments, journal data, or I/O error."
 )]
 pub struct JournalArgs {
     #[command(subcommand)]
@@ -25,6 +25,11 @@ pub struct JournalArgs {
 #[derive(Debug, Subcommand)]
 pub enum JournalCommand {
     /// Summarize JSONL records, keeping only a per-path table in memory.
+    ///
+    /// Classify file reads and writes from an operation journal, optionally restricting the summary to a range of marks.
+    #[command(
+        after_help = "Example: ratarmount journal summarize attempt.jsonl --json\n\nExit status:\n  0  Summary written.\n  2  Invalid arguments, journal data, marks, or I/O error."
+    )]
     Summarize {
         file: PathBuf,
         #[arg(long)]
@@ -37,6 +42,11 @@ pub enum JournalCommand {
         until_mark: Option<String>,
     },
     /// Append a UTF-8 label (at most 4096 bytes) through the mount-root xattr.
+    ///
+    /// Send a turn label to a live journaled mount using user.ratarmount.mark on its root.
+    #[command(
+        after_help = "Example: ratarmount journal mark mnt turn-1\n\nExit status:\n  0  Mark appended.\n  2  Invalid arguments, label, mount, or I/O error."
+    )]
     Mark { mount: PathBuf, label: String },
 }
 

@@ -21,26 +21,71 @@ pub struct OverlayArgs {
 #[derive(Debug, Subcommand)]
 pub enum OverlayCommand {
     /// Show metadata, counts, and writability without modifying the overlay.
+    ///
+    /// Read creation metadata and overlay statistics without creating or repairing a database.
+    #[command(
+        after_help = "Example: ratarmount overlay info attempt --json\n\nExit status:\n  0  Metadata displayed.\n  1  Operational error.\n  2  Invalid arguments."
+    )]
     Info(InfoArgs),
-    /// Import a unified or Git patch into a new overlay. Exit 1: rejected hunks, 2: error.
+    /// Import a unified or Git patch into a new overlay.
+    ///
+    /// Apply a patch against a base and optional lower layers, then seal the result unless --no-seal is set.
+    #[command(
+        after_help = "Example: ratarmount overlay import attempt.patch replay base.tar.zst\n\nExit status:\n  0  Patch imported.\n  1  Hunks rejected with --reject.\n  2  Invalid input or operational error."
+    )]
     Import(super::overlay_import::ImportArgs),
-    /// Import a stopped kernel overlayfs upperdir. Exit 0: imported, 2: error.
+    /// Import a stopped kernel overlayfs upperdir.
+    ///
+    /// Translate whiteouts and opaque directories against the supplied lower stack, sealing the result unless --no-seal is set.
+    #[command(
+        after_help = "Example: ratarmount overlay import-upperdir upper replay base.tar.zst\n\nExit status:\n  0  Upperdir imported.\n  2  Invalid input or operational error."
+    )]
     ImportUpperdir(upperdir::ImportUpperdirArgs),
-    /// Seal exact changes and make the overlay read-only. Exit 0: sealed, 2: error.
+    /// Seal exact changes and make the overlay read-only.
+    ///
+    /// Check consistency, record the exact change digest, and remove host write permissions; repeating seal returns the recorded digest.
+    #[command(
+        after_help = "Example: ratarmount overlay seal attempt base.tar.zst\n\nExit status:\n  0  Overlay sealed or already sealed.\n  2  Invalid input or operational error."
+    )]
     Seal(SealArgs),
-    /// Restore owner write permission and remove the seal. Requires --i-know.
+    /// Restore owner write permission and remove the seal.
+    ///
+    /// Require --i-know to discard the immutability guarantee, clear recorded seal hashes, and restore owner write access.
+    #[command(
+        after_help = "Example: ratarmount overlay unseal attempt --i-know\n\nExit status:\n  0  Overlay unsealed.\n  2  Invalid input (including missing --i-know) or operational error."
+    )]
     Unseal {
         directory: PathBuf,
         #[arg(long)]
         i_know: bool,
     },
-    /// Verify a seal. Exit 0: match, 1: mismatches, 2: error or not sealed.
+    /// Verify an overlay seal.
+    ///
+    /// Recompute exact changes against the base and lower layers and compare the digest, per-path hashes, and seal sentinel.
+    #[command(
+        after_help = "Example: ratarmount overlay verify attempt base.tar.zst --json\n\nExit status:\n  0  Seal matches.\n  1  Seal mismatch.\n  2  Invalid input, operational error, or overlay not sealed."
+    )]
     Verify(SealArgs),
     /// Pack a sealed overlay as a portable seekable tar.zst bundle.
+    ///
+    /// Bundle the sealed overlay with a manifest against the lower view, optionally including its journal and indexes.
+    #[command(
+        after_help = "Example: ratarmount overlay pack attempt attempt.tar.zst\n\nExit status:\n  0  Bundle written.\n  2  Invalid input or operational error, including an unsealed overlay."
+    )]
     Pack(PackArgs),
-    /// Restore a sealed overlay. Exit 0: match, 1: mismatch, 2: error.
+    /// Restore a sealed overlay from a bundle.
+    ///
+    /// Safely extract the overlay and check its seal; when the recorded stack is unavailable, check only the immutable database and sentinel.
+    #[command(
+        after_help = "Example: ratarmount overlay unpack attempt.tar.zst restored\n\nExit status:\n  0  Restored checks match.\n  1  Seal mismatch.\n  2  Invalid input or operational error."
+    )]
     Unpack { bundle: PathBuf, directory: PathBuf },
-    /// Check overlay consistency. Exit 0: clean/repaired, 1: inconsistencies, 2: error.
+    /// Check overlay consistency.
+    ///
+    /// Inspect database rows and host entries after unmounting; --repair fixes recoverable inconsistencies and refuses sealed overlays.
+    #[command(
+        after_help = "Example: ratarmount overlay fsck attempt --repair --json\n\nExit status:\n  0  Clean or repaired.\n  1  Unrepaired inconsistencies.\n  2  Invalid input or operational error."
+    )]
     Fsck {
         directory: PathBuf,
         #[arg(long)]

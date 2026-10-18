@@ -18,7 +18,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 #[derive(Debug, Parser)]
 #[command(
     name = "ratarmount snapshot",
-    about = "Export GIT_BASE OUT.tar.zst [--with-index] [--json], or add/list restic snapshots"
+    about = "Export GIT_BASE OUT.tar.zst [--with-index] [--json], or add/list restic snapshots",
+    long_about = "Export a committed Git tree as a deterministic seekable tar.zst, or use add/list to store and inspect local restic snapshots.",
+    after_help = "Examples:\n  ratarmount snapshot repo@HEAD base.tar.zst --with-index\n  ratarmount snapshot add tree --repo backups --init\n  ratarmount snapshot list --repo backups\n\nExit status:\n  0  Success.\n  1  Operational error.\n  2  Invalid arguments.\n  Restic add/list forward nonzero restic status (including 3 for partial backup);\n  termination by a signal returns 128 + signal."
 )]
 pub(super) struct SnapshotArgs {
     #[command(subcommand)]
@@ -27,7 +29,19 @@ pub(super) struct SnapshotArgs {
 
 #[derive(Debug, Subcommand)]
 enum Action {
+    /// Back up a directory or committed Git tree into a local restic repository.
+    ///
+    /// Materialize Git inputs without history, optionally initialize a missing repository, and print the resulting snapshot summary.
+    #[command(
+        after_help = "Example: ratarmount snapshot add tree --repo backups --init\n\nExit status:\n  0  Backup completed.\n  1  Operational error.\n  2  Invalid arguments.\n  Nonzero restic init/backup status is forwarded (including 3 for partial backup);\n  termination by a signal returns 128 + signal."
+    )]
     Add(AddArgs),
+    /// List snapshots in a local restic repository.
+    ///
+    /// Query restic for snapshot metadata and print the available snapshots without modifying the repository.
+    #[command(
+        after_help = "Example: ratarmount snapshot list --repo backups\n\nExit status:\n  0  Snapshots listed.\n  1  Operational error.\n  2  Invalid arguments.\n  Nonzero restic snapshots status is forwarded; termination by a signal returns\n  128 + signal."
+    )]
     List(RepoArgs),
     #[command(skip)]
     Export(GitSnapshotArgs),
@@ -36,7 +50,9 @@ enum Action {
 #[derive(Debug, Parser)]
 #[command(
     name = "ratarmount snapshot",
-    about = "Export a committed Git tree as a deterministic seekable tar.zst"
+    about = "Export a committed Git tree as a deterministic seekable tar.zst",
+    long_about = "Export the selected local Git tree without history as a deterministic seekable tar.zst. Optionally build a companion index and print a JSON summary; existing output files are refused.",
+    after_help = "Example: ratarmount snapshot repo@HEAD base.tar.zst --with-index\n\nExit status:\n  0  Snapshot exported.\n  1  Operational error.\n  2  Invalid arguments."
 )]
 struct GitSnapshotArgs {
     git_base: String,
@@ -512,6 +528,51 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::fs::symlink;
+
+    /// Regression: leaf command help omitted the exit status documented for harnesses.
+    #[test]
+    fn regression_help_states_exit_status() {
+        use clap::CommandFactory;
+
+        fn check(mut command: clap::Command) {
+            let name = command.get_name().to_owned();
+            let help = command.render_long_help().to_string();
+            assert!(help.contains("Exit status:"), "{name}: {help}");
+            assert!(help.contains("Example"), "{name}: missing example");
+        }
+
+        check(crate::diff::DiffArgs::command());
+        let overlay = crate::overlay_cmd::OverlayArgs::command();
+        for name in [
+            "info",
+            "seal",
+            "unseal",
+            "verify",
+            "fsck",
+            "import",
+            "import-upperdir",
+            "pack",
+            "unpack",
+        ] {
+            check(overlay.find_subcommand(name).unwrap().clone());
+        }
+        let journal = crate::journal_cmd::JournalArgs::command();
+        for name in ["summarize", "mark"] {
+            check(journal.find_subcommand(name).unwrap().clone());
+        }
+        check(
+            crate::sandbox::SandboxArgs::command()
+                .find_subcommand("run")
+                .unwrap()
+                .clone(),
+        );
+        let snapshot = SnapshotArgs::command();
+        for name in ["add", "list"] {
+            check(snapshot.find_subcommand(name).unwrap().clone());
+        }
+        check(snapshot);
+        check(GitSnapshotArgs::command());
+    }
 
     fn parse(extra: &[&str]) -> SnapshotArgs {
         SnapshotArgs::try_parse_from(

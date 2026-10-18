@@ -128,17 +128,20 @@ repaired. A mounted overlay's exclusive database lock is reported as "in use".
 | `base_committed_at` | Time of the last successful base-archive commit |
 | `unsealed_at` | Last explicit unseal time |
 
-Offline command exit codes:
+Every command below includes an `Exit status:` block and examples in its long
+`--help`. Offline command exit codes:
 
 | Command | Exit status |
 |---|---|
-| `overlay info`, `seal`, `unseal`, `pack`, `import-upperdir` | 0 success; 2 invalid input or operational error |
+| `overlay info` | 0 success; 1 operational error; 2 argument error |
+| `overlay seal`, `unseal`, `pack`, `import-upperdir` | 0 success; 2 invalid input or operational error |
 | `overlay verify`, `unpack` | 0 match; 1 mismatch; 2 invalid input or operational error |
 | `overlay fsck` | 0 clean/repaired; 1 unrepaired inconsistencies; 2 operational error |
 | `overlay import` | 0 imported; 1 rejected hunks with `--reject`; 2 invalid input or operational error |
 | `diff` | 0 unchanged; 1 changed; 2 error; 3 limits; successful hash/manifest output always exits 0 |
 | `journal summarize`, `journal mark` | 0 success; 2 invalid arguments, data or I/O error |
 | `snapshot` (Git export) | 0 success; 1 operational error; 2 argument error |
+| `snapshot add`, `snapshot list` (restic) | 0 success; 1 local operational error; 2 argument error; nonzero restic status forwarded (including 3 for partial backup), or 128 + signal |
 | `sandbox run` | 0 completed pipeline (inspect JSON `exit_code`); 2 harness failure |
 
 ### Base and stack digests

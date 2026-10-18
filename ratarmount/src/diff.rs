@@ -22,7 +22,8 @@ pub(crate) mod tests;
 
 #[derive(Debug, Parser)]
 #[command(name = "ratarmount diff", about = "Compare an overlay with its composed lower view (no mount required)",
-    after_help = "Exit codes: 0 no changes, 1 changes, 2 error, 3 size/file limit exceeded.\n--hash and --manifest exit 0 on success. Patches always preserve exact bytes.",
+    long_about = "Compare an overlay with its composed lower view without mounting it. Render byte-preserving patches, path summaries, manifests, or canonical hashes against the base and optional lower layers.",
+    after_help = "Example: ratarmount diff attempt base.tar.zst --git\n\nExit status:\n  0  No changes, or successful --hash/--manifest output.\n  1  Changes found.\n  2  Invalid input or operational error.\n  3  Size/file limit exceeded.",
     group(ArgGroup::new("mode").args(["patch", "git", "manifest", "hash", "stat", "name_only", "name_status"])))]
 pub struct DiffArgs {
     pub directory: PathBuf,
