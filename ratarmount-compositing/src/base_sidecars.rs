@@ -10,12 +10,11 @@ pub const MANIFEST_SIDECAR_SUFFIX: &str = ".manifest.jsonl";
 
 /// Pinned-snapshot index name `X.index.<64 lowercase hex>.sqlite`.
 fn is_index_snapshot(name: &str) -> bool {
-    name.find(".index.").is_some_and(|at| {
-        name[at + ".index.".len()..]
-            .strip_suffix(".sqlite")
-            .is_some_and(|id| {
-                id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-            })
+    // Anchored at the end: the id is the last dotted component before `.sqlite`.
+    name.strip_suffix(".sqlite").is_some_and(|stem| {
+        stem.rsplit_once(".index.").is_some_and(|(_, id)| {
+            id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
     })
 }
 
@@ -31,10 +30,14 @@ fn is_index_sidecar(name: &str) -> bool {
     if is_index_snapshot(name) || name.ends_with(".index.ptr") {
         return true;
     }
-    let Some(at) = name.find(".index.sqlite") else {
-        return false;
-    };
-    let rest = &name[at + ".index.sqlite".len()..];
+    // An archive name may itself contain `.index.sqlite` (`b.index.sqlite.tar`),
+    // so accept any occurrence whose remainder is a known sidecar tail; a name
+    // like `b.index.sqlite.tar` has none, `b.index.sqlite.tar.index.sqlite` does.
+    name.match_indices(".index.sqlite")
+        .any(|(at, m)| is_index_sqlite_tail(&name[at + m.len()..]))
+}
+
+fn is_index_sqlite_tail(rest: &str) -> bool {
     if matches!(
         rest,
         "" | "-wal"
@@ -120,6 +123,10 @@ mod tests {
             "a.tar.index.sqlite.xz",
             "a.tar.index.sqlite.bz2",
             "a.tar.index.sqlite.digest-lock",
+            "backup.index.sqlite.tar.index.sqlite",
+            "backup.index.sqlite.tar.index.sqlite-wal",
+            "backup.index.sqlite.tar.index.sqlite.tmp.1.2",
+            &format!("backup.index.sqlite.tar.index.{id}.sqlite"),
             "a.tar.index.sqlite.tmp.123.4",
             "a.tar.index.sqlite.tmp.123.4-wal",
             ".ratarmount-index-ptr-x.tmp",
@@ -144,6 +151,10 @@ mod tests {
             "a.tar.index.sqlite.tmp.x.y",
             "a.tar.index.sqlite.tmp.1",
             "a.tar.index.ABAB.sqlite",
+            // Regression: an archive whose own name holds `.index.sqlite`.
+            "backup.index.sqlite.tar",
+            "backup.index.sqlite.tar.gz",
+            "backup.index.sqlite.tar.index.txt",
         ] {
             assert!(!is(name, &[]), "{name} is base content");
         }
