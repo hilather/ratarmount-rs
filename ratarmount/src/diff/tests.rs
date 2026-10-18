@@ -726,7 +726,7 @@ fn regression_diff_positional_alias_and_mode_conflicts() {
     use clap::CommandFactory;
     DiffArgs::command().write_long_help(&mut help).unwrap();
     let help = String::from_utf8(help).unwrap();
-    assert!(help.contains("3 size/file limit"));
+    assert!(help.contains("3  Size/file limit exceeded"));
     assert!(!help.contains("--base <"));
 }
 
