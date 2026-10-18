@@ -661,3 +661,45 @@ fn regression_git_overlay_against_directory_base_is_refused() {
     let out = env.run(&["--no-mount", "--lower", s(&overlay), s(&dir)]);
     assert!(!out.status.success(), "dir accepted: {}", text(&out));
 }
+
+/// Regression (R4-S12): an archive-recorded overlay against `git:///repo#rev`
+/// is a base switch, refused by seal, pack and diff.
+#[test]
+fn regression_archive_overlay_against_git_base_is_refused() {
+    for v in VERBS {
+        let env = Env::new();
+        let (_archive, overlay) = fixture(&env, Kind::Archive, !matches!(v, Verb::Seal));
+        let (url, _) = git_base(&env, "repo");
+        refused(&verb(&env, v, &overlay, Path::new(&url), &[]));
+        assert!(!env.path("bundle.tar.zst").exists(), "{v:?} wrote a bundle");
+        if matches!(v, Verb::Seal) {
+            assert!(!meta_of(&overlay).layer_sealed());
+        }
+    }
+}
+
+/// Regression (R4-S12): a Git-recorded overlay against an archive is refused
+/// by seal, pack and diff.
+#[test]
+fn regression_git_overlay_against_archive_base_is_refused() {
+    for v in VERBS {
+        let env = Env::new();
+        let (url, _) = git_base(&env, "repo");
+        let overlay = env.path("overlay");
+        env.ok(&["--no-mount", "-w", s(&overlay), &url]);
+        if !matches!(v, Verb::Seal) {
+            env.ok(&["overlay", "seal", s(&overlay)]);
+        }
+        let dir = env.path("plain");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.txt"), b"git content\n").unwrap();
+        let archive = env.path("plain.tar");
+        assert!(Command::new("tar")
+            .args(["cf", s(&archive), "-C", s(&dir), "a.txt"])
+            .status()
+            .unwrap()
+            .success());
+        refused(&verb(&env, v, &overlay, &archive, &[]));
+        assert!(!env.path("bundle.tar.zst").exists(), "{v:?} wrote a bundle");
+    }
+}
