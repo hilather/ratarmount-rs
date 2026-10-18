@@ -381,3 +381,61 @@ fn regression_strong_directory_base_confirmed_by_supplied_digest() {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["base"], digest.as_str());
 }
+
+/// A sealed overlay that changes `x.txt` from the base's bytes to `new`.
+fn non_empty_sealed(env: &Env) -> (PathBuf, PathBuf) {
+    let (base, overlay) = fixture(env, Kind::Dir, false);
+    fs::write(overlay.join("x.txt"), b"new\n").unwrap();
+    env.ok(&["overlay", "seal", s(&overlay)]);
+    (base, overlay)
+}
+
+/// Regression (R4-S1): a forced pack kept the sealed layer digest while
+/// replacing the base rows, so a non-empty layer whose change set differs on
+/// the base as it is now (`x` A->B, base `x` became B) produced a bundle that
+/// failed its own unpack / verify. It now refuses that case.
+#[test]
+fn regression_forced_pack_refuses_when_change_set_differs_on_actual_base() {
+    let env = Env::new();
+    let (base, overlay) = non_empty_sealed(&env);
+    fs::write(base.join("x.txt"), b"new\n").unwrap();
+    let out = verb(
+        &env,
+        Verb::Pack,
+        &overlay,
+        &base,
+        &["--force-base-mismatch"],
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("change set") && err.contains("unseal"),
+        "{err}"
+    );
+    assert!(!env.path("bundle.tar.zst").exists());
+}
+
+/// A forced pack of a non-empty layer whose change set is unchanged on the
+/// edited base still bundles, and the bundle unpacks and verifies on that base.
+#[test]
+fn regression_forced_pack_non_empty_unrelated_edit_round_trips() {
+    let env = Env::new();
+    let (base, overlay) = non_empty_sealed(&env);
+    fs::write(base.join("y.txt"), b"other edited\n").unwrap();
+    let out = verb(
+        &env,
+        Verb::Pack,
+        &overlay,
+        &base,
+        &["--force-base-mismatch"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let restored = env.path("restored");
+    env.ok(&[
+        "overlay",
+        "unpack",
+        s(&env.path("bundle.tar.zst")),
+        s(&restored),
+    ]);
+    env.ok(&["overlay", "verify", s(&restored), s(&base)]);
+}

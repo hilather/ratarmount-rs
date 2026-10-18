@@ -266,6 +266,16 @@ pub fn pack(
         ..Default::default()
     };
     let changes = overlay_changes::change_set(directory, lower_view, &opts)?;
+    if options.base_rows.is_some() && overlay_changes::canonical_hash(&changes, &opts)? != digest {
+        // The sealed digest covers the change set on the base the layer was
+        // sealed on. Replacing only the base rows would make a bundle whose
+        // unpack / verify fails against the base it names; recomputing the
+        // digest would make the layer claim a seal it never had.
+        return Err(invalid(
+            "the layer's change set on the base as it is now differs from the one it was sealed with; \
+             run `overlay unseal --i-know`, then `overlay seal --force-base-mismatch` against this base, then pack",
+        ));
+    }
     let mut manifest = tempfile::tempfile()?;
     overlay_changes::write_manifest(&changes, &mut manifest)?;
     let mut paths = BTreeSet::new();
