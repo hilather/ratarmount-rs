@@ -1,327 +1,192 @@
-//! Offline patches from overlay content and durable tombstones.
+//! Offline diff CLI. Change detection and canonical hashes live in compositing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use clap::Parser;
-use ratarmount_compositing::{is_overlay_internal_path, HIDDEN_DB};
-use ratarmount_core::{metadata_mode, MountSource, OpenOptions, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
+use clap::{ArgGroup, Parser};
+use ratarmount_compositing::overlay_changes::{
+    self as core, Algorithm, ChangeOptions, Entry, Normalize,
+};
+use ratarmount_compositing::{compose_stack, Immutability, OverlayMeta};
+use ratarmount_core::{MountSource, OpenOptions, S_IFDIR, S_IFMT};
 use ratarmount_session::factory;
-use rusqlite::{Connection, OpenFlags};
 
+mod live;
 mod patch;
 #[cfg(test)]
 mod tests;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "ratarmount diff",
-    about = "Compare a write overlay with its read-only base (no mount or git required)"
-)]
+#[command(name = "ratarmount diff", about = "Compare an overlay with its composed lower view (no mount required)",
+    after_help = "Exit codes: 0 no changes, 1 changes, 2 error, 3 size/file limit exceeded.\n--hash and --manifest exit 0 on success. Patches always preserve exact bytes.",
+    group(ArgGroup::new("mode").args(["patch", "git", "manifest", "hash", "stat", "name_only", "name_status"])))]
 pub struct DiffArgs {
     pub directory: PathBuf,
-    /// Original archive, committed Git repository, folder, or remote URL.
-    #[arg(long)]
+    /// Archive, committed Git repository, folder or URL; defaults to meta.base_url.
+    #[arg(value_name = "BASE")]
+    pub base_source: Option<PathBuf>,
+    #[arg(long, hide = true)]
     pub base: Option<PathBuf>,
-    /// Emit a git-apply-compatible patch, including binary literals and renames.
+    /// Unified patch (the default).
+    #[arg(long)]
+    pub patch: bool,
+    /// Git-apply-compatible patch, including literal binary sections.
     #[arg(long)]
     pub git: bool,
-    /// Number of unified context lines.
-    #[arg(short = 'U', long, default_value_t = 3)]
-    pub context: usize,
-    /// Print per-file line counts and totals instead of a patch.
-    #[arg(long, conflicts_with = "name_status")]
+    /// One JSON object per changed path.
+    #[arg(long)]
+    pub manifest: bool,
+    /// Canonical content hash, independent of patch formatting.
+    #[arg(long)]
+    pub hash: bool,
+    /// Print per-path line counts, totals and bytes written.
+    #[arg(long)]
     pub stat: bool,
-    /// Print A/M/D/T/R100 and paths instead of a patch.
+    #[arg(long)]
+    pub name_only: bool,
+    /// Print A/M/D/T (or written without a base) and paths.
     #[arg(long)]
     pub name_status: bool,
-    /// Include .git directories (normally omitted for synthetic-head overlays).
+    /// Compare OTHER_DIR's tree to OVERLAY_DIR's tree on the same stack.
+    #[arg(long, value_name = "OTHER_DIR")]
+    pub between: Option<PathBuf>,
+    /// Lower overlays, bottom to top; defaults to meta.lower_layers.
+    #[arg(long, value_name = "DIR")]
+    pub lower: Vec<PathBuf>,
+    /// Hash/manifest normalization only; loose is for analysis, not grading.
+    #[arg(long, default_value = "exact", value_parser = ["exact", "strict", "loose"])]
+    pub normalize: String,
+    /// Gitignore-style mount-relative exclusion; repeatable.
+    #[arg(long, value_name = "GLOB")]
+    pub exclude: Vec<String>,
+    #[arg(long)]
+    pub ignore_mode: bool,
+    #[arg(long, default_value = "sha256", value_parser = ["sha256", "blake3"])]
+    pub algo: String,
+    /// Refuse unsealed top and lower overlays.
+    #[arg(long)]
+    pub strict: bool,
+    /// Text above this size per side uses binary rendering (including Git literals).
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    pub max_diff_bytes: u64,
+    /// Limit rendered patch bytes and per-payload input work; exceeded => exit 3.
+    #[arg(long)]
+    pub max_patch_bytes: Option<u64>,
+    /// Limit changed paths / manifest rows; exceeded => exit 3.
+    #[arg(long)]
+    pub max_files: Option<usize>,
+    /// Machine-readable --stat or --hash.
+    #[arg(long)]
+    pub json: bool,
+    #[arg(short = 'o', value_name = "FILE")]
+    pub output: Option<PathBuf>,
+    /// Detect exact-content renames (never used for --hash/--manifest).
+    #[arg(long)]
+    pub detect_renames: bool,
+    #[arg(short = 'U', long, default_value_t = 3)]
+    pub context: usize,
     #[arg(long)]
     pub include_git_dir: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Entry {
-    mode: u32,
-    data: Vec<u8>,
+impl Default for DiffArgs {
+    fn default() -> Self {
+        Self::parse_from(["ratarmount diff", "unused"])
+    }
 }
 
-impl Entry {
-    fn git_mode(&self) -> u32 {
-        if self.mode & S_IFMT == S_IFLNK {
-            0o120000
-        } else if self.mode & 0o100 != 0 {
-            0o100755
-        } else {
-            0o100644
+impl DiffArgs {
+    fn is_patch(&self) -> bool {
+        !(self.manifest || self.hash || self.stat || self.name_only || self.name_status)
+    }
+    fn options(&self) -> ChangeOptions {
+        ChangeOptions {
+            normalize: if !(self.hash || self.manifest) {
+                Normalize::Exact
+            } else {
+                match self.normalize.as_str() {
+                    "strict" => Normalize::Strict,
+                    "loose" => Normalize::Loose,
+                    _ => Normalize::Exact,
+                }
+            },
+            algo: if self.algo == "blake3" {
+                Algorithm::Blake3
+            } else {
+                Algorithm::Sha256
+            },
+            excludes: self.exclude.clone(),
+            ignore_mode: self.ignore_mode,
+            include_git_dir: self.include_git_dir,
+            max_files: self.max_files,
+            max_content_bytes: if self.is_patch() {
+                self.max_patch_bytes
+            } else {
+                None
+            },
         }
     }
 }
 
-#[derive(Debug)]
+// Rendering-only rename pairs. Canonical rows always remain delete + add.
+#[derive(Clone, Debug)]
 struct Change {
     from: String,
     to: String,
     old: Option<Entry>,
     new: Option<Entry>,
 }
-
 impl Change {
     fn status(&self) -> &'static str {
         match (&self.old, &self.new) {
             (None, _) => "A",
             (_, None) => "D",
             (Some(_), Some(_)) if self.from != self.to => "R100",
-            (Some(a), Some(b)) if a.mode & S_IFMT != b.mode & S_IFMT => "T",
+            (Some(a), Some(b)) if a.kind() != b.kind() => "T",
             _ => "M",
         }
     }
 }
 
-fn excluded(path: &str, include_git: bool) -> bool {
-    is_overlay_internal_path(path) || (!include_git && path.split('/').any(|part| part == ".git"))
-}
-
-fn checked_path(path: &str) -> Result<String, String> {
-    let path = path.trim_start_matches('/');
-    if path.is_empty()
-        || path
-            .split('/')
-            .any(|p| p.is_empty() || p == "." || p == "..")
-    {
-        return Err(format!("invalid overlay path {path:?}"));
+fn render_changes(changes: &[core::Change], args: &DiffArgs) -> io::Result<Vec<Change>> {
+    let mut out = Vec::new();
+    for change in changes {
+        let path = std::str::from_utf8(&change.path)
+            .map_err(io::Error::other)?
+            .to_owned();
+        out.push(Change {
+            from: path.clone(),
+            to: path,
+            old: change.old.clone(),
+            new: change.new.clone(),
+        });
     }
-    Ok(path.to_owned())
-}
-
-fn tombstones(root: &Path, include_git: bool) -> Result<BTreeSet<String>, String> {
-    let db = root.join(HIDDEN_DB);
-    let read = || -> Result<_, Box<dyn std::error::Error>> {
-        if !fs::symlink_metadata(&db)?.is_file() {
-            return Err("overlay database must be a regular file".into());
-        }
-        let conn = Connection::open_with_flags(
-            &db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        let mut stmt =
-            conn.prepare("SELECT path, name FROM files WHERE deleted = 1 ORDER BY path, name")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut paths = BTreeSet::new();
-        for row in rows {
-            let (parent, name) = row?;
-            let path = checked_path(&format!("{}/{name}", parent.trim_end_matches('/')))?;
-            if !excluded(&path, include_git) {
-                paths.insert(path);
-            }
-        }
-        Ok(paths)
-    };
-    read().map_err(|e| {
-        format!(
-            "error reading existing overlay database {}: {e}",
-            db.display()
-        )
-    })
-}
-
-fn deleted(path: &str, tombstones: &BTreeSet<String>) -> bool {
-    let mut ancestor = path;
-    loop {
-        if tombstones.contains(ancestor) {
-            return true;
-        }
-        match ancestor.rsplit_once('/') {
-            Some((parent, _)) => ancestor = parent,
-            None => return false,
-        }
+    if args.detect_renames {
+        detect_renames(&mut out);
     }
-}
-
-fn host_entries(
-    root: &Path,
-    rel: &str,
-    include_git: bool,
-    removed: &BTreeSet<String>,
-    entries: &mut BTreeMap<String, Option<Entry>>,
-) -> Result<(), String> {
-    for child in fs::read_dir(root.join(rel)).map_err(|e| e.to_string())? {
-        let child = child.map_err(|e| e.to_string())?;
-        let name = child
-            .file_name()
-            .into_string()
-            .map_err(|_| "overlay path is not UTF-8")?;
-        let path = if rel.is_empty() {
-            name
-        } else {
-            format!("{rel}/{name}")
-        };
-        if excluded(&path, include_git) || deleted(&path, removed) {
-            continue;
-        }
-        let meta = fs::symlink_metadata(child.path()).map_err(|e| e.to_string())?;
-        if meta.is_dir() {
-            entries.insert(path.clone(), None);
-            host_entries(root, &path, include_git, removed, entries)?;
-        } else {
-            let data = if meta.is_symlink() {
-                fs::read_link(child.path())
-                    .map_err(|e| e.to_string())?
-                    .as_os_str()
-                    .as_bytes()
-                    .to_vec()
-            } else if meta.is_file() {
-                fs::read(child.path()).map_err(|e| format!("{path}: {e}"))?
-            } else {
-                return Err(format!(
-                    "{path}: only regular files and symlinks can be diffed"
-                ));
-            };
-            entries.insert(
-                path,
-                Some(Entry {
-                    mode: metadata_mode(&meta),
-                    data,
-                }),
-            );
-        }
-    }
-    Ok(())
-}
-
-fn base_entries(
-    source: &dyn MountSource,
-    path: &str,
-    include_git: bool,
-    entries: &mut BTreeMap<String, Entry>,
-) -> Result<(), String> {
-    if excluded(path, include_git) || entries.contains_key(path) {
-        return Ok(());
-    }
-    let full = format!("/{path}");
-    let Some(fi) = source.lookup(&full, 0) else {
-        return Ok(());
-    };
-    let data = match fi.mode & S_IFMT {
-        S_IFDIR => {
-            let children = source
-                .list_dirents(&full)
-                .ok_or_else(|| format!("cannot list base directory {path}"))?;
-            for child in children {
-                let name = checked_path(&child.name)?;
-                if name.contains('/') {
-                    return Err(format!("invalid base directory entry {name:?}"));
-                }
-                base_entries(source, &format!("{path}/{name}"), include_git, entries)?;
-            }
-            return Ok(());
-        }
-        S_IFLNK => fi.linkname.as_bytes().to_vec(),
-        S_IFREG => {
-            let mut data = Vec::new();
-            source
-                .open(&fi, 0)
-                .map_err(|e| format!("{path}: {e}"))?
-                .read_to_end(&mut data)
-                .map_err(|e| format!("{path}: {e}"))?;
-            if data.len() as u64 != fi.size {
-                return Err(format!(
-                    "{path}: short base read (expected {}, got {})",
-                    fi.size,
-                    data.len()
-                ));
-            }
-            data
-        }
-        _ => return Err(format!("{path}: unsupported base file type")),
-    };
-    entries.insert(
-        path.into(),
-        Entry {
-            mode: fi.mode,
-            data,
-        },
-    );
-    Ok(())
-}
-
-fn collect(args: &DiffArgs, source: &dyn MountSource) -> Result<Vec<Change>, String> {
-    let removed = tombstones(&args.directory, args.include_git_dir)?;
-    collect_removed(args, source, &removed)
-}
-
-fn collect_removed(
-    args: &DiffArgs,
-    source: &dyn MountSource,
-    removed: &BTreeSet<String>,
-) -> Result<Vec<Change>, String> {
-    let mut host = BTreeMap::new();
-    host_entries(
-        &args.directory,
-        "",
-        args.include_git_dir,
-        removed,
-        &mut host,
-    )?;
-    let mut old = BTreeMap::new();
-    for path in removed {
-        base_entries(source, path, args.include_git_dir, &mut old)?;
-    }
-    for (path, entry) in &host {
-        // Existing host directories are just COW parents, not recursive edits.
-        if entry.is_none()
-            && source
-                .lookup(&format!("/{path}"), 0)
-                .is_some_and(|fi| fi.mode & S_IFMT == S_IFDIR)
-        {
-            continue;
-        }
-        base_entries(source, path, args.include_git_dir, &mut old)?;
-    }
-    let paths: BTreeSet<_> = old.keys().chain(host.keys()).cloned().collect();
-    let mut changes = Vec::new();
-    for path in paths {
-        let before = old.remove(&path);
-        let after = host.remove(&path).flatten();
-        let equal = before == after
-            || (args.git
-                && before
-                    .as_ref()
-                    .zip(after.as_ref())
-                    .is_some_and(|(a, b)| a.git_mode() == b.git_mode() && a.data == b.data));
-        if !equal {
-            changes.push(Change {
-                from: path.clone(),
-                to: path,
-                old: before,
-                new: after,
-            });
-        }
-    }
-    if args.git || args.name_status || args.stat {
-        detect_renames(&mut changes);
-    }
-    Ok(changes)
+    Ok(out)
 }
 
 fn detect_renames(changes: &mut Vec<Change>) {
-    // Stable, one-to-one pairing, including duplicate-content candidates.
     let mut pairs = Vec::new();
     let mut used = BTreeSet::new();
     for (i, change) in changes.iter().enumerate().filter(|(_, c)| c.new.is_none()) {
-        let before = change.old.as_ref().expect("deletion");
+        let Some(before) = &change.old else {
+            continue;
+        };
+        if before.mode & S_IFMT == S_IFDIR {
+            continue;
+        }
         if let Some((j, _)) = changes.iter().enumerate().find(|(j, c)| {
             !used.contains(j)
                 && c.old.is_none()
-                && c.new.as_ref().is_some_and(|after| {
-                    before.mode & S_IFMT == after.mode & S_IFMT && before.data == after.data
-                })
+                && c.new
+                    .as_ref()
+                    .is_some_and(|after| before.kind() == after.kind() && before.hash == after.hash)
         }) {
             used.insert(j);
             pairs.push((i, j));
@@ -368,66 +233,277 @@ impl Drop for ProgressToStderr {
     }
 }
 
-/// Render against an already composed base (also used by the sandbox API).
-pub(crate) fn render_source(
-    args: &DiffArgs,
-    source: &dyn MountSource,
-    deleted: Option<Vec<String>>,
-) -> Result<String, String> {
-    let changes = if let Some(deleted) = deleted {
-        let mut removed = BTreeSet::new();
-        for path in deleted {
-            let path = checked_path(&path)?;
-            if !excluded(&path, args.include_git_dir) {
-                removed.insert(path);
-            }
-        }
-        collect_removed(args, source, &removed)?
-    } else {
-        collect(args, source)?
-    };
-    patch::render(&changes, args).map_err(|e| e.to_string())
+fn read_meta(dir: &Path, strict: bool) -> io::Result<Option<OverlayMeta>> {
+    let meta = OverlayMeta::read(dir).map_err(io::Error::other)?;
+    if strict && !meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
+        return Err(io::Error::other(format!(
+            "{}: unsealed overlay refused by --strict",
+            dir.display()
+        )));
+    }
+    match &meta {
+        None => eprintln!("diff: {}: legacy overlay", dir.display()),
+        Some(m) if m.legacy() => eprintln!("diff: {}: legacy overlay", dir.display()),
+        Some(m) if !m.layer_sealed() => eprintln!(
+            "diff: {}: unsealed overlay; stop writers before diff",
+            dir.display()
+        ),
+        _ => {}
+    }
+    core::mentioned_paths(dir)?;
+    Ok(meta)
 }
 
-fn execute(args: &DiffArgs) -> Result<(String, bool), String> {
-    let base = args.base.as_ref().ok_or("--base SOURCE is required: the overlay does not store original contents or its base location")?;
-    // Validate before opening the base; never initialize a missing overlay DB.
-    tombstones(&args.directory, args.include_git_dir)?;
-    let mut options = OpenOptions {
+struct Prepared {
+    changes: Vec<core::Change>,
+    options: ChangeOptions,
+    meta: Option<OverlayMeta>,
+}
+
+fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
+    if args.json && !(args.hash || args.stat) {
+        return Err(io::Error::other("--json requires --hash or --stat"));
+    }
+    let options = args.options();
+    core::Excludes::new(&options)?;
+    if options.normalize == Normalize::Loose {
+        eprintln!("diff: warning: loose normalization is for analysis only, never grading");
+    }
+    let meta = read_meta(&args.directory, args.strict)?;
+    let explicit_base = args.base_source.as_ref().or(args.base.as_ref());
+    let recorded_base = meta
+        .as_ref()
+        .and_then(OverlayMeta::base_url)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let base = explicit_base.or(recorded_base.as_ref());
+    if explicit_base.is_none() {
+        if let Some(base) = base {
+            eprintln!("diff: using base from overlay metadata: {}", base.display());
+        }
+    }
+    let Some(base) = base else {
+        if args.is_patch() || args.stat || args.between.is_some() || !args.lower.is_empty() {
+            return Err(io::Error::other("BASE (or --base SOURCE / meta.base_url) is required for patches, --stat, --lower and --between"));
+        }
+        return Ok(Prepared {
+            changes: core::change_set_without_base(&args.directory, &options)?,
+            options,
+            meta,
+        });
+    };
+    let lower_dirs = if args.lower.is_empty() {
+        meta.as_ref()
+            .map(|m| {
+                m.lower_layers()
+                    .map(|ls| ls.into_iter().map(|l| l.path).collect())
+            })
+            .transpose()
+            .map_err(io::Error::other)?
+            .unwrap_or_default()
+    } else {
+        args.lower.clone()
+    };
+    let mut layers = Vec::new();
+    for dir in lower_dirs {
+        let m = read_meta(&dir, args.strict)?;
+        let immutable = if m.as_ref().is_some_and(OverlayMeta::layer_sealed) {
+            Immutability::Immutable
+        } else {
+            Immutability::Shared
+        };
+        layers.push((dir, immutable));
+    }
+    if let Some(other) = &args.between {
+        let other_meta = read_meta(other, args.strict)?;
+        let legacy = |m: &Option<OverlayMeta>| m.as_ref().is_none_or(OverlayMeta::legacy);
+        if legacy(&meta) && legacy(&other_meta) {
+            if explicit_base.is_none() || args.lower.is_empty() {
+                return Err(io::Error::other("legacy --between requires an explicit BASE and --lower stack shared by both overlays"));
+            }
+            eprintln!("diff: legacy --between: using the explicitly supplied BASE and --lower stack for both overlays");
+        } else {
+            let stack = meta.as_ref().and_then(OverlayMeta::stack_digest);
+            if stack.is_none() || stack != other_meta.as_ref().and_then(OverlayMeta::stack_digest) {
+                return Err(io::Error::other(
+                    "--between requires both overlays to record the same stack_digest",
+                ));
+            }
+        }
+    }
+    let mut open = OpenOptions {
         write_index: false,
         index_in_memory: true,
-        // A working repository means its committed tree, not local edits.
         git: base.join(".git").exists(),
         ..OpenOptions::default()
     };
-    let changes = {
-        let _progress = ProgressToStderr::new().map_err(|e| e.to_string())?;
-        let bundle = factory::build_mount_source_ex(
-            std::slice::from_ref(base),
-            &mut options,
-            false,
-            factory::CompositingOptions::default(),
-        )?;
-        collect(args, bundle.source.as_ref())?
+    // Keep lazy lookup/open progress off stdout as well as factory progress.
+    let _progress = ProgressToStderr::new()?;
+    let source = factory::build_mount_source_ex(
+        std::slice::from_ref(base),
+        &mut open,
+        false,
+        factory::CompositingOptions::default(),
+    )
+    .map_err(io::Error::other)?
+    .source;
+    let stack = compose_stack(source, &layers)?;
+    let changes = if let Some(other) = &args.between {
+        core::between(&args.directory, other, stack, &options)?
+    } else {
+        core::change_set(&args.directory, stack, &options)?
     };
-    Ok((
-        patch::render(&changes, args).map_err(|e| e.to_string())?,
-        !changes.is_empty(),
-    ))
+    Ok(Prepared {
+        changes,
+        options,
+        meta,
+    })
+}
+
+fn render(prepared: &Prepared, args: &DiffArgs, out: &mut dyn Write) -> io::Result<()> {
+    if args.manifest {
+        return core::write_manifest(&prepared.changes, out);
+    }
+    if args.hash {
+        let hash = core::canonical_hash(&prepared.changes, &prepared.options)?;
+        if args.json {
+            let meta = prepared.meta.as_ref();
+            let base = meta.and_then(OverlayMeta::base_digest);
+            let mut stack = meta.and_then(OverlayMeta::stack_digest).map(str::to_owned);
+            if stack.is_none() {
+                if let Some(base) = base {
+                    let lower = meta.unwrap().lower_layers().map_err(io::Error::other)?;
+                    stack = Some(ratarmount_compositing::stack_digest(
+                        base,
+                        &lower
+                            .iter()
+                            .map(|l| l.layer_digest.as_str())
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+            }
+            serde_json::to_writer(
+                &mut *out,
+                &serde_json::json!({"patch":hash,"base":base,"stack":stack,"files":prepared.changes.len(),"normalize":prepared.options.normalize.as_str(),"excludes":args.exclude,"algo":prepared.options.algo.as_str(),"sealed":meta.is_some_and(OverlayMeta::layer_sealed)}),
+            )?;
+            out.write_all(b"\n")?;
+        } else {
+            writeln!(out, "{hash}")?;
+        }
+        return Ok(());
+    }
+    if args.name_only
+        || (args.name_status
+            && prepared
+                .changes
+                .iter()
+                .any(|c| c.status == core::Status::Written))
+    {
+        for change in &prepared.changes {
+            if args.name_status {
+                write!(out, "{}\t", change.status.letter())?;
+            }
+            writeln!(out, "{}", patch::quote_bytes(&change.path))?;
+        }
+        return Ok(());
+    }
+    patch::render(&render_changes(&prepared.changes, args)?, args, out)
+}
+
+struct LimitedWriter<'a> {
+    inner: &'a mut dyn Write,
+    left: u64,
+}
+impl Write for LimitedWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() as u64 > self.left {
+            return Err(core::limit_error(
+                "rendered patch exceeds --max-patch-bytes",
+            ));
+        }
+        let n = self.inner.write(bytes)?;
+        self.left -= n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_output(prepared: &Prepared, args: &DiffArgs, out: &mut dyn Write) -> io::Result<()> {
+    if let Some(limit) = args.max_patch_bytes.filter(|_| args.is_patch()) {
+        render(
+            prepared,
+            args,
+            &mut LimitedWriter {
+                inner: out,
+                left: limit,
+            },
+        )
+    } else {
+        render(prepared, args, out)
+    }
+}
+
+/// Keep the daemon's live inspection path: its writer holds the database lock,
+/// so tombstones arrive through the inspection socket rather than a SQL read.
+pub(crate) fn render_source(
+    args: &DiffArgs,
+    source: Arc<dyn MountSource>,
+    deleted: Option<Vec<String>>,
+) -> Result<Vec<u8>, String> {
+    let result = || -> io::Result<Vec<u8>> {
+        let options = args.options();
+        let changes = match deleted {
+            Some(deleted) => live::changes(args, source, deleted)?,
+            None => core::change_set(&args.directory, source, &options)?,
+        };
+        let mut output = Vec::new();
+        write_output(
+            &Prepared {
+                changes,
+                options,
+                meta: None,
+            },
+            args,
+            &mut output,
+        )?;
+        Ok(output)
+    };
+    result().map_err(|e| e.to_string())
+}
+
+fn execute(args: &DiffArgs) -> io::Result<i32> {
+    let prepared = prepare(args)?;
+    // Withhold partial output on a limit/error. The spool holds rendered bytes,
+    // not all source payloads, and is removed automatically on every error.
+    let mut spool = tempfile::tempfile()?;
+    write_output(&prepared, args, &mut spool)?;
+    spool.rewind()?;
+    if let Some(path) = &args.output {
+        let mut out = fs::File::create(path)?;
+        io::copy(&mut spool, &mut out)?;
+        out.flush()?;
+    } else {
+        io::copy(&mut spool, &mut io::stdout().lock())?;
+    }
+    Ok(if args.hash || args.manifest {
+        0
+    } else {
+        i32::from(!prepared.changes.is_empty())
+    })
 }
 
 pub fn run(args: &DiffArgs) -> i32 {
     match execute(args) {
-        Ok((output, changed)) => match io::stdout().lock().write_all(output.as_bytes()) {
-            Ok(()) => i32::from(changed),
-            Err(error) => {
-                eprintln!("diff: {error}");
-                2
-            }
-        },
+        Ok(code) => code,
         Err(error) => {
             eprintln!("diff: {error}");
-            2
+            if core::is_limit_error(&error) {
+                3
+            } else {
+                2
+            }
         }
     }
 }

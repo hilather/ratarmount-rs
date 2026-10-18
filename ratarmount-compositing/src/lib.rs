@@ -9,6 +9,7 @@ mod control;
 mod empty_archive;
 mod folder;
 mod oci_whiteout;
+pub mod overlay_changes;
 pub mod overlay_layer;
 pub mod overlay_meta;
 mod overlay_policy;

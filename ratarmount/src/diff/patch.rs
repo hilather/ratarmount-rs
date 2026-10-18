@@ -1,25 +1,31 @@
-//! Unified hunks and Git literal binary patches (zlib + Git base85).
+//! Unified byte hunks and streaming Git literal binary patches (zlib + Git base85).
 
-use std::fmt::Write as _;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 
 use flate2::{write::ZlibEncoder, Compression};
+use ratarmount_compositing::overlay_changes::{binary, Entry};
+use ratarmount_core::{S_IFDIR, S_IFMT};
 use sha1::{Digest, Sha1};
 
-use super::{Change, DiffArgs, Entry};
+use super::{Change, DiffArgs};
 
 const BASE85: &[u8; 85] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
 
 pub(super) fn quote(path: &str) -> String {
+    quote_bytes(path.as_bytes())
+}
+
+pub(super) fn quote_bytes(path: &[u8]) -> String {
     if path
-        .bytes()
-        .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+        .iter()
+        .all(|b| b.is_ascii_graphic() && *b != b'"' && *b != b'\\')
     {
-        return path.to_owned();
+        return String::from_utf8(path.to_vec()).expect("ASCII path");
     }
+    use std::fmt::Write as _;
     let mut out = String::from("\"");
-    for b in path.bytes() {
+    for &b in path {
         match b {
             b'"' => out.push_str("\\\""),
             b'\\' => out.push_str("\\\\"),
@@ -36,38 +42,72 @@ pub(super) fn quote(path: &str) -> String {
     out
 }
 
-fn bytes(entry: &Option<Entry>) -> &[u8] {
-    entry.as_ref().map_or(&[], |e| e.data.as_slice())
+fn bytes(entry: &Option<Entry>) -> io::Result<Vec<u8>> {
+    entry
+        .as_ref()
+        .map_or_else(|| Ok(Vec::new()), Entry::read_bytes)
 }
 
-fn binary(data: &[u8]) -> bool {
-    data.contains(&0) || std::str::from_utf8(data).is_err()
+fn blob_id(entry: &Option<Entry>) -> io::Result<String> {
+    let Some(entry) = entry else {
+        return Ok("0".repeat(40));
+    };
+    let mut hash = Sha1::new();
+    hash.update(format!("blob {}\0", entry.size).as_bytes());
+    let mut reader = entry.open()?.take(entry.size.saturating_add(1));
+    let mut block = [0; 64 * 1024];
+    loop {
+        let n = reader.read(&mut block)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&block[..n]);
+    }
+    if reader.limit() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "content changed during Git blob hashing",
+        ));
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
-fn blob_id(entry: &Option<Entry>) -> String {
-    match entry {
-        None => "0".repeat(40),
-        Some(entry) => {
-            let mut hash = Sha1::new();
-            hash.update(format!("blob {}\0", entry.data.len()).as_bytes());
-            hash.update(&entry.data);
-            format!("{:x}", hash.finalize())
+fn literal(out: &mut dyn Write, entry: &Option<Entry>) -> io::Result<()> {
+    // Spool compressed data, never the uncompressed payload. This keeps a
+    // size-fallback literal bounded even for a multi-gigabyte file.
+    let mut zlib = ZlibEncoder::new(tempfile::tempfile()?, Compression::default());
+    let size = entry.as_ref().map_or(0, |e| e.size);
+    if let Some(entry) = entry {
+        let copied = io::copy(&mut entry.open()?.take(size.saturating_add(1)), &mut zlib)?;
+        if copied != size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "content changed during binary patch",
+            ));
         }
     }
-}
-
-fn literal(out: &mut String, data: &[u8]) -> io::Result<()> {
-    let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
-    zlib.write_all(data)?;
-    let compressed = zlib.finish()?;
-    let _ = writeln!(out, "literal {}", data.len());
-    for chunk in compressed.chunks(52) {
-        out.push(if chunk.len() <= 26 {
-            b'A' + chunk.len() as u8 - 1
+    let mut compressed = zlib.finish()?;
+    compressed.rewind()?;
+    writeln!(out, "literal {size}")?;
+    let mut block = [0; 52];
+    loop {
+        let mut n = 0;
+        while n < block.len() {
+            let read = compressed.read(&mut block[n..])?;
+            if read == 0 {
+                break;
+            }
+            n += read;
+        }
+        if n == 0 {
+            break;
+        }
+        out.write_all(&[if n <= 26 {
+            b'A' + n as u8 - 1
         } else {
-            b'a' + chunk.len() as u8 - 27
-        } as char);
-        for word in chunk.chunks(4) {
+            b'a' + n as u8 - 27
+        }])?;
+        for word in block[..n].chunks(4) {
             let mut padded = [0; 4];
             padded[..word.len()].copy_from_slice(word);
             let mut value = u32::from_be_bytes(padded);
@@ -76,25 +116,40 @@ fn literal(out: &mut String, data: &[u8]) -> io::Result<()> {
                 *digit = BASE85[(value % 85) as usize];
                 value /= 85;
             }
-            for digit in encoded {
-                out.push(digit as char);
-            }
+            out.write_all(&encoded)?;
         }
-        out.push('\n');
+        out.write_all(b"\n")?;
     }
-    out.push('\n');
-    Ok(())
+    out.write_all(b"\n")
+}
+
+fn is_binary(entry: &Option<Entry>, max_text: u64) -> io::Result<bool> {
+    let Some(entry) = entry else {
+        return Ok(false);
+    };
+    if entry.size > max_text {
+        return Ok(true);
+    }
+    let mut prefix = Vec::new();
+    entry.open()?.take(8192).read_to_end(&mut prefix)?;
+    Ok(binary(&prefix))
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Line<'a> {
     tag: char,
-    text: &'a str,
+    text: &'a [u8],
 }
 
-fn lines<'a>(old: &'a str, new: &'a str) -> Vec<Line<'a>> {
-    let a: Vec<_> = old.split_inclusive('\n').collect();
-    let b: Vec<_> = new.split_inclusive('\n').collect();
+fn lines<'a>(old: &'a [u8], new: &'a [u8]) -> Vec<Line<'a>> {
+    let a: Vec<_> = old
+        .split_inclusive(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    let b: Vec<_> = new
+        .split_inclusive(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
     let prefix = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
     let suffix = a[prefix..]
         .iter()
@@ -118,7 +173,7 @@ fn lines<'a>(old: &'a str, new: &'a str) -> Vec<Line<'a>> {
     result
 }
 
-fn myers<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<Line<'a>> {
+fn myers<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> Vec<Line<'a>> {
     let fallback = || {
         a.iter()
             .map(|text| Line { tag: '-', text })
@@ -211,7 +266,7 @@ fn range(before: usize, count: usize) -> String {
     }
 }
 
-fn hunks(out: &mut String, lines: &[Line<'_>], context: usize) {
+fn hunks(out: &mut dyn Write, lines: &[Line<'_>], context: usize) -> io::Result<()> {
     let changed: Vec<_> = lines
         .iter()
         .enumerate()
@@ -235,33 +290,32 @@ fn hunks(out: &mut String, lines: &[Line<'_>], context: usize) {
         }
         let old_count = lines[start..end].iter().filter(|l| l.tag != '+').count();
         let new_count = lines[start..end].iter().filter(|l| l.tag != '-').count();
-        let _ = writeln!(
+        writeln!(
             out,
             "@@ -{} +{} @@",
             range(old_before, old_count),
             range(new_before, new_count)
-        );
+        )?;
         for line in &lines[start..end] {
-            out.push(line.tag);
-            out.push_str(line.text);
-            if !line.text.ends_with('\n') {
-                out.push_str("\n\\ No newline at end of file\n");
+            out.write_all(&[line.tag as u8])?;
+            out.write_all(line.text)?;
+            if !line.text.ends_with(b"\n") {
+                out.write_all(b"\n\\ No newline at end of file\n")?;
             }
         }
         old_before += old_count;
         new_before += new_count;
         previous = end;
     }
+    Ok(())
 }
 
-fn file_patch(out: &mut String, change: &Change, args: &DiffArgs) -> io::Result<()> {
+fn file_patch(out: &mut dyn Write, change: &Change, args: &DiffArgs) -> io::Result<()> {
     let Change { from, to, old, new } = change;
-    // Git represents a type change as a deletion followed by an addition.
-    if args.git
-        && old
-            .as_ref()
-            .zip(new.as_ref())
-            .is_some_and(|(a, b)| a.git_mode() & 0o170000 != b.git_mode() & 0o170000)
+    if old
+        .as_ref()
+        .zip(new.as_ref())
+        .is_some_and(|(a, b)| a.mode & S_IFMT != b.mode & S_IFMT)
     {
         file_patch(
             out,
@@ -284,11 +338,15 @@ fn file_patch(out: &mut String, change: &Change, args: &DiffArgs) -> io::Result<
             args,
         );
     }
+    if old
+        .as_ref()
+        .or(new.as_ref())
+        .is_some_and(|e| e.mode & S_IFMT == S_IFDIR)
+    {
+        return Ok(());
+    }
     let a = quote(&format!("a/{from}"));
     let b = quote(&format!("b/{to}"));
-    if args.git {
-        let _ = writeln!(out, "diff --git {a} {b}");
-    }
     let mode = |entry: &Entry| {
         if args.git {
             entry.git_mode()
@@ -296,252 +354,139 @@ fn file_patch(out: &mut String, change: &Change, args: &DiffArgs) -> io::Result<
             entry.mode
         }
     };
+    let content_changed =
+        old.as_ref().and_then(|e| e.hash.as_ref()) != new.as_ref().and_then(|e| e.hash.as_ref());
+    let mode_changed = old
+        .as_ref()
+        .zip(new.as_ref())
+        .is_some_and(|(a, b)| mode(a) != mode(b));
+    if !content_changed && (!mode_changed || args.ignore_mode) && from == to {
+        return Ok(());
+    }
+    if args.git {
+        writeln!(out, "diff --git {a} {b}")?;
+    }
     match (old, new) {
-        (None, Some(new)) => {
-            let _ = writeln!(out, "new file mode {:06o}", mode(new));
-        }
-        (Some(old), None) => {
-            let _ = writeln!(out, "deleted file mode {:06o}", mode(old));
-        }
-        (Some(old), Some(new)) if mode(old) != mode(new) => {
-            let _ = writeln!(
-                out,
-                "old mode {:06o}\nnew mode {:06o}",
-                mode(old),
-                mode(new)
-            );
-        }
+        (None, Some(new)) => writeln!(out, "new file mode {:06o}", mode(new))?,
+        (Some(old), None) => writeln!(out, "deleted file mode {:06o}", mode(old))?,
+        (Some(old), Some(new)) if mode_changed && !args.ignore_mode => writeln!(
+            out,
+            "old mode {:06o}\nnew mode {:06o}",
+            mode(old),
+            mode(new)
+        )?,
         _ => {}
     }
     if from != to {
-        let _ = writeln!(
+        writeln!(
             out,
             "similarity index 100%\nrename from {}\nrename to {}",
             quote(from),
             quote(to)
-        );
+        )?;
     }
-    let before = bytes(old);
-    let after = bytes(new);
-    let content_changed = before != after;
     if args.git && (content_changed || old.is_none() || new.is_none()) {
         let common_mode = old
             .as_ref()
             .zip(new.as_ref())
             .filter(|(a, b)| a.git_mode() == b.git_mode())
-            .map(|(entry, _)| format!(" {:06o}", entry.git_mode()))
+            .map(|(e, _)| format!(" {:06o}", e.git_mode()))
             .unwrap_or_default();
-        let _ = writeln!(out, "index {}..{}{common_mode}", blob_id(old), blob_id(new));
+        writeln!(
+            out,
+            "index {}..{}{common_mode}",
+            blob_id(old)?,
+            blob_id(new)?
+        )?;
     }
     if !content_changed && old.is_some() && new.is_some() {
         if !args.git {
-            let _ = writeln!(out, "--- {a}\n+++ {b}");
+            writeln!(out, "--- {a}\n+++ {b}")?;
         }
         return Ok(());
     }
-    if binary(before) || binary(after) {
+    if is_binary(old, args.max_diff_bytes)? || is_binary(new, args.max_diff_bytes)? {
         if args.git {
-            out.push_str("GIT binary patch\n");
-            literal(out, after)?;
-            literal(out, before)?;
+            out.write_all(b"GIT binary patch\n")?;
+            literal(out, new)?;
+            literal(out, old)?;
         } else {
-            let _ = writeln!(out, "Binary files {a} and {b} differ");
+            writeln!(out, "Binary files {a} and {b} differ")?;
         }
-    } else if content_changed || !args.git {
-        let _ = writeln!(
-            out,
-            "--- {}\n+++ {}",
-            if old.is_none() { "/dev/null" } else { &a },
-            if new.is_none() { "/dev/null" } else { &b }
-        );
-        hunks(
-            out,
-            &lines(
-                std::str::from_utf8(before).expect("text"),
-                std::str::from_utf8(after).expect("text"),
-            ),
-            args.context,
-        );
+    } else {
+        let before = bytes(old)?;
+        let after = bytes(new)?;
+        if before != after || !args.git {
+            writeln!(
+                out,
+                "--- {}\n+++ {}",
+                if old.is_none() { "/dev/null" } else { &a },
+                if new.is_none() { "/dev/null" } else { &b }
+            )?;
+            hunks(out, &lines(&before, &after), args.context)?;
+        }
     }
     Ok(())
 }
 
-pub(super) fn render(changes: &[Change], args: &DiffArgs) -> io::Result<String> {
-    let mut out = String::new();
-    let (mut inserted, mut removed) = (0, 0);
+pub(super) fn render(changes: &[Change], args: &DiffArgs, out: &mut dyn Write) -> io::Result<()> {
+    let (mut inserted, mut removed, mut written) = (0, 0, 0u64);
+    let mut stats = Vec::new();
     for change in changes {
         if args.name_status {
             if change.from != change.to {
-                let _ = writeln!(out, "R100\t{}\t{}", quote(&change.from), quote(&change.to));
+                writeln!(out, "R100\t{}\t{}", quote(&change.from), quote(&change.to))?;
             } else {
-                let _ = writeln!(out, "{}\t{}", change.status(), quote(&change.to));
+                writeln!(out, "{}\t{}", change.status(), quote(&change.to))?;
             }
         } else if args.stat {
-            let before = bytes(&change.old);
-            let after = bytes(&change.new);
             let path = if change.from == change.to {
                 quote(&change.to)
             } else {
                 format!("{} => {}", quote(&change.from), quote(&change.to))
             };
-            if binary(before) || binary(after) {
-                let _ = writeln!(
-                    out,
-                    " {path} | Bin {} -> {} bytes",
-                    before.len(),
-                    after.len()
-                );
+            let before_size = change.old.as_ref().map_or(0, |e| e.size);
+            let after_size = change.new.as_ref().map_or(0, |e| e.size);
+            written += after_size;
+            let binary = is_binary(&change.old, args.max_diff_bytes)?
+                || is_binary(&change.new, args.max_diff_bytes)?;
+            let (adds, dels) = if binary {
+                (0, 0)
             } else {
-                let edits = lines(
-                    std::str::from_utf8(before).expect("text"),
-                    std::str::from_utf8(after).expect("text"),
-                );
-                let adds = edits.iter().filter(|l| l.tag == '+').count();
-                let dels = edits.iter().filter(|l| l.tag == '-').count();
-                inserted += adds;
-                removed += dels;
-                let _ = writeln!(out, " {path} | {} (+{adds} -{dels})", adds + dels);
+                let before = bytes(&change.old)?;
+                let after = bytes(&change.new)?;
+                let edits = lines(&before, &after);
+                (
+                    edits.iter().filter(|l| l.tag == '+').count(),
+                    edits.iter().filter(|l| l.tag == '-').count(),
+                )
+            };
+            inserted += adds;
+            removed += dels;
+            if args.json {
+                stats.push(serde_json::json!({"path":change.to,"insertions":adds,"deletions":dels,"binary":binary,"bytes_written":after_size}));
+            } else if binary {
+                writeln!(out, " {path} | Bin {before_size} -> {after_size} bytes")?;
+            } else {
+                writeln!(out, " {path} | {} (+{adds} -{dels})", adds + dels)?;
             }
         } else {
-            file_patch(&mut out, change, args)?;
+            file_patch(out, change, args)?;
         }
     }
-    if args.stat && !changes.is_empty() {
-        let _ = writeln!(
-            out,
-            " {} files changed, {inserted} insertions(+), {removed} deletions(-)",
-            changes.len()
-        );
+    if args.stat {
+        if args.json {
+            serde_json::to_writer(
+                &mut *out,
+                &serde_json::json!({"files":changes.len(),"insertions":inserted,"deletions":removed,"bytes_written":written,"paths":stats}),
+            )?;
+            out.write_all(b"\n")?;
+        } else if !changes.is_empty() {
+            writeln!(out, " {} files changed, {inserted} insertions(+), {removed} deletions(-), {written} bytes written", changes.len())?;
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Read;
-
-    /// Regression: binary literals must round-trip without an installed Git.
-    #[test]
-    fn regression_diff_binary_literal_roundtrip() {
-        for data in [vec![], vec![0], (0..=255).cycle().take(10_000).collect()] {
-            let args = DiffArgs {
-                directory: "unused".into(),
-                base: None,
-                git: true,
-                context: 3,
-                stat: false,
-                name_status: false,
-                include_git_dir: false,
-            };
-            let change = Change {
-                from: "bin".into(),
-                to: "bin".into(),
-                old: Some(Entry {
-                    mode: 0o100644,
-                    data: vec![0xff, 0],
-                }),
-                new: Some(Entry {
-                    mode: 0o100644,
-                    data: data.clone(),
-                }),
-            };
-            let patch = render(&[change], &args).unwrap();
-            let encoded = patch.split_once("GIT binary patch\n").unwrap().1;
-            let mut lines = encoded.lines();
-            assert_eq!(lines.next().unwrap(), format!("literal {}", data.len()));
-            let mut compressed = Vec::new();
-            for line in lines.take_while(|line| !line.is_empty()) {
-                let len = match line.as_bytes()[0] {
-                    b'A'..=b'Z' => line.as_bytes()[0] - b'A' + 1,
-                    n => n - b'a' + 27,
-                } as usize;
-                let mut block = Vec::new();
-                for word in line.as_bytes()[1..].as_chunks::<5>().0 {
-                    let value = word.iter().fold(0u32, |n, digit| {
-                        n * 85 + BASE85.iter().position(|v| v == digit).unwrap() as u32
-                    });
-                    block.extend_from_slice(&value.to_be_bytes());
-                }
-                compressed.extend_from_slice(&block[..len]);
-            }
-            let mut decoded = Vec::new();
-            flate2::read::ZlibDecoder::new(compressed.as_slice())
-                .read_to_end(&mut decoded)
-                .unwrap();
-            assert_eq!(decoded, data);
-        }
-        assert_eq!(
-            blob_id(&Some(Entry {
-                mode: 0o100644,
-                data: vec![]
-            })),
-            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
-        );
-    }
-
-    /// Regression: separated edits, zero context and missing newlines retain exact ranges.
-    #[test]
-    fn regression_diff_context_and_missing_newline() {
-        let mut out = String::new();
-        hunks(
-            &mut out,
-            &lines("a\nb\nc\nd\ne\nf\ng\nh\n", "A\nb\nc\nd\ne\nf\ng\nH"),
-            1,
-        );
-        assert_eq!(out, "@@ -1,2 +1,2 @@\n-a\n+A\n b\n@@ -7,2 +7,2 @@\n g\n-h\n+H\n\\ No newline at end of file\n");
-        out.clear();
-        hunks(&mut out, &lines("a\nb\n", "a\nx\nb\n"), 0);
-        assert_eq!(out, "@@ -1,0 +2 @@\n+x\n");
-    }
-
-    /// Regression: edit scripts must preserve both inputs for repeated and empty lines.
-    #[test]
-    fn regression_diff_edit_script_preserves_inputs() {
-        let samples = [
-            "",
-            "a",
-            "a\n",
-            "\n",
-            "a\nb\na\n",
-            "b\na\nb",
-            "\n\na\na\nb\n",
-        ];
-        for a in samples {
-            for b in samples {
-                let script = lines(a, b);
-                assert_eq!(
-                    script
-                        .iter()
-                        .filter(|l| l.tag != '+')
-                        .map(|l| l.text)
-                        .collect::<String>(),
-                    a
-                );
-                assert_eq!(
-                    script
-                        .iter()
-                        .filter(|l| l.tag != '-')
-                        .map(|l| l.text)
-                        .collect::<String>(),
-                    b
-                );
-            }
-        }
-    }
-
-    /// Regression: unrelated large text must produce an exact replacement with bounded traceback.
-    #[test]
-    fn regression_diff_large_replacement_bounds_traceback() {
-        let a = vec!["old\n"; 2000];
-        let b = vec!["new\n"; 2000];
-        let script = myers(&a, &b);
-        assert_eq!(script.len(), 4000);
-        assert!(script[..2000]
-            .iter()
-            .all(|line| line.tag == '-' && line.text == "old\n"));
-        assert!(script[2000..]
-            .iter()
-            .all(|line| line.tag == '+' && line.text == "new\n"));
-    }
-}
+mod tests;

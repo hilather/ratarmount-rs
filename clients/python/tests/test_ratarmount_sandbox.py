@@ -133,3 +133,16 @@ def test_regression_base_destroy_and_shutdown_do_not_double_destroy(daemon):
     client.shutdown()
     client.close()
     assert requests[-1]["op"] == "shutdown"
+
+
+def test_regression_latin1_patch_bytes_are_not_replaced():
+    from ratarmount_sandbox import Attempt
+
+    class Client:
+        def _call(self, op, **kwargs):
+            assert op == "diff"
+            return {"patch_b64": "K2NhZukK"}
+
+    attempt = Attempt(Client(), dict(id="1", base="base", path="/mnt/1",
+                                     overlay_dir="/overlay/1", status="ready"))
+    assert attempt.diff() == b"+caf\xe9\n"
