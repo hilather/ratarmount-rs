@@ -1581,8 +1581,10 @@ impl OverlayMeta {
 
 /// Write `rows` into an unsealed overlay's `meta` table (a forced seal).
 pub fn record_base_rows_offline(overlay: &Path, rows: &BTreeMap<String, String>) -> Result<()> {
+    // NOFOLLOW rejects a symlink in any component, so resolve the directory
+    // first (every macOS temp dir lives under /var -> /private/var).
     let conn = Connection::open_with_flags(
-        overlay.join(HIDDEN_DB),
+        overlay.canonicalize()?.join(HIDDEN_DB),
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     conn.busy_timeout(std::time::Duration::ZERO)?;

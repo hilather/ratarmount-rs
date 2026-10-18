@@ -545,3 +545,27 @@ fn regression_forced_pack_clears_obsolete_identity_rows() {
         text(&out)
     );
 }
+
+/// Regression (R4-S11): a forced seal opened the overlay database with
+/// `SQLITE_OPEN_NOFOLLOW` without resolving the parent, so an overlay reached
+/// through a symlinked directory (`/link/overlay`, macOS `/tmp/...`) failed
+/// with `SQLITE_CANTOPEN_SYMLINK`.
+#[test]
+fn regression_forced_seal_under_symlinked_parent() {
+    let env = Env::new();
+    let (base, overlay) = fixture(&env, Kind::Dir, false);
+    edit(&base, Kind::Dir);
+    let link = env.path("link");
+    std::os::unix::fs::symlink(env.path(""), &link).unwrap();
+    let through = link.join("overlay");
+    let out = verb(
+        &env,
+        Verb::Seal,
+        &through,
+        &base,
+        &["--force-base-mismatch"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(meta_of(&overlay).layer_sealed());
+    assert!(meta_of(&overlay).get("base_mismatch_forced_at").is_some());
+}
