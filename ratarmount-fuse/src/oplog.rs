@@ -178,6 +178,9 @@ impl OpLog {
             output.write_all(b"\n")?;
         }
         let start = Instant::now();
+        // Absolute, so a journal read later or elsewhere still names the mount.
+        let mount = std::path::absolute(mount).unwrap_or_else(|_| mount.to_path_buf());
+        let overlay = overlay.map(|o| std::path::absolute(o).unwrap_or_else(|_| o.to_path_buf()));
         write_line(
             &mut output,
             &json!({"journal": 1, "mount": mount,
@@ -648,6 +651,29 @@ mod tests {
         assert_eq!(ranges.first_ts, Some(0));
         assert_eq!(ranges.bytes, 12);
         assert_eq!(ranges.count, 3);
+    }
+
+    #[test]
+    /// Regression: the header recorded the mount and overlay exactly as given
+    /// on the command line ("mnt"), so a stored journal could not name them.
+    fn regression_oplog_header_paths_are_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace");
+        let log = OpLog::open(
+            &options(path.clone()),
+            Path::new("relative-mnt"),
+            Some(Path::new("relative-overlay")),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        drop(log);
+        let header = &records(&path)[0];
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(header["mount"], cwd.join("relative-mnt").to_str().unwrap());
+        assert_eq!(
+            header["overlay"],
+            cwd.join("relative-overlay").to_str().unwrap()
+        );
     }
 
     #[test]
