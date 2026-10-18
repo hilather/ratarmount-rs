@@ -1370,6 +1370,10 @@ struct MountedBase {
     /// addition to the bottom lower's recorded set so a top or mount point
     /// inside the base does not make the base differ.
     extra_excludes: Vec<PathBuf>,
+    /// `--journal` files that already exist inside a directory base. They count
+    /// as base content (a read-only mount records no exclusions), so a changed
+    /// base is refused naming them.
+    existing_journals: Vec<PathBuf>,
 }
 
 /// Whether [`MountLowerStack`] compares the mounted base with the bottom
@@ -1478,8 +1482,18 @@ fn mounted_base_identity(
                     lower.display()
                 )
             } else {
+                let journals: String = base
+                    .existing_journals
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "; the existing --journal file {} lies inside the base and counts as base content (move it outside the base, or pass --force-stack-mismatch)",
+                            p.display()
+                        )
+                    })
+                    .collect();
                 format!(
-                    "lower {} was sealed against a different base than the mounted one; run `overlay verify {} BASE` to compare digests, or pass --force-stack-mismatch to mount anyway",
+                    "lower {} was sealed against a different base than the mounted one; run `overlay verify {} BASE` to compare digests, or pass --force-stack-mismatch to mount anyway{journals}",
                     lower.display(),
                     lower.display()
                 )
@@ -2419,6 +2433,11 @@ fn main() {
                 args.write_overlay.as_deref(),
                 args.journal.iter().cloned().collect(),
                 mount_point_exclusion(&args, mountpoint.as_deref(), &inputs).as_deref(),
+            ),
+            existing_journals: existing_journals_inside_base(
+                inputs.first().map(PathBuf::as_path),
+                &args.lower,
+                &args.journal,
             ),
             path: (inputs.len() == 1).then(|| inputs[0].clone()),
             git_tree: overlay_git_tree.clone(),
@@ -4725,6 +4744,30 @@ fn lower_extra_excludes(
         out.extend(resolved.paths().iter().cloned());
     }
     out
+}
+
+/// `--journal` files that exist already and lie inside a directory base under a
+/// `--lower` stack (see [`MountedBase::existing_journals`]).
+fn existing_journals_inside_base(
+    base: Option<&Path>,
+    lowers: &[PathBuf],
+    journals: &Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let Some(base) = base.filter(|b| !lowers.is_empty() && b.is_dir()) else {
+        return Vec::new();
+    };
+    journals
+        .iter()
+        .filter(|p| std::fs::symlink_metadata(p).is_ok())
+        .filter(|p| {
+            ratarmount_compositing::overlay_meta::resolve_base_excludes(
+                base,
+                std::slice::from_ref(*p),
+            )
+            .is_ok_and(|(_, inside)| !inside.paths().is_empty())
+        })
+        .cloned()
+        .collect()
 }
 
 fn mount_point_exclusion(

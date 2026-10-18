@@ -328,8 +328,49 @@ mod mounted {
         fs::write(&existing, b"someone's file").unwrap();
         let error = ro(&existing, &[]).unwrap_err();
         assert!(error.contains("different base"), "{error}");
+        // K8: the refusal names the override and the journal path that caused it.
+        assert!(error.contains("--force-stack-mismatch"), "{error}");
+        assert!(
+            error.contains(existing.to_str().unwrap()) && error.contains("--journal"),
+            "the refusal must name the journal path {}: {error}",
+            existing.display()
+        );
         // The explicit override still works.
         ro(&existing, &[OsStr::new("--force-stack-mismatch")]).unwrap();
+    }
+
+    /// Regression (K9): the same scenario with a new writable top,
+    /// `--lower L -w NEWTOP --journal B/new.log`, where `B/new.log` is an
+    /// ordinary file added to the base after sealing: refused (not hidden by the
+    /// invocation exclusion), naming the override and the path.
+    #[test]
+    fn regression_writable_top_journal_cannot_hide_an_existing_base_file() {
+        if !available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = base_dir(tmp.path());
+        let lower = tmp.path().join("lower");
+        ok(no_mount(tmp.path(), &lower, &base, &[]));
+        ok(cli(
+            tmp.path(),
+            &[OsStr::new("overlay"), OsStr::new("seal"), lower.as_os_str()],
+        ));
+        let mnt = tmp.path().join("mnt");
+        fs::create_dir(&mnt).unwrap();
+        let existing = base.join("new.log");
+        fs::write(&existing, b"someone's file").unwrap();
+        let top = tmp.path().join("top");
+        let flags = [
+            OsStr::new("--lower"),
+            lower.as_os_str(),
+            OsStr::new("--journal"),
+            existing.as_os_str(),
+        ];
+        let error = cycle_with(tmp.path(), Some(&top), &base, &mnt, &flags, &|_| {}).unwrap_err();
+        assert!(error.contains("different base"), "{error}");
+        assert!(error.contains("--force-stack-mismatch"), "{error}");
+        assert_eq!(fs::read(&existing).unwrap(), b"someone's file");
     }
 
     fn write_through(name: &'static str) -> impl Fn(&Path) {
