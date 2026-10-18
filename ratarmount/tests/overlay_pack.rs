@@ -604,3 +604,139 @@ fn regression_unpack_flag_caps_refuse_bundle_and_override_env() {
     expect(out, 0);
     assert!(dest.is_dir());
 }
+
+/// Run `overlay pack OVERLAY OUT` with the pack-hold seam, SIGKILL it while it
+/// holds its output temp file, and return the entries it left beside `OUT`.
+fn kill_pack(f: &Fixture, out: &Path) -> Vec<String> {
+    let ready = f.tmp.path().join("pack-ready");
+    let _ = fs::remove_file(&ready);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .env("XDG_CACHE_HOME", &f.cache)
+        .env("RATARMOUNT_TEST_PACK_HOLD", &ready)
+        .args(["overlay", "pack"])
+        .arg(&f.overlay)
+        .arg(out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pack never started writing"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.kill().unwrap(); // SIGKILL
+    child.wait().unwrap();
+    assert!(!out.exists(), "killed pack published a bundle");
+    entries(out.parent().unwrap())
+}
+
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn backdate(path: &Path, secs: u64) {
+    let when = std::time::SystemTime::now() - Duration::from_secs(secs);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(when))
+        .unwrap();
+}
+
+/// Regression (I3): a SIGKILLed `overlay pack` left an empty `.tmpXXXXXX`
+/// (and its staging directory) beside the bundle, and the next pack never
+/// swept them. Now they carry a `.ratarmount-pack-` name and the next pack
+/// removes the dead ones; young, locked, foreign-named and symlinked files stay.
+#[test]
+fn regression_pack_sweeps_killed_pack_leftovers() {
+    use std::os::fd::AsRawFd;
+    let f = Fixture::new();
+    let work = f.tmp.path().join("out");
+    fs::create_dir(&work).unwrap();
+    let out = work.join("b.tar.zst");
+    let left = kill_pack(&f, &out);
+    let temps: Vec<&String> = left
+        .iter()
+        .filter(|n| n.starts_with(".ratarmount-pack-"))
+        .collect();
+    assert!(
+        !temps.is_empty(),
+        "no recognisable pack leftovers: {left:?}"
+    );
+    assert!(
+        left.iter().all(|n| n.starts_with(".ratarmount-pack-")),
+        "anonymous leftovers: {left:?}"
+    );
+    let dead_file = work.join(
+        temps
+            .iter()
+            .find(|n| n.ends_with(".tmp"))
+            .expect("temp file"),
+    );
+    assert_eq!(fs::metadata(&dead_file).unwrap().len(), 0);
+    // Negatives: a young dead-shaped file, a live (locked) old one, foreign
+    // names, an old symlink and the old anonymous `.tmpXXXXXX` shape.
+    let young = work.join(".ratarmount-pack-Yg9Zq1.tmp");
+    fs::write(&young, b"").unwrap();
+    let live = work.join(".ratarmount-pack-Lv3Aa0.tmp");
+    fs::write(&live, b"").unwrap();
+    backdate(&live, 3600);
+    let live_file = fs::File::open(&live).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(live_file.as_raw_fd(), libc::LOCK_EX) },
+        0
+    );
+    let mut keep = vec![young, live];
+    for name in [
+        ".ratarmount-pack-notes.tmp",
+        ".ratarmount-pack-aB3xY.tmp",
+        ".ratarmount-pack-aB3xY99.tmp",
+        ".ratarmount-pack-aB3xY9.tmp.bak",
+        "x.ratarmount-pack-aB3xY9.tmp",
+        ".tmpAb3xY9",
+    ] {
+        let path = work.join(name);
+        fs::write(&path, b"").unwrap();
+        backdate(&path, 3600);
+        keep.push(path);
+    }
+    let target = f.tmp.path().join("precious");
+    fs::write(&target, b"x").unwrap();
+    let link = work.join(".ratarmount-pack-Sy1Mk2.tmp");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    keep.push(link);
+    // The killed pack's leftovers are fresh: backdate them like a pack that
+    // died long ago, then a second pack sweeps them.
+    for name in &left {
+        if work.join(name).is_file() {
+            backdate(&work.join(name), 3600);
+        }
+    }
+    expect(
+        command(
+            &[Path::new("overlay"), Path::new("pack"), &f.overlay, &out],
+            &f.cache,
+        ),
+        0,
+    );
+    assert!(out.exists());
+    let after = entries(&work);
+    for name in &left {
+        assert!(!after.contains(name), "not swept: {name} in {after:?}");
+    }
+    for path in keep {
+        assert!(path.symlink_metadata().is_ok(), "swept {}", path.display());
+    }
+    assert!(target.exists());
+    drop(live_file);
+}

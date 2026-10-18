@@ -273,7 +273,8 @@ pub fn pack(
     let mut plain = tempfile::tempfile()?;
     // An overlay from an earlier build may hold a credentialed base URL: export
     // a redacted copy of its database; the source is never modified.
-    let staging = tempfile::tempdir_in(output_parent)?;
+    sweep_pack_temps(output_parent);
+    let staging = Stage::new_in(output_parent, PACK_STAGE_PREFIX, false)?;
     let packed = match &options.base_rows {
         Some(rows) => meta.with_rows(rows),
         None => meta.clone(),
@@ -344,7 +345,18 @@ pub fn pack(
     }
     plain.rewind()?;
     let mut remaining = plain.metadata()?.len();
-    let mut encoded = tempfile::NamedTempFile::new_in(output_parent)?;
+    let mut encoded = tempfile::Builder::new()
+        .prefix(PACK_TEMP_PREFIX)
+        .suffix(PACK_TEMP_SUFFIX)
+        .tempfile_in(output_parent)?;
+    // Held while the file is written, so a concurrent pack's sweep never
+    // removes a live temp file; released when the process exits or is killed.
+    if !try_flock(encoded.as_file()) {
+        return Err(io::Error::other(
+            "pack temp file is locked by another process",
+        ));
+    }
+    ratarmount_compositing::overlay_meta::test_pack_hold();
     {
         let mut writer =
             ratarmount_compress::ZstdFrameWriter::new(BufWriter::new(encoded.as_file_mut()), 3);
@@ -744,7 +756,65 @@ fn open_nofollow(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-const STAGE_PREFIXES: [&str; 2] = [".ratarmount-unpack-", ".ratarmount-layer-"];
+const PACK_STAGE_PREFIX: &str = ".ratarmount-pack-stage-";
+const STAGE_PREFIXES: [&str; 3] = [
+    ".ratarmount-unpack-",
+    ".ratarmount-layer-",
+    PACK_STAGE_PREFIX,
+];
+/// `overlay pack` writes the bundle to `.ratarmount-pack-` + six random
+/// alphanumerics + `.tmp` beside the output and renames it into place.
+const PACK_TEMP_PREFIX: &str = ".ratarmount-pack-";
+const PACK_TEMP_SUFFIX: &str = ".tmp";
+/// A file younger than this may be a pack that has not taken its lock yet.
+const PACK_TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn is_pack_temp_name(name: &str) -> bool {
+    name.strip_prefix(PACK_TEMP_PREFIX)
+        .and_then(|rest| rest.strip_suffix(PACK_TEMP_SUFFIX))
+        .is_some_and(|random| {
+            random.len() == 6 && random.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+}
+
+/// Remove temp files of killed packs from the output directory: exact name
+/// shape, regular file (never a symlink), ours, at least a minute old and not
+/// locked (a live pack holds an exclusive flock on its file). Staging
+/// directories are swept with the other stages. The anonymous `.tmpXXXXXX`
+/// names of earlier builds cannot be told from other programs' temp files and
+/// are left alone. Best effort.
+fn sweep_pack_temps(parent: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let euid = unsafe { libc::geteuid() };
+    for entry in entries.flatten() {
+        if !is_pack_temp_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.uid() != euid {
+            continue;
+        }
+        let old_enough = meta
+            .modified()
+            .ok()
+            .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+            .is_some_and(|age| age >= PACK_TEMP_MIN_AGE);
+        if !old_enough {
+            continue;
+        }
+        if let Ok(file) = open_nofollow(&path) {
+            if try_flock(&file) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
 const COPY_PREFIX: &str = ".ratarmount-copy-";
 
 /// Builds before the `.ratarmount-copy-` rename staged bundle copies as

@@ -835,6 +835,21 @@ pub fn test_hash_gate() -> Option<PathBuf> {
     }
 }
 
+/// Test seam (`test-hooks` feature or unit tests): when
+/// `RATARMOUNT_TEST_PACK_HOLD` names a file, `overlay pack` creates it as the
+/// ready signal once its output temp file exists and then blocks (60 s cap)
+/// so a test can SIGKILL it mid-write. A no-op in release builds.
+pub fn test_pack_hold() {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(ready) = std::env::var_os("RATARMOUNT_TEST_PACK_HOLD") {
+        let _ = fs::write(ready, b"ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 /// Compare-and-set a pending digest to `strong`. A no-op (`false`) unless the
 /// kind is still `pending` and the recorded stamp still equals `pending`'s, so
 /// a supplied digest, a forced reopen or a commit that moved the stamp wins.

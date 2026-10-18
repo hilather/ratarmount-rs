@@ -434,6 +434,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Journal header newer than supported fell through to "missing journal header" (R4-F5) | `cargo test -p ratarmount --bin ratarmount regression_journal_newer_version` |
 | Credentials leaked: `sandbox run` cleanup warning, rclone/restic/torrent/tracker URLs, userinfo containing `/`, `?` or `#` (R4-F4) | `cargo test -p ratarmount-core --lib regression_redact` · `cargo test -p ratarmount --bin ratarmount regression_run_cleanup_warning_is_redacted` |
 | `redact_remote_url` masked only the password; index-pointer WARN logged `?sig=` / SAS / presigned query and quoted error URLs (R4-I2) | `cargo test -p ratarmount-session --lib regression_redact_remote_url` · `cargo test -p ratarmount-session --lib regression_pointer_warn` |
+| Killed `overlay pack` leaves an anonymous `.tmpXXXXXX` temp file and staging dir beside the bundle that the next pack never sweeps (R4-I3; real SIGKILL via `RATARMOUNT_TEST_PACK_HOLD`; young, locked, foreign-named, symlinked and legacy-anonymous files stay) | `cargo test -p ratarmount --test overlay_pack regression_pack_sweeps_killed_pack_leftovers` |
 | overlay_exclusions: unmount helper passed on a `-z` fallback; empty refusal text hid a signal death (R4-F3/F3b) | `cargo test -p ratarmount --test overlay_exclusions` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
