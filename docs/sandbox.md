@@ -206,6 +206,37 @@ once. While a digest is `pending`, `diff --hash --json` and the `sandbox run`
 report give `base` and `stack` as `null` and `base_pending: true` (never a
 stack derived from an empty digest).
 
+#### Digest states
+
+`base_digest_state` is a stable contract next to `base_digest_kind`
+(`strong`, `weak`, `git-tree`, `none`, `pending`). It has three values:
+
+| State | Meaning |
+|---|---|
+| `present` | A digest is recorded: kind `strong`, `weak` or `git-tree`. |
+| `pending` | An archive base has not been hashed yet. `base_digest` and `stack_digest` are empty (`null` in JSON). |
+| `none` | No digest: `--base-digest none`, or a legacy overlay that recorded none. |
+
+It appears in `overlay info` (text and `--json`), in the root xattr
+`user.ratarmount.base_digest_state` of a mount (it changes from `pending` to
+`present` when the background hasher finishes; a read-only `--lower` mount
+reports `pending` when the base archive was never hashed), and in the
+`diff --hash --json` and `sandbox run` `patch_hash` reports. Those reports keep
+the older boolean `base_pending` (true exactly when the state is `pending`) for
+compatibility. `pending` means the archive was not hashed yet, so there is no
+base identity to compare: a consumer that needs one (for example cpanmine)
+must treat `pending` as an error, or resolve it first with `overlay seal`.
+
+When a verb resolves a `pending` digest it hashes the archive through the
+index digest cache: with a writable index the digest is written there, and
+every later mount or verb reads it (no more hashing). Without one (`:memory:`,
+read-only or hard-linked index, none) the digest is recorded in the overlay
+database only and the index is not touched. With no writable index there is no
+lock to coordinate on, and ratarmount keeps no user-level digest cache, so
+hashing is **per verb**: N concurrent `overlay seal` runs over one read-only
+archive hash it N times (each records the same correct digest), and every
+`overlay verify` rehashes the base, by design, even when the digest is cached.
+
 A directory gets a `weak` digest by default: `weak:<hex>` over a sorted
 manifest of relative path, type, size and nanosecond mtime (symlinks include
 their target; directories and unreadable subdirectories are typed entries

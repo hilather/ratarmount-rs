@@ -4,6 +4,8 @@
 
 ### Changes
 
+- **Digest states:** `overlay info`, the root xattr `user.ratarmount.base_digest_state`, `diff --hash --json` and the `sandbox run` `patch_hash` report carry a stable `base_digest_state` of `present`, `pending` or `none` (see docs/sandbox.md, "Digest states"); `base_pending` stays for compatibility. A digest resolved by `overlay seal` is written back to a writable index cache (and to the overlay database only otherwise); concurrent seals over a read-only archive hash once per seal, and `overlay verify` always rehashes the base. (#133)
+
 - Git mounts (`git:///…`, `--git`) show writable-style modes `0644`/`0755`/`0777` instead of read-only modes. (#133)
 - `ratarmount diff` takes `BASE` as a positional argument (it no longer reads only `meta.base_url`) and reports a rename as a delete plus an add; the old rename detection is behind `--detect-renames`. (#133)
 - A `-w` overlay created by this version records the base's size and mtime and refuses to open after an external change to either; pass `--force-base-mismatch` to override. (#133)
