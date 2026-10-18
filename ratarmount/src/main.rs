@@ -2033,6 +2033,7 @@ fn main() {
         let stop = Arc::clone(&control_stop);
         let mp_ctrl = mp.clone();
         let pre_control = Arc::clone(&bundle.source);
+        let unmount_in_progress = Arc::new(AtomicBool::new(false));
         let on_search = find::live_search_callback(
             Arc::clone(&pre_control),
             overlay_arc.clone(),
@@ -2045,8 +2046,35 @@ fn main() {
                 ControlFolderOptions::enabled()
                     .with_label(mp.display().to_string())
                     .with_on_unmount(Arc::new(move || {
-                        stop.store(true, Ordering::SeqCst);
-                        let _ = unmount(&mp_ctrl);
+                        // The callback fires inside the FUSE request that opens or reads the
+                        // control file, so unmounting here would always find the mount busy
+                        // (and a retry would stall the request thread). Unmount on a short
+                        // thread instead: the opener's request finishes, the opener closes
+                        // the file, and the retrying unmount then succeeds. The guard only
+                        // blocks a concurrent attempt (open and read both fire); `stop` is
+                        // set after success so a failed attempt can be retried by a later read.
+                        if unmount_in_progress.swap(true, Ordering::SeqCst) {
+                            return;
+                        }
+                        let stop = Arc::clone(&stop);
+                        let mp = mp_ctrl.clone();
+                        let in_progress = Arc::clone(&unmount_in_progress);
+                        let spawned = thread::Builder::new()
+                            .name("ratarmount-control-unmount".into())
+                            .spawn(move || match unmount(&mp) {
+                                Ok(()) => stop.store(true, Ordering::SeqCst),
+                                Err(e) => {
+                                    log::warn!(
+                                        "control file unmount of {} failed: {e}",
+                                        mp.display()
+                                    );
+                                    in_progress.store(false, Ordering::SeqCst);
+                                }
+                            });
+                        if let Err(e) = spawned {
+                            log::warn!("control file unmount: cannot start thread: {e}");
+                            unmount_in_progress.store(false, Ordering::SeqCst);
+                        }
                     }))
                     .with_on_search(Arc::clone(&on_search)),
             )
@@ -3529,6 +3557,7 @@ fn start_control_interface(
                             &stop,
                             on_search.as_ref(),
                             quota.as_deref(),
+                            &|p| unmount(p),
                         );
                         let _ = stream.write_all(reply.as_bytes());
                     }
@@ -3549,8 +3578,9 @@ fn control_reply_with_quota(
     stop: &AtomicBool,
     on_search: Option<&SearchFn>,
     quota: Option<&ratarmount_compositing::OverlayQuota>,
+    unmount_op: &dyn Fn(&Path) -> std::io::Result<()>,
 ) -> String {
-    let mut reply = control_reply(cmd, mp, stop, on_search);
+    let mut reply = control_reply(cmd, mp, stop, on_search, unmount_op);
     if cmd == "status" {
         if let Some(quota) = quota {
             reply.push_str(&quota.usage().status_text());
@@ -3559,7 +3589,13 @@ fn control_reply_with_quota(
     reply
 }
 
-fn control_reply(cmd: &str, mp: &Path, stop: &AtomicBool, on_search: Option<&SearchFn>) -> String {
+fn control_reply(
+    cmd: &str,
+    mp: &Path,
+    stop: &AtomicBool,
+    on_search: Option<&SearchFn>,
+    unmount_op: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> String {
     match cmd {
         "ping" => "pong\n".to_string(),
         "status" => format!(
@@ -3568,9 +3604,14 @@ fn control_reply(cmd: &str, mp: &Path, stop: &AtomicBool, on_search: Option<&Sea
             ratarmount_core::budget::MemoryBudget::global().status_text()
         ),
         "unmount" | "quit" | "exit" => {
-            let _ = unmount(mp);
-            stop.store(true, Ordering::Relaxed);
-            "ok unmounted\n".to_string()
+            // On failure keep the socket up so the client can retry.
+            match unmount_op(mp) {
+                Ok(()) => {
+                    stop.store(true, Ordering::Relaxed);
+                    "ok unmounted\n".to_string()
+                }
+                Err(e) => format!("error: unmount failed: {e}\n"),
+            }
         }
         "help" => "commands: ping status unmount search help\n".to_string(),
         "search" => "error: search requires a pattern\n".to_string(),
@@ -3601,6 +3642,12 @@ fn control_reply(cmd: &str, mp: &Path, stop: &AtomicBool, on_search: Option<&Sea
         }
         other => format!("error: unknown command {other:?}\n"),
     }
+}
+
+/// Unmount stand-in for control-reply unit tests that never touch a mount.
+#[cfg(test)]
+fn no_unmount(_: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn wait_until_mounted(path: &Path, timeout: Duration) -> bool {
@@ -4896,7 +4943,7 @@ mod serve_cli_tests {
 
 #[cfg(test)]
 mod find_cli_tests {
-    use super::{control_reply, find_cli_error, parse_args_from, SearchFn};
+    use super::{control_reply, find_cli_error, no_unmount, parse_args_from, SearchFn};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -5119,21 +5166,40 @@ mod find_cli_tests {
             std::path::Path::new("/mnt"),
             &stop,
             Some(&cb),
+            &no_unmount,
         );
         assert!(reply.contains("/a.fits\t4\t1"), "{reply}");
         assert!(reply.contains("/dir/b.fits\t5\t2"), "{reply}");
         assert!(reply.contains("count 2"), "{reply}");
 
-        let missing = control_reply("search *.fits", std::path::Path::new("/mnt"), &stop, None);
+        let missing = control_reply(
+            "search *.fits",
+            std::path::Path::new("/mnt"),
+            &stop,
+            None,
+            &no_unmount,
+        );
         assert!(
             missing.contains("on-disk index"),
             "socket :memory:/missing: {missing}"
         );
 
-        let no_pat = control_reply("search", std::path::Path::new("/mnt"), &stop, Some(&cb));
+        let no_pat = control_reply(
+            "search",
+            std::path::Path::new("/mnt"),
+            &stop,
+            Some(&cb),
+            &no_unmount,
+        );
         assert!(no_pat.contains("pattern"), "{no_pat}");
 
-        let help = control_reply("help", std::path::Path::new("/mnt"), &stop, Some(&cb));
+        let help = control_reply(
+            "help",
+            std::path::Path::new("/mnt"),
+            &stop,
+            Some(&cb),
+            &no_unmount,
+        );
         assert!(help.contains("search"), "{help}");
 
         let err_cb: SearchFn =
@@ -5143,9 +5209,44 @@ mod find_cli_tests {
             std::path::Path::new("/mnt"),
             &stop,
             Some(&err_cb),
+            &no_unmount,
         );
         assert!(mem.starts_with("error:"), "{mem}");
         assert!(!mem.contains("count "), "{mem}");
+    }
+
+    /// Regression: the control socket answered "ok unmounted" and stopped even when the
+    /// unmount failed (busy), leaving a mount nobody could reach.
+    #[test]
+    fn regression_control_reply_unmount_result() {
+        let mp = std::path::Path::new("/mnt");
+        for cmd in ["unmount", "quit", "exit"] {
+            let stop = AtomicBool::new(false);
+            assert_eq!(
+                control_reply(cmd, mp, &stop, None, &|_| Ok(())),
+                "ok unmounted\n"
+            );
+            assert!(
+                stop.load(std::sync::atomic::Ordering::Relaxed),
+                "{cmd}: stop after success"
+            );
+
+            let stop = AtomicBool::new(false);
+            let busy = |_: &std::path::Path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    "still busy",
+                ))
+            };
+            let reply = control_reply(cmd, mp, &stop, None, &busy);
+            assert!(reply.starts_with("error:"), "{cmd}: {reply}");
+            assert!(reply.contains("still busy"), "{cmd}: {reply}");
+            assert!(
+                !stop.load(std::sync::atomic::Ordering::Relaxed),
+                "{cmd}: stop after failure"
+            );
+            assert_eq!(control_reply("ping", mp, &stop, None, &busy), "pong\n");
+        }
     }
 }
 
@@ -6629,12 +6730,25 @@ mod sandbox_cli_tests {
         let quota =
             ratarmount_compositing::OverlayQuota::new(root.path(), Some(1024), None).unwrap();
         let stop = AtomicBool::new(false);
-        let reply =
-            control_reply_with_quota("status", Path::new("/mnt"), &stop, None, Some(&quota));
+        let reply = control_reply_with_quota(
+            "status",
+            Path::new("/mnt"),
+            &stop,
+            None,
+            Some(&quota),
+            &no_unmount,
+        );
         assert!(reply.starts_with("mounted /mnt\nmemory_budget unlimited\n"));
         assert!(reply.ends_with("overlay_bytes 0\noverlay_quota_bytes 1024\noverlay_files 0\noverlay_quota_files unlimited\n"));
         assert_eq!(
-            control_reply_with_quota("ping", Path::new("/mnt"), &stop, None, Some(&quota)),
+            control_reply_with_quota(
+                "ping",
+                Path::new("/mnt"),
+                &stop,
+                None,
+                Some(&quota),
+                &no_unmount
+            ),
             "pong\n"
         );
     }
@@ -6945,7 +7059,13 @@ mod memory_budget_tests {
             1,
             ratarmount_core::budget::Priority::Cache,
         );
-        let reply = control_reply("status", Path::new("mnt"), &AtomicBool::new(false), None);
+        let reply = control_reply(
+            "status",
+            Path::new("mnt"),
+            &AtomicBool::new(false),
+            None,
+            &|_| Ok(()),
+        );
         assert!(reply.contains("memory_budget unlimited"));
         assert!(reply.contains("memory_pool socket-test"));
     }

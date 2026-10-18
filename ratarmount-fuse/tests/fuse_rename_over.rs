@@ -791,10 +791,9 @@ impl MountGuard {
     }
 
     fn graceful_unmount(&mut self) -> Result<(), String> {
-        if !run_fusermount(&["-u"], &self.mnt, UNMOUNT_DEADLINE) {
+        if let Err(e) = graceful_fusermount_u(&self.mnt) {
             return Err(format!(
-                "fusermount3 -u {} failed within {UNMOUNT_DEADLINE:?} (daemon pid {})\n{}",
-                self.mnt.display(),
+                "{e} (daemon pid {})\n{}",
                 self.daemon_pid,
                 tail(&self.daemon_log)
             ));
@@ -826,6 +825,49 @@ fn reap(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             _ => return None,
         }
+    }
+}
+
+/// How long a graceful unmount keeps retrying a busy mount (desktop watchers such as
+/// gvfsd-trash probe each new mount). Separate from the per-attempt `UNMOUNT_DEADLINE`.
+const BUSY_RETRY: Duration = Duration::from_secs(1);
+
+/// `fusermount3 -u` with stderr captured, retried every 50 ms while it reports
+/// "Device or resource busy". Never lazy: a mount that stays busy fails the test.
+fn graceful_fusermount_u(mnt: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + BUSY_RETRY;
+    loop {
+        let mut cmd = Command::new("fusermount3");
+        cmd.arg("-u")
+            .arg(mnt)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("spawn fusermount3: {e}"))?;
+        let Some(st) = reap(&mut child, UNMOUNT_DEADLINE) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "fusermount3 -u {} did not finish within {UNMOUNT_DEADLINE:?}",
+                mnt.display()
+            ));
+        };
+        if st.success() {
+            return Ok(());
+        }
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = io::Read::read_to_string(&mut pipe, &mut stderr);
+        }
+        if !stderr.contains("Device or resource busy") || Instant::now() >= deadline {
+            return Err(format!(
+                "fusermount3 -u {} failed ({st}): {}",
+                mnt.display(),
+                stderr.trim()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

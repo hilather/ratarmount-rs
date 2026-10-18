@@ -376,7 +376,8 @@ fn regression_control_file_unmount_exhaustion_then_retry() {
     let mut holder = Holder::start(e.mnt.join("file"));
     read_control_unmount(&e.mnt);
     assert!(
-        d.log.wait_contains("control file unmount", Duration::from_secs(10))
+        d.log
+            .wait_contains("control file unmount", Duration::from_secs(10))
             && d.log.wait_contains("failed", Duration::from_secs(1)),
         "no control-file unmount failure warning while the mount is held\n{}",
         d.log.text()
