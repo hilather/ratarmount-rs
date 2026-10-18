@@ -756,3 +756,217 @@ fn regression_git_and_remote_kind_switch_is_refused_by_every_verb() {
         }
     }
 }
+
+/// `meta.json` of a packed bundle (`.tar.zst`).
+fn bundle_meta_json(bundle: &Path) -> serde_json::Value {
+    use std::io::Read;
+    let decoder = zstd::stream::read::Decoder::new(fs::File::open(bundle).unwrap()).unwrap();
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap().ends_with("meta.json") {
+            let mut text = String::new();
+            entry.read_to_string(&mut text).unwrap();
+            return serde_json::from_str(&text).unwrap();
+        }
+    }
+    panic!("no meta.json in {bundle:?}");
+}
+
+const STALE_ROWS: [&str; 4] = [
+    "base_size",
+    "base_mtime_ns",
+    "base_local_path",
+    "base_weak_digest",
+];
+
+/// The overlay's `(base_kind, base_digest, base_digest_kind)` for assertions.
+fn identity_of(meta: &OverlayMeta) -> (String, String) {
+    (
+        meta.get("base_kind").unwrap_or("").to_owned(),
+        meta.base_digest().unwrap_or("").to_owned(),
+    )
+}
+
+/// Review nit (R5-4): a forced pack across kinds records the ACTUAL base in
+/// both the bundle's `meta.json` and the packed database rows, and the stale
+/// rows of the old kind are gone from both.
+#[test]
+fn regression_forced_pack_across_kinds_records_actual_base_in_bundle_and_db() {
+    // archive -> Git, then Git -> directory.
+    for case in ["archive_to_git", "git_to_dir"] {
+        let env = Env::new();
+        let (url, tree) = git_base(&env, "repo");
+        let dir = env.path("plain");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.txt"), b"git content\n").unwrap();
+        let (overlay, actual, want_kind, want_digest) = if case == "archive_to_git" {
+            let (_archive, overlay) = fixture(&env, Kind::Archive, true);
+            let want = format!("git-tree:{tree}");
+            (overlay, PathBuf::from(&url), "git", want)
+        } else {
+            let overlay = env.path("overlay");
+            env.ok(&["--no-mount", "-w", s(&overlay), &url]);
+            env.ok(&["overlay", "seal", s(&overlay)]);
+            (overlay, dir.clone(), "directory", weak_now(&dir))
+        };
+        let old = meta_of(&overlay);
+        let out = verb(
+            &env,
+            Verb::Pack,
+            &overlay,
+            &actual,
+            &["--force-base-mismatch"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{case}: {}", text(&out));
+        // The sealed source layer is not modified.
+        assert_eq!(identity_of(&meta_of(&overlay)), identity_of(&old), "{case}");
+        let bundle = env.path("bundle.tar.zst");
+        let json = bundle_meta_json(&bundle);
+        assert_eq!(json["base_kind"], want_kind, "{case}: {json}");
+        assert_eq!(json["base_digest"], want_digest.as_str(), "{case}: {json}");
+        assert!(
+            json["base_mismatch_forced_at"].is_string(),
+            "{case}: {json}"
+        );
+        let restored = env.path("restored");
+        env.ok(&["overlay", "unpack", s(&bundle), s(&restored)]);
+        let meta = meta_of(&restored);
+        assert_eq!(
+            identity_of(&meta),
+            (want_kind.to_owned(), want_digest.clone()),
+            "{case}"
+        );
+        let stale: &[&str] = if case == "archive_to_git" {
+            &[
+                "base_size",
+                "base_mtime_ns",
+                "base_local_path",
+                "base_weak_digest",
+            ]
+        } else {
+            &[
+                "base_git_tree",
+                "base_size",
+                "base_mtime_ns",
+                "base_local_path",
+            ]
+        };
+        for key in stale {
+            assert!(
+                json.get(*key).is_none(),
+                "{case}: bundle meta.json kept {key}"
+            );
+            assert!(meta.get(key).is_none(), "{case}: packed DB kept {key}");
+        }
+        if case == "archive_to_git" {
+            assert_eq!(json["base_git_tree"], tree.as_str(), "{json}");
+            assert_eq!(meta.get("base_git_tree"), Some(tree.as_str()));
+        } else {
+            assert_eq!(meta.get("base_weak_digest"), Some(weak_now(&dir).as_str()));
+        }
+    }
+}
+
+/// Review nit (R5-4): a forced diff reports the base actually diffed
+/// (`base`, `base_forced`, `base_identity: "forced"`, `base_recorded`) when the
+/// kind changed, not only when the same kind was edited.
+#[test]
+fn regression_forced_diff_across_kinds_reports_actual_base() {
+    let env = Env::new();
+    let (url, tree) = git_base(&env, "repo");
+    let (_archive, overlay) = fixture(&env, Kind::Archive, true);
+    let old = meta_of(&overlay).base_digest().unwrap().to_owned();
+    let out = verb(
+        &env,
+        Verb::Diff,
+        &overlay,
+        Path::new(&url),
+        &["--force-base-mismatch"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["base_forced"], true, "{json}");
+    assert_eq!(json["base_identity"], "forced", "{json}");
+    assert_eq!(json["base_recorded"], old.as_str(), "{json}");
+    assert_eq!(json["base"], format!("git-tree:{tree}").as_str(), "{json}");
+
+    // Git -> directory.
+    let env = Env::new();
+    let (git, _) = git_base(&env, "repo");
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), &git]);
+    env.ok(&["overlay", "seal", s(&overlay)]);
+    let old = meta_of(&overlay).base_digest().unwrap().to_owned();
+    let dir = env.path("plain");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"git content\n").unwrap();
+    let out = verb(&env, Verb::Diff, &overlay, &dir, &["--force-base-mismatch"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["base_forced"], true, "{json}");
+    assert_eq!(json["base_identity"], "forced", "{json}");
+    assert_eq!(json["base_recorded"], old.as_str(), "{json}");
+    assert_eq!(json["base"], weak_now(&dir).as_str(), "{json}");
+}
+
+/// Review nit (R5-4): forced Git -> directory and forced archive -> Git seals
+/// keep none of the old kind's rows, and `--lower` then accepts only the new
+/// base.
+#[test]
+fn regression_forced_seal_git_to_dir_and_archive_to_git_clear_stale_rows() {
+    // Git -> directory.
+    let env = Env::new();
+    let (git, _) = git_base(&env, "repo");
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), &git]);
+    let dir = env.path("plain");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"git content\n").unwrap();
+    let out = verb(&env, Verb::Seal, &overlay, &dir, &["--force-base-mismatch"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let meta = meta_of(&overlay);
+    assert_eq!(meta.get("base_kind"), Some("directory"));
+    assert!(meta.get("base_git_tree").is_none(), "git tree survived");
+    assert_eq!(meta.get("base_weak_digest"), Some(weak_now(&dir).as_str()));
+    let out = env.run(&["--no-mount", "--lower", s(&overlay), &git]);
+    assert!(
+        !out.status.success(),
+        "old git base accepted: {}",
+        text(&out)
+    );
+    let out = env.run(&["--no-mount", "--lower", s(&overlay), s(&dir)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+
+    // archive -> Git.
+    let env = Env::new();
+    let (archive, overlay) = fixture(&env, Kind::Archive, false);
+    assert!(meta_of(&overlay).get("base_size").is_some());
+    let (git, tree) = git_base(&env, "repo");
+    let out = verb(
+        &env,
+        Verb::Seal,
+        &overlay,
+        Path::new(&git),
+        &["--force-base-mismatch"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let meta = meta_of(&overlay);
+    assert_eq!(meta.get("base_kind"), Some("git"));
+    assert_eq!(meta.get("base_git_tree"), Some(tree.as_str()));
+    for key in STALE_ROWS.into_iter().chain(["base_index_path"]) {
+        assert!(
+            meta.get(key).is_none(),
+            "{key} survived: {:?}",
+            meta.get(key)
+        );
+    }
+    let out = env.run(&["--no-mount", "--lower", s(&overlay), s(&archive)]);
+    assert!(
+        !out.status.success(),
+        "old archive accepted: {}",
+        text(&out)
+    );
+    let out = env.run(&["--no-mount", "--lower", s(&overlay), &git]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+}
