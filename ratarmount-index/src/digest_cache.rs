@@ -190,9 +190,11 @@ struct Cache {
     index: PathBuf,
 }
 
-/// `create_table`: false for a read-only peek, which must not wait out another
-/// mount creating the table (a missing table is simply a miss).
-fn open_cache(index: Option<&Path>, create_table: bool) -> Option<Cache> {
+/// The canonical path of an index that may carry a digest cache: an existing,
+/// writable, unpublished regular file. Whether its database can be opened right
+/// now (busy, no `files` table) is a separate question; the per-archive lock
+/// depends only on this one.
+fn cache_target(index: Option<&Path>) -> Option<PathBuf> {
     let index = index?;
     let metadata = fs::metadata(index).ok()?;
     if !metadata.is_file() || metadata.permissions().readonly() {
@@ -219,6 +221,16 @@ fn open_cache(index: Option<&Path>, create_table: bool) -> Option<Cache> {
     {
         return None;
     }
+    Some(index)
+}
+
+/// `create_table`: false for a read-only peek, which must not wait out another
+/// mount creating the table (a missing table is simply a miss).
+fn open_cache(index: Option<&Path>, create_table: bool) -> Option<Cache> {
+    open_cache_at(cache_target(index)?, create_table)
+}
+
+fn open_cache_at(index: PathBuf, create_table: bool) -> Option<Cache> {
     let conn = Connection::open_with_flags(&index, OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
     // A peek stays instant on a busy index. A caller that goes on to hash and
     // store must not mistake another mount's write lock for "no cache": that
@@ -390,16 +402,23 @@ fn cached_with(
     let stamp = ArchiveDigestStamp::read(&path)?;
     // Keep raw OS bytes: two non-UTF-8 paths must not share a lossy cache key.
     let key = path.as_os_str().as_encoded_bytes();
-    let cache = open_cache(index, true);
+    let target = cache_target(index);
+    let mut cache = target.clone().and_then(|t| open_cache_at(t, true));
     if let (Some(cache), false) = (&cache, refresh) {
         if let Some(hit) = lookup(cache, key, &stamp) {
             return Ok(hit);
         }
     }
-    let _guard = match &cache {
-        Some(cache) => {
-            let guard = HashGuard::acquire(&path, &cache.index, check)?;
-            if !refresh {
+    // The lock depends on the index existing, not on its database being open:
+    // another mount's long write lock must not let this one hash unserialized.
+    let _guard = match &target {
+        Some(target) => {
+            let guard = HashGuard::acquire(&path, target, check)?;
+            if cache.is_none() {
+                // Busy earlier; the holder may be gone by now.
+                cache = open_cache_at(target.clone(), true);
+            }
+            if let (Some(cache), false) = (&cache, refresh) {
                 // The hash we waited for just committed; a busy moment is not a miss.
                 let _ = set_write_busy(&cache.conn);
                 if let Some(hit) = lookup(cache, key, &stamp) {
@@ -811,6 +830,88 @@ mod tests {
             );
         });
         assert_eq!(hashes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Regression: an index write-locked for longer than the open timeout gave
+    /// "no cache", which skipped the per-archive lock, so concurrent mounts
+    /// hashed the same archive at once. The lock is taken whenever the index
+    /// exists; the hash then runs under it (and is not stored).
+    #[cfg(unix)]
+    #[test]
+    fn regression_digest_once_lock_held_when_index_stays_busy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc::channel;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, vec![7u8; 4096]).unwrap();
+        let index = index_with_files(dir.path());
+        // Held for the whole test: every open times out.
+        let holder = Connection::open(&index).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let (hashes, in_flight, max_in_flight) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let (started_tx, started) = channel::<()>();
+        let (release, release_rx) = channel::<()>();
+        let (b_done_tx, b_done) = channel::<()>();
+        let b_polls = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let (archive, index) = (&archive, &index);
+            let (hashes, in_flight, max_in_flight) = (&hashes, &in_flight, &max_in_flight);
+            let enter = move || {
+                hashes.fetch_add(1, Ordering::SeqCst);
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(now, Ordering::SeqCst);
+            };
+            let a = scope.spawn(move || {
+                busy_probe::OPEN_POLLS.with(|polls| polls.set(3));
+                cached_archive_digest_with(archive, Some(index), |p| {
+                    enter();
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    sha256_hex_stream(&mut fs::File::open(p)?)
+                })
+                .unwrap()
+            });
+            started.recv().unwrap();
+            let b_polls = &b_polls;
+            let b = scope.spawn(move || {
+                busy_probe::OPEN_POLLS.with(|polls| polls.set(3));
+                let digest = cached_archive_digest_cancellable(
+                    archive,
+                    Some(index),
+                    &|| {
+                        b_polls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    |p| {
+                        enter();
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        sha256_hex_stream(&mut fs::File::open(p)?)
+                    },
+                )
+                .unwrap();
+                b_done_tx.send(()).unwrap();
+                digest
+            });
+            // B must be waiting on A's lock (polling), not hashing beside it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while b_polls.load(Ordering::SeqCst) < 5 && b_done.try_recv().is_err() {
+                assert!(std::time::Instant::now() < deadline, "B never polled");
+                std::thread::yield_now();
+            }
+            let overlapped = max_in_flight.load(Ordering::SeqCst);
+            release.send(()).unwrap();
+            let (da, db) = (a.join().unwrap(), b.join().unwrap());
+            assert_eq!(da, db);
+            assert_eq!(overlapped, 1, "two mounts hashed the archive at once");
+        });
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+        // The index never accepted a row, so each hash ran (once per mount).
+        assert_eq!(hashes.load(Ordering::SeqCst), 2);
     }
 
     /// The cache is available only for a writable, unpublished index.
