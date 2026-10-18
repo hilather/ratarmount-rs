@@ -83,6 +83,16 @@ when it merges; README and docs are updated in the same merge.
     recorded stack) both need §3's `ReadOnlyOverlayLayer`, so the layer source
     is built in wave 0, before `diff` and `seal`. The `--lower` mount flags land
     in wave 1 with seal, because they check the sealed state.
+14. **The overlay `files` table is not a complete record of a layer.** A
+    copy-on-write modification of an existing base or lower file writes the
+    host file and no row; rows exist for new paths, tombstones and
+    metadata-only edits (WriteOverlay and Python ratarmount both treat host
+    files as authoritative for presence). The spec's "every path mentioned in
+    the top layer's files table" (§2.2) and fsck's "every entry in the files
+    directory has a row" (§4) are therefore wrong: consumers (change set, hash,
+    manifest, seal, verify) walk host files ∪ rows, and a host file without a
+    row is not an fsck error. Found by the end-to-end run after wave 3
+    (SBX-COW).
 
 ## 3. Tracking table
 
@@ -103,6 +113,7 @@ Model: **astra** = `gpt-6-astra`, **sol** = `gpt-6.1-sol`, **luna** = `gpt-6-lun
 | SBX-PACK | §8 | 2 | sol [high] | new `ratarmount/src/overlay_pack.rs` | Pack refuses unsealed; pack → unpack → verify; bundle mounts directly and as `--lower` (unpacked to a cache keyed by `layer_digest`); `--include-journal`, `--include-index` | done |
 | SBX-RUN | §10 | 3 | astra [high] | `ratarmount/src/sandbox/run.rs` | Stub runtime test: mount → run → unmount → fsck → seal → pack → JSON; timeout; stale mount under `--top` cleaned via PID file | done |
 | SBX-UPPER | §15.9 | 3 | sol [high] | `overlay import-upperdir` arm, env-gated test, `docs/sandbox.md` interop section | Whiteouts → tombstones, opaque dirs → per-child tombstones; read-only ratarmount stack as overlayfs `lowerdir` (unshare user ns, skip if unavailable) | done |
+| SBX-COW | §2.2, §4 (correction 14) | 4 | astra [xhigh] | `overlay_changes.rs`, `overlay_fsck.rs`, `overlay_seal.rs`, tests | Copy-on-write fixtures: `M f` in diff, fsck clean, seal+verify, import round trip, `--lower` COW served; e2e script reaches ALL-DONE | in progress |
 | SBX-DOCS | §14 | 3 | luna [medium] | `docs/sandbox.md`, README, `docs/formats.md`/CLI tour | End-to-end flow, branching recipe, xattr protocol, meta keys, hash definition, renames, exit codes; README subcommand list + comparison rows | todo |
 
 ## 4. Dependency graph
