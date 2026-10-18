@@ -51,6 +51,37 @@ const WRITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const CREATE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCK_POLL: Duration = Duration::from_millis(20);
 
+/// Wait up to [`WRITE_BUSY_TIMEOUT`] for another writer of the index.
+#[cfg(not(test))]
+fn set_write_busy(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(WRITE_BUSY_TIMEOUT)
+}
+
+/// Unit tests: the same wait as a handler that records which threads hit a busy
+/// database, so a test can release the other writer exactly when this one is
+/// waiting instead of sleeping and hoping.
+#[cfg(test)]
+fn set_write_busy(conn: &Connection) -> rusqlite::Result<()> {
+    fn handler(attempt: i32) -> bool {
+        let mut waiting = busy_probe::WAITING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !waiting.contains(&std::thread::current().id()) {
+            waiting.push(std::thread::current().id());
+        }
+        drop(waiting);
+        std::thread::sleep(Duration::from_millis(1));
+        i64::from(attempt) < WRITE_BUSY_TIMEOUT.as_millis() as i64
+    }
+    conn.busy_handler(Some(handler))
+}
+
+#[cfg(test)]
+mod busy_probe {
+    pub static WAITING: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+        std::sync::Mutex::new(Vec::new());
+}
+
 fn never_cancelled() -> std::io::Result<()> {
     Ok(())
 }
@@ -328,7 +359,7 @@ fn cached_with(
             let guard = HashGuard::acquire(&path, &cache.index, check)?;
             if !refresh {
                 // The hash we waited for just committed; a busy moment is not a miss.
-                let _ = cache.conn.busy_timeout(WRITE_BUSY_TIMEOUT);
+                let _ = set_write_busy(&cache.conn);
                 if let Some(hit) = lookup(cache, key, &stamp) {
                     return Ok(hit);
                 }
@@ -344,7 +375,7 @@ fn cached_with(
         )));
     }
     if let Some(cache) = &cache {
-        let stored = cache.conn.busy_timeout(WRITE_BUSY_TIMEOUT).and_then(|()| {
+        let stored = set_write_busy(&cache.conn).and_then(|()| {
             cache.conn.execute(
                 "INSERT OR REPLACE INTO overlay_base_digests VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
@@ -582,19 +613,37 @@ mod tests {
             .execute_batch("DELETE FROM overlay_base_digests")
             .unwrap();
         let hashes = std::sync::atomic::AtomicUsize::new(0);
+        let releasers = std::cell::RefCell::new(Vec::new());
         for _ in 0..3 {
             cached_archive_digest_with(&archive, Some(&index), |p| {
                 hashes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // Another writer holds the index while this hash finishes.
+                // Another writer holds the index while this hash finishes; it
+                // commits only once this thread's INSERT has hit the busy
+                // database (no sleeps, no timing guesses).
                 let holder = Connection::open(&index).unwrap();
                 holder.execute_batch("BEGIN IMMEDIATE").unwrap();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                let writer = std::thread::current().id();
+                busy_probe::WAITING
+                    .lock()
+                    .unwrap()
+                    .retain(|id| *id != writer);
+                releasers.borrow_mut().push(std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                    while !busy_probe::WAITING.lock().unwrap().contains(&writer) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the digest INSERT never waited on the busy index"
+                        );
+                        std::thread::yield_now();
+                    }
                     holder.execute_batch("COMMIT").unwrap();
-                });
+                }));
                 sha256_hex_stream(&mut fs::File::open(p)?)
             })
             .unwrap();
+        }
+        for releaser in releasers.into_inner() {
+            releaser.join().unwrap();
         }
         assert_eq!(hashes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -611,12 +660,13 @@ mod tests {
         let canonical = index.canonicalize().unwrap();
         let other_process = open_lock_file(&canonical).unwrap();
         assert!(try_flock(&other_process).unwrap());
-        let start = std::time::Instant::now();
+        // Cancel on the Nth poll of the lock wait, not after a wall-clock delay.
+        let polls = std::sync::atomic::AtomicUsize::new(0);
         let result = cached_archive_digest_cancellable(
             &archive,
             Some(&index),
             &|| {
-                if start.elapsed() > Duration::from_millis(150) {
+                if polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 5 {
                     Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stop"))
                 } else {
                     Ok(())
