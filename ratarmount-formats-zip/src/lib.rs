@@ -2397,7 +2397,7 @@ fn ensure_parent_dirs(
 /// `errno_t` is failure). Either failure, an invalid field, or a
 /// spring-forward hole that never reaches a fixed point returns `0.0`.
 /// The old `mktime` path normalized that hole and used `SystemTime::now()`
-/// when `t < 0`. A fall-back fold may differ by 3600s from glibc. Windows
+/// when `t < 0`. A fall-back fold may differ by the zone's DST delta from glibc. Windows
 /// follows the CRT DST rules.
 fn msdos_to_unix(year: u16, month: u8, day: u8, hour: u8, min: u8, sec: u8) -> f64 {
     msdos_to_unix_with((year, month, day, hour, min, sec), local_minus_utc)
@@ -3422,6 +3422,59 @@ mod tests {
             msdos_to_unix_with((2107, 12, 31, 23, 59, 58), |_| Some(9 * 3600)),
             (naive - 9 * 3600) as f64
         );
+    }
+
+    /// Regression: invalid civil fields are `0.0` from `msdos_to_unix_with` and
+    /// `None` from `civil_seconds`. 2000-02-29 and 2024-02-29 are real leap days.
+    /// 2100-02-29 is not. Apr 31, hour 24 and 31, minute 60 and 63, and second 62
+    /// are not real. Second 60 (DOS field 30) is a leap second, one past :59.
+    /// The offset stub is UTC, so the result does not depend on `TZ`.
+    #[test]
+    fn regression_msdos_calendar_edges() {
+        let utc = |year, month, day, hour, min, sec| {
+            msdos_to_unix_with((year, month, day, hour, min, sec), |_| Some(0))
+        };
+        assert_eq!(
+            utc(2000, 2, 29, 0, 0, 0),
+            utc(2000, 2, 28, 0, 0, 0) + 86_400.0
+        );
+        assert_eq!(
+            utc(2024, 2, 29, 0, 0, 0),
+            utc(2024, 2, 28, 0, 0, 0) + 86_400.0
+        );
+        assert_eq!(
+            civil_seconds(2000, 2, 29, 0, 0, 0),
+            civil_seconds(2000, 2, 28, 0, 0, 0).map(|secs| secs + 86_400)
+        );
+        assert_eq!(
+            civil_seconds(2024, 2, 29, 0, 0, 0),
+            civil_seconds(2024, 2, 28, 0, 0, 0).map(|secs| secs + 86_400)
+        );
+
+        assert_eq!(utc(2100, 2, 29, 0, 0, 0), 0.0);
+        assert_eq!(civil_seconds(2100, 2, 29, 0, 0, 0), None);
+        assert_ne!(utc(2000, 4, 30, 0, 0, 0), 0.0);
+        assert!(civil_seconds(2000, 4, 30, 0, 0, 0).is_some());
+        assert_eq!(utc(2000, 4, 31, 0, 0, 0), 0.0);
+        assert_eq!(civil_seconds(2000, 4, 31, 0, 0, 0), None);
+
+        for (hour, min, sec) in [
+            (24u8, 0u8, 0u8),
+            (31, 0, 0),
+            (0, 60, 0),
+            (0, 63, 0),
+            (0, 0, 62),
+        ] {
+            assert_eq!(utc(2000, 1, 1, hour, min, sec), 0.0, "{hour}:{min}:{sec}");
+            assert_eq!(
+                civil_seconds(2000, 1, 1, i32::from(hour), i32::from(min), i32::from(sec)),
+                None,
+                "{hour}:{min}:{sec}"
+            );
+        }
+        let sec59 = civil_seconds(2000, 1, 1, 0, 0, 59).expect("second 59");
+        assert_eq!(civil_seconds(2000, 1, 1, 0, 0, 60), Some(sec59 + 1));
+        assert_eq!(utc(2000, 1, 1, 0, 0, 60), utc(2000, 1, 1, 0, 0, 59) + 1.0);
     }
 
     /// Regression: `read_file_range_at_into` treated `ErrorKind::Interrupted` as fatal.
