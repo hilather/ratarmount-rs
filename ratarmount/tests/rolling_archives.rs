@@ -151,3 +151,75 @@ fn fuse_rolling_one_cycle() {
         Err(error) => panic!("FUSE roll cycle hung: {error}; log: {daemon_log}"),
     }
 }
+
+/// Regression: a rolling commit recorded the old generation's baseline and
+/// refused the next mount of the same series (no kernel mount required).
+#[test]
+fn regression_rolling_commit_baseline_allows_cli_remount() {
+    use ratarmount_compositing::{
+        CommitMode, OverlayCreateInfo, OverlayMeta, RollingMountSource, WriteOverlay,
+    };
+    use ratarmount_core::{MountSource, OpenOptions};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("traces.tar.zst");
+    let overlay = dir.path().join("overlay");
+    let opener = |path: &Path| {
+        ratarmount_session::factory::open_path(
+            path,
+            &OpenOptions {
+                index_in_memory: true,
+                ..Default::default()
+            },
+            false,
+        )
+        .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))
+    };
+    let series = Arc::new(RollingMountSource::open(&base, "1B".parse().unwrap(), opener).unwrap());
+    let info = OverlayCreateInfo {
+        base_url: base.to_str().unwrap().to_owned(),
+        local_path: Some(series.active_path()),
+        ..Default::default()
+    };
+    let mut ov =
+        WriteOverlay::new_with_create_info(series.clone() as Arc<dyn MountSource>, &overlay, &info)
+            .unwrap();
+    ov.set_rolling(series.clone());
+    ov.set_commit_mode(CommitMode::Append);
+    for name in ["one", "two"] {
+        fs::write(overlay.join(name), name.as_bytes()).unwrap();
+        assert!(ov.commit_live_idle(&base, Duration::ZERO, opener).unwrap());
+    }
+    assert!(series.active_path().ends_with("traces.000002.tar.zst"));
+    drop(ov);
+    let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
+    assert!(meta.get("base_committed_at").is_some());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    command
+        .args([
+            "--no-mount",
+            "--index-file",
+            ":memory:",
+            "--roll-every",
+            "1B",
+            "-w",
+        ])
+        .arg(&overlay)
+        .arg(&base);
+    let out = command.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let active = series.active_path();
+    let modified = fs::metadata(&active).unwrap().modified().unwrap();
+    File::open(active)
+        .unwrap()
+        .set_modified(modified + Duration::from_secs(1))
+        .unwrap();
+    let out = command.output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("base mismatch"));
+}

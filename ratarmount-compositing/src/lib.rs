@@ -10,6 +10,7 @@ mod empty_archive;
 mod folder;
 mod oci_whiteout;
 pub mod overlay_layer;
+pub mod overlay_meta;
 mod overlay_policy;
 mod path_intern;
 mod payload;
@@ -40,6 +41,9 @@ pub use folder::FolderMountSource;
 pub use oci_whiteout::OciImageMountSource;
 pub use overlay_layer::{
     compose_stack, serving_layer, Immutability, LayerIndex, ReadOnlyOverlayLayer,
+};
+pub use overlay_meta::{
+    stack_digest, BaseDigestRequest, LowerLayerRecord, OverlayCreateInfo, OverlayMeta,
 };
 pub use overlay_policy::{
     parse_overlay_size, CompositeOverlayPolicy, OverlayQuota, OverlayStats, OverlayUsage,

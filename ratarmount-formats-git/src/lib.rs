@@ -95,6 +95,11 @@ pub struct GitMountSource {
 }
 
 impl GitMountSource {
+    /// Object id of the selected tree, including any `with_prefix` subtree.
+    pub fn tree_id(&self) -> String {
+        self.tree_oid.to_string()
+    }
+
     pub fn open(path: impl AsRef<Path>, reference: Option<&str>) -> Result<Self> {
         let path = path.as_ref();
         if !looks_like_git(path) {
