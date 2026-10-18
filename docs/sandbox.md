@@ -917,6 +917,15 @@ overlay_quota_files 100000
 An absent limit is printed as `unlimited`. In-flight COW reservations are
 included in live usage; offline statistics describe named content only.
 
+## Interrupted seals
+
+A seal commits its digest, then writes the `.ratarmount-sealed` sentinel, then
+makes the tree read-only. If the process is killed in between, re-run
+`ratarmount overlay seal DIR`: it writes a missing sentinel, re-applies the
+read-only modes and reports `already_sealed` as before. It never writes the
+database, and it refuses (exit 2, file untouched) a sentinel that names a
+different digest.
+
 ## Bundles
 
 Pack a sealed overlay into one portable, seekable `.tar.zst` archive:

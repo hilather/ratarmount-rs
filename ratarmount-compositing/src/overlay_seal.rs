@@ -186,11 +186,13 @@ pub fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutc
     let meta = OverlayMeta::read(dir).map_err(overlay_error)?;
     if let Some(meta) = meta.filter(OverlayMeta::layer_sealed) {
         check_hash_format(|key| meta.get(key))?;
+        let layer_digest: String = meta
+            .get("layer_digest")
+            .ok_or_else(|| io::Error::other("sealed overlay has no layer_digest"))?
+            .into();
+        finish_sealed(dir, &root, &layer_digest)?;
         return Ok(SealOutcome {
-            layer_digest: meta
-                .get("layer_digest")
-                .ok_or_else(|| io::Error::other("sealed overlay has no layer_digest"))?
-                .into(),
+            layer_digest,
             sealed_at: meta.get("sealed_at").unwrap().into(),
             already_sealed: true,
         });
@@ -256,18 +258,60 @@ pub fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutc
     // Publish without following an existing sentinel symlink. Keep the DB open
     // until its commit is durable, then close before changing host permissions.
     drop(conn);
-    let mut sentinel = tempfile::Builder::new()
-        .prefix(".ratarmount.overlay.cow-seal-")
-        .tempfile_in(dir)?;
-    writeln!(sentinel, "{layer_digest}")?;
-    sentinel.as_file().sync_all()?;
-    sentinel.persist(dir.join(SENTINEL)).map_err(|e| e.error)?;
+    write_sentinel(dir, &layer_digest)?;
     chmod_tree(&root, false)?;
     Ok(SealOutcome {
         layer_digest,
         sealed_at,
         already_sealed: false,
     })
+}
+
+fn write_sentinel(dir: &Path, layer_digest: &str) -> io::Result<()> {
+    let mut sentinel = tempfile::Builder::new()
+        .prefix(".ratarmount.overlay.cow-seal-")
+        .tempfile_in(dir)?;
+    writeln!(sentinel, "{layer_digest}")?;
+    sentinel.as_file().sync_all()?;
+    sentinel.persist(dir.join(SENTINEL)).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Finish a seal that was interrupted after its metadata commit: write the
+/// missing sentinel (a present one must match exactly and is never replaced)
+/// and re-apply the read-only modes. Writes nothing to the sealed database.
+fn finish_sealed(dir: &Path, root: &OwnedFd, layer_digest: &str) -> io::Result<()> {
+    match host::openat(
+        root,
+        SENTINEL,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) if crate::host_stat::fstat(&fd)?.st_mode & libc::S_IFMT == libc::S_IFREG => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            fs::File::from(fd)
+                .take((layer_digest.len() + 2) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes != layer_digest.as_bytes() && bytes != format!("{layer_digest}\n").as_bytes() {
+                return Err(io::Error::other(
+                    "sealed overlay sentinel does not match its layer digest; refusing to overwrite it",
+                ));
+            }
+        }
+        Ok(_) => {
+            return Err(io::Error::other(
+                "sealed overlay sentinel is not a regular file; refusing to replace it",
+            ))
+        }
+        Err(rustix::io::Errno::NOENT) => write_sentinel(dir, layer_digest)?,
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "sealed overlay sentinel is not a regular file ({e}); refusing to replace it"
+            )))
+        }
+    }
+    chmod_tree(root, false)
 }
 
 /// Remove seal metadata and restore owner write permission. Mode overrides stay.
@@ -516,6 +560,63 @@ mod tests {
         let report = verify(&f.dir, f.base.clone()).unwrap();
         assert!(!report.ok);
         assert_eq!(report.mismatched, ["sub/cow"]);
+    }
+
+    fn writable_entries(dir: &Path) -> Vec<String> {
+        let mut modes = BTreeMap::new();
+        walk_modes(&root(dir).unwrap(), "", &mut modes).unwrap();
+        modes
+            .into_iter()
+            .filter(|(_, m)| m & ratarmount_core::S_IFMT != ratarmount_core::S_IFLNK)
+            .filter(|(_, m)| m & 0o222 != 0)
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    /// Regression: a seal killed after the DB commit left no sentinel, and a re-run was a silent no-op.
+    #[test]
+    fn regression_seal_rerun_writes_missing_sentinel() {
+        let f = Fixture::new();
+        seal(&f.dir, f.base.clone()).unwrap();
+        chmod_tree(&root(&f.dir).unwrap(), true).unwrap();
+        fs::remove_file(f.dir.join(SENTINEL)).unwrap();
+        assert!(!verify(&f.dir, f.base.clone()).unwrap().ok);
+        assert!(seal(&f.dir, f.base.clone()).unwrap().already_sealed);
+        assert!(f.dir.join(SENTINEL).exists());
+        assert!(verify(&f.dir, f.base.clone()).unwrap().ok);
+    }
+
+    /// Regression: a seal killed during chmod left writable entries that `verify` accepted.
+    #[test]
+    fn regression_seal_rerun_reapplies_read_only_modes() {
+        let f = Fixture::new();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let sub = root(&f.dir).unwrap();
+        chmod_tree(&sub, true).unwrap();
+        // Leave only part of the tree sealed, like a kill mid-walk.
+        let sentinel = f.dir.join(SENTINEL);
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(!writable_entries(&f.dir).is_empty());
+        assert!(seal(&f.dir, f.base.clone()).unwrap().already_sealed);
+        assert_eq!(writable_entries(&f.dir), Vec::<String>::new());
+        assert_eq!(
+            fs::metadata(&f.dir).unwrap().permissions().mode() & 0o222,
+            0
+        );
+        assert!(verify(&f.dir, f.base.clone()).unwrap().ok);
+    }
+
+    /// Regression: a re-run must never overwrite a sentinel that names another digest.
+    #[test]
+    fn regression_seal_rerun_refuses_wrong_sentinel() {
+        let f = Fixture::new();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let sentinel = f.dir.join(SENTINEL);
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&sentinel, b"wrong digest\n").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(seal(&f.dir, f.base.clone()).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"wrong digest\n");
     }
 
     /// Regression: chmod -w changed lookup and readdir modes, and leaked the sentinel.

@@ -463,3 +463,39 @@ fn regression_verify_base_without_digest_is_skipped() {
     assert_eq!(out["base_check"], "skipped", "{out}");
     assert!(out["base_ok"].is_null(), "{out}");
 }
+
+// ---- an interrupted seal is finished by re-running seal (N3) ----
+
+/// Regression: a seal killed after its commit left no sentinel (verify failed
+/// forever) and writable entries (verify passed on a writable tree); re-running
+/// `overlay seal` was a silent no-op.
+#[test]
+fn regression_seal_rerun_cli_finishes_interrupted_seal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let (_, dir) = fixture(tmp.path());
+    let digest = expect(env_command(&home, &["overlay", "seal", &dir]), 0);
+    // Simulate the kill: no sentinel, and the payload plus root writable again.
+    let dirp = Path::new(&dir);
+    let file = dirp.join("file");
+    fs::set_permissions(dirp, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(dirp.join(".ratarmount-sealed")).unwrap();
+    expect(env_command(&home, &["overlay", "verify", &dir]), 1);
+    assert_eq!(
+        expect(env_command(&home, &["overlay", "seal", &dir]), 0),
+        digest
+    );
+    assert!(dirp.join(".ratarmount-sealed").exists());
+    assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o222, 0);
+    assert_eq!(fs::metadata(dirp).unwrap().permissions().mode() & 0o222, 0);
+    assert_eq!(
+        expect(env_command(&home, &["overlay", "verify", &dir]), 0),
+        digest
+    );
+    expect(
+        env_command(&home, &["overlay", "unseal", &dir, "--i-know"]),
+        0,
+    );
+}
