@@ -8,6 +8,7 @@ mod automount;
 mod control;
 mod empty_archive;
 mod folder;
+pub mod host_stat;
 mod oci_whiteout;
 pub mod overlay_changes;
 #[cfg(unix)]

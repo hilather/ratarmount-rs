@@ -203,6 +203,8 @@ fn regression_fuse_cow_edits_agree_across_diff_fsck_seal_verify_pack() {
     fs::set_permissions(mnt.join("bin/tool"), fs::Permissions::from_mode(0o755)).unwrap();
     fs::create_dir(mnt.join("gen")).unwrap();
     fs::write(mnt.join("gen/out.o"), b"\x7fELF\0\0binary").unwrap();
+    // Symlink rows carry no mode in the canonical hash (format 2).
+    std::os::unix::fs::symlink("../src/a.c", mnt.join("gen/a.c")).unwrap();
     mount.unmount();
 
     // The precondition this test exists for: COW edits have host bytes but no row.
@@ -241,12 +243,21 @@ fn regression_fuse_cow_edits_agree_across_diff_fsck_seal_verify_pack() {
         "docs/gone.txt",
         "bin/tool",
         "gen/out.o",
+        "gen/a.c",
     ] {
         assert!(
             manifest.contains(path),
             "manifest misses {path}:\n{manifest}"
         );
     }
+    let link = manifest
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|row| row["path"] == "gen/a.c")
+        .unwrap();
+    assert_eq!(link["type"], "symlink", "{link}");
+    assert_eq!(link["target"], "../src/a.c", "{link}");
+    assert!(link.get("mode").is_none(), "{link}");
     let patch = expect(run(&[p("diff"), o], &cache), 1);
     assert!(patch.contains("+int a(void) { return 10; }"), "{patch}");
     assert!(patch.contains("+int c(void) { return 3; }"), "{patch}");

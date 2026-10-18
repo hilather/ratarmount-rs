@@ -29,6 +29,9 @@ use crate::{
 };
 
 /// SHA-256 of the empty canonical stream, independent of the base or stack.
+/// Version of the canonical hash definition, recorded by `overlay seal` as
+/// `canonical_hash_format`. 2: symlink rows carry no mode.
+pub const CANONICAL_HASH_FORMAT: &str = "2";
 pub const EMPTY_SHA256: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -252,13 +255,17 @@ impl Change {
             .map_or("file", Entry::kind)
     }
     /// Canonical row: path NUL status NUL type NUL mode NUL content-hash NUL.
-    /// A deletion has the old type/mode but no new content hash.
+    /// A deletion has the old type/mode but no new content hash. Symlinks
+    /// contribute no mode (canonical hash format 2): Linux reports 120777 and
+    /// macOS a umask-dependent mode, so including it made hashes unportable.
     pub fn write_canonical_row(&self, out: &mut dyn Write, opts: &ChangeOptions) -> io::Result<()> {
         let entry = self.new.as_ref().or(self.old.as_ref());
         let mode = if opts.ignore_mode {
             String::new()
         } else {
-            entry.map_or_else(String::new, |e| format!("{:06o}", e.mode))
+            entry
+                .filter(|e| e.mode & S_IFMT != S_IFLNK)
+                .map_or_else(String::new, |e| format!("{:06o}", e.mode))
         };
         for field in [
             self.path.as_slice(),
@@ -288,7 +295,9 @@ impl Change {
         row.insert("type".into(), self.kind().into());
         if let Some(new) = &self.new {
             row.insert("layer".into(), "top".into());
-            row.insert("mode".into(), format!("{:06o}", new.mode).into());
+            if new.mode & S_IFMT != S_IFLNK {
+                row.insert("mode".into(), format!("{:06o}", new.mode).into());
+            }
             if new.hash.is_some() || new.kind() == "dir" {
                 row.insert("size".into(), new.size.into());
             }
@@ -732,7 +741,7 @@ pub(crate) fn walk_host_entries(
         if internal_path(&path) {
             continue;
         }
-        let stat = host::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let stat = crate::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
             let child = host::openat(fd, name, directory_flags(), Mode::empty())?;
             walk_host_entries(&child, &path, hosts)?;
@@ -1583,6 +1592,53 @@ mod tests {
             "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         );
     }
+    /// Regression: a hash covering a symlink differed between Linux (120777)
+    /// and macOS (umask-dependent) hosts. Symlink rows carry no mode, added or
+    /// deleted; regular-file modes still count.
+    #[test]
+    fn regression_symlink_mode_does_not_change_canonical_hash() {
+        let opts = ChangeOptions::default();
+        let change = |path: &[u8], mode, deleted: bool| {
+            let entry = Entry::from_bytes(mode, b"target".to_vec(), &opts).unwrap();
+            let (status, old, new) = if deleted {
+                (Status::Deleted, Some(entry), None)
+            } else {
+                (Status::Added, None, Some(entry))
+            };
+            Change {
+                path: path.to_vec(),
+                status,
+                old,
+                new,
+                base_layer: None,
+            }
+        };
+        let digest = |mode, deleted| {
+            canonical_hash(
+                &[
+                    change(b"link", mode, deleted),
+                    change(b"z", 0o100644, false),
+                ],
+                &opts,
+            )
+            .unwrap()
+        };
+        for deleted in [false, true] {
+            assert_eq!(digest(0o120777, deleted), digest(0o120755, deleted));
+            let mut row = Vec::new();
+            change(b"link", 0o120755, deleted)
+                .write_canonical_row(&mut row, &opts)
+                .unwrap();
+            assert!(row.starts_with(b"link\0"), "{row:?}");
+            assert!(row.windows(10).any(|w| w == b"\0symlink\0\0"), "{row:?}");
+        }
+        assert!(change(b"link", 0o120755, false)
+            .manifest_row()
+            .get("mode")
+            .is_none());
+        let file = |mode| canonical_hash(&[change(b"f", mode, false)], &opts).unwrap();
+        assert_ne!(file(0o100644), file(0o100755));
+    }
     /// Regression: loose removes blank lines, strict retains them, binary ignores normalization.
     #[test]
     fn regression_hash_loose_blank_lines_and_binary() {
@@ -2258,10 +2314,10 @@ mod tests {
     /// Golden fixture for the canonical hash definition. A fixed overlay, built
     /// through the same COW open FUSE uses (no `files` row for `/a`), must keep
     /// these exact bytes and digests. Changing them changes every recorded
-    /// seal, bundle and grading hash: update only with a format version bump.
+    /// seal, bundle and grading hash: update only with a bump of
+    /// `CANONICAL_HASH_FORMAT` (these are format 2 values).
     /// `test-harness/canonical-hash/reference.py` reproduces the SHA-256 values
-    /// independently. Linux only: macOS reports symlink mode 0755, not 0777.
-    #[cfg(target_os = "linux")]
+    /// independently. Runs on macOS too: symlink rows carry no mode.
     #[test]
     fn golden_canonical_hash_fixture() {
         use std::os::unix::fs::PermissionsExt;
@@ -2332,11 +2388,11 @@ mod tests {
             digest(Normalize::Exact, Algorithm::Blake3),
         ];
         let want = [
-            "a|modified|file|100644|sha256:7aa7a5359173d05b63cfd682e3c38487f3cb4f7f1d60659fe59fab1505977d4c|added.txt|added|file|100644|sha256:f553d63a4fb1dd6dc6cba87232d677814a3fead4d03ab645d46aefebd68ceded|dir|added|dir|040755||keep/gone.txt|deleted|file|100644||link|added|symlink|120777|sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb|tool|modified|file|100755|sha256:a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf|",
-            "sha256:d1ff1abce4ef923a02e7c6f4fee513333b8fc4ccaef983a2c6395d3d7fa67026",
-            "sha256:1fac458db6df916fa9721ef40833e417af99988f90cfa06fbf477a241d46cc37",
-            "sha256:73a1c14c339962ca7a2960c48972d7935a9cd82a14bf9c0c2cebb779b02d7aa6",
-            "blake3:8ae7dafb36e31e43a419c459e00971e868f5aab31200910dff08c2db0ae18709",
+            "a|modified|file|100644|sha256:7aa7a5359173d05b63cfd682e3c38487f3cb4f7f1d60659fe59fab1505977d4c|added.txt|added|file|100644|sha256:f553d63a4fb1dd6dc6cba87232d677814a3fead4d03ab645d46aefebd68ceded|dir|added|dir|040755||keep/gone.txt|deleted|file|100644||link|added|symlink||sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb|tool|modified|file|100755|sha256:a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf|",
+            "sha256:49432f9694187c67e3004623692f7b094d2a48c8c13f27a5574c86f30b537fc8",
+            "sha256:dd4ed4fe4601864c92f8a326caf2235092597da41b6f9738d8d5761dc1b1e9fc",
+            "sha256:ea731b2e4b1e23edaaa648fc0f194036dd825d11a8aeb50ed59b12b3125588b2",
+            "blake3:eedfb3fac8a025c6d7c9bd57349f8bf714206fc2802c88df4aacd79e704cb7f7",
         ];
         assert_eq!(got, want, "canonical hash definition drifted");
     }

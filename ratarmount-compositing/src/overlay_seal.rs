@@ -96,7 +96,7 @@ fn walk_modes(fd: &OwnedFd, parent: &str, modes: &mut BTreeMap<String, u32>) -> 
 }
 
 fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
-    let mode = host::fstat(fd)?.st_mode;
+    let mode = crate::host_stat::fstat(fd)?.st_mode;
     let change = |mode: host::RawMode| {
         Mode::from_raw_mode(if writable {
             mode | 0o200
@@ -113,7 +113,7 @@ fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
-        let stat = host::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let stat = crate::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
         let kind = stat.st_mode & libc::S_IFMT;
         if kind == libc::S_IFLNK {
             continue;
@@ -127,7 +127,7 @@ fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
         if kind == libc::S_IFDIR {
             chmod_tree(&child, writable)?;
         } else {
-            host::fchmod(&child, change(host::fstat(&child)?.st_mode))?;
+            host::fchmod(&child, change(crate::host_stat::fstat(&child)?.st_mode))?;
         }
     }
     if !writable {
@@ -185,6 +185,7 @@ pub fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutc
     let root = root(dir)?;
     let meta = OverlayMeta::read(dir).map_err(overlay_error)?;
     if let Some(meta) = meta.filter(OverlayMeta::layer_sealed) {
+        check_hash_format(|key| meta.get(key))?;
         return Ok(SealOutcome {
             layer_digest: meta
                 .get("layer_digest")
@@ -241,7 +242,11 @@ pub fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutc
     }
     OverlayMeta::set_many(
         &conn,
-        &[("sealed_at", &sealed_at), ("layer_digest", &layer_digest)],
+        &[
+            ("sealed_at", &sealed_at),
+            ("layer_digest", &layer_digest),
+            ("canonical_hash_format", changes::CANONICAL_HASH_FORMAT),
+        ],
     )
     .map_err(overlay_error)?;
     conn.execute_batch("COMMIT").map_err(sql_error)?;
@@ -289,6 +294,24 @@ pub fn unseal(dir: &Path) -> io::Result<()> {
 
 /// Verify without writing or changing permissions, including per-path differences
 /// and the sentinel. A missing seal is an error; mismatches are a successful report.
+/// Refuse a layer sealed under another canonical hash definition: its digest
+/// cannot be recomputed by this build, so a mismatch would be a false alarm
+/// and a match would be luck. `get` reads the recorded metadata.
+pub fn check_hash_format<'a>(get: impl Fn(&str) -> Option<&'a str>) -> io::Result<()> {
+    let recorded = get("canonical_hash_format").unwrap_or("1");
+    if recorded == changes::CANONICAL_HASH_FORMAT {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "layer was sealed with canonical hash format {recorded}; this ratarmount computes format {} \
+             (symlink rows carry no mode). Unseal with --i-know and seal again to re-record the digest",
+            changes::CANONICAL_HASH_FORMAT
+        ),
+    ))
+}
+
 pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<VerifyReport> {
     let root = root(dir)?;
     let conn = connection(dir, true)?;
@@ -296,6 +319,7 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         .map_err(overlay_error)?
         .filter(OverlayMeta::layer_sealed)
         .ok_or_else(|| io::Error::other("overlay is not sealed"))?;
+    check_hash_format(|key| meta.get(key))?;
     let recorded = meta
         .get("layer_digest")
         .ok_or_else(|| io::Error::other("sealed overlay has no layer_digest"))?
@@ -320,7 +344,7 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
-        Ok(fd) if host::fstat(&fd)?.st_mode & libc::S_IFMT == libc::S_IFREG => {
+        Ok(fd) if crate::host_stat::fstat(&fd)?.st_mode & libc::S_IFMT == libc::S_IFREG => {
             use std::io::Read;
             let mut bytes = Vec::new();
             fs::File::from(fd)
@@ -638,6 +662,56 @@ mod tests {
             fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
             0o750
         );
+    }
+
+    /// Regression: format 2 dropped symlink modes from the canonical hash; a
+    /// layer sealed under format 1 must be refused by name, not reported as a
+    /// content mismatch (or pass by luck), until it is resealed.
+    #[test]
+    fn regression_seal_records_and_checks_canonical_hash_format() {
+        let f = Fixture::new();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let format = |dir: &Path| {
+            OverlayMeta::read(dir)
+                .unwrap()
+                .unwrap()
+                .get("canonical_hash_format")
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            format(&f.dir).as_deref(),
+            Some(changes::CANONICAL_HASH_FORMAT)
+        );
+        for old in [Some("1"), None] {
+            chmod_tree(&root(&f.dir).unwrap(), true).unwrap();
+            let conn = connection(&f.dir, false).unwrap();
+            match old {
+                Some(v) => OverlayMeta::set(&conn, "canonical_hash_format", v).unwrap(),
+                None => {
+                    conn.execute("DELETE FROM meta WHERE key='canonical_hash_format'", [])
+                        .unwrap();
+                }
+            }
+            drop(conn);
+            chmod_tree(&root(&f.dir).unwrap(), false).unwrap();
+            for error in [
+                verify(&f.dir, f.base.clone()).unwrap_err(),
+                seal(&f.dir, f.base.clone()).unwrap_err(),
+            ] {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    error.to_string().contains("canonical hash format 1"),
+                    "{error}"
+                );
+            }
+        }
+        unseal(&f.dir).unwrap();
+        seal(&f.dir, f.base.clone()).unwrap();
+        assert_eq!(
+            format(&f.dir).as_deref(),
+            Some(changes::CANONICAL_HASH_FORMAT)
+        );
+        assert!(verify(&f.dir, f.base.clone()).unwrap().ok);
     }
 
     /// Regression: legacy databases and .git changes must be sealable without losing exact bytes.

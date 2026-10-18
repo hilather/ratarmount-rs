@@ -66,6 +66,8 @@ pub struct DiffArgs {
     pub exclude: Vec<String>,
     #[arg(long)]
     pub ignore_mode: bool,
+    /// Hash algorithm: blake3 is several times faster without SHA CPU
+    /// extensions and suits grading loops; keep sha256 for published digests.
     #[arg(long, default_value = "sha256", value_parser = ["sha256", "blake3"])]
     pub algo: String,
     /// Refuse unsealed top and lower overlays.

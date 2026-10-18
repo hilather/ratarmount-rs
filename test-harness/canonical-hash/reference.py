@@ -9,8 +9,8 @@ ratarmount-compositing/src/overlay_changes.rs.
 
 Rows are sorted by path bytes. Each row is
     path NUL status NUL type NUL mode NUL content-hash NUL
-with mode as six octal digits of st_mode and an empty content hash for
-directories and deletions. Symlink targets and binary files (a NUL in the
+with mode as six octal digits of st_mode (empty for symlinks: canonical hash
+format 2) and an empty content hash for directories and deletions. Symlink targets and binary files (a NUL in the
 first 8 KiB) always hash exact bytes.
 """
 import hashlib
@@ -42,7 +42,8 @@ def canonical_hash(rows):
     """rows: iterable of (path bytes, status, type, st_mode int, hash or '')."""
     digest = hashlib.sha256()
     for path, status, kind, mode, content in sorted(rows, key=lambda r: r[0]):
-        for field in (path, status.encode(), kind.encode(), b'%06o' % mode, content.encode()):
+        mode_field = b'' if kind == 'symlink' else b'%06o' % mode
+        for field in (path, status.encode(), kind.encode(), mode_field, content.encode()):
             digest.update(field + b'\0')
     return 'sha256:' + digest.hexdigest()
 
@@ -59,9 +60,9 @@ def golden(mode):
 
 
 GOLDEN = {
-    'exact': 'sha256:d1ff1abce4ef923a02e7c6f4fee513333b8fc4ccaef983a2c6395d3d7fa67026',
-    'strict': 'sha256:1fac458db6df916fa9721ef40833e417af99988f90cfa06fbf477a241d46cc37',
-    'loose': 'sha256:73a1c14c339962ca7a2960c48972d7935a9cd82a14bf9c0c2cebb779b02d7aa6',
+    'exact': 'sha256:49432f9694187c67e3004623692f7b094d2a48c8c13f27a5574c86f30b537fc8',
+    'strict': 'sha256:dd4ed4fe4601864c92f8a326caf2235092597da41b6f9738d8d5761dc1b1e9fc',
+    'loose': 'sha256:ea731b2e4b1e23edaaa648fc0f194036dd825d11a8aeb50ed59b12b3125588b2',
 }
 
 if __name__ == '__main__':

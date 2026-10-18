@@ -409,8 +409,9 @@ makes an accidental 10 GiB write fail promptly. Manifest/hash modes ignore the
 patch budget and stream content hashing with bounded buffers. The change-path
 list still takes memory proportional to the number of mentioned paths.
 
-Manifest rows contain `path`, `status`, `type`, and, for present entries, `mode`,
-`size`, `hash` (files and symlinks), `target` (symlinks) and `layer:"top"`.
+Manifest rows contain `path`, `status`, `type`, and, for present entries, `mode`
+(not for symlinks), `size`, `hash` (files and symlinks), `target` (symlinks) and
+`layer:"top"`.
 A base-less metadata-only write omits unknown size and content hash.
 Existing lower entries contribute `base_hash` and `base_layer` (`base` or
 `lower:N`, numbered from one). Deleted rows have no new content hash. Modes are
@@ -428,7 +429,10 @@ path in byte order after exclusions, hash this row into the final digest:
 path NUL status NUL type NUL mode-or-empty NUL content-hash-or-empty NUL
 ```
 
-Content hashes include the algorithm prefix. A deletion uses the old type/mode
+Content hashes include the algorithm prefix. Symlink rows always have an empty
+mode field: Linux reports `120777` and macOS a umask-dependent mode (usually
+`120755`), so including it made a hash covering a symlink differ between hosts.
+Regular files and directories keep their mode. A deletion uses the old type/mode
 and an empty new-content hash; directories also have no content hash. The base
 hash, provenance, timestamps and rendered patch text are excluded. Both content
 and row hashing use the chosen algorithm. `Change::row_hash` exposes the same row
@@ -438,11 +442,25 @@ encoding for verification tools to identify mismatching paths.
 is a short, dependency-free reference implementation of the SHA-256 definition,
 including normalization. Its `--self-test` (run in CI) and the Rust test
 `golden_canonical_hash_fixture` pin the same fixture to the same three digests,
-so an external grader can check its own implementation against either. Modes are
-the host `st_mode` values: a symlink is `120777` on Linux but follows the umask on
-macOS (usually `120755`),
-so a canonical hash that includes a symlink is not portable between the two
-unless `--ignore-mode` is used.
+so an external grader can check its own implementation against either.
+
+This definition is **canonical hash format 2**. Format 1, used only by
+pre-release builds of the sandbox branch, also hashed symlink modes; any
+digest covering a symlink changed when format 2 dropped them, which also changed
+the golden digests. Seal records `canonical_hash_format` = `2` in the layer
+metadata, and bundles carry it in `meta.json`. Verify, pack, unpack and repeated
+seal refuse a layer recorded under another format (missing means 1) with exit 2,
+because this build cannot recompute that digest. To move such a layer to format 2,
+run `overlay unseal --i-know` and seal it again.
+
+Choosing `--algo`: on a CPU without SHA extensions (i7-8750H), `diff --hash` of
+one modified 1 GiB file, which hashes both the base and the overlay copy, took
+about 9.5 s with SHA-256 and 0.8 s with BLAKE3 (`--normalize strict` on 1 GiB of
+text: 11.4 s against 3.0 s).
+Use `blake3` for hashes that stay inside a grading loop, and `sha256` for
+published digests such as seals and bundles. With `--hash` or `--manifest` the
+cost is hashing only: `--max-diff-bytes` keeps large files out of the diff
+algorithm, and memory stays around 20 MiB.
 
 `--normalize exact` hashes bytes as written. `strict` converts CRLF to LF, strips
 trailing ASCII whitespace per line (space, tab, CR, LF and form feed; not vertical

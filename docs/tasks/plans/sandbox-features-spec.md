@@ -1,6 +1,23 @@
 # ratarmount-rs: sandbox and grading features for agent harnesses and RL loops
 
-**Status:** spec, ready to implement. Revision 2 (2026-10-17). Supersedes `ratarmount-diff-feature.md`; section 2 is that spec, corrected. Everything else is new.
+**Status:** implemented on branch `sandbox/integration`, draft PR #133 (2026-10-18); not merged, not tagged. Revision 2 (2026-10-17) was the build spec; this revision 2.1 records what the implementation taught us so the spec matches the code.
+
+**Corrections from implementation (2026-10-18):**
+- **The `files` table is not the full change set.** A modification of an existing file lands in the overlay files directory *without* a database row; only creates, deletes, renames and attribute changes write rows. §2.2, §4 and §8 must therefore enumerate the change set as *files-directory entries ∪ `files` rows*, never rows alone. This bug made `diff` miss the most common agent edit and made `seal` refuse ordinary overlays; unit fixtures built overlays without going through FUSE and did not catch it. Rule going forward: the default fixture for this crate is a real FUSE mount, and one test must write a DB-less modification and assert that `diff`, `seal`, `fsck`, `pack` and `verify` agree on it.
+- **`fsck` must accept ordinary deletes** of files inside directories the overlay never touched (tombstone row, no parent row). Fixed; §4's consistency rules read accordingly.
+- **Paths are UTF-8 strings throughout the codebase**, not bytes. §11's "bytes, not strings" is withdrawn for paths (contents remain bytes). FUSE previously mapped non-UTF-8 names to U+FFFD, collapsing distinct names; creating such a name now fails with `EILSEQ`. `path_b64` in §2.4 is unnecessary. Consumers must treat a non-UTF-8 filename in a base archive as unsupported (cpanmine: skip reason `non_utf8_path`).
+- **Renames** are delete + add by default as specified; `--detect-renames` on `diff` restores pairing when wanted. The canonical hash never uses rename pairing.
+- Smaller: the layer-stack check no longer hides the underlying error for a broken overlay database; the journal records absolute mount paths.
+- Open: non-FUSE build of the non-mount subcommands; the `serve-sandboxes` design note (§12); arm64 mount testing on the GB10 boxes.
+
+**Review round (2026-10-18), further corrections and decisions:**
+- **Canonical hash, symlink rule (change to §2.5):** regular files contribute `mode`; **symlinks contribute type only** (empty mode field). Symlink modes are `120777` on Linux and umask-dependent on macOS, so a hash covering a symlink was not portable between a Dell and the laptop. This changes golden digests once: bump the fixture's format tag and say so in `docs/sandboxes.md`.
+- **`strict` normalization:** "trailing ASCII whitespace" means space, tab, CR, FF; **vertical tab is not whitespace** here. Documented; the Python reference (`test-harness/canonical-hash/reference.py`) matches.
+- **Hash algorithm guidance:** SHA-256 costs ~9.5 s/GiB on CPUs without SHA extensions, BLAKE3 ~0.8 s/GiB; strict-mode hashing after the hasher-state fix is 11.4 s vs 3.0 s per GiB of text. Recommend `--algo blake3` for grading-loop hashes (internal) and `sha256` for published digests (base, bundle). `--max-diff-bytes` (8 MiB) means large files never reach the diff algorithm; the cost is hashing only, memory ~20 MiB.
+- **Journal overhead is +0.2%** on a quiet machine with alternating benchmark order. The earlier −3% and −8.7% were order bias (baseline always first); the benchmark now alternates. Quote +0.2%.
+- **macOS:** `fsck`/`seal`/`verify`/`pack` now work under symlinked parent directories (every macOS temp dir); `unpack` can rename a read-only sealed directory into place. **Required before tagging:** the rustix panic on certain file metadata must become an exit-2 error naming the path, not a crash; a grading command that panics on a real overlay is a silent mis-grade path. Keep the known-limitation note.
+- **Fixture policy, final form:** the compositing crate cannot mount FUSE, so the real-mount agreement test lives in `ratarmount/tests/fuse_cow_agreement.rs` (edit through a mount, no DB row; `diff --hash`, `seal`, `verify`, `pack`, `unpack`+`verify` agree; `fsck` clean; hash identical before/after seal and after `fsck --repair`). Every new overlay feature adds a case there.
+- **Merge gate:** every CI check green on the final commit (the macOS job was red for the PR's whole life while only the last 15 check lines were read). Then merge #133 and tag, so cpanmine can pin a commit.
 **Crates touched:** `ratarmount` (new subcommands `diff`, `overlay`, `journal`, `sandbox`; mount flags), `ratarmount-compositing` (read-only overlay layer source, overlay metadata, seal, fsck), `ratarmount-fuse` (journal hooks, control xattrs), `ratarmount-formats-git` (git-ref bases), packaging (arm64 binaries), docs, README feature table.
 **Conventions:** `AGENTS.md` applies: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` before every commit; README feature-comparison table and docs updated in the same commit as the feature.
 
@@ -106,7 +123,7 @@ Modifiers:
   --normalize <exact|strict|loose>   hashing/manifest normalization (§2.5); patches are always exact
   --exclude <GLOB>         drop matching paths (repeatable; gitignore globs on mount-relative paths)
   --ignore-mode            mode-only changes are not changes
-  --algo <sha256|blake3>   hash algorithm (default sha256)
+  --algo <sha256|blake3>   hash algorithm (default sha256; blake3 recommended for grading loops, see review notes)
   --strict                 refuse an unsealed overlay (§4); default warns on stderr
   --max-diff-bytes <N>     text diffs over N bytes per side fall back to the binary form (default 8 MiB)
   --max-patch-bytes <N>    fail with exit 3 if the rendered patch exceeds N (default unlimited)
@@ -163,6 +180,7 @@ Over a byte stream, never over rendered diff text:
 ```
 for each changed path, byte-sorted, after excludes:
   path "\0" status "\0" type "\0" mode-or-"" "\0" normalized-content-hash-or-target-hash "\0"
+  (mode is empty for symlinks: see review notes; regular files keep it)
 ```
 
 then `algo(stream)`; output `sha256:<hex>`. Normalization levels for text files (binary is hashed as-is):

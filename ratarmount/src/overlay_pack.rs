@@ -8,7 +8,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ratarmount_compositing::{overlay_changes, OverlayMeta, HIDDEN_DB};
+use ratarmount_compositing::{
+    overlay_changes, overlay_seal::check_hash_format, OverlayMeta, HIDDEN_DB,
+};
 use ratarmount_core::MountSource;
 use rustix::fs::{self as host, AtFlags, Dir, Mode, OFlags};
 
@@ -98,7 +100,7 @@ fn collect(fd: &OwnedFd, prefix: &str, paths: &mut BTreeSet<String>) -> io::Resu
         if omitted(&path) {
             continue;
         }
-        let stat = host::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let stat = ratarmount_compositing::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
             let child = host::openat(fd, name, directory_flags(), Mode::empty())?;
             collect(&child, &path, paths)?;
@@ -128,7 +130,8 @@ fn append_host<W: Write>(tar: &mut tar::Builder<W>, root: &OwnedFd, path: &str) 
     } else {
         parent(root, path, false)?
     };
-    let stat = host::statat(&fd, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+    let stat =
+        ratarmount_compositing::host_stat::statat(&fd, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
     let archive_path = if path.is_empty() {
         "layer".into()
     } else {
@@ -307,6 +310,7 @@ fn bundle_meta(bundle: &Path) -> io::Result<BTreeMap<String, String>> {
     if !meta.contains_key("sealed_at") {
         return Err(invalid("bundle layer is unsealed"));
     }
+    check_hash_format(|key| meta.get(key).map(String::as_str))?;
     Ok(meta)
 }
 
@@ -344,6 +348,7 @@ fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
         .get("layer_digest")
         .ok_or_else(|| invalid("missing layer_digest"))?;
     valid_digest(digest)?;
+    check_hash_format(|key| meta.get(key))?;
     Ok(meta)
 }
 
@@ -446,13 +451,16 @@ fn seal_directories(fd: &OwnedFd) -> io::Result<()> {
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
-        let stat = host::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let stat = ratarmount_compositing::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
             let child = host::openat(fd, name, directory_flags(), Mode::empty())?;
             seal_directories(&child)?;
         }
     }
-    host::fchmod(fd, Mode::from_raw_mode(host::fstat(fd)?.st_mode & !0o222))?;
+    host::fchmod(
+        fd,
+        Mode::from_raw_mode(ratarmount_compositing::host_stat::fstat(fd)?.st_mode & !0o222),
+    )?;
     Ok(())
 }
 
@@ -631,7 +639,7 @@ fn unpack_impl(bundle: &Path, directory: &Path, require_match: bool) -> io::Resu
     // it, even within one parent, and the sealed layer root is read-only.
     // Hold the root by fd so the permission change follows the renamed inode.
     let root = host::open(layer, directory_flags(), Mode::empty())?;
-    let sealed = host::fstat(&root)?.st_mode;
+    let sealed = ratarmount_compositing::host_stat::fstat(&root)?.st_mode;
     host::fchmod(&root, Mode::from_raw_mode(sealed | 0o200))?;
     fs::rename(layer, directory)
         .map_err(|e| io::Error::new(e.kind(), format!("publish layer: {e}")))?;
@@ -710,11 +718,10 @@ mod tests {
                 .open(dir.join("sub/file"))
                 .unwrap()
                 .set_times(
-                    // Pre-epoch, but not within (-1 s, 0): macOS reports those as
-                    // {0 s, negative ns}, which rustix 1.1's stat conversion
-                    // rejects with a panic.
+                    // Regression: within (-1 s, 0) macOS reports {0 s, negative
+                    // ns}, which rustix 1.1's stat panicked on (host_stat).
                     fs::FileTimes::new().set_modified(
-                        std::time::UNIX_EPOCH - std::time::Duration::from_millis(1250),
+                        std::time::UNIX_EPOCH - std::time::Duration::from_millis(250),
                     ),
                 )
                 .unwrap();
@@ -741,6 +748,32 @@ mod tests {
         fn drop(&mut self) {
             cleanup_dirs(&open_root(self.tmp.path()).unwrap());
         }
+    }
+
+    /// Regression: pack must refuse a layer sealed under canonical hash
+    /// format 1 (symlink modes hashed) instead of shipping a digest that this
+    /// build's unpack/verify cannot reproduce.
+    #[test]
+    fn regression_pack_refuses_old_canonical_hash_format() {
+        let f = Fixture::new(true);
+        let db = f.dir.join(HIDDEN_DB);
+        let mode = |path: &Path, mode| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(&f.dir, 0o755);
+        mode(&db, 0o644);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        OverlayMeta::set(&conn, "canonical_hash_format", "1").unwrap();
+        drop(conn);
+        mode(&db, 0o444);
+        mode(&f.dir, 0o555);
+        let bundle = f.tmp.path().join("old.tar.zst");
+        let error = pack(&f.dir, &bundle, f.base.clone(), &PackOptions::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("canonical hash format 1"),
+            "{error}"
+        );
+        assert!(!bundle.exists());
     }
 
     /// Regression: pack must refuse unsealed overlays without publishing output.
