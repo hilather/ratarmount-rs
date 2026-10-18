@@ -376,6 +376,10 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Operation journal loses ranges, denials, marks or metadata; root control xattrs wrong; a read-only mount without `--journal` loses kernel `ro`; FUSE `symlink` on `-w` returns EPERM (SBX-OPLOG) | `cargo test -p ratarmount-fuse --lib regression_oplog` · `cargo test -p ratarmount-compositing --lib regression_oplog` · `cargo test -p ratarmount --test fuse_journal` |
 | Journal summaries misclassify reads/writes or marks; journal verbs and flags steal positionals (SBX-OPLOG) | `cargo test -p ratarmount --bin ratarmount journal_cmd::tests` |
 | Read-only `--lower` mount serves empty `user.ratarmount.stack_digest`/`layers` and `sealed` 0 (SBX-OPLOG × SBX-LOWER) | `cargo test -p ratarmount --test fuse_lower regression_fuse_lower_read_only_root_xattrs` |
+| Overlay change set / canonical hash / manifest: normalization, exclusions before content, write-then-revert, tombstone of nothing, lower provenance, symlinks as data (SBX-DIFF) | `cargo test -p ratarmount-compositing --lib overlay_changes` |
+| `diff` positionals, byte hunks (Latin-1 stays text), `git apply` round trip per case, `--between`, exit 3 limits, renames delete + add unless `--detect-renames` (SBX-DIFF) | `cargo test -p ratarmount --bin ratarmount diff` · `cargo test -p ratarmount --test diff` |
+| Live sandbox diff reopens the locked DB or corrupts Latin-1 patch bytes (SBX-DIFF) | `cargo test -p ratarmount --bin ratarmount sandbox` · `cargo test -p ratarmount --test sandbox` · `uv run --with pytest python -m pytest -q clients/python/tests/test_ratarmount_sandbox.py` |
+| 10 GiB sparse file: `--max-patch-bytes` reads it all, or `--manifest` buffers it (SBX-DIFF) | `cargo test -p ratarmount --bin ratarmount regression_diff_limits_and_sparse_file_exit_three` · (slow, ignored) `cargo test -p ratarmount --bin ratarmount regression_diff_sparse_manifest_streams_ten_gib -- --ignored` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

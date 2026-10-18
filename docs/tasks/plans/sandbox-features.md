@@ -94,9 +94,9 @@ Model: **astra** = `gpt-6-astra`, **sol** = `gpt-6.1-sol`, **luna** = `gpt-6-lun
 | SBX-LAYER | §3.3 | 0 | astra [xhigh] | new `ratarmount-compositing/src/overlay_layer.rs` | `ReadOnlyOverlayLayer: MountSource` over (inner, overlay dir): resolution by top-most mention, tombstones hide all below, re-create over a lower delete, merged `list_dirents`, xattrs, `content_generation` forwarded; opens DB `mode=ro` and `immutable=1` when asked; never writes; `WriteOverlay::new(stack, top)` copy-up from a lower layer yields the lower bytes; tests with base + 2 layers | done |
 | SBX-UTF8 | §11 | 0 | sol [medium] | `ratarmount-fuse/src/lib.rs` name conversion on write ops | Non-UTF-8 names on create/mknod/mkdir/symlink/link/rename refused with `EILSEQ`, nothing written; lookups of such names `ENOENT`; regression tests | done |
 | SBX-RULES | §7 | 0 | sol [high] | `overlay_policy.rs`, policy flags in `main.rs` | `--overlay-allow` exceptions (most specific wins; ancestor-rename rule respects allows); `erofs_denied` counter exposed through `QuotaUsage`/status; a denial callback hook (for the oplog); `readonly_rules` JSON recorded via a setter SBX-META's meta API can call at merge | done |
-| SBX-DIFF | §2 | 1 | astra [xhigh] | `ratarmount/src/diff.rs`, `diff/**` | Every §2 flag; change set from the `files` table + composed view; streaming hashes; excludes before content; `--lower`; `--between`; normalization levels; exit codes 0/1/2/3; §13 §2 test list incl. `git apply` round trip per case and every §2.5 hash property | in progress |
+| SBX-DIFF | §2 | 1 | astra [xhigh] | `ratarmount/src/diff.rs`, `diff/**` | Every §2 flag; change set from the `files` table + composed view; streaming hashes; excludes before content; `--lower`; `--between`; normalization levels; exit codes 0/1/2/3; §13 §2 test list incl. `git apply` round trip per case and every §2.5 hash property | done |
 | SBX-LOWER | §3.1/3.2, §4 fsck | 1 | astra [xhigh] | `overlay_fsck.rs`, `--lower` flags, fsck arm | §13 §3 list and fsck bullets | done |
-| SBX-SEAL | §4 seal/unseal/verify | 1b | astra [xhigh] | compositing `overlay_fsck.rs`, seal/unseal/verify/fsck arms in `overlay_cmd.rs`, `--lower`/`--allow-unsealed-lower`/`--force-stack-mismatch` mount flags | §13 §3 and §4 lists; `-w` on sealed refused; sealed lowers opened immutable; two tops over one sealed lower; commit with `--lower` refused | todo |
+| SBX-SEAL | §4 seal/unseal/verify | 1b | astra [xhigh] | compositing `overlay_fsck.rs`, seal/unseal/verify/fsck arms in `overlay_cmd.rs`, `--lower`/`--allow-unsealed-lower`/`--force-stack-mismatch` mount flags | §13 §3 and §4 lists; `-w` on sealed refused; sealed lowers opened immutable; two tops over one sealed lower; commit with `--lower` refused | in progress |
 | SBX-GIT | §9 | 1 | sol [high] | `ratarmount-formats-git` (tree accessor), `git:///` alias in factory, `ratarmount/src/snapshot.rs` git mode | `base_digest` `git-tree:<sha>`; `snapshot <git>#sha out.tar.zst --with-index` mounts with no index build; tar.zst and git bases give identical composed manifests | done |
 | SBX-IMPORT | §5 | 2 | astra [xhigh] | new `ratarmount/src/overlay_import.rs` + parser module | Every §2 case round-trips `diff → import → diff --hash`; real `git diff --binary` patch imports; rename from/to; `--reject`; `..`/symlink-component/`delta` refused; `--mtime` | todo |
 | SBX-OPLOG | §6 | 2 | astra [xhigh] | new `ratarmount-fuse/src/oplog.rs`, FUSE callback hooks, root control xattrs, `journal summarize|mark` in new `ratarmount/src/journal_cmd.rs`, benchmark script | §13 §6 list; header; coalesced ranges cap 64; layer attribution; marks via xattr; summarize lists; overhead benchmark reported | done |
@@ -121,3 +121,9 @@ wave 0:  META ─┬─────────────┬──────
   merges into `sandbox/integration`, compiles the whole workspace after every
   merge, and runs FUSE tests the sandbox cannot.
 - Every merge adds AGENTS.md regression-catalog rows for the new tests.
+
+## 6. Measurements
+
+| What | Result | Notes |
+|---|---|---|
+| Journal overhead (`benchmarks/journal-overhead.sh`, release, 3+3 runs) | -3.0% (journal median 1.511 s vs baseline 1.558 s) | Within noise; laptop load average ~13 from another build. Rerun on a quiet machine before quoting. |
