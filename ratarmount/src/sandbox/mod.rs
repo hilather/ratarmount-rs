@@ -31,6 +31,11 @@ pub struct SandboxArgs {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run one container command against a write-overlay stack.
+    ///
+    /// Mount the stack, run a container, unmount, repair and hash the result, and optionally seal or pack it. Stdout is a JSON report.
+    #[command(
+        after_help = "Example: ratarmount sandbox run --base base.tar.zst --top attempt --image busybox -- sh -c 'echo hello > /repo/result'\n\nExit status:\n  0  Pipeline completed, even if the container failed. Inspect JSON exit_code:\n     runtime status, 124 for timeout, or 128 + signal for interruption.\n  2  Invalid arguments or harness failure (setup, cleanup, or reporting)."
+    )]
     Run(Box<run::RunArgs>),
     Daemon {
         #[arg(long)]
