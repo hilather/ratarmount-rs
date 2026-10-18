@@ -1114,7 +1114,8 @@ pub fn verify_base(dir: &Path, base: &Path) -> BaseCheck {
     let Some(recorded) = meta.base_digest().filter(|d| !d.is_empty()) else {
         return skipped("no base digest recorded");
     };
-    let Ok(base_meta) = fs::symlink_metadata(base) else {
+    // Follow a root symlink: the base is what it points at (as when mounting).
+    let Ok(base_meta) = fs::metadata(base) else {
         return skipped("base is not a local path");
     };
     let excludes = || match meta.get("base_weak_excludes") {
@@ -1710,6 +1711,48 @@ mod tests {
         assert!(matches!(
             verify_base(&overlay, &basedir),
             BaseCheck::Skipped { .. }
+        ));
+    }
+
+    /// Regression: `verify` through a symlink to the base classified the root
+    /// by `symlink_metadata`, so it was neither file nor directory and the
+    /// base check was skipped; an edited base verified (exit 0).
+    #[cfg(unix)]
+    #[test]
+    fn regression_verify_base_follows_a_root_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir(&basedir).unwrap();
+        fs::write(basedir.join("f"), b"abc").unwrap();
+        let overlay = root.path().join("ov");
+        open_dir_base(&basedir, &overlay, &info(&basedir)).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&basedir, &link).unwrap();
+        assert!(matches!(
+            verify_base(&overlay, &link),
+            BaseCheck::Matches {
+                strength: BaseStrength::Weak,
+                ..
+            }
+        ));
+        fs::write(basedir.join("f"), b"abcd").unwrap();
+        assert!(matches!(
+            verify_base(&overlay, &link),
+            BaseCheck::Mismatch { .. }
+        ));
+        // An archive base reached through a symlink is hashed too.
+        let archive = root.path().join("a.tar");
+        fs::write(&archive, b"abc").unwrap();
+        let (strong, _) = pending_overlay(root.path(), &archive, "strong");
+        let conn = Connection::open(strong.join(HIDDEN_DB)).unwrap();
+        assert!(resolve_pending_base_digest(&conn).unwrap());
+        drop(conn);
+        let alink = root.path().join("alink");
+        std::os::unix::fs::symlink(&archive, &alink).unwrap();
+        fs::write(&archive, b"abX").unwrap();
+        assert!(matches!(
+            verify_base(&strong, &alink),
+            BaseCheck::Mismatch { .. }
         ));
     }
 
