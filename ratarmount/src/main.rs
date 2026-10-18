@@ -1253,6 +1253,8 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
 struct MountLowerStack {
     layers: Vec<(PathBuf, ratarmount_compositing::Immutability)>,
     records: Vec<ratarmount_compositing::LowerLayerRecord>,
+    /// `base_digest` recorded by the bottom lower, which was created on the base.
+    base_digest: Option<String>,
 }
 
 impl MountLowerStack {
@@ -1261,6 +1263,7 @@ impl MountLowerStack {
         let mut stack = Self {
             layers: Vec::new(),
             records: Vec::new(),
+            base_digest: None,
         };
         for path in paths {
             let path = path
@@ -1273,6 +1276,12 @@ impl MountLowerStack {
                     "lower {} is unsealed; pass --allow-unsealed-lower to use it",
                     path.display()
                 ));
+            }
+            if stack.records.is_empty() {
+                stack.base_digest = meta
+                    .as_ref()
+                    .and_then(|m| m.base_digest())
+                    .map(str::to_owned);
             }
             stack.records.push(LowerLayerRecord {
                 path: path.clone(),
@@ -1297,6 +1306,36 @@ impl MountLowerStack {
             ));
         }
         Ok(stack)
+    }
+
+    /// Identity a read-only composed mount (no `-w` top) serves through the
+    /// root `user.ratarmount.*` status xattrs. Empty without `--lower`.
+    fn read_only_metadata(&self) -> std::collections::BTreeMap<String, String> {
+        let mut metadata = std::collections::BTreeMap::new();
+        if self.records.is_empty() {
+            return metadata;
+        }
+        let base = self.base_digest.clone().unwrap_or_default();
+        let digests: Vec<&str> = self
+            .records
+            .iter()
+            .map(|r| r.layer_digest.as_str())
+            .collect();
+        metadata.insert(
+            "stack_digest".into(),
+            ratarmount_compositing::stack_digest(&base, &digests),
+        );
+        metadata.insert("base_digest".into(), base);
+        metadata.insert(
+            "lower_layers".into(),
+            serde_json::to_string(&self.records).expect("lower records"),
+        );
+        // The composed view cannot change only when every layer is sealed.
+        if self.records.iter().all(|r| !r.sealed_at.is_empty()) {
+            let top = self.records.last().expect("non-empty");
+            metadata.insert("sealed_at".into(), top.sealed_at.clone());
+        }
+        metadata
     }
 
     fn check_top(&self, dir: &Path, force: bool) -> Result<(), String> {
@@ -2358,7 +2397,11 @@ fn main() {
         journal: journal_options,
         quota: overlay_quota.clone(),
         readonly: journal_rules,
-        ..Default::default()
+        metadata: if overlay_arc.is_none() {
+            lower_stack.read_only_metadata()
+        } else {
+            Default::default()
+        },
     };
 
     let writable = overlay_arc.is_some();

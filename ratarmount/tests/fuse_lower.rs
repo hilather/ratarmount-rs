@@ -218,3 +218,57 @@ fn regression_fuse_lower_read_only_without_top() {
         Some(libc::EROFS)
     );
 }
+
+fn root_xattr(mount: &Path, name: &str) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(mount.as_os_str().as_bytes()).unwrap();
+    let name = std::ffi::CString::new(name).unwrap();
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    assert!(n >= 0, "getxattr: {}", std::io::Error::last_os_error());
+    buf.truncate(n as usize);
+    String::from_utf8(buf).unwrap()
+}
+
+/// Regression: a read-only `--lower` mount (no `-w` top) served empty
+/// `user.ratarmount.stack_digest`/`layers` and `sealed` 0, so a grader could
+/// not tell which stack it was reading.
+#[test]
+fn regression_fuse_lower_read_only_root_xattrs_name_the_stack() {
+    if !available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (base, lower) = fixture(root.path());
+    let path = root.path().join("mnt");
+    let _mount = Mount::start(&base, &lower, None, &path);
+    let base_digest = OverlayMeta::read(&lower)
+        .unwrap()
+        .unwrap()
+        .base_digest()
+        .unwrap_or("")
+        .to_owned();
+    assert_eq!(
+        root_xattr(&path, "user.ratarmount.stack_digest"),
+        ratarmount_compositing::stack_digest(&base_digest, &["sha256:prepared"])
+    );
+    assert_eq!(
+        root_xattr(&path, "user.ratarmount.base_digest"),
+        base_digest
+    );
+    assert_eq!(root_xattr(&path, "user.ratarmount.sealed"), "1");
+    let layers: serde_json::Value =
+        serde_json::from_str(&root_xattr(&path, "user.ratarmount.layers")).unwrap();
+    assert_eq!(layers[0]["layer_digest"], "sha256:prepared");
+    assert_eq!(
+        layers[0]["path"],
+        lower.canonicalize().unwrap().to_str().unwrap()
+    );
+}

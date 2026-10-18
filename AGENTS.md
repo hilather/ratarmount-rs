@@ -373,6 +373,9 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Killed overlay writers leave inconsistent rows/content; `overlay fsck --repair` follows unsafe paths or modifies sealed/mounted overlays (SBX-LOWER) | `cargo test -p ratarmount-compositing --lib overlay_fsck` |
 | `--lower` stacks lose identity, accept unsealed lowers or a different stack, allow `-w` on a sealed top or a layered commit, or serve wrong composed content (SBX-LOWER) | `cargo test -p ratarmount --bin ratarmount lower_stack_tests` · `cargo test -p ratarmount --test overlay_lower` · `cargo test -p ratarmount --test fuse_lower` |
+| Operation journal loses ranges, denials, marks or metadata; root control xattrs wrong; a read-only mount without `--journal` loses kernel `ro`; FUSE `symlink` on `-w` returns EPERM (SBX-OPLOG) | `cargo test -p ratarmount-fuse --lib regression_oplog` · `cargo test -p ratarmount-compositing --lib regression_oplog` · `cargo test -p ratarmount --test fuse_journal` |
+| Journal summaries misclassify reads/writes or marks; journal verbs and flags steal positionals (SBX-OPLOG) | `cargo test -p ratarmount --bin ratarmount journal_cmd::tests` |
+| Read-only `--lower` mount serves empty `user.ratarmount.stack_digest`/`layers` and `sealed` 0 (SBX-OPLOG × SBX-LOWER) | `cargo test -p ratarmount --test fuse_lower regression_fuse_lower_read_only_root_xattrs` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
