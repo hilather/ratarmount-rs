@@ -1023,3 +1023,68 @@ getfattr -n user.ratarmount.stats mnt
 getfattr -n user.ratarmount.base_digest mnt
 python3 -c 'import os; os.setxattr("mnt", "user.ratarmount.mark", b"turn 2")'
 ```
+
+## Bundles
+
+Pack a sealed overlay into one portable, seekable `.tar.zst` archive:
+
+```bash
+ratarmount overlay seal attempt
+ratarmount overlay pack attempt attempt.tar.zst \
+  --include-journal attempt-journal.jsonl --include-index
+ratarmount overlay unpack attempt.tar.zst restored
+ratarmount overlay verify restored
+```
+
+`pack DIR BUNDLE [--lower LAYER …] [BASE]` uses the recorded base URL and lower
+layers unless overridden. It refuses unsealed overlays and existing output
+files, publishes the completed bundle atomically, and prints `layer_digest`.
+Packing the same layer with the same optional inputs produces identical bytes.
+Paths are sorted, archive uid/gid are zero, and layer modes, mtimes and symlink
+targets are preserved. File content is streamed; symlinks are never followed.
+In-use markers and COW/spool temporary files are excluded.
+
+The ordinary TAR layout is:
+
+```text
+layer/                         # overlay content and directories
+layer/.ratarmount.overlay.sqlite
+layer/.ratarmount-sealed
+manifest.jsonl                 # exact changes against the composed stack
+meta.json                      # all overlay meta keys, as JSON string values
+journal.jsonl                  # with --include-journal FILE
+journal-summary.json           # journal summarize output
+index/BASE.index.sqlite        # with --include-index, if an adjacent sidecar exists
+```
+
+The index is the local base archive's adjacent `BASE.index.sqlite` sidecar;
+remote and directory bases do not contribute an index. Unpacking restores only
+`layer/`. To use a shipped index on another machine, copy it beside the matching
+base archive under its original sidecar name. A bundle carries layer changes,
+not the base archive or its lower layers.
+
+`unpack BUNDLE DIR` accepts a nonexistent or empty directory, restores sealed
+read-only permissions, checks that the database opens read-only and immutable,
+and compares the seal sentinel with the recorded digest. It also recomputes the
+seal against the recorded stack when that base and its lowers are reachable.
+When they are absent it reports that only the database and sentinel were
+checked; run `overlay verify` after restoring the stack to validate content.
+Exit codes are 0 for a match, 1 for a digest/content mismatch, and 2 for invalid
+input or an operational error. Unsafe archive paths, duplicate entries,
+hardlinks, device entries and writes through symlink components are refused.
+Extraction uses a private staging directory and publishes the result by rename.
+
+A bundle can be mounted directly as an ordinary archive, or used as a lower:
+
+```bash
+ratarmount attempt.tar.zst inspect-mnt
+# inspect-mnt contains layer/, manifest.jsonl and meta.json
+ratarmount --lower attempt.tar.zst -w next-attempt base.tar.zst work-mnt
+```
+
+For `--lower`, the metadata is read through the archive session API, then the
+layer is unpacked once into
+`$XDG_CACHE_HOME/ratarmount/layers/<layer_digest without sha256:>` (default:
+`~/.cache/ratarmount/layers/`). Publication is atomic. Later mounts reuse the
+cached sealed directory after checking its immutable database and sentinel;
+a damaged cache entry is refused. Directory lowers continue to work normally.

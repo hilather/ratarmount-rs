@@ -41,6 +41,7 @@ mod find;
 mod journal_cmd;
 mod overlay_cmd;
 mod overlay_commit;
+mod overlay_pack;
 mod overlay_stats;
 mod publish_index;
 mod sandbox;
@@ -1266,6 +1267,14 @@ impl MountLowerStack {
             base_digest: None,
         };
         for path in paths {
+            let cached;
+            let path = if path.is_file() {
+                cached = overlay_pack::cached_lower(path)
+                    .map_err(|e| format!("lower bundle {}: {e}", path.display()))?;
+                &cached
+            } else {
+                path
+            };
             let path = path
                 .canonicalize()
                 .map_err(|e| format!("lower {}: {e}", path.display()))?;
