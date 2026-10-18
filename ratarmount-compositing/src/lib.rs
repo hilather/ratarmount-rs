@@ -53,11 +53,13 @@ pub use overlay_layer::{
     compose_stack, serving_layer, Immutability, LayerIndex, ReadOnlyOverlayLayer,
 };
 pub use overlay_meta::{
-    append_base_excludes, base_digest_state, directory_digest, directory_digest_calls_this_thread,
-    directory_digest_excluding, directory_weak_digest, directory_weak_walks_this_thread,
-    record_base_digest, redact_meta_values, resolve_base_excludes, resolve_pending_base_digest,
-    stack_digest, verify_base, BaseCheck, BaseDigestRequest, BaseExcludes, BaseStrength,
-    LowerLayerRecord, OverlayCreateInfo, OverlayMeta, PendingBase,
+    append_base_excludes, base_digest_state, compare_base_identity, directory_digest,
+    directory_digest_calls_this_thread, directory_digest_excluding, directory_weak_digest,
+    directory_weak_walks_this_thread, forced_base_record, record_base_digest,
+    record_base_rows_offline, redact_meta_values, resolve_base_excludes,
+    resolve_pending_base_digest, stack_digest, verify_base, BaseCheck, BaseComparison,
+    BaseDigestRequest, BaseExcludes, BaseProbe, BaseStrength, LowerLayerRecord, OverlayCreateInfo,
+    OverlayMeta, PendingBase,
 };
 pub use overlay_policy::{
     parse_overlay_size, CompositeOverlayPolicy, OverlayQuota, OverlayStats, OverlayUsage,

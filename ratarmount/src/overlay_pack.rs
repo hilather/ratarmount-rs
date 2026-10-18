@@ -32,6 +32,9 @@ pub struct PackOptions {
     pub include_index: bool,
     /// Local base override for locating its adjacent index sidecar.
     pub base: Option<PathBuf>,
+    /// Rows describing the base actually used, written over the bundle's
+    /// metadata (`meta.json` and the packed database) by a forced pack.
+    pub base_rows: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -131,8 +134,9 @@ fn sanitized_db(
     directory: &Path,
     staging: &Path,
     meta: &OverlayMeta,
+    packed: &OverlayMeta,
 ) -> io::Result<Option<PathBuf>> {
-    let clean = meta.redacted_values();
+    let clean = packed.redacted_values();
     if &clean == meta.values() {
         return Ok(None);
     }
@@ -160,8 +164,11 @@ fn sanitized_db(
         .map_err(io::Error::other)?;
     for (key, value) in &clean {
         if meta.values().get(key) != Some(value) {
-            conn.execute("UPDATE meta SET value=?1 WHERE key=?2", [value, key])
-                .map_err(io::Error::other)?;
+            conn.execute(
+                "INSERT INTO meta (key,value) VALUES (?2,?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [value, key],
+            )
+            .map_err(io::Error::other)?;
         }
     }
     conn.execute_batch("VACUUM;").map_err(io::Error::other)?;
@@ -267,7 +274,11 @@ pub fn pack(
     // An overlay from an earlier build may hold a credentialed base URL: export
     // a redacted copy of its database; the source is never modified.
     let staging = tempfile::tempdir_in(output_parent)?;
-    let sanitized = sanitized_db(directory, staging.path(), &meta)?;
+    let packed = match &options.base_rows {
+        Some(rows) => meta.with_rows(rows),
+        None => meta.clone(),
+    };
+    let sanitized = sanitized_db(directory, staging.path(), &meta, &packed)?;
     {
         let mut tar = tar::Builder::new(BufWriter::new(&mut plain));
         // Top-level members and all layer entries use bytewise sorted paths.
@@ -322,7 +333,7 @@ pub fn pack(
         append_bytes(
             &mut tar,
             "meta.json",
-            &serde_json::to_vec(&meta.redacted_values())?,
+            &serde_json::to_vec(&packed.redacted_values())?,
         )?;
         append_bytes(
             &mut tar,
@@ -1418,7 +1429,7 @@ mod tests {
             .unwrap();
         let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
         drop(conn);
-        let copy = sanitized_db(&dir, &link.join("stage"), &meta)
+        let copy = sanitized_db(&dir, &link.join("stage"), &meta, &meta)
             .unwrap()
             .unwrap();
         let bytes = fs::read(copy).unwrap();
@@ -1726,6 +1737,7 @@ mod tests {
                 include_journal: Some(journal),
                 include_index: true,
                 base: None,
+                base_rows: None,
             },
         )
         .unwrap();

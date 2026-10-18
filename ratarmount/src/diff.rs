@@ -94,6 +94,8 @@ pub struct DiffArgs {
     pub context: usize,
     #[arg(long)]
     pub include_git_dir: bool,
+    #[command(flatten)]
+    pub identity: crate::overlay_cmd::BaseIdentityArgs,
 }
 
 impl Default for DiffArgs {
@@ -261,6 +263,9 @@ struct Prepared {
     changes: Vec<core::Change>,
     options: ChangeOptions,
     meta: Option<OverlayMeta>,
+    /// Set when `--force-base-mismatch` overrode a changed base:
+    /// (recorded digest, digest of the base actually diffed).
+    forced_base: Option<(Option<String>, String)>,
 }
 
 fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
@@ -293,6 +298,7 @@ fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
             changes: core::change_set_without_base(&args.directory, &options)?,
             options,
             meta,
+            forced_base: None,
         });
     };
     let lower_dirs = if args.lower.is_empty() {
@@ -334,6 +340,19 @@ fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
             }
         }
     }
+    // Same cheap identity check as reopen and `--lower`: a base that is not the
+    // one the overlay recorded must not be diffed silently.
+    let forced_base =
+        crate::overlay_cmd::gate_base(&args.directory, meta.as_ref(), base, &args.identity)
+            .map_err(io::Error::other)?
+            .and_then(|outcome| {
+                outcome.forced.map(|rows| {
+                    (
+                        outcome.recorded,
+                        rows.get("base_digest").cloned().unwrap_or_default(),
+                    )
+                })
+            });
     let mut open = OpenOptions {
         write_index: false,
         index_in_memory: true,
@@ -360,6 +379,7 @@ fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
         changes,
         options,
         meta,
+        forced_base,
     })
 }
 
@@ -373,9 +393,18 @@ fn render(prepared: &Prepared, args: &DiffArgs, out: &mut dyn Write) -> io::Resu
             let meta = prepared.meta.as_ref();
             // A pending archive base has no digest yet: report base and stack as
             // unknown (null), never a stack derived from the empty string.
-            let base = meta.and_then(OverlayMeta::known_base_digest);
+            let forced = prepared.forced_base.as_ref();
+            // A forced run reports the base actually diffed, never the stale
+            // recorded value; an unforced one has just confirmed the recorded one.
+            let base = match forced {
+                Some((_, actual)) => Some(actual.as_str()),
+                None => meta.and_then(OverlayMeta::known_base_digest),
+            };
             let pending = meta.is_some_and(|m| m.base_digest_kind() == Some("pending"));
             let mut stack = meta.and_then(OverlayMeta::stack_digest).map(str::to_owned);
+            if forced.is_some() {
+                stack = None;
+            }
             if stack.is_none() {
                 if let Some(base) = base {
                     let lower = meta.unwrap().lower_layers().map_err(io::Error::other)?;
@@ -390,7 +419,7 @@ fn render(prepared: &Prepared, args: &DiffArgs, out: &mut dyn Write) -> io::Resu
             }
             serde_json::to_writer(
                 &mut *out,
-                &serde_json::json!({"patch":hash,"base":base,"stack":stack,"files":prepared.changes.len(),"normalize":prepared.options.normalize.as_str(),"excludes":args.exclude,"algo":prepared.options.algo.as_str(),"sealed":meta.is_some_and(OverlayMeta::layer_sealed),"base_pending":pending,"base_digest_state":meta.map_or("none", OverlayMeta::base_digest_state)}),
+                &serde_json::json!({"patch":hash,"base":base,"base_forced":forced.is_some(),"base_recorded":forced.and_then(|(recorded, _)| recorded.as_deref()),"stack":stack,"files":prepared.changes.len(),"normalize":prepared.options.normalize.as_str(),"excludes":args.exclude,"algo":prepared.options.algo.as_str(),"sealed":meta.is_some_and(OverlayMeta::layer_sealed),"base_pending":pending,"base_digest_state":meta.map_or("none", OverlayMeta::base_digest_state)}),
             )?;
             out.write_all(b"\n")?;
         } else {
@@ -470,6 +499,7 @@ pub(crate) fn render_source(
                 changes,
                 options,
                 meta: None,
+                forced_base: None,
             },
             args,
             &mut output,

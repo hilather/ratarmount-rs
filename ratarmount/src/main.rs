@@ -1418,85 +1418,35 @@ fn mounted_base_identity(
     base: &MountedBase,
     force: bool,
 ) -> Result<String, String> {
-    use ratarmount_compositing::overlay_meta::{directory_weak_digest, BaseExcludes};
-    let get = |key: &str| meta.and_then(|m| m.get(key));
-    // Kind `none` (and a lower with no kind) recorded no identity to compare.
-    let decidable = meta.is_some_and(|m| m.base_digest_kind().is_some_and(|k| k != "none"));
-    let recorded_weak = get("base_weak_digest");
-    let recorded_stamp = get("base_size").zip(get("base_mtime_ns"));
-    let recorded_tree = get("base_git_tree");
-    let mut mismatch: Option<String> = None;
-    let identity = if let Some(tree) = &base.git_tree {
-        let current = format!("git-tree:{tree}");
-        if decidable
-            && (recorded_tree.is_some_and(|r| r != tree)
-                || recorded_weak.is_some()
-                || recorded_stamp.is_some())
-        {
-            mismatch = Some(current.clone());
-        }
-        current
-    } else if let Some(dir) = base.path.as_deref().filter(|p| p.is_dir()) {
-        let need_walk = base.supplied.is_none() || (decidable && recorded_weak.is_some());
-        let current = if need_walk {
-            // The lower's own recorded set measured its digest; this
-            // invocation's own paths are added so they cannot count as edits.
-            let recorded = match get("base_weak_excludes") {
-                Some(text) => BaseExcludes::from_json(text).map_err(|e| e.to_string())?,
-                None => BaseExcludes::default(),
-            };
-            let excludes =
-                BaseExcludes::new(recorded.paths().iter().chain(&base.extra_excludes).cloned());
-            Some(
-                directory_weak_digest(dir, &excludes)
-                    .map_err(|e| format!("cannot measure base {}: {e}", dir.display()))?,
-            )
-        } else {
-            None
-        };
-        if decidable {
-            let differs = match (recorded_weak, &current) {
-                (Some(recorded), Some(now)) => recorded != now,
-                _ => recorded_stamp.is_some() || recorded_tree.is_some(),
-            };
-            if differs {
-                mismatch = current.clone().or_else(|| Some("a directory".into()));
-            }
-        }
-        base.supplied.clone().or(current).unwrap_or_default()
-    } else if let Some(file) = base.path.as_deref().filter(|p| p.is_file()) {
-        if decidable {
-            let stamp = ratarmount_index::ArchiveDigestStamp::read(file)
-                .map_err(|e| format!("cannot stat base {}: {e}", file.display()))?;
-            let differs = match recorded_stamp {
-                Some((size, mtime)) => {
-                    stamp.size.to_string() != size || stamp.mtime_ns.to_string() != mtime
-                }
-                None => recorded_weak.is_some() || recorded_tree.is_some(),
-            };
-            if differs {
-                mismatch = Some(format!("size={},mtime_ns={}", stamp.size, stamp.mtime_ns));
-            }
-        }
-        base.supplied.clone().unwrap_or_else(|| {
-            ratarmount_index::peek_archive_digest(file, base.index.as_deref())
-                .ok()
-                .flatten()
-                .unwrap_or_default()
-        })
-    } else {
-        base.supplied.clone().unwrap_or_default()
+    let probe = ratarmount_compositing::BaseProbe {
+        path: base.path.as_deref(),
+        git_tree: base.git_tree.as_deref(),
+        supplied: base.supplied.as_deref(),
+        index: base.index.as_deref(),
+        extra_excludes: &base.extra_excludes,
     };
+    let comparison = ratarmount_compositing::compare_base_identity(meta, &probe)?;
+    let get = |key: &str| meta.and_then(|m| m.get(key));
+    let mismatch = comparison.mismatch;
+    let identity = comparison.identity;
     if let Some(current) = mismatch {
         if !force {
             let recorded = get("base_digest").unwrap_or("unknown");
-            return Err(if base.git_tree.is_some() || base.path.is_none() {
-                format!(
+            let strong = meta.is_some_and(|m| m.base_digest_kind() == Some("strong"));
+            return Err(
+                if strong && base.git_tree.is_none() && base.path.is_some() {
+                    format!(
+                    "lower {} was sealed against a strong base digest ({recorded}) and the mounted base's identity could not be confirmed cheaply (size/mtime or the directory manifest differ, and neither a matching --base-digest nor a matching cached SHA-256 in the base's index was found; the mount never hashes the base). Pass --base-digest {recorded} (from `overlay digest-base` on the source) if the mounted base is a copy of it, run `overlay verify {} BASE`, or pass --force-stack-mismatch as a last resort",
+                    lower.display(),
+                    lower.display()
+                )
+                } else if base.git_tree.is_some() || base.path.is_none() {
+                    format!(
                     "lower {} was sealed against base {recorded} but the mounted base is {current}; pass --force-stack-mismatch to override",
                     lower.display()
                 )
-            } else {
-                let journals: String = base
+                } else {
+                    let journals: String = base
                     .existing_journals
                     .iter()
                     .map(|p| {
@@ -1506,12 +1456,13 @@ fn mounted_base_identity(
                         )
                     })
                     .collect();
-                format!(
+                    format!(
                     "lower {} was sealed against a different base than the mounted one; run `overlay verify {} BASE` to compare digests, or pass --force-stack-mismatch to mount anyway{journals}",
                     lower.display(),
                     lower.display()
                 )
-            });
+                },
+            );
         }
     }
     Ok(identity)

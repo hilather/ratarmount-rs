@@ -47,7 +47,7 @@ pub enum OverlayCommand {
     #[command(
         after_help = "Example: ratarmount overlay seal attempt base.tar.zst\n\nExit status:\n  0  Overlay sealed or already sealed.\n  2  Invalid input or operational error."
     )]
-    Seal(SealArgs),
+    Seal(SealCmd),
     /// Restore owner write permission and remove the seal.
     ///
     /// Require --i-know to discard the immutability guarantee, clear recorded seal hashes, and restore owner write access.
@@ -123,6 +123,8 @@ pub struct DigestBaseArgs {
 
 #[derive(Debug, Args)]
 pub struct PackArgs {
+    #[command(flatten)]
+    pub identity: BaseIdentityArgs,
     pub directory: PathBuf,
     pub bundle: PathBuf,
     #[arg(long)]
@@ -132,6 +134,36 @@ pub struct PackArgs {
     #[arg(long, action = clap::ArgAction::Append)]
     pub lower: Vec<PathBuf>,
     pub base: Option<PathBuf>,
+}
+
+/// How `seal`, `pack` and `diff` treat a base that no longer matches the
+/// identity the overlay recorded.
+#[derive(Debug, Args, Default, Clone)]
+pub struct BaseIdentityArgs {
+    /// Proceed although the base differs from the one the overlay recorded (experimental).
+    ///
+    /// Seal and pack record the base actually used (and the override time);
+    /// diff reports it. Without this flag a changed base is refused.
+    #[arg(long)]
+    pub force_base_mismatch: bool,
+    /// Strong digest of the base (from `overlay digest-base`), confirming a copy without hashing (experimental).
+    #[arg(long, value_name = "sha256:HEX", value_parser = parse_supplied_digest)]
+    pub base_digest: Option<String>,
+}
+
+fn parse_supplied_digest(value: &str) -> Result<String, String> {
+    match value.parse::<ratarmount_compositing::BaseDigestRequest>()? {
+        ratarmount_compositing::BaseDigestRequest::Supplied(digest) => Ok(digest),
+        _ => Err("expected sha256:<64 hex digits>".into()),
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct SealCmd {
+    #[command(flatten)]
+    pub seal: SealArgs,
+    #[command(flatten)]
+    pub identity: BaseIdentityArgs,
 }
 
 #[derive(Debug, Args)]
@@ -327,12 +359,103 @@ pub(super) fn lower_view(
     super::MountLowerStack::open(source, None, &lowers, false).map(|(_, view)| view)
 }
 
+/// What the identity gate decided for `seal`, `pack` and `diff`.
+pub(super) struct GateOutcome {
+    /// The digest the overlay recorded, when it knows one.
+    pub recorded: Option<String>,
+    /// Set when `--force-base-mismatch` overrode a mismatch: the rows that
+    /// describe the base actually used (`base_digest`, `stack_digest`, ...).
+    pub forced: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// Compare the base with the identity the overlay recorded, with the check the
+/// `--lower` mount uses (metadata only, no hashing). `Ok(None)` when there is
+/// nothing to compare (legacy overlay, kind `none`, remote base).
+pub(super) fn gate_base(
+    dir: &Path,
+    meta: Option<&OverlayMeta>,
+    base: &Path,
+    identity: &BaseIdentityArgs,
+) -> Result<Option<GateOutcome>, String> {
+    use ratarmount_compositing::{compare_base_identity, forced_base_record, BaseProbe};
+    let Some(meta) = meta.filter(|m| !m.legacy()) else {
+        return Ok(None);
+    };
+    if meta.base_digest_kind().is_none_or(|k| k == "none") {
+        return Ok(None);
+    }
+    let git_tree = if meta.get("base_git_tree").is_some() {
+        let mut options = ratarmount_core::OpenOptions {
+            git: true,
+            ..Default::default()
+        };
+        super::overlay_cmd::pin_git_base(&mut [base.to_path_buf()], &mut options)?
+    } else {
+        None
+    };
+    if git_tree.is_none() && !base.is_dir() && !base.is_file() {
+        return Ok(None);
+    }
+    let index = meta.get("base_index_path").map(PathBuf::from).or_else(|| {
+        base.is_file()
+            .then(|| ratarmount_index::default_index_path(base))
+    });
+    let probe = BaseProbe {
+        path: Some(base),
+        git_tree: git_tree.as_deref(),
+        supplied: identity.base_digest.as_deref(),
+        index: index.as_deref(),
+        extra_excludes: &[],
+    };
+    let comparison = compare_base_identity(Some(meta), &probe)?;
+    let recorded = meta.known_base_digest().map(str::to_owned);
+    let Some(current) = &comparison.mismatch else {
+        return Ok(Some(GateOutcome {
+            recorded,
+            forced: None,
+        }));
+    };
+    if !identity.force_base_mismatch {
+        let strong_hint = if meta.base_digest_kind() == Some("strong") {
+            "; for a byte-identical copy pass its strong digest with --base-digest sha256:<hex> (see `overlay digest-base`), which confirms identity without hashing"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "base mismatch: {} is not the base overlay {} recorded (recorded {}; current {current}); identity could not be confirmed cheaply{strong_hint}; use --force-base-mismatch to proceed with the base as it is now",
+            ratarmount_core::redact_base_url(&base.to_string_lossy()),
+            dir.display(),
+            meta.base_digest().filter(|d| !d.is_empty()).unwrap_or("pending"),
+        ));
+    }
+    if meta.base_digest_kind() == Some("strong") && identity.base_digest.is_none() && base.is_dir()
+    {
+        eprintln!("warning: the recorded strong directory digest cannot be recomputed without hashing; recording the weak manifest of the base as it is now (pass --base-digest to keep a strong identity)");
+    }
+    let forced = forced_base_record(meta, &probe, &comparison)?;
+    Ok(Some(GateOutcome {
+        recorded,
+        forced: Some(forced),
+    }))
+}
+
 pub fn pack(args: &PackArgs) -> Result<(String, i32), String> {
     let meta = OverlayMeta::read(&args.directory).map_err(|e| e.to_string())?;
     if !meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
         return Err("overlay is not sealed".into());
     }
     let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
+    let base = select_base(
+        &SealArgs {
+            directory: args.directory.clone(),
+            base: args.base.clone(),
+            lower: Vec::new(),
+            json: false,
+        },
+        meta.as_ref(),
+    )?;
+    let forced = gate_base(&args.directory, meta.as_ref(), &base, &args.identity)?
+        .and_then(|outcome| outcome.forced);
     let lower = lower_view(&SealArgs {
         directory: args.directory.clone(),
         base: args.base.clone(),
@@ -343,13 +466,15 @@ pub fn pack(args: &PackArgs) -> Result<(String, i32), String> {
         include_journal: args.include_journal.clone(),
         include_index: args.include_index,
         base: args.base.clone(),
+        base_rows: forced,
     };
     super::overlay_pack::pack(&args.directory, &args.bundle, lower, &options)
         .map(|digest| (digest, 0))
         .map_err(|e| format!("pack: {e}"))
 }
 
-pub fn seal(args: &SealArgs) -> Result<(String, i32), String> {
+pub fn seal(cmd: &SealCmd) -> Result<(String, i32), String> {
+    let args = &cmd.seal;
     // Idempotence does not require the base still to be available.
     let meta = OverlayMeta::read(&args.directory)
         .map_err(|e| super::overlay_open_error(&args.directory, &e))?;
@@ -358,6 +483,13 @@ pub fn seal(args: &SealArgs) -> Result<(String, i32), String> {
         std::sync::Arc::new(ratarmount_compositing::overlay_changes::EmptySource)
             as std::sync::Arc<dyn ratarmount_core::MountSource>
     } else {
+        let base = select_base(args, meta.as_ref())?;
+        if let Some(forced) =
+            gate_base(&args.directory, meta.as_ref(), &base, &cmd.identity)?.and_then(|o| o.forced)
+        {
+            ratarmount_compositing::record_base_rows_offline(&args.directory, &forced)
+                .map_err(|e| format!("seal {}: {e}", args.directory.display()))?;
+        }
         lower_view(args)?
     };
     let outcome = ratarmount_compositing::overlay_seal::seal(&args.directory, lower)

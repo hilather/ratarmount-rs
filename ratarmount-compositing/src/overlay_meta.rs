@@ -1235,6 +1235,243 @@ pub fn verify_base(dir: &Path, base: &Path) -> BaseCheck {
     }
 }
 
+/// What a caller knows about a base without reading any of its content.
+pub struct BaseProbe<'a> {
+    /// Local path of a directory or archive base; `None` for remote bases.
+    pub path: Option<&'a Path>,
+    /// Tree id of a pinned Git base.
+    pub git_tree: Option<&'a str>,
+    /// A supplied `--base-digest`.
+    pub supplied: Option<&'a str>,
+    /// Index sidecar whose digest cache may already hold the archive's digest.
+    pub index: Option<&'a Path>,
+    /// Base-relative paths of the caller's own overlay, journal and mount
+    /// point, left out of the walk in addition to the recorded set.
+    pub extra_excludes: &'a [PathBuf],
+}
+
+/// Result of [`compare_base_identity`].
+#[derive(Debug, Default)]
+pub struct BaseComparison {
+    /// The base's own identity: the supplied digest, the weak manifest, the
+    /// tree id or an archive's cached digest; empty when it is not known
+    /// without hashing.
+    pub identity: String,
+    /// `Some(current identity)` when the base differs from the recorded one
+    /// and nothing cheap confirms it.
+    pub mismatch: Option<String>,
+    /// The directory walk, when one was made.
+    pub weak: Option<String>,
+    /// The archive's size/mtime stamp, when one was read.
+    pub stamp: Option<ArchiveDigestStamp>,
+    /// The archive digest the index cache already holds (never hashed here).
+    pub cached_digest: Option<String>,
+}
+
+/// The one cheap identity check: reopen, `overlay seal`/`pack`, `diff` and the
+/// `--lower` mount all compare a base with what the overlay recorded through
+/// this. Metadata only, never a content read:
+///
+/// * directories: the weak walk with the *recorded* exclusions (plus the
+///   caller's own paths);
+/// * archives: the size/mtime stamp;
+/// * Git: the tree id;
+/// * when the stamp or walk differs but the recorded kind is `strong`, the
+///   base is still accepted if the supplied digest or the digest already cached
+///   in the archive's index equals the recorded one. A supplied digest that
+///   contradicts a strong record is a mismatch even if the walk agrees.
+///
+/// A recorded kind of `none` (or no metadata) recorded no identity to compare.
+pub fn compare_base_identity(
+    meta: Option<&OverlayMeta>,
+    probe: &BaseProbe,
+) -> std::result::Result<BaseComparison, String> {
+    let get = |key: &str| meta.and_then(|m| m.get(key));
+    let decidable = meta.is_some_and(|m| m.base_digest_kind().is_some_and(|k| k != "none"));
+    let strong = meta.is_some_and(|m| m.base_digest_kind() == Some("strong"));
+    let recorded_digest = meta.and_then(OverlayMeta::base_digest);
+    let recorded_weak = get("base_weak_digest");
+    let recorded_stamp = get("base_size").zip(get("base_mtime_ns"));
+    let recorded_tree = get("base_git_tree");
+    // A strong record is confirmed by the same digest from elsewhere.
+    let confirms = |digest: Option<&str>| strong && digest.is_some() && digest == recorded_digest;
+    let mut out = BaseComparison::default();
+    let mut mismatch: Option<String> = None;
+    if let Some(tree) = probe.git_tree {
+        let current = format!("git-tree:{tree}");
+        if decidable
+            && (recorded_tree.is_some_and(|r| r != tree)
+                || recorded_weak.is_some()
+                || recorded_stamp.is_some())
+        {
+            mismatch = Some(current.clone());
+        }
+        out.identity = current;
+    } else if let Some(dir) = probe.path.filter(|p| p.is_dir()) {
+        let need_walk = probe.supplied.is_none() || (decidable && recorded_weak.is_some());
+        if need_walk {
+            // The recorded set measured the digest; the caller's own paths are
+            // added so they cannot count as edits.
+            let recorded = match get("base_weak_excludes") {
+                Some(text) => BaseExcludes::from_json(text).map_err(|e| e.to_string())?,
+                None => BaseExcludes::default(),
+            };
+            let excludes =
+                BaseExcludes::new(recorded.paths().iter().chain(probe.extra_excludes).cloned());
+            out.weak = Some(
+                directory_weak_digest(dir, &excludes)
+                    .map_err(|e| format!("cannot measure base {}: {e}", dir.display()))?,
+            );
+        }
+        if decidable {
+            let differs = match (recorded_weak, &out.weak) {
+                (Some(recorded), Some(now)) => recorded != now,
+                _ => recorded_stamp.is_some() || recorded_tree.is_some(),
+            };
+            if differs && !confirms(probe.supplied) {
+                mismatch = out.weak.clone().or_else(|| Some("a directory".into()));
+            }
+        }
+        out.identity = probe
+            .supplied
+            .map(str::to_owned)
+            .or_else(|| out.weak.clone())
+            .unwrap_or_default();
+    } else if let Some(file) = probe.path.filter(|p| p.is_file()) {
+        if decidable {
+            let stamp = ArchiveDigestStamp::read(file)
+                .map_err(|e| format!("cannot stat base {}: {e}", file.display()))?;
+            out.stamp = Some(stamp);
+        }
+        if probe.supplied.is_none() || (decidable && strong) {
+            out.cached_digest = peek_archive_digest(file, probe.index).ok().flatten();
+        }
+        if let Some(stamp) = &out.stamp {
+            let differs = match recorded_stamp {
+                Some((size, mtime)) => {
+                    stamp.size.to_string() != size || stamp.mtime_ns.to_string() != mtime
+                }
+                None => recorded_weak.is_some() || recorded_tree.is_some(),
+            };
+            if differs && !confirms(probe.supplied) && !confirms(out.cached_digest.as_deref()) {
+                mismatch = Some(format!("size={},mtime_ns={}", stamp.size, stamp.mtime_ns));
+            }
+        }
+        out.identity = probe
+            .supplied
+            .map(str::to_owned)
+            .or_else(|| out.cached_digest.clone())
+            .unwrap_or_default();
+    } else {
+        out.identity = probe.supplied.unwrap_or_default().to_owned();
+    }
+    // A supplied digest that is not the strong one recorded is a different base.
+    if mismatch.is_none() && decidable && strong {
+        if let Some(supplied) = probe.supplied.filter(|s| Some(*s) != recorded_digest) {
+            mismatch = Some(supplied.to_owned());
+        }
+    }
+    out.mismatch = mismatch;
+    Ok(out)
+}
+
+/// The meta rows that make the overlay describe the base `probe` measured,
+/// for a forced seal or pack (`--force-base-mismatch`): the actual identity
+/// instead of the recorded one, the recomputed `stack_digest`, and the time of
+/// the override. Metadata only: a directory records its weak walk (or the
+/// supplied strong digest), an archive its stamp plus the supplied or cached
+/// digest, else the weak `size`/`mtime_ns` form (nothing is hashed), Git its
+/// tree id.
+pub fn forced_base_record(
+    meta: &OverlayMeta,
+    probe: &BaseProbe,
+    measured: &BaseComparison,
+) -> std::result::Result<BTreeMap<String, String>, String> {
+    let mut rows: BTreeMap<String, String> = BTreeMap::new();
+    let mut set = |key: &str, value: String| {
+        rows.insert(key.to_owned(), value);
+    };
+    let (digest, kind, source) = if let Some(tree) = probe.git_tree {
+        set("base_git_tree", tree.to_owned());
+        (format!("git-tree:{tree}"), "git-tree", "computed")
+    } else if let Some(dir) = probe.path.filter(|p| p.is_dir()) {
+        if let Some(weak) = &measured.weak {
+            set("base_weak_digest", weak.clone());
+        }
+        match (probe.supplied, &measured.weak) {
+            (Some(supplied), _) => (supplied.to_owned(), "strong", "supplied"),
+            (None, Some(weak)) => (weak.clone(), "weak", "computed"),
+            (None, None) => {
+                return Err(format!("cannot measure base {}", dir.display()));
+            }
+        }
+    } else if let Some(file) = probe.path.filter(|p| p.is_file()) {
+        let stamp = measured
+            .stamp
+            .as_ref()
+            .ok_or_else(|| format!("cannot stat base {}", file.display()))?;
+        set("base_size", stamp.size.to_string());
+        set("base_mtime_ns", stamp.mtime_ns.to_string());
+        set(
+            "base_local_path",
+            file.canonicalize()
+                .map_err(|e| format!("cannot resolve base {}: {e}", file.display()))?
+                .to_string_lossy()
+                .into_owned(),
+        );
+        match (probe.supplied, &measured.cached_digest) {
+            (Some(supplied), _) => (supplied.to_owned(), "strong", "supplied"),
+            (None, Some(cached)) => (cached.clone(), "strong", "computed"),
+            (None, None) => (
+                format!("weak:size={},mtime_ns={}", stamp.size, stamp.mtime_ns),
+                "weak",
+                "computed",
+            ),
+        }
+    } else {
+        return Err("the base is not a local directory, archive or Git tree".into());
+    };
+    let layers = meta.lower_layers().map_err(|e| e.to_string())?;
+    let stack = stack_digest(
+        &digest,
+        &layers
+            .iter()
+            .map(|l| l.layer_digest.as_str())
+            .collect::<Vec<_>>(),
+    );
+    set("base_digest", digest);
+    set("base_digest_kind", kind.to_owned());
+    set("base_digest_source", source.to_owned());
+    set("stack_digest", stack);
+    set("base_mismatch_forced_at", timestamp());
+    Ok(rows)
+}
+
+impl OverlayMeta {
+    /// A copy with `rows` written over it (a forced pack's bundle metadata).
+    pub fn with_rows(&self, rows: &BTreeMap<String, String>) -> Self {
+        let mut values = self.values.clone();
+        values.extend(rows.iter().map(|(k, v)| (k.clone(), v.clone())));
+        Self { values }
+    }
+}
+
+/// Write `rows` into an unsealed overlay's `meta` table (a forced seal).
+pub fn record_base_rows_offline(overlay: &Path, rows: &BTreeMap<String, String>) -> Result<()> {
+    let conn = Connection::open_with_flags(
+        overlay.join(HIDDEN_DB),
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    OverlayMeta::set_many(
+        &conn,
+        &rows
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn verify(
     conn: &Connection,
     meta: &OverlayMeta,

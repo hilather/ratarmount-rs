@@ -316,11 +316,26 @@ size/mtime, Git tree ids and the weak manifest of a directory base (re-walked wi
 the recorded exclusions) are checked; file contents and remote objects are
 not rehashed. A directory base edited between sessions is refused, naming
 `--force-base-mismatch`. For a copy of a base on another host or filesystem
-(mtimes differ), take the strong digest on the source and pass it with `--base-digest`. Deliberately
+(mtimes differ), take the strong digest on the source and pass it with `--base-digest`; a read-only `--lower` mount accepts it too when it equals the lower's recorded strong digest (an archive's cached index digest works as well; the mount never hashes). Deliberately
 preserving file size and mtime can therefore evade the cheap check. A mismatch
 refuses the mount; its message shows the recorded digest and current identity
 (stat values for a local archive, without recomputing SHA-256).
-`--force-base-mismatch` records the override time while preserving the original
+`overlay seal`, `overlay pack` and `diff` (any mode) run the same cheap check
+before they do anything and refuse a base that is not the recorded one, showing
+recorded and current identity and naming `--force-base-mismatch` (experimental),
+and `--base-digest sha256:<hex>` when the record is strong: a supplied digest, or
+the digest already cached in an archive's index, equal to the recorded one
+confirms a copy without hashing. Forced, `seal` records the base actually used
+(a directory: its weak manifest, or the supplied strong digest; an archive: its
+size/mtime plus the supplied or cached digest, else the weak
+`weak:size=,mtime_ns=` form; Git: the tree id), recomputes `stack_digest` and
+sets `base_mismatch_forced_at`, so `overlay verify` against that base passes;
+`pack` writes the same rows into the bundle only (the sealed source layer is
+untouched); `diff --hash --json` reports the base actually diffed as `base`,
+with `base_forced: true` and `base_recorded`. A forced run over a strong
+directory record without `--base-digest` downgrades to the weak manifest and
+says so. Sealing an already sealed overlay still needs no base.
+`--force-base-mismatch` on reopen records the override time while preserving the original
 base and stack digests. Use it deliberately after an external base replacement.
 Successful local archive commits refresh the recorded size, mtime, base and
 stack digests, and record `base_committed_at`. Strong digests are recomputed
