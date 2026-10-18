@@ -946,6 +946,38 @@ fn regression_digest_once_eight_concurrent_mounts() {
     assert_eq!(hash_lines(&log), 1, "{:?}", std::fs::read_to_string(&log));
 }
 
+/// Regression: a second mount's cache peek waited for the first mount's hash
+/// (it took the same lock), so it was not serving until that hash finished.
+/// While mount 0 is hashing (delay), mount 1 must be serving and show a pending
+/// digest; afterwards both resolve and the archive was hashed exactly once.
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_second_mount_serves_while_the_first_is_hashing() {
+    let root = tempfile::tempdir().unwrap();
+    let Some((archive, index)) = logged_fixture(root.path()) else {
+        return;
+    };
+    let log = root.path().join("hash.log");
+    let hashing = 8000;
+    let mut first = LoggedMount::spawn(root.path(), 0, &archive, Some(&index), &log, hashing);
+    wait_until("first serving", || first.serving());
+    wait_until("first started hashing", || hash_lines(&log) == 1);
+    let started = std::time::Instant::now();
+    let mut second = LoggedMount::spawn(root.path(), 1, &archive, Some(&index), &log, hashing);
+    wait_until("second serving", || second.serving());
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(hashing),
+        "second mount was not serving until the first hash finished"
+    );
+    assert_eq!(second.xattr("base_digest"), "", "digest still pending");
+    wait_until("first digest", || !first.xattr("base_digest").is_empty());
+    wait_until("second digest", || !second.xattr("base_digest").is_empty());
+    assert_eq!(first.xattr("base_digest"), second.xattr("base_digest"));
+    first.unmount();
+    second.unmount();
+    assert_eq!(hash_lines(&log), 1, "{:?}", std::fs::read_to_string(&log));
+}
+
 /// Regression: C3 case 3, with no writable index cache (`:memory:`) every
 /// mount's background hasher rehashed the archive. The digest stays pending.
 #[cfg(target_os = "linux")]
