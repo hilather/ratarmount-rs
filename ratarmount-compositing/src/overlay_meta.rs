@@ -108,6 +108,63 @@ pub(crate) fn plan_excludes(
     }))
 }
 
+/// `SQLITE_READONLY_ROLLBACK`: a read-only open found a hot rollback journal
+/// (a writer died mid-transaction) that only a read-write open can play back.
+fn is_hot_journal(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK
+    )
+}
+
+/// Roll back the hot journal an interrupted writer (a SIGKILLed `overlay
+/// import`) left behind, so the read verbs can report on the overlay (fsck
+/// then names `import_incomplete`). Only an unsealed overlay whose database
+/// and directory are writable is touched; a sealed or read-only one gets an
+/// error naming the interrupted write and its journal stays as it is.
+fn recover_hot_journal(dir: &Path, db: &Path) -> Result<()> {
+    let journal = PathBuf::from(format!("{}-journal", db.display()));
+    let refuse = |why: &str| {
+        OverlayError::Msg(format!(
+            "an interrupted write left {} ({why}); mount -w once on a writable \
+             copy to roll it back, or discard the overlay and re-import",
+            journal.display()
+        ))
+    };
+    if fs::symlink_metadata(dir.join(crate::overlay_seal::SENTINEL)).is_ok() {
+        return Err(refuse("the overlay is sealed and is not rolled back"));
+    }
+    if !path_writable(dir) || !path_writable(db) {
+        return Err(refuse("the overlay or its directory is read-only"));
+    }
+    let conn = Connection::open_with_flags(
+        dir.canonicalize()?.join(HIDDEN_DB),
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    // Any read takes the shared lock, which plays the journal back.
+    match conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    }) {
+        Ok(_) => Ok(()),
+        Err(error) if is_hot_journal(&error) => Err(refuse("it could not be rolled back here")),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn path_writable(path: &Path) -> bool {
+    rustix::fs::access(path, rustix::fs::Access::WRITE_OK).is_ok()
+}
+
+#[cfg(not(unix))]
+fn path_writable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| !m.permissions().readonly())
+}
+
 /// Highest overlay `format_version` this build reads. Additive keys
 /// (`base_weak_digest`, `base_digest_source`, `import_in_progress`, ...) stay
 /// within version 2.
@@ -138,7 +195,13 @@ impl OverlayMeta {
             conn.busy_timeout(std::time::Duration::ZERO)?;
             Self::from_connection(&conn)
         };
-        read().map_err(|error| match error {
+        let result = match read() {
+            Err(OverlayError::Sqlite(error)) if is_hot_journal(&error) => {
+                recover_hot_journal(dir.as_ref(), &db).and_then(|()| read())
+            }
+            other => other,
+        };
+        result.map_err(|error| match error {
             OverlayError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
                 if matches!(
                     code.code,

@@ -277,41 +277,126 @@ fn regression_import_lower_stack_identity_and_unsealed_opt_in() {
     ratarmount_compositing::overlay_seal::unseal(&lower).unwrap();
 }
 
-/// Regression: a killed `overlay import --no-seal` left an overlay that fsck called clean and seal sealed.
+/// Spawn `overlay import` with the journal-hold seam and SIGKILL it while its
+/// write transaction is open. Returns the overlay directory; the rollback
+/// `-journal` is asserted to exist (a real hot journal, not a fabricated file).
+#[cfg(unix)]
+fn kill_import_mid_transaction(root: &Path, base: &Path) -> std::path::PathBuf {
+    let dest = root.join("overlay");
+    let ready = root.join("ready");
+    let patch = b"--- /dev/null\n+++ b/new\n@@ -0,0 +1 @@\n+hello\n";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .env("HOME", root)
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("RATARMOUNT_TEST_JOURNAL_HOLD", &ready)
+        .args(["overlay", "import", "--no-seal", "-"])
+        .arg(&dest)
+        .arg(base)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(patch).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "import never reached the transaction hold"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.kill().unwrap(); // SIGKILL
+    child.wait().unwrap();
+    let journal = dest.join(".ratarmount.overlay.sqlite-journal");
+    assert!(journal.exists(), "no hot journal after SIGKILL");
+    dest
+}
+
+#[cfg(unix)]
+fn overlay_cli(root: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .env("HOME", root)
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .arg("overlay")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// Regression: a killed `overlay import --no-seal` left an overlay that fsck
+/// called clean and seal sealed, and (I1) its hot `-journal` made info, fsck
+/// and seal fail with the misleading "attempt to write a readonly database".
+/// A real SIGKILL mid-transaction: fsck must report `import_incomplete`.
+#[cfg(unix)]
 #[test]
 fn regression_seal_refuses_incomplete_import() {
     let root = tempfile::tempdir().unwrap();
     let base = root.path().join("base");
     fs::create_dir(&base).unwrap();
-    let dest = root.path().join("overlay");
-    let patch = b"--- /dev/null\n+++ b/new\n@@ -0,0 +1 @@\n+hello\n";
-    let out = import(&base, &dest, patch, &["--no-seal"]);
-    assert_eq!(out.status.code(), Some(0));
-    // Leave the marker an interrupted import would have left behind.
-    rusqlite::Connection::open(dest.join(".ratarmount.overlay.sqlite"))
-        .unwrap()
-        .execute(
-            "INSERT INTO meta(key,value) VALUES('import_in_progress','1:2')",
-            [],
-        )
-        .unwrap();
-    let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_ratarmount"))
-            .env("HOME", root.path())
-            .env("XDG_CACHE_HOME", root.path().join("cache"))
-            .args(["overlay"])
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    let fsck = run(&["fsck", "--json", dest.to_str().unwrap()]);
+    let dest = kill_import_mid_transaction(root.path(), &base);
+    let d = dest.to_str().unwrap();
+    let info = overlay_cli(root.path(), &["info", "--json", d]);
+    assert_eq!(info.status.code(), Some(0), "{info:?}");
+    // The read rolled the journal back.
+    assert!(!dest.join(".ratarmount.overlay.sqlite-journal").exists());
+    let fsck = overlay_cli(root.path(), &["fsck", "--json", d]);
     assert_eq!(fsck.status.code(), Some(1), "{fsck:?}");
-    assert!(String::from_utf8_lossy(&fsck.stdout).contains("\"import_incomplete\":1"));
-    let seal = run(&["seal", dest.to_str().unwrap(), base.to_str().unwrap()]);
+    let out = String::from_utf8_lossy(&fsck.stdout);
+    assert!(out.contains("\"import_incomplete\":1"), "{out}");
+    let seal = overlay_cli(root.path(), &["seal", d, base.to_str().unwrap()]);
     assert_eq!(seal.status.code(), Some(2), "{seal:?}");
     let err = String::from_utf8_lossy(&seal.stderr);
     assert!(err.contains("import"), "{err}");
+    assert!(!err.contains("readonly"), "{err}");
     assert!(!OverlayMeta::read(&dest).unwrap().unwrap().layer_sealed());
+}
+
+/// Regression (I1): a hot journal in a read-only directory, or on a sealed
+/// overlay, is not rolled back; the error names the interrupted write.
+#[cfg(unix)]
+#[test]
+fn regression_hot_journal_unrecoverable_names_interrupted_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let dest = kill_import_mid_transaction(root.path(), &base);
+    let journal = dest.join(".ratarmount.overlay.sqlite-journal");
+    let before = fs::read(&journal).unwrap();
+    let check = |label: &str| {
+        for args in [["info", "--json"], ["fsck", "--json"]] {
+            let out = overlay_cli(root.path(), &[args[0], args[1], dest.to_str().unwrap()]);
+            assert_ne!(out.status.code(), Some(0), "{label}: {out:?}");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("interrupted write") && err.contains("-journal"),
+                "{label}: {err}"
+            );
+            assert!(
+                !err.contains("attempt to write a readonly"),
+                "{label}: {err}"
+            );
+        }
+        assert_eq!(
+            fs::read(&journal).unwrap(),
+            before,
+            "{label}: journal changed"
+        );
+    };
+    // Read-only directory (running as root would ignore the mode; skip then).
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::File::create(dest.join("probe")).is_ok() {
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_file(dest.join("probe"));
+        eprintln!("skip: directory permissions are not enforced (root)");
+        return;
+    }
+    check("read-only directory");
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+    // A sealed overlay (sentinel present) is never rolled back silently.
+    fs::write(dest.join(".ratarmount-sealed"), b"sha256:0\n").unwrap();
+    check("sealed sentinel");
 }
 
 /// Regression: N6, `overlay import` accepted `.ratarmount-control/` paths. The

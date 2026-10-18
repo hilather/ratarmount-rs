@@ -14,7 +14,7 @@ use rustix::fs::{self as host, AtFlags, Dir, Mode, OFlags};
 use crate::overlay_changes::{self as changes, ChangeOptions};
 use crate::{Immutability, OverlayError, OverlayMeta, ReadOnlyOverlayLayer, HIDDEN_DB};
 
-const SENTINEL: &str = ".ratarmount-sealed";
+pub(crate) const SENTINEL: &str = ".ratarmount-sealed";
 const SEAL_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS seal_rows (path TEXT PRIMARY KEY, row_hash TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS overlay_metadata (path TEXT PRIMARY KEY, mode INTEGER, atime REAL, mtime REAL);";
 

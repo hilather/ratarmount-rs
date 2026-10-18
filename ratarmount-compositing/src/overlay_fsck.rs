@@ -702,15 +702,52 @@ mod tests {
         assert!(!tmp.path().join(HIDDEN_DB).exists());
     }
 
-    /// Regression: a killed `overlay import --no-seal` left a partial overlay that fsck reported clean.
+    /// Child half of [`regression_fsck_reports_incomplete_import`]: marks an
+    /// import in progress, opens a write transaction and blocks until killed.
+    /// Ignored, so it only runs when the parent re-executes the test binary.
     #[test]
-    fn regression_fsck_reports_incomplete_import() {
-        let (_tmp, dir, source) = fixture();
-        let overlay = WriteOverlay::new(source.clone(), &dir).unwrap();
+    #[ignore = "child process of regression_fsck_reports_incomplete_import"]
+    fn hot_journal_child() {
+        let dir = std::env::var_os("RATARMOUNT_TEST_CHILD_OVERLAY").expect("child overlay dir");
+        let base = std::path::PathBuf::from(dir.clone()).with_file_name("base");
+        let source = Arc::new(FolderMountSource::new(&base).unwrap());
+        let overlay = WriteOverlay::new(source, std::path::Path::new(&dir)).unwrap();
         overlay
             .set_meta("import_in_progress", "123:2026-10-18T00:00:00Z")
             .unwrap();
-        drop(overlay);
+        overlay.test_hold_open_transaction();
+    }
+
+    /// Regression: a killed `overlay import --no-seal` left a partial overlay
+    /// that fsck reported clean, and (I1) its hot `-journal` made `fsck` fail
+    /// with a readonly error. The writer is a real child process, SIGKILLed
+    /// while its write transaction is open.
+    #[cfg(unix)]
+    #[test]
+    fn regression_fsck_reports_incomplete_import() {
+        let (tmp, dir, source) = fixture();
+        let ready = tmp.path().join("ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "overlay_fsck::tests::hot_journal_child",
+            ])
+            .env("RATARMOUNT_TEST_CHILD_OVERLAY", &dir)
+            .env("RATARMOUNT_TEST_JOURNAL_HOLD", &ready)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < deadline, "child never held");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let journal = dir.join(format!("{HIDDEN_DB}-journal"));
+        assert!(journal.exists(), "no hot journal after SIGKILL");
         for repair in [false, true] {
             let report = fsck(&dir, repair).unwrap();
             assert!(!report.is_clean(), "repair={repair}: {}", report.result());

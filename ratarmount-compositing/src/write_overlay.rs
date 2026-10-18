@@ -2998,6 +2998,30 @@ impl WriteOverlay {
         crate::overlay_meta::OverlayMeta::remove(&db, key)
     }
 
+    /// Test seam (`test-hooks` feature or unit tests): when
+    /// `RATARMOUNT_TEST_JOURNAL_HOLD` names a file, open a write transaction
+    /// that dirties more pages than the page cache holds (so SQLite writes
+    /// the rollback journal and the database), create that file as the ready
+    /// signal and block holding the transaction. The test then SIGKILLs the
+    /// process, which leaves a hot `-journal`. No-op in release builds.
+    pub fn test_hold_open_transaction(&self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(ready) = std::env::var_os("RATARMOUNT_TEST_JOURNAL_HOLD") {
+            let db = self.db.lock().expect("overlay db");
+            db.execute_batch(
+                "BEGIN IMMEDIATE; \
+                 INSERT OR REPLACE INTO meta(key, value) VALUES('test_scratch', hex(randomblob(6000000)));",
+            )
+            .expect("hold transaction");
+            std::fs::write(ready, b"ready").expect("ready file");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _ = db.execute_batch("ROLLBACK");
+        }
+    }
+
     /// Change metadata through the same policy gate as data writes. Archive-only
     /// members retain their original read cookie and never copy payload data.
     pub fn set_metadata(&self, path: &str, attrs: &OverlayMetadata) -> Result<()> {

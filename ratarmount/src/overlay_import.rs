@@ -200,6 +200,7 @@ fn import(
         )
         .map_err(|e| e.to_string())?;
         begin_import(&overlay)?;
+        overlay.test_hold_open_transaction();
         let mut written = BTreeSet::new();
         let mut rejected = BTreeSet::new();
         let mut rejects: BTreeMap<String, Vec<u8>> = BTreeMap::new();

@@ -4,6 +4,7 @@
 
 ### Changes
 
+- **Interrupted `overlay import` (#133, Robo-Ilya follow-up 1):** a SIGKILLed import leaves a hot rollback `-journal`; `overlay info`, `fsck`, `seal` and `diff` used to fail with "attempt to write a readonly database". Reading an unsealed overlay whose database and directory are writable now rolls the journal back, so `fsck` reports `import_incomplete` and `seal` refuses by naming the import. A sealed or read-only overlay is never rolled back; the error says "an interrupted write left <db>-journal" and how to recover.
 - **`overlay seal`, `overlay pack` and `diff` check the base (#133, Keystone 5564615409 blocker 1):** they run the cheap identity check reopen and `--lower` use (weak walk with the recorded exclusions, archive size/mtime, Git tree id; a strong record is also confirmed by `--base-digest` or by the digest already cached in the archive's index; nothing is hashed) and refuse a base that is not the recorded one, naming `--force-base-mismatch` (and `--base-digest` for a strong record). With `--force-base-mismatch` a seal records the base actually used (and `base_mismatch_forced_at`), a pack records it in the bundle only, and `diff --hash --json` reports it as `base` with `base_forced` and `base_recorded`. Both flags are experimental.
 - **`--lower` accepts a copy of a strong base:** a bundle sealed against a strong digest is accepted over a byte-identical copy when `--base-digest` equals the recorded digest or the digest cached in the mounted archive's index does; the mount still never hashes.
 
