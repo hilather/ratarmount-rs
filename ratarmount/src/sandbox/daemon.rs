@@ -571,7 +571,7 @@ impl<M: Mounter> Supervisor<M> {
             .cloned()
             .chain(readonly)
             .collect();
-        ratarmount_compositing::ReadOnlyGlobs::new(&readonly)
+        ratarmount_compositing::ReadOnlyGlobs::with_allow(&readonly, &base.options.allow_globs)
             .map_err(|e| invalid(e.to_string()))?;
         let ram = match overlay {
             Overlay::Disk => None,

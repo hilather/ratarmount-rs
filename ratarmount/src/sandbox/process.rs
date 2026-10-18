@@ -94,6 +94,9 @@ pub fn mount_args(
     for glob in readonly {
         args.extend(["--overlay-readonly".into(), glob.into()]);
     }
+    for glob in &base.options.allow_globs {
+        args.extend(["--overlay-allow".into(), glob.into()]);
+    }
     args.extend([
         "--".into(),
         base.source.clone().into(),

@@ -79,6 +79,77 @@ fn fuse_sandbox_readonly_and_quota() {
     );
 }
 
+/// Regression: read-only exceptions must reach FUSE for data, metadata and name
+/// operations, including creating the exception root without moving that root.
+#[test]
+fn fuse_sandbox_readonly_allow_exceptions() {
+    with_mount_options(
+        "rrs-sandbox-allow-",
+        |d, _| {
+            use std::os::unix::fs::PermissionsExt;
+            let mnt = d.parent().unwrap();
+            let agent = mnt.join("t/agent");
+            fs::create_dir(&agent).unwrap();
+            fs::create_dir(agent.join("dir")).unwrap();
+            let file = agent.join("dir/new");
+            fs::write(&file, b"allowed").unwrap();
+            File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_len(3)
+                .unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+            let name = CString::new("user.rules").unwrap();
+            let set_xattr = |path: &Path| {
+                let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+                if unsafe {
+                    libc::setxattr(path.as_ptr(), name.as_ptr(), b"x".as_ptr().cast(), 1, 0)
+                } == 0
+                {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            };
+            set_xattr(&file).unwrap();
+            let moved = agent.join("dir/moved");
+            fs::rename(&file, &moved).unwrap();
+            assert_eq!(fs::read(&moved).unwrap(), b"all");
+            for result in [
+                fs::write(mnt.join("t/new"), b"denied"),
+                fs::write(mnt.join("t/seed"), b"denied"),
+                fs::create_dir(mnt.join("t/newdir")),
+                fs::remove_file(mnt.join("t/seed")),
+                fs::rename(mnt.join("t"), mnt.join("moved-t")),
+                fs::rename(&agent, mnt.join("moved-agent")),
+                fs::rename(&moved, mnt.join("t/moved")),
+                fs::set_permissions(mnt.join("t/seed"), fs::Permissions::from_mode(0o600)),
+                set_xattr(&mnt.join("t/seed")),
+            ] {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EROFS));
+            }
+            fs::remove_file(&moved).unwrap();
+            fs::remove_dir(agent.join("dir")).unwrap();
+            let status = fs::read_to_string(mnt.join(".ratarmount-control/status")).unwrap();
+            let denied: u64 = status
+                .lines()
+                .find_map(|line| line.strip_prefix("erofs_denied "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(denied >= 9, "{status}");
+        },
+        &[
+            "--overlay-readonly",
+            "t/**",
+            "--overlay-allow",
+            "t/agent/**",
+            "--control-interface",
+        ],
+    );
+}
+
 /// Regression: uid/gid/umask mapping must reach stat(2) for archive and overlay files.
 #[test]
 fn fuse_sandbox_mapped_owners() {

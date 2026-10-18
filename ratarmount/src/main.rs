@@ -508,6 +508,10 @@ struct Args {
     #[arg(long, value_delimiter = ',', action = ArgAction::Append, requires = "overlay_target", conflicts_with = "commit_overlay")]
     overlay_readonly: Vec<String>,
 
+    /// Writable exceptions to read-only rules; more literal components win (ties allow).
+    #[arg(long, value_delimiter = ',', action = ArgAction::Append, requires_all = ["overlay_target", "overlay_readonly"], conflicts_with = "commit_overlay")]
+    overlay_allow: Vec<String>,
+
     /// Maximum logical overlay bytes, including COW (bytes or binary K/M/G/T).
     #[arg(long, value_parser = ratarmount_compositing::parse_overlay_size, requires = "overlay_target", conflicts_with = "commit_overlay")]
     overlay_quota: Option<u64>,
@@ -808,9 +812,11 @@ where
     expand_sandbox(&mut args, caller_ids())
         .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
     if !args.overlay_readonly.is_empty() {
-        ratarmount_compositing::ReadOnlyGlobs::new(&args.overlay_readonly).map_err(|e| {
-            clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string())
-        })?;
+        ratarmount_compositing::ReadOnlyGlobs::with_allow(
+            &args.overlay_readonly,
+            &args.overlay_allow,
+        )
+        .map_err(|e| clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string()))?;
     }
     if !find && !args.find_xattrs.is_empty() {
         return Err(clap::Error::raw(
@@ -1811,12 +1817,12 @@ fn main() {
                     use ratarmount_compositing::{
                         CompositeOverlayPolicy, OverlayPolicy, OverlayQuota, ReadOnlyGlobs,
                     };
-                    let quota = match OverlayQuota::new(
+                    let mut quota = match OverlayQuota::new(
                         ov.root(),
                         args.overlay_quota,
                         args.overlay_quota_files,
                     ) {
-                        Ok(quota) => Arc::new(quota),
+                        Ok(quota) => quota,
                         Err(e) => {
                             eprintln!("error scanning write overlay: {e}");
                             std::process::exit(1);
@@ -1824,12 +1830,15 @@ fn main() {
                     };
                     let mut policies: Vec<Arc<dyn OverlayPolicy>> = Vec::new();
                     if !args.overlay_readonly.is_empty() {
-                        policies.push(Arc::new(
-                            ReadOnlyGlobs::new(&args.overlay_readonly)
+                        let rules = Arc::new(
+                            ReadOnlyGlobs::with_allow(&args.overlay_readonly, &args.overlay_allow)
                                 .and_then(|rules| rules.with_overlay_root(ov.root()))
                                 .expect("validated read-only globs and overlay root"),
-                        ));
+                        );
+                        quota = quota.with_readonly(rules.clone());
+                        policies.push(rules);
                     }
+                    let quota = Arc::new(quota);
                     policies.push(quota.clone());
                     ov.set_policy(Some(Arc::new(CompositeOverlayPolicy(policies))));
                     overlay_quota = Some(quota);
@@ -6566,6 +6575,7 @@ mod sandbox_cli_tests {
     fn regression_overlay_policy_flags_require_write_overlay() {
         for flag in [
             "--overlay-readonly",
+            "--overlay-allow",
             "--overlay-quota",
             "--overlay-quota-files",
         ] {
@@ -6622,21 +6632,83 @@ mod sandbox_cli_tests {
         ])
         .is_err());
     }
+    /// Regression: a single allow value must not consume the archive positional,
+    /// and exceptions require read-only rules and a writable overlay target.
+    #[test]
+    fn regression_overlay_allow_keeps_archive_and_requires_readonly() {
+        for target in [vec!["-w", "ov"], vec!["--overlay-tmpfs"], vec!["--sandbox"]] {
+            let args = parse_args_from(["ratarmount"].into_iter().chain(target).chain([
+                "--overlay-readonly",
+                "t/**",
+                "--overlay-allow",
+                "t/agent/**,t/extra/**",
+                "--overlay-allow",
+                "t/new/**",
+                "a.tar",
+                "mnt",
+            ]))
+            .unwrap();
+            assert_eq!(args.overlay_allow, ["t/agent/**", "t/extra/**", "t/new/**"]);
+            assert_eq!(args.paths, [PathBuf::from("a.tar"), PathBuf::from("mnt")]);
+        }
+        assert!(parse_args_from([
+            "ratarmount",
+            "-w",
+            "ov",
+            "--overlay-allow",
+            "t/agent/**",
+            "a.tar"
+        ])
+        .is_err());
+        for bad in ["", "x**y", "../t", "a,,b", "a/./b"] {
+            assert!(
+                parse_args_from([
+                    "ratarmount",
+                    "-w",
+                    "ov",
+                    "--overlay-readonly",
+                    "t/**",
+                    "--overlay-allow",
+                    bad,
+                    "a.tar"
+                ])
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
     /// Regression: socket status includes the same live policy fields as the virtual file.
     #[test]
     fn regression_control_socket_quota_status() {
         let root = tempfile::tempdir().unwrap();
-        let quota =
-            ratarmount_compositing::OverlayQuota::new(root.path(), Some(1024), None).unwrap();
+        use ratarmount_compositing::{OverlayMutation, OverlayPolicy, OverlayQuota, ReadOnlyGlobs};
+        let rules = Arc::new(ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"]).unwrap());
+        let quota = OverlayQuota::new(root.path(), Some(1024), None)
+            .unwrap()
+            .with_readonly(rules.clone());
         let stop = AtomicBool::new(false);
         let reply =
             control_reply_with_quota("status", Path::new("/mnt"), &stop, None, Some(&quota));
         assert!(reply.starts_with("mounted /mnt\nmemory_budget unlimited\n"));
-        assert!(reply.ends_with("overlay_bytes 0\noverlay_quota_bytes 1024\noverlay_files 0\noverlay_quota_files unlimited\n"));
+        assert!(reply.ends_with("overlay_bytes 0\noverlay_quota_bytes 1024\noverlay_files 0\noverlay_quota_files unlimited\nerofs_denied 0\n"));
         assert_eq!(
             control_reply_with_quota("ping", Path::new("/mnt"), &stop, None, Some(&quota)),
             "pong\n"
         );
+        assert!(rules
+            .check_mutation(OverlayMutation::Create, &["/t/blocked"])
+            .is_err());
+        let reply =
+            control_reply_with_quota("status", Path::new("/mnt"), &stop, None, Some(&quota));
+        assert!(reply.ends_with("erofs_denied 1\n"));
+        let unlimited = OverlayQuota::new(root.path(), None, None)
+            .unwrap()
+            .with_readonly(rules);
+        let reply =
+            control_reply_with_quota("status", Path::new("/mnt"), &stop, None, Some(&unlimited));
+        assert!(reply.contains("overlay_quota_bytes unlimited\n"));
+        assert!(reply.ends_with("erofs_denied 1\n"));
     }
 }
 

@@ -53,7 +53,9 @@ Unix mode field; unsupported SET_INFO classes continue to return an error.
 
 ## Read-only path rules
 
-`--overlay-readonly GLOBS` accepts a comma-separated list and can be repeated.
+`--overlay-readonly GLOBS` and `--overlay-allow GLOBS` accept comma-separated
+lists and can be repeated. Both require `-w`, `--overlay-tmpfs` or `--sandbox`;
+`--overlay-allow` also requires at least one `--overlay-readonly` rule.
 Quote patterns to prevent expansion by your shell. Matching is case-sensitive
 and anchored at the mount root: `tests/**` and `/tests/**` are equivalent and
 match `tests`, `tests/a`, and `tests/a/b.t`, but not `other/tests/a`.
@@ -67,22 +69,64 @@ match `tests`, `tests/a`, and `tests/a/b.t`, but not `other/tests/a`.
   and has the same effect as omitting it. `tests/**` explicitly includes the
   directory node itself, whereas `tests/*` matches children.
 - Other characters are literal, including `[`, `]`, `!`, `#` and backslash.
-  There are no exclusion/negation rules, brace expansion, escaping, or comments.
+  There is no negation syntax, brace expansion, escaping, or comments.
   A comma always separates rules. Whitespace around each rule is trimmed.
   Empty rules, empty interior components, `.` and `..` are rejected.
 
+The matching rule with the most **literal path components** wins: a component
+counts as literal only if it contains neither `*` nor `?`. Wildcard components
+(including `**`) contribute zero; literal character count and rule order do not
+break ties. **Allow wins every specificity tie.** A path with no matching rule
+is writable. Every rule applies to its matched root and descendants, including
+exceptions: `t/agent/**` permits creating `t/agent` itself.
+
+```sh
+ratarmount -w attempt-overlay --overlay-readonly 't/**' \
+  --overlay-allow 't/agent/**' source.tar mnt/
+```
+
+For these rules:
+
+| Operation | `t/suite` | `t/agent` | `t/agent/leaf` | `outside` |
+| --- | --- | --- | --- | --- |
+| Create, mkdir, write, truncate, unlink, chmod, setxattr | EROFS | allowed | allowed | allowed |
+| Rename endpoint, rmdir, reset | EROFS | EROFS | allowed | allowed |
+
+The second row also checks possible protected descendants. Exception roots inside
+protected subtrees stay anchored: renaming `t` or `t/agent` is refused; renaming an allowed leaf within
+`t/agent` succeeds. A more specific read-only rule such as
+`t/agent/private/**` protects that subtree again and prevents moving its parents.
+These are policy decisions; normal filesystem errors and directory-rename
+limitations still apply.
+
 A protected path rejects creation, write opens, writes, truncate, COW copy-up,
-unlink, rmdir, mkdir, chmod, timestamp updates and symlink creation with `EROFS` (read-only filesystem).
+unlink, rmdir, mkdir, chmod, timestamp updates, setxattr and symlink creation
+with `EROFS` (read-only filesystem).
 Both rename endpoints are checked. Host parent symlinks are resolved as well,
 so a symlink alias cannot bypass rules for pre-existing overlay content; unlinking
 the alias itself remains allowed. Rename, rmdir and overlay reset also reject
-an ancestor of any possible match: with `a/*/test`, renaming `a` is refused even
-if no matching child currently exists. This conservative rule prevents moving
-protected paths through a parent. While a COW copy is in flight, replacing any
-of its parent directories or parent symlink aliases is also temporarily refused
+an ancestor of a possible read-only match that outranks the allow rule at that
+ancestor: with `a/*/test`, renaming `a` is refused even if no matching child
+currently exists. This conservative rule prevents moving protected paths through
+a parent, including when a descendant exception might later override that match.
+While a COW copy is in flight, replacing any of its parent directories or parent
+symlink aliases is also temporarily refused
 with `EROFS`. This keeps the copy's publication path stable; the restriction is
 released when the copy completes or fails. Unprotected directory renames still have
 the overlay's existing directory-rename limitations.
+
+Every `EROFS` returned by the rule policy increments its live `erofs_denied`
+counter once, including temporary COW-parent denials. With `--control-interface`,
+the socket `status` reply and `/.ratarmount-control/status` include an
+`erofs_denied N` line alongside quota usage, even when no quota is configured.
+The counter starts at zero for each policy instance; offline `overlay-stats`
+does not include it. An observer hook receives the requested path and policy
+operation once per denial for journal integration. Rules are available in input
+order as `{"readonly":[...],"allow":[...]}` for metadata integration.
+
+Supervisor protocol version 1 also accepts optional base `options.allow_globs`
+(an array of strings), forwarded as `--overlay-allow` to attempt mounts. It
+requires base `readonly_globs`; attempts cannot supply new allow exceptions.
 
 ## Quota
 
