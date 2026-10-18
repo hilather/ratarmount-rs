@@ -371,6 +371,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Successful archive commits leave a stale overlay baseline and refuse the next `-w` mount (SBX-META) | `cargo test -p ratarmount-compositing --lib refreshes_baseline` · `cargo test -p ratarmount-index --lib regression_digest_cache_commit_refresh` · `cargo test -p ratarmount --test rolling_archives` · `cargo test -p ratarmount --test commit_overlay_live` |
 | `git:///path#rev` parsing, committed modes, gitlinks hiding siblings; git snapshot differs from its base, rebuilds its index, or corrupts digest stdout; empty TAR directory cannot be listed (SBX-GIT) | `cargo test -p ratarmount-formats-git` · `cargo test -p ratarmount-session --lib git_` · `cargo test -p ratarmount --bin ratarmount snapshot::tests` · `cargo test -p ratarmount --bin ratarmount regression_create_base_preserves_git_url_alias` · `cargo test -p ratarmount --bin ratarmount regression_git_url_write_base_is_never_created_as_archive` · `cargo test -p ratarmount-formats-tar --lib regression_empty_tar_directory_has_empty_listing` |
 
+| Killed overlay writers leave inconsistent rows/content; `overlay fsck --repair` follows unsafe paths or modifies sealed/mounted overlays (SBX-LOWER) | `cargo test -p ratarmount-compositing --lib overlay_fsck` |
+| `--lower` stacks lose identity, accept unsealed lowers or a different stack, allow `-w` on a sealed top or a layered commit, or serve wrong composed content (SBX-LOWER) | `cargo test -p ratarmount --bin ratarmount lower_stack_tests` · `cargo test -p ratarmount --test overlay_lower` · `cargo test -p ratarmount --test fuse_lower` |
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
 ## Workspace layout
