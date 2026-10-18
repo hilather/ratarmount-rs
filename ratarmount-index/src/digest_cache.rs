@@ -180,8 +180,15 @@ fn open_cache(index: Option<&Path>, create_table: bool) -> Option<Cache> {
         return None;
     }
     let conn = Connection::open_with_flags(&index, OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
-    // Lookups stay instant on a busy index; only the write waits (below).
-    conn.busy_timeout(Duration::ZERO).ok()?;
+    // A peek stays instant on a busy index. A caller that goes on to hash and
+    // store must not mistake another mount's write lock for "no cache": that
+    // would skip the per-archive lock and hash the archive again.
+    conn.busy_timeout(if create_table {
+        CREATE_BUSY_TIMEOUT
+    } else {
+        Duration::ZERO
+    })
+    .ok()?;
     let has_files: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='files')",
@@ -205,7 +212,6 @@ fn open_cache(index: Option<&Path>, create_table: bool) -> Option<Cache> {
         }
         // Concurrent first mounts all create it; wait out the winner instead
         // of mistaking its write lock for "no cache".
-        conn.busy_timeout(CREATE_BUSY_TIMEOUT).ok()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS overlay_base_digests (
                 path BLOB PRIMARY KEY, size TEXT NOT NULL, mtime_ns TEXT NOT NULL,
@@ -213,8 +219,9 @@ fn open_cache(index: Option<&Path>, create_table: bool) -> Option<Cache> {
             );",
         )
         .ok()?;
-        conn.busy_timeout(Duration::ZERO).ok()?;
     }
+    // Lookups stay instant on a busy index; only the write waits (below).
+    conn.busy_timeout(Duration::ZERO).ok()?;
     Some(Cache { conn, index })
 }
 
@@ -592,6 +599,30 @@ mod tests {
         });
         assert!(digests.windows(2).all(|w| w[0] == w[1]));
         assert_eq!(hashes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Regression: C3, opening the cache for a hash probed `sqlite_master` with
+    /// busy timeout zero, so a mount that opened while another held the write
+    /// lock got no cache, skipped the per-archive lock and hashed again (CI:
+    /// "hashed 6 times, want 1").
+    #[test]
+    fn regression_digest_once_open_waits_for_busy_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_with_files(dir.path());
+        let holder = Connection::open(&index).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        assert!(open_cache(Some(&index), true).is_some());
+        releaser.join().unwrap();
+        // A peek still never waits.
+        let holder = Connection::open(&index).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let started = std::time::Instant::now();
+        assert!(open_cache(Some(&index), false).is_none());
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     /// Regression: C3, the cache INSERT ran with busy timeout zero and its
