@@ -9,6 +9,7 @@ mod control;
 mod empty_archive;
 mod folder;
 mod oci_whiteout;
+pub mod overlay_changes;
 #[cfg(unix)]
 pub mod overlay_fsck;
 pub mod overlay_layer;

@@ -39,6 +39,22 @@ fn regression_diff_exit_codes_and_clean_stdout() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(result.stdout.is_empty());
+    let overlay = WriteOverlay::new(
+        Arc::new(FolderMountSource::new(&base).unwrap()),
+        &overlay_dir,
+    )
+    .unwrap();
+    overlay.ensure_modifiable("/a").unwrap();
+    overlay
+        .set_metadata(
+            "/a",
+            &ratarmount_compositing::OverlayMetadata {
+                mode: Some(0o644),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    drop(overlay);
     let before_db = fs::read(overlay_dir.join(HIDDEN_DB)).unwrap();
     fs::write(overlay_dir.join("a"), b"after\n").unwrap();
     let result = run(&overlay_dir, Some(&base), &[]);
@@ -109,13 +125,22 @@ fn regression_diff_git_base_uses_committed_tree() {
         .unwrap();
     fs::write(repo_dir.join("a"), b"dirty\n").unwrap();
     let overlay_dir = tmp.path().join("overlay");
-    drop(
-        WriteOverlay::new(
-            Arc::new(FolderMountSource::new(&repo_dir).unwrap()),
-            &overlay_dir,
+    let overlay = WriteOverlay::new(
+        Arc::new(FolderMountSource::new(&repo_dir).unwrap()),
+        &overlay_dir,
+    )
+    .unwrap();
+    overlay.ensure_modifiable("/a").unwrap();
+    overlay
+        .set_metadata(
+            "/a",
+            &ratarmount_compositing::OverlayMetadata {
+                mode: Some(0o644),
+                ..Default::default()
+            },
         )
-        .unwrap(),
-    );
+        .unwrap();
+    drop(overlay);
     fs::write(overlay_dir.join("a"), b"attempt\n").unwrap();
     let result = run(&overlay_dir, Some(&repo_dir), &[]);
     assert_eq!(
@@ -127,4 +152,47 @@ fn regression_diff_git_base_uses_committed_tree() {
     let patch = String::from_utf8(result.stdout).unwrap();
     assert!(patch.contains("-committed\n+attempt\n"), "{patch}");
     assert_eq!(fs::read(repo_dir.join("a")).unwrap(), b"dirty\n");
+}
+
+/// Regression: legacy/unsealed and loose warnings stay on stderr; --hash remains machine-readable.
+#[test]
+fn regression_diff_warnings_hash_and_limits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let dir = tmp.path().join("overlay");
+    let overlay =
+        WriteOverlay::new(Arc::new(FolderMountSource::new(&base).unwrap()), &dir).unwrap();
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    let mut file = unsafe { fs::File::from_raw_fd(overlay.create_file("/a", 0o644).unwrap()) };
+    file.write_all(b"new \r\n").unwrap();
+    overlay.finish_owned_write_fd(file);
+    drop(overlay);
+    let result = run(
+        &dir,
+        Some(&base),
+        &["--hash", "--normalize", "loose", "--json"],
+    );
+    assert_eq!(result.status.code(), Some(0));
+    let row: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(row["files"], 1);
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("unsealed overlay"));
+    assert_eq!(stderr.matches("analysis only").count(), 1);
+    let result = run(&dir, Some(&base), &["--max-patch-bytes", "1"]);
+    assert_eq!(result.status.code(), Some(3));
+    assert!(result.stdout.is_empty());
+    let result = run(&dir, Some(&base), &["--manifest", "--max-files", "0"]);
+    assert_eq!(result.status.code(), Some(3));
+    assert!(result.stdout.is_empty());
+    rusqlite::Connection::open(dir.join(HIDDEN_DB))
+        .unwrap()
+        .execute("DROP TABLE meta", [])
+        .unwrap();
+    let result = run(&dir, None, &["--manifest"]);
+    assert_eq!(result.status.code(), Some(0));
+    assert!(String::from_utf8(result.stderr)
+        .unwrap()
+        .contains("legacy overlay"));
 }

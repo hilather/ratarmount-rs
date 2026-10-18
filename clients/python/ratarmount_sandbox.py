@@ -5,6 +5,7 @@ Transport failures are not retried: a timed-out mutation may have completed;
 use list() to reconcile before issuing another new().
 """
 
+import base64
 import json
 import socket as _socket
 
@@ -34,7 +35,11 @@ class Attempt:
         self._destroyed = False
 
     def diff(self, git=True):
-        return self._client._call("diff", id=self.id, git=git)["patch"]
+        """Return a UTF-8 patch as str, or non-UTF-8 patch content as bytes."""
+        result = self._client._call("diff", id=self.id, git=git)
+        if "patch_b64" in result:
+            return base64.b64decode(result["patch_b64"], validate=True)
+        return result["patch"]
 
     def stats(self):
         return self._client._call("stats", id=self.id)

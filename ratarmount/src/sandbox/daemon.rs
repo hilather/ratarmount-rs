@@ -443,18 +443,16 @@ impl<M: Mounter> Supervisor<M> {
                 let patch = crate::diff::render_source(
                     &crate::diff::DiffArgs {
                         directory: attempt.overlay_dir.clone(),
-                        base: None,
                         git,
-                        context: 3,
-                        stat: false,
-                        name_status: false,
-                        include_git_dir: false,
+                        ..Default::default()
                     },
-                    source.source.as_ref(),
+                    source.source.clone(),
                     deleted,
                 )
                 .map_err(|e| ApiError::new("diff_failed", e))?;
-                Ok(json!({"patch": patch}))
+                let mut response = serde_json::Map::new();
+                ratarmount_compositing::overlay_changes::json_bytes(&mut response, "patch", &patch);
+                Ok(serde_json::Value::Object(response))
             }
             Operation::Stats { id } => {
                 let attempt = self.attempt(&id)?.clone();

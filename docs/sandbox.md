@@ -70,9 +70,9 @@ reopening the overlay, and a later data write preserves the mode during copy-up.
 TAR and compressed-TAR commit preserve executable bits and modification times;
 the current TAR writer stores whole-second mtime and does not store atime.
 Metadata-only commit uses the same temporary payload staging as provenance
-xattrs and is limited to the TAR commit formats. The current `ratarmount diff`
-scanner walks host files, so it omits these metadata-only archive edits until
-a data write copies the member into the overlay.
+xattrs and is limited to the TAR commit formats. Offline `ratarmount diff`
+includes metadata-only mode changes without requiring a payload copy-up.
+Time-only changes do not enter its change set.
 
 NFSv3/v4 SETATTR, 9P Tsetattr and SFTP SETSTAT also apply mode and time changes.
 SFTP OPEN honors requested creation permissions. The current NFSv3 server dependency
@@ -403,54 +403,137 @@ and modifications are consequently reported together.
 
 ## diff
 
-Export an attempt's patch offline, without a mount or a Git executable:
+Compare an overlay with its composed lower view without mounting it:
 
 ```sh
-ratarmount diff --base source.tar attempt-overlay > attempt.diff
-ratarmount diff --base repo.git attempt-overlay --git > attempt.patch
-ratarmount diff --base source.tar attempt-overlay --name-status
-ratarmount diff --base source.tar attempt-overlay --stat
+ratarmount diff attempt-overlay source.tar --git -o attempt.patch
+ratarmount diff attempt-overlay source.tar --lower prepared --name-status
+ratarmount diff attempt-overlay --manifest
+ratarmount diff attempt-overlay --hash --normalize strict --json
+ratarmount diff attempt-b source.tar --between attempt-a --git
 ```
 
-`--base SOURCE` is required to generate an accurate patch: the overlay stores
-changed content and deletion records, but neither the original content nor its
-base location. SOURCE accepts the session factory's archives, committed Git
-repositories, folders and remote URLs. A working Git repository compares against
-its committed tree, including when its working tree has edits. Use the same base
-snapshot used for the attempt. The base and overlay contents remain read-only;
-archive indexes are built in memory. Stop writers first for a consistent view.
+The syntax is `ratarmount diff [OPTIONS] OVERLAY_DIR [BASE]`. BASE accepts the
+mount factory's archives, committed Git repositories, folders and remote URLs.
+A working Git repository compares against its committed tree even when its
+working tree is dirty. The old `--base SOURCE` spelling remains a hidden alias;
+a positional BASE takes precedence. Without either, `meta.base_url` supplies the
+base and a note goes to stderr. Repeat `--lower DIR` in bottom-to-top order, or
+omit it to use `meta.lower_layers`. Sealed lowers open immutable; other lowers
+open read-only. `--strict` refuses any unsealed top or lower. Without it, unsealed
+and legacy overlays produce warnings. Stop writers before comparing: offline
+diff refuses a database locked by a mount, and files/SQLite are separate stores.
 
-The default is a deterministic unified diff with three context lines; `-U N`
-(`--context N`) changes the context. Additions/deletions use `/dev/null`, symlinks
-are compared as link-target text, and missing final newlines are marked.
-Binary data (NUL bytes or invalid UTF-8) prints `Binary files a/x and b/x differ`.
-New, deleted and changed modes are recorded, including mode-only changes.
+Choose one output mode (default `--patch`):
 
-`--git` emits a [Git patch](https://git-scm.com/docs/diff-format) accepted by
-`git apply --check` / `git apply`: Git headers,
-executable modes, symlinks as mode `120000`, exact-content renames with similarity
-100%, and forward/reverse `GIT binary patch` literals (zlib + base85). Git modes
-record the owner executable bit, not other Unix permission changes. Type changes use
-a delete/add pair. Rename detection pairs deleted paths with new paths of the
-same type and identical bytes, in deterministic path order; other moves remain
-delete/add. Default unified output keeps delete/add records. `--name-status`
-prints `A`, `M`, `D`, `T` or `R100` with paths; `--stat` prints per-file line counts
-(byte sizes for binary changes) and totals. Both summaries detect exact renames
-and replace patch output; they cannot be combined with each other.
-Use `git apply --unidiff-zero` when applying a patch generated with `-U 0`.
+| Mode | Output |
+|---|---|
+| `--patch` | Unified patch, three context lines by default; `-U N` / `--context N` changes that. |
+| `--git` | Git headers, blob IDs, executable modes, symlink targets, and forward/reverse literal binary patches. |
+| `--manifest` | One JSON object per changed path, byte-sorted. |
+| `--hash` | Canonical hash; `--json` includes base/stack identity and comparison options. |
+| `--stat` | Per-path insertion/deletion counts, file count and bytes written; supports `--json`. |
+| `--name-only` | Changed paths, one per line. |
+| `--name-status` | `A`, `M`, `D`, `T` and paths (`written` when added/modified is unknown). |
 
-Internal database, marker and staging names are excluded using the overlay's
-shared path filter at every depth. `.git` directories, including synthetic-head
-metadata, are omitted by default; `--include-git-dir` includes them. Unchanged
-copy-up files are omitted. Git patches do not represent empty directories or
-directory permission changes. Unsupported special files and non-UTF-8 filenames
-produce an error. Content is held in memory; very large, unrelated text files
-may use a full replacement hunk to bound diff traceback storage.
+Manifest, hash and name modes also work without a base. They call present entries
+`written` because added versus modified is unknown. Patches, stat and between
+comparisons require a base. `-o FILE` writes output to a file. Source-opening
+progress and warnings go to stderr. Output is withheld until rendering succeeds,
+so a limit failure does not publish a partial patch or truncate an existing output.
 
-Exit status is **0** for no changes, **1** for changes, and **2** for an error
-(including missing/corrupt/locked databases or a missing `--base`). Redirecting
-stdout preserves a clean patch; source-opening progress goes to stderr. Harnesses
-should accept both 0 and 1 as successful comparisons.
+The change set comes from `files` and metadata-only `overlay_metadata` mentions,
+resolved through the same read-only overlay layers as a mount. Orphan host files
+without a database mention do not enter an offline diff. Unchanged copy-ups,
+write-then-revert and tombstones of nonexistent lower paths are omitted. Empty
+directories appear as `"type":"dir"` in the manifest; Git patches cannot create
+empty directories or preserve directory modes. Symlinks are target strings,
+never followed. Invalid traversal/NUL rows are corruption errors. The database's
+normal absolute **mount-parent** column is allowed; absolute child names are not.
+
+Renames are delete + add by default, including `sandbox diff --git`.
+`--detect-renames` opts into deterministic exact-content pairing and `R100` / Git
+rename headers. It never changes a manifest or canonical hash. Type changes use
+delete + add in patches and `T` in name-status output. Git mode headers preserve
+the owner executable bit; other Unix permission changes remain visible in the
+manifest. `--ignore-mode` omits mode-only changes and mode fields from canonical
+hash rows. Use `git apply --unidiff-zero` for patches generated with `-U 0`.
+
+Patches always preserve exact content bytes. Binary means NUL in the first
+8 KiB, so Latin-1 and other non-UTF-8 text remains text. CRLF and missing final
+newlines round-trip. Binary unified output says `Binary files … differ`; `--git`
+emits literal zlib/base85 sections, never delta sections. Text exceeding
+`--max-diff-bytes` per side (default 8 MiB) deliberately uses this binary form.
+Large literals stream via a compressed temporary file instead of buffering the
+payload. Text hunks retain the existing bounded Myers traceback.
+
+`--exclude GLOB` is repeatable, case-sensitive and applied before content opens
+on either side. It supports `*`, `?`, `**`, bracket classes, trailing `/` for a
+directory subtree, leading `/` for root anchoring, and slashless patterns at any
+depth. Overlay internal names are always excluded; `.git` components are excluded
+unless `--include-git-dir` is given. Negated re-inclusion rules are not supported.
+
+`--max-files N` caps changed paths / manifest rows. `--max-patch-bytes N` caps
+rendered patch output **and** imposes a conservative per-payload input-work budget:
+a mentioned regular file larger than N fails before hashing or compression,
+including one that might compress below N or prove unchanged. This extra check
+makes an accidental 10 GiB write fail promptly. Manifest/hash modes ignore the
+patch budget and stream content hashing with bounded buffers. The change-path
+list still takes memory proportional to the number of mentioned paths.
+
+Manifest rows contain `path`, `status`, `type`, and, for present entries, `mode`,
+`size`, `hash` (files and symlinks), `target` (symlinks) and `layer:"top"`.
+A base-less metadata-only write omits unknown size and content hash.
+Existing lower entries contribute `base_hash` and `base_layer` (`base` or
+`lower:N`, numbered from one). Deleted rows have no new content hash. Modes are
+six-digit octal. A changed mount-root mode uses the empty relative path.
+Byte-string JSON writers emit `path_b64` / `target_b64` in place
+of non-UTF-8 strings. Overlay paths currently use UTF-8 TEXT and MountSource
+strings, so arbitrary byte paths remain unsupported; the base64 writer is tested
+with synthetic byte paths. The daemon similarly returns `patch_b64` instead of
+`patch` for non-UTF-8 patch bytes; UTF-8 responses retain `{"patch":"…"}`.
+
+Canonical hashing uses `--algo sha256|blake3` (default SHA-256). For every changed
+path in byte order after exclusions, hash this row into the final digest:
+
+```text
+path NUL status NUL type NUL mode-or-empty NUL content-hash-or-empty NUL
+```
+
+Content hashes include the algorithm prefix. A deletion uses the old type/mode
+and an empty new-content hash; directories also have no content hash. The base
+hash, provenance, timestamps and rendered patch text are excluded. Both content
+and row hashing use the chosen algorithm. `Change::row_hash` exposes the same row
+encoding for verification tools to identify mismatching paths.
+
+`--normalize exact` hashes bytes as written. `strict` converts CRLF to LF, strips
+trailing ASCII whitespace per line and ignores one final newline; it is suitable
+for grading. `loose` additionally removes blank lines and warns once on stderr:
+it is for analysis only, because blank lines can affect tests. Symlink targets
+and binary data always use exact bytes. Normalization applies only to hash and
+manifest comparisons; normalized-equivalent edits disappear from those change
+sets. Patches always compare exact bytes. SHA-256 hashes supplied by a lower
+view's `user.hash.sha256` xattr are preferred for exact SHA-256 comparisons.
+Materialized lower payloads are rehashed because their inherited base xattr may
+be stale.
+
+The empty change-set SHA-256 constant (SHA-256 of the empty stream) is:
+
+```text
+sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+```
+
+`--hash --json` returns `patch`, `base`, `stack`, `files`, `normalize`, `excludes`,
+`algo`, and `sealed`. Base and stack are recorded metadata (or null); a missing
+stack digest is derived from the recorded base digest and ordered lower digests.
+`--between OTHER_DIR` compares OTHER's composed tree to OVERLAY_DIR's tree using
+the union of both overlays' mentions. Both must record the same `stack_digest`.
+For two legacy overlays, an explicit BASE and `--lower` stack are required and
+used for both, with a warning. Identical trees produce the empty constant.
+
+Exit status is **0** for no changes, **1** for changes, **2** for errors and **3**
+for size/file limits. Hash and manifest modes always exit **0** on success.
+Harnesses consuming patch/name/stat modes should accept both 0 and 1.
 
 ## Ownership and container mounts
 
