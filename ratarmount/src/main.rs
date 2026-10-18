@@ -1218,7 +1218,7 @@ fn main() {
     }
 
     if let Some(snapshot) = &args.snapshot {
-        match snapshot::run(snapshot, &mut std::io::stdout().lock()) {
+        match snapshot::run_cli(snapshot) {
             Ok(code) => std::process::exit(code),
             Err(error) => {
                 eprintln!("snapshot: {error}");

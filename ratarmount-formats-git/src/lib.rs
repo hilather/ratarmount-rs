@@ -62,6 +62,48 @@ pub fn split_inline_reference(path: &Path) -> Option<(PathBuf, String)> {
     None
 }
 
+/// Parse a local `git:///absolute/path#revision` alias. The fragment defaults to HEAD.
+/// `@` is always part of the path here, unlike the legacy inline-ref syntax.
+pub fn parse_git_url(input: &str) -> Result<Option<(PathBuf, Option<String>)>> {
+    let Some(local) = input.strip_prefix("git://") else {
+        return Ok(None);
+    };
+    if !local.starts_with('/') {
+        return Err(GitError::Msg(
+            "network git URLs are not supported; clone locally".into(),
+        ));
+    }
+    let (encoded, reference) = match local.split_once('#') {
+        Some((path, "")) => return Err(GitError::Msg(format!("empty git revision in {path}"))),
+        Some((path, reference)) => (path, Some(reference.to_owned())),
+        None => (local, None),
+    };
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut bytes = encoded.bytes();
+    while let Some(byte) = bytes.next() {
+        decoded.push(if byte == b'%' {
+            let hi = bytes.next().and_then(|b| (b as char).to_digit(16));
+            let lo = bytes.next().and_then(|b| (b as char).to_digit(16));
+            match (hi, lo) {
+                (Some(hi), Some(lo)) => (hi * 16 + lo) as u8,
+                _ => {
+                    return Err(GitError::Msg(
+                        "invalid percent escape in git URL path".into(),
+                    ))
+                }
+            }
+        } else {
+            byte
+        });
+    }
+    if decoded.contains(&0) {
+        return Err(GitError::Msg("NUL in git URL path".into()));
+    }
+    let path = String::from_utf8(decoded)
+        .map_err(|_| GitError::Msg("git URL path must be UTF-8".into()))?;
+    Ok(Some((PathBuf::from(path), reference)))
+}
+
 fn git_path_userdata(path: &str) -> UserData {
     UserData::Other(format!("git:{path}"))
 }
@@ -168,6 +210,11 @@ impl GitMountSource {
         self.commit_oid
     }
 
+    /// Object ID of the selected tree (including `--git-prefix`, when applied).
+    pub fn tree_id(&self) -> String {
+        self.tree_oid.to_string()
+    }
+
     /// Cache a standalone repository and expose its files under `/.git`.
     pub fn with_synthetic_head(mut self, cache_root: &Path) -> Result<Self> {
         self.synthetic = Some(self.with_repo(|repo| {
@@ -221,6 +268,9 @@ impl GitMountSource {
                 Some(e) => e,
                 None => return Ok(None),
             };
+            if entry.filemode() == 0o160000 {
+                return Ok(None);
+            }
             current = entry.to_object(repo)?;
         }
         Ok(Some(current))
@@ -229,25 +279,11 @@ impl GitMountSource {
     fn convert_mode(&self, obj: &git2::Object<'_>, filemode: i32) -> u32 {
         // git filemodes: 0o100644, 0o100755, 0o120000 (link), 0o040000 (tree), 0o160000 (submodule)
         if filemode == 0o120000 {
-            return ratarmount_core::S_IFLNK | 0o555;
+            return ratarmount_core::S_IFLNK | 0o777;
         }
         match obj.kind() {
-            Some(ObjectType::Tree) => {
-                ratarmount_core::S_IFDIR
-                    | if self.synthetic.is_some() {
-                        0o755
-                    } else {
-                        0o555
-                    }
-            }
-            _ => {
-                let exec = filemode & 0o111 != 0;
-                let mut perms = if exec { 0o555 } else { 0o444 };
-                if self.synthetic.is_some() {
-                    perms |= 0o200;
-                }
-                ratarmount_core::S_IFREG | perms
-            }
+            Some(ObjectType::Tree) => ratarmount_core::S_IFDIR | 0o755,
+            _ => ratarmount_core::S_IFREG | if filemode & 0o111 != 0 { 0o755 } else { 0o644 },
         }
     }
 
@@ -318,6 +354,10 @@ impl GitMountSource {
                         format!("/{base}/{name}")
                     }
                 };
+                if entry.filemode() == 0o160000 {
+                    ratarmount_core::eprintln!("warning: skipping Git submodule {path}/{name}");
+                    continue;
+                }
                 let child = entry.to_object(repo)?;
                 let fi = self.object_to_file_info(repo, &child, &child_v, entry.filemode())?;
                 map.insert(name, fi);
@@ -361,6 +401,10 @@ impl GitMountSource {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
+                if entry.filemode() == 0o160000 {
+                    ratarmount_core::eprintln!("warning: skipping Git submodule {path}/{name}");
+                    continue;
+                }
                 let child = entry.to_object(repo)?;
                 let mode = self.convert_mode(&child, entry.filemode());
                 let size = if mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG
@@ -517,6 +561,109 @@ impl MountSource for GitMountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: URL fragments select refs without interpreting `@` in directory names.
+    #[test]
+    fn regression_git_url_local_paths_and_at_names() {
+        for (url, path, reference) in [
+            (
+                "git:///srv/my%20repo%40home.git#release@1",
+                "/srv/my repo@home.git",
+                Some("release@1"),
+            ),
+            ("git:///srv/repo/.git", "/srv/repo/.git", None),
+            (
+                "git:///srv/repo%23one%25.git#HEAD~1",
+                "/srv/repo#one%.git",
+                Some("HEAD~1"),
+            ),
+            ("git:///srv/a+b@c#HEAD", "/srv/a+b@c", Some("HEAD")),
+        ] {
+            assert_eq!(
+                parse_git_url(url).unwrap(),
+                Some((PathBuf::from(path), reference.map(str::to_owned)))
+            );
+        }
+        assert!(parse_git_url("/srv/repo@HEAD").unwrap().is_none());
+        for url in [
+            "git://host/repo#HEAD",
+            "git://localhost/repo",
+            "git://user@host/repo",
+        ] {
+            assert_eq!(
+                parse_git_url(url).unwrap_err().to_string(),
+                "network git URLs are not supported; clone locally"
+            );
+        }
+        for url in [
+            "git:///srv/repo%",
+            "git:///srv/repo%2",
+            "git:///srv/%xx",
+            "git:///srv/%00",
+            "git:///srv/%ff",
+            "git:///srv/repo#",
+        ] {
+            assert!(parse_git_url(url).is_err(), "{url}");
+        }
+    }
+
+    /// Regression: gitlinks with absent objects must not hide their sibling files.
+    #[test]
+    fn regression_git_gitlink_skipped_and_committed_modes_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init_bare(temp.path()).unwrap();
+        let empty = repo.treebuilder(None).unwrap().write().unwrap();
+        let mut tree = repo.treebuilder(None).unwrap();
+        tree.insert("dir", empty, 0o040000).unwrap();
+        tree.insert("file", repo.blob(b"contents").unwrap(), 0o100644)
+            .unwrap();
+        tree.insert("run", repo.blob(b"script").unwrap(), 0o100755)
+            .unwrap();
+        tree.insert("link", repo.blob(b"file").unwrap(), 0o120000)
+            .unwrap();
+        // A gitlink's target is normally absent in the superproject object database.
+        tree.insert(
+            "module",
+            Oid::from_str("1234567890123456789012345678901234567890").unwrap(),
+            0o160000,
+        )
+        .unwrap();
+        let tree_id = tree.write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature =
+            git2::Signature::new("Test", "test@example.com", &git2::Time::new(1234567890, 0))
+                .unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
+        let source = GitMountSource::open(temp.path(), Some("HEAD")).unwrap();
+        assert_eq!(
+            format!("git-tree:{}", source.tree_id()),
+            format!("git-tree:{tree_id}")
+        );
+        assert!(source.is_immutable());
+        let Some(ListResult::Infos(infos)) = source.list("/") else {
+            panic!("missing listing")
+        };
+        assert!(!infos.contains_key("module"));
+        assert!(source.lookup("/module", 0).is_none());
+        let dents = source.list_dirents("/").unwrap();
+        assert_eq!(dents.len(), 4);
+        for (name, mode) in [
+            ("dir", 0o040755),
+            ("file", 0o100644),
+            ("run", 0o100755),
+            ("link", 0o120777),
+        ] {
+            assert_eq!(infos[name].mode, mode);
+            assert_eq!(source.lookup(name, 0).unwrap().mode, mode);
+            assert_eq!(dents.iter().find(|d| d.name == name).unwrap().mode, mode);
+        }
+        assert_eq!(source.lookup("link", 0).unwrap().linkname, "file");
+        assert_eq!(
+            source.with_prefix("dir").unwrap().tree_id(),
+            empty.to_string()
+        );
+    }
 
     #[test]
     fn open_ratarmount_rs_repo() {

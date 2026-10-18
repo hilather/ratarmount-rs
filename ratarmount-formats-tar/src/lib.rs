@@ -18,6 +18,7 @@
 #[macro_use]
 extern crate ratarmount_core;
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -837,7 +838,11 @@ fn paths_equal_nested(a: &str, b: &str) -> bool {
 
 impl MountSource for SqliteIndexedTar {
     fn list(&self, path: &str) -> Option<ListResult> {
-        let mut map = self.index.list(path).ok().flatten()?;
+        let mut map = match self.index.list(path).ok()? {
+            Some(map) => map,
+            None if self.is_dir(path) => BTreeMap::new(),
+            None => return None,
+        };
         // Newest row wins in the index map; drop dumpdir whiteouts so deleted names vanish.
         map.retain(|_, fi| !is_dumpdir_tombstone(fi));
         Some(ListResult::Infos(map))
@@ -851,7 +856,11 @@ impl MountSource for SqliteIndexedTar {
     }
 
     fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
-        let rows = self.index.list_dirents(path).ok().flatten()?;
+        let rows = match self.index.list_dirents(path).ok()? {
+            Some(rows) => rows,
+            None if self.is_dir(path) => Vec::new(),
+            None => return None,
+        };
         Some(
             rows.into_iter()
                 .filter(|d| d.linkname != DUMPDIR_DELETE_LINKNAME)
@@ -3229,6 +3238,80 @@ mod tests {
     use super::*;
     use std::io::{Read, Seek, Write};
     use std::process::Command;
+
+    /// Regression: an explicit empty TAR directory must list successfully, including warm indexes.
+    #[test]
+    fn regression_empty_tar_directory_has_empty_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("empty-dir.tar");
+        let index = temp.path().join("empty-dir.tar.index.sqlite");
+        let mut file = File::create(&archive).unwrap();
+        write_ustar_members(
+            &mut file,
+            &[
+                UstarMember {
+                    path: "empty",
+                    payload: UstarPayload::Directory,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 123,
+                    xattrs: &[],
+                },
+                UstarMember {
+                    path: "file",
+                    payload: UstarPayload::File { bytes: b"payload" },
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 123,
+                    xattrs: &[],
+                },
+            ],
+        )
+        .unwrap();
+        write_tar_eof(&mut file).unwrap();
+        drop(file);
+        for memory in [true, false] {
+            let options = OpenOptions {
+                index_in_memory: memory,
+                ..Default::default()
+            };
+            for warm in [false, true] {
+                let source = if warm && !memory {
+                    SqliteIndexedTar::open_with_existing_index(
+                        &archive,
+                        &archive,
+                        &index,
+                        options.clone(),
+                        &mut None,
+                    )
+                } else {
+                    SqliteIndexedTar::create_index(
+                        &archive,
+                        &archive,
+                        (!memory).then_some(index.as_path()),
+                        &options,
+                        "test",
+                        &mut None,
+                    )
+                }
+                .unwrap();
+                assert!(source.is_dir("/empty"));
+                assert!(
+                    matches!(source.list("/empty"), Some(ListResult::Infos(entries)) if entries.is_empty())
+                );
+                assert!(source.list_dirents("/empty").unwrap().is_empty());
+                assert!(
+                    matches!(source.list_mode("/empty"), Some(ListModeResult::Modes(entries)) if entries.is_empty())
+                );
+                for path in ["/file", "/absent"] {
+                    assert!(source.list(path).is_none());
+                    assert!(source.list_dirents(path).is_none());
+                }
+            }
+        }
+    }
 
     /// Regression: passthrough must expose member bytes, never a TAR header or stale path.
     #[test]

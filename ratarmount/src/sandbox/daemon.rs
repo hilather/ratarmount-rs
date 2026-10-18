@@ -704,6 +704,12 @@ fn verify_tmpfs(_path: &Path) -> Result<()> {
 }
 
 fn absolute_source(source: &str) -> Result<String> {
+    if ratarmount_formats_git::parse_git_url(source)
+        .map_err(|e| invalid(e.to_string()))?
+        .is_some()
+    {
+        return Ok(source.into());
+    }
     // Probe only an ASCII scheme prefix: the legacy URL detector also slices
     // its input at byte seven for restic, which need not be a UTF-8 boundary.
     let remote = source
@@ -876,4 +882,20 @@ pub fn serve(socket: &Path, root: &Path, limit: usize, timeout: Duration) -> Res
         thread::sleep(Duration::from_millis(10));
     }
     supervisor.destroy_all()
+}
+
+/// Regression: create-base must preserve Git URL aliases for the shared factory parser.
+#[test]
+fn regression_create_base_preserves_git_url_alias() {
+    for source in [
+        "git:///srv/repo%20one.git#HEAD~1",
+        "git:///srv/repo@home/.git",
+    ] {
+        assert_eq!(absolute_source(source).unwrap(), source);
+    }
+    assert!(absolute_source("git://host/repo")
+        .unwrap_err()
+        .message
+        .contains("network git URLs are not supported; clone locally"));
+    assert!(Path::new(&absolute_source("relative/repo@HEAD").unwrap()).is_absolute());
 }

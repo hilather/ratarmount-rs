@@ -2223,8 +2223,17 @@ fn open_path_impl(
     // Resolve inline refs before the normal filesystem existence check.
     #[cfg(feature = "git")]
     {
-        let inline = ratarmount_formats_git::split_inline_reference(path);
-        let git_path = inline.as_ref().map_or(path, |(p, _)| p.as_path());
+        let url = ratarmount_formats_git::parse_git_url(&path.to_string_lossy())
+            .map_err(|e| e.to_string())?;
+        let inline = if url.is_none() {
+            ratarmount_formats_git::split_inline_reference(path)
+        } else {
+            None
+        };
+        let git_path = url.as_ref().map_or_else(
+            || inline.as_ref().map_or(path, |(p, _)| p.as_path()),
+            |(p, _)| p.as_path(),
+        );
         let is_bare = git_path.join("HEAD").is_file()
             && git_path.join("objects").is_dir()
             && git_path.join("refs").is_dir()
@@ -2232,6 +2241,7 @@ fn open_path_impl(
         let force = options.git
             || options.git_ref.is_some()
             || inline.is_some()
+            || url.is_some()
             || (git_path.is_dir()
                 && looks_like_git(git_path)
                 && std::env::var_os("RATARMOUNT_FORCE_GIT").is_some());
@@ -2239,13 +2249,16 @@ fn open_path_impl(
             if !looks_like_git(git_path) {
                 return Err(format!("{} is not a git repository", git_path.display()));
             }
-            if inline.is_some() && options.git_ref.is_some() {
+            if (inline.is_some() || url.as_ref().is_some_and(|(_, r)| r.is_some()))
+                && options.git_ref.is_some()
+            {
                 return Err("use either repo@REV or --git-ref, not both".into());
             }
             let reference = options
                 .git_ref
                 .as_deref()
-                .or_else(|| inline.as_ref().map(|(_, r)| r.as_str()));
+                .or_else(|| inline.as_ref().map(|(_, r)| r.as_str()))
+                .or_else(|| url.as_ref().map(|(_, r)| r.as_deref().unwrap_or("HEAD")));
             let mut git = GitMountSource::open(git_path, reference).map_err(|e| e.to_string())?;
             if let Some(prefix) = &options.git_prefix {
                 git = git.with_prefix(prefix).map_err(|e| e.to_string())?;
@@ -4547,6 +4560,9 @@ pub fn build_mount_source_ex(
 fn input_is_git(path: &Path, options: &OpenOptions) -> bool {
     #[cfg(feature = "git")]
     {
+        if path.to_string_lossy().starts_with("git://") {
+            return true;
+        }
         if ratarmount_remote::is_remote_url(&path.to_string_lossy()) {
             return false;
         }
@@ -8667,6 +8683,117 @@ mod tensors_tests;
 #[cfg(all(test, feature = "git", unix))]
 mod git_tests {
     use super::*;
+
+    /// Regression: local Git URL aliases must force Git mode throughout composition.
+    #[test]
+    fn regression_git_url_alias_forces_pinned_local_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        for bare in [false, true] {
+            let path = temp.path().join(if bare {
+                "bare @repo.git"
+            } else {
+                "working @repo"
+            });
+            let repo = if bare {
+                git2::Repository::init_bare(&path)
+            } else {
+                git2::Repository::init(&path)
+            }
+            .unwrap();
+            let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+            let mut builder = repo.treebuilder(None).unwrap();
+            builder
+                .insert("file", repo.blob(b"original").unwrap(), 0o100644)
+                .unwrap();
+            let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+            let first = repo
+                .commit(Some("HEAD"), &signature, &signature, "first", &tree, &[])
+                .unwrap();
+            builder
+                .insert("file", repo.blob(b"later").unwrap(), 0o100644)
+                .unwrap();
+            let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "later",
+                &tree,
+                &[&repo.find_commit(first).unwrap()],
+            )
+            .unwrap();
+            for path in [&path, &repo.path().to_owned()] {
+                let encoded = path
+                    .to_str()
+                    .unwrap()
+                    .replace('%', "%25")
+                    .replace(' ', "%20")
+                    .replace('@', "%40");
+                let url = PathBuf::from(format!("git://{encoded}#{first}"));
+                assert!(input_is_git(&url, &OpenOptions::default()));
+                let bundle = build_mount_source_ex(
+                    std::slice::from_ref(&url),
+                    &mut OpenOptions::default(),
+                    false,
+                    CompositingOptions::default(),
+                )
+                .unwrap();
+                let info = bundle.source.lookup("/file", 0).unwrap();
+                assert_eq!(bundle.source.read(&info, 99, 0).unwrap(), b"original");
+                assert!(bundle.source.lookup("/.git", 0).is_none());
+                assert!(open_path(
+                    &url,
+                    &OpenOptions {
+                        git_ref: Some("HEAD".into()),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .is_err());
+                let head = open_path(
+                    Path::new(&format!("git://{encoded}")),
+                    &OpenOptions::default(),
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    head.read(&head.lookup("file", 0).unwrap(), 99, 0).unwrap(),
+                    b"later"
+                );
+                let explicit = open_path(
+                    Path::new(&format!("git://{encoded}")),
+                    &OpenOptions {
+                        git_ref: Some(first.to_string()),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    explicit
+                        .read(&explicit.lookup("file", 0).unwrap(), 99, 0)
+                        .unwrap(),
+                    b"original"
+                );
+            }
+            repo.reference("refs/heads/master", first, true, "fixture fallback")
+                .unwrap();
+            repo.set_head("refs/heads/missing").unwrap();
+            let head_url = format!("git://{}", path.display());
+            assert!(
+                open_path(Path::new(&head_url), &OpenOptions::default(), false)
+                    .err()
+                    .unwrap()
+                    .contains("cannot resolve git ref \"HEAD\"")
+            );
+        }
+        assert!(
+            open_path(Path::new("git://host/repo"), &OpenOptions::default(), false)
+                .err()
+                .unwrap()
+                .contains("network git URLs are not supported; clone locally")
+        );
+    }
 
     /// Regression: the factory ignored explicit refs and mounted the future fix at HEAD.
     #[test]

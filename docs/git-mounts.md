@@ -5,6 +5,7 @@ Mount a committed tree, optionally selecting a revision and subdirectory:
 ```sh
 ratarmount --git-ref HEAD~1 /path/to/repo mnt
 ratarmount '/path/to/repo.git@v1.0' mnt
+ratarmount 'git:///path/to/repo.git#v1.0' mnt
 ratarmount --git --git-prefix src /path/to/repo mnt
 ratarmount --git-ref <base-sha> --git-synthetic-head -w attempt-overlay /path/to/repo mnt
 ```
@@ -33,9 +34,50 @@ available as `user.ratarmount.git.commit` on ordinary Git mounts. Synthetic
 mounts expose no such xattr on any path, including `.git/*`. Keep daemon logs
 outside the agent sandbox: the info log still records the resolved source ID.
 
+The local URL form `git:///absolute/path#REV` also selects Git mode. It accepts
+bare repositories, working directories, and `.git` directories. Omit `#REV` to
+select HEAD. The path is percent-decoded (`%20` for a space, `%23` for a literal
+`#`); `@` in this path is always a directory-name character. A URL fragment and
+`--git-ref` cannot both select a revision. URLs with a host, including
+`git://localhost/...`, fail with “network git URLs are not supported; clone
+locally”. The same alias works in mount positionals, diff bases, overlay
+commands, and sandbox daemon `create-base` sources.
+
+Git source metadata preserves committed permissions: regular files are 0644 or
+0755, directories 0755, and symlinks 0777. The source remains read-only until
+wrapped in a write overlay. Ordinary Git sources skip submodules (gitlinks) with
+a warning; synthetic HEAD continues to reject them.
+
 `--git-prefix SUBDIR` selects a directory within that commit; missing prefixes
 and file prefixes are errors. Synthetic HEAD then refers to that subtree,
 with paths relative to it.
+
+## Portable Git snapshots
+
+```sh
+ratarmount snapshot 'git:///srv/repos/project.git#v1.0' project.tar.zst --with-index
+ratarmount snapshot '/srv/repos/project.git@v1.0' project.tar.zst --frame-size 1M --json
+```
+
+This exports the committed tree without a checkout, `.git`, or synthetic HEAD.
+Entries are sorted by path, ownership is uid/gid 0, mtimes use the commit's
+committer time, and file modes and symlink targets match the Git base. Empty
+directories are preserved and list as empty on both bases. Submodules are skipped
+with a stderr warning. Working-tree changes and later commits are
+excluded. Identical input trees, commit times, and frame sizes produce identical
+archive bytes. Existing output archives are refused.
+
+The archive uses independent zstd frames with an official seek table. Frame size
+is configurable (default 1 MiB, positive and at most 2³²−1 bytes). `--with-index`
+writes `project.tar.zst.index.sqlite` alongside the archive. Ship both files in
+the same directory to let mounts reuse the index without building it.
+
+Text output contains two lines, `sha256:<archive hash>` and `git-tree:<tree id>`.
+`--json` emits an object with `archive_digest` and `base_digest` containing those
+strings. The Git tree ID is the base digest used for Git bases; the archive hash
+identifies the exported bytes. Existing `snapshot add` and `snapshot list`
+commands retain their restic behavior. Use `./add` or `./list` if a local Git
+repository has one of those reserved command names.
 
 ## Synthetic repository guarantees
 
