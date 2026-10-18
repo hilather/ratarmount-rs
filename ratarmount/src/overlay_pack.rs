@@ -2491,6 +2491,7 @@ mod tests {
             std::slice::from_ref(&base_dir),
             None,
             std::slice::from_ref(&bundle),
+            true,
         );
         assert_eq!(key, None);
         let cache = f.tmp.path().join("cache");
@@ -2528,7 +2529,7 @@ mod tests {
         assert!(error.contains("deleted"), "{error}");
         // A directory has no computed strong digest, and a supplied
         // `--base-digest` is only a claim: still no marker.
-        let strong = crate::lower_base_key(std::slice::from_ref(&base_dir), None, &paths);
+        let strong = crate::lower_base_key(std::slice::from_ref(&base_dir), None, &paths, true);
         assert_eq!(strong, None);
     }
 

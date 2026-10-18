@@ -1290,17 +1290,49 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
 /// computed strong digest, a union (several inputs) would need every input's
 /// identity and its index only covers the first, and a supplied
 /// `--base-digest` is just the caller's unchecked claim, so it never keys a
-/// marker. Computed only when a `--lower` bundle needs it.
-fn lower_base_key(bases: &[PathBuf], index: Option<&Path>, lowers: &[PathBuf]) -> Option<String> {
+/// marker. Any option that reshapes the mounted view (see
+/// [`mounted_view_is_default`]) also disables markers: the archive's digest
+/// says nothing about the paths the bundle is verified against then.
+/// Computed only when a `--lower` bundle needs it.
+fn lower_base_key(
+    bases: &[PathBuf],
+    index: Option<&Path>,
+    lowers: &[PathBuf],
+    default_view: bool,
+) -> Option<String> {
     let [base] = bases else {
         return None;
     };
+    if !default_view {
+        return None;
+    }
     if !lowers.iter().any(|p| p.is_file()) || !base.is_file() {
         return None;
     }
     ratarmount_index::peek_archive_digest(base, index)
         .ok()
         .flatten()
+}
+
+/// Whether the mount serves the base's paths unchanged, so a bundle verified
+/// against the archive's content stays verified. Any option that shapes the
+/// mounted tree (prefix, transforms, recursion, binds, corpus, git prefix,
+/// rolling series, union disabling) makes this false; a new view option must
+/// be added here.
+fn mounted_view_is_default(args: &Args, rolling: bool) -> bool {
+    !rolling
+        && args.prefix.is_empty()
+        && args.transform.is_none()
+        && args.transform_recursive_mount_point.is_none()
+        && !args.recursive
+        && args.recursion_depth == 0
+        && !args.lazy
+        && !args.strip_recursive_tar_extension
+        && !args.disable_union_mount
+        && args.source_binds.is_empty()
+        && args.corpus_list.is_none()
+        && args.git_prefix.is_none()
+        && args.roll_every.is_none()
 }
 
 /// The base a mount actually serves, as far as it can be identified without
@@ -2341,7 +2373,12 @@ fn main() {
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
-    let lower_key = lower_base_key(&inputs, index_sidecar.as_deref(), &args.lower);
+    let lower_key = lower_base_key(
+        &inputs,
+        index_sidecar.as_deref(),
+        &args.lower,
+        mounted_view_is_default(&args, rolling.is_some()),
+    );
     let lower_identity = BaseIdentity::Enforce {
         base: MountedBase {
             extra_excludes: lower_extra_excludes(
@@ -8478,7 +8515,7 @@ mod lower_marker_key_tests {
         let bundle = dir.path().join("l.tar.zst");
         std::fs::write(&bundle, b"x").unwrap();
         let lowers = [bundle];
-        let key = |inputs: &[PathBuf]| lower_base_key(inputs, Some(&index), &lowers);
+        let key = |inputs: &[PathBuf]| lower_base_key(inputs, Some(&index), &lowers, true);
         // One archive: keyed by its cached digest.
         assert_eq!(key(std::slice::from_ref(&a)), Some(digest.clone()));
         // A directory beside it has no computed strong identity: no marker, so
@@ -8498,10 +8535,50 @@ mod lower_marker_key_tests {
         let bundle = dir.path().join("l.tar.zst");
         std::fs::write(&bundle, b"x").unwrap();
         let lowers = [bundle];
-        assert_eq!(lower_base_key(&[a_dir(dir.path())], None, &lowers), None);
+        assert_eq!(lower_base_key(&[a_dir(dir.path())], None, &lowers, true), None);
         let bare = dir.path().join("bare.tar");
         std::fs::write(&bare, b"zz").unwrap();
-        assert_eq!(lower_base_key(&[bare], None, &lowers), None);
+        assert_eq!(lower_base_key(&[bare], None, &lowers, true), None);
+    }
+
+    /// Regression: a marker cached for the plain view skipped verification when
+    /// the same bundle was mounted with `--prefix p` (or any other option that
+    /// reshapes the paths), accepting a Modified->Added change.
+    #[test]
+    fn regression_marker_key_needs_the_default_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, index, digest) = cached_archive(dir.path(), "a.tar", b"aaaa");
+        let bundle = dir.path().join("l.tar.zst");
+        std::fs::write(&bundle, b"x").unwrap();
+        let lowers = [bundle.clone()];
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["ratarmount"];
+            argv.extend_from_slice(extra);
+            argv.push("a.tar");
+            Args::try_parse_from(argv).unwrap()
+        };
+        let key = |extra: &[&str]| {
+            lower_base_key(
+                std::slice::from_ref(&a),
+                Some(&index),
+                &lowers,
+                mounted_view_is_default(&parse(extra), false),
+            )
+        };
+        assert_eq!(key(&[]), Some(digest));
+        for extra in [
+            &["--prefix", "p"][..],
+            &["--transform", "a", "b"],
+            &["--transform-recursive-mount-point", "a", "b"],
+            &["-r"],
+            &["--lazy"],
+            &["--disable-union-mount"],
+            &["-s"],
+            &["--git-prefix", "x"],
+        ] {
+            assert_eq!(key(extra), None, "{extra:?}");
+        }
+        assert!(!mounted_view_is_default(&parse(&[]), true));
     }
 
     fn a_dir(parent: &Path) -> PathBuf {
