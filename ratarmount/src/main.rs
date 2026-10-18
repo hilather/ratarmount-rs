@@ -1340,12 +1340,15 @@ impl MountLowerStack {
 
     fn check_top(&self, dir: &Path, force: bool) -> Result<(), String> {
         use ratarmount_compositing::OverlayMeta;
-        match std::fs::symlink_metadata(dir.join(HIDDEN_DB)) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.to_string()),
-            Ok(_) => {}
+        // A missing, unreadable, corrupt or locked database is left to
+        // `WriteOverlay::new`, whose errors name the file and the way out
+        // (#89); it also refuses a sealed top inside its open transaction.
+        if std::fs::symlink_metadata(dir.join(HIDDEN_DB)).is_err() {
+            return Ok(());
         }
-        let meta = OverlayMeta::read(dir).map_err(|e| overlay_open_error(dir, &e))?;
+        let Ok(meta) = OverlayMeta::read(dir) else {
+            return Ok(());
+        };
         if meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
             return Err(format!(
                 "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
