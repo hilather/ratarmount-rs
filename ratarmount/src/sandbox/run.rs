@@ -745,6 +745,8 @@ fn mount_ready(cleanup: &mut Cleanup, stderr: &mut File, base: &Path) -> io::Res
             if shown != raw {
                 diagnostic = diagnostic.replace(raw.as_ref(), &shown);
             }
+            // A library may also echo a rewritten form (`webdav://` as `http://`).
+            let diagnostic = ratarmount_core::redact_urls_in_text(&diagnostic);
             return Err(io::Error::other(format!(
                 "mount did not become ready: {diagnostic}"
             )));
@@ -786,7 +788,7 @@ pub fn run(args: &RunArgs) -> io::Result<()> {
     let value = match &result {
         Ok(report) => report.clone(),
         Err(error) => {
-            json!({"error":error.to_string(), "interrupted":SIGNAL.load(Ordering::Relaxed) != 0})
+            json!({"error":ratarmount_core::redact_urls_in_text(&error.to_string()), "interrupted":SIGNAL.load(Ordering::Relaxed) != 0})
         }
     };
     let mut out = io::stdout().lock();

@@ -478,6 +478,65 @@ fn regression_run_credentialed_base_url_is_redacted_in_failure() {
     assert_no_secrets(&String::from_utf8_lossy(&output.stderr), "stderr");
 }
 
+/// An HTTP stub that answers every request with `403 Forbidden`.
+fn serve_forbidden() -> u16 {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut socket) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let _ = socket.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    port
+}
+
+/// Regression: a `webdav://host/f?token=SECRET` base is rewritten to an HTTP
+/// URL before the request, so the 403 error text named the rewritten URL and
+/// the exact-string replacement of the original base missed the token.
+#[test]
+fn regression_run_transformed_url_in_error_is_redacted() {
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let port = serve_forbidden();
+    for scheme in ["webdav", "http"] {
+        let url = format!("{scheme}://user:s3cr3t@127.0.0.1:{port}/f.tar?token=deadbeef");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        command
+            .args(["sandbox", "run", "--base", &url, "--top"])
+            .arg(fixture.temp.path().join(format!("top-{scheme}")))
+            .args(["--image", "busybox", "--json", "--", "true"])
+            .env("RATARMOUNT_SANDBOX_RUNTIME", stub())
+            .env("RATARMOUNT_STUB_STATE", fixture.temp.path().join("runtime"))
+            .env("HOME", fixture.temp.path().join("home"))
+            .env("XDG_CACHE_HOME", fixture.temp.path().join("home/.cache"));
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!output.status.success(), "{scheme}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("403") || stderr.contains("403"),
+            "{scheme}: {stdout}\n{stderr}"
+        );
+        assert_no_secrets(&stdout, "stdout");
+        assert_no_secrets(&stderr, "stderr");
+    }
+}
+
 /// Regression: a successful `sandbox run` over a credentialed URL base printed
 /// the secrets in mount progress, the report or the overlay it left behind.
 #[test]
