@@ -1229,7 +1229,7 @@ mean whatever docker/podman define as unlimited) and `--cap-add CAP` (repeatable
 `[A-Za-z0-9_]+`) adds a capability back (experimental, may change); nothing
 removes `no-new-privileges`. A credentialed `--base URL` is visible in `ps`
 because the mount child's argv carries the URL as given (only what is stored or
-printed is redacted); use an unauthenticated URL. Docker is preferred, then Podman, unless `--runtime`
+printed is redacted, including the runtime's stderr in cleanup warnings and the inline credentials of `rclone`, `restic` and `torrent`/magnet inputs; the covered forms are listed in the module docs of `ratarmount-core/src/redact.rs`); use an unauthenticated URL. Docker is preferred, then Podman, unless `--runtime`
 selects one. `RATARMOUNT_SANDBOX_RUNTIME=/absolute/path/to/executable` overrides
 that selection, including for the in-tree test stub. The runtime must use the
 local host's mount namespace; a remote Docker daemon cannot bind this mount.

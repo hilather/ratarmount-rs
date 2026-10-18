@@ -616,12 +616,19 @@ impl Drop for Cleanup {
             Ok(()) => {
                 let _ = fs::remove_file(&self.pid_file);
             }
-            Err(error) => eprintln!(
-                "sandbox run cleanup: {error}; retained {}",
-                self.pid_file.display()
-            ),
+            Err(error) => eprintln!("{}", cleanup_warning(&error, &self.pid_file)),
         }
     }
+}
+
+/// The stderr line for a failed cleanup. The error can carry a runtime's own
+/// stderr, which may echo a credentialed image or base URL.
+fn cleanup_warning(error: &io::Error, pid_file: &Path) -> String {
+    format!(
+        "sandbox run cleanup: {}; retained {}",
+        ratarmount_core::redact_urls_in_text(&error.to_string()),
+        pid_file.display()
+    )
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
@@ -1336,6 +1343,54 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(super::super::error_exit_code(&parsed), 2);
+    }
+
+    /// Regression: the "sandbox run cleanup" warning printed the runtime's
+    /// stderr unredacted, so a credentialed URL it echoed reached the terminal.
+    #[test]
+    fn regression_run_cleanup_warning_is_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime.sh");
+        fs::write(
+            &runtime,
+            "#!/bin/sh\necho \"denied: https://admin:hunter2@registry.example/v2/img?token=SECRETTOK\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut cleanup = Cleanup {
+            control_dir: None,
+            record: PidRecord {
+                owner: ProcessIdentity::new(std::process::id()),
+                mountpoint: dir.path().join("not-mounted"),
+                container: "ratarmount-run-test".into(),
+                runtime,
+                mount_child: None,
+                runtime_child: None,
+                ram_top: None,
+            },
+            pid_file: pid_file.clone(),
+            top: dir.path().join("top"),
+            mount_child: None,
+            runtime_child: None,
+            stopped: false,
+            runtime_stopped: false,
+        };
+        let error = cleanup.stop().unwrap_err();
+        assert!(error.to_string().contains("hunter2"), "stub did not echo");
+        let warning = cleanup_warning(&error, &pid_file);
+        for secret in ["hunter2", "SECRETTOK", "admin"] {
+            assert!(!warning.contains(secret), "{warning}");
+        }
+        assert!(
+            warning.contains("https://registry.example/v2/img"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(&pid_file.display().to_string()),
+            "{warning}"
+        );
+        cleanup.stopped = true;
     }
 
     /// Regression: stale/reused PIDs must not identify an unrelated live process as this run.
