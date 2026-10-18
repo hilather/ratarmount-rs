@@ -51,8 +51,10 @@ pub fn redact_urls_in_text(text: &str) -> String {
             .match_indices("://")
             .map(|(at, _)| {
                 rest[..at]
-                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-                    .map_or(0, |i| i + 1)
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+                    .map_or(0, |(i, c)| i + c.len_utf8())
             })
             .next();
         let magnet = rest.to_ascii_lowercase().find("magnet:?");
@@ -163,6 +165,23 @@ mod tests {
             for secret in ["s3cr3t", "deadbeef", "passkey", "tok", "sig=", "u:p"] {
                 assert!(!got.contains(secret) || input.starts_with("git:"), "{got}");
             }
+        }
+    }
+
+    /// Regression: `/tmp/éhttps://missing.tar` made the token scanner add one
+    /// to the byte offset of the two-byte `é` and slice inside it (panic).
+    #[test]
+    fn regression_redact_urls_in_text_multibyte() {
+        assert_eq!(
+            redact_urls_in_text("/tmp/éhttps://missing.tar"),
+            "/tmp/éhttps://missing.tar"
+        );
+        assert_eq!(
+            redact_urls_in_text("файл→http://u:p@h/x?token=abc, 日本語ftp://h/y?k=v"),
+            "файл→http://h/x, 日本語ftp://h/y"
+        );
+        for input in ["é://", "😀://x", "a😀magnet:?xt=1&tr=s", "ééé", "://é"] {
+            let _ = redact_urls_in_text(input);
         }
     }
 }
