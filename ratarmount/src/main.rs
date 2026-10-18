@@ -2217,7 +2217,10 @@ fn main() {
             }
         }
     }
-    let overlay_git_tree = if args.write_overlay.is_some() && args.source_binds.is_empty() {
+    // A read-only `--lower` mount compares the tree too (tree id lookup, no hashing).
+    let overlay_git_tree = if (args.write_overlay.is_some() || !args.lower.is_empty())
+        && args.source_binds.is_empty()
+    {
         overlay_cmd::pin_git_base(&mut source_paths, &mut open_opts).unwrap_or_else(|error| {
             eprintln!("error resolving overlay base: {error}");
             std::process::exit(1);

@@ -178,3 +178,51 @@ fn regression_lower_strong_archive_copy_accepted_by_cached_digest_without_hashin
     assert!(err.contains("could not be confirmed cheaply"), "{err}");
     assert!(!log.exists() || fs::read_to_string(&log).unwrap().is_empty());
 }
+
+/// Regression (R4-S8): a read-only `--lower` mount resolved the Git tree id
+/// only with `-w`, so the comparator got no tree and a lower sealed against
+/// `git:///repo#A` was accepted on `git:///repo#B`.
+#[test]
+fn regression_lower_read_only_git_lower_compares_tree() {
+    let env = Env::new();
+    let repo_dir = env.path("repo");
+    let repo = git2::Repository::init(&repo_dir).unwrap();
+    let sig = git2::Signature::new("t", "t@t", &git2::Time::new(0, 0)).unwrap();
+    let mut commits = Vec::new();
+    let mut parent: Option<git2::Oid> = None;
+    for content in [&b"one\n"[..], &b"two\n"[..]] {
+        let blob = repo.blob(content).unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder.insert("a.txt", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let parents: Vec<git2::Commit> = parent
+            .map(|p| repo.find_commit(p).unwrap())
+            .into_iter()
+            .collect();
+        let parents: Vec<&git2::Commit> = parents.iter().collect();
+        let id = repo
+            .commit(Some("HEAD"), &sig, &sig, "c", &tree, &parents)
+            .unwrap();
+        parent = Some(id);
+        commits.push(id);
+    }
+    let url = |c: git2::Oid| format!("git://{}#{c}", repo_dir.display());
+    let overlay = env.path("L");
+    env.ok(&["--no-mount", "-w", s(&overlay), &url(commits[0])]);
+    env.ok(&["overlay", "seal", s(&overlay)]);
+    let out = env.run(
+        &["--no-mount", "--lower", s(&overlay), &url(commits[1])],
+        None,
+    );
+    assert!(!out.status.success(), "wrong tree accepted: {}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--force-stack-mismatch"),
+        "{}",
+        text(&out)
+    );
+    let out = env.run(
+        &["--no-mount", "--lower", s(&overlay), &url(commits[0])],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+}
