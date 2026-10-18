@@ -395,6 +395,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Canonical hash definition drifts (row encoding, normalization, mode, algorithm prefix); Python reference disagrees | `cargo test -p ratarmount-compositing --lib golden_canonical_hash_fixture` · `python3 -I test-harness/canonical-hash/reference.py --self-test` |
 | Strict/loose hashing cloned the digest per line and whitespace run (1 GiB text: 65 s BLAKE3, 21 s SHA-256); streaming digest must equal the reference normalization for any chunking and whitespace-buffer overflow | `cargo test -p ratarmount-compositing --lib regression_text_digest_matches_reference` · `cargo test -p ratarmount-compositing --lib regression_hash_normalization_streams` |
 | Journal overhead benchmark biased by fixed run order or dies on a transiently busy unmount | `./benchmarks/journal-overhead.sh --self-test` |
+| macOS build breaks: `overlay pack`/`unpack` passed a `u32` mode where rustix's `RawMode` is `u16` on macOS (SBX-PACK) | CI job `macOS (build + test)` (`cargo build` there; Linux cannot cross-check without the macOS SDK) |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

@@ -12,6 +12,12 @@ use ratarmount_compositing::{overlay_changes, OverlayMeta, HIDDEN_DB};
 use ratarmount_core::MountSource;
 use rustix::fs::{self as host, AtFlags, Dir, Mode, OFlags};
 
+/// Bundle permission bits as the host mode_t (u16 on macOS, u32 on Linux).
+#[allow(clippy::unnecessary_cast)]
+fn raw_mode(mode: u32) -> host::RawMode {
+    (mode & 0o7777) as host::RawMode
+}
+
 const SENTINEL: &str = ".ratarmount-sealed";
 const FRAME_SIZE: u64 = 4 * 1024 * 1024;
 
@@ -503,7 +509,7 @@ fn extract(bundle: &Path, directory: &Path) -> io::Result<()> {
                 ));
             }
             file.set_times(fs::FileTimes::new().set_modified(mtime))?;
-            host::fchmod(&file, Mode::from_raw_mode(mode))?;
+            host::fchmod(&file, Mode::from_raw_mode(raw_mode(mode)))?;
         } else if kind.is_symlink() {
             let target = entry
                 .link_name_bytes()
@@ -540,7 +546,7 @@ fn extract(bundle: &Path, directory: &Path) -> io::Result<()> {
         };
         let file = File::from(fd);
         file.set_times(fs::FileTimes::new().set_modified(mtime))?;
-        host::fchmod(&file, Mode::from_raw_mode(mode))?;
+        host::fchmod(&file, Mode::from_raw_mode(raw_mode(mode)))?;
     }
     seal_directories(&root)
 }
