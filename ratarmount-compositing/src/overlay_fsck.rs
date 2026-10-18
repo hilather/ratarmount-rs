@@ -315,8 +315,13 @@ pub(crate) fn check_connection(
                 store_host(conn, path, host.expect("host checked"))?;
             }
         }
+        // Only present rows need a host parent directory. A tombstone hides a
+        // base path and never needs one: deleting `a/b/c` inside an untouched
+        // base directory creates no host `a/b`, and `rm -rf d; echo x > d`
+        // leaves `d/...` tombstones under what is now a file or symlink.
         let parent = split(path).0;
-        if !parent.is_empty()
+        if !row.deleted
+            && !parent.is_empty()
             && !hidden(parent)
             && !row.metadata_only
             && !hosts
@@ -324,25 +329,6 @@ pub(crate) fn check_connection(
                 .is_some_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR)
         {
             report.missing_parent += 1;
-            if repair && row.deleted {
-                let mut fd = open_directory(root, "")?;
-                let mut prefix = String::new();
-                for part in parent.split('/') {
-                    if !prefix.is_empty() {
-                        prefix.push('/');
-                    }
-                    prefix.push_str(part);
-                    match fs::mkdirat(&fd, part, Mode::from_raw_mode(0o755)) {
-                        Ok(()) => {
-                            let stat = fs::statat(&fd, part, AtFlags::SYMLINK_NOFOLLOW)?;
-                            store_host(conn, &prefix, &stat)?;
-                        }
-                        Err(rustix::io::Errno::EXIST) => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                    fd = fs::openat(&fd, part, directory_flags(), Mode::empty())?;
-                }
-            }
         }
     }
     for (path, stat) in &hosts {
@@ -387,6 +373,7 @@ pub(crate) fn check_connection(
 mod tests {
     use super::*;
     use crate::{FolderMountSource, OverlayMetadata, WriteOverlay};
+    use ratarmount_core::MountSource;
     use std::fs as host;
     use std::sync::Arc;
 
@@ -534,9 +521,10 @@ mod tests {
         assert!(fsck(&dir, false).unwrap().is_clean());
     }
 
-    /// Regression: a tombstone below a live symlink must not unlink its external target.
+    /// Regression: a tombstone below a live symlink must not unlink its external
+    /// target, and is not an inconsistency (`rm -rf d; ln -s x d`).
     #[test]
-    fn regression_fsck_tombstone_below_symlink_fails_closed() {
+    fn regression_fsck_tombstone_below_symlink_is_harmless() {
         let (tmp, dir, _source) = fixture();
         let outside = tmp.path().join("outside");
         host::create_dir(&outside).unwrap();
@@ -545,12 +533,54 @@ mod tests {
         db(&dir)
             .execute_batch("INSERT INTO files(path,name,deleted) VALUES ('/link','keep',1)")
             .unwrap();
-        assert_eq!(fsck(&dir, false).unwrap().missing_parent, 1);
-        assert!(fsck(&dir, true).is_err());
+        // A tombstone below what is now a symlink is stale but harmless; it is
+        // not an error, and repair never traverses the link.
+        // (The fixture's link has no row, so it is a genuine orphan.)
+        let report = fsck(&dir, false).unwrap();
+        assert_eq!((report.missing_parent, report.tombstone_content), (0, 0));
+        assert_eq!(report.orphan_content, 1);
+        fsck(&dir, true).unwrap();
+        assert!(fsck(&dir, false).unwrap().is_clean());
         assert_eq!(host::read(outside.join("keep")).unwrap(), b"safe");
         assert!(host::symlink_metadata(dir.join("link"))
             .unwrap()
             .is_symlink());
+    }
+
+    /// Regression: fsck reported `missing_parent` for ordinary agent edits, so
+    /// `overlay seal` refused them: deleting a file inside an untouched base
+    /// directory (no host parent), and replacing a base directory with a file
+    /// or a symlink (tombstones left under a non-directory).
+    #[test]
+    fn regression_fsck_tombstones_need_no_host_parent() {
+        let (tmp, dir, _) = fixture();
+        let base = tmp.path().join("base");
+        for sub in ["a/b", "d/sub", "l/x"] {
+            host::create_dir_all(base.join(sub)).unwrap();
+        }
+        for file in ["a/b/c", "d/sub/old", "l/x/k"] {
+            host::write(base.join(file), b"base").unwrap();
+        }
+        let source: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base).unwrap());
+        let overlay = WriteOverlay::new(source.clone(), &dir).unwrap();
+        overlay.unlink("/a/b/c").unwrap();
+        for (file, sub, top) in [("/d/sub/old", "/d/sub", "/d"), ("/l/x/k", "/l/x", "/l")] {
+            overlay.unlink(file).unwrap();
+            overlay.rmdir(sub).unwrap();
+            overlay.rmdir(top).unwrap();
+        }
+        use std::io::Write as _;
+        use std::os::fd::FromRawFd as _;
+        let fd = overlay.create_file("/d", 0o644).unwrap();
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(b"now a file").unwrap();
+        overlay.finish_owned_write_fd(file);
+        overlay.create_symlink("/l", "/etc").unwrap();
+        drop(overlay);
+        let report = fsck(&dir, false).unwrap();
+        assert!(report.is_clean(), "{}", report.result());
+        assert!(!dir.join("a").exists(), "fsck must not create host parents");
+        crate::overlay_seal::seal(&dir, source).unwrap();
     }
 
     /// Regression: tombstoned directories leave descendants and missing parents inconsistent.
@@ -567,9 +597,11 @@ mod tests {
             )
             .unwrap();
         let report = fsck(&dir, true).unwrap();
-        assert_eq!(report.missing_parent, 2);
+        // Only the present `/missing/child` row lacks its parent; the tombstone
+        // `/deleted-parent/child` needs none and repair must not invent one.
+        assert_eq!(report.missing_parent, 1);
         assert!(!dir.join("gone").exists());
-        assert!(dir.join("deleted-parent").is_dir());
+        assert!(!dir.join("deleted-parent").exists());
         assert!(fsck(&dir, false).unwrap().is_clean());
     }
 
