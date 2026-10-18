@@ -259,3 +259,126 @@ fn regression_stack_top_over_lower_measures_own_base() {
     let meta_c = OverlayMeta::read(&c).unwrap().unwrap();
     assert_eq!(meta_c.base_digest(), Some(supplied.as_str()));
 }
+
+fn dir_base(root: &Path, name: &str, body: &[u8]) -> std::path::PathBuf {
+    let base = root.join(name);
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("f"), body).unwrap();
+    base
+}
+
+fn tar_base(path: &Path, body: &[u8]) {
+    let mut tar = tar::Builder::new(fs::File::create(path).unwrap());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(body.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "f", body).unwrap();
+    tar.finish().unwrap();
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Regression: a lower sealed against one base mounted over another base was
+/// accepted (read-only and as the lower of a `-w` top) and reported the lower's
+/// own base identity.
+#[test]
+fn regression_lower_over_different_directory_base_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let x = dir_base(tmp.path(), "x", b"one");
+    let y = dir_base(tmp.path(), "y", b"different length");
+    let lower = tmp.path().join("lower");
+    success(open(&x, Some(&lower), &[], &[]));
+    seal(&lower, "sha256:lower");
+    success(open(&x, None, &[&lower], &[]));
+    for top in [None, Some(tmp.path().join("top"))] {
+        let refused = open(&y, top.as_deref(), &[&lower], &[]);
+        assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+        let error = stderr(&refused);
+        assert!(
+            error.contains("sealed against a different base")
+                && error.contains("overlay verify")
+                && error.contains("--force-stack-mismatch"),
+            "{error}"
+        );
+        success(open(
+            &y,
+            top.as_deref(),
+            &[&lower],
+            &["--force-stack-mismatch"],
+        ));
+    }
+}
+
+/// Regression: a base edited after the lower was sealed was accepted; the
+/// comparison is a metadata walk, so it must not read file content.
+#[test]
+fn regression_lower_directory_edit_is_refused_without_reading() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = dir_base(tmp.path(), "base", b"one");
+    let lower = tmp.path().join("lower");
+    success(open(&base, Some(&lower), &[], &[]));
+    seal(&lower, "sha256:lower");
+    success(open(&base, None, &[&lower], &[]));
+    fs::write(base.join("g"), b"added after sealing").unwrap();
+    let refused = open(&base, None, &[&lower], &[]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("sealed against a different base"));
+}
+
+/// Regression: a lower sealed against archive X mounted over archive Y.
+#[test]
+fn regression_lower_over_different_archive_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let x = tmp.path().join("x.tar");
+    let y = tmp.path().join("y.tar");
+    tar_base(&x, b"one");
+    // Tar pads to 10 KiB blocks: a different size needs a bigger body.
+    tar_base(&y, &[b'y'; 20_000]);
+    let lower = tmp.path().join("lower");
+    success(open(&x, Some(&lower), &[], &[]));
+    seal(&lower, "sha256:lower");
+    success(open(&x, None, &[&lower], &[]));
+    for top in [None, Some(tmp.path().join("top"))] {
+        let refused = open(&y, top.as_deref(), &[&lower], &[]);
+        assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+        assert!(stderr(&refused).contains("sealed against a different base"));
+        success(open(
+            &y,
+            top.as_deref(),
+            &[&lower],
+            &["--force-stack-mismatch"],
+        ));
+    }
+}
+
+/// A lower recorded with `--base-digest none` carries no identity: accepted.
+#[test]
+fn regression_lower_none_kind_lower_is_accepted_over_any_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let x = dir_base(tmp.path(), "x", b"one");
+    let y = dir_base(tmp.path(), "y", b"different length");
+    let lower = tmp.path().join("lower");
+    success(open(&x, Some(&lower), &[], &["--base-digest", "none"]));
+    seal(&lower, "sha256:lower");
+    success(open(&y, None, &[&lower], &[]));
+}
+
+/// Regression: the lower's overlay inside the base (excluded from its weak
+/// digest) that grows after sealing must not make the unchanged base differ.
+#[test]
+fn regression_a2_bottom_lower_with_own_exclusions_then_new_top() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = dir_base(tmp.path(), "base", b"one");
+    let lower = base.join("lower-ov");
+    success(open(&base, Some(&lower), &[], &[]));
+    fs::write(lower.join("grown"), b"written after creation").unwrap();
+    seal(&lower, "sha256:lower");
+    success(open(&base, None, &[&lower], &[]));
+    success(open(&base, Some(&tmp.path().join("top")), &[&lower], &[]));
+    fs::write(base.join("g"), b"real change").unwrap();
+    let refused = open(&base, None, &[&lower], &[]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+}

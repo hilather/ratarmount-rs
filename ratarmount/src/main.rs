@@ -1304,11 +1304,140 @@ fn lower_base_key(
         .flatten()
 }
 
+/// The base a mount actually serves, as far as it can be identified without
+/// reading content.
+#[derive(Default)]
+struct MountedBase {
+    /// Local path of a directory or archive base; `None` for remote bases.
+    path: Option<PathBuf>,
+    /// Tree id of a pinned Git base.
+    git_tree: Option<String>,
+    /// A supplied `--base-digest`, reported as the base's identity.
+    supplied: Option<String>,
+    /// Index sidecar whose digest cache may already hold the archive's digest.
+    index: Option<PathBuf>,
+    /// Base-relative paths of this invocation's own overlay, journal and mount
+    /// point (and the existing top's recorded set), left out of the walk in
+    /// addition to the bottom lower's recorded set so a top or mount point
+    /// inside the base does not make the base differ.
+    extra_excludes: Vec<PathBuf>,
+}
+
+/// Whether [`MountLowerStack`] compares the mounted base with the bottom
+/// lower's recorded identity. Only the mount path enforces it; offline
+/// commands (`verify`, `seal`, `pack`, `diff`, import) report base problems
+/// through their own checks.
+enum BaseIdentity {
+    Offline,
+    Enforce { base: MountedBase, force: bool },
+}
+
 struct MountLowerStack {
     layers: Vec<(PathBuf, ratarmount_compositing::Immutability)>,
     records: Vec<ratarmount_compositing::LowerLayerRecord>,
-    /// `base_digest` recorded by the bottom lower, which was created on the base.
+    /// Identity of the base this stack is mounted on: the mounted base's own
+    /// when [`BaseIdentity::Enforce`] measured it (empty when unknown), else
+    /// the digest recorded by the bottom lower.
     base_digest: Option<String>,
+}
+
+/// Compare the mounted base with what the bottom lower recorded, using
+/// metadata only (a weak directory walk with the lower's own recorded
+/// exclusions, an archive's size and mtime, a Git tree id). Returns the
+/// mounted base's own identity ("" when it cannot be known without hashing).
+fn mounted_base_identity(
+    lower: &Path,
+    meta: Option<&ratarmount_compositing::OverlayMeta>,
+    base: &MountedBase,
+    force: bool,
+) -> Result<String, String> {
+    use ratarmount_compositing::overlay_meta::{directory_weak_digest, BaseExcludes};
+    let get = |key: &str| meta.and_then(|m| m.get(key));
+    // Kind `none` (and a lower with no kind) recorded no identity to compare.
+    let decidable = meta.is_some_and(|m| m.base_digest_kind().is_some_and(|k| k != "none"));
+    let recorded_weak = get("base_weak_digest");
+    let recorded_stamp = get("base_size").zip(get("base_mtime_ns"));
+    let recorded_tree = get("base_git_tree");
+    let mut mismatch: Option<String> = None;
+    let identity = if let Some(tree) = &base.git_tree {
+        let current = format!("git-tree:{tree}");
+        if decidable
+            && (recorded_tree.is_some_and(|r| r != tree)
+                || recorded_weak.is_some()
+                || recorded_stamp.is_some())
+        {
+            mismatch = Some(current.clone());
+        }
+        current
+    } else if let Some(dir) = base.path.as_deref().filter(|p| p.is_dir()) {
+        let need_walk = base.supplied.is_none() || (decidable && recorded_weak.is_some());
+        let current = if need_walk {
+            // The lower's own recorded set measured its digest; this
+            // invocation's own paths are added so they cannot count as edits.
+            let recorded = match get("base_weak_excludes") {
+                Some(text) => BaseExcludes::from_json(text).map_err(|e| e.to_string())?,
+                None => BaseExcludes::default(),
+            };
+            let excludes =
+                BaseExcludes::new(recorded.paths().iter().chain(&base.extra_excludes).cloned());
+            Some(
+                directory_weak_digest(dir, &excludes)
+                    .map_err(|e| format!("cannot measure base {}: {e}", dir.display()))?,
+            )
+        } else {
+            None
+        };
+        if decidable {
+            let differs = match (recorded_weak, &current) {
+                (Some(recorded), Some(now)) => recorded != now,
+                _ => recorded_stamp.is_some() || recorded_tree.is_some(),
+            };
+            if differs {
+                mismatch = current.clone().or_else(|| Some("a directory".into()));
+            }
+        }
+        base.supplied.clone().or(current).unwrap_or_default()
+    } else if let Some(file) = base.path.as_deref().filter(|p| p.is_file()) {
+        if decidable {
+            let stamp = ratarmount_index::ArchiveDigestStamp::read(file)
+                .map_err(|e| format!("cannot stat base {}: {e}", file.display()))?;
+            let differs = match recorded_stamp {
+                Some((size, mtime)) => {
+                    stamp.size.to_string() != size || stamp.mtime_ns.to_string() != mtime
+                }
+                None => recorded_weak.is_some() || recorded_tree.is_some(),
+            };
+            if differs {
+                mismatch = Some(format!("size={},mtime_ns={}", stamp.size, stamp.mtime_ns));
+            }
+        }
+        base.supplied.clone().unwrap_or_else(|| {
+            ratarmount_index::peek_archive_digest(file, base.index.as_deref())
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        })
+    } else {
+        base.supplied.clone().unwrap_or_default()
+    };
+    if let Some(current) = mismatch {
+        if !force {
+            let recorded = get("base_digest").unwrap_or("unknown");
+            return Err(if base.git_tree.is_some() || base.path.is_none() {
+                format!(
+                    "lower {} was sealed against base {recorded} but the mounted base is {current}; pass --force-stack-mismatch to override",
+                    lower.display()
+                )
+            } else {
+                format!(
+                    "lower {} was sealed against a different base than the mounted one; run `overlay verify {} BASE` to compare digests, or pass --force-stack-mismatch to mount anyway",
+                    lower.display(),
+                    lower.display()
+                )
+            });
+        }
+    }
+    Ok(identity)
 }
 
 impl MountLowerStack {
@@ -1345,6 +1474,25 @@ impl MountLowerStack {
         paths: &[PathBuf],
         allow_unsealed: bool,
         cache: Option<&Path>,
+    ) -> Result<(Self, Arc<dyn ratarmount_core::MountSource>), String> {
+        Self::open_with(
+            base,
+            base_key,
+            paths,
+            allow_unsealed,
+            cache,
+            &BaseIdentity::Offline,
+        )
+    }
+
+    /// [`Self::open_in`] with the base identity policy (see [`BaseIdentity`]).
+    fn open_with(
+        base: Arc<dyn ratarmount_core::MountSource>,
+        base_key: Option<&str>,
+        paths: &[PathBuf],
+        allow_unsealed: bool,
+        cache: Option<&Path>,
+        identity: &BaseIdentity,
     ) -> Result<(Self, Arc<dyn ratarmount_core::MountSource>), String> {
         use ratarmount_compositing::{Immutability, LowerLayerRecord, OverlayMeta};
         use sha2::{Digest, Sha256};
@@ -1398,10 +1546,15 @@ impl MountLowerStack {
                 ));
             }
             if stack.records.is_empty() {
-                stack.base_digest = meta
-                    .as_ref()
-                    .and_then(|m| m.base_digest())
-                    .map(str::to_owned);
+                stack.base_digest = match identity {
+                    BaseIdentity::Offline => meta
+                        .as_ref()
+                        .and_then(|m| m.base_digest())
+                        .map(str::to_owned),
+                    BaseIdentity::Enforce { base, force } => {
+                        Some(mounted_base_identity(&path, meta.as_ref(), base, *force)?)
+                    }
+                };
             }
             stack.records.push(LowerLayerRecord {
                 path: path.clone(),
@@ -1441,9 +1594,14 @@ impl MountLowerStack {
             .iter()
             .map(|r| r.layer_digest.as_str())
             .collect();
+        // No stack identity without a known base (e.g. an uncached archive).
         metadata.insert(
             "stack_digest".into(),
-            ratarmount_compositing::stack_digest(&base, &digests),
+            if base.is_empty() {
+                String::new()
+            } else {
+                ratarmount_compositing::stack_digest(&base, &digests)
+            },
         );
         metadata.insert("base_digest".into(), base);
         metadata.insert(
@@ -2195,11 +2353,37 @@ fn main() {
         index_sidecar.as_deref(),
         &args.lower,
     );
-    let (lower_stack, lower_view) = MountLowerStack::open(
+    let lower_identity = BaseIdentity::Enforce {
+        base: MountedBase {
+            extra_excludes: lower_extra_excludes(
+                inputs.first().map(PathBuf::as_path),
+                &args.lower,
+                args.write_overlay.as_deref(),
+                args.journal
+                    .iter()
+                    .cloned()
+                    .chain(mount_point_exclusion(&args, mountpoint.as_deref(), &inputs))
+                    .collect(),
+            ),
+            path: (inputs.len() == 1).then(|| inputs[0].clone()),
+            git_tree: overlay_git_tree.clone(),
+            supplied: match &args.base_digest {
+                Some(ratarmount_compositing::BaseDigestRequest::Supplied(digest)) => {
+                    Some(digest.clone())
+                }
+                _ => None,
+            },
+            index: index_sidecar.clone(),
+        },
+        force: args.force_stack_mismatch,
+    };
+    let (lower_stack, lower_view) = MountLowerStack::open_with(
         bundle.source.clone(),
         lower_key.as_deref(),
         &args.lower,
         args.allow_unsealed_lower,
+        None,
+        &lower_identity,
     )
     .unwrap_or_else(|error| {
         eprintln!("error: {error}");
@@ -4369,6 +4553,37 @@ fn split_inputs_mountpoint(paths: &[PathBuf], no_mount: bool) -> (Vec<PathBuf>, 
 
 /// The FUSE mount point a mount will use, for the weak digest's excluded set.
 /// None for `--no-mount`, export-only runs and unmounts.
+/// Base-relative exclusions for the A2 walk of a directory base: the paths of
+/// this invocation (journal, mount point, a new `-w` overlay) resolved with the
+/// topmost-new rule, plus the set an existing `-w` overlay already recorded.
+fn lower_extra_excludes(
+    base: Option<&Path>,
+    lowers: &[PathBuf],
+    overlay: Option<&Path>,
+    mut paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    use ratarmount_compositing::overlay_meta::{resolve_base_excludes, BaseExcludes};
+    let Some(base) = base.filter(|b| !lowers.is_empty() && b.is_dir()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(overlay) = overlay.filter(|o| o.as_os_str() != ":temp:") {
+        paths.push(overlay.to_path_buf());
+        if let Some(recorded) = ratarmount_compositing::OverlayMeta::read(overlay)
+            .ok()
+            .flatten()
+            .and_then(|m| m.get("base_weak_excludes").map(str::to_owned))
+            .and_then(|text| BaseExcludes::from_json(&text).ok())
+        {
+            out.extend(recorded.paths().iter().cloned());
+        }
+    }
+    if let Ok((_, resolved)) = resolve_base_excludes(base, &paths) {
+        out.extend(resolved.paths().iter().cloned());
+    }
+    out
+}
+
 fn mount_point_exclusion(
     args: &Args,
     mountpoint: Option<&Path>,
@@ -7970,5 +8185,159 @@ mod lower_stack_tests {
         OverlayMeta::set(&conn, "sealed_at", "2026-10-17T00:00:00Z").unwrap();
         drop(conn);
         assert_eq!(open(false).unwrap().layers[0].1, Immutability::Immutable);
+    }
+
+    /// A sealed lower over `base` whose recorded identity is `meta`.
+    fn identity_lower(
+        root: &Path,
+        base: &Path,
+        meta: &[(&str, &str)],
+    ) -> (Arc<dyn ratarmount_core::MountSource>, PathBuf) {
+        let view: Arc<dyn ratarmount_core::MountSource> =
+            Arc::new(FolderMountSource::new(base).unwrap());
+        let dir = root.join("lower");
+        drop(WriteOverlay::new(view.clone(), &dir).unwrap());
+        let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+        OverlayMeta::set_many(&conn, meta).unwrap();
+        OverlayMeta::set_many(
+            &conn,
+            &[
+                ("sealed_at", "2026-10-17T00:00:00Z"),
+                ("layer_digest", "sha256:layer"),
+            ],
+        )
+        .unwrap();
+        (view, dir)
+    }
+
+    fn enforce(base: &Path, force: bool) -> BaseIdentity {
+        BaseIdentity::Enforce {
+            base: MountedBase {
+                path: Some(base.to_path_buf()),
+                ..Default::default()
+            },
+            force,
+        }
+    }
+
+    /// Regression: a read-only `--lower` mount reported the bottom lower's
+    /// recorded `base_digest` (here forged) whatever base was mounted.
+    #[test]
+    fn regression_lower_forged_digest_not_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(base.join("f"), b"one").unwrap();
+        let weak = ratarmount_compositing::overlay_meta::directory_weak_digest(
+            &base,
+            &ratarmount_compositing::overlay_meta::BaseExcludes::default(),
+        )
+        .unwrap();
+        let (view, lower) = identity_lower(
+            root.path(),
+            &base,
+            &[
+                ("base_digest", "sha256:forged"),
+                ("base_digest_kind", "strong"),
+                ("base_weak_digest", &weak),
+                ("base_weak_excludes", "[]"),
+            ],
+        );
+        let paths = [lower];
+        let (stack, _) =
+            MountLowerStack::open_with(view, None, &paths, false, None, &enforce(&base, false))
+                .unwrap();
+        let metadata = stack.read_only_metadata();
+        assert_eq!(metadata["base_digest"], weak);
+        assert_eq!(
+            metadata["stack_digest"],
+            ratarmount_compositing::stack_digest(&weak, &["sha256:layer"])
+        );
+    }
+
+    /// Regression: offline commands (`overlay verify`, `seal`, `pack`) must not
+    /// refuse a lower over a byte-identical copy of its base; only the mount
+    /// path enforces the identity.
+    #[test]
+    fn regression_verify_stacked_strong_overlay_over_byte_identical_copy_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        let copy = root.path().join("copy");
+        for dir in [&base, &copy] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("f"), b"one").unwrap();
+        }
+        let file = std::fs::File::options()
+            .write(true)
+            .open(copy.join("f"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        drop(file);
+        let weak = ratarmount_compositing::overlay_meta::directory_weak_digest(
+            &base,
+            &ratarmount_compositing::overlay_meta::BaseExcludes::default(),
+        )
+        .unwrap();
+        let (_, lower) = identity_lower(
+            root.path(),
+            &base,
+            &[
+                ("base_digest", "sha256:strong"),
+                ("base_digest_kind", "strong"),
+                ("base_weak_digest", &weak),
+            ],
+        );
+        let paths = [lower];
+        let view: Arc<dyn ratarmount_core::MountSource> =
+            Arc::new(FolderMountSource::new(&copy).unwrap());
+        MountLowerStack::open_in(view.clone(), None, &paths, false, None).unwrap();
+        let error = MountLowerStack::open_with(
+            view.clone(),
+            None,
+            &paths,
+            false,
+            None,
+            &enforce(&copy, false),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("--force-stack-mismatch"), "{error}");
+        MountLowerStack::open_with(view, None, &paths, false, None, &enforce(&copy, true)).unwrap();
+    }
+
+    /// An archive base whose digest is not cached has no identity to report:
+    /// empty `base_digest` and `stack_digest`, and no hashing at mount.
+    #[test]
+    fn regression_lower_uncached_archive_reports_no_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("base.bin");
+        std::fs::write(&archive, b"archive bytes").unwrap();
+        let stamp = ratarmount_index::ArchiveDigestStamp::read(&archive).unwrap();
+        let folder = root.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let (view, lower) = identity_lower(
+            root.path(),
+            &folder,
+            &[
+                ("base_digest", ""),
+                ("base_digest_kind", "pending"),
+                ("base_size", &stamp.size.to_string()),
+                ("base_mtime_ns", &stamp.mtime_ns.to_string()),
+            ],
+        );
+        let paths = [lower];
+        let (stack, _) = MountLowerStack::open_with(
+            view,
+            None,
+            &paths,
+            false,
+            Some(root.path()),
+            &enforce(&archive, false),
+        )
+        .unwrap();
+        let metadata = stack.read_only_metadata();
+        assert_eq!(metadata["base_digest"], "");
+        assert_eq!(metadata["stack_digest"], "");
     }
 }

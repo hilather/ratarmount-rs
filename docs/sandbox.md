@@ -287,6 +287,21 @@ allows it and records `stack_mismatch_forced_at`; it preserves the original
 stack identity. A sealed top cannot be opened with `-w`, including when using
 `--sandbox`: mount it with `--lower` or unseal it first.
 
+**The lower must match the mounted base.** A mount (read-only `--lower`, or a
+`-w`/`--overlay-tmpfs`/`--sandbox` top over a stack) compares the base it serves
+with the identity the bottom lower recorded, using metadata only, never file
+content: a directory base is walked (path, size, mtime) with the lower's own
+recorded `base_weak_excludes` and compared with its `base_weak_digest`; a local
+archive's size and mtime are compared with `base_size`/`base_mtime_ns`; a Git
+base's tree id with `base_git_tree`. A difference refuses the mount with
+`lower PATH was sealed against a different base than the mounted one; run
+`overlay verify PATH BASE` to compare digests, or pass --force-stack-mismatch to
+mount anyway`. A lower recorded with `--base-digest none`, or one that predates
+these keys, has no identity to compare and is accepted. A same-size edit with a
+restored mtime passes at mount; `overlay verify` (which rehashes) catches it.
+Offline commands (`overlay verify`, `seal`, `pack`, `diff`, `import`) do not
+apply this check.
+
 Committing a layered stack is unsupported: `--commit-overlay`, on-exit commit,
 a nonzero commit interval, and rolling commits with `--lower` are refused with
 “commit of a layered stack is not supported; flatten first”. RAM tops are
@@ -726,8 +741,8 @@ without a write overlay:
 
 | Xattr | Value |
 | --- | --- |
-| `user.ratarmount.base_digest` | Recorded base identity, or empty string |
-| `user.ratarmount.stack_digest` | Recorded stack identity, or empty string |
+| `user.ratarmount.base_digest` | Identity of the base actually mounted: the supplied `--base-digest`, the weak manifest of a directory, `git-tree:<id>`, or an archive's cached digest; empty when it is not known without hashing. On a read-only `--lower` mount it is never the lower's recorded value |
+| `user.ratarmount.stack_digest` | Recorded stack identity, or empty string (on a read-only `--lower` mount, derived from the mounted base's identity and the lower digests; empty when that base identity is empty) |
 | `user.ratarmount.sealed` | `1` when the supplied metadata is sealed, otherwise `0` |
 | `user.ratarmount.layers` | JSON `lower_layers`, or `[]` without metadata |
 | `user.ratarmount.journal` | Resolved active journal path, or empty string |
