@@ -29,15 +29,19 @@ const HOLD_AFTER_TRIGGER: Duration = Duration::from_millis(200);
 struct Log {
     text: Arc<Mutex<String>>,
     trigger: Receiver<()>,
+    /// Never sent on; disconnects when the reader thread hits EOF.
+    eof: Receiver<()>,
 }
 
 impl Log {
     fn attach(child: &mut Child) -> Log {
         let text = Arc::new(Mutex::new(String::new()));
         let (tx, trigger) = mpsc::channel();
+        let (eof_tx, eof) = mpsc::channel::<()>();
         let stderr = child.stderr.take().expect("piped stderr");
         let sink = Arc::clone(&text);
         thread::spawn(move || {
+            let _eof_tx = eof_tx;
             let mut fired = false;
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
@@ -50,7 +54,13 @@ impl Log {
                 t.push('\n');
             }
         });
-        Log { text, trigger }
+        Log { text, trigger, eof }
+    }
+
+    /// After the child is reaped, wait (bounded) for the reader to consume the rest of the pipe
+    /// so assertions see the full log.
+    fn drain(&self) {
+        let _ = self.eof.recv_timeout(Duration::from_secs(5));
     }
 
     fn text(&self) -> String {
@@ -236,6 +246,7 @@ impl Daemon {
 
     fn assert_clean_exit(&mut self, what: &str) {
         let st = self.wait_exit();
+        self.log.drain();
         assert!(
             st.is_some_and(|s| s.success()),
             "{what}: daemon did not exit 0 within {EXIT_DEADLINE:?}: {st:?}\n{}",
@@ -331,6 +342,7 @@ fn regression_sigterm_unmount_retries_while_busy() {
     d.log.wait_trigger("SIGTERM");
     holder.release_after(HOLD_AFTER_TRIGGER);
     let st = d.wait_exit();
+    d.log.drain();
     assert!(
         st.is_some(),
         "daemon still running {EXIT_DEADLINE:?} after SIGTERM + release\n{}",
@@ -357,6 +369,7 @@ fn regression_dash_u_retries_while_busy() {
     ulog.wait_trigger("ratarmount -u");
     holder.release_after(HOLD_AFTER_TRIGGER);
     let st = wait_child(&mut u, EXIT_DEADLINE);
+    ulog.drain();
     assert!(
         st.is_some_and(|s| s.success()),
         "ratarmount -u did not exit 0: {st:?}\n{}",
