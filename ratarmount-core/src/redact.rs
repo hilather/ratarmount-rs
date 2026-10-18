@@ -248,11 +248,18 @@ fn token_end(token: &str) -> usize {
     let rclone = starts_with_ci(token, "rclone");
     let mut quote = None;
     let mut previous = ' ';
-    for (i, c) in token.char_indices() {
+    let mut chars = token.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
         match quote {
             Some(q) => {
                 if c == q {
-                    quote = None;
+                    // A doubled quote is an escaped quote and the value goes on
+                    // (<https://rclone.org/docs/#connection-strings>).
+                    if chars.peek().is_some_and(|&(_, next)| next == q) {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
                 }
             }
             None if rclone && previous == '=' && matches!(c, '"' | '\'') => quote = Some(c),
@@ -313,6 +320,40 @@ mod tests {
         ];
         for (input, want) in cases {
             assert_eq!(redact_urls_in_text(input), want, "input {input}");
+        }
+    }
+
+    /// Regression (R4-S10): a doubled quote is an escaped quote in an rclone
+    /// connection string, so `pass='prefix''SECRET'` ended the token early and
+    /// left `'SECRET'` in the logged text.
+    #[test]
+    fn regression_redact_rclone_doubled_quotes() {
+        for (input, want) in [
+            ("rclone+remote,pass='prefix''SECRET':p", "rclone+remote:p"),
+            (
+                "rclone+remote,pass=\"prefix\"\"SECRET\":p",
+                "rclone+remote:p",
+            ),
+            (
+                "failed: rclone+remote,pass='a'',b''c',x=1:p, retry",
+                "failed: rclone+remote,x=1:p, retry",
+            ),
+            (
+                "open rclone://:s3,secret_access_key='it''s S 3',region=eu:bkt/k now",
+                "open rclone://:s3,region=eu:bkt/k now",
+            ),
+        ] {
+            assert_eq!(redact_urls_in_text(input), want, "text {input}");
+        }
+        for (input, want) in [
+            ("rclone+remote,pass='prefix''SECRET':p", "rclone+remote:p"),
+            (
+                "rclone+remote,pass=\"prefix\"\"SECRET\":p",
+                "rclone+remote:p",
+            ),
+            ("rclone+remote,pass='a'',b''c',x=1:p", "rclone+remote,x=1:p"),
+        ] {
+            assert_eq!(redact_base_url(input), want, "url {input}");
         }
     }
 
