@@ -499,3 +499,41 @@ fn regression_seal_rerun_cli_finishes_interrupted_seal() {
         0,
     );
 }
+
+/// Regression: no reader checked `format_version`, so an overlay written by a
+/// newer ratarmount was sealed, verified, packed and listed as format 2.
+#[test]
+fn regression_format_version_3_refused_by_overlay_verbs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let (_, dir) = fixture(tmp.path());
+    expect(env_command(&home, &["overlay", "seal", &dir]), 0);
+    let db = Path::new(&dir).join(HIDDEN_DB);
+    // A sealed layer is read-only (database and directory): open it up to
+    // stand in for an overlay written by a newer build, then close it again.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE meta SET value='3' WHERE key='format_version'", [])
+        .unwrap();
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o444)).unwrap();
+    let bundle = tmp.path().join("b.tar.zst");
+    for args in [
+        vec!["overlay", "info", &dir],
+        vec!["overlay", "verify", &dir],
+        vec!["overlay", "fsck", &dir],
+        vec!["overlay", "seal", &dir],
+        vec!["overlay", "pack", &dir, bundle.to_str().unwrap()],
+    ] {
+        let out = env_command(&home, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_ne!(out.status.code(), Some(0), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("is newer than this ratarmount supports"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert!(!bundle.exists());
+}

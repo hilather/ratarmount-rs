@@ -108,7 +108,7 @@ repaired. A mounted overlay's exclusive database lock is reported as "in use".
 
 | Key | Meaning |
 |---|---|
-| `format_version` | `2` for new overlays; `1` for migrated legacy overlays |
+| `format_version` | `2` for new overlays; `1` for migrated legacy overlays. A value above `2` is refused by every reader (`overlay format_version N is newer than this ratarmount supports (2); upgrade ratarmount`); new keys are additive within version 2 and are accepted |
 | `ratarmount_version` | Creator's version |
 | `created_at` | Creation time, RFC 3339 UTC |
 | `base_url` | Original base positional, with credentials removed: remote URLs lose userinfo, query and fragment (`https://user:pw@h/b.tar?sig=x` is stored as `https://h/b.tar`), a magnet URI keeps only `xt` and `dn`, and local paths and `git:///` URLs are unchanged. A remote base recorded this way cannot be reopened by `seal`, `verify`, `pack` or `diff` from the overlay alone: pass BASE explicitly |
@@ -973,10 +973,15 @@ layer/.ratarmount.overlay.sqlite
 layer/.ratarmount-sealed
 manifest.jsonl                 # exact changes against the composed stack
 meta.json                      # all overlay meta keys, as JSON string values
+bundle.json                    # {"bundle_format":1}: the bundle layout version
 journal.jsonl                  # with --include-journal FILE
 journal-summary.json           # journal summarize output
 index/BASE.index.sqlite        # with --include-index, if an adjacent sidecar exists
 ```
+
+`bundle.json` versions the layout of the bundle itself. A bundle without it is
+layout 1; `unpack` and the `--lower` cache refuse a layout above 1 with
+`bundle layout N is newer than this ratarmount supports (1)`.
 
 The index is the local base archive's adjacent `BASE.index.sqlite` sidecar;
 remote and directory bases do not contribute an index. Unpacking restores only

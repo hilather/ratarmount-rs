@@ -103,6 +103,11 @@ pub(crate) fn plan_excludes(
     }))
 }
 
+/// Highest overlay `format_version` this build reads. Additive keys
+/// (`base_weak_digest`, `base_digest_source`, `import_in_progress`, ...) stay
+/// within version 2.
+pub const MAX_FORMAT_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(transparent)]
 pub struct OverlayMeta {
@@ -157,7 +162,15 @@ impl OverlayMeta {
         let values = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(Some(Self { values }))
+        let meta = Self { values };
+        let version = meta.format_version()?;
+        if let Some(version) = version.filter(|v| *v > MAX_FORMAT_VERSION) {
+            return Err(OverlayError::Msg(format!(
+                "overlay format_version {version} is newer than this ratarmount supports \
+                 ({MAX_FORMAT_VERSION}); upgrade ratarmount"
+            )));
+        }
+        Ok(Some(meta))
     }
 
     pub fn values(&self) -> &BTreeMap<String, String> {
@@ -2372,5 +2385,73 @@ mod tests {
         drop(open_dir_base(&basedir, &overlay, &context).unwrap());
         // A journal-free, mount-point-free remount still passes (recorded set).
         drop(open_dir_base(&basedir, &overlay, &info(&basedir)).unwrap());
+    }
+
+    fn bump_format_version(overlay: &Path, version: &str) {
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        OverlayMeta::set(&conn, "format_version", version).unwrap();
+    }
+
+    /// Regression: a `format_version` newer than this build read as valid and
+    /// was served and sealed as if it were format 2.
+    #[test]
+    fn regression_format_version_3_is_refused_by_every_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir(&basedir).unwrap();
+        fs::write(basedir.join("f"), b"x").unwrap();
+        let overlay = root.path().join("overlay");
+        drop(open_dir_base(&basedir, &overlay, &info(&basedir)).unwrap());
+        bump_format_version(&overlay, "3");
+        let newer = |error: String| {
+            assert!(
+                error.contains("format_version 3 is newer") && error.contains("upgrade"),
+                "{error}"
+            )
+        };
+        newer(OverlayMeta::read(&overlay).unwrap_err().to_string());
+        newer(
+            open_dir_base(&basedir, &overlay, &info(&basedir))
+                .err()
+                .expect("WriteOverlay::new must refuse")
+                .to_string(),
+        );
+        newer(
+            crate::overlay_seal::verify(&overlay, base(&basedir))
+                .unwrap_err()
+                .to_string(),
+        );
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        newer(OverlayMeta::from_connection(&conn).unwrap_err().to_string());
+        // Version 2 and an unparsable value keep their messages.
+        bump_format_version(&overlay, "2");
+        assert!(OverlayMeta::read(&overlay).unwrap().is_some());
+        bump_format_version(&overlay, "two");
+        assert!(OverlayMeta::read(&overlay)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid overlay format_version"));
+    }
+
+    /// Regression: the version gate must accept the additive format-2 keys.
+    #[test]
+    fn regression_format_version_2_accepts_additive_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(META_SCHEMA).unwrap();
+        OverlayMeta::set_many(
+            &conn,
+            &[
+                ("format_version", "2"),
+                ("base_digest_kind", "weak"),
+                ("base_weak_digest", "weak:size=1,x"),
+                ("base_weak_excludes", "[]"),
+                ("base_digest_source", "computed"),
+                ("import_in_progress", "1:2"),
+            ],
+        )
+        .unwrap();
+        let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
+        assert_eq!(meta.format_version().unwrap(), Some(2));
+        assert_eq!(meta.get("import_in_progress"), Some("1:2"));
     }
 }

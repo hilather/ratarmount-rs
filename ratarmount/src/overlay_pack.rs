@@ -318,6 +318,11 @@ pub fn pack(
             "meta.json",
             &serde_json::to_vec(&meta.redacted_values())?,
         )?;
+        append_bytes(
+            &mut tar,
+            "bundle.json",
+            &serde_json::to_vec(&serde_json::json!({ "bundle_format": BUNDLE_FORMAT }))?,
+        )?;
         tar.into_inner()?.flush()?;
     }
     plain.rewind()?;
@@ -351,6 +356,10 @@ fn valid_digest(digest: &str) -> io::Result<&str> {
         .ok_or_else(|| invalid("invalid layer_digest"))
 }
 
+/// Bundle layout version written to `bundle.json`; a bundle without the member
+/// is layout 1.
+const BUNDLE_FORMAT: u64 = 1;
+
 /// Read metadata via the regular session API; no bundle payload is extracted.
 fn bundle_meta(bundle: &Path) -> io::Result<BTreeMap<String, String>> {
     let options = ratarmount_core::OpenOptions {
@@ -360,6 +369,19 @@ fn bundle_meta(bundle: &Path) -> io::Result<BTreeMap<String, String>> {
     };
     let source = ratarmount_session::factory::open_path(bundle, &options, false)
         .map_err(io::Error::other)?;
+    if let Some(info) = source.lookup("/bundle.json", 0) {
+        let layout: serde_json::Value = serde_json::from_reader(source.open(&info, 0)?)
+            .map_err(|_| invalid("bundle.json is not valid JSON"))?;
+        let format = layout
+            .get("bundle_format")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| invalid("bundle.json bundle_format is not an integer"))?;
+        if format > BUNDLE_FORMAT {
+            return Err(invalid(format!(
+                "bundle layout {format} is newer than this ratarmount supports ({BUNDLE_FORMAT})"
+            )));
+        }
+    }
     let info = source
         .lookup("/meta.json", 0)
         .ok_or_else(|| invalid("bundle missing meta.json"))?;
@@ -1573,6 +1595,84 @@ mod tests {
         let mut writer = ratarmount_compress::ZstdFrameWriter::new(File::create(out).unwrap(), 3);
         writer.write_frame(&bytes[..]).unwrap();
         writer.finish().unwrap();
+    }
+
+    fn bundle_members(bundle: &Path) -> Vec<String> {
+        let body = ratarmount_compress::open_seekable_zstd(bundle).unwrap();
+        let mut archive = tar::Archive::new(body.open_reader().unwrap());
+        archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Regression: bundles carried no layout version, so a future layout was
+    /// unpacked as layout 1. `pack` writes `bundle.json`; a newer layout is
+    /// refused by unpack and by the `--lower` cache; layout 1 and a bundle with
+    /// no member both work.
+    #[test]
+    fn regression_bundle_json_layout_version_gate() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("good.tar.zst");
+        assert!(bundle_members(&bundle).iter().any(|m| m == "bundle.json"));
+        let out = f.tmp.path().join("ok1");
+        assert!(unpack(&bundle, &out).unwrap().ok);
+
+        let newer = f.tmp.path().join("newer.tar.zst");
+        retar_with(&bundle, &newer, "bundle.json", br#"{"bundle_format":2}"#);
+        let error = unpack(&newer, &f.tmp.path().join("no"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("bundle layout 2 is newer than this ratarmount supports (1)"),
+            "{error}"
+        );
+        let cache = f.tmp.path().join("cache");
+        let error = cached_lower_in(&newer, &cache, f.base.clone(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bundle layout 2 is newer"), "{error}");
+        assert!(cache_entries(&cache).is_empty());
+
+        for bad in [&br#"{"bundle_format":"1"}"#[..], b"[]", b"not json"] {
+            let broken = f.tmp.path().join("broken.tar.zst");
+            let _ = fs::remove_file(&broken);
+            retar_with(&bundle, &broken, "bundle.json", bad);
+            assert!(unpack(&broken, &f.tmp.path().join("nob")).is_err());
+        }
+
+        let v1 = f.tmp.path().join("v1.tar.zst");
+        retar_with(&bundle, &v1, "bundle.json", br#"{"bundle_format":1}"#);
+        assert!(unpack(&v1, &f.tmp.path().join("ok2")).unwrap().ok);
+    }
+
+    /// A bundle from before `bundle.json` (no member) is layout 1.
+    #[test]
+    fn regression_bundle_without_bundle_json_is_layout_1() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("good.tar.zst");
+        let body = ratarmount_compress::open_seekable_zstd(&bundle).unwrap();
+        let mut archive = tar::Archive::new(body.open_reader().unwrap());
+        let mut builder = tar::Builder::new(Vec::new());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().to_string_lossy() == "bundle.json" {
+                continue;
+            }
+            let mut header = entry.header().clone();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            header.set_cksum();
+            builder.append(&header, &data[..]).unwrap();
+        }
+        let bytes = builder.into_inner().unwrap();
+        let old = f.tmp.path().join("old.tar.zst");
+        let mut writer = ratarmount_compress::ZstdFrameWriter::new(File::create(&old).unwrap(), 3);
+        writer.write_frame(&bytes[..]).unwrap();
+        writer.finish().unwrap();
+        assert!(!bundle_members(&old).iter().any(|m| m == "bundle.json"));
+        assert!(unpack(&old, &f.tmp.path().join("restored")).unwrap().ok);
     }
 
     type Seen = Arc<std::sync::Mutex<Vec<(&'static str, Vec<String>)>>>;
