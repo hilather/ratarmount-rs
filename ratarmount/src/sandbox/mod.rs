@@ -5,6 +5,7 @@ mod inspection;
 pub(crate) use inspection::start as start_inspection;
 mod process;
 mod protocol;
+mod run;
 #[cfg(test)]
 mod tests;
 
@@ -29,6 +30,8 @@ pub struct SandboxArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run one container command against a write-overlay stack.
+    Run(Box<run::RunArgs>),
     Daemon {
         #[arg(long)]
         state_dir: PathBuf,
@@ -77,8 +80,12 @@ enum Command {
 }
 
 pub fn run(args: &SandboxArgs) -> Result<(), String> {
+    if let Command::Run(run) = &args.command {
+        return self::run::run(run).map_err(|e| e.to_string());
+    }
     let socket = args.socket.as_deref().ok_or("--socket PATH is required")?;
     let operation = match &args.command {
+        Command::Run(_) => unreachable!("handled before daemon socket lookup"),
         Command::Daemon {
             state_dir,
             max_attempts,
@@ -137,6 +144,14 @@ pub fn run(args: &SandboxArgs) -> Result<(), String> {
         Ok(())
     } else {
         Err("request failed (see JSON error)".into())
+    }
+}
+
+pub fn error_exit_code(args: &SandboxArgs) -> i32 {
+    if matches!(args.command, Command::Run(_)) {
+        2
+    } else {
+        1
     }
 }
 
