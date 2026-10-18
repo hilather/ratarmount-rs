@@ -466,7 +466,10 @@ fn create_run_dir_in(default: &Path) -> io::Result<PathBuf> {
         + probe.as_os_str().len()
         > MAX_SOCKET_PATH;
     let dir = if long {
-        builder.tempdir_in("/tmp")?
+        // `/tmp` is a symlink to `/private/tmp` on macOS; the directory is
+        // judged (and later canonicalized) at its resolved, longer path.
+        let tmp = Path::new("/tmp");
+        builder.tempdir_in(tmp.canonicalize().as_deref().unwrap_or(tmp))?
     } else {
         builder.tempdir_in(default)?
     };
@@ -1691,8 +1694,18 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
         // A short real directory is still used as is.
         let direct = tempfile::tempdir_in("/tmp").unwrap();
-        let dir = create_run_dir_in(direct.path()).unwrap();
-        assert!(dir.starts_with(direct.path()), "{dir:?}");
+        // (`/tmp` is a symlink to `/private/tmp` on macOS: compare resolved paths.)
+        let dir = create_run_dir_in(direct.path())
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        assert!(
+            dir.starts_with(direct.path().canonicalize().unwrap()),
+            "{dir:?}"
+        );
+        // The fallback under `/tmp` also yields a short enough socket path.
+        let socket = control_socket_path(&dir, u32::MAX);
+        assert!(socket.as_os_str().len() <= MAX_SOCKET_PATH, "{socket:?}");
     }
 
     /// Regression: `sandbox run` reads `erofs_denied` from the mount's control
