@@ -139,3 +139,26 @@ fn regression_seal_cli_recorded_lowers_and_legacy_explicit_base() {
     expect(command(&["overlay", "verify", &lower, &base]), 0);
     expect(command(&["overlay", "unseal", &lower, "--i-know"]), 0);
 }
+
+/// Regression: SQLITE_OPEN_NOFOLLOW rejects a symlink in any path component, so
+/// fsck, seal, verify and pack failed with "unable to open database file" when
+/// the overlay sat below a symlinked directory (every macOS temp dir: /var).
+#[test]
+fn regression_symlinked_parent_dir_fsck_seal_verify_pack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (_, dir) = fixture(&link);
+    assert!(dir.contains("/link/"));
+    expect(command(&["overlay", "fsck", &dir]), 0);
+    let digest = expect(command(&["overlay", "seal", &dir]), 0);
+    assert_eq!(expect(command(&["overlay", "verify", &dir]), 0), digest);
+    let bundle = link.join("bundle.tar.zst");
+    expect(
+        command(&["overlay", "pack", &dir, bundle.to_str().unwrap()]),
+        0,
+    );
+    expect(command(&["overlay", "unseal", &dir, "--i-know"]), 0);
+}

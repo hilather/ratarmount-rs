@@ -396,6 +396,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Strict/loose hashing cloned the digest per line and whitespace run (1 GiB text: 65 s BLAKE3, 21 s SHA-256); streaming digest must equal the reference normalization for any chunking and whitespace-buffer overflow | `cargo test -p ratarmount-compositing --lib regression_text_digest_matches_reference` · `cargo test -p ratarmount-compositing --lib regression_hash_normalization_streams` |
 | Journal overhead benchmark biased by fixed run order or dies on a transiently busy unmount | `./benchmarks/journal-overhead.sh --self-test` |
 | macOS build breaks: `overlay pack`/`unpack` passed a `u32` mode where rustix's `RawMode` is `u16` on macOS (SBX-PACK) | CI job `macOS (build + test)` (`cargo build` there; Linux cannot cross-check without the macOS SDK) |
+| `overlay fsck`/`seal`/`verify`/`pack` fail with "unable to open database file" (`SQLITE_CANTOPEN_SYMLINK`) when any parent directory is a symlink, e.g. every macOS temp dir under `/var`; journal path test expected the uncanonical temp path | `cargo test -p ratarmount --test overlay_seal regression_symlinked_parent_dir` · `cargo test -p ratarmount-fuse --lib regression_oplog_metadata_uses_mounted_connection` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

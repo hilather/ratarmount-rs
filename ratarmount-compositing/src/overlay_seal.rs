@@ -70,8 +70,9 @@ fn connection(dir: &Path, immutable: bool) -> io::Result<Connection> {
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
     } else {
+        // NOFOLLOW rejects a symlink in any component, so resolve the directory.
         Connection::open_with_flags(
-            path,
+            dir.canonicalize()?.join(HIDDEN_DB),
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
     }

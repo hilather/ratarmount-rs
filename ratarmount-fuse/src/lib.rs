@@ -8661,7 +8661,15 @@ mod tests {
         );
         assert_eq!(
             overlay.meta_value("journal_path").unwrap(),
-            Some(dir.path().join("trace").to_string_lossy().into_owned())
+            // The journal path is canonical (macOS temp dirs live under /var -> /private/var).
+            Some(
+                dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("trace")
+                    .to_string_lossy()
+                    .into_owned()
+            )
         );
         assert!(overlay.meta_value("absent").unwrap().is_none());
     }
