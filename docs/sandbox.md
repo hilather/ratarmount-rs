@@ -1135,6 +1135,14 @@ depends on the host kernel and filesystem behavior, including directory entry
 types; `index` and `xino` are disabled in the baseline probe. No claim is made
 that those options are required on every kernel.
 
+**Result (2026-10-17, Linux 7.2.5, x86_64, unprivileged):** the layout works.
+Kernel overlayfs accepted the read-only ratarmount FUSE mount as `lowerdir`
+inside `unshare -Urm` with the options above; `make` and its check ran in the
+merged view; the native upperdir and its portable copy imported to the same
+layer digest; and both imports' `diff --manifest` rows and composed views
+matched the kernel's merged view exactly. ratarmount can therefore sit under
+an existing overlayfs-based forker as its environment library.
+
 Run the probe on a host with `/dev/fuse`, `fusermount3`, `unshare`, `mount`,
 `umount`, Python 3 and make:
 
