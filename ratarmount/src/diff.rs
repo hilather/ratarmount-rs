@@ -371,7 +371,10 @@ fn render(prepared: &Prepared, args: &DiffArgs, out: &mut dyn Write) -> io::Resu
         let hash = core::canonical_hash(&prepared.changes, &prepared.options)?;
         if args.json {
             let meta = prepared.meta.as_ref();
-            let base = meta.and_then(OverlayMeta::base_digest);
+            // A pending archive base has no digest yet: report base and stack as
+            // unknown (null), never a stack derived from the empty string.
+            let base = meta.and_then(OverlayMeta::known_base_digest);
+            let pending = meta.is_some_and(|m| m.base_digest_kind() == Some("pending"));
             let mut stack = meta.and_then(OverlayMeta::stack_digest).map(str::to_owned);
             if stack.is_none() {
                 if let Some(base) = base {
@@ -387,7 +390,7 @@ fn render(prepared: &Prepared, args: &DiffArgs, out: &mut dyn Write) -> io::Resu
             }
             serde_json::to_writer(
                 &mut *out,
-                &serde_json::json!({"patch":hash,"base":base,"stack":stack,"files":prepared.changes.len(),"normalize":prepared.options.normalize.as_str(),"excludes":args.exclude,"algo":prepared.options.algo.as_str(),"sealed":meta.is_some_and(OverlayMeta::layer_sealed)}),
+                &serde_json::json!({"patch":hash,"base":base,"stack":stack,"files":prepared.changes.len(),"normalize":prepared.options.normalize.as_str(),"excludes":args.exclude,"algo":prepared.options.algo.as_str(),"sealed":meta.is_some_and(OverlayMeta::layer_sealed),"base_pending":pending}),
             )?;
             out.write_all(b"\n")?;
         } else {

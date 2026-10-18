@@ -202,6 +202,12 @@ impl OverlayMeta {
     pub fn base_digest(&self) -> Option<&str> {
         self.get("base_digest")
     }
+    /// The base digest when one is actually known: not `pending` (recorded as
+    /// the empty string until resolved) and not empty.
+    pub fn known_base_digest(&self) -> Option<&str> {
+        self.base_digest()
+            .filter(|d| !d.is_empty() && self.base_digest_kind() != Some("pending"))
+    }
     pub fn base_digest_kind(&self) -> Option<&str> {
         self.get("base_digest_kind")
     }

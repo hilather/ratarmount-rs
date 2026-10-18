@@ -1025,7 +1025,7 @@ fn finish(args: &RunArgs, top: &Path, journal: &Path, execution: Execution) -> i
     Ok(json!({
         "exit_code":exit_code, "timed_out":timed_out, "interrupted":SIGNAL.load(Ordering::Relaxed) != 0,
         "wall_time_s":start.elapsed().as_secs_f64(),
-        "patch_hash":{"patch":hash, "base":meta.base_digest(), "stack":meta.stack_digest(), "files":changes.len(), "normalize":"strict", "algo":"sha256", "excludes":[], "sealed":meta.layer_sealed()},
+        "patch_hash":{"patch":hash, "base":meta.known_base_digest(), "stack":meta.stack_digest(), "files":changes.len(), "normalize":"strict", "algo":"sha256", "excludes":[], "sealed":meta.layer_sealed(), "base_pending":meta.base_digest_kind() == Some("pending")},
         "manifest_path":manifest, "journal_summary":summary, "overlay":top, "bundle":bundle,
         "erofs_denied":erofs_denied, "bytes_written":bytes_written, "fsck_result":fsck.result()
     }))

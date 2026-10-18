@@ -785,6 +785,29 @@ fn regression_diff_seals_lowers_and_hash_json() {
     assert_eq!(run(&args), 0);
 }
 
+/// Regression: a pending archive base (digest recorded as "") made
+/// `diff --hash --json` derive a stack digest from the empty string, so every
+/// uncached archive emitted the same stack key. Base and stack are null.
+#[test]
+fn regression_diff_hash_json_pending_base_has_no_stack() {
+    let (_tmp, mut args) = command_fixture();
+    args.hash = true;
+    args.json = true;
+    meta_set(
+        &args.directory,
+        &[("base_digest_kind", "pending"), ("base_digest", "")],
+    );
+    let conn = Connection::open(args.directory.join(HIDDEN_DB)).unwrap();
+    conn.execute("DELETE FROM meta WHERE key='stack_digest'", [])
+        .unwrap();
+    drop(conn);
+    assert_eq!(run(&args), 0);
+    let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
+    assert!(row["base"].is_null(), "{row}");
+    assert!(row["stack"].is_null(), "{row}");
+    assert_eq!(row["base_pending"], true);
+}
+
 /// Regression: --between rejects different stacks, gives the empty constant for identical trees, and applies A→B.
 #[test]
 fn regression_diff_between_stack_checks_and_apply() {
