@@ -89,13 +89,13 @@ impl Drop for Fixture {
                 for verb in ["kill", "rm"] {
                     let _ = Command::new(stub())
                         .arg(verb)
-                        .arg(record["container"].as_str().unwrap())
+                        .arg(record["container"].as_str().unwrap_or_default())
                         .env("RATARMOUNT_STUB_STATE", self.temp.path().join("runtime"))
                         .status();
                 }
                 let _ = Command::new("fusermount3")
                     .arg("-uz")
-                    .arg(record["mountpoint"].as_str().unwrap())
+                    .arg(record["mountpoint"].as_str().unwrap_or_default())
                     .status();
             }
         }

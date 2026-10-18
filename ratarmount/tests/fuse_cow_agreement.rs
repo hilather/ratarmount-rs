@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -107,10 +107,18 @@ impl Mount {
             .arg("-u")
             .arg(&self.path)
             .status()
-            .unwrap()
-            .success()
+            .is_ok_and(|status| status.success())
         {
-            assert!(Instant::now() < deadline, "unmount stayed busy");
+            if Instant::now() >= deadline {
+                // Detach and kill before the assertion unwinds into Drop.
+                let _ = Command::new("fusermount3")
+                    .arg("-uz")
+                    .arg(&self.path)
+                    .status();
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("unmount stayed busy");
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
         let status = self.child.wait().unwrap();
@@ -144,24 +152,50 @@ fn files_rows(overlay: &Path) -> Vec<(String, String, bool)> {
         .unwrap()
 }
 
+/// Restore write access under `path` so `TempDir` can remove it. Runs from
+/// destructors, so it never panics: errors are skipped, and a nested mount
+/// point (different `st_dev` than the root) is not descended into.
 fn make_writable(path: &Path) {
-    for entry in walk(path) {
-        let meta = fs::symlink_metadata(&entry).unwrap();
-        if !meta.file_type().is_symlink() {
-            let mode = meta.permissions().mode() | 0o200;
-            fs::set_permissions(&entry, fs::Permissions::from_mode(mode)).unwrap();
+    let Ok(root) = fs::symlink_metadata(path) else {
+        return;
+    };
+    make_writable_under(path, root.dev());
+}
+
+fn make_writable_under(path: &Path, dev: u64) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || meta.dev() != dev {
+        return;
+    }
+    let extra = if meta.is_dir() { 0o700 } else { 0o200 };
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(meta.mode() | extra));
+    if meta.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_writable_under(&entry.path(), dev);
+            }
         }
     }
 }
 
-fn walk(path: &Path) -> Vec<PathBuf> {
-    let mut out = vec![path.to_path_buf()];
-    if fs::symlink_metadata(path).unwrap().is_dir() {
-        for entry in fs::read_dir(path).unwrap() {
-            out.extend(walk(&entry.unwrap().path()));
-        }
-    }
-    out
+/// Regression: a failed unmount left the mountpoint mounted, and the
+/// `Writable` destructor `unwrap`ped while unwinding, aborting the test binary.
+#[test]
+fn regression_make_writable_never_panics_in_a_destructor() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_writable(&tmp.path().join("missing"));
+
+    let dir = tmp.path().join("locked");
+    fs::create_dir(&dir).unwrap();
+    let file = dir.join("f");
+    fs::write(&file, b"x").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    make_writable(&dir);
+    assert_ne!(fs::metadata(&file).unwrap().permissions().mode() & 0o200, 0);
+    assert_ne!(fs::metadata(&dir).unwrap().permissions().mode() & 0o700, 0);
 }
 
 /// Regression: copy-on-write edits made through FUSE create no `files` row;

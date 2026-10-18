@@ -89,13 +89,14 @@ impl Drop for Fixture {
                 return;
             };
             if meta.is_dir() {
-                fs::set_permissions(
+                let _ = fs::set_permissions(
                     path,
                     fs::Permissions::from_mode(meta.permissions().mode() | 0o700),
-                )
-                .unwrap();
-                for child in fs::read_dir(path).unwrap() {
-                    writable(&child.unwrap().path());
+                );
+                if let Ok(children) = fs::read_dir(path) {
+                    for child in children.flatten() {
+                        writable(&child.path());
+                    }
                 }
             }
         }

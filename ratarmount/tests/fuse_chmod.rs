@@ -44,10 +44,10 @@ impl Mount {
             .arg(&self.path)
             .status();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while self.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
-        if self.child.try_wait().unwrap().is_none() {
+        if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
