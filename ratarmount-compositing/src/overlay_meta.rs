@@ -732,6 +732,7 @@ impl PendingBase {
 /// counted), sleep `RATARMOUNT_TEST_HASH_DELAY_MS` (widens race windows) and
 /// block until the path in `RATARMOUNT_TEST_HASH_HOLD` exists (an explicit
 /// release instead of a timed delay; capped at 60 s so a lost test cannot hang).
+#[cfg(any(test, feature = "test-hooks"))]
 fn test_hash_seam(path: &Path) {
     use std::io::Write;
     if let Some(log) = std::env::var_os("RATARMOUNT_TEST_HASH_LOG") {
@@ -750,6 +751,24 @@ fn test_hash_seam(path: &Path) {
         while !hold.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+}
+
+/// Release builds read none of the `RATARMOUNT_TEST_*` variables.
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn test_hash_seam(_path: &Path) {}
+
+/// Test seam (`test-hooks` feature or unit tests): the path in
+/// `RATARMOUNT_TEST_HASH_GATE`; the background base hash waits until it
+/// exists. Always `None` in release builds.
+pub fn test_hash_gate() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        std::env::var_os("RATARMOUNT_TEST_HASH_GATE").map(PathBuf::from)
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    {
+        None
     }
 }
 

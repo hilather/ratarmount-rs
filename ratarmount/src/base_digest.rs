@@ -1,7 +1,6 @@
 //! Lazy base digest: an archive base whose digest was not cached is recorded
 //! as `pending` at creation and hashed here, after the mount is serving.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -11,10 +10,6 @@ use ratarmount_compositing::WriteOverlay;
 use crate::overlay_commit;
 
 static WORKER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
-
-/// Test seam: when set, the background hash waits until this path exists.
-/// Offline verbs never read it.
-const GATE_ENV: &str = "RATARMOUNT_TEST_HASH_GATE";
 
 fn check_not_stopping() -> std::io::Result<()> {
     if overlay_commit::term_requested() {
@@ -48,7 +43,8 @@ pub fn spawn_if_pending(overlay: &Option<Arc<WriteOverlay>>) {
     *worker = thread::Builder::new()
         .name("ratarmount-base-digest".into())
         .spawn(move || {
-            if let Some(gate) = std::env::var_os(GATE_ENV).map(PathBuf::from) {
+            // Test seam, compiled only with `test-hooks`: wait until a file exists.
+            if let Some(gate) = ratarmount_compositing::overlay_meta::test_hash_gate() {
                 while !gate.exists() {
                     if check_not_stopping().is_err() {
                         return;

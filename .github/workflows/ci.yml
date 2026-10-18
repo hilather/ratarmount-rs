@@ -163,6 +163,9 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p ratarmount
 
+      - name: No test-only env seams in the release binary
+        run: ./packaging/test-no-test-hooks-in-release.sh target/release/ratarmount
+
       - name: Enforce rust-gates.json (cold index hard gate)
         env:
           RUST_BIN: ${{ github.workspace }}/target/release/ratarmount
