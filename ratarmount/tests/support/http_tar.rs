@@ -3,6 +3,12 @@
 /// A tiny HTTP stub serving one small tar with Range support; returns the base URL
 /// (`http://127.0.0.1:PORT`). Serves until the test process exits.
 pub fn serve_tar_stub() -> String {
+    serve_tar_stub_forbidding(None)
+}
+
+/// [`serve_tar_stub`] that answers `403 Forbidden` while `forbid` exists, so a
+/// test can expire the "signed URL" mid-run by creating that file.
+pub fn serve_tar_stub_forbidding(forbid: Option<std::path::PathBuf>) -> String {
     use std::io::{BufRead, BufReader, Write};
     let mut builder = tar::Builder::new(Vec::new());
     let mut header = tar::Header::new_gnu();
@@ -19,6 +25,7 @@ pub fn serve_tar_stub() -> String {
         for stream in listener.incoming() {
             let Ok(mut socket) = stream else { continue };
             let body = body.clone();
+            let forbid = forbid.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
                 let mut first = String::new();
@@ -38,6 +45,12 @@ pub fn serve_tar_stub() -> String {
                         let b: usize = b.parse().unwrap_or(body.len() - 1);
                         range = Some((a, b.min(body.len() - 1)));
                     }
+                }
+                if forbid.as_ref().is_some_and(|f| f.exists()) {
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    return;
                 }
                 let head = first.starts_with("HEAD ");
                 let (status, slice, extra) = match range {

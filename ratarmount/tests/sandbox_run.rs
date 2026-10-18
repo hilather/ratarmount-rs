@@ -580,6 +580,41 @@ fn regression_run_credentialed_base_url_is_redacted_on_success() {
     }
 }
 
+/// Regression: the signed URL expires while the command runs, so `finish()`
+/// reopening the base fails with an error naming the URL; the original error
+/// reached `main` and stderr unredacted (only the JSON was sanitized).
+#[test]
+fn regression_run_finalization_error_is_redacted() {
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let forbid = fixture.temp.path().join("forbid");
+    let port = http_tar::serve_tar_stub_forbidding(Some(forbid.clone()));
+    let port = port.rsplit(':').next().unwrap().to_owned();
+    let url = format!("http://user:s3cr3t@127.0.0.1:{port}/b.tar?X-Amz-Signature=deadbeef");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    command
+        .args(["sandbox", "run", "--base", &url, "--top"])
+        .arg(&fixture.top)
+        .args(["--image", "busybox", "--json", "--", "sh", "-c"])
+        .arg(format!("printf x > out; touch {}", forbid.display()))
+        .env("RATARMOUNT_SANDBOX_RUNTIME", stub())
+        .env("RATARMOUNT_STUB_STATE", fixture.temp.path().join("runtime"))
+        .env("HOME", fixture.temp.path().join("home"))
+        .env("XDG_CACHE_HOME", fixture.temp.path().join("home/.cache"));
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("403") || stderr.contains("403"),
+        "failure did not come from the reopened base: {stdout}\n{stderr}"
+    );
+    assert_no_secrets(&stdout, "stdout");
+    assert_no_secrets(&stderr, "stderr");
+}
+
 /// Regression (Keystone (a)): the in-FS `/.ratarmount-control/` (host pid,
 /// memory stats, an `unmount` file) was bound into the container and visible
 /// to the graded mount. The counters now come over a private socket.

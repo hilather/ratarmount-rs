@@ -794,7 +794,16 @@ pub fn run(args: &RunArgs) -> io::Result<()> {
     let mut out = io::stdout().lock();
     serde_json::to_writer(&mut out, &value)?;
     writeln!(out)?;
-    result.map(|_| ())
+    // The error also goes to `main`, which prints it to stderr: it must not
+    // carry a signed URL a library put in its text (finish() reopens the base).
+    result.map(|_| ()).map_err(redacted_error)
+}
+
+fn redacted_error(error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        ratarmount_core::redact_urls_in_text(&error.to_string()),
+    )
 }
 
 fn pipeline(args: &RunArgs) -> io::Result<Value> {
@@ -1038,6 +1047,23 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::sync::Arc;
+
+    /// Regression: an error from `finish()` (a library-rewritten signed URL in
+    /// its text) went to `main` and stderr unredacted; only the JSON was clean.
+    #[test]
+    fn regression_run_error_returned_to_main_is_redacted() {
+        let raw = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "http: HTTP 403 for http://u:s3cr3t@127.0.0.1:1/f.tar?token=deadbeef&X-Amz-Signature=abc",
+        );
+        let clean = redacted_error(raw);
+        assert_eq!(clean.kind(), io::ErrorKind::PermissionDenied);
+        let text = clean.to_string();
+        for secret in ["s3cr3t", "deadbeef", "X-Amz-Signature=abc"] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert!(text.contains("403"), "{text}");
+    }
 
     fn args(extra: &[&str]) -> RunArgs {
         let mut argv = vec![
