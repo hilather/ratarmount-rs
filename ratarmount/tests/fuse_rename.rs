@@ -177,6 +177,82 @@ fn fuse_sandbox_mapped_owners() {
     );
 }
 
+/// Regression (Ilya #2): writes into the virtual `/.ratarmount-control/` folder
+/// landed in the overlay (create, mkdir, symlink, rename into it, xattr, chmod).
+/// With `--control-interface` the name is reserved at the mount root only.
+#[test]
+fn fuse_control_folder_name_is_reserved() {
+    with_mount_options(
+        "rrs-ctl-reserved-",
+        |d, ov| {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let mnt = d.parent().unwrap();
+            let ctl = mnt.join(".ratarmount-control");
+            let denied = |what: &str, r: io::Result<()>| {
+                let e = r.expect_err(what);
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{what}: {e}");
+            };
+            denied("create", fs::write(ctl.join("x"), b"x"));
+            denied("mkdir", fs::create_dir(ctl.join("dir")));
+            denied("symlink", symlink("a1", ctl.join("link")));
+            denied("rename into", fs::rename(d.join("a1"), ctl.join("moved")));
+            denied(
+                "chmod status",
+                fs::set_permissions(ctl.join("status"), fs::Permissions::from_mode(0o600)),
+            );
+            assert!(
+                !ov.join(".ratarmount-control").exists(),
+                "landed in overlay"
+            );
+            // Guard: the folder still works and ordinary names are untouched.
+            assert!(fs::read_to_string(ctl.join("status"))
+                .unwrap()
+                .starts_with("mounted"));
+            assert!(list(mnt).contains(&".ratarmount-control".to_string()));
+            fs::create_dir(mnt.join("sub")).unwrap();
+            fs::create_dir(mnt.join("sub/.ratarmount-control")).unwrap();
+            fs::write(mnt.join("sub/.ratarmount-control/x"), b"ok").unwrap();
+            fs::write(mnt.join(".ratarmount-controlx"), b"ok").unwrap();
+        },
+        &["--control-interface"],
+    );
+}
+
+/// Regression (Keystone (a)): `--control-socket-only` keeps the socket but not
+/// the in-FS folder (host pid, memory stats, `unmount` file). The name is then
+/// an ordinary one.
+#[test]
+fn regression_control_socket_only_hides_folder() {
+    with_mount_options(
+        "rrs-ctl-socket-only-",
+        |d, ov| {
+            use std::io::{Read, Write};
+            let mnt = d.parent().unwrap();
+            assert!(!list(mnt).contains(&".ratarmount-control".to_string()));
+            assert_enoent(mnt, ".ratarmount-control/status");
+            fs::write(mnt.join(".ratarmount-control-x"), b"ok").unwrap();
+            fs::create_dir(mnt.join(".ratarmount-control")).unwrap();
+            fs::write(mnt.join(".ratarmount-control/x"), b"ordinary").unwrap();
+            assert_eq!(
+                fs::read(ov.join(".ratarmount-control/x")).unwrap(),
+                b"ordinary"
+            );
+            let log = fs::read_to_string(ov.parent().unwrap().join("daemon.log")).unwrap();
+            let socket = log
+                .lines()
+                .find_map(|l| l.strip_prefix("control interface: "))
+                .expect("control interface line in daemon log");
+            let mut stream = std::os::unix::net::UnixStream::connect(socket.trim()).unwrap();
+            stream.write_all(b"status\n").unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            assert!(reply.starts_with("mounted "), "{reply}");
+            assert!(!reply.lines().any(|l| l.starts_with("pid")), "{reply}");
+        },
+        &["--control-interface", "--control-socket-only"],
+    );
+}
+
 fn with_mount_options(prefix: &str, cases: fn(&Path, &Path), options: &[&str]) {
     if let Some(msg) = skip_reason() {
         eprintln!("{msg}");

@@ -520,3 +520,49 @@ fn regression_run_credentialed_base_url_is_redacted_on_success() {
         assert_no_secrets(value, key);
     }
 }
+
+/// Regression (Keystone (a)): the in-FS `/.ratarmount-control/` (host pid,
+/// memory stats, an `unmount` file) was bound into the container and visible
+/// to the graded mount. The counters now come over a private socket.
+#[test]
+fn regression_run_container_tree_has_no_control_dir() {
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let private = tempfile::Builder::new()
+        .prefix("rrs-run-tmp-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut command = fixture.command(
+        &["--readonly", "input"],
+        "ls -a . > seen.txt; ls .ratarmount-control/status > status.txt 2>&1; \
+         cat .ratarmount-control/pid > pid.txt 2>/dev/null; echo denied > input; true",
+    );
+    let output = command.env("TMPDIR", private.path()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let seen = fs::read_to_string(fixture.top.join("seen.txt")).unwrap();
+    assert!(!seen.contains(".ratarmount-control"), "{seen}");
+    assert!(!seen.contains("ratarmount-control-"), "{seen}");
+    let status = fs::read_to_string(fixture.top.join("status.txt")).unwrap();
+    assert!(status.contains("No such file"), "{status}");
+    assert!(
+        !fixture.top.join("pid.txt").exists()
+            || fs::read(fixture.top.join("pid.txt")).unwrap().is_empty()
+    );
+    // The counter is read over the socket, not the in-FS status file.
+    assert!(report["erofs_denied"].as_u64().unwrap() > 0, "{report}");
+    let left: Vec<_> = fs::read_dir(private.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !left.iter().any(|n| n.starts_with("ratarmount-ctl-")),
+        "control dir leaked: {left:?}"
+    );
+}

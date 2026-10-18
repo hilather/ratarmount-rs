@@ -320,6 +320,25 @@ fn regression_import_refuses_traversal_absolute_nul_and_non_utf8_paths() {
     assert!(parse::parse(b"--- /dev/null\n+++ b/.ratarmount.overlay.sqlite\n", 1024).is_err());
 }
 
+/// Regression: `.ratarmount-control/` paths (N6) are refused on either side;
+/// the same name below a subdirectory or as a longer sibling name is ordinary.
+#[test]
+fn regression_import_refuses_control_dir_paths_parse() {
+    for path in [".ratarmount-control/x", ".ratarmount-control"] {
+        let add = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+x\n");
+        assert!(parse::parse(add.as_bytes(), 1024).is_err(), "{add}");
+        let del = format!("--- a/{path}\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n");
+        assert!(parse::parse(del.as_bytes(), 1024).is_err(), "{del}");
+    }
+    let rename =
+        b"diff --git a/x b/.ratarmount-control/x\nrename from x\nrename to .ratarmount-control/x\n";
+    assert!(parse::parse(rename, 1024).is_err());
+    for path in ["sub/.ratarmount-control/x", ".ratarmount-controlx"] {
+        let add = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+x\n");
+        assert!(parse::parse(add.as_bytes(), 1024).is_ok(), "{add}");
+    }
+}
+
 /// Regression: neither lower nor newly written symlink parents may be traversed.
 #[test]
 fn regression_import_refuses_lower_and_overlay_symlink_components() {

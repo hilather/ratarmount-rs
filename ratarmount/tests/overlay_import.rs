@@ -313,3 +313,49 @@ fn regression_seal_refuses_incomplete_import() {
     assert!(err.contains("import"), "{err}");
     assert!(!OverlayMeta::read(&dest).unwrap().unwrap().layer_sealed());
 }
+
+/// Regression: N6, `overlay import` accepted `.ratarmount-control/` paths. The
+/// mount's virtual control folder would hide them while diff/hash/seal still
+/// covered the bytes. Refused like a traversal path (exit 2, no overlay).
+#[test]
+fn regression_import_refuses_control_dir_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let traversal = import(
+        &base,
+        &root.path().join("traversal"),
+        b"--- /dev/null\n+++ b/../x\n@@ -0,0 +1 @@\n+x\n",
+        &[],
+    );
+    assert_eq!(traversal.status.code(), Some(2));
+    for (n, path) in [".ratarmount-control/x", ".ratarmount-control"]
+        .into_iter()
+        .enumerate()
+    {
+        let dest = root.path().join(format!("ctl{n}"));
+        let patch = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+x\n");
+        let output = import(&base, &dest, patch.as_bytes(), &[]);
+        assert_eq!(
+            output.status.code(),
+            traversal.status.code(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!dest.exists(), "overlay created for {path}");
+    }
+    let dest = root.path().join("sub");
+    let output = import(
+        &base,
+        &dest,
+        b"--- /dev/null\n+++ b/sub/.ratarmount-control/x\n@@ -0,0 +1 @@\n+x\n",
+        &["--no-seal"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dest.join("sub/.ratarmount-control/x").is_file());
+}

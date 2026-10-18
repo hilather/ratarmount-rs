@@ -623,7 +623,10 @@ trimmed to force a match. CRLF, Latin-1 file content and missing final newlines
 are preserved. Git C-quoted names are decoded, and header paths have one
 leading component removed (`-p1`); plain `diff -u` headers may include a tab
 followed by a timestamp. Both old and new names are validated. Absolute paths,
-NUL, empty, `.` or `..` components, reserved overlay bookkeeping names, and
+NUL, empty, `.` or `..` components, reserved overlay bookkeeping names, the
+`.ratarmount-control` folder at the root (a `--control-interface` mount serves
+a virtual folder there, so imported bytes would be hashed and sealed but
+invisible; refused whatever flags the later mount uses), and
 symlink parents in either the lower view or the new overlay are refused.
 Symlink targets are stored as link data, never followed. Paths and symlink
 targets must be UTF-8 because the workspace's mount and overlay APIs use
@@ -872,6 +875,15 @@ with `EROFS`. This keeps the copy's publication path stable; the restriction is
 released when the copy completes or fails. Unprotected directory renames still have
 the overlay's existing directory-rename limitations.
 
+While a mount serves the control folder (`--control-interface` without
+`--control-socket-only`), `/.ratarmount-control` is a reserved name at the mount
+root: create, mkdir, symlink, rename into or out of it, writes, truncates,
+xattr, chmod and utimens on it fail with EACCES and never reach the overlay.
+Read-only opens, `status` and `ls` work. The same name below a subdirectory
+(`/sub/.ratarmount-control`) or a longer name (`/.ratarmount-controlx`) is
+ordinary, and so is the name on a mount without `--control-interface` or with
+`--control-socket-only`.
+
 Every `EROFS` returned by the rule policy increments its live `erofs_denied`
 counter once, including temporary COW-parent denials. With `--control-interface`,
 the socket `status` reply and `/.ratarmount-control/status` include an
@@ -1109,7 +1121,11 @@ Stdout contains exactly one JSON object. Container stdout/stderr goes to stderr;
 `fsck_result`. `patch_hash` has the same fields as `diff --hash --json`, using
 strict normalization, SHA-256, and no excludes. `bytes_written` is the final
 logical overlay payload size, not cumulative I/O. `erofs_denied` comes from the
-mount's control status before unmount. Manifest and journal artifacts live next
+mount's control status before unmount, read over a private control socket: the
+mount child runs with `--control-interface --control-socket-only` (experimental)
+and a `TMPDIR` that is a 0700 directory outside the container's bind, so the
+in-FS `/.ratarmount-control/` folder (host pid, memory stats, an `unmount` file)
+is not visible in the container or the graded mount. Manifest and journal artifacts live next
 to the top: `<top>.manifest.jsonl`, `<top>.journal.jsonl`, and
 `<top>.journal.summary.json`. The summary report contains its path and counts of
 files read, read then written, and written blind. Without `--journal`, it is null;

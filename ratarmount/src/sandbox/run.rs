@@ -406,7 +406,42 @@ fn wait_database(top: &Path) -> io::Result<()> {
     }
 }
 
+/// Longest control socket path the platforms accept (`sun_path`, macOS 104).
+const MAX_SOCKET_PATH: usize = 100;
+
+/// `<dir>/ratarmount-control-<pid>.sock`: where a mount child started with
+/// `TMPDIR=<dir>` listens for control commands.
+fn control_socket_path(dir: &Path, mount_pid: u32) -> PathBuf {
+    dir.join(format!("ratarmount-control-{mount_pid}.sock"))
+}
+
+/// A 0700 directory owned by the caller that holds the mount child's control
+/// socket, outside the container's bind. Under `/tmp` when the default
+/// temporary directory would make the socket path too long for `sun_path`.
+fn create_control_dir() -> io::Result<PathBuf> {
+    let probe = control_socket_path(Path::new(""), u32::MAX);
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("ratarmount-ctl-");
+    let default = std::env::temp_dir();
+    let long =
+        default.as_os_str().len() + "/ratarmount-ctl-XXXXXX".len() + 1 + probe.as_os_str().len()
+            > MAX_SOCKET_PATH;
+    let dir = if long {
+        builder.tempdir_in("/tmp")?
+    } else {
+        builder.tempdir()?
+    };
+    // The directory is created with the umask's mode: restrict it before the
+    // mount child binds its socket inside.
+    fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
+    Ok(dir.keep())
+}
+
 struct Cleanup {
+    control_dir: Option<PathBuf>,
     record: PidRecord,
     pid_file: PathBuf,
     top: PathBuf,
@@ -491,6 +526,9 @@ impl Cleanup {
             }
         }
         let _ = fs::remove_dir(&self.record.mountpoint);
+        if let Some(dir) = self.control_dir.take() {
+            let _ = fs::remove_dir_all(dir);
+        }
         self.stopped = true;
         Ok(())
     }
@@ -551,6 +589,7 @@ fn recover(pid_file: &Path, top: &Path) -> io::Result<()> {
         return Err(io::Error::other("recorded sandbox run is still alive"));
     }
     let mut cleanup = Cleanup {
+        control_dir: None,
         record,
         pid_file: pid_file.into(),
         top: top.into(),
@@ -563,10 +602,16 @@ fn recover(pid_file: &Path, top: &Path) -> io::Result<()> {
 }
 
 fn mount_argv(args: &RunArgs, top: &Path, mount: &Path, journal: &Path) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = ["-f", "--sandbox", "--control-interface", "-w"]
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    let mut argv: Vec<OsString> = [
+        "-f",
+        "--sandbox",
+        "--control-interface",
+        "--control-socket-only",
+        "-w",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
     argv.push(top.into());
     for lower in &args.lower {
         argv.extend(["--lower".into(), lower.into()]);
@@ -642,8 +687,24 @@ fn mount_ready(cleanup: &mut Cleanup, stderr: &mut File, base: &Path) -> io::Res
     }
 }
 
-fn counters(mount: &Path) -> io::Result<u64> {
-    let status = fs::read_to_string(mount.join(".ratarmount-control/status"))?;
+/// Ask the mount's control socket for `status` (5 s timeouts).
+fn control_status(socket: &Path) -> io::Result<String> {
+    use std::io::{Read, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    let timeout = Some(Duration::from_secs(5));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    stream.write_all(b"status\n")?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    Ok(reply)
+}
+
+fn counters(socket: &Path) -> io::Result<u64> {
+    parse_erofs_denied(&control_status(socket)?)
+}
+
+fn parse_erofs_denied(status: &str) -> io::Result<u64> {
     // The mount only installs a quota/rule policy when one was requested.
     status
         .lines()
@@ -718,7 +779,9 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
         runtime_child: None,
         ram_top: ram.map(tempfile::TempDir::keep),
     };
+    let control_dir = create_control_dir()?;
     let mut cleanup = Cleanup {
+        control_dir: Some(control_dir.clone()),
         record,
         pid_file,
         top: top.clone(),
@@ -744,10 +807,12 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
             &cleanup.record.mountpoint,
             &journal,
         ))
+        .env("TMPDIR", &control_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(mount_stderr.try_clone()?))
         .stderr(Stdio::from(mount_stderr.try_clone()?))
         .spawn()?;
+    let control_socket = control_socket_path(&control_dir, child.id());
     cleanup.record.mount_child = Some(ProcessIdentity::new(child.id()));
     cleanup.mount_child = Some(child);
     cleanup.save()?;
@@ -796,7 +861,7 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
     };
     // Stop all writers before reading counters, then drop the mount's DB lock.
     cleanup.stop_runtime()?;
-    let erofs_denied = counters(&cleanup.record.mountpoint)?;
+    let erofs_denied = counters(&control_socket)?;
     cleanup.stop()?;
     let bytes_written = ratarmount_compositing::OverlayQuota::new(&top, None, None)?
         .usage()
@@ -1053,6 +1118,7 @@ mod tests {
                 "-f",
                 "--sandbox",
                 "--control-interface",
+                "--control-socket-only",
                 "-w",
                 "/ram",
                 "--lower",
@@ -1212,6 +1278,7 @@ mod tests {
         };
         let top = temp.path().join("top");
         let mut cleanup = Cleanup {
+            control_dir: None,
             record,
             pid_file: pid_path(&top),
             top,
@@ -1379,5 +1446,35 @@ mod tests {
             report["patch_hash"]["patch"],
             overlay_changes::canonical_hash(&changes, &options).unwrap()
         );
+    }
+
+    /// Regression: `sandbox run` reads `erofs_denied` from the mount's control
+    /// socket (the in-FS control folder is not mounted) and the socket path is
+    /// `<dir>/ratarmount-control-<pid>.sock`.
+    #[test]
+    fn regression_control_socket_counters_and_path() {
+        use std::io::{Read, Write};
+        let dir = create_control_dir().unwrap();
+        let mode =
+            std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&dir).unwrap().permissions());
+        assert_eq!(mode & 0o777, 0o700);
+        let socket = control_socket_path(&dir, 4242);
+        assert_eq!(socket, dir.join("ratarmount-control-4242.sock"));
+        assert!(socket.as_os_str().len() <= MAX_SOCKET_PATH, "{socket:?}");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for reply in ["mounted /m\nerofs_denied 7\n", "mounted /m\n"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 7];
+                stream.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"status\n");
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        assert_eq!(counters(&socket).unwrap(), 7);
+        // No quota/rule policy: the line is absent and the count is zero.
+        assert_eq!(counters(&socket).unwrap(), 0);
+        server.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
 }

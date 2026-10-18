@@ -137,6 +137,17 @@ struct Args {
     #[arg(long = "control-interface", action = ArgAction::SetTrue)]
     control_interface: bool,
 
+    /// Serve the control socket but not the in-FS `/.ratarmount-control/`
+    /// folder (experimental; `sandbox run` uses it so the pid, memory stats
+    /// and `unmount` file are not visible in the container).
+    #[arg(
+        long = "control-socket-only",
+        hide = true,
+        requires = "control_interface",
+        action = ArgAction::SetTrue
+    )]
+    control_socket_only: bool,
+
     /// Export the archive as NFS (userspace). Does not require a FUSE mountpoint.
     /// Default protocol is NFSv3. Bind address is `--nfs-bind` (default 127.0.0.1:20490).
     #[arg(long = "nfs", action = ArgAction::SetTrue)]
@@ -2447,6 +2458,7 @@ fn main() {
                     ov.set_rolling(series.clone());
                 }
                 ov.set_encoding(&args.encoding);
+                ov.set_control_reserved(args.control_interface && !args.control_socket_only);
                 if let Ok(Some(marker)) = ov.meta_value("import_in_progress") {
                     eprintln!(
                         "warning: {} holds a partial `overlay import` ({marker}); delete it and import again before sealing",
@@ -2746,22 +2758,24 @@ fn main() {
             inputs[0].clone(),
             open_opts.clone(),
         );
-        bundle.source = Arc::new(
-            ControlFolderMountSource::new(
-                pre_control,
-                ControlFolderOptions::enabled()
-                    .with_label(mp.display().to_string())
-                    .with_on_unmount(Arc::new(move || {
-                        stop.store(true, Ordering::SeqCst);
-                        let _ = unmount(&mp_ctrl);
-                    }))
-                    .with_on_search(Arc::clone(&on_search)),
-            )
-            .with_on_status(overlay_quota.clone().map(|quota| {
-                Arc::new(move || quota.usage().status_text())
-                    as Arc<dyn Fn() -> String + Send + Sync>
-            })),
-        ) as Arc<dyn MountSource>;
+        if !args.control_socket_only {
+            bundle.source = Arc::new(
+                ControlFolderMountSource::new(
+                    pre_control,
+                    ControlFolderOptions::enabled()
+                        .with_label(mp.display().to_string())
+                        .with_on_unmount(Arc::new(move || {
+                            stop.store(true, Ordering::SeqCst);
+                            let _ = unmount(&mp_ctrl);
+                        }))
+                        .with_on_search(Arc::clone(&on_search)),
+                )
+                .with_on_status(overlay_quota.clone().map(|quota| {
+                    Arc::new(move || quota.usage().status_text())
+                        as Arc<dyn Fn() -> String + Send + Sync>
+                })),
+            ) as Arc<dyn MountSource>;
+        }
         start_control_interface(
             mp,
             Arc::clone(&control_stop),

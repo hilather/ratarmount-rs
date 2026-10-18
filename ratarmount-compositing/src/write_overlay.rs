@@ -84,6 +84,21 @@ pub fn is_overlay_internal_path(path: &str) -> bool {
     path.split('/').any(is_overlay_internal_name)
 }
 
+/// The virtual control folder served by `--control-interface`. Matches the
+/// normalized path (`./`, `//`, `..` collapsed): the folder itself and
+/// everything under it, at the mount root only.
+pub fn is_control_reserved_path(path: &str) -> bool {
+    let n = normpath(path);
+    n == "/.ratarmount-control" || n.starts_with("/.ratarmount-control/")
+}
+
+fn control_name_refused(path: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{path} is the reserved control folder (--control-interface)"),
+    )
+}
+
 /// Refusal for a mount-side create/delete/rename/write of an internal name.
 fn internal_name_refused(path: &str) -> OverlayError {
     OverlayError::Io(io::Error::new(
@@ -696,6 +711,9 @@ pub struct WriteOverlay {
     write_fds: Mutex<HashMap<i32, String>>,
     /// TAR member-name encoding (`-e`); live `.tar.zst` persist. Default utf-8.
     encoding: String,
+    /// `--control-interface` is serving a virtual `/.ratarmount-control`:
+    /// the name is reserved and every mutation of it is refused.
+    control_reserved: bool,
     /// Last successful persist window for incremental sidecar patch (F-2).
     last_patch_window: Mutex<Option<IndexPatchWindow>>,
     /// Live commit coordinator (V-4). Separate from `commit_gate` (writers vs
@@ -790,7 +808,22 @@ impl WriteOverlay {
             .map(|_| self.policy_gate.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// Reserved control name (only while the control folder is served).
+    fn is_control_path(&self, path: &str) -> bool {
+        self.control_reserved && is_control_reserved_path(path)
+    }
+
+    fn refuse_control_path(&self, path: &str) -> io::Result<()> {
+        if self.is_control_path(path) {
+            return Err(control_name_refused(path));
+        }
+        Ok(())
+    }
+
     fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()> {
+        for p in paths {
+            self.refuse_control_path(p)?;
+        }
         if let Some(policy) = &self.policy {
             let paths: Vec<String> = paths.iter().map(|p| normpath(p)).collect();
             let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
@@ -1205,6 +1238,7 @@ impl WriteOverlay {
             commit_generation: std::sync::atomic::AtomicU64::new(0),
             write_fds: Mutex::new(HashMap::new()),
             encoding: "utf-8".into(),
+            control_reserved: false,
             last_patch_window: Mutex::new(None),
             commit_mode: CommitMode::Copy,
             manifest_hashes: None,
@@ -1328,6 +1362,12 @@ impl WriteOverlay {
     /// Defaults to `"utf-8"` inside [`Self::new`]; fuse/nfs tests need not call this.
     pub fn set_encoding(&mut self, encoding: &str) {
         self.encoding = encoding.to_string();
+    }
+
+    /// Reserve `/.ratarmount-control` (call when the virtual control folder is
+    /// mounted, before sharing the overlay). Off: the name is ordinary.
+    pub fn set_control_reserved(&mut self, on: bool) {
+        self.control_reserved = on;
     }
 
     /// True after persist-ok + reopen-err; further interval ticks must remount.
@@ -2035,6 +2075,7 @@ impl WriteOverlay {
         if is_overlay_internal_path(path) {
             return Err(internal_name_refused(path));
         }
+        self.refuse_control_path(path)?;
         self.check_mutation(OverlayMutation::Create, &[path])?;
         #[cfg(not(unix))]
         {
@@ -2098,6 +2139,7 @@ impl WriteOverlay {
             let _gate = self.commit_gate.read().expect("overlay commit gate");
             let _policy = self.policy_lock();
             if flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0 {
+                self.refuse_control_path(path)?;
                 self.check_mutation(OverlayMutation::OpenWrite, &[path])?;
             }
             drop(_policy);
@@ -3103,6 +3145,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
         let path = normpath(path);
+        self.refuse_control_path(&path)?;
         self.check_mutation(OverlayMutation::Write, &[&path])?;
         if self.rolling.is_some() && !self.has_file(&path) {
             self.refuse_sealed_delete(&path)?;
@@ -18278,5 +18321,130 @@ mod tests {
             Some(crate::LayerIndex::Base)
         );
         assert_eq!(overlay.base_serving_layer("/missing"), None);
+    }
+
+    /// Regression (Ilya #2): writes under the virtual `/.ratarmount-control`
+    /// folder landed in the overlay. Reserved only while the control folder is
+    /// served; every entry point refuses with `PermissionDenied`.
+    #[cfg(unix)]
+    #[test]
+    fn regression_control_name_reserved_at_every_entry_point() {
+        type Op = fn(&WriteOverlay, &str) -> io::Result<()>;
+        let ops: Vec<(&str, Op)> = vec![
+            ("create_file", |o, p| {
+                o.create_file(p, 0o644).map(close_fd).map_err(into_io)
+            }),
+            ("open O_CREAT", |o, p| {
+                o.open_overlay_fd_with_mode(p, libc::O_CREAT | libc::O_WRONLY, 0o644)
+                    .map(close_fd)
+                    .map_err(into_io)
+            }),
+            ("open O_TRUNC", |o, p| {
+                o.open_overlay_fd_with_mode(p, libc::O_TRUNC | libc::O_WRONLY, 0o644)
+                    .map(close_fd)
+                    .map_err(into_io)
+            }),
+            ("mkdir", |o, p| o.mkdir(p, 0o755).map_err(into_io)),
+            ("symlink", |o, p| o.create_symlink(p, "t").map_err(into_io)),
+            ("unlink", |o, p| o.unlink(p).map_err(into_io)),
+            ("rmdir", |o, p| o.rmdir(p).map_err(into_io)),
+            ("truncate", |o, p| o.truncate(p, 0).map_err(into_io)),
+            ("rename source", |o, p| {
+                o.rename(p, "/dest").map_err(into_io)
+            }),
+            ("rename dest", |o, p| o.rename("/a", p).map_err(into_io)),
+            ("set_xattr", |o, p| {
+                o.set_xattr(p, "user.k", b"v", 0).map_err(into_io)
+            }),
+            ("remove_xattr", |o, p| {
+                o.remove_xattr(p, "user.k").map_err(into_io)
+            }),
+            ("chmod", |o, p| {
+                let m = OverlayMetadata {
+                    mode: Some(0o600),
+                    ..Default::default()
+                };
+                o.set_attributes(p, None, &m).map_err(into_io)
+            }),
+            ("utimens", |o, p| {
+                let m = OverlayMetadata {
+                    mtime: Some(5.0),
+                    ..Default::default()
+                };
+                o.set_attributes(p, None, &m).map_err(into_io)
+            }),
+            ("set_metadata", |o, p| {
+                let m = OverlayMetadata {
+                    mode: Some(0o600),
+                    ..Default::default()
+                };
+                o.set_metadata(p, &m).map_err(into_io)
+            }),
+            ("set_attributes size", |o, p| {
+                o.set_attributes(p, Some(0), &OverlayMetadata::default())
+                    .map_err(into_io)
+            }),
+        ];
+        fn close_fd(fd: i32) {
+            unsafe { libc::close(fd) };
+        }
+        fn into_io(e: OverlayError) -> io::Error {
+            match e {
+                OverlayError::Io(e) => e,
+                other => io::Error::other(other.to_string()),
+            }
+        }
+        let spellings = [
+            "/.ratarmount-control/x",
+            "./.ratarmount-control/x",
+            "//.ratarmount-control/x",
+            "/a/../.ratarmount-control/x",
+            "/.ratarmount-control",
+        ];
+        // The base already holds the reserved name, for unlink/xattr/chmod/rename-from.
+        let base = || {
+            Arc::new(MemBase::with(&[
+                ("/a", b"a"),
+                ("/.ratarmount-control/x", b"x"),
+                ("/sub/.ratarmount-control/x", b"x"),
+            ])) as Arc<dyn MountSource>
+        };
+        let td = tempfile::tempdir().unwrap();
+        let mut on = WriteOverlay::new(base(), td.path()).unwrap();
+        on.set_control_reserved(true);
+        for (name, op) in &ops {
+            for path in spellings {
+                let err = op(&on, path).expect_err(&format!("{name} {path}"));
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::PermissionDenied,
+                    "{name} {path}: {err}"
+                );
+            }
+            // Names that only look similar stay ordinary (the error, if any, is not the refusal).
+            for path in ["/sub/.ratarmount-control/x", "/.ratarmount-controlx"] {
+                if let Err(e) = op(&on, path) {
+                    assert!(
+                        !e.to_string().contains("reserved control folder"),
+                        "{name} {path}: {e}"
+                    );
+                }
+            }
+        }
+        assert!(!td.path().join(".ratarmount-control").exists());
+        // Off (no --control-interface, or --control-socket-only): ordinary names.
+        let td = tempfile::tempdir().unwrap();
+        let off = WriteOverlay::new(base(), td.path()).unwrap();
+        off.create_file("/.ratarmount-control/new", 0o644)
+            .map(close_fd)
+            .unwrap();
+        off.mkdir("/.ratarmount-control/d", 0o755).unwrap();
+        off.set_xattr("/.ratarmount-control/x", "user.k", b"v", 0)
+            .unwrap();
+        for path in spellings {
+            assert!(is_control_reserved_path(path), "{path}");
+        }
+        assert!(!is_control_reserved_path("/sub/.ratarmount-control/x"));
+        assert!(!is_control_reserved_path("/.ratarmount-controlx"));
     }
 }

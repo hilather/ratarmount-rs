@@ -131,6 +131,14 @@ fn path(input: &[u8], strip: bool, timestamp: bool) -> io::Result<Option<String>
     if ratarmount_compositing::is_overlay_internal_path(&format!("/{text}")) {
         return Err(invalid(format!("reserved overlay path: {text}")));
     }
+    // A mount with `--control-interface` serves a virtual folder here (and
+    // `sandbox run` always does): imported content would be invisible but
+    // still hashed and sealed. Refused whatever the later mount flags are.
+    if ratarmount_compositing::is_control_reserved_path(&format!("/{text}")) {
+        return Err(invalid(format!(
+            "reserved control folder path: {text} (/.ratarmount-control is served by --control-interface)"
+        )));
+    }
     Ok(Some(text))
 }
 

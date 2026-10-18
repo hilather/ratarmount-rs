@@ -69,7 +69,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing · `[x]` Rust-only = beyond
 | `shard` / `export-index --format parquet|jsonl|csv` | no | **added** (dataset packing and index export without FUSE; Parquet is default feature `export-parquet`) | `[x]` Rust-only |
 | `-p` / `--prefix` | yes | yes | `[x]` |
 | `--file-versions` / `--no-file-versions` | yes | **both forms** | `[x]` |
-| `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket **and** in-FS folder (`status`/`pid`/`unmount`/`help` plus read-only `search/<pattern>` glob locate; quote globs). No FUSE write-then-read `echo pat > search`. | `[x]` / overlay names not in catalog |
+| `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket **and** in-FS folder (`status`/`pid`/`unmount`/`help` plus read-only `search/<pattern>` glob locate; quote globs). No FUSE write-then-read `echo pat > search`. With `-w` the folder name is reserved (EACCES). Hidden experimental `--control-socket-only` keeps the socket and omits the folder (used by `sandbox run`). | `[x]` / overlay names not in catalog |
 | `--nfs` | no | **added** (userspace NFS; NFSv3 default; no FUSE mount required) | `[x]` Rust-only |
 | `--nfs-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20490`) | `[x]` |
 | `--nfs-vers 3\|4` | no | **added** (default `3`; `4`/`4.1` need `--nfs` + a `nfsv4` binary — Linux/macOS packages compile it; source `--features nfsv4`, rustc ≥ 1.88; ignored without `--nfs`; `4.0` rejected) | `[x]` Rust-only |
