@@ -2872,6 +2872,18 @@ impl WriteOverlay {
         Ok(())
     }
 
+    /// Read overlay-level metadata through the held connection, including on a mounted overlay.
+    pub fn meta_value(&self, key: &str) -> Result<Option<String>> {
+        let db = self.db.lock().expect("overlay db");
+        Ok(crate::overlay_meta::OverlayMeta::from_connection(&db)?
+            .and_then(|meta| meta.get(key).map(str::to_owned)))
+    }
+
+    /// Provenance in the composed base, before this writable layer.
+    pub fn base_serving_layer(&self, path: &str) -> Option<crate::LayerIndex> {
+        crate::serving_layer(self.current_base().as_ref(), path)
+    }
+
     /// Record one overlay-level `meta` key (for example `readonly_rules`).
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         let db = self.db.lock().expect("overlay db");
@@ -18017,5 +18029,22 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+    #[test]
+    fn regression_oplog_meta_value_reads_the_exclusively_held_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay =
+            WriteOverlay::new(Arc::new(MemBase::with(&[("/base", b"data")])), dir.path()).unwrap();
+        assert!(overlay.meta_value("journal_path").unwrap().is_none());
+        overlay.set_meta("journal_path", "/trace.jsonl").unwrap();
+        assert_eq!(
+            overlay.meta_value("journal_path").unwrap().as_deref(),
+            Some("/trace.jsonl")
+        );
+        assert_eq!(
+            overlay.base_serving_layer("/base"),
+            Some(crate::LayerIndex::Base)
+        );
+        assert_eq!(overlay.base_serving_layer("/missing"), None);
     }
 }
