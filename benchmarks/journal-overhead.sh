@@ -18,6 +18,35 @@ def overhead(baseline, journal):
     return 100 * (statistics.median(journal) / statistics.median(baseline) - 1)
 
 
+def paired_overhead(runs):
+    # runs: (enabled, seconds) in execution order. One ratio per complete ABBA
+    # block; the median ratio resists drift that unpaired medians absorb.
+    ratios = []
+    for i in range(0, len(runs) - len(runs) % 4, 4):
+        block = runs[i:i + 4]
+        base = sum(s for e, s in block if not e)
+        journal = sum(s for e, s in block if e)
+        ratios.append(journal / base)
+    return 100 * (statistics.median(ratios) - 1) if ratios else None
+
+
+def unmount(mount):
+    # A desktop indexer can briefly hold a fresh mount; retry before failing.
+    for _ in range(50):
+        if subprocess.run(['fusermount3', '-u', str(mount)], check=False).returncode == 0:
+            return
+        time.sleep(.2)
+    subprocess.run(['fusermount3', '-uz', str(mount)], check=False)
+
+
+def order(run):
+    # Run -1 is a discarded warm-up. Then ABBA pairs, so drift (page cache,
+    # CPU clocks) hits both sides equally instead of always favoring the second.
+    if run < 0:
+        return 0
+    return (run % 4) in (1, 2)
+
+
 def fixture(path):
     files = {}
     for i in range(64):
@@ -36,6 +65,9 @@ def fixture(path):
 
 if '--self-test' in sys.argv:
     assert overhead([1, 2, 3], [2, 4, 6]) == 100
+    assert round(paired_overhead([(0, 1), (1, 2), (1, 2), (0, 1), (0, 2), (1, 2), (1, 2), (0, 2), (0, 9)]), 6) == 50
+    assert paired_overhead([(0, 1)]) is None
+    assert [order(run) for run in range(-1, 8)] == [0, 0, 1, 1, 0, 0, 1, 1, 0]
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / 'base.tar'
         fixture(path)
@@ -59,12 +91,13 @@ runs = int(os.environ.get('RUNS', '6'))
 if runs < 2:
     sys.exit('RUNS must be at least 2')
 times = [[], []]
+sequence = []
 with tempfile.TemporaryDirectory(prefix='ratarmount-journal-bench-') as tmp:
     root = pathlib.Path(tmp)
     archive = root / 'base.tar'
     fixture(archive)
-    for run in range(runs):
-        enabled = run % 2
+    for run in range(-1, runs):
+        enabled = int(order(run))
         mount = root / f'mnt-{run}'
         mount.mkdir()
         command = [str(binary), '-f', '--passthrough', 'off', '-w', str(root / f'overlay-{run}')]
@@ -82,10 +115,15 @@ with tempfile.TemporaryDirectory(prefix='ratarmount-journal-bench-') as tmp:
             for _ in range(3):
                 subprocess.run(['make', '-s', 'clean'], cwd=mount, check=True)
                 subprocess.run(['make', '-s', '-j' + os.environ.get('JOBS', '4'), 'all', 'check'], cwd=mount, check=True)
-            times[enabled].append(time.monotonic() - start)
-            print(f'run={run + 1} journal={bool(enabled)} seconds={times[enabled][-1]:.6f}', flush=True)
+            elapsed = time.monotonic() - start
+            if run < 0:
+                print(f'warm-up seconds={elapsed:.6f} (discarded)', flush=True)
+            else:
+                times[enabled].append(elapsed)
+                sequence.append((enabled, elapsed))
+                print(f'run={run + 1} journal={bool(enabled)} seconds={elapsed:.6f}', flush=True)
         finally:
-            subprocess.run(['fusermount3', '-u', str(mount)], check=False)
+            unmount(mount)
             try:
                 child.wait(timeout=20)
             except subprocess.TimeoutExpired:
@@ -94,5 +132,7 @@ with tempfile.TemporaryDirectory(prefix='ratarmount-journal-bench-') as tmp:
                 raise
         if child.returncode:
             raise RuntimeError(f'mount exited {child.returncode}')
-print(f'baseline_median={statistics.median(times[0]):.6f}s journal_median={statistics.median(times[1]):.6f}s overhead={overhead(*times):+.2f}% (target <3%; not a CI gate)')
+paired = paired_overhead(sequence)
+paired = 'n/a (RUNS < 4)' if paired is None else f'{paired:+.2f}%'
+print(f'baseline_median={statistics.median(times[0]):.6f}s journal_median={statistics.median(times[1]):.6f}s overhead={overhead(*times):+.2f}% paired_abba_overhead={paired} (target <3%; not a CI gate; quote the paired figure)')
 PY

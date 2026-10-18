@@ -385,37 +385,113 @@ impl Write for ContentDigest {
     }
 }
 
-// Hash checkpoints discard trailing whitespace without retaining even a very
-// long line (or a huge run of spaces) in memory.
+// Streams normalized text into one digest. Bytes that may still be dropped
+// are deferred instead of hashed: blank lines as a count, and the whitespace
+// since the last non-whitespace byte in a bounded buffer. A whitespace run
+// longer than the buffer falls back to a digest checkpoint, so memory stays
+// bounded and the digest state is only cloned once per overflowing run.
+// Kept bytes are staged in `staged` so the digest sees large updates.
 struct TextDigest {
-    done: ContentDigest,
-    line: ContentDigest,
-    trimmed: Option<ContentDigest>,
-    nonblank: bool,
-    started: bool,
+    out: ContentDigest,
+    staged: Vec<u8>,
+    /// Newlines owed before the next non-whitespace byte.
     pending_lines: u64,
+    /// Whitespace on the current line since its last non-whitespace byte.
+    blanks: Vec<u8>,
+    /// `out` before this line's deferred newlines and whitespace, once
+    /// `blanks` overflowed and they were hashed speculatively.
+    checkpoint: Option<ContentDigest>,
+    nonblank: bool,
     loose: bool,
+    cap: usize,
 }
 impl TextDigest {
+    const BLANK_CAP: usize = 64 * 1024;
+    const STAGE: usize = 64 * 1024;
     fn new(algo: Algorithm, loose: bool) -> Self {
-        let done = ContentDigest::new(algo);
+        Self::with_cap(algo, loose, Self::BLANK_CAP)
+    }
+    fn with_cap(algo: Algorithm, loose: bool, cap: usize) -> Self {
         Self {
-            line: done.clone(),
-            done,
-            trimmed: None,
-            nonblank: false,
-            started: false,
+            out: ContentDigest::new(algo),
+            staged: Vec::with_capacity(Self::STAGE),
             pending_lines: 0,
+            blanks: Vec::new(),
+            checkpoint: None,
+            nonblank: false,
             loose,
+            cap,
         }
     }
-    fn newlines(hash: &mut ContentDigest, mut count: u64) {
+    fn emit(&mut self, bytes: &[u8]) {
+        if self.staged.len() + bytes.len() > Self::STAGE {
+            self.out.update(&self.staged);
+            self.staged.clear();
+            if bytes.len() > Self::STAGE {
+                self.out.update(bytes);
+                return;
+            }
+        }
+        self.staged.extend_from_slice(bytes);
+    }
+    fn commit(&mut self) {
+        self.out.update(&self.staged);
+        self.staged.clear();
+    }
+    fn newlines(&mut self, mut count: u64) {
         let block = [b'\n'; 4096];
         while count != 0 {
             let n = count.min(block.len() as u64) as usize;
-            hash.update(&block[..n]);
+            self.emit(&block[..n]);
             count -= n as u64;
         }
+    }
+    /// Hash the deferred newlines (unless already hashed) and whitespace.
+    fn flush_deferred(&mut self) {
+        if !self.nonblank {
+            self.newlines(self.pending_lines);
+            self.pending_lines = 0;
+        }
+        let blanks = std::mem::take(&mut self.blanks);
+        self.emit(&blanks);
+        self.blanks = blanks;
+        self.blanks.clear();
+    }
+    fn whitespace(&mut self, run: &[u8]) {
+        if self.checkpoint.is_some() {
+            self.emit(run);
+        } else if self.blanks.len() + run.len() <= self.cap {
+            self.blanks.extend_from_slice(run);
+        } else {
+            self.commit();
+            self.checkpoint = Some(self.out.clone());
+            let pending = self.pending_lines;
+            self.flush_deferred();
+            // Restored on rollback together with `out`.
+            self.pending_lines = pending;
+            self.emit(run);
+        }
+    }
+    fn content(&mut self, run: &[u8]) {
+        if self.checkpoint.take().is_some() {
+            // Everything deferred is already in `out` and is now committed.
+            if !self.nonblank {
+                self.pending_lines = 0;
+            }
+        } else {
+            self.flush_deferred();
+        }
+        self.nonblank = true;
+        self.emit(run);
+    }
+    /// Drop this line's trailing whitespace (and, for a blank line, its
+    /// speculatively hashed newlines).
+    fn rollback(&mut self) {
+        if let Some(checkpoint) = self.checkpoint.take() {
+            self.staged.clear();
+            self.out = checkpoint;
+        }
+        self.blanks.clear();
     }
     fn update(&mut self, bytes: &[u8]) {
         for part in bytes.split_inclusive(|b| *b == b'\n') {
@@ -425,52 +501,36 @@ impl TextDigest {
             } else {
                 part
             };
-            if !self.started {
-                self.line = self.done.clone();
-                Self::newlines(&mut self.line, self.pending_lines);
-                self.started = true;
+            // Everything up to the last non-whitespace byte is kept, interior
+            // whitespace included; hash it in one update.
+            let kept = text
+                .iter()
+                .rposition(|b| !b.is_ascii_whitespace())
+                .map_or(0, |i| i + 1);
+            if kept != 0 {
+                self.content(&text[..kept]);
             }
-            let mut pos = 0;
-            while pos < text.len() {
-                let white = text[pos].is_ascii_whitespace();
-                let end = pos
-                    + text[pos..]
-                        .iter()
-                        .take_while(|b| b.is_ascii_whitespace() == white)
-                        .count();
-                if white {
-                    if self.trimmed.is_none() {
-                        self.trimmed = Some(self.line.clone());
-                    }
-                } else {
-                    self.trimmed = None;
-                    self.nonblank = true;
-                }
-                self.line.update(&text[pos..end]);
-                pos = end;
+            if kept != text.len() {
+                self.whitespace(&text[kept..]);
             }
             if newline {
+                self.rollback();
                 if self.nonblank {
-                    self.done = self.trimmed.take().unwrap_or_else(|| self.line.clone());
                     self.pending_lines = 1;
                 } else if !self.loose {
                     self.pending_lines += 1;
                 }
                 self.nonblank = false;
-                self.started = false;
-                self.trimmed = None;
             }
         }
     }
     fn finish(mut self) -> String {
-        if self.nonblank {
-            self.trimmed.take().unwrap_or(self.line).finish()
-        } else {
-            if !self.loose {
-                Self::newlines(&mut self.done, self.pending_lines.saturating_sub(1));
-            }
-            self.done.finish()
+        self.rollback();
+        if !self.nonblank && !self.loose {
+            self.newlines(self.pending_lines.saturating_sub(1));
         }
+        self.commit();
+        self.out.finish()
     }
 }
 
@@ -1572,6 +1632,86 @@ mod tests {
             hash(b"a\n", Normalize::Exact)
         );
     }
+    /// In-memory statement of the documented rules, independent of TextDigest.
+    fn reference_normalize(data: &[u8], loose: bool) -> Vec<u8> {
+        let mut lines: Vec<&[u8]> = data
+            .split(|b| *b == b'\n')
+            .map(|line| {
+                let end = line
+                    .iter()
+                    .rposition(|b| !b.is_ascii_whitespace())
+                    .map_or(0, |i| i + 1);
+                &line[..end]
+            })
+            .collect();
+        if lines.len() > 1 && lines.last() == Some(&&b""[..]) {
+            lines.pop(); // ignore one final newline
+        }
+        if loose {
+            lines.retain(|line| !line.is_empty());
+        }
+        lines.join(&b'\n')
+    }
+
+    /// Regression: strict/loose hashing cloned the digest state per line and per
+    /// whitespace run (1 GiB of text: 21 s SHA-256, 65 s BLAKE3 vs 0.9 s exact).
+    /// The deferred-buffer digest must equal hashing the reference
+    /// normalization for any chunking and for whitespace runs past the buffer.
+    #[test]
+    fn regression_text_digest_matches_reference_for_any_chunking_and_cap() {
+        let alphabet = b"ab \t\r\n\x0b\x0c";
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let mut inputs: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"\n".to_vec(),
+            b"\n\n\na".to_vec(),
+            b"a\n\n\n".to_vec(),
+            b"  \n \n".to_vec(),
+            b"a   ".to_vec(),
+            b"\r\n\r\nx \r\n\r\n".to_vec(),
+        ];
+        for _ in 0..400 {
+            let len = next(40);
+            inputs.push((0..len).map(|_| alphabet[next(alphabet.len())]).collect());
+        }
+        // Past the 64 KiB stage and blank buffers: long words, long space runs.
+        let mut big = Vec::new();
+        while big.len() < 300_000 {
+            let byte = alphabet[next(alphabet.len())];
+            let run = if next(50) == 0 { 70_000 } else { 1 + next(12) };
+            big.extend(std::iter::repeat_n(byte, run));
+        }
+        inputs.push(big);
+        for data in &inputs {
+            for loose in [false, true] {
+                for algo in [Algorithm::Sha256, Algorithm::Blake3] {
+                    let mut want = ContentDigest::new(algo);
+                    want.update(&reference_normalize(data, loose));
+                    let want = want.finish();
+                    for cap in [0, 1, 3, TextDigest::BLANK_CAP] {
+                        for chunk in [1, 2, 5, 64, 1 << 20] {
+                            let mut got = TextDigest::with_cap(algo, loose, cap);
+                            for part in data.chunks(chunk) {
+                                got.update(part);
+                            }
+                            assert_eq!(
+                                got.finish(),
+                                want,
+                                "data={data:?} loose={loose} cap={cap} chunk={chunk}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Regression: write-then-revert and tombstone-of-nothing must not become changes.
     #[test]
     fn regression_changes_revert_and_tombstone_of_nothing() {
@@ -2113,5 +2253,91 @@ mod tests {
             )
             .unwrap_err()
         ));
+    }
+
+    /// Golden fixture for the canonical hash definition. A fixed overlay, built
+    /// through the same COW open FUSE uses (no `files` row for `/a`), must keep
+    /// these exact bytes and digests. Changing them changes every recorded
+    /// seal, bundle and grading hash: update only with a format version bump.
+    /// `test-harness/canonical-hash/reference.py` reproduces the SHA-256 values
+    /// independently. Linux only: macOS reports symlink mode 0755, not 0777.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn golden_canonical_hash_fixture() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base_dir = tmp.path().join("base");
+        fs::create_dir_all(base_dir.join("keep")).unwrap();
+        for (name, body) in [
+            ("a", b"old\n".as_slice()),
+            ("keep/gone.txt", b"gone\n"),
+            ("keep/stay.txt", b"stay\n"),
+            ("tool", b"#!/bin/sh\n"),
+        ] {
+            fs::write(base_dir.join(name), body).unwrap();
+            fs::set_permissions(base_dir.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let base: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base_dir).unwrap());
+        let dir = tmp.path().join("overlay");
+        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        cow_write(&ov, "/a", b"new\n");
+        put(&ov, "/added.txt", b"one  \r\ntwo\t\n\n");
+        ov.unlink("/keep/gone.txt").unwrap();
+        ov.set_attributes(
+            "/tool",
+            None,
+            &OverlayMetadata {
+                mode: Some(0o755),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        ov.create_symlink("/link", "a").unwrap();
+        ov.mkdir("/dir", 0o755).unwrap();
+        drop(ov);
+        // Pin host modes so the umask cannot leak into the fixture.
+        fs::set_permissions(dir.join("added.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(dir.join("dir"), fs::Permissions::from_mode(0o755)).unwrap();
+        let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM files WHERE path='' AND name='a'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "the fixture must exercise a row-less COW edit"
+        );
+        drop(conn);
+
+        let digest = |normalize, algo| {
+            let opts = ChangeOptions {
+                normalize,
+                algo,
+                ..Default::default()
+            };
+            canonical_hash(&change_set(&dir, base.clone(), &opts).unwrap(), &opts).unwrap()
+        };
+        let opts = ChangeOptions::default();
+        let mut stream = Vec::new();
+        for change in change_set(&dir, base.clone(), &opts).unwrap() {
+            change.write_canonical_row(&mut stream, &opts).unwrap();
+        }
+        let got = [
+            String::from_utf8(stream).unwrap().replace('\0', "|"),
+            digest(Normalize::Exact, Algorithm::Sha256),
+            digest(Normalize::Strict, Algorithm::Sha256),
+            digest(Normalize::Loose, Algorithm::Sha256),
+            digest(Normalize::Exact, Algorithm::Blake3),
+        ];
+        let want = [
+            "a|modified|file|100644|sha256:7aa7a5359173d05b63cfd682e3c38487f3cb4f7f1d60659fe59fab1505977d4c|added.txt|added|file|100644|sha256:f553d63a4fb1dd6dc6cba87232d677814a3fead4d03ab645d46aefebd68ceded|dir|added|dir|040755||keep/gone.txt|deleted|file|100644||link|added|symlink|120777|sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb|tool|modified|file|100755|sha256:a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf|",
+            "sha256:d1ff1abce4ef923a02e7c6f4fee513333b8fc4ccaef983a2c6395d3d7fa67026",
+            "sha256:1fac458db6df916fa9721ef40833e417af99988f90cfa06fbf477a241d46cc37",
+            "sha256:73a1c14c339962ca7a2960c48972d7935a9cd82a14bf9c0c2cebb779b02d7aa6",
+            "blake3:8ae7dafb36e31e43a419c459e00971e868f5aab31200910dff08c2db0ae18709",
+        ];
+        assert_eq!(got, want, "canonical hash definition drifted");
     }
 }

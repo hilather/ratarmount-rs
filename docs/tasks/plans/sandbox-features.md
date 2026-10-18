@@ -137,8 +137,24 @@ wave 0:  META ─┬─────────────┬──────
 
 | What | Result | Notes |
 |---|---|---|
-| Journal overhead (`benchmarks/journal-overhead.sh`, release, 3+3 runs) | -3.0% (journal median 1.511 s vs baseline 1.558 s) | Within noise; laptop load average ~13 from another build. Rerun on a quiet machine before quoting. |
+| Journal overhead (`benchmarks/journal-overhead.sh`, release, 16+16 runs, ABBA order, one discarded warm-up) | **+0.2%** paired ABBA estimate (unpaired medians of the same runs: -2.7%) | 2026-10-18, load average ~1.3. The earlier -3.0% (3+3 runs, load ~13) and a -8.7% rerun came from a fixed baseline-first order; the script now alternates ABBA and reports the paired figure. Quote the paired number. |
 | Kernel overlayfs interop (done-when #9) | Pass: ratarmount stack as `lowerdir` in `unshare -Urm`, build ran, imported upperdir manifest == kernel merged view | Linux 7.2.5, unprivileged, 2026-10-17 |
 | End-to-end scenario (git snapshot → prepared `make` → sealed lower → attempt → diff/apply/tree-equal → strict hash equality → import round trip → seal/verify/tamper → fsck → journal marks → pack/unpack) | Pass, no mounts left | Linux 7.2.5, debug build, 2026-10-17 |
 | `sandbox run` with real Docker (busybox) | Pass (`RATARMOUNT_TEST_DOCKER=1`) | Docker 29.7.2 |
 | `diff --manifest` / `--hash` over a 1 GiB sparse modified file (release) | 5.1 s / 4.6 s (~210 MB/s) | Load average ~13; the ignored 10 GiB test's 1,029 s was a debug build |
+| Where 1 GiB diff time goes (release, i7-8750H without SHA extensions, 1 GiB base + 1 GiB row-less COW copy, 2026-10-18) | Hashing-bound: `/proc` `rchar` shows each side read once (2.0 GiB total), RSS ~20 MiB. `--hash`/`--manifest`/`--name-status`/`--stat`/patch all ~9.5 s; `--algo blake3` 0.8 s. `sha256sum` alone is 2.45 s/GiB, so the `sha2` crate's software SHA-256 runs at ~0.5x OpenSSL here. No Myers pass: above `--max-diff-bytes` (8 MiB) the patch is `Binary files differ`; `--git` writes a literal (22-25 s, 2.7-8 MB output) | SHA-NI CPUs should be several times faster. Untried: hash both sides in parallel; skip the base hash when sizes differ in exact mode |
+| Strict/loose normalized hashing of 1 GiB text, before → after the TextDigest rewrite | SHA-256 strict 21.2 s → 11.4 s (exact 10.4 s); BLAKE3 strict 64.9 s → 2.95 s (exact 0.86 s) | The old digest cloned the hasher at every line and whitespace run. Hashes unchanged (golden fixture, reference property test) |
+
+## 7. Review follow-ups (2026-10-18)
+
+From the review of #133:
+
+| Item | Outcome |
+|---|---|
+| One test writing through real FUSE (row-less COW edits) where diff, fsck, seal, verify, pack and unpack must agree | `ratarmount/tests/fuse_cow_agreement.rs`: tar base, truncating rewrite and append of existing members (asserted to have no `files` row), new file, delete in an untouched directory, chmod, new dir. One digest from `diff --hash`, `seal`, `verify`, `unpack`, `verify` of the unpacked copy and `diff --strict --hash`. With the host walk removed the test fails (`manifest misses src/a.c`). |
+| `diff --hash` stable across seal (seal must not create rows that change the hash) | Same test: exact and `--normalize strict` hashes and the manifest are identical before and after `seal` and after `fsck --repair`. Seal writes `overlay_metadata` modes and `seal_rows`, never `files` rows. |
+| Golden hash fixture so refactors cannot drift the definition | `golden_canonical_hash_fixture` pins the row stream and the exact/strict/loose SHA-256 and exact BLAKE3 digests of a fixed overlay (includes a row-less COW edit, tombstone, mode-only change, symlink, dir). `test-harness/canonical-hash/reference.py` reproduces the SHA-256 values from the documented rules (CI self-test). Writing it found a docs gap: "ASCII whitespace" excludes vertical tab. Linux-only: macOS symlink modes differ (documented). |
+| Journal overhead rerun on a quiet machine | +0.2% (paired ABBA); see measurements. Benchmark fixed. |
+| Is the 1 GiB diff hashing-bound or diff-bound? | Hashing-bound; `--max-diff-bytes` stops Myers at 8 MiB. Found and fixed the normalized-hash slowdown above. |
+| "FUSE-built fixture as the default for the crate" | Not done wholesale. `ratarmount-compositing` cannot mount FUSE; its tests use `cow_write`, which calls the same `open_overlay_fd(O_TRUNC)` copy-up as FUSE `open`. New cross-subcommand tests should start from `fuse_cow_agreement.rs`. |
+

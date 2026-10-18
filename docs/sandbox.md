@@ -434,8 +434,19 @@ hash, provenance, timestamps and rendered patch text are excluded. Both content
 and row hashing use the chosen algorithm. `Change::row_hash` exposes the same row
 encoding for verification tools to identify mismatching paths.
 
+[`test-harness/canonical-hash/reference.py`](../test-harness/canonical-hash/reference.py)
+is a short, dependency-free reference implementation of the SHA-256 definition,
+including normalization. Its `--self-test` (run in CI) and the Rust test
+`golden_canonical_hash_fixture` pin the same fixture to the same three digests,
+so an external grader can check its own implementation against either. Modes are
+the host `st_mode` values: a symlink is `120777` on Linux but follows the umask on
+macOS (usually `120755`),
+so a canonical hash that includes a symlink is not portable between the two
+unless `--ignore-mode` is used.
+
 `--normalize exact` hashes bytes as written. `strict` converts CRLF to LF, strips
-trailing ASCII whitespace per line and ignores one final newline; it is suitable
+trailing ASCII whitespace per line (space, tab, CR, LF and form feed; not vertical
+tab) and ignores one final newline; it is suitable
 for grading. `loose` additionally removes blank lines and warns once on stderr:
 it is for analysis only, because blank lines can affect tests. Symlink targets
 and binary data always use exact bytes. Normalization applies only to hash and
