@@ -84,16 +84,25 @@ fn read_bounded(reader: impl Read, limit: u64) -> io::Result<Vec<u8>> {
 }
 
 /// The open source is retained for sealing, so Git branches are resolved once.
-struct ImportStack {
-    source: Arc<dyn MountSource>,
-    info: OverlayCreateInfo,
-    inputs: Vec<PathBuf>,
+pub(super) struct ImportStack {
+    pub source: Arc<dyn MountSource>,
+    pub info: OverlayCreateInfo,
+    pub inputs: Vec<PathBuf>,
 }
 
 impl ImportStack {
     fn open(args: &ImportArgs) -> Result<Self, String> {
-        let lowers = super::MountLowerStack::read(&args.lower, args.allow_unsealed_lower)?;
-        let mut inputs = vec![PathBuf::from(&args.base)];
+        Self::open_base(&args.base, &args.lower, args.allow_unsealed_lower)
+    }
+
+    /// Shared by patch and kernel upperdir imports; retain the pinned stack for sealing.
+    pub fn open_base(
+        base: &str,
+        lower: &[PathBuf],
+        allow_unsealed_lower: bool,
+    ) -> Result<Self, String> {
+        let lowers = super::MountLowerStack::read(lower, allow_unsealed_lower)?;
+        let mut inputs = vec![PathBuf::from(base)];
         let mut open = OpenOptions {
             write_index: false,
             index_in_memory: true,
@@ -114,7 +123,7 @@ impl ImportStack {
         Ok(Self {
             source,
             info: OverlayCreateInfo {
-                base_url: args.base.clone(),
+                base_url: base.into(),
                 lower_layers: lowers.records,
                 git_tree,
                 ..Default::default()
@@ -124,7 +133,7 @@ impl ImportStack {
     }
 }
 
-fn validate_destination(dir: &Path) -> Result<(), String> {
+pub(super) fn validate_destination(dir: &Path) -> Result<(), String> {
     match fs::symlink_metadata(dir) {
         Ok(meta) if meta.is_dir() => {
             if fs::read_dir(dir)

@@ -1089,6 +1089,76 @@ layer is unpacked once into
 cached sealed directory after checking its immutable database and sentinel;
 a damaged cache entry is refused. Directory lowers continue to work normally.
 
+## Kernel overlayfs interop
+
+`ratarmount overlay import-upperdir` converts a stopped kernel overlayfs
+upperdir into a ratarmount overlay. Pass the same base and sealed lower layers
+that supplied the kernel's lowerdir, in the same bottom-to-top order:
+
+```bash
+ratarmount overlay import-upperdir --lower prepared upperdir attempt base.tar.zst
+ratarmount diff --manifest attempt
+```
+
+The destination must be new or empty. Import seals it by default and prints
+its layer digest; `--no-seal` leaves it writable. Success exits 0, errors exit 2.
+The importer shares patch import's base opening, Git revision pinning, lower
+stack composition and overlay creation metadata. It reads files in bounded
+chunks, preserves modes, mtimes and symlink targets, and never traverses a
+symlink entry. Stop writers and unmount the kernel overlay before importing;
+if copying its upperdir, preserve xattrs and whiteouts.
+
+Character devices with device number 0:0 and `.wh.NAME` markers become
+tombstones. The importer also accepts regular-file whiteouts carrying
+`user.overlay.whiteout` or `trusted.overlay.whiteout`. A directory with
+`trusted.overlay.opaque=y`, `user.overlay.opaque=y`, or a `.wh..wh..opq` marker
+hides lower children absent from its upper tree, including descendants under
+retained upper directories. Marker files are not exposed in the imported view.
+Redirect and metacopy xattrs cause an error: use `redirect_dir=off,metacopy=off`
+when creating the kernel overlay. Other special files and non-UTF-8 names or
+symlink targets are refused. Ownership, hardlink relationships and arbitrary
+xattrs are not imported.
+
+The intended forker layout mounts a read-only ratarmount stack outside the user
+namespace, then uses that mountpoint as overlayfs's `lowerdir` inside
+`unshare -Urm`. Both `upperdir` and `workdir` live on one tmpfs. The opt-in test
+uses these mount options:
+
+```text
+lowerdir=MNT,upperdir=TMPFS/up,workdir=TMPFS/work,userxattr,index=off,xino=off,redirect_dir=off,metacopy=off
+```
+
+It uses the same mapped user for the FUSE mount and namespace, without
+`allow_other` by default. Set `RATARMOUNT_OVERLAYFS_ALLOW_OTHER=1` to probe
+`-o allow_other` when the host's FUSE policy permits it. FUSE lowerdir support
+depends on the host kernel and filesystem behavior, including directory entry
+types; `index` and `xino` are disabled in the baseline probe. No claim is made
+that those options are required on every kernel.
+
+Run the probe on a host with `/dev/fuse`, `fusermount3`, `unshare`, `mount`,
+`umount`, Python 3 and make:
+
+```bash
+RATARMOUNT_TEST_OVERLAYFS=1 cargo test -p ratarmount --test overlayfs_interop -- --nocapture
+```
+
+The test runs a small make/check workload, deletes lower files, replaces an
+opaque directory, changes entry types, and imports both the native upperdir
+and a portable copy. Its copy preserves xattrs and converts device whiteouts
+to `.wh.` markers so copying needs no `mknod` privilege. Independent snapshots
+of the kernel's lower and merged trees validate `diff --manifest` paths,
+types, modes and hashes; the complete composed imported views are also compared
+to the merged snapshot. Missing tools, disabled namespaces, or a rejected
+overlayfs mount print a skip reason, including kernel/options for mount errors.
+Build, import and comparison errors after a successful mount fail the test.
+
+Local sandbox probe (2026-10-17): `unshare -Urm true` succeeded, but `/dev/fuse`
+is absent. The real FUSE-lowerdir/overlayfs run therefore remains unverified
+here; no kernel compatibility result is inferred from the offline tests.
+The orchestrator must run the opt-in test to establish the host's outcome.
+Always-on tests cover marker whiteouts, recursive opacity, metadata and type
+changes without mounting anything.
+
 ## Overlay import
 
 `ratarmount overlay import` builds a new write overlay from a unified or Git
