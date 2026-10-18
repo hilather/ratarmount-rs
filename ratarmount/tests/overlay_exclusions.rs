@@ -209,6 +209,42 @@ mod mounted {
         true
     }
 
+    /// `fusermount3 -u` with a bounded retry: the kernel keeps the mount busy
+    /// until the daemon has answered the asynchronous FUSE RELEASE of a file
+    /// the test just closed. Falls back to a lazy unmount so none is left stale.
+    fn unmount_with_retry(mnt: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ok = Command::new("fusermount3")
+                .arg("-u")
+                .arg(mnt)
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            // Already unmounted by an earlier attempt also ends the loop.
+            if ok
+                || !fs::metadata(mnt).is_ok_and(|m| {
+                    Some(m.dev()) != fs::metadata(mnt.parent().unwrap()).ok().map(|p| p.dev())
+                })
+            {
+                return;
+            }
+            if Instant::now() > deadline {
+                eprintln!(
+                    "fusermount3 -u {} still busy after 5 s; using -z",
+                    mnt.display()
+                );
+                let _ = Command::new("fusermount3")
+                    .arg("-u")
+                    .arg("-z")
+                    .arg(mnt)
+                    .status();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// One foreground `-w` mount; `Ok` once it was ready, served and unmounted
     /// cleanly, `Err(stderr)` if it exited first (a refusal).
     fn cycle(
@@ -251,9 +287,7 @@ mod mounted {
             .unwrap();
         let parent_dev = fs::metadata(mnt.parent().unwrap()).ok().map(|m| m.dev());
         let deadline = Instant::now() + Duration::from_secs(30);
-        let unmount = || {
-            let _ = Command::new("fusermount3").arg("-u").arg(mnt).status();
-        };
+        let unmount = || unmount_with_retry(mnt);
         let ready = loop {
             if fs::metadata(mnt).is_ok_and(|m| Some(m.dev()) != parent_dev)
                 && fs::read_dir(mnt).is_ok()
@@ -284,9 +318,17 @@ mod mounted {
                 return Ok(());
             }
             if start.elapsed() > Duration::from_secs(30) {
+                let _ = Command::new("fusermount3")
+                    .arg("-u")
+                    .arg("-z")
+                    .arg(mnt)
+                    .status();
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("mount did not exit after unmount");
+                panic!(
+                    "mount did not exit after unmount (cycle for {})",
+                    mnt.display()
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
