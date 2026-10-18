@@ -18,6 +18,8 @@ pub struct BaseOptions {
     /// Octal string, like the mount CLI.
     pub umask: Option<String>,
     pub readonly_globs: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allow_globs: Vec<String>,
     /// Logical bytes (not a filesystem block limit).
     pub quota: Option<u64>,
     pub passthrough: Option<String>,
