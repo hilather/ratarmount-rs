@@ -1,5 +1,6 @@
 //! One-shot container runner. The mount child owns the only overlay writer.
 
+use crate::control_socket_path;
 use clap::Args;
 use ratarmount_compositing::overlay_changes::{self, ChangeOptions, Normalize};
 use ratarmount_compositing::{overlay_fsck, overlay_seal, OverlayMeta, HIDDEN_DB};
@@ -408,12 +409,6 @@ fn wait_database(top: &Path) -> io::Result<()> {
 
 /// Longest control socket path the platforms accept (`sun_path`, macOS 104).
 const MAX_SOCKET_PATH: usize = 100;
-
-/// `<dir>/ratarmount-control-<pid>.sock`: where a mount child started with
-/// `TMPDIR=<dir>` listens for control commands.
-fn control_socket_path(dir: &Path, mount_pid: u32) -> PathBuf {
-    dir.join(format!("ratarmount-control-{mount_pid}.sock"))
-}
 
 /// The private `ratarmount-run-XXXXXX` parent: a 0700 directory owned by the
 /// caller that holds the mountpoint (`mnt`) and the mount child's control

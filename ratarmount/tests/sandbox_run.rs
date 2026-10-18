@@ -622,3 +622,82 @@ fn regression_run_mountpoint_parent_is_private_0700() {
     assert!(left.is_empty(), "left behind: {left:?}");
     assert!(fs::metadata(shared.path()).unwrap().mode() & 0o1000 != 0);
 }
+
+fn names_in(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Regression (F): the mount child's `ratarmount-control-<pid>.sock` stayed in
+/// `TMPDIR` after `sandbox run` unmounted it externally. It now lives in the
+/// private run directory, which is removed, and a socket another process left
+/// in the same `TMPDIR` is never touched.
+#[test]
+fn regression_run_removes_own_control_socket_and_keeps_foreign_one() {
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let private = tempfile::Builder::new()
+        .prefix("rrs-f-tmp-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let foreign = private.path().join("ratarmount-control-1.sock");
+    fs::write(&foreign, b"").unwrap();
+    let output = fixture
+        .command(&[], "echo ok > ok")
+        .env("TMPDIR", private.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        names_in(private.path()),
+        vec!["ratarmount-control-1.sock".to_string()]
+    );
+}
+
+/// Regression (F): after the runner is SIGKILLed, the next run's recovery also
+/// removes the dead run's private directory and its socket.
+#[test]
+fn regression_run_sigkill_recovery_leaves_no_socket_or_run_dir() {
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let private = tempfile::Builder::new()
+        .prefix("rrs-f2-tmp-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut child = fixture
+        .command(&[], "echo ready > ready; sleep 60")
+        .env("TMPDIR", private.path())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(&fixture.top.join("ready"), &mut child);
+    let during = names_in(private.path());
+    assert!(
+        during.iter().any(|n| n.starts_with("ratarmount-run-")),
+        "{during:?}"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let output = fixture
+        .command(&[], "echo recovered > recovered")
+        .env("TMPDIR", private.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let left = names_in(private.path());
+    assert!(left.is_empty(), "left behind: {left:?}");
+}

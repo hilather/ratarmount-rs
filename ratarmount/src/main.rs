@@ -19,7 +19,7 @@ use ratarmount_compress::{
 };
 use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
 use ratarmount_fuse::{
-    clamp_readahead, mount_blocking_with_activity as mount_blocking, parse_byte_size, unmount,
+    clamp_readahead, mount_blocking_with_activity as fuse_mount_blocking, parse_byte_size, unmount,
     PassthroughMode, PassthroughOptions, RECOMMENDED_READAHEAD_BYTES,
 };
 use ratarmount_index::{
@@ -4230,14 +4230,76 @@ fn print_oss_attributions(full: bool) {
 
 type SearchFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
+/// `<dir>/ratarmount-control-<pid>.sock`.
+pub(crate) fn control_socket_path(dir: &Path, pid: u32) -> PathBuf {
+    dir.join(format!("ratarmount-control-{pid}.sock"))
+}
+
+/// Removes the control socket when dropped. The accept thread only unlinks
+/// after its stop flag is set, and `accept()` blocks, so an external
+/// `fusermount -u` never reaches that.
+struct ControlSocket(PathBuf);
+
+impl Drop for ControlSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The live control socket, for the serve paths that end in `process::exit`
+/// (which skips [`ControlSocket`]'s destructor): see [`mount_blocking`].
+static CONTROL_SOCKET: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// [`fuse_mount_blocking`], then unlink the control socket: the mount is over
+/// whether it ended by `fusermount -u`, the control `unmount`, or an error, and
+/// every caller goes on to `process::exit` or returns into a forked child.
+#[allow(clippy::too_many_arguments)]
+fn mount_blocking(
+    source: Arc<dyn MountSource>,
+    mountpoint: impl AsRef<Path>,
+    foreground: bool,
+    writable: bool,
+    overlay: Option<Arc<WriteOverlay>>,
+    extra_fuse_opts: &str,
+    readahead: u64,
+    passthrough: PassthroughOptions,
+    direct_io: bool,
+    activity: ratarmount_fuse::oplog::MountActivity,
+) -> std::io::Result<()> {
+    let r = fuse_mount_blocking(
+        source,
+        mountpoint,
+        foreground,
+        writable,
+        overlay,
+        extra_fuse_opts,
+        readahead,
+        passthrough,
+        direct_io,
+        activity,
+    );
+    remove_registered_control_socket();
+    r
+}
+
+fn remove_registered_control_socket() {
+    let path = CONTROL_SOCKET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Listen for line-based control commands on a Unix socket.
 fn start_control_interface(
     mountpoint: &Path,
     stop: Arc<AtomicBool>,
     on_search: Option<SearchFn>,
     quota: Option<Arc<ratarmount_compositing::OverlayQuota>>,
-) -> Option<PathBuf> {
-    let sock = std::env::temp_dir().join(format!("ratarmount-control-{}.sock", std::process::id()));
+) -> Option<ControlSocket> {
+    let sock = control_socket_path(&std::env::temp_dir(), std::process::id());
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
@@ -4276,7 +4338,8 @@ fn start_control_interface(
         }
         let _ = std::fs::remove_file(&sock_path);
     });
-    Some(sock)
+    *CONTROL_SOCKET.lock().unwrap_or_else(|e| e.into_inner()) = Some(sock.clone());
+    Some(ControlSocket(sock))
 }
 
 fn control_reply_with_quota(
@@ -7529,6 +7592,21 @@ mod sandbox_cli_tests {
                 "{bad}"
             );
         }
+    }
+
+    /// Regression: the control socket file name format and its Drop unlink.
+    #[test]
+    fn regression_control_socket_guard_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = control_socket_path(dir.path(), 4242);
+        assert_eq!(path, dir.path().join("ratarmount-control-4242.sock"));
+        std::fs::write(&path, b"").unwrap();
+        let other = control_socket_path(dir.path(), 1);
+        std::fs::write(&other, b"").unwrap();
+        drop(ControlSocket(path.clone()));
+        assert!(!path.exists());
+        assert!(other.exists(), "another pid's socket must survive");
+        drop(ControlSocket(path));
     }
 
     /// Regression: socket status includes the same live policy fields as the virtual file.
