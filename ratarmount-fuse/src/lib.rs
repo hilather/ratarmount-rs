@@ -908,6 +908,20 @@ impl RatarmountFs {
         };
         let value = match key {
             "user.ratarmount.base_digest" => meta("base_digest")?,
+            "user.ratarmount.base_digest_state" => {
+                if self.overlay.is_some() {
+                    ratarmount_compositing::base_digest_state(
+                        Some(meta("base_digest_kind")?.as_str()).filter(|k| !k.is_empty()),
+                        &meta("base_digest")?,
+                    )
+                    .into()
+                } else {
+                    match meta("base_digest_state")? {
+                        state if state.is_empty() => "none".into(),
+                        state => state,
+                    }
+                }
+            }
             "user.ratarmount.stack_digest" => meta("stack_digest")?,
             "user.ratarmount.sealed" => if meta("sealed_at")?.is_empty() {
                 "0"
@@ -8659,6 +8673,25 @@ mod tests {
             fs.xattr_value(1, "user.ratarmount.base_digest").unwrap(),
             Some(b"sha256:base".to_vec())
         );
+        // Regression: base_digest_state xattr follows the recorded kind.
+        for (kind, digest, state) in [
+            ("pending", "", "pending"),
+            ("strong", "sha256:base", "present"),
+            ("weak", "sha256:weak", "present"),
+            ("git-tree", "git-tree:abc", "present"),
+            ("none", "none", "none"),
+        ] {
+            overlay.set_meta("base_digest_kind", kind).unwrap();
+            overlay.set_meta("base_digest", digest).unwrap();
+            assert_eq!(
+                fs.xattr_value(1, "user.ratarmount.base_digest_state")
+                    .unwrap(),
+                Some(state.as_bytes().to_vec()),
+                "{kind}"
+            );
+        }
+        overlay.set_meta("base_digest_kind", "strong").unwrap();
+        overlay.set_meta("base_digest", "sha256:base").unwrap();
         assert_eq!(
             overlay.meta_value("journal_path").unwrap(),
             // The journal path is canonical (macOS temp dirs live under /var -> /private/var).

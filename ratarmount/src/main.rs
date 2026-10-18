@@ -1634,6 +1634,16 @@ impl MountLowerStack {
                 ratarmount_compositing::stack_digest(&base, &digests)
             },
         );
+        // An empty base here is an archive that was never hashed.
+        metadata.insert(
+            "base_digest_state".into(),
+            if base.is_empty() {
+                "pending"
+            } else {
+                "present"
+            }
+            .into(),
+        );
         metadata.insert("base_digest".into(), base);
         metadata.insert(
             "lower_layers".into(),
@@ -8465,6 +8475,7 @@ mod lower_stack_tests {
         let metadata = stack.read_only_metadata();
         assert_eq!(metadata["base_digest"], "");
         assert_eq!(metadata["stack_digest"], "");
+        assert_eq!(metadata["base_digest_state"], "pending");
     }
 }
 

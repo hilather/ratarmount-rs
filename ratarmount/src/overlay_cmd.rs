@@ -507,6 +507,12 @@ pub fn info(args: &InfoArgs) -> Result<String, String> {
         );
     }
     fields.insert(
+        "base_digest_state".into(),
+        meta.as_ref()
+            .map_or("none", OverlayMeta::base_digest_state)
+            .into(),
+    );
+    fields.insert(
         "legacy".into(),
         meta.as_ref().is_none_or(OverlayMeta::legacy).into(),
     );

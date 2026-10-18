@@ -390,7 +390,7 @@ fn render(prepared: &Prepared, args: &DiffArgs, out: &mut dyn Write) -> io::Resu
             }
             serde_json::to_writer(
                 &mut *out,
-                &serde_json::json!({"patch":hash,"base":base,"stack":stack,"files":prepared.changes.len(),"normalize":prepared.options.normalize.as_str(),"excludes":args.exclude,"algo":prepared.options.algo.as_str(),"sealed":meta.is_some_and(OverlayMeta::layer_sealed),"base_pending":pending}),
+                &serde_json::json!({"patch":hash,"base":base,"stack":stack,"files":prepared.changes.len(),"normalize":prepared.options.normalize.as_str(),"excludes":args.exclude,"algo":prepared.options.algo.as_str(),"sealed":meta.is_some_and(OverlayMeta::layer_sealed),"base_pending":pending,"base_digest_state":meta.map_or("none", OverlayMeta::base_digest_state)}),
             )?;
             out.write_all(b"\n")?;
         } else {

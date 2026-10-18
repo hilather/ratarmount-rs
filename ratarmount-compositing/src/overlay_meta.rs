@@ -211,6 +211,11 @@ impl OverlayMeta {
     pub fn base_digest_kind(&self) -> Option<&str> {
         self.get("base_digest_kind")
     }
+    /// The stable `base_digest_state` contract (docs/sandbox.md, "Digest
+    /// states"): `pending`, `none` or `present`.
+    pub fn base_digest_state(&self) -> &'static str {
+        base_digest_state(self.base_digest_kind(), self.base_digest().unwrap_or(""))
+    }
     pub fn stack_digest(&self) -> Option<&str> {
         self.get("stack_digest")
     }
@@ -623,6 +628,19 @@ pub fn directory_digest_excluding(root: &Path, excludes: &BaseExcludes) -> Resul
         hasher.update(content.as_bytes());
     }
     Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// Map a recorded `base_digest_kind` and `base_digest` to `base_digest_state`:
+/// `pending` while an archive base is not hashed yet, `none` when no digest
+/// was asked for (kind `none`, or nothing recorded), otherwise `present`
+/// (strong, weak and git-tree digests are all `present`; the kind says which).
+pub fn base_digest_state(kind: Option<&str>, digest: &str) -> &'static str {
+    match kind {
+        Some("pending") => "pending",
+        Some("none") => "none",
+        _ if digest.is_empty() || digest == "none" => "none",
+        _ => "present",
+    }
 }
 
 /// A `pending` archive base: what the background hasher or an offline verb
@@ -1153,7 +1171,10 @@ pub fn verify_base(dir: &Path, base: &Path) -> BaseCheck {
     } else if base_meta.is_file() {
         match kind {
             Some("strong") => fs::File::open(base)
-                .and_then(|mut f| sha256_hex_stream(&mut f))
+                .and_then(|mut f| {
+                    test_hash_seam(base);
+                    sha256_hex_stream(&mut f)
+                })
                 .map(|hex| {
                     (
                         recorded.to_owned(),
@@ -2047,6 +2068,19 @@ mod tests {
             .unwrap()
             .values()
             .is_empty());
+    }
+
+    /// The `base_digest_state` mapping: pending, none, and present for every
+    /// recorded digest (strong, weak, git-tree); legacy overlays map by digest.
+    #[test]
+    fn base_digest_state_mapping() {
+        assert_eq!(base_digest_state(Some("pending"), ""), "pending");
+        assert_eq!(base_digest_state(Some("none"), "none"), "none");
+        for kind in ["strong", "weak", "git-tree"] {
+            assert_eq!(base_digest_state(Some(kind), "sha256:x"), "present");
+        }
+        assert_eq!(base_digest_state(None, ""), "none");
+        assert_eq!(base_digest_state(None, "sha256:x"), "present");
     }
 
     fn pending_overlay(root: &Path, archive: &Path, name: &str) -> (PathBuf, PendingBase) {

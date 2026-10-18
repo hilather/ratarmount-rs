@@ -592,6 +592,7 @@ fn regression_pending_xattrs_empty_while_gated() {
     };
     assert_eq!(mount.xattr("base_digest"), "");
     assert_eq!(mount.xattr("stack_digest"), "");
+    assert_eq!(mount.xattr("base_digest_state"), "pending");
     mount.release();
     mount.unmount();
 }
@@ -624,6 +625,7 @@ fn regression_pending_digest_recorded_after_hashing_finishes() {
         mount.xattr("stack_digest"),
         ratarmount_compositing::stack_digest(&expected, &[])
     );
+    assert_eq!(mount.xattr("base_digest_state"), "present");
     mount.unmount();
     let meta = OverlayMeta::read(&mount.overlay).unwrap().unwrap();
     assert_eq!(meta.base_digest_kind(), Some("strong"));

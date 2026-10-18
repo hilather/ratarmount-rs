@@ -53,7 +53,7 @@ pub use overlay_layer::{
     compose_stack, serving_layer, Immutability, LayerIndex, ReadOnlyOverlayLayer,
 };
 pub use overlay_meta::{
-    append_base_excludes, directory_digest, directory_digest_calls_this_thread,
+    append_base_excludes, base_digest_state, directory_digest, directory_digest_calls_this_thread,
     directory_digest_excluding, directory_weak_digest, directory_weak_walks_this_thread,
     record_base_digest, redact_meta_values, resolve_base_excludes, resolve_pending_base_digest,
     stack_digest, verify_base, BaseCheck, BaseDigestRequest, BaseExcludes, BaseStrength,

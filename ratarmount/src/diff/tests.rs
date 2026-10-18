@@ -806,6 +806,29 @@ fn regression_diff_hash_json_pending_base_has_no_stack() {
     assert!(row["base"].is_null(), "{row}");
     assert!(row["stack"].is_null(), "{row}");
     assert_eq!(row["base_pending"], true);
+    assert_eq!(row["base_digest_state"], "pending");
+}
+
+/// `diff --hash --json` reports `base_digest_state` for present and none too.
+#[test]
+fn regression_diff_hash_json_base_digest_state_present_and_none() {
+    for (kind, digest, state) in [
+        ("strong", "sha256:abc", "present"),
+        ("weak", "sha256:def", "present"),
+        ("none", "none", "none"),
+    ] {
+        let (_tmp, mut args) = command_fixture();
+        args.hash = true;
+        args.json = true;
+        meta_set(
+            &args.directory,
+            &[("base_digest_kind", kind), ("base_digest", digest)],
+        );
+        assert_eq!(run(&args), 0);
+        let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
+        assert_eq!(row["base_digest_state"], state, "{kind}: {row}");
+        assert_eq!(row["base_pending"], false, "{kind}: {row}");
+    }
 }
 
 /// Regression: --between rejects different stacks, gives the empty constant for identical trees, and applies A→B.

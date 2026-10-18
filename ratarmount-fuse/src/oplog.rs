@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 pub const STATUS_KEYS: &[&str] = &[
     "user.ratarmount.base_digest",
+    "user.ratarmount.base_digest_state",
     "user.ratarmount.stack_digest",
     "user.ratarmount.sealed",
     "user.ratarmount.layers",
