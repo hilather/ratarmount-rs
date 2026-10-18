@@ -117,8 +117,8 @@ mod busy_probe {
         std::sync::Mutex::new(Vec::new());
     thread_local! {
         /// Busy polls a hashing open makes before it gives up (stands in for
-        /// `CREATE_BUSY_TIMEOUT`); 2 s of 1 ms polls unless a test lowers it.
-        pub static OPEN_POLLS: Cell<i32> = const { Cell::new(2_000) };
+        /// `CREATE_BUSY_TIMEOUT`); `CREATE_BUSY_TIMEOUT` worth of 1 ms polls unless a test lowers it.
+        pub static OPEN_POLLS: Cell<i32> = const { Cell::new(super::CREATE_BUSY_TIMEOUT.as_millis() as i32) };
     }
 }
 
