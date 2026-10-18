@@ -2385,11 +2385,8 @@ fn main() {
                 inputs.first().map(PathBuf::as_path),
                 &args.lower,
                 args.write_overlay.as_deref(),
-                args.journal
-                    .iter()
-                    .cloned()
-                    .chain(mount_point_exclusion(&args, mountpoint.as_deref(), &inputs))
-                    .collect(),
+                args.journal.iter().cloned().collect(),
+                mount_point_exclusion(&args, mountpoint.as_deref(), &inputs).as_deref(),
             ),
             path: (inputs.len() == 1).then(|| inputs[0].clone()),
             git_tree: overlay_git_tree.clone(),
@@ -4654,21 +4651,31 @@ fn split_inputs_mountpoint(paths: &[PathBuf], no_mount: bool) -> (Vec<PathBuf>, 
 /// Base-relative exclusions for the A2 walk of a directory base: the paths of
 /// this invocation (journal, mount point, a new `-w` overlay) resolved with the
 /// topmost-new rule, plus the set an existing `-w` overlay already recorded.
+///
+/// An invocation-only path (journal, mount point) is excluded only if it is
+/// not in the base yet, is the mount point and an empty directory, or is
+/// already in a recorded excluded set (the top's, added below, or the bottom
+/// lower's, which the walk applies itself). Anything else is base content, so
+/// a change to it is a base change, with or without `-w`.
 fn lower_extra_excludes(
     base: Option<&Path>,
     lowers: &[PathBuf],
     overlay: Option<&Path>,
     mut paths: Vec<PathBuf>,
+    mount_point: Option<&Path>,
 ) -> Vec<PathBuf> {
     use ratarmount_compositing::overlay_meta::{resolve_base_excludes, BaseExcludes};
     let Some(base) = base.filter(|b| !lowers.is_empty() && b.is_dir()) else {
         return Vec::new();
     };
-    // Without a `-w` overlay nothing records these paths, so a path that is
-    // already in the base is a change to it, not this invocation's own file;
-    // only paths this invocation will create are excluded.
-    if overlay.is_none() {
-        paths.retain(|p| std::fs::symlink_metadata(p).is_err());
+    paths.retain(|p| std::fs::symlink_metadata(p).is_err());
+    if let Some(mp) = mount_point {
+        let empty_dir = std::fs::symlink_metadata(mp).map_or(true, |m| {
+            m.is_dir() && std::fs::read_dir(mp).is_ok_and(|mut d| d.next().is_none())
+        });
+        if empty_dir {
+            paths.push(mp.to_path_buf());
+        }
     }
     let mut out: Vec<PathBuf> = Vec::new();
     if let Some(overlay) = overlay.filter(|o| o.as_os_str() != ":temp:") {
@@ -8480,8 +8487,79 @@ mod lower_extra_excludes_tests {
             &lowers,
             None,
             vec![base.join("new.log"), base.join("fresh/j.jsonl")],
+            None,
         );
         assert_eq!(out, vec![PathBuf::from("fresh")]);
+    }
+
+    /// Regression: with `-w NEWTOP` the existing-file filter was skipped, so
+    /// `--lower L -w NEWTOP --journal B/new.log` hid an ordinary `B/new.log`
+    /// added to the base after L was sealed.
+    #[test]
+    fn regression_writable_top_excludes_only_new_journal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(base.join("new.log"), b"x").unwrap();
+        let lowers = [dir.path().join("lower")];
+        let top = dir.path().join("newtop");
+        let out = lower_extra_excludes(
+            Some(&base),
+            &lowers,
+            Some(&top),
+            vec![base.join("new.log")],
+            None,
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// An empty mount point directory inside the base is excluded (a repeated
+    /// read-only `--lower` mount keeps working); one with content, or a plain
+    /// file, is base content.
+    #[test]
+    fn regression_mount_point_excluded_only_when_empty_or_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(base.join("mnt")).unwrap();
+        std::fs::create_dir_all(base.join("busy")).unwrap();
+        std::fs::write(base.join("busy/f"), b"x").unwrap();
+        std::fs::write(base.join("file"), b"x").unwrap();
+        let lowers = [dir.path().join("lower")];
+        let run = |mp: PathBuf| lower_extra_excludes(Some(&base), &lowers, None, vec![], Some(&mp));
+        assert_eq!(run(base.join("mnt")), vec![PathBuf::from("mnt")]);
+        assert_eq!(run(base.join("fresh")), vec![PathBuf::from("fresh")]);
+        assert!(run(base.join("busy")).is_empty());
+        assert!(run(base.join("file")).is_empty());
+    }
+
+    /// A `-w` remount of the same top keeps its journal inside the base: the
+    /// top's recorded set (written when the journal did not exist yet) covers it.
+    #[test]
+    fn regression_writable_remount_uses_recorded_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let top = dir.path().join("top");
+        let lowers = [dir.path().join("lower")];
+        let journal = base.join("j.log");
+        let first = lower_extra_excludes(
+            Some(&base),
+            &lowers,
+            Some(&top),
+            vec![journal.clone()],
+            None,
+        );
+        assert_eq!(first, vec![PathBuf::from("j.log")]);
+        std::fs::create_dir(&top).unwrap();
+        let conn = rusqlite::Connection::open(top.join(ratarmount_compositing::HIDDEN_DB)).unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        ratarmount_compositing::OverlayMeta::set(&conn, "base_weak_excludes", r#"["j.log"]"#)
+            .unwrap();
+        drop(conn);
+        std::fs::write(&journal, b"j").unwrap();
+        let again = lower_extra_excludes(Some(&base), &lowers, Some(&top), vec![journal], None);
+        assert!(again.contains(&PathBuf::from("j.log")), "{again:?}");
     }
 }
 
@@ -8535,7 +8613,10 @@ mod lower_marker_key_tests {
         let bundle = dir.path().join("l.tar.zst");
         std::fs::write(&bundle, b"x").unwrap();
         let lowers = [bundle];
-        assert_eq!(lower_base_key(&[a_dir(dir.path())], None, &lowers, true), None);
+        assert_eq!(
+            lower_base_key(&[a_dir(dir.path())], None, &lowers, true),
+            None
+        );
         let bare = dir.path().join("bare.tar");
         std::fs::write(&bare, b"zz").unwrap();
         assert_eq!(lower_base_key(&[bare], None, &lowers, true), None);

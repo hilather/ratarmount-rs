@@ -238,10 +238,17 @@ recorded in `base_weak_excludes` (base-relative, append-only). When the
 overlay's parent does not exist yet (`-w BASE/new/ov`) the topmost new
 component (`new`) is recorded, because creating the overlay adds it. A later
 mount may append a journal path that is not in the base yet; one that already
-exists is base content and is refused. A read-only `--lower` mount (no `-w`)
-has nowhere to record anything, so an invocation path (`--journal`, mount
-point) that already exists in the base is not excluded from the base check: it
-counts as a change to the base (`--force-stack-mismatch` to override). Index and sidecar files that ratarmount
+exists is base content and is refused. The same rule holds for the check of a
+`--lower` stack against its base, with or without `-w`: an invocation path
+(`--journal`, mount point) is left out only if it is not in the base yet, is
+already in a recorded excluded set (the existing top's, or the bottom lower's),
+or is the mount point and an empty directory. Anything else counts as a change
+to the base (`--force-stack-mismatch` to override). A `-w` remount of the same
+top keeps its journal inside the base (it was recorded when first created). A
+read-only `--lower` mount has nowhere to record anything, so a `--journal` file
+that already exists inside the base is refused on the next mount; keep the
+journal outside the base. Repeated read-only mounts with an empty mount point
+directory inside the base work. Index and sidecar files that ratarmount
 itself writes beside an archive (`X.index.sqlite` and its `-wal`/`-shm`,
 `.index.ptr`, pinned `.index.<id>.sqlite`, `.rgzi`, `.gzidx`, commit journals,
 manifests, staging temp names) never count. Archives written, replaced or
