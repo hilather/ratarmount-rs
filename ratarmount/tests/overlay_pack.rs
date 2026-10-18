@@ -121,6 +121,12 @@ fn regression_cow_bundle_cli_roundtrip_and_lower_cache() {
         ),
         0,
     );
+    // Regression: publishing renames the sealed root (macOS needs write
+    // permission for that); the published root must be read-only again.
+    assert_eq!(
+        fs::metadata(&restored).unwrap().permissions().mode() & 0o222,
+        0
+    );
     assert_eq!(
         expect(
             command(

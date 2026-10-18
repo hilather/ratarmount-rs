@@ -627,8 +627,15 @@ fn unpack_impl(bundle: &Path, directory: &Path, require_match: bool) -> io::Resu
     if require_match && !outcome.ok {
         return Err(invalid("bundle seal verification failed"));
     }
+    // macOS (like the BSDs) needs write permission on a directory to rename
+    // it, even within one parent, and the sealed layer root is read-only.
+    // Hold the root by fd so the permission change follows the renamed inode.
+    let root = host::open(layer, directory_flags(), Mode::empty())?;
+    let sealed = host::fstat(&root)?.st_mode;
+    host::fchmod(&root, Mode::from_raw_mode(sealed | 0o200))?;
     fs::rename(layer, directory)
         .map_err(|e| io::Error::new(e.kind(), format!("publish layer: {e}")))?;
+    host::fchmod(&root, Mode::from_raw_mode(sealed))?;
     Ok(outcome)
 }
 
