@@ -16,6 +16,9 @@
 - `sandbox run` mounts with `--control-socket-only` and reads its counters over a private socket: the in-FS `/.ratarmount-control/` (host pid, memory stats, `unmount`) is no longer visible inside the container or the graded mount. (#133)
 - Experimental, may change: `overlay digest-base` and its `--exclude-overlay`, `overlay unpack --max-bytes/--max-entries` and `RATARMOUNT_BUNDLE_MAX_BYTES`/`RATARMOUNT_BUNDLE_MAX_ENTRIES`, `overlay verify --no-base-check`, `sandbox run --cap-add/--pids-limit/--base-digest`, `--control-socket-only`. (#133)
 - `overlay unpack` without a reachable recorded stack now says `content not verified; run overlay verify DIR BASE before using it as a lower` (exit 0 unchanged). (#133)
+- A `--lower` bundle verification marker is used only when the mount serves the archive's own paths: `--prefix`, `--transform`, recursion, `--bind`, corpus and rolling series always re-verify. (#133)
+- A `--journal` file or non-empty mount point that already exists inside a directory base is base content for the `--lower` base check with `-w` too; only new paths, paths already in a recorded excluded set and an empty mount point directory are excluded. A read-only `--lower` mount with an existing journal inside the base is refused on the next mount; keep the journal outside the base. (#133)
+- `sandbox run` redacts signed URLs in the error it exits with, including a failure while finishing; URL redaction no longer panics on multibyte text. (#133)
 
 ### Features
 
