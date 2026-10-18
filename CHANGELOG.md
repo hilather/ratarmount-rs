@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### Changes
+
+- Git mounts (`git:///…`, `--git`) show writable-style modes `0644`/`0755`/`0777` instead of read-only modes. (#133)
+- `ratarmount diff` takes `BASE` as a positional argument (it no longer reads only `meta.base_url`) and reports a rename as a delete plus an add; the old rename detection is behind `--detect-renames`. (#133)
+- A `-w` overlay created by this version records the base's size and mtime and refuses to open after an external change to either; pass `--force-base-mismatch` to override. (#133)
+- **Weak base identity for directories:** a new `-w`, `--overlay-tmpfs` or `--sandbox` overlay over a **directory** base no longer reads the base's content: its digest is `weak:<hex>` over a sorted (path, type, size, mtime; symlink target) manifest from an `lstat` walk, so a 1 GiB directory base mounts in tens of milliseconds (release build; a debug build took 65-86 s before) and FIFOs or unreadable files in the base no longer break creation. An overlay inside a directory base is excluded from the digest (recorded, append-only, in `base_weak_excludes`), ratarmount index sidecars (`.index.sqlite`, `.rgzi`, `.gzidx`, commit journals) are ignored, `--base-digest` is also accepted with `--lower`, and `sandbox run` takes `--base-digest`. A strong digest is available on request: `ratarmount overlay digest-base DIR` (or `ratarmount snapshot`) prints `sha256:<hex>`, which `--base-digest` records. Git bases (tree sha) are unchanged. A weak digest cannot see a content edit that keeps size and mtime. (#133)
+- **Archive bases are hashed after the mount is serving:** an archive base whose SHA-256 is not yet cached is recorded as `pending` and hashed on a background thread; the digest, its cache entry and `stack_digest` are filled in when it finishes. Until then `overlay info` prints `base_digest: pending (computing)` and the root xattrs `user.ratarmount.base_digest` and `stack_digest` are empty. `overlay seal`, `verify`, `pack`, `diff --hash` and `sandbox run` resolve a `pending` digest themselves (one cached pass over the archive); `--base-digest` skips all hashing. (#133)
+- **Behaviour change for working-tree (live directory) bases:** an overlay on a directory base now refuses to reopen after the base's entries, sizes or mtimes change (`base mismatch … use --force-base-mismatch to override`); earlier builds never checked directory bases on remount. Index sidecars written into the base are ignored. A repack that writes into the base (for example `--repack-seekable` next to its input) is base content and changes the digest. `overlay verify` also compares the base (weak manifest, or the full digest when a strong one is recorded). (#133)
+- `--lower BUNDLE` cache entries are keyed by the SHA-256 of the bundle file (`layers/<sha256>`) instead of the claimed layer digest; a fill (or a marker miss) verifies the bundle against the mounted base and lowers by reading the paths the layer mentions (not the whole base); `.verified` markers are used only when the whole stack below is sealed and the base has a strong digest (a supplied `--base-digest` or a cached archive digest); weak directory bases always re-verify; entries from earlier builds are ignored. (#133)
+- Names that are not UTF-8 get `EILSEQ` through the write overlay and FUSE instead of being lossy-converted. (#133)
+- `sandbox run` containers get `--cap-drop ALL`, `--security-opt no-new-privileges` and `--pids-limit 4096`; use `--cap-add` and `--pids-limit` to adjust. (#133)
+- `sandbox run` mounts with `--control-socket-only` and reads its counters over a private socket: the in-FS `/.ratarmount-control/` (host pid, memory stats, `unmount`) is no longer visible inside the container or the graded mount. (#133)
+- Experimental, may change: `overlay digest-base` and its `--exclude-overlay`, `overlay unpack --max-bytes/--max-entries` and `RATARMOUNT_BUNDLE_MAX_BYTES`/`RATARMOUNT_BUNDLE_MAX_ENTRIES`, `overlay verify --no-base-check`, `sandbox run --cap-add/--pids-limit/--base-digest`, `--control-socket-only`. (#133)
+- `overlay unpack` without a reachable recorded stack now says `content not verified; run overlay verify DIR BASE before using it as a lower` (exit 0 unchanged). (#133)
+
+### Features
+
+- Sandbox and grading: sealed layers and `--lower` stacks, `overlay` verbs (`import`, `import-upperdir`, `seal`, `verify`, `fsck`, `pack`, `unpack`, `info`, `digest-base`), bundles as `.tar.zst`, `sandbox run`, the operation journal, canonical diff hashing. (#133)
+
+### Fixes
+
+- A `--lower` bundle is verified against the mounted base and lowers before it is cached, and a cached layer is re-verified on reuse for a new base/stack view. (#133)
+- A `--lower` stack refuses a bottom lower sealed against a different base (override: `--force-stack-mismatch`) and reports the mounted base's identity, not the lower's record. (#133)
+- Overlay metadata, bundles, `overlay info`, `sandbox run` output and mount progress lines no longer show credentials from remote base URLs (userinfo and query are removed for remote schemes; local paths and `git:///` URLs are untouched). (#133)
+- `overlay pack` redacts credentials from `meta.json` and the packed DB. (#133)
+- `overlay verify` also checks the base against the recorded digest (strong digests are rehashed, so same-size mtime-restored edits are caught; weak directory digests are re-walked) and exits 1 with `base mismatch`; `--no-base-check` skips it. (#133)
+- Re-running `overlay seal` completes an interrupted seal (sentinel and read-only modes). (#133)
+- A killed `overlay import` is marked incomplete (`overlay fsck` reports it, `seal` refuses); `overlay unpack` and `--lower` staging directories stay writable until publication, are held by a lock while active, and stale ones are swept. (#133)
+- `/.ratarmount-control/` is reserved in a `-w` overlay when `--control-interface` is on, and `overlay import` refuses it. (#133)
+- The control socket `ratarmount-control-<pid>.sock` is removed on unmount, including an external `fusermount -u`; `sandbox run` gives its mount child a private `TMPDIR` and removes the whole private run directory (socket included) on cleanup. (#133)
+- `overlay unpack` caps extracted bytes and entries; overlay metadata newer than this build, and bundles with a newer layout, are refused. (#133)
+- `sandbox run` mounts under a private 0700 directory. (#133)
+- A panic inside a host `stat` call (for example rustix 1.1 on a pre-epoch mtime on macOS) in `overlay fsck`, `seal`, `verify`, `pack` and `diff` is now an error naming the path (exit 2) instead of aborting the verb with status 101. (#133)
+
 ## 0.1.35
 
 ### Changes
