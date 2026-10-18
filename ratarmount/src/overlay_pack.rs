@@ -761,17 +761,6 @@ impl Drop for Stage {
     }
 }
 
-/// Open for the sweeper's flock without following a symlink planted under a
-/// swept name.
-fn open_nofollow(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    File::options()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-}
-
 const PACK_STAGE_PREFIX: &str = ".ratarmount-pack-stage-";
 const STAGE_PREFIXES: [&str; 3] = [
     ".ratarmount-unpack-",
@@ -829,15 +818,7 @@ fn sweep_pack_temps_in(dir: &OwnedFd) {
         if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_uid != euid {
             continue;
         }
-        #[allow(clippy::unnecessary_cast)]
-        let modified = std::time::UNIX_EPOCH
-            + std::time::Duration::new(
-                u64::try_from(stat.st_mtime).unwrap_or(0),
-                u32::try_from(stat.st_mtime_nsec).unwrap_or(0),
-            );
-        let old_enough = std::time::SystemTime::now()
-            .duration_since(modified)
-            .is_ok_and(|age| age >= PACK_TEMP_MIN_AGE);
+        let old_enough = stat_age(&stat) >= PACK_TEMP_MIN_AGE;
         if !old_enough {
             continue;
         }
@@ -852,7 +833,100 @@ fn sweep_pack_temps_in(dir: &OwnedFd) {
         let same = ratarmount_compositing::host_stat::fstat(&file)
             .is_ok_and(|now| now.st_dev == stat.st_dev && now.st_ino == stat.st_ino);
         if same {
-            let _ = host::unlinkat(dir, name, AtFlags::empty());
+            if let Ok(name) = name.to_str() {
+                unlink_if_same(dir, name, &file);
+            }
+        }
+    }
+}
+
+static QUARANTINE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Remove the directory entry `name` only if it still names the inode behind
+/// `locked`. `unlinkat` acts on the *name*, so checking the opened inode first
+/// leaves a window in which the entry can be replaced by another file (and a
+/// different live pack's locked temp deleted). The entry is renamed to a unique
+/// quarantine name in the same directory, the quarantine name is checked
+/// (`fstatat` without following) against the locked inode, and only then
+/// unlinked; a mismatch puts the entry back (`linkat` never replaces a file
+/// created in the meantime) and removes nothing. Same-uid attackers only: the
+/// directories swept are the caller's own. Returns whether the entry was removed.
+fn unlink_if_same(dir: &OwnedFd, name: &str, locked: &File) -> bool {
+    use std::sync::atomic::Ordering;
+    let Ok(held) = ratarmount_compositing::host_stat::fstat(locked) else {
+        return false;
+    };
+    let quarantine = format!(
+        ".ratarmount-quarantine-{}-{}",
+        std::process::id(),
+        QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    if host::renameat(dir, name, dir, quarantine.as_str()).is_err() {
+        return false;
+    }
+    let same = ratarmount_compositing::host_stat::statat(
+        dir,
+        quarantine.as_str(),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .is_ok_and(|now| now.st_dev == held.st_dev && now.st_ino == held.st_ino);
+    if same {
+        return host::unlinkat(dir, quarantine.as_str(), AtFlags::empty()).is_ok();
+    }
+    if host::linkat(dir, quarantine.as_str(), dir, name, AtFlags::empty()).is_ok() {
+        let _ = host::unlinkat(dir, quarantine.as_str(), AtFlags::empty());
+    }
+    false
+}
+
+/// Age of a stat'ed entry by its mtime (zero for an mtime in the future).
+fn stat_age(stat: &rustix::fs::Stat) -> std::time::Duration {
+    #[allow(clippy::unnecessary_cast)]
+    let modified = std::time::UNIX_EPOCH
+        + std::time::Duration::new(
+            u64::try_from(stat.st_mtime).unwrap_or(0),
+            u32::try_from(stat.st_mtime_nsec).unwrap_or(0),
+        );
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default()
+}
+
+/// Open a regular lock/temp file relative to `dir` for the sweeper's flock,
+/// never following a symlink planted under the name.
+fn open_lock_at(dir: &OwnedFd, name: &str) -> io::Result<File> {
+    let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    Ok(File::from(host::openat(dir, name, flags, Mode::empty())?))
+}
+
+/// Delete everything below `fd` through descriptors only: each child is opened
+/// relative to its parent with `O_NOFOLLOW`, so no pathname (and no symlink
+/// swapped in for an ancestor) is ever resolved. Read-only directories are made
+/// writable first. Best effort.
+fn remove_contents(fd: &OwnedFd) {
+    let _ = host::fchmod(fd, Mode::from_raw_mode(0o700));
+    let Ok(entries) = Dir::read_from(fd) else {
+        return;
+    };
+    let names: Vec<_> = entries
+        .flatten()
+        .map(|e| e.file_name().to_owned())
+        .filter(|n| n.to_bytes() != b"." && n.to_bytes() != b"..")
+        .collect();
+    for name in names {
+        let is_dir = ratarmount_compositing::host_stat::statat(
+            fd,
+            name.as_c_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
+        if is_dir {
+            if let Ok(child) = host::openat(fd, name.as_c_str(), directory_flags(), Mode::empty()) {
+                remove_contents(&child);
+            }
+            let _ = host::unlinkat(fd, name.as_c_str(), AtFlags::REMOVEDIR);
+        } else {
+            let _ = host::unlinkat(fd, name.as_c_str(), AtFlags::empty());
         }
     }
 }
@@ -887,56 +961,65 @@ fn is_legacy_copy_name(name: &str) -> bool {
 /// taken; no mtime heuristic is used for stages with a lock (the root mtime
 /// is a restored archive value). Best effort: errors are ignored.
 fn sweep_stale_stages(parent: &Path, sweep_copies: bool) {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(entries) = fs::read_dir(parent) else {
+    // Resolve the caller's path once and work only relative to the opened
+    // directory: replacing `parent` (or an ancestor) with a symlink after a
+    // lock is taken redirects nothing.
+    let Ok(canonical) = parent.canonicalize() else {
+        return;
+    };
+    let Ok(dir) = open_root(&canonical) else {
+        return;
+    };
+    sweep_stale_stages_in(&dir, sweep_copies);
+}
+
+fn sweep_stale_stages_in(dir: &OwnedFd, sweep_copies: bool) {
+    use ratarmount_compositing::host_stat::{fstat, statat};
+    let Ok(entries) = Dir::read_from(dir) else {
         return;
     };
     let euid = unsafe { libc::geteuid() };
     let day = std::time::Duration::from_secs(24 * 3600);
     let minute = std::time::Duration::from_secs(60);
-    let age = |meta: &fs::Metadata| {
-        meta.modified()
-            .ok()
-            .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
-            .unwrap_or_default()
-    };
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
+        let Ok(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if meta.file_type().is_symlink() || meta.uid() != euid {
+        let Ok(stat) = statat(dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        let kind = stat.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFLNK || stat.st_uid != euid {
             continue;
         }
         if sweep_copies
             && (name.starts_with(COPY_PREFIX) || is_legacy_copy_name(&name))
-            && meta.is_file()
+            && kind == libc::S_IFREG
         {
             // A copy being written has a fresh mtime; the age check closes the
             // gap between its creation and its flock.
-            if age(&meta) < minute {
+            if stat_age(&stat) < minute {
                 continue;
             }
-            let Ok(file) = open_nofollow(&path) else {
+            let Ok(file) = open_lock_at(dir, &name) else {
                 continue;
             };
             if try_flock(&file) {
-                let _ = fs::remove_file(&path);
+                unlink_if_same(dir, &name, &file);
             }
-        } else if name.strip_suffix(".lock").is_some_and(is_stage_name) {
+        } else if name.strip_suffix(".lock").is_some_and(is_stage_name) && kind == libc::S_IFREG {
             // Orphan lock whose stage is gone.
-            let stage = parent.join(name.trim_end_matches(".lock"));
-            if fs::symlink_metadata(&stage).is_err() {
-                if let Ok(file) = open_nofollow(&path) {
+            let stage = name.trim_end_matches(".lock");
+            if statat(dir, stage, AtFlags::SYMLINK_NOFOLLOW).is_err() {
+                if let Ok(file) = open_lock_at(dir, &name) {
                     if try_flock(&file) {
-                        let _ = fs::remove_file(&path);
+                        unlink_if_same(dir, &name, &file);
                     }
                 }
             }
-        } else if is_stage_name(&name) && meta.is_dir() {
-            let lock = lock_path(&path);
-            let held = match open_nofollow(&lock) {
+        } else if is_stage_name(&name) && kind == libc::S_IFDIR {
+            let lock = format!("{name}.lock");
+            let held = match open_lock_at(dir, &lock) {
                 Ok(file) => {
                     if !try_flock(&file) {
                         continue;
@@ -944,15 +1027,26 @@ fn sweep_stale_stages(parent: &Path, sweep_copies: bool) {
                     Some(file)
                 }
                 // No lock: the stage predates locks or is foreign.
-                Err(_) if age(&meta) > day => None,
+                Err(_) if stat_age(&stat) > day => None,
                 Err(_) => continue,
             };
-            if let Ok(root) = open_root(&path) {
-                cleanup_dirs(&root);
+            let Ok(child) = host::openat(dir, name.as_str(), directory_flags(), Mode::empty())
+            else {
+                continue;
+            };
+            // Still the directory that was checked, not one renamed in under
+            // the name; the contents are removed through this descriptor.
+            if !fstat(&child)
+                .is_ok_and(|now| now.st_dev == stat.st_dev && now.st_ino == stat.st_ino)
+            {
+                continue;
             }
-            let _ = fs::remove_dir_all(&path);
-            if held.is_some() {
-                let _ = fs::remove_file(&lock);
+            remove_contents(&child);
+            drop(child);
+            // Non-recursive: only an empty directory goes.
+            let _ = host::unlinkat(dir, name.as_str(), AtFlags::REMOVEDIR);
+            if let Some(file) = held {
+                unlink_if_same(dir, &lock, &file);
             }
         }
     }
@@ -2253,6 +2347,82 @@ mod tests {
             "deleted through the swapped path"
         );
         assert!(!tmp.path().join("moved").join(name).exists());
+    }
+
+    /// Regression (R4-S9a): the stage sweep deleted recursively through the
+    /// parent pathname after taking the stage lock; replacing the parent with a
+    /// symlink then removed another directory's same-named live stage. The whole
+    /// removal is relative to the directory opened once, and a symlink inside a
+    /// stage is unlinked, never followed. (Pre-fix the sweep took a path, so
+    /// there was no way to swap it after the lock: no separate red run.)
+    #[test]
+    fn regression_stage_sweep_is_directory_relative_and_never_follows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let decoy = tmp.path().join("decoy");
+        let outside = tmp.path().join("outside");
+        for dir in [&out, &decoy, &outside] {
+            fs::create_dir(dir).unwrap();
+        }
+        fs::write(outside.join("precious"), b"mine").unwrap();
+        let name = ".ratarmount-pack-stage-Ab3xY9";
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 24 * 3600);
+        for dir in [&out, &decoy] {
+            let stage = dir.join(name);
+            fs::create_dir_all(stage.join("ro/deeper")).unwrap();
+            fs::write(stage.join("ro/deeper/file"), b"x").unwrap();
+            std::os::unix::fs::symlink(&outside, stage.join("link")).unwrap();
+            fs::set_permissions(stage.join("ro"), fs::Permissions::from_mode(0o500)).unwrap();
+            File::open(&stage)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let pinned = open_root(&out).unwrap();
+        // The parent path now names the decoy.
+        fs::rename(&out, tmp.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&decoy, &out).unwrap();
+        sweep_stale_stages_in(&pinned, false);
+        assert!(decoy.join(name).join("ro/deeper/file").exists());
+        assert!(!tmp.path().join("moved").join(name).exists());
+        assert!(outside.join("precious").exists(), "followed a symlink");
+    }
+
+    /// Regression (R4-S9b): the sweeper checked the opened inode and then
+    /// unlinked the *name*; replacing the entry in between deleted a different
+    /// (live, locked) file. The entry is quarantined, verified and only then
+    /// unlinked; a swapped entry is put back.
+    #[test]
+    fn regression_unlink_if_same_leaves_a_swapped_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = open_root(tmp.path()).unwrap();
+        let name = ".ratarmount-pack-Ab3xY9.tmp";
+        fs::write(tmp.path().join(name), b"stale").unwrap();
+        let locked = File::options()
+            .read(true)
+            .write(true)
+            .open(tmp.path().join(name))
+            .unwrap();
+        // Another pack's live temp file takes the name after the open.
+        fs::write(tmp.path().join("live"), b"live pack").unwrap();
+        fs::rename(tmp.path().join("live"), tmp.path().join(name)).unwrap();
+        assert!(!unlink_if_same(&dir, name, &locked));
+        assert_eq!(fs::read(tmp.path().join(name)).unwrap(), b"live pack");
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("quarantine"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // The matching inode is removed, with no quarantine name left behind.
+        let locked = File::options()
+            .read(true)
+            .write(true)
+            .open(tmp.path().join(name))
+            .unwrap();
+        assert!(unlink_if_same(&dir, name, &locked));
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     /// Regression: a stage whose lock another process holds is never swept,
