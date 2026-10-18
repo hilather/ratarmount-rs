@@ -228,9 +228,7 @@ pub fn redact_urls_in_text(text: &str) -> String {
         };
         out.push_str(&rest[..start]);
         let token = &rest[start..];
-        let end = token
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`'))
-            .unwrap_or(token.len());
+        let end = token_end(token);
         // Trailing sentence punctuation is not part of the URL.
         let url = token[..end].trim_end_matches(['.', ',', ';', ':', ')', ']', '}']);
         out.push_str(&redact_base_url(url));
@@ -239,6 +237,31 @@ pub fn redact_urls_in_text(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// End of the URL-looking token at the start of `token`. A rclone connection
+/// string may carry a quoted parameter value (`token='a b'`) that holds quotes,
+/// whitespace and delimiters, so for those the end is found outside any quote
+/// that opens right after `=`.
+fn token_end(token: &str) -> usize {
+    let ends = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`');
+    let rclone = starts_with_ci(token, "rclone");
+    let mut quote = None;
+    let mut previous = ' ';
+    for (i, c) in token.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if rclone && previous == '=' && matches!(c, '"' | '\'') => quote = Some(c),
+            None if ends(c) => return i,
+            None => {}
+        }
+        previous = c;
+    }
+    token.len()
 }
 
 /// [`redact_base_url`] for a path label that may be a remote URL (progress lines).
@@ -291,6 +314,39 @@ mod tests {
         for (input, want) in cases {
             assert_eq!(redact_urls_in_text(input), want, "input {input}");
         }
+    }
+
+    /// Regression (R4-S4): the text scanner ended an rclone token at the first
+    /// quote, so `token='SECRET'` left the secret in logged error text.
+    #[test]
+    fn regression_redact_quoted_rclone_values() {
+        for (input, want) in [
+            ("rclone+remote,token='SECRET':p", "rclone+remote:p"),
+            ("rclone+remote,token=\"SECRET\":p", "rclone+remote:p"),
+            (
+                "failed: rclone+remote,token='a b\"c':p, retry",
+                "failed: rclone+remote:p, retry",
+            ),
+            (
+                "open rclone://:s3,secret_access_key='S 3',region=eu:bkt/k now",
+                "open rclone://:s3,region=eu:bkt/k now",
+            ),
+            (
+                "open 'rclone+remote:bkt/k' now",
+                "open 'rclone+remote:bkt/k' now",
+            ),
+        ] {
+            assert_eq!(redact_urls_in_text(input), want, "text {input}");
+            assert!(!redact_urls_in_text(input).contains("SECRET"));
+        }
+        assert_eq!(
+            redact_base_url("rclone+remote,token='SECRET':p"),
+            "rclone+remote:p"
+        );
+        assert_eq!(
+            redact_base_url("rclone+remote,token=\"SECRET\":p"),
+            "rclone+remote:p"
+        );
     }
 
     #[test]
