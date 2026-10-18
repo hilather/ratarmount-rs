@@ -29,6 +29,10 @@ pub enum OverlayCommand {
     },
     /// Verify a seal. Exit 0: match, 1: mismatches, 2: error or not sealed.
     Verify(SealArgs),
+    /// Pack a sealed overlay as a portable seekable tar.zst bundle.
+    Pack(PackArgs),
+    /// Restore a sealed overlay. Exit 0: match, 1: mismatch, 2: error.
+    Unpack { bundle: PathBuf, directory: PathBuf },
     /// Check overlay consistency. Exit 0: clean/repaired, 1: inconsistencies, 2: error.
     Fsck {
         directory: PathBuf,
@@ -37,6 +41,19 @@ pub enum OverlayCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct PackArgs {
+    pub directory: PathBuf,
+    pub bundle: PathBuf,
+    #[arg(long)]
+    pub include_journal: Option<PathBuf>,
+    #[arg(long)]
+    pub include_index: bool,
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub lower: Vec<PathBuf>,
+    pub base: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -64,6 +81,8 @@ pub fn run(args: &OverlayArgs) -> Result<(String, i32), String> {
         OverlayCommand::Seal(args) => seal(args),
         OverlayCommand::Unseal { directory, i_know } => unseal(directory, *i_know),
         OverlayCommand::Verify(args) => verify(args),
+        OverlayCommand::Pack(args) => Ok(bundle_exit(pack(args))),
+        OverlayCommand::Unpack { bundle, directory } => Ok(bundle_exit(unpack(bundle, directory))),
         OverlayCommand::Fsck {
             directory,
             repair,
@@ -72,7 +91,33 @@ pub fn run(args: &OverlayArgs) -> Result<(String, i32), String> {
     }
 }
 
-fn lower_view(args: &SealArgs) -> Result<std::sync::Arc<dyn ratarmount_core::MountSource>, String> {
+// The mount dispatch historically maps unknown offline errors to exit 1.
+// Bundle verbs reserve that code for a digest mismatch.
+fn bundle_exit(result: Result<(String, i32), String>) -> (String, i32) {
+    result.unwrap_or_else(|error| {
+        eprintln!("{error}");
+        (String::new(), 2)
+    })
+}
+
+pub fn unpack(bundle: &Path, directory: &Path) -> Result<(String, i32), String> {
+    let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
+    let result = super::overlay_pack::unpack(bundle, directory)
+        .map_err(|e| format!("unpack {}: {e}", bundle.display()))?;
+    if !result.verified {
+        eprintln!("recorded stack unavailable; checked immutable database and seal sentinel only");
+    }
+    let output = if result.ok {
+        result.layer_digest
+    } else {
+        format!("{}\nseal mismatch", result.layer_digest)
+    };
+    Ok((output, i32::from(!result.ok)))
+}
+
+pub(super) fn lower_view(
+    args: &SealArgs,
+) -> Result<std::sync::Arc<dyn ratarmount_core::MountSource>, String> {
     use ratarmount_session::factory;
     let meta = OverlayMeta::read(&args.directory)
         .map_err(|e| super::overlay_open_error(&args.directory, &e))?;
@@ -114,6 +159,28 @@ fn lower_view(args: &SealArgs) -> Result<std::sync::Arc<dyn ratarmount_core::Mou
     .map_err(|e| e.to_string())?
     .source;
     ratarmount_compositing::compose_stack(source, &stack.layers).map_err(|e| e.to_string())
+}
+
+pub fn pack(args: &PackArgs) -> Result<(String, i32), String> {
+    let meta = OverlayMeta::read(&args.directory).map_err(|e| e.to_string())?;
+    if !meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
+        return Err("overlay is not sealed".into());
+    }
+    let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
+    let lower = lower_view(&SealArgs {
+        directory: args.directory.clone(),
+        base: args.base.clone(),
+        lower: args.lower.clone(),
+        json: false,
+    })?;
+    let options = super::overlay_pack::PackOptions {
+        include_journal: args.include_journal.clone(),
+        include_index: args.include_index,
+        base: args.base.clone(),
+    };
+    super::overlay_pack::pack(&args.directory, &args.bundle, lower, &options)
+        .map(|digest| (digest, 0))
+        .map_err(|e| format!("pack: {e}"))
 }
 
 pub fn seal(args: &SealArgs) -> Result<(String, i32), String> {
