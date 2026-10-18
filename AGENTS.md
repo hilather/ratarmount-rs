@@ -384,6 +384,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | `--lower` stack check masks the #89 overlay-open errors (corrupt / locked / misplaced DB) | `cargo test -p ratarmount --test overlay_open_error` |
 | Bundles lose seals, modes, timestamps, tombstones or journal/index files; unpack follows traversal/symlink entries; racing `--lower` bundle cache publication (SBX-PACK) | `cargo test -p ratarmount --bin ratarmount overlay_pack::tests` · `cargo test -p ratarmount --test overlay_pack` |
 | `overlay import` loses bytes/types/modes, mishandles hunk offsets, rejects or binary literals, or accepts `..`/absolute/NUL/symlink-component paths; `diff --git → import → diff --hash` does not round-trip (SBX-IMPORT) | `cargo test -p ratarmount --bin ratarmount overlay_import` · `cargo test -p ratarmount --test overlay_import` |
+| `sandbox run` loses cleanup, stale-mount recovery, timeout/signal handling, RAM-top persistence, or the hash/seal/pack report (SBX-RUN) | `cargo test -p ratarmount --bin ratarmount sandbox::run::tests` · `cargo test -p ratarmount --test sandbox_run` · opt-in: `RATARMOUNT_TEST_DOCKER=1 cargo test -p ratarmount --test sandbox_run regression_run_real_docker_opt_in` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
