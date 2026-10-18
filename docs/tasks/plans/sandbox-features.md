@@ -157,4 +157,4 @@ From the review of #133:
 | Journal overhead rerun on a quiet machine | +0.2% (paired ABBA); see measurements. Benchmark fixed. |
 | Is the 1 GiB diff hashing-bound or diff-bound? | Hashing-bound; `--max-diff-bytes` stops Myers at 8 MiB. Found and fixed the normalized-hash slowdown above. |
 | "FUSE-built fixture as the default for the crate" | Not done wholesale. `ratarmount-compositing` cannot mount FUSE; its tests use `cow_write`, which calls the same `open_overlay_fd(O_TRUNC)` copy-up as FUSE `open`. New cross-subcommand tests should start from `fuse_cow_agreement.rs`. |
-
+| macOS CI (red since the PR's first run, missed at first) | Fixed: `u16` mode type on macOS in pack; `SQLITE_OPEN_NOFOLLOW` rejecting the `/var` → `/private/var` symlink in fsck/seal; renaming the read-only sealed root in unpack. Test fixes: pre-epoch fixture mtime moved to −1.25 s (rustix 1.1 panics on macOS for mtimes in (−1 s, 0), a residual for real files too); APFS rejects non-UTF-8 names. |
