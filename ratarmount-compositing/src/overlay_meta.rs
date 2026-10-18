@@ -1348,6 +1348,8 @@ pub struct BaseComparison {
 
 /// The one cheap identity check: reopen, `overlay seal`/`pack`, `diff` and the
 /// `--lower` mount all compare a base with what the overlay recorded through
+    /// A recorded row (tree id, manifest or stamp) was compared with the base.
+    pub compared: bool,
 /// this. Metadata only, never a content read:
 ///
 /// * directories: the weak walk with the *recorded* exclusions (plus the
@@ -1381,6 +1383,7 @@ pub fn compare_base_identity(
             && (recorded_tree.is_some_and(|r| r != tree)
                 || recorded_weak.is_some()
                 || recorded_stamp.is_some())
+        out.compared = recorded_tree.is_some();
         {
             mismatch = Some(current.clone());
         }
@@ -1405,6 +1408,7 @@ pub fn compare_base_identity(
             let differs = match (recorded_weak, &out.weak) {
                 (Some(recorded), Some(now)) => recorded != now,
                 _ => recorded_stamp.is_some() || recorded_tree.is_some(),
+        out.compared = recorded_weak.is_some();
             };
             if differs && !confirms(probe.supplied) {
                 mismatch = out.weak.clone().or_else(|| Some("a directory".into()));
@@ -1428,6 +1432,7 @@ pub fn compare_base_identity(
             let differs = match recorded_stamp {
                 Some((size, mtime)) => {
                     stamp.size.to_string() != size || stamp.mtime_ns.to_string() != mtime
+        out.compared = recorded_stamp.is_some();
                 }
                 None => recorded_weak.is_some() || recorded_tree.is_some(),
             };
@@ -1447,6 +1452,20 @@ pub fn compare_base_identity(
     if mismatch.is_none() && decidable && strong {
         if let Some(supplied) = probe.supplied.filter(|s| Some(*s) != recorded_digest) {
             mismatch = Some(supplied.to_owned());
+    // A strong record with nothing local to compare (an overlay made over an
+    // HTTP base has no stamp, manifest or tree) agrees with a local base only
+    // if the same strong digest comes from elsewhere.
+    if mismatch.is_none() && decidable && strong && !out.compared {
+        let local =
+            probe.git_tree.is_some() || probe.path.is_some_and(|p| p.is_dir() || p.is_file());
+        if local && !confirms(probe.supplied) && !confirms(out.cached_digest.as_deref()) {
+            mismatch = Some(if out.identity.is_empty() {
+                "a base with no recorded comparison".to_owned()
+            } else {
+                out.identity.clone()
+            });
+        }
+    }
         }
     }
     out.mismatch = mismatch;
@@ -1507,7 +1526,7 @@ pub fn forced_base_record(
             ),
         }
     } else {
-        return Err("the base is not a local directory, archive or Git tree".into());
+        return Err("the base is not a local directory, archive or Git tree; pass --base-digest sha256:<hex> to record its identity".into());
     };
     let layers = meta.lower_layers().map_err(|e| e.to_string())?;
     let stack = stack_digest(
