@@ -49,6 +49,29 @@ ratarmount diff ./changes --base archive.tar          # what changed, as a listi
 ratarmount diff ./changes --base repo.git@<sha> --git # as a Git patch
 ```
 
+## Layered overlays
+
+Internally, `ReadOnlyOverlayLayer` wraps a base `MountSource` and one existing
+overlay directory. `compose_stack` applies directories from bottom to top;
+each layer merges directory entries, hides tombstoned names, and serves its own
+host files before consulting the inner view. A later layer can recreate a
+deleted path. Wrapping the result in `WriteOverlay::new(stack, top)` makes
+copy-up read the composed lower bytes, including files created by a lower layer.
+
+The read-only view uses the same host metadata, metadata-only chmod/utime
+overrides, and xattr replacement/removal rules as a writable overlay. Database,
+marker, and staging names stay hidden. Host symlinks remain symlink entries and
+are never opened as their targets.
+
+Construction snapshots database rows in memory without schema changes or
+repairs. `Immutability::Immutable` opens SQLite with `mode=ro&immutable=1` for
+caller-guaranteed sealed layers; `Shared` uses ordinary read-only access and
+reports a busy writer. Shared rows do not refresh automatically, and host files
+are read directly, so this mode does not promise a consistent live snapshot.
+`serving_layer` reports `base` or `lower:N` (1-based, bottom to top); an entry
+with metadata-only or xattr changes belongs to the layer making those changes.
+Seal checks and mount flags are handled by the caller.
+
 ## Committing offline
 
 ```bash

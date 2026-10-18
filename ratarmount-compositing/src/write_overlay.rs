@@ -200,7 +200,7 @@ pub fn overlay_atime(fi: &FileInfo) -> f64 {
         .unwrap_or(fi.mtime)
 }
 
-fn set_info_atime(fi: &mut FileInfo, atime: f64) {
+pub(crate) fn set_info_atime(fi: &mut FileInfo, atime: f64) {
     fi.userdata
         .retain(|data| !matches!(data, UserData::Other(s) if s.starts_with("overlay-atime:")));
     let index = fi.userdata.len().saturating_sub(1);
@@ -4428,7 +4428,11 @@ fn set_host_metadata(path: &Path, attrs: &OverlayMetadata) -> io::Result<()> {
     }
 }
 
-fn file_info_from_overlay_meta(path: &str, host: &Path, meta: &fs::Metadata) -> FileInfo {
+pub(crate) fn file_info_from_overlay_meta(
+    path: &str,
+    host: &Path,
+    meta: &fs::Metadata,
+) -> FileInfo {
     let linkname = if meta.file_type().is_symlink() {
         fs::read_link(host)
             .map(|p| p.to_string_lossy().into_owned())
@@ -5771,7 +5775,7 @@ fn create_overlay_marker(path: &Path) -> io::Result<bool> {
 }
 
 /// WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no equivalent bit.
-fn open_options_nofollow() -> FsOpenOptions {
+pub(crate) fn open_options_nofollow() -> FsOpenOptions {
     let mut opts = FsOpenOptions::new();
     #[cfg(unix)]
     {
