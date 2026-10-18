@@ -48,6 +48,30 @@ pub fn cached_archive_digest(path: &Path, index: Option<&Path>) -> Result<String
     })
 }
 
+/// The cached SHA-256 of `path`, or `None` on a miss. Never hashes the archive.
+pub fn peek_archive_digest(path: &Path, index: Option<&Path>) -> Result<Option<String>> {
+    match cached_with(path, index, false, |_| {
+        Err(IndexError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "digest not cached",
+        )))
+    }) {
+        Ok(digest) => Ok(Some(digest)),
+        Err(IndexError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Like [`cached_archive_digest`], but the caller supplies the hashing (for
+/// example a cancellable stream). The result is cached like any other.
+pub fn cached_archive_digest_with(
+    path: &Path,
+    index: Option<&Path>,
+    hash: impl FnOnce(&Path) -> std::io::Result<String>,
+) -> Result<String> {
+    cached_with(path, index, false, |path| Ok(hash(path)?))
+}
+
 /// Rehash after an intentional archive commit and replace its cached identity.
 /// Unlike `cached_archive_digest`, this never trusts a pre-commit cache hit.
 pub fn refresh_archive_digest(path: &Path, index: Option<&Path>) -> Result<String> {

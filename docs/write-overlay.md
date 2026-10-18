@@ -36,7 +36,7 @@ receive only `format_version=1` and remain legacy, without a fabricated base
 identity. See [Overlay metadata](sandbox.md#overlay-metadata) for keys, digest
 kinds, `--base-digest`, and cheap remount verification. A directory base records
 a `weak` digest (path, type, size, mtime; `base_weak_digest`, `base_weak_excludes`)
-and is never content-hashed by a mount; use `ratarmount overlay digest-base` for
+and is never content-hashed by a mount (an archive base is hashed in the background after the mount is serving, recorded as `pending` until then; see sandbox.md); use `ratarmount overlay digest-base` for
 a strong one.
 Copy-on-write stages each copy in a `.ratarmount.overlay.cow-*` temp next to
 its destination, hidden the same way (ASCII case ignored); `--commit-overlay`

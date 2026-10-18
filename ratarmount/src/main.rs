@@ -34,6 +34,7 @@ use ratarmount_session::factory;
 #[macro_use]
 mod quiet_print;
 
+mod base_digest;
 mod corpus;
 mod diff;
 mod export_index;
@@ -3098,6 +3099,7 @@ fn spawn_interval_if(
     stop: Option<ratarmount_nfs::NfsStop>,
     open_opts: &OpenOptions,
 ) -> Option<thread::JoinHandle<()>> {
+    base_digest::spawn_if_pending(overlay);
     match (overlay, live_archive, commit_interval) {
         (Some(ov), Some(archive), Some(dur)) => Some(overlay_commit::spawn_interval_commits(
             Arc::clone(ov),
@@ -3129,6 +3131,7 @@ fn finish_overlay_serve(
     commit: impl FnOnce(Option<&WriteOverlay>),
 ) {
     overlay_commit::request_shutdown();
+    base_digest::join();
     if let Some(handle) = interval {
         let _ = handle.join();
     }
@@ -6696,6 +6699,39 @@ mod overlay_unmount_drop_tests {
         });
         let source: Arc<dyn MountSource> = Arc::clone(&ov) as Arc<dyn MountSource>;
         finish_overlay_serve(Some(ov), Some(source), Some(interval), |_| {});
+        assert!(
+            weak.upgrade().is_none(),
+            "overlay Arc still alive after finish"
+        );
+    }
+
+    /// Regression: the lazy base-digest thread must be joined before the
+    /// overlay drops, or `process::exit` strands `WriteOverlay::drop`.
+    #[test]
+    fn finish_overlay_serve_joins_base_digest_thread() {
+        let _guard = lock_term_flag();
+        let _reset = ResetTerm;
+        crate::overlay_commit::set_term_flag_for_test(false);
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, vec![7u8; 1 << 20]).unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(
+            WriteOverlay::new_with_create_info(
+                Arc::new(EmptyBase) as Arc<dyn MountSource>,
+                &overlay,
+                &ratarmount_compositing::OverlayCreateInfo {
+                    base_url: archive.to_str().unwrap().into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(ov.pending_base().unwrap().is_some());
+        let weak = Arc::downgrade(&ov);
+        let ov = Some(ov);
+        crate::base_digest::spawn_if_pending(&ov);
+        finish_overlay_serve(ov, None, None, |_| {});
         assert!(
             weak.upgrade().is_none(),
             "overlay Arc still alive after finish"

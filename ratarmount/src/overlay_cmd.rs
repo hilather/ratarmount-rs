@@ -406,6 +406,21 @@ pub fn info(args: &InfoArgs) -> Result<String, String> {
                 .map(|(k, v)| (k.clone(), v.clone().into())),
         );
     }
+    // A lazily hashed archive base has no digest yet (spec 1.2): say so rather
+    // than print an empty string.
+    if meta
+        .as_ref()
+        .is_some_and(|m| m.base_digest_kind() == Some("pending"))
+    {
+        fields.insert(
+            "base_digest".into(),
+            if args.json {
+                serde_json::Value::Null
+            } else {
+                "pending (computing)".into()
+            },
+        );
+    }
     fields.insert(
         "legacy".into(),
         meta.as_ref().is_none_or(OverlayMeta::legacy).into(),
@@ -668,6 +683,48 @@ mod tests {
         assert_eq!(output["legacy"], true);
         assert_eq!(output["format_version"], "1");
         assert!(output.get("base_digest").is_none());
+    }
+
+    /// Regression: an archive base still being hashed must read as pending
+    /// (JSON `null` + kind `pending`, text "pending (computing)"), not as an
+    /// empty digest.
+    #[test]
+    fn regression_pending_overlay_info_reports_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("a.tar");
+        std::fs::write(&archive, b"abc").unwrap();
+        let overlay = root.path().join("overlay");
+        drop(
+            WriteOverlay::new_with_create_info(
+                Arc::new(FolderMountSource::new(root.path()).unwrap()),
+                &overlay,
+                &OverlayCreateInfo {
+                    base_url: archive.to_str().unwrap().into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let json: serde_json::Value = serde_json::from_str(
+            &info(&InfoArgs {
+                directory: overlay.clone(),
+                json: true,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["base_digest"], serde_json::Value::Null);
+        assert_eq!(json["base_digest_kind"], "pending");
+        assert!(json.get("stack_digest").is_none());
+        let text = info(&InfoArgs {
+            directory: overlay,
+            json: false,
+        })
+        .unwrap();
+        assert!(
+            text.contains("base_digest: pending (computing)\n"),
+            "{text}"
+        );
     }
 
     /// Regression: a Git branch moving during startup must not change the mounted base tree.

@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ratarmount_index::{cached_archive_digest, sha256_hex, sha256_hex_stream, ArchiveDigestStamp};
+use ratarmount_index::{
+    cached_archive_digest_with, peek_archive_digest, sha256_hex, sha256_hex_stream,
+    ArchiveDigestStamp,
+};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -592,6 +595,134 @@ pub fn directory_digest_excluding(root: &Path, excludes: &BaseExcludes) -> Resul
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+/// A `pending` archive base: what the background hasher or an offline verb
+/// hashes, with the stamp recorded at creation.
+#[derive(Clone, Debug)]
+pub struct PendingBase {
+    pub path: PathBuf,
+    pub index: Option<PathBuf>,
+    pub size: u64,
+    pub mtime_ns: i128,
+}
+
+impl PendingBase {
+    /// `Some` when the overlay's base digest is still `pending`.
+    pub fn from_meta(meta: &OverlayMeta) -> Result<Option<Self>> {
+        if meta.base_digest_kind() != Some("pending") {
+            return Ok(None);
+        }
+        let field = |key: &str| {
+            meta.get(key)
+                .ok_or_else(|| OverlayError::Msg(format!("pending base digest: no {key} recorded")))
+        };
+        let parse = |key: &str| {
+            field(key)?
+                .parse::<i128>()
+                .map_err(|e| OverlayError::Msg(format!("pending base digest: bad {key}: {e}")))
+        };
+        Ok(Some(Self {
+            path: PathBuf::from(field("base_local_path")?),
+            index: meta.get("base_index_path").map(PathBuf::from),
+            size: u64::try_from(parse("base_size")?).map_err(|e| {
+                OverlayError::Msg(format!("pending base digest: bad base_size: {e}"))
+            })?,
+            mtime_ns: parse("base_mtime_ns")?,
+        }))
+    }
+
+    fn stamp_matches(&self) -> Result<bool> {
+        let now = ArchiveDigestStamp::read(&self.path)?;
+        Ok(now.size == self.size && now.mtime_ns == self.mtime_ns)
+    }
+
+    /// SHA-256 of the archive (a cache hit is free). `check` is polled between
+    /// chunks; an error from it abandons the hash and nothing is cached. The
+    /// stamp must still equal the recorded one before and after.
+    pub fn hash(&self, check: &dyn Fn() -> std::io::Result<()>) -> Result<String> {
+        if !self.stamp_matches()? {
+            return Err(OverlayError::Msg(format!(
+                "base {} changed since the overlay was created; its digest cannot be resolved (use --force-base-mismatch when remounting)",
+                self.path.display()
+            )));
+        }
+        let digest = cached_archive_digest_with(&self.path, self.index.as_deref(), |path| {
+            struct Checked<'a, R>(R, &'a dyn Fn() -> std::io::Result<()>);
+            impl<R: std::io::Read> std::io::Read for Checked<'_, R> {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    (self.1)()?;
+                    self.0.read(buf)
+                }
+            }
+            sha256_hex_stream(&mut Checked(fs::File::open(path)?, check))
+        })
+        .map_err(|e| OverlayError::Msg(format!("cannot hash base {}: {e}", self.path.display())))?;
+        if !self.stamp_matches()? {
+            return Err(OverlayError::Msg("base changed while hashing".into()));
+        }
+        Ok(digest)
+    }
+}
+
+/// Compare-and-set a pending digest to `strong`. A no-op (`false`) unless the
+/// kind is still `pending` and the recorded stamp still equals `pending`'s, so
+/// a supplied digest, a forced reopen or a commit that moved the stamp wins.
+pub fn record_base_digest(conn: &Connection, pending: &PendingBase, digest: &str) -> Result<bool> {
+    conn.execute_batch("SAVEPOINT overlay_record_base_digest")?;
+    let result = (|| -> Result<bool> {
+        let meta = OverlayMeta::from_connection(conn)?;
+        let Some(meta) = meta.filter(|m| m.base_digest_kind() == Some("pending")) else {
+            return Ok(false);
+        };
+        if meta.get("base_size") != Some(pending.size.to_string().as_str())
+            || meta.get("base_mtime_ns") != Some(pending.mtime_ns.to_string().as_str())
+        {
+            return Ok(false);
+        }
+        let layers = meta.lower_layers()?;
+        let stack = stack_digest(
+            digest,
+            &layers
+                .iter()
+                .map(|l| l.layer_digest.as_str())
+                .collect::<Vec<_>>(),
+        );
+        OverlayMeta::set_many(
+            conn,
+            &[
+                ("base_digest", digest),
+                ("base_digest_kind", "strong"),
+                ("stack_digest", &stack),
+            ],
+        )?;
+        Ok(true)
+    })();
+    match result {
+        Ok(done) => {
+            conn.execute_batch("RELEASE overlay_record_base_digest")?;
+            Ok(done)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO overlay_record_base_digest; RELEASE overlay_record_base_digest",
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Hash and record a `pending` base digest through `conn`. `false` when the
+/// digest was not pending. Offline verbs that need the digest call this.
+pub fn resolve_pending_base_digest(conn: &Connection) -> Result<bool> {
+    let Some(meta) = OverlayMeta::from_connection(conn)? else {
+        return Ok(false);
+    };
+    let Some(pending) = PendingBase::from_meta(&meta)? else {
+        return Ok(false);
+    };
+    let digest = pending.hash(&|| Ok(()))?;
+    record_base_digest(conn, &pending, &digest)
+}
+
 fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -641,10 +772,15 @@ impl OverlayCreateInfo {
                 };
                 return Ok((weak, "weak"));
             }
-            let digest = cached_archive_digest(path, self.index_path.as_deref()).map_err(|e| {
-                OverlayError::Msg(format!("cannot hash base {}: {e}", path.display()))
-            })?;
-            return Ok((digest, "strong"));
+            // Hashing happens after the mount is serving (spec 1.2): a miss is
+            // recorded as `pending` and resolved by the mount's background
+            // hasher or by the first verb that needs the digest.
+            let cached = peek_archive_digest(path, self.index_path.as_deref())
+                .map_err(|e| OverlayError::Msg(format!("cannot read base digest cache: {e}")))?;
+            return Ok(match cached {
+                Some(digest) => (digest, "strong"),
+                None => (String::new(), "pending"),
+            });
         }
         let token =
             serde_json::to_vec(&(&self.base_url, &self.remote_token)).expect("strings serialize");
@@ -697,7 +833,10 @@ pub(crate) fn initialize(
             serde_json::to_string(&info.lower_layers)
                 .map_err(|e| OverlayError::Msg(e.to_string()))?,
         ),
-        (
+    ]);
+    // A pending base has no stack digest until its digest is known.
+    if kind != "pending" {
+        values.insert(
             "stack_digest",
             stack_digest(
                 &digest,
@@ -707,8 +846,8 @@ pub(crate) fn initialize(
                     .map(|l| l.layer_digest.as_str())
                     .collect::<Vec<_>>(),
             ),
-        ),
-    ]);
+        );
+    }
     if kind != "none" {
         let supplied = matches!(info.base_digest, BaseDigestRequest::Supplied(_));
         values.insert(
@@ -768,8 +907,13 @@ pub(crate) fn refresh_committed_base(conn: &Connection, archive: &Path) -> Resul
         &sibling
     };
     let digest = match meta.base_digest_kind() {
-        Some("strong") => ratarmount_index::refresh_archive_digest(&archive, Some(index))
-            .map_err(|error| OverlayError::Msg(format!("cannot hash committed base: {error}")))?,
+        // A commit rewrites the archive anyway; its new digest also resolves
+        // a digest that was still pending.
+        Some("strong" | "pending") => {
+            ratarmount_index::refresh_archive_digest(&archive, Some(index)).map_err(|error| {
+                OverlayError::Msg(format!("cannot hash committed base: {error}"))
+            })?
+        }
         Some("weak") => format!("weak:size={},mtime_ns={}", stamp.size, stamp.mtime_ns),
         _ => meta.base_digest().unwrap_or("none").to_owned(),
     };
@@ -786,17 +930,27 @@ pub(crate) fn refresh_committed_base(conn: &Connection, archive: &Path) -> Resul
             .map(|l| l.layer_digest.as_str())
             .collect::<Vec<_>>(),
     );
+    let kind = if meta.base_digest_kind() == Some("pending") {
+        "strong"
+    } else {
+        meta.base_digest_kind().unwrap_or("none")
+    };
+    let values = [
+        ("base_size", stamp.size.to_string()),
+        ("base_mtime_ns", stamp.mtime_ns.to_string()),
+        ("base_digest", digest),
+        ("base_digest_kind", kind.to_owned()),
+        ("stack_digest", stack),
+        ("base_committed_at", timestamp()),
+        ("base_local_path", archive.to_string_lossy().into_owned()),
+        ("base_index_path", index.to_string_lossy().into_owned()),
+    ];
     OverlayMeta::set_many(
         conn,
-        &[
-            ("base_size", &stamp.size.to_string()),
-            ("base_mtime_ns", &stamp.mtime_ns.to_string()),
-            ("base_digest", &digest),
-            ("stack_digest", &stack),
-            ("base_committed_at", &timestamp()),
-            ("base_local_path", &archive.to_string_lossy()),
-            ("base_index_path", &index.to_string_lossy()),
-        ],
+        &values
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect::<Vec<_>>(),
     )
 }
 
@@ -820,7 +974,10 @@ fn verify(
     if meta.base_digest_kind() == Some("none") {
         return Ok(());
     }
-    let old = meta.base_digest().unwrap_or("none");
+    let old = match meta.base_digest_kind() {
+        Some("pending") => "pending",
+        _ => meta.base_digest().unwrap_or("none"),
+    };
     let mut to_append: Vec<PathBuf> = Vec::new();
     let mut mismatch = if let Some(recorded) = meta.get("base_git_tree") {
         (info.git_tree.as_deref() != Some(recorded)).then(|| {
@@ -958,6 +1115,11 @@ mod tests {
             sealed_at: "2026-10-17T00:00:00Z".into(),
         });
         drop(WriteOverlay::new_with_create_info(base(root.path()), &overlay, &info).unwrap());
+        // An uncached archive is `pending` until something resolves it.
+        assert_eq!(meta_of(&overlay).base_digest_kind(), Some("pending"));
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        assert!(resolve_pending_base_digest(&conn).unwrap());
+        drop(conn);
         let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
         for key in [
             "format_version",
@@ -1057,6 +1219,7 @@ mod tests {
         let overlay = root.path().join("overlay");
         let mut context = info(&archive);
         drop(WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context).unwrap());
+        resolve_pending_base_digest(&Connection::open(overlay.join(HIDDEN_DB)).unwrap()).unwrap();
         let old = OverlayMeta::read(&overlay)
             .unwrap()
             .unwrap()
@@ -1226,7 +1389,9 @@ mod tests {
         // Positive controls: the counters are wired.
         let archive = root.path().join("a.tar");
         fs::write(&archive, b"abc").unwrap();
-        drop(open_dir_base(root.path(), &root.path().join("ov2"), &info(&archive)).unwrap());
+        let ov2 = root.path().join("ov2");
+        drop(open_dir_base(root.path(), &ov2, &info(&archive)).unwrap());
+        resolve_pending_base_digest(&Connection::open(ov2.join(HIDDEN_DB)).unwrap()).unwrap();
         assert!(ratarmount_index::sha256_stream_calls_this_thread() > streams);
         directory_digest(root.path().join("base").join("sub").as_path()).unwrap();
         assert_eq!(directory_digest_calls_this_thread(), dirs + 1);
@@ -1542,5 +1707,163 @@ mod tests {
             .unwrap()
             .values()
             .is_empty());
+    }
+
+    fn pending_overlay(root: &Path, archive: &Path, name: &str) -> (PathBuf, PendingBase) {
+        let overlay = root.join(name);
+        drop(WriteOverlay::new_with_create_info(base(root), &overlay, &info(archive)).unwrap());
+        let meta = meta_of(&overlay);
+        let pending = PendingBase::from_meta(&meta).unwrap().expect("pending");
+        (overlay, pending)
+    }
+
+    /// Regression: an uncached archive base was hashed on the mount's critical
+    /// path; it is now `pending` with no digest and no stack digest.
+    #[test]
+    fn regression_pending_archive_base_records_no_digest_until_resolved() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("a.tar");
+        fs::write(&archive, b"abc").unwrap();
+        let before = ratarmount_index::sha256_stream_calls_this_thread();
+        let (overlay, _) = pending_overlay(root.path(), &archive, "overlay");
+        assert_eq!(ratarmount_index::sha256_stream_calls_this_thread(), before);
+        let meta = meta_of(&overlay);
+        assert_eq!(meta.base_digest_kind(), Some("pending"));
+        assert_eq!(meta.base_digest(), Some(""));
+        assert_eq!(meta.stack_digest(), None);
+        assert_eq!(meta.get("base_digest_source"), Some("computed"));
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        assert!(resolve_pending_base_digest(&conn).unwrap());
+        assert!(!resolve_pending_base_digest(&conn).unwrap());
+        drop(conn);
+        let meta = meta_of(&overlay);
+        assert_eq!(meta.base_digest_kind(), Some("strong"));
+        assert_eq!(
+            meta.base_digest(),
+            Some(format!("sha256:{:x}", Sha256::digest(b"abc")).as_str())
+        );
+        assert_eq!(
+            meta.stack_digest(),
+            Some(stack_digest(meta.base_digest().unwrap(), &[]).as_str())
+        );
+        assert!(ratarmount_index::sha256_stream_calls_this_thread() > before);
+    }
+
+    /// Regression: `record_base_digest` must be a compare-and-set on `pending`
+    /// for the recorded stamp, so a supplied digest or a moved archive wins.
+    #[test]
+    fn regression_pending_cas_loses_to_supplied_digest_and_changed_stamp() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("a.tar");
+        fs::write(&archive, b"abc").unwrap();
+        let (overlay, pending) = pending_overlay(root.path(), &archive, "overlay");
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        let digest = format!("sha256:{}", "b".repeat(64));
+        // A changed stamp (a commit moved the archive) records nothing.
+        let moved = PendingBase {
+            size: pending.size + 1,
+            ..pending.clone()
+        };
+        assert!(!record_base_digest(&conn, &moved, &digest).unwrap());
+        assert_eq!(meta_of(&overlay).base_digest_kind(), Some("pending"));
+        // A digest recorded by someone else first wins.
+        OverlayMeta::set_many(
+            &conn,
+            &[
+                ("base_digest", "sha256:supplied"),
+                ("base_digest_kind", "strong"),
+            ],
+        )
+        .unwrap();
+        assert!(!record_base_digest(&conn, &pending, &digest).unwrap());
+        assert_eq!(meta_of(&overlay).base_digest(), Some("sha256:supplied"));
+    }
+
+    /// Regression: a pending reopen must still run the size/mtime check
+    /// before anything is hashed, naming `--force-base-mismatch`.
+    #[test]
+    fn regression_pending_reopen_size_mtime_check_still_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("a.tar");
+        fs::write(&archive, b"abc").unwrap();
+        let (overlay, _) = pending_overlay(root.path(), &archive, "overlay");
+        drop(
+            WriteOverlay::new_with_create_info(base(root.path()), &overlay, &info(&archive))
+                .unwrap(),
+        );
+        fs::write(&archive, b"changed").unwrap();
+        let before = ratarmount_index::sha256_stream_calls_this_thread();
+        let error =
+            WriteOverlay::new_with_create_info(base(root.path()), &overlay, &info(&archive))
+                .err()
+                .unwrap()
+                .to_string();
+        assert!(
+            error.contains("base mismatch") && error.contains("recorded digest pending"),
+            "{error}"
+        );
+        assert!(error.contains("--force-base-mismatch"), "{error}");
+        assert_eq!(ratarmount_index::sha256_stream_calls_this_thread(), before);
+        // The stale record cannot be resolved against the changed archive.
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        let error = resolve_pending_base_digest(&conn).unwrap_err().to_string();
+        assert!(
+            error.contains("changed since the overlay was created"),
+            "{error}"
+        );
+        assert_eq!(meta_of(&overlay).base_digest_kind(), Some("pending"));
+    }
+
+    /// Regression: a digest resolved once is cached in the index, so a second
+    /// overlay on the same archive records `strong` at creation (no pending).
+    #[test]
+    fn regression_pending_reopen_after_exit_resolves_via_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("a.tar");
+        fs::write(&archive, b"abc").unwrap();
+        let index = root.path().join("a.tar.index.sqlite");
+        Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT);")
+            .unwrap();
+        let mut context = info(&archive);
+        context.index_path = Some(index);
+        let first = root.path().join("first");
+        drop(WriteOverlay::new_with_create_info(base(root.path()), &first, &context).unwrap());
+        assert_eq!(meta_of(&first).base_digest_kind(), Some("pending"));
+        let conn = Connection::open(first.join(HIDDEN_DB)).unwrap();
+        assert!(resolve_pending_base_digest(&conn).unwrap());
+        drop(conn);
+        let second = root.path().join("second");
+        let before = ratarmount_index::sha256_stream_calls_this_thread();
+        drop(WriteOverlay::new_with_create_info(base(root.path()), &second, &context).unwrap());
+        assert_eq!(ratarmount_index::sha256_stream_calls_this_thread(), before);
+        assert_eq!(meta_of(&second).base_digest_kind(), Some("strong"));
+        assert_eq!(
+            meta_of(&second).base_digest(),
+            meta_of(&first).base_digest()
+        );
+    }
+
+    /// Regression (archive half of "with --base-digest no base file is
+    /// opened for hashing"): a supplied digest hashes nothing, and without it
+    /// creation hashes nothing either but resolving does (positive control).
+    #[test]
+    fn regression_base_digest_flag_opens_no_base_file_for_hashing() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("a.tar");
+        fs::write(&archive, b"abc").unwrap();
+        let mut context = info(&archive);
+        context.base_digest = BaseDigestRequest::Supplied(format!("sha256:{}", "c".repeat(64)));
+        let before = ratarmount_index::sha256_stream_calls_this_thread();
+        let overlay = root.path().join("supplied");
+        drop(WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context).unwrap());
+        assert_eq!(ratarmount_index::sha256_stream_calls_this_thread(), before);
+        assert_eq!(meta_of(&overlay).base_digest_kind(), Some("strong"));
+        let (overlay, _) = pending_overlay(root.path(), &archive, "computed");
+        assert_eq!(ratarmount_index::sha256_stream_calls_this_thread(), before);
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        resolve_pending_base_digest(&conn).unwrap();
+        assert!(ratarmount_index::sha256_stream_calls_this_thread() > before);
     }
 }

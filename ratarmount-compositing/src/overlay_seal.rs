@@ -196,6 +196,9 @@ pub fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutc
         });
     }
     let conn = connection(dir, false)?;
+    // A sealed layer is never `pending`: hash the base first, outside the
+    // write transaction (a cache hit is free).
+    crate::resolve_pending_base_digest(&conn).map_err(overlay_error)?;
     // Readers can still take snapshots for canonical hashing. Competing writers,
     // including mounts in exclusive locking mode, cannot enter this interval.
     conn.execute_batch("BEGIN IMMEDIATE").map_err(sql_error)?;

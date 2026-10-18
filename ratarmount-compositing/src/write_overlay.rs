@@ -2927,6 +2927,23 @@ impl WriteOverlay {
         crate::serving_layer(self.current_base().as_ref(), path)
     }
 
+    /// The archive base whose digest is still `pending`, if any.
+    pub fn pending_base(&self) -> Result<Option<crate::PendingBase>> {
+        let db = self.db.lock().expect("overlay db");
+        match crate::OverlayMeta::from_connection(&db)? {
+            Some(meta) => crate::PendingBase::from_meta(&meta),
+            None => Ok(None),
+        }
+    }
+
+    /// Record a lazily computed base digest through the mount's own connection
+    /// (a live mount holds it exclusively). Compare-and-set: `false` when the
+    /// digest is no longer `pending` for `pending`'s stamp.
+    pub fn record_base_digest(&self, pending: &crate::PendingBase, digest: &str) -> Result<bool> {
+        let db = self.db.lock().expect("overlay db");
+        crate::record_base_digest(&db, pending, digest)
+    }
+
     /// Record one overlay-level `meta` key (for example `readonly_rules`).
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         let db = self.db.lock().expect("overlay db");

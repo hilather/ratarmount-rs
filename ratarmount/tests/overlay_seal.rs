@@ -162,3 +162,56 @@ fn regression_symlinked_parent_dir_fsck_seal_verify_pack() {
     );
     expect(command(&["overlay", "unseal", &dir, "--i-know"]), 0);
 }
+
+/// Regression: an archive base hashed lazily is `pending` until something
+/// resolves it; sealing must hash, record and only then seal, so a sealed
+/// layer never carries `pending`, and `verify` agrees.
+#[test]
+fn regression_seal_of_pending_overlay_computes_and_records_digest() {
+    use sha2::{Digest, Sha256};
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("file"), b"base\n").unwrap();
+    let archive = tmp.path().join("base.tar");
+    assert!(Command::new("tar")
+        .arg("cf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&base)
+        .arg("file")
+        .status()
+        .unwrap()
+        .success());
+    let dir = tmp.path().join("overlay");
+    let writer = WriteOverlay::new_with_create_info(
+        Arc::new(FolderMountSource::new(&base).unwrap()),
+        &dir,
+        &OverlayCreateInfo {
+            base_url: archive.to_str().unwrap().into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    cow::cow_write(&writer, "/file", b"change\n");
+    drop(writer);
+    let meta = ratarmount_compositing::OverlayMeta::read(&dir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.base_digest_kind(), Some("pending"));
+    assert_eq!(meta.stack_digest(), None);
+    let dir = dir.to_str().unwrap();
+    expect(command(&["overlay", "seal", dir]), 0);
+    let meta = ratarmount_compositing::OverlayMeta::read(Path::new(dir))
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.base_digest_kind(), Some("strong"));
+    let expected = format!("sha256:{:x}", Sha256::digest(fs::read(&archive).unwrap()));
+    assert_eq!(meta.base_digest(), Some(expected.as_str()));
+    assert_eq!(
+        meta.stack_digest(),
+        Some(ratarmount_compositing::stack_digest(&expected, &[]).as_str())
+    );
+    assert!(meta.layer_sealed());
+    expect(command(&["overlay", "verify", dir]), 0);
+}

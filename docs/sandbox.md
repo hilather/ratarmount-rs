@@ -112,8 +112,8 @@ repaired. A mounted overlay's exclusive database lock is reported as "in use".
 | `ratarmount_version` | Creator's version |
 | `created_at` | Creation time, RFC 3339 UTC |
 | `base_url` | Original base positional |
-| `base_digest` | `sha256:<hex>`, `git-tree:<sha>`, `weak:<hex>` (also the default for a directory base), or `none` |
-| `base_digest_kind` | `strong`, `git-tree`, `weak`, or `none` |
+| `base_digest` | `sha256:<hex>`, `git-tree:<sha>`, `weak:<hex>` (also the default for a directory base), or `none`; empty while `pending` |
+| `base_digest_kind` | `strong`, `git-tree`, `weak`, `pending`, or `none` |
 | `base_digest_source` | `computed` or `supplied` (absent for `none`) |
 | `base_weak_digest`, `base_weak_excludes` | Directory bases: the weak manifest digest (also recorded beside a supplied strong digest) and the JSON array of base-relative paths left out of it |
 | `base_size`, `base_mtime_ns` | Local archive size and modification time used for cheap remount checks |
@@ -156,11 +156,28 @@ The input is the UTF-8 digest strings, including their algorithm prefixes, in
 bottom-to-top order. With no lowers, hash only the base digest and newline.
 The stored result has the `sha256:` prefix.
 
-A local archive gets a streaming SHA-256 of all file bytes at creation. If an
-existing writable archive index is available, a small cache reuses the digest
-for the same canonical path, size, nanosecond mtime, and inode. Hashing never
-creates an archive index. `--no-recreate-index` and immutable index snapshots
-are not modified for this cache.
+A local archive gets a streaming SHA-256 of all file bytes, but never on the
+mount's critical path. If an existing writable archive index holds the digest
+for the same canonical path, size, nanosecond mtime, and inode, creation
+records it as `strong` at once. Otherwise creation records
+`base_digest_kind = pending` (empty `base_digest`, no `stack_digest`, the
+base's size and mtime as usual) and the mount hashes the archive on a
+background thread once it is serving, then records `strong`, the digest and
+`stack_digest` through the mount's own database connection (a compare-and-set
+on `pending` and the recorded stamp, so a supplied digest, a forced reopen or a
+commit that moved the archive wins). Until then `overlay info` prints
+`base_digest: pending (computing)` (`null` and `"pending"` with `--json`) and
+the live `user.ratarmount.base_digest` and `user.ratarmount.stack_digest`
+xattrs read as empty. If the process exits first, the next mount of the
+overlay (after the usual size/mtime check, which still runs before any
+hashing) restarts the hash, and `overlay seal` hashes and records the digest
+before sealing, so a sealed layer is never `pending`. A successful archive
+commit rehashes the new archive and resolves it too. `--base-digest` removes
+the work entirely: no base file is opened for hashing. `--no-mount` creation
+never serves, so it stays `pending`. Hashing never creates an archive index.
+`--no-recreate-index` and immutable index snapshots are not modified for this
+cache. The test-only variable `RATARMOUNT_TEST_HASH_GATE=<path>` holds the
+background hash until that path exists.
 
 A directory gets a `weak` digest by default: `weak:<hex>` over a sorted
 manifest of relative path, type, size and nanosecond mtime (symlinks include

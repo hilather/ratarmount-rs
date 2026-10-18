@@ -41,10 +41,10 @@ fn regression_overlay_meta_cli_creation_info_and_remount() {
     assert_success(&output);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["base_url"], archive.to_str().unwrap());
-    assert_eq!(
-        value["base_digest"],
-        format!("sha256:{:x}", Sha256::digest([0u8; 1024]))
-    );
+    // `--no-mount` never serves, so nothing hashed the archive: pending (spec
+    // 1.2: hashing is lazy). Seal/verbs and the mount's hasher resolve it.
+    assert_eq!(value["base_digest"], serde_json::Value::Null);
+    assert_eq!(value["base_digest_kind"], "pending");
     assert_eq!(value["format_version"], "2");
     assert_eq!(value["legacy"], false);
     assert_eq!(value["files_present"], 0);
@@ -430,4 +430,204 @@ fn regression_overlay_meta_cli_directory_remount_refuses_edit() {
     assert_eq!(refused.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--force-base-mismatch"));
     assert_success(&open(&overlay, &base, &["--force-base-mismatch"]));
+}
+
+/// A foreground `-w` mount of a tar whose background digest hash is held at a
+/// gate file the test creates to release it. Linux with /dev/fuse only.
+#[cfg(target_os = "linux")]
+struct GatedMount {
+    root: tempfile::TempDir,
+    archive: std::path::PathBuf,
+    overlay: std::path::PathBuf,
+    mnt: std::path::PathBuf,
+    gate: std::path::PathBuf,
+    child: std::process::Child,
+}
+
+#[cfg(target_os = "linux")]
+impl GatedMount {
+    fn start() -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::{Duration, Instant};
+        if !Path::new("/dev/fuse").exists()
+            || Command::new("fusermount3")
+                .arg("--version")
+                .output()
+                .is_err()
+        {
+            eprintln!("skip: /dev/fuse or fusermount3 unavailable");
+            return None;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("member.txt"), b"member bytes\n").unwrap();
+        let archive = root.path().join("base.tar");
+        assert!(Command::new("tar")
+            .arg("cf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .arg("member.txt")
+            .status()
+            .unwrap()
+            .success());
+        let mnt = root.path().join("mnt");
+        std::fs::create_dir(&mnt).unwrap();
+        let overlay = root.path().join("overlay");
+        let gate = root.path().join("gate");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        private_env(&mut cmd, root.path());
+        let child = cmd
+            .env("RATARMOUNT_TEST_HASH_GATE", &gate)
+            .args([
+                "-f",
+                "--passthrough",
+                "off",
+                "--index-file",
+                ":memory:",
+                "-w",
+            ])
+            .arg(&overlay)
+            .arg(&archive)
+            .arg(&mnt)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut mount = Self {
+            root,
+            archive,
+            overlay,
+            mnt,
+            gate,
+            child,
+        };
+        let parent_dev = std::fs::metadata(mount.root.path()).unwrap().dev();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        // Ready means a member can be read, not merely that the mount exists.
+        while std::fs::read(mount.mnt.join("member.txt")).ok().as_deref()
+            != Some(b"member bytes\n".as_slice())
+            || std::fs::metadata(&mount.mnt).unwrap().dev() == parent_dev
+        {
+            if Instant::now() > deadline || mount.child.try_wait().unwrap().is_some() {
+                mount.unmount();
+                panic!("mount not serving a member read within 20 s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Some(mount)
+    }
+
+    /// The root `user.ratarmount.<name>` xattr.
+    fn xattr(&self, name: &str) -> String {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(self.mnt.as_os_str().as_bytes()).unwrap();
+        let key = std::ffi::CString::new(format!("user.ratarmount.{name}")).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                key.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        assert!(
+            n >= 0,
+            "getxattr {name}: {}",
+            std::io::Error::last_os_error()
+        );
+        String::from_utf8(buf[..n as usize].to_vec()).unwrap()
+    }
+
+    fn release(&self) {
+        std::fs::write(&self.gate, b"go").unwrap();
+    }
+
+    fn unmount(&mut self) {
+        let _ = Command::new("fusermount3")
+            .arg("-u")
+            .arg(&self.mnt)
+            .status();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for GatedMount {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&self.mnt)
+                .status();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Regression: an uncached archive base was hashed before the mount served
+/// (spec 1.2: hashing is lazy, after the mount is serving). With the hash held
+/// at the gate the mount still serves a member read.
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_uncached_archive_base_mount_ready_before_hashing_finishes() {
+    let Some(mut mount) = GatedMount::start() else {
+        return;
+    };
+    // `start` only returns after a member read succeeded with the gate shut.
+    assert!(!mount.gate.exists());
+    mount.release();
+    mount.unmount();
+}
+
+/// Regression: while the hash is gated the live digest xattrs are empty (not
+/// the digest the old synchronous path had already recorded).
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_pending_xattrs_empty_while_gated() {
+    let Some(mut mount) = GatedMount::start() else {
+        return;
+    };
+    assert_eq!(mount.xattr("base_digest"), "");
+    assert_eq!(mount.xattr("stack_digest"), "");
+    mount.release();
+    mount.unmount();
+}
+
+/// Regression: after the background hash finishes it records the digest
+/// through the mount's own connection: xattrs change, and the overlay ends
+/// `strong` with a stack digest.
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_pending_digest_recorded_after_hashing_finishes() {
+    use std::time::{Duration, Instant};
+    let Some(mut mount) = GatedMount::start() else {
+        return;
+    };
+    let expected = format!(
+        "sha256:{:x}",
+        Sha256::digest(std::fs::read(&mount.archive).unwrap())
+    );
+    mount.release();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while mount.xattr("base_digest") != expected {
+        assert!(
+            Instant::now() < deadline,
+            "digest not recorded within 20 s: {:?}",
+            mount.xattr("base_digest")
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        mount.xattr("stack_digest"),
+        ratarmount_compositing::stack_digest(&expected, &[])
+    );
+    mount.unmount();
+    let meta = OverlayMeta::read(&mount.overlay).unwrap().unwrap();
+    assert_eq!(meta.base_digest_kind(), Some("strong"));
+    assert_eq!(meta.base_digest(), Some(expected.as_str()));
+    assert!(meta.stack_digest().is_some());
 }
