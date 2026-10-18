@@ -1115,7 +1115,14 @@ Repeat `--lower`, `--readonly`, `--allow`, and `--env K=V` for multiple values.
 The default container working directory and bind destination are `/repo`; change
 both with `--bind /path`. `--cpus N` and `--memory SIZE` are passed to the runtime.
 `--network` accepts `none` (default), `bridge`, or `host`. The command runs as the
-calling user's UID/GID. Docker is preferred, then Podman, unless `--runtime`
+calling user's UID/GID. The container is hardened by default:
+`--cap-drop ALL`, `--security-opt no-new-privileges` and `--pids-limit 4096`
+are always passed. `--pids-limit N` changes the process cap (`0` or `-1`
+mean whatever docker/podman define as unlimited) and `--cap-add CAP` (repeatable,
+`[A-Za-z0-9_]+`) adds a capability back (experimental, may change); nothing
+removes `no-new-privileges`. A credentialed `--base URL` is visible in `ps`
+because the mount child's argv carries the URL as given (only what is stored or
+printed is redacted); use an unauthenticated URL. Docker is preferred, then Podman, unless `--runtime`
 selects one. `RATARMOUNT_SANDBOX_RUNTIME=/absolute/path/to/executable` overrides
 that selection, including for the in-tree test stub. The runtime must use the
 local host's mount namespace; a remote Docker daemon cannot bind this mount.

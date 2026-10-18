@@ -701,3 +701,66 @@ fn regression_run_sigkill_recovery_leaves_no_socket_or_run_dir() {
     let left = names_in(private.path());
     assert!(left.is_empty(), "left behind: {left:?}");
 }
+
+fn recorded_argv(fixture: &Fixture) -> Vec<String> {
+    let state = fixture.temp.path().join("runtime");
+    let file = fs::read_dir(&state)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "argv"))
+        .expect("stub recorded no argv");
+    fs::read_to_string(file)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn flag_values(argv: &[String], flag: &str) -> Vec<String> {
+    argv.windows(2)
+        .filter(|w| w[0] == flag)
+        .map(|w| w[1].clone())
+        .collect()
+}
+
+/// Regression (I): containers ran with default capabilities, privilege
+/// escalation allowed and no process limit.
+#[test]
+fn regression_run_container_is_hardened_by_default() {
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.run(&[], "true");
+    let argv = recorded_argv(&fixture);
+    assert_eq!(flag_values(&argv, "--cap-drop"), ["ALL"], "{argv:?}");
+    assert_eq!(
+        flag_values(&argv, "--security-opt"),
+        ["no-new-privileges"],
+        "{argv:?}"
+    );
+    assert_eq!(flag_values(&argv, "--pids-limit"), ["4096"], "{argv:?}");
+    assert!(flag_values(&argv, "--cap-add").is_empty(), "{argv:?}");
+}
+
+/// Regression (I): `--pids-limit` overrides the default and `--cap-add` adds
+/// capabilities back.
+#[test]
+fn regression_run_pids_limit_and_cap_add_reach_the_runtime() {
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.run(
+        &["--pids-limit", "64", "--cap-add", "NET_BIND_SERVICE"],
+        "true",
+    );
+    let argv = recorded_argv(&fixture);
+    assert_eq!(flag_values(&argv, "--pids-limit"), ["64"], "{argv:?}");
+    assert_eq!(
+        flag_values(&argv, "--cap-add"),
+        ["NET_BIND_SERVICE"],
+        "{argv:?}"
+    );
+    assert_eq!(flag_values(&argv, "--cap-drop"), ["ALL"], "{argv:?}");
+}

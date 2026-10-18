@@ -8,18 +8,20 @@ verb=$1
 shift
 case "$verb" in
   run)
-    name= mount= envs=()
+    name= mount= envs=() argv=("$@")
     while (($#)); do
       case "$1" in
         --rm) shift ;;
         --name) name=$2; shift 2 ;;
         -v) mount=${2%:*}; shift 2 ;;
         -e) envs+=("$2"); shift 2 ;;
-        -w|--network|--cpus|--memory|--user) shift 2 ;;
+        -w|--network|--cpus|--memory|--user|--cap-drop|--cap-add|--security-opt|--pids-limit) shift 2 ;;
         *) shift; break ;; # image
       esac
     done
     [[ -n "$name" && -n "$mount" ]]
+    # Kept after the run so tests can read the full runtime argv, one per line.
+    printf "%s\n" "${argv[@]}" > "$state/$name.argv"
     setsid env "${envs[@]}" bash -c '
       state=$1; name=$2; mount=$3; shift 3
       printf "%s\n" "$$" > "$state/$name.tmp"

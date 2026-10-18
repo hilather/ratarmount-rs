@@ -47,6 +47,12 @@ pub struct RunArgs {
     memory: Option<String>,
     #[arg(long, default_value = "none", value_parser = ["none", "bridge", "host"])]
     network: String,
+    /// Maximum number of processes in the container (docker/podman `--pids-limit`).
+    #[arg(long, default_value_t = 4096, allow_hyphen_values = true)]
+    pids_limit: i64,
+    /// Add a Linux capability back (all are dropped by default); repeatable.
+    #[arg(long, value_name = "CAP", value_parser = parse_cap)]
+    cap_add: Vec<String>,
     #[arg(long)]
     journal: bool,
     #[arg(long)]
@@ -68,6 +74,20 @@ pub struct RunArgs {
     json: bool,
     #[arg(last = true, required = true, num_args = 1..)]
     command: Vec<OsString>,
+}
+
+fn parse_cap(value: &str) -> Result<String, String> {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "invalid capability name {value:?} (use [A-Za-z0-9_]+)"
+        ))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -274,6 +294,17 @@ fn runtime_argv(args: &RunArgs, mount: &Path, name: &str, uid: u32, gid: u32) ->
     }
     for env in &args.env {
         argv.extend(["-e".into(), env.into()]);
+    }
+    argv.extend([
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--pids-limit".into(),
+        args.pids_limit.to_string().into(),
+    ]);
+    for cap in &args.cap_add {
+        argv.extend(["--cap-add".into(), cap.into()]);
     }
     argv.extend([
         "--user".into(),
@@ -1114,6 +1145,12 @@ mod tests {
                     "1G",
                     "-e",
                     "TOKEN=a b;$x",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--pids-limit",
+                    "4096",
                     "--user",
                     "123:456",
                     "busybox",
@@ -1123,6 +1160,61 @@ mod tests {
                 ]
                 .map(OsString::from)
             );
+        }
+    }
+
+    /// Regression: the container ran with docker's default capabilities and no
+    /// process cap; `--pids-limit` and `--cap-add` adjust the new defaults.
+    #[test]
+    fn regression_run_pids_limit_and_cap_add_override() {
+        let args = args(&[
+            "--pids-limit",
+            "64",
+            "--cap-add",
+            "NET_BIND_SERVICE",
+            "--cap-add",
+            "CHOWN",
+        ]);
+        let argv = runtime_argv(&args, Path::new("/m"), "n", 1, 2);
+        let text: Vec<String> = argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = text.iter().position(|a| a == "--cap-drop").unwrap();
+        assert_eq!(
+            text[at..at + 10],
+            [
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--pids-limit",
+                "64",
+                "--cap-add",
+                "NET_BIND_SERVICE",
+                "--cap-add",
+                "CHOWN"
+            ]
+        );
+        assert_eq!(text[at + 10], "--user");
+        let unlimited = super::super::SandboxArgs::try_parse_from([
+            "s",
+            "run",
+            "--base",
+            "/b",
+            "--top",
+            "/t",
+            "--image",
+            "i",
+            "--pids-limit",
+            "-1",
+            "--",
+            "true",
+        ])
+        .is_ok();
+        assert!(unlimited, "-1 means unlimited");
+        for bad in ["", "A B", "CAP;x", "--user"] {
+            assert!(parse_cap(bad).is_err(), "{bad:?}");
         }
     }
 
