@@ -1003,6 +1003,17 @@ verified against the view it is mounted on** (the base plus the lowers beneath
 it); a mismatch refuses the mount, names the offending paths and publishes
 nothing. Publication is atomic.
 
+**Staging is removable until the end.** `unpack` and the cache fill extract into
+a staging directory (`.ratarmount-unpack-*` beside the destination,
+`.ratarmount-layer-*` in the cache) that stays writable throughout; the archived
+modes, mtimes and read-only bits are applied in one last step after every check
+has passed, just before the publishing rename. A process killed earlier
+therefore leaves a tree `rm -rf` can delete. Each stage holds an `flock` on a
+sibling `<stage>.lock` file (never inside the layer), and the next `unpack` or
+cache fill removes stages of dead processes whose lock it can take; a stage
+another process still holds, directories with other names and symlinks are left
+alone. Leftover `.copy-*` bundle copies are swept the same way.
+
 This check reads base and lower content only for the paths the layer mentions
 (plus the descendants of directories it deletes or replaces), once per cache
 fill or marker miss; it never hashes the whole base, and a plain `-w` mount

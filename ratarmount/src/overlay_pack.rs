@@ -496,11 +496,146 @@ fn cleanup_dirs(fd: &OwnedFd) {
     }
 }
 
-struct Stage(tempfile::TempDir);
+/// Exclusive advisory lock held for the life of a stage (or `.copy-` file).
+/// The stage's lock file lives beside it as `<stage>.lock`, never inside the
+/// layer, where it would be published, hashed and packed as content.
+struct StageLock {
+    _file: File,
+    path: PathBuf,
+}
+
+fn try_flock(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+impl StageLock {
+    fn beside(stage: &Path) -> io::Result<Self> {
+        let path = lock_path(stage);
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        if !try_flock(&file) {
+            return Err(io::Error::other("staging lock is held by another process"));
+        }
+        Ok(Self { _file: file, path })
+    }
+}
+
+impl Drop for StageLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn lock_path(stage: &Path) -> PathBuf {
+    let mut name = stage.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+// Field order matters: the directory is removed before the lock file.
+struct Stage {
+    dir: tempfile::TempDir,
+    _lock: StageLock,
+}
+
+impl Stage {
+    fn new_in(parent: &Path, prefix: &str) -> io::Result<Self> {
+        sweep_stale_stages(parent);
+        let dir = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
+        let lock = StageLock::beside(dir.path())?;
+        Ok(Self { dir, _lock: lock })
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
 impl Drop for Stage {
     fn drop(&mut self) {
-        if let Ok(root) = open_root(self.0.path()) {
+        if let Ok(root) = open_root(self.dir.path()) {
             cleanup_dirs(&root);
+        }
+    }
+}
+
+const STAGE_PREFIXES: [&str; 2] = [".ratarmount-unpack-", ".ratarmount-layer-"];
+const COPY_PREFIX: &str = ".copy-";
+
+/// Remove staging left by killed processes. Only our own prefixes, owned by
+/// us, never symlinks. A stage is abandoned when its sibling lock can be
+/// taken; no mtime heuristic is used for stages with a lock (the root mtime
+/// is a restored archive value). Best effort: errors are ignored.
+fn sweep_stale_stages(parent: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let euid = unsafe { libc::geteuid() };
+    let day = std::time::Duration::from_secs(24 * 3600);
+    let minute = std::time::Duration::from_secs(60);
+    let age = |meta: &fs::Metadata| {
+        meta.modified()
+            .ok()
+            .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+            .unwrap_or_default()
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || meta.uid() != euid {
+            continue;
+        }
+        if name.starts_with(COPY_PREFIX) && meta.is_file() {
+            // A copy being written has a fresh mtime; the age check closes the
+            // gap between its creation and its flock.
+            if age(&meta) < minute {
+                continue;
+            }
+            let Ok(file) = File::options().read(true).write(true).open(&path) else {
+                continue;
+            };
+            if try_flock(&file) {
+                let _ = fs::remove_file(&path);
+            }
+        } else if STAGE_PREFIXES.iter().any(|p| name.starts_with(p)) && name.ends_with(".lock") {
+            // Orphan lock whose stage is gone.
+            let stage = parent.join(name.trim_end_matches(".lock"));
+            if fs::symlink_metadata(&stage).is_err() {
+                if let Ok(file) = File::options().read(true).write(true).open(&path) {
+                    if try_flock(&file) {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        } else if STAGE_PREFIXES.iter().any(|p| name.starts_with(p)) && meta.is_dir() {
+            let lock = lock_path(&path);
+            let held = match File::options().read(true).write(true).open(&lock) {
+                Ok(file) => {
+                    if !try_flock(&file) {
+                        continue;
+                    }
+                    Some(file)
+                }
+                // No lock: the stage predates locks or is foreign.
+                Err(_) if age(&meta) > day => None,
+                Err(_) => continue,
+            };
+            if let Ok(root) = open_root(&path) {
+                cleanup_dirs(&root);
+            }
+            let _ = fs::remove_dir_all(&path);
+            if held.is_some() {
+                let _ = fs::remove_file(&lock);
+            }
         }
     }
 }
@@ -525,8 +660,17 @@ fn seal_directories(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-fn extract(bundle: &Path, directory: &Path) -> io::Result<()> {
+/// Modes and mtimes the archive asks for. Extraction creates everything
+/// writable (a killed unpack must leave a tree `rm -rf` can remove) and
+/// `finalize_stage` applies these once every check has passed.
+struct Recorded {
+    files: Vec<(String, u32)>,
+    directories: BTreeMap<String, (u32, std::time::SystemTime)>,
+}
+
+fn extract(bundle: &Path, directory: &Path) -> io::Result<Recorded> {
     let root = open_root(directory)?;
+    let mut files = Vec::new();
     let body = ratarmount_compress::open_seekable_zstd(bundle).map_err(io::Error::other)?;
     let mut archive = tar::Archive::new(body.open_reader()?);
     let mut seen = BTreeSet::new();
@@ -540,7 +684,7 @@ fn extract(bundle: &Path, directory: &Path) -> io::Result<()> {
         if path != "layer" && !path.starts_with("layer/") {
             continue;
         }
-        let mode = entry.header().mode()? & 0o7777 & !0o222;
+        let mode = entry.header().mode()? & 0o7777;
         let kind = entry.header().entry_type();
         let mtime = entry_mtime(&mut entry)?;
         let relative = path.strip_prefix("layer/").unwrap_or("");
@@ -578,7 +722,9 @@ fn extract(bundle: &Path, directory: &Path) -> io::Result<()> {
                 ));
             }
             file.set_times(fs::FileTimes::new().set_modified(mtime))?;
-            host::fchmod(&file, Mode::from_raw_mode(raw_mode(mode)))?;
+            files.push((relative.to_string(), mode));
+            #[cfg(test)]
+            run_extract_hook(&MID_EXTRACT, directory);
         } else if kind.is_symlink() {
             let target = entry
                 .link_name_bytes()
@@ -605,8 +751,27 @@ fn extract(bundle: &Path, directory: &Path) -> io::Result<()> {
             return Err(invalid(format!("unsupported bundle entry {path}")));
         }
     }
-    // Children first, so sealed parent permissions never obstruct extraction.
-    for (path, (mode, mtime)) in directories.into_iter().rev() {
+    #[cfg(test)]
+    run_extract_hook(&AFTER_EXTRACT, directory);
+    Ok(Recorded { files, directories })
+}
+
+/// Apply the archived modes and mtimes and make the tree read-only. Runs after
+/// all checks, immediately before the publishing rename.
+fn finalize_stage(directory: &Path, recorded: Recorded) -> io::Result<()> {
+    let root = open_root(directory)?;
+    for (path, mode) in &recorded.files {
+        let (fd, name) = parent(&root, path, false)?;
+        let child = host::openat(
+            &fd,
+            name.as_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        host::fchmod(&child, Mode::from_raw_mode(raw_mode(mode & !0o222)))?;
+    }
+    // Children first, so sealed parent permissions never obstruct this walk.
+    for (path, (mode, mtime)) in recorded.directories.into_iter().rev() {
         let fd = if path.is_empty() {
             host::openat(&root, ".", directory_flags(), Mode::empty())?
         } else {
@@ -615,7 +780,7 @@ fn extract(bundle: &Path, directory: &Path) -> io::Result<()> {
         };
         let file = File::from(fd);
         file.set_times(fs::FileTimes::new().set_modified(mtime))?;
-        host::fchmod(&file, Mode::from_raw_mode(raw_mode(mode)))?;
+        host::fchmod(&file, Mode::from_raw_mode(raw_mode(mode & !0o222)))?;
     }
     seal_directories(&root)
 }
@@ -677,11 +842,12 @@ fn unpack_impl(bundle: &Path, directory: &Path) -> io::Result<UnpackOutcome> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let stage = Stage(tempfile::tempdir_in(output_parent)?);
     // Stage beside the destination, so publishing a read-only directory does
     // not need write permission to update its `..` across different parents.
-    let layer = stage.0.path();
-    extract(bundle, layer).map_err(|e| io::Error::new(e.kind(), format!("extract layer: {e}")))?;
+    let stage = Stage::new_in(output_parent, ".ratarmount-unpack-")?;
+    let layer = stage.path();
+    let recorded = extract(bundle, layer)
+        .map_err(|e| io::Error::new(e.kind(), format!("extract layer: {e}")))?;
     let meta = immutable_meta(layer)
         .map_err(|e| io::Error::new(e.kind(), format!("read layer database: {e}")))?;
     let metadata_ok = meta.values() == &metadata;
@@ -693,6 +859,7 @@ fn unpack_impl(bundle: &Path, directory: &Path) -> io::Result<UnpackOutcome> {
         ok: verified.unwrap_or(true) && metadata_ok && sentinel_ok,
         verified: verified.is_some(),
     };
+    finalize_stage(layer, recorded)?;
     publish_layer(layer, directory)?;
     Ok(outcome)
 }
@@ -731,10 +898,26 @@ pub fn cached_lower(
 }
 
 #[cfg(test)]
+type ExtractHook = std::cell::RefCell<Option<Box<dyn Fn(&Path)>>>;
+
+#[cfg(test)]
 thread_local! {
     static VERIFY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AFTER_COPY: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
+    static MID_EXTRACT: ExtractHook =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_EXTRACT: ExtractHook =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_extract_hook(hook: &'static std::thread::LocalKey<ExtractHook>, stage: &Path) {
+    hook.with(|h| {
+        if let Some(h) = h.borrow().as_ref() {
+            h(stage);
+        }
+    });
 }
 
 /// Copy the bundle into a private file inside the cache while hashing it, so
@@ -746,6 +929,10 @@ fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempF
         .prefix(".copy-")
         .suffix(".tar.zst")
         .tempfile_in(cache)?;
+    // The flock lives as long as the copy's descriptor, i.e. until it is dropped.
+    if !try_flock(copy.as_file()) {
+        return Err(io::Error::other("staging file is locked"));
+    }
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
     loop {
@@ -849,13 +1036,9 @@ pub(crate) fn cached_lower_in(
         return hit(&destination);
     }
     // Stage beside the destination; nothing is published before it verifies.
-    let stage = Stage(
-        tempfile::Builder::new()
-            .prefix(".ratarmount-layer-")
-            .tempdir_in(cache)?,
-    );
-    let layer = stage.0.path();
-    extract(copy.path(), layer)
+    let stage = Stage::new_in(cache, ".ratarmount-layer-")?;
+    let layer = stage.path();
+    let recorded = extract(copy.path(), layer)
         .map_err(|e| io::Error::new(e.kind(), format!("extract layer: {e}")))?;
     let meta = immutable_meta(layer)
         .map_err(|e| io::Error::new(e.kind(), format!("read layer database: {e}")))?;
@@ -868,6 +1051,7 @@ pub(crate) fn cached_lower_in(
         return Err(invalid("sentinel digest does not match metadata"));
     }
     verify_against_view(layer, &view)?;
+    finalize_stage(layer, recorded)?;
     match publish_layer(layer, &destination) {
         Ok(()) => {}
         // Lost a concurrent fill (renaming onto a non-empty directory fails):
@@ -1312,6 +1496,250 @@ mod tests {
         let mut writer = ratarmount_compress::ZstdFrameWriter::new(File::create(out).unwrap(), 3);
         writer.write_frame(&bytes[..]).unwrap();
         writer.finish().unwrap();
+    }
+
+    type Seen = Arc<std::sync::Mutex<Vec<(&'static str, Vec<String>)>>>;
+
+    fn missing_user_write(root: &Path) -> Vec<String> {
+        let mut bad = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let meta = fs::symlink_metadata(&dir).unwrap();
+            if meta.permissions().mode() & 0o200 == 0 {
+                bad.push(dir.display().to_string());
+            }
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let meta = fs::symlink_metadata(&path).unwrap();
+                    if meta.is_dir() {
+                        stack.push(path);
+                    } else if !meta.file_type().is_symlink()
+                        && meta.permissions().mode() & 0o200 == 0
+                    {
+                        bad.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        bad
+    }
+
+    /// A read-only staging tree as a SIGKILLed unpack leaves it.
+    fn make_stale(parent: &Path, name: &str, with_lock: bool) -> PathBuf {
+        let stage = parent.join(name);
+        fs::create_dir_all(stage.join("sub/deeper")).unwrap();
+        fs::write(stage.join("sub/deeper/file"), b"x").unwrap();
+        for dir in ["sub/deeper", "sub", ""] {
+            fs::set_permissions(stage.join(dir), fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        fs::set_permissions(
+            stage.join("sub/deeper/file"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        File::open(&stage)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 365 * 86400),
+            ))
+            .unwrap();
+        if with_lock {
+            fs::write(parent.join(format!("{name}.lock")), b"").unwrap();
+        }
+        stage
+    }
+
+    fn hold_lock(path: &Path) -> File {
+        use std::os::fd::AsRawFd;
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        file
+    }
+
+    /// Regression (Ilya QA2 N4): extraction stripped write bits as it went, so
+    /// a SIGKILL mid-unpack left a tree `rm -rf` cannot remove.
+    #[test]
+    fn regression_unpack_staging_is_writable_during_extract() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let seen: Seen = Arc::default();
+        for (name, key) in [("mid", 0), ("after", 1)] {
+            let seen = seen.clone();
+            let hook: Box<dyn Fn(&Path)> = Box::new(move |stage| {
+                seen.lock().unwrap().push((name, missing_user_write(stage)));
+            });
+            if key == 0 {
+                MID_EXTRACT.with(|h| *h.borrow_mut() = Some(hook));
+            } else {
+                AFTER_EXTRACT.with(|h| *h.borrow_mut() = Some(hook));
+            }
+        }
+        let out = f.tmp.path().join("out");
+        let report = unpack(&bundle, &out).unwrap();
+        MID_EXTRACT.with(|h| *h.borrow_mut() = None);
+        AFTER_EXTRACT.with(|h| *h.borrow_mut() = None);
+        assert!(report.ok);
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|(n, _)| *n == "mid"));
+        assert!(seen.iter().any(|(n, _)| *n == "after"));
+        for (name, bad) in seen.iter() {
+            assert!(
+                bad.is_empty(),
+                "{name}: not writable during extract: {bad:?}"
+            );
+        }
+        // Published layers are read-only as before.
+        assert_eq!(fs::metadata(&out).unwrap().permissions().mode() & 0o222, 0);
+        assert_eq!(
+            fs::metadata(out.join("sub/file"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o551 & !0o222
+        );
+    }
+
+    /// Regression (fold-in 4): the stage lock lives beside the stage and is
+    /// never layer content.
+    #[test]
+    fn regression_stage_lock_is_not_layer_content() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let out = f.tmp.path().join("out");
+        unpack(&bundle, &out).unwrap();
+        let locks = |dir: &Path| -> Vec<String> {
+            fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".lock"))
+                .collect()
+        };
+        assert!(locks(&out).is_empty(), "{:?}", locks(&out));
+        assert!(locks(f.tmp.path()).is_empty(), "{:?}", locks(f.tmp.path()));
+        let cache = f.tmp.path().join("cache");
+        let layer = cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
+        assert!(locks(&layer).is_empty());
+        assert!(locks(&cache).is_empty(), "{:?}", locks(&cache));
+        assert!(
+            ratarmount_compositing::overlay_seal::verify(&layer, f.base.clone())
+                .unwrap()
+                .ok
+        );
+    }
+
+    /// Regression (Ilya QA2 N4): abandoned read-only staging dirs are swept.
+    #[test]
+    fn regression_unpack_sweeps_stale_read_only_staging() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let parent = f.tmp.path().join("work");
+        fs::create_dir(&parent).unwrap();
+        let stale = make_stale(&parent, ".ratarmount-unpack-stale", true);
+        let foreign = make_stale(&parent, "other-stale", false);
+        let target = parent.join("target");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, parent.join(".ratarmount-unpack-link")).unwrap();
+        unpack(&bundle, &parent.join("out")).unwrap();
+        assert!(!stale.exists(), "stale stage survived");
+        assert!(!parent.join(".ratarmount-unpack-stale.lock").exists());
+        assert!(foreign.exists(), "foreign prefix must survive");
+        assert!(target.exists());
+        assert!(fs::symlink_metadata(parent.join(".ratarmount-unpack-link")).is_ok());
+    }
+
+    /// Regression: a stage whose lock another process holds is never swept,
+    /// whatever its (restored archive) root mtime says.
+    #[test]
+    fn regression_unpack_active_stage_is_not_swept() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let parent = f.tmp.path().join("work");
+        fs::create_dir(&parent).unwrap();
+        let active = make_stale(&parent, ".ratarmount-unpack-active", true);
+        let _held = hold_lock(&parent.join(".ratarmount-unpack-active.lock"));
+        unpack(&bundle, &parent.join("out")).unwrap();
+        assert!(
+            active.join("sub/deeper/file").exists(),
+            "active stage swept"
+        );
+        assert!(parent.join(".ratarmount-unpack-active.lock").exists());
+    }
+
+    /// Regression: the cache fill sweeps stale `.ratarmount-layer-*` stages and
+    /// unlocked `.copy-*` files, never a locked one.
+    #[test]
+    fn regression_cache_fill_sweeps_stale_staging() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let cache = f.tmp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let stale = make_stale(&cache, ".ratarmount-layer-stale", true);
+        let active = make_stale(&cache, ".ratarmount-layer-active", true);
+        let _held = hold_lock(&cache.join(".ratarmount-layer-active.lock"));
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let copy = |name: &str| {
+            let path = cache.join(name);
+            fs::write(&path, b"partial").unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+            path
+        };
+        let dead_copy = copy(".copy-dead.tar.zst");
+        let live_copy = copy(".copy-live.tar.zst");
+        let _live = hold_lock(&live_copy);
+        cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
+        assert!(!stale.exists());
+        assert!(!cache.join(".ratarmount-layer-stale.lock").exists());
+        assert!(!dead_copy.exists());
+        assert!(active.exists());
+        assert!(live_copy.exists());
+    }
+
+    /// Regression: a failed fill leaves no staging directory or lock behind.
+    #[test]
+    fn regression_unpack_failure_leaves_removable_staging() {
+        let f = Fixture::new(true);
+        let good = f.bundle("good.tar.zst");
+        let evil = f.tmp.path().join("evil.tar.zst");
+        retar_with(&good, &evil, "layer/sub/file", b"EVIL!!!\n");
+        fs::rename(f.tmp.path().join("base"), f.tmp.path().join("base-away")).unwrap();
+        let view = folder(f.tmp.path().join("base-away"));
+        let cache = f.tmp.path().join("cache");
+        cached_lower_in(&evil, &cache, view, None).unwrap_err();
+        let left: Vec<_> = fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".ratarmount-") || n.ends_with(".lock"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// The published root is read-only and was renamed from a staged one.
+    #[test]
+    fn regression_unpack_publish_keeps_macos_rename_workaround() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let out = f.tmp.path().join("out");
+        unpack(&bundle, &out).unwrap();
+        assert_eq!(fs::metadata(&out).unwrap().permissions().mode() & 0o222, 0);
+        assert!(fs::read_dir(&out).unwrap().next().is_some());
     }
 
     fn cache_entries(cache: &Path) -> Vec<String> {
