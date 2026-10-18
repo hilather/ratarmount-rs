@@ -22,6 +22,39 @@ These options require an overlay from `-w` / `--write-overlay`,
 overlay to FUSE, NFS, 9P, SFTP, SMB and WebDAV. Reads and read-only opens remain
 available. The base archive is unchanged by ordinary overlay writes.
 
+## Git-ref bases and portable snapshots
+
+Use a committed Git tree directly as an attempt's base:
+
+```sh
+ratarmount -w attempt-overlay 'git:///srv/repos/project.git#v1.0' mnt
+ratarmount sandbox create-base --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" \
+  task 'git:///srv/repos/project.git#v1.0'
+```
+
+`git:///absolute/path#REV` accepts bare repositories, working directories, and
+`.git` directories. It forces Git mode; an omitted revision selects HEAD. Paths
+are percent-decoded and may contain literal `@`. Network Git URLs are refused:
+clone locally first. `repo@REV` and `--git-ref` remain supported. Pin a commit ID
+for reproducible attempts. Git base digests use `git-tree:<selected tree id>`.
+
+To distribute the same tree as an archive, export it with its mount index:
+
+```sh
+ratarmount snapshot 'git:///srv/repos/project.git#v1.0' base.tar.zst --with-index --json
+```
+
+Ship `base.tar.zst` and `base.tar.zst.index.sqlite` together. Mounts discover the
+sidecar alongside the archive and reuse it. The archive is deterministic for the
+selected tree, commit time, and frame size: sorted paths, uid/gid 0, committed
+file permissions, directories 0755, preserved symlinks, and commit-time mtimes.
+There is no `.git` or synthetic HEAD; submodules are skipped with a stderr
+warning. Independent zstd frames and a seek table support random access;
+`--frame-size SIZE` changes the default 1 MiB frame size. JSON output reports
+`archive_digest` (`sha256:…`) and `base_digest` (`git-tree:…`); text output prints
+those values on two lines. Existing restic `snapshot add|list` commands are
+unchanged. See [Git mounts](git-mounts.md) for selectors and synthetic HEAD.
+
 ## Executables and file metadata
 
 Writable FUSE mounts honor chmod and access/modification time updates, including

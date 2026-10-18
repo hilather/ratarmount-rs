@@ -351,7 +351,9 @@ pub fn maybe_create_missing_write_base(
     path: &Path,
     ctx: CreateMissingContext,
 ) -> Result<EmptyCreateOutcome, String> {
-    if ratarmount_remote::is_remote_url(&path.to_string_lossy()) {
+    if path.to_string_lossy().starts_with("git://")
+        || ratarmount_remote::is_remote_url(&path.to_string_lossy())
+    {
         return Ok(EmptyCreateOutcome::Unchanged);
     }
     if matches!(ctx, CreateMissingContext::OfflineCommit)
@@ -2286,6 +2288,26 @@ mod tests {
         let got = validate_live_commit_args(Some(&ov), std::slice::from_ref(&zst))
             .expect("accept created .tar.zst");
         assert_eq!(got, zst);
+    }
+
+    /// Regression: Git URLs ending in archive suffixes must reach the Git parser unchanged.
+    #[test]
+    fn regression_git_url_write_base_is_never_created_as_archive() {
+        for url in [
+            "git:///srv/repo.tar",
+            "git:///srv/repo#branch.tar.zst",
+            "git://host/repo.tar",
+        ] {
+            for context in [
+                CreateMissingContext::Mount,
+                CreateMissingContext::OfflineCommit,
+            ] {
+                assert_eq!(
+                    maybe_create_missing_write_base(Path::new(url), context).unwrap(),
+                    EmptyCreateOutcome::Unchanged
+                );
+            }
+        }
     }
 
     #[test]
