@@ -86,7 +86,12 @@ pub(crate) fn plan_excludes(
     info: &OverlayCreateInfo,
     overlay: &Path,
 ) -> Result<Option<ExcludePlan>> {
-    if info.git_tree.is_some() || info.base_digest == BaseDigestRequest::None {
+    if info.git_tree.is_some() {
+        return Ok(None);
+    }
+    // `--base-digest none` only applies at creation: it skips the walk for a
+    // new overlay, but a reopen compares the recorded identity regardless.
+    if info.base_digest == BaseDigestRequest::None && !overlay.join(HIDDEN_DB).exists() {
         return Ok(None);
     }
     let Some(path) = info.path().filter(|p| p.is_dir()) else {
@@ -933,6 +938,7 @@ pub(crate) fn initialize(
     };
     let info = info.unwrap_or(&default);
     let dir_weak = plan
+        .filter(|_| info.base_digest != BaseDigestRequest::None)
         .map(|plan| directory_weak_digest(&plan.base, &plan.excludes))
         .transpose()?;
     let before = info.stamp()?;
@@ -1395,6 +1401,49 @@ mod tests {
             meta.stack_digest(),
             Some(stack_digest(meta.base_digest().unwrap(), &["sha256:first"]).as_str())
         );
+    }
+
+    /// Regression: `--base-digest none` on REOPEN of a weak directory overlay
+    /// suppressed the exclusion plan, skipped the recorded weak comparison and
+    /// accepted a changed base without `--force-base-mismatch`. The flag only
+    /// applies at creation; a reopen always compares the recorded identity.
+    #[test]
+    fn regression_reopen_with_base_digest_none_still_compares_recorded_weak() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir(&basedir).unwrap();
+        fs::write(basedir.join("f"), b"abc").unwrap();
+        let overlay = root.path().join("overlay");
+        drop(open_dir_base(&basedir, &overlay, &info(&basedir)).unwrap());
+        assert!(OverlayMeta::read(&overlay)
+            .unwrap()
+            .unwrap()
+            .get("base_weak_digest")
+            .is_some());
+        fs::write(basedir.join("f"), b"abcdef").unwrap();
+        let mut request = info(&basedir);
+        request.base_digest = BaseDigestRequest::None;
+        request.force_base_mismatch = false;
+        let err = open_dir_base(&basedir, &overlay, &request)
+            .err()
+            .expect("changed base must be refused")
+            .to_string();
+        assert!(err.contains("base mismatch"), "{err}");
+        assert!(err.contains("--force-base-mismatch"), "{err}");
+        // Forced: accepted, and the override is recorded.
+        request.force_base_mismatch = true;
+        drop(open_dir_base(&basedir, &overlay, &request).unwrap());
+        assert!(OverlayMeta::read(&overlay)
+            .unwrap()
+            .unwrap()
+            .get("base_mismatch_forced_at")
+            .is_some());
+        // A new overlay created with `none` still records no walk.
+        let fresh = root.path().join("fresh");
+        drop(open_dir_base(&basedir, &fresh, &request).unwrap());
+        let meta = OverlayMeta::read(&fresh).unwrap().unwrap();
+        assert_eq!(meta.base_digest_kind(), Some("none"));
+        assert!(meta.get("base_weak_digest").is_none());
     }
 
     /// Regression: legacy overlays must keep tombstones and remain digest-free after migration.
