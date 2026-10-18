@@ -527,3 +527,79 @@ fn regression_pack_redacts_credentialed_base_in_meta_and_db() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+fn unpack_cmd(f: &Fixture, dest: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    cmd.env("XDG_CACHE_HOME", &f.cache)
+        .env("HOME", f.tmp.path())
+        .env_remove("RATARMOUNT_BUNDLE_MAX_BYTES")
+        .env_remove("RATARMOUNT_BUNDLE_MAX_ENTRIES")
+        .args(["overlay", "unpack"])
+        .arg(&f.bundle)
+        .arg(dest)
+        .args(extra);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+fn expect_cap_refusal(output: Output, dest: &Path, what: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("extracts more than") && stderr.contains(what),
+        "stderr: {stderr}"
+    );
+    assert!(!dest.exists(), "destination must be absent");
+}
+
+/// Regression: a bundle extracting more entries or bytes than the caps (set
+/// through the environment) is refused, leaving no destination; before the
+/// caps existed the variables were ignored and the unpack succeeded.
+#[test]
+fn regression_unpack_env_caps_refuse_bundle() {
+    let f = Fixture::new();
+    let dest = f.tmp.path().join("env-entries");
+    expect_cap_refusal(
+        unpack_cmd(&f, &dest, &[], &[("RATARMOUNT_BUNDLE_MAX_ENTRIES", "2")]),
+        &dest,
+        "entries",
+    );
+    let dest = f.tmp.path().join("env-bytes");
+    expect_cap_refusal(
+        unpack_cmd(&f, &dest, &[], &[("RATARMOUNT_BUNDLE_MAX_BYTES", "100")]),
+        &dest,
+        "bytes",
+    );
+}
+
+/// The flags take the same caps and beat the environment.
+#[test]
+fn regression_unpack_flag_caps_refuse_bundle_and_override_env() {
+    let f = Fixture::new();
+    let dest = f.tmp.path().join("flag-entries");
+    expect_cap_refusal(
+        unpack_cmd(&f, &dest, &["--max-entries", "2"], &[]),
+        &dest,
+        "entries",
+    );
+    let dest = f.tmp.path().join("flag-bytes");
+    expect_cap_refusal(
+        unpack_cmd(&f, &dest, &["--max-bytes", "100"], &[]),
+        &dest,
+        "bytes",
+    );
+    let dest = f.tmp.path().join("flag-wins");
+    let out = unpack_cmd(
+        &f,
+        &dest,
+        &["--max-entries", "1000000", "--max-bytes", "1G"],
+        &[
+            ("RATARMOUNT_BUNDLE_MAX_ENTRIES", "2"),
+            ("RATARMOUNT_BUNDLE_MAX_BYTES", "100"),
+        ],
+    );
+    expect(out, 0);
+    assert!(dest.is_dir());
+}

@@ -86,7 +86,16 @@ pub enum OverlayCommand {
     #[command(
         after_help = "Example: ratarmount overlay unpack attempt.tar.zst restored\n\nExit status:\n  0  Restored checks match.\n  1  Seal mismatch.\n  2  Invalid input or operational error."
     )]
-    Unpack { bundle: PathBuf, directory: PathBuf },
+    Unpack {
+        bundle: PathBuf,
+        directory: PathBuf,
+        /// Refuse a bundle that extracts more than SIZE bytes (experimental; default 32G, or $RATARMOUNT_BUNDLE_MAX_BYTES).
+        #[arg(long, value_name = "SIZE", value_parser = ratarmount_compositing::parse_overlay_size)]
+        max_bytes: Option<u64>,
+        /// Refuse a bundle with more than N entries (experimental; default 1000000, or $RATARMOUNT_BUNDLE_MAX_ENTRIES).
+        #[arg(long, value_name = "N")]
+        max_entries: Option<u64>,
+    },
     /// Check overlay consistency.
     ///
     /// Inspect database rows and host entries after unmounting; --repair fixes recoverable inconsistencies and refuses sealed overlays.
@@ -166,7 +175,17 @@ pub fn run(args: &OverlayArgs) -> Result<(String, i32), String> {
         OverlayCommand::Verify(args) => verify(args),
         OverlayCommand::DigestBase(args) => digest_base(args),
         OverlayCommand::Pack(args) => Ok(bundle_exit(pack(args))),
-        OverlayCommand::Unpack { bundle, directory } => Ok(bundle_exit(unpack(bundle, directory))),
+        OverlayCommand::Unpack {
+            bundle,
+            directory,
+            max_bytes,
+            max_entries,
+        } => Ok(bundle_exit(unpack(
+            bundle,
+            directory,
+            *max_bytes,
+            *max_entries,
+        ))),
         OverlayCommand::Fsck {
             directory,
             repair,
@@ -229,9 +248,16 @@ fn bundle_exit(result: Result<(String, i32), String>) -> (String, i32) {
     })
 }
 
-pub fn unpack(bundle: &Path, directory: &Path) -> Result<(String, i32), String> {
+pub fn unpack(
+    bundle: &Path,
+    directory: &Path,
+    max_bytes: Option<u64>,
+    max_entries: Option<u64>,
+) -> Result<(String, i32), String> {
     let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
-    let result = super::overlay_pack::unpack(bundle, directory)
+    let limits = super::overlay_pack::Limits::resolve(max_bytes, max_entries)
+        .map_err(|e| format!("unpack {}: {e}", bundle.display()))?;
+    let result = super::overlay_pack::unpack_with_limits(bundle, directory, limits)
         .map_err(|e| format!("unpack {}: {e}", bundle.display()))?;
     if !result.verified {
         eprintln!("content not verified; run `overlay verify DIR BASE` before using it as a lower");

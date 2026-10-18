@@ -663,13 +663,57 @@ fn seal_directories(fd: &OwnedFd) -> io::Result<()> {
 /// Modes and mtimes the archive asks for. Extraction creates everything
 /// writable (a killed unpack must leave a tree `rm -rf` can remove) and
 /// `finalize_stage` applies these once every check has passed.
+#[derive(Debug)]
 struct Recorded {
     files: Vec<(String, u32)>,
     directories: BTreeMap<String, (u32, std::time::SystemTime)>,
 }
 
+/// Bounds on what one bundle may extract. A layer is a patch of agent edits,
+/// so the defaults are generous but still stop a compression bomb.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub max_bytes: u64,
+    pub max_entries: u64,
+}
+
+pub const DEFAULT_MAX_BYTES: u64 = 32 << 30;
+pub const DEFAULT_MAX_ENTRIES: u64 = 1_000_000;
+const MAX_BYTES_ENV: &str = "RATARMOUNT_BUNDLE_MAX_BYTES";
+const MAX_ENTRIES_ENV: &str = "RATARMOUNT_BUNDLE_MAX_ENTRIES";
+
+impl Limits {
+    /// Explicit values win over the environment, which wins over the defaults.
+    pub fn resolve(max_bytes: Option<u64>, max_entries: Option<u64>) -> io::Result<Self> {
+        let from_env = |name: &str| -> io::Result<Option<u64>> {
+            match std::env::var(name) {
+                Ok(v) if !v.trim().is_empty() => ratarmount_compositing::parse_overlay_size(&v)
+                    .map(Some)
+                    .map_err(|e| invalid(format!("{name}: {e}"))),
+                _ => Ok(None),
+            }
+        };
+        Ok(Self {
+            max_bytes: match max_bytes {
+                Some(n) => n,
+                None => from_env(MAX_BYTES_ENV)?.unwrap_or(DEFAULT_MAX_BYTES),
+            },
+            max_entries: match max_entries {
+                Some(n) => n,
+                None => from_env(MAX_ENTRIES_ENV)?.unwrap_or(DEFAULT_MAX_ENTRIES),
+            },
+        })
+    }
+}
+
 fn extract(bundle: &Path, directory: &Path) -> io::Result<Recorded> {
+    extract_with_limits(bundle, directory, Limits::resolve(None, None)?)
+}
+
+fn extract_with_limits(bundle: &Path, directory: &Path, limits: Limits) -> io::Result<Recorded> {
     let root = open_root(directory)?;
+    let mut entries_seen = 0u64;
+    let mut remaining = limits.max_bytes;
     let mut files = Vec::new();
     let body = ratarmount_compress::open_seekable_zstd(bundle).map_err(io::Error::other)?;
     let mut archive = tar::Archive::new(body.open_reader()?);
@@ -677,6 +721,13 @@ fn extract(bundle: &Path, directory: &Path) -> io::Result<Recorded> {
     let mut directories = BTreeMap::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
+        entries_seen += 1;
+        if entries_seen > limits.max_entries {
+            return Err(invalid(format!(
+                "bundle extracts more than {} entries",
+                limits.max_entries
+            )));
+        }
         let path = safe_path(&entry.path_bytes())?;
         if !seen.insert(path.clone()) {
             return Err(invalid(format!("duplicate bundle entry {path}")));
@@ -715,12 +766,29 @@ fn extract(bundle: &Path, directory: &Path) -> io::Result<Recorded> {
             )?;
             let mut file = File::from(child);
             let expected = entry.size();
-            if io::copy(&mut entry, &mut file)? != expected {
+            let too_big = || {
+                invalid(format!(
+                    "bundle extracts more than {} bytes",
+                    limits.max_bytes
+                ))
+            };
+            if expected > remaining {
+                return Err(too_big());
+            }
+            let written = io::copy(
+                &mut (&mut entry).take(remaining.saturating_add(1)),
+                &mut file,
+            )?;
+            if written > remaining {
+                return Err(too_big());
+            }
+            if written != expected {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "truncated bundle member",
                 ));
             }
+            remaining -= written;
             file.set_times(fs::FileTimes::new().set_modified(mtime))?;
             files.push((relative.to_string(), mode));
             #[cfg(test)]
@@ -822,11 +890,20 @@ fn verify_recorded(directory: &Path, meta: &OverlayMeta) -> io::Result<Option<bo
 
 /// Restore into a nonexistent or empty directory. Always checks immutable DB
 /// metadata and the sentinel; verifies changes when the recorded stack exists.
-pub fn unpack(bundle: &Path, directory: &Path) -> io::Result<UnpackOutcome> {
-    unpack_impl(bundle, directory)
+#[cfg(test)]
+fn unpack(bundle: &Path, directory: &Path) -> io::Result<UnpackOutcome> {
+    unpack_with_limits(bundle, directory, Limits::resolve(None, None)?)
 }
 
-fn unpack_impl(bundle: &Path, directory: &Path) -> io::Result<UnpackOutcome> {
+pub fn unpack_with_limits(
+    bundle: &Path,
+    directory: &Path,
+    limits: Limits,
+) -> io::Result<UnpackOutcome> {
+    unpack_impl(bundle, directory, limits)
+}
+
+fn unpack_impl(bundle: &Path, directory: &Path, limits: Limits) -> io::Result<UnpackOutcome> {
     let metadata = bundle_meta(bundle)?;
     match fs::symlink_metadata(directory) {
         Ok(m) if m.is_dir() && fs::read_dir(directory)?.next().is_none() => {}
@@ -846,7 +923,7 @@ fn unpack_impl(bundle: &Path, directory: &Path) -> io::Result<UnpackOutcome> {
     // not need write permission to update its `..` across different parents.
     let stage = Stage::new_in(output_parent, ".ratarmount-unpack-")?;
     let layer = stage.path();
-    let recorded = extract(bundle, layer)
+    let recorded = extract_with_limits(bundle, layer, limits)
         .map_err(|e| io::Error::new(e.kind(), format!("extract layer: {e}")))?;
     let meta = immutable_meta(layer)
         .map_err(|e| io::Error::new(e.kind(), format!("read layer database: {e}")))?;
@@ -2297,6 +2374,124 @@ mod tests {
             fs::create_dir(&dir).unwrap();
             assert!(extract(&bundle, &dir).is_err(), "{kind:?}");
         }
+    }
+
+    /// Bundle of `layer/` plus the named regular files, each of the given size.
+    fn sized_bundle(f: &Fixture, name: &str, files: &[(&str, usize)]) -> PathBuf {
+        let mut tar = tar::Builder::new(Vec::new());
+        let meta = checked_meta(&f.dir).unwrap();
+        append_bytes(
+            &mut tar,
+            "meta.json",
+            &serde_json::to_vec(meta.values()).unwrap(),
+        )
+        .unwrap();
+        let mut dir = header(0o755, 0, 0, tar::EntryType::Directory);
+        tar.append_data(&mut dir, "layer/", &[][..]).unwrap();
+        for (path, size) in files {
+            let body = vec![7u8; *size];
+            let mut h = header(0o644, 0, *size as u64, tar::EntryType::Regular);
+            tar.append_data(&mut h, format!("layer/{path}"), &body[..])
+                .unwrap();
+        }
+        let bundle = f.tmp.path().join(name);
+        let mut writer =
+            ratarmount_compress::ZstdFrameWriter::new(File::create(&bundle).unwrap(), 3);
+        writer.write_frame(&tar.into_inner().unwrap()[..]).unwrap();
+        writer.finish().unwrap();
+        bundle
+    }
+
+    fn leftovers(parent: &Path) -> Vec<String> {
+        fs::read_dir(parent)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".ratarmount-unpack-"))
+            .collect()
+    }
+
+    /// Regression: a bundle with more tar entries than the cap (a zip-bomb
+    /// style entry flood) must fail, leave no destination and no staging.
+    #[test]
+    fn regression_extract_refuses_entry_count_over_cap() {
+        let f = Fixture::new(true);
+        let files: Vec<(String, usize)> = (0..6).map(|i| (format!("f{i}"), 1)).collect();
+        let refs: Vec<(&str, usize)> = files.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let bundle = sized_bundle(&f, "many.tar.zst", &refs);
+        let limits = |n| Limits {
+            max_bytes: u64::MAX,
+            max_entries: n,
+        };
+        let dir = f.tmp.path().join("ex");
+        fs::create_dir(&dir).unwrap();
+        let err = extract_with_limits(&bundle, &dir, limits(3)).unwrap_err();
+        assert!(err.to_string().contains("more than 3 entries"), "{err}");
+        // Exactly at the cap (meta.json, layer/, six files) succeeds.
+        let ok = f.tmp.path().join("ex-ok");
+        fs::create_dir(&ok).unwrap();
+        extract_with_limits(&bundle, &ok, limits(8)).unwrap();
+        let dest = f.tmp.path().join("dest");
+        let err = unpack_with_limits(&bundle, &dest, limits(3)).unwrap_err();
+        assert!(err.to_string().contains("more than 3 entries"), "{err}");
+        assert!(!dest.exists());
+        assert!(leftovers(f.tmp.path()).is_empty());
+    }
+
+    /// Regression: members individually under the byte cap whose sum is over
+    /// it must fail; exactly at the cap succeeds.
+    #[test]
+    fn regression_extract_refuses_total_bytes_over_cap() {
+        let f = Fixture::new(true);
+        let bundle = sized_bundle(&f, "big.tar.zst", &[("a", 600), ("b", 600)]);
+        let limits = |n| Limits {
+            max_bytes: n,
+            max_entries: u64::MAX,
+        };
+        let dir = f.tmp.path().join("ex");
+        fs::create_dir(&dir).unwrap();
+        let err = extract_with_limits(&bundle, &dir, limits(1000)).unwrap_err();
+        assert!(err.to_string().contains("more than 1000 bytes"), "{err}");
+        let ok = f.tmp.path().join("ex-ok");
+        fs::create_dir(&ok).unwrap();
+        extract_with_limits(&bundle, &ok, limits(1200)).unwrap();
+        let dest = f.tmp.path().join("dest");
+        let err = unpack_with_limits(&bundle, &dest, limits(1000)).unwrap_err();
+        assert!(err.to_string().contains("more than 1000 bytes"), "{err}");
+        assert!(!dest.exists());
+        assert!(leftovers(f.tmp.path()).is_empty());
+    }
+
+    /// Mutant gaps: path components that alias another path are unsafe.
+    #[test]
+    fn regression_safe_path_rejects_aliasing_components() {
+        for bad in ["", ".", "a//b", "a/./b", "/abs", "a/../b"] {
+            assert!(safe_path(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        assert_eq!(safe_path(b"a/b/").unwrap(), "a/b");
+    }
+
+    /// Mutant gaps: unpack refuses a non-empty, symlink or file destination
+    /// and leaves each untouched.
+    #[test]
+    fn regression_unpack_refuses_non_directory_destinations() {
+        let f = Fixture::new(true);
+        let bundle = sized_bundle(&f, "ok.tar.zst", &[("a", 1)]);
+        let full = f.tmp.path().join("full");
+        fs::create_dir(&full).unwrap();
+        fs::write(full.join("keep"), b"x").unwrap();
+        let file = f.tmp.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        let target = f.tmp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = f.tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        for dest in [&full, &file, &link] {
+            assert!(unpack(&bundle, dest).is_err(), "{dest:?}");
+        }
+        assert_eq!(fs::read(full.join("keep")).unwrap(), b"x");
+        assert_eq!(fs::read(&file).unwrap(), b"x");
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
     }
 
     /// Regression: the overlay CLI must keep both bundle operands and its

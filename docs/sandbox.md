@@ -990,6 +990,15 @@ and compares the seal sentinel with the recorded digest. It also recomputes the
 seal against the recorded stack when that base and its lowers are reachable.
 When they are absent it reports that only the database and sentinel were
 checked; run `overlay verify` after restoring the stack to validate content.
+
+**Extraction caps (experimental; may change before 1.0).** A bundle that would
+extract more than 1,000,000 tar entries or 32 GiB is refused with
+`bundle extracts more than N entries` / `more than N bytes`, and the staging
+tree is removed, so a decompression bomb cannot fill the disk. Override with
+`overlay unpack BUNDLE DIR --max-bytes SIZE --max-entries N` (`SIZE` takes
+`K`/`M`/`G`/`T`) or the environment variables `RATARMOUNT_BUNDLE_MAX_BYTES`
+and `RATARMOUNT_BUNDLE_MAX_ENTRIES`; a flag beats the variable. `--lower`
+bundle fills use the variables or the defaults.
 Exit codes are 0 for a match, 1 for a digest/content mismatch, and 2 for invalid
 input or an operational error. Unsafe archive paths, duplicate entries,
 hardlinks, device entries and writes through symlink components are refused.
