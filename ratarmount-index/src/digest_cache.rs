@@ -64,18 +64,16 @@ pub fn cached_archive_digest(path: &Path, index: Option<&Path>) -> Result<String
     })
 }
 
-/// The cached SHA-256 of `path`, or `None` on a miss. Never hashes the archive.
+/// The cached SHA-256 of `path`, or `None` on a miss. Never hashes the archive
+/// and never waits: it takes neither the in-process entry nor the cross-process
+/// lock, so a mount that only peeks is ready while another mount is hashing.
 pub fn peek_archive_digest(path: &Path, index: Option<&Path>) -> Result<Option<String>> {
-    match cached_with(path, index, false, &never_cancelled, |_| {
-        Err(IndexError::Io(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "digest not cached",
-        )))
-    }) {
-        Ok(digest) => Ok(Some(digest)),
-        Err(IndexError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(e) => Err(e),
-    }
+    let path = path.canonicalize()?;
+    let stamp = ArchiveDigestStamp::read(&path)?;
+    let Some(cache) = open_cache(index, false) else {
+        return Ok(None);
+    };
+    Ok(lookup(&cache, path.as_os_str().as_encoded_bytes(), &stamp))
 }
 
 /// Like [`cached_archive_digest`], but the caller supplies the hashing (for
@@ -113,7 +111,7 @@ pub fn refresh_archive_digest(path: &Path, index: Option<&Path>) -> Result<Strin
 /// created. When false, a mount must leave the digest pending rather than
 /// rehash the archive on every mount.
 pub fn archive_digest_cache_available(index: Option<&Path>) -> bool {
-    open_cache(index).is_some_and(|cache| open_lock_file(&cache.index).is_some())
+    open_cache(index, true).is_some_and(|cache| open_lock_file(&cache.index).is_some())
 }
 
 struct Cache {
@@ -121,7 +119,9 @@ struct Cache {
     index: PathBuf,
 }
 
-fn open_cache(index: Option<&Path>) -> Option<Cache> {
+/// `create_table`: false for a read-only peek, which must not wait out another
+/// mount creating the table (a missing table is simply a miss).
+fn open_cache(index: Option<&Path>, create_table: bool) -> Option<Cache> {
     let index = index?;
     let metadata = fs::metadata(index).ok()?;
     if !metadata.is_file() || metadata.permissions().readonly() {
@@ -169,6 +169,9 @@ fn open_cache(index: Option<&Path>) -> Option<Cache> {
         )
         .ok()?;
     if !has_table {
+        if !create_table {
+            return None;
+        }
         // Concurrent first mounts all create it; wait out the winner instead
         // of mistaking its write lock for "no cache".
         conn.busy_timeout(CREATE_BUSY_TIMEOUT).ok()?;
@@ -314,7 +317,7 @@ fn cached_with(
     let stamp = ArchiveDigestStamp::read(&path)?;
     // Keep raw OS bytes: two non-UTF-8 paths must not share a lossy cache key.
     let key = path.as_os_str().as_encoded_bytes();
-    let cache = open_cache(index);
+    let cache = open_cache(index, true);
     if let (Some(cache), false) = (&cache, refresh) {
         if let Some(hit) = lookup(cache, key, &stamp) {
             return Ok(hit);
@@ -627,6 +630,56 @@ mod tests {
         // The cancelled wait left no in-process entry behind.
         drop(other_process);
         cached_archive_digest(&archive, Some(&index)).unwrap();
+    }
+
+    /// Regression: a mount's cache peek waited on the lock another mount held
+    /// while hashing, so the second mount was not ready until the first hash
+    /// finished. The peek must return a miss at once and the archive is still
+    /// hashed exactly once.
+    #[test]
+    fn regression_peek_does_not_wait_for_a_running_hash() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc::channel;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, vec![7u8; 4096]).unwrap();
+        let index = index_with_files(dir.path());
+        let hashes = AtomicUsize::new(0);
+        let (started_tx, started) = channel::<()>();
+        let (release, release_rx) = channel::<()>();
+        std::thread::scope(|scope| {
+            let (hashes, archive, index) = (&hashes, &archive, &index);
+            let hasher = scope.spawn(move || {
+                cached_archive_digest_with(archive, Some(index), |p| {
+                    hashes.fetch_add(1, Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    sha256_hex_stream(&mut fs::File::open(p)?)
+                })
+                .unwrap()
+            });
+            started.recv().unwrap();
+            let (done_tx, done) = channel();
+            let (archive2, index2) = (archive.clone(), index.clone());
+            std::thread::spawn(move || {
+                done_tx
+                    .send(peek_archive_digest(&archive2, Some(&index2)))
+                    .ok();
+            });
+            let peeked = done.recv_timeout(Duration::from_secs(5));
+            release.send(()).unwrap();
+            let digest = hasher.join().unwrap();
+            assert!(
+                matches!(peeked, Ok(Ok(None))),
+                "peek blocked or hit while the hash was running: {peeked:?}"
+            );
+            // After the hash lands, the peek is a hit and nothing hashes again.
+            assert_eq!(
+                peek_archive_digest(&archive, Some(&index)).unwrap(),
+                Some(digest)
+            );
+        });
+        assert_eq!(hashes.load(Ordering::SeqCst), 1);
     }
 
     /// The cache is available only for a writable, unpublished index.

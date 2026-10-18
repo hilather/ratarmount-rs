@@ -1,4 +1,7 @@
 //! Portable sealed layers: deterministic seekable bundles and confined extraction.
+//!
+//! Unix-only by design (`std::os::unix`, `flock`, `openat`); `main.rs` builds it
+//! unconditionally, as the binary is not built for Windows.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -360,17 +363,105 @@ fn valid_digest(digest: &str) -> io::Result<&str> {
 /// is layout 1.
 const BUNDLE_FORMAT: u64 = 1;
 
-/// Read metadata via the regular session API; no bundle payload is extracted.
-fn bundle_meta(bundle: &Path) -> io::Result<BTreeMap<String, String>> {
-    let options = ratarmount_core::OpenOptions {
-        write_index: false,
-        index_in_memory: true,
-        ..Default::default()
-    };
-    let source = ratarmount_session::factory::open_path(bundle, &options, false)
-        .map_err(io::Error::other)?;
-    if let Some(info) = source.lookup("/bundle.json", 0) {
-        let layout: serde_json::Value = serde_json::from_reader(source.open(&info, 0)?)
+/// Largest `meta.json` / `bundle.json` read from a bundle; real ones are a few KiB.
+const MAX_META_BYTES: u64 = 1 << 20;
+
+// Decoded bytes read so far by the capped decoders of this thread (tests assert
+// that a hostile bundle stops the decode early).
+#[cfg(test)]
+thread_local! {
+    static DECODED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Streaming zstd decoder that fails once it has produced more than the
+/// bundle's limits allow: `max_bytes` of payload plus tar framing (a header and
+/// padding per entry and a small constant for PAX records). Nothing is spooled
+/// to disk, so `--max-bytes` stops the work, not only the extraction.
+struct CappedDecode<R> {
+    inner: R,
+    decoded: u64,
+    max_bytes: u64,
+    entries: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl<R: Read> Read for CappedDecode<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let allowed = self
+            .max_bytes
+            .saturating_add(self.entries.get().saturating_add(2).saturating_mul(2048))
+            .saturating_add(1 << 20);
+        let room = allowed.saturating_sub(self.decoded);
+        if room == 0 {
+            return Err(invalid(format!(
+                "bundle decodes to more than {} bytes",
+                self.max_bytes
+            )));
+        }
+        let want = buf.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..want])?;
+        self.decoded += n as u64;
+        #[cfg(test)]
+        DECODED_BYTES.with(|c| c.set(c.get() + n as u64));
+        Ok(n)
+    }
+}
+
+type BundleTar = tar::Archive<CappedDecode<zstd::stream::read::Decoder<'static, BufReader<File>>>>;
+
+/// Open `bundle` as a tar read through the capped streaming decoder. The
+/// returned counter is the number of entries seen, kept by the caller.
+fn open_bundle_tar(
+    bundle: &Path,
+    limits: Limits,
+) -> io::Result<(BundleTar, std::rc::Rc<std::cell::Cell<u64>>)> {
+    let entries = std::rc::Rc::new(std::cell::Cell::new(0));
+    let decoder = zstd::stream::read::Decoder::new(File::open(bundle)?)?;
+    let archive = tar::Archive::new(CappedDecode {
+        inner: decoder,
+        decoded: 0,
+        max_bytes: limits.max_bytes,
+        entries: entries.clone(),
+    });
+    Ok((archive, entries))
+}
+
+fn read_capped_member(entry: &mut impl Read, what: &str) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    entry.take(MAX_META_BYTES + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > MAX_META_BYTES {
+        return Err(invalid(format!(
+            "bundle {what} is larger than {MAX_META_BYTES} bytes"
+        )));
+    }
+    Ok(data)
+}
+
+/// Read metadata by a sequential, size-capped scan of the bundle: `meta.json`
+/// and `bundle.json` are read (each at most 1 MiB) and every other payload is
+/// skipped, never extracted or spooled. The scan is bounded by `limits`, like
+/// extraction, so a hostile bundle cannot make this step do unbounded work.
+fn bundle_meta(bundle: &Path, limits: Limits) -> io::Result<BTreeMap<String, String>> {
+    let (mut archive, seen) = open_bundle_tar(bundle, limits)?;
+    let mut layout = None;
+    let mut meta_json = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        seen.set(seen.get() + 1);
+        if seen.get() > limits.max_entries {
+            return Err(invalid(format!(
+                "bundle extracts more than {} entries",
+                limits.max_entries
+            )));
+        }
+        let name = entry.path_bytes().into_owned();
+        match name.as_slice() {
+            b"bundle.json" => layout = Some(read_capped_member(&mut entry, "bundle.json")?),
+            b"meta.json" => meta_json = Some(read_capped_member(&mut entry, "meta.json")?),
+            _ => {}
+        }
+    }
+    if let Some(layout) = layout {
+        let layout: serde_json::Value = serde_json::from_slice(&layout)
             .map_err(|_| invalid("bundle.json is not valid JSON"))?;
         let format = layout
             .get("bundle_format")
@@ -382,10 +473,8 @@ fn bundle_meta(bundle: &Path) -> io::Result<BTreeMap<String, String>> {
             )));
         }
     }
-    let info = source
-        .lookup("/meta.json", 0)
-        .ok_or_else(|| invalid("bundle missing meta.json"))?;
-    let meta: BTreeMap<String, String> = serde_json::from_reader(source.open(&info, 0)?)?;
+    let meta_json = meta_json.ok_or_else(|| invalid("bundle missing meta.json"))?;
+    let meta: BTreeMap<String, String> = serde_json::from_slice(&meta_json)?;
     valid_digest(
         meta.get("layer_digest")
             .ok_or_else(|| invalid("bundle missing layer_digest"))?,
@@ -518,7 +607,7 @@ fn cleanup_dirs(fd: &OwnedFd) {
     }
 }
 
-/// Exclusive advisory lock held for the life of a stage (or `.copy-` file).
+/// Exclusive advisory lock held for the life of a stage (or `.ratarmount-copy-` file).
 /// The stage's lock file lives beside it as `<stage>.lock`, never inside the
 /// layer, where it would be published, hashed and packed as content.
 struct StageLock {
@@ -566,11 +655,31 @@ struct Stage {
 }
 
 impl Stage {
-    fn new_in(parent: &Path, prefix: &str) -> io::Result<Self> {
-        sweep_stale_stages(parent);
-        let dir = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
-        let lock = StageLock::beside(dir.path())?;
-        Ok(Self { dir, _lock: lock })
+    /// `sweep_copies` is true only for ratarmount's private cache; the user's
+    /// destination parent is never searched for copy files.
+    fn new_in(parent: &Path, prefix: &str, sweep_copies: bool) -> io::Result<Self> {
+        Self::new_in_with(parent, prefix, sweep_copies, StageLock::beside)
+    }
+
+    /// A concurrent sweeper can take a fresh stage's lock before the stage does
+    /// and then remove the stage; make a new one rather than fail.
+    fn new_in_with(
+        parent: &Path,
+        prefix: &str,
+        sweep_copies: bool,
+        lock_for: impl Fn(&Path) -> io::Result<StageLock>,
+    ) -> io::Result<Self> {
+        const ATTEMPTS: usize = 4;
+        sweep_stale_stages(parent, sweep_copies);
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            let dir = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
+            match lock_for(dir.path()) {
+                Ok(lock) => return Ok(Self { dir, _lock: lock }),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::other("cannot lock staging")))
     }
 
     fn path(&self) -> &Path {
@@ -586,14 +695,25 @@ impl Drop for Stage {
     }
 }
 
+/// Open for the sweeper's flock without following a symlink planted under a
+/// swept name.
+fn open_nofollow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
 const STAGE_PREFIXES: [&str; 2] = [".ratarmount-unpack-", ".ratarmount-layer-"];
-const COPY_PREFIX: &str = ".copy-";
+const COPY_PREFIX: &str = ".ratarmount-copy-";
 
 /// Remove staging left by killed processes. Only our own prefixes, owned by
 /// us, never symlinks. A stage is abandoned when its sibling lock can be
 /// taken; no mtime heuristic is used for stages with a lock (the root mtime
 /// is a restored archive value). Best effort: errors are ignored.
-fn sweep_stale_stages(parent: &Path) {
+fn sweep_stale_stages(parent: &Path, sweep_copies: bool) {
     use std::os::unix::fs::MetadataExt;
     let Ok(entries) = fs::read_dir(parent) else {
         return;
@@ -616,13 +736,13 @@ fn sweep_stale_stages(parent: &Path) {
         if meta.file_type().is_symlink() || meta.uid() != euid {
             continue;
         }
-        if name.starts_with(COPY_PREFIX) && meta.is_file() {
+        if sweep_copies && name.starts_with(COPY_PREFIX) && meta.is_file() {
             // A copy being written has a fresh mtime; the age check closes the
             // gap between its creation and its flock.
             if age(&meta) < minute {
                 continue;
             }
-            let Ok(file) = File::options().read(true).write(true).open(&path) else {
+            let Ok(file) = open_nofollow(&path) else {
                 continue;
             };
             if try_flock(&file) {
@@ -632,7 +752,7 @@ fn sweep_stale_stages(parent: &Path) {
             // Orphan lock whose stage is gone.
             let stage = parent.join(name.trim_end_matches(".lock"));
             if fs::symlink_metadata(&stage).is_err() {
-                if let Ok(file) = File::options().read(true).write(true).open(&path) {
+                if let Ok(file) = open_nofollow(&path) {
                     if try_flock(&file) {
                         let _ = fs::remove_file(&path);
                     }
@@ -640,7 +760,7 @@ fn sweep_stale_stages(parent: &Path) {
             }
         } else if STAGE_PREFIXES.iter().any(|p| name.starts_with(p)) && meta.is_dir() {
             let lock = lock_path(&path);
-            let held = match File::options().read(true).write(true).open(&lock) {
+            let held = match open_nofollow(&lock) {
                 Ok(file) => {
                     if !try_flock(&file) {
                         continue;
@@ -737,13 +857,13 @@ fn extract_with_limits(bundle: &Path, directory: &Path, limits: Limits) -> io::R
     let mut entries_seen = 0u64;
     let mut remaining = limits.max_bytes;
     let mut files = Vec::new();
-    let body = ratarmount_compress::open_seekable_zstd(bundle).map_err(io::Error::other)?;
-    let mut archive = tar::Archive::new(body.open_reader()?);
+    let (mut archive, entry_counter) = open_bundle_tar(bundle, limits)?;
     let mut seen = BTreeSet::new();
     let mut directories = BTreeMap::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         entries_seen += 1;
+        entry_counter.set(entries_seen);
         if entries_seen > limits.max_entries {
             return Err(invalid(format!(
                 "bundle extracts more than {} entries",
@@ -926,7 +1046,7 @@ pub fn unpack_with_limits(
 }
 
 fn unpack_impl(bundle: &Path, directory: &Path, limits: Limits) -> io::Result<UnpackOutcome> {
-    let metadata = bundle_meta(bundle)?;
+    let metadata = bundle_meta(bundle, limits)?;
     match fs::symlink_metadata(directory) {
         Ok(m) if m.is_dir() && fs::read_dir(directory)?.next().is_none() => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -943,7 +1063,7 @@ fn unpack_impl(bundle: &Path, directory: &Path, limits: Limits) -> io::Result<Un
         .unwrap_or(Path::new("."));
     // Stage beside the destination, so publishing a read-only directory does
     // not need write permission to update its `..` across different parents.
-    let stage = Stage::new_in(output_parent, ".ratarmount-unpack-")?;
+    let stage = Stage::new_in(output_parent, ".ratarmount-unpack-", false)?;
     let layer = stage.path();
     let recorded = extract_with_limits(bundle, layer, limits)
         .map_err(|e| io::Error::new(e.kind(), format!("extract layer: {e}")))?;
@@ -1025,7 +1145,7 @@ fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempF
     use sha2::{Digest, Sha256};
     let mut source = File::open(bundle)?;
     let mut copy = tempfile::Builder::new()
-        .prefix(".copy-")
+        .prefix(COPY_PREFIX)
         .suffix(".tar.zst")
         .tempfile_in(cache)?;
     // The flock lives as long as the copy's descriptor, i.e. until it is dropped.
@@ -1109,7 +1229,7 @@ pub(crate) fn cached_lower_in(
             hook();
         }
     });
-    let metadata = bundle_meta(copy.path())?;
+    let metadata = bundle_meta(copy.path(), Limits::resolve(None, None)?)?;
     let digest = metadata
         .get("layer_digest")
         .expect("checked digest")
@@ -1135,7 +1255,7 @@ pub(crate) fn cached_lower_in(
         return hit(&destination);
     }
     // Stage beside the destination; nothing is published before it verifies.
-    let stage = Stage::new_in(cache, ".ratarmount-layer-")?;
+    let stage = Stage::new_in(cache, ".ratarmount-layer-", true)?;
     let layer = stage.path();
     let recorded = extract(copy.path(), layer)
         .map_err(|e| io::Error::new(e.kind(), format!("extract layer: {e}")))?;
@@ -1855,7 +1975,7 @@ mod tests {
     }
 
     /// Regression: the cache fill sweeps stale `.ratarmount-layer-*` stages and
-    /// unlocked `.copy-*` files, never a locked one.
+    /// unlocked `.ratarmount-copy-*` files, never a locked one.
     #[test]
     fn regression_cache_fill_sweeps_stale_staging() {
         let f = Fixture::new(true);
@@ -1877,8 +1997,8 @@ mod tests {
                 .unwrap();
             path
         };
-        let dead_copy = copy(".copy-dead.tar.zst");
-        let live_copy = copy(".copy-live.tar.zst");
+        let dead_copy = copy(".ratarmount-copy-dead.tar.zst");
+        let live_copy = copy(".ratarmount-copy-live.tar.zst");
         let _live = hold_lock(&live_copy);
         cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
         assert!(!stale.exists());
@@ -1886,6 +2006,59 @@ mod tests {
         assert!(!dead_copy.exists());
         assert!(active.exists());
         assert!(live_copy.exists());
+    }
+
+    /// Regression: `overlay unpack bundle work/out` swept `work` and deleted the
+    /// user's own old `.copy-notes`; only ratarmount's private cache is swept
+    /// for copy files, and only by a ratarmount-specific prefix.
+    #[test]
+    fn regression_unpack_does_not_delete_user_copy_files() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let parent = f.tmp.path().join("work");
+        fs::create_dir(&parent).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let mut mine = Vec::new();
+        for name in [
+            ".copy-notes",
+            ".copy-dead.tar.zst",
+            ".ratarmount-copy-notes",
+        ] {
+            let path = parent.join(name);
+            fs::write(&path, b"mine").unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+            mine.push(path);
+        }
+        unpack(&bundle, &parent.join("out")).unwrap();
+        for path in mine {
+            assert!(path.exists(), "unpack deleted {}", path.display());
+        }
+    }
+
+    /// Regression: the sweeper can lock a stage's lock file between its
+    /// creation and the stage's own flock (and then removes the stage); the
+    /// stage retries instead of failing "staging lock is held".
+    #[test]
+    fn regression_stage_new_in_retries_when_sweeper_wins_lock_race() {
+        let tmp = tempfile::tempdir().unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let stage = Stage::new_in_with(tmp.path(), ".ratarmount-unpack-", false, |dir| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                // The sweeper removed the stage after taking its lock.
+                fs::remove_dir_all(dir).unwrap();
+                return Err(io::Error::other("staging lock is held by another process"));
+            }
+            StageLock::beside(dir)
+        })
+        .unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert!(stage.path().is_dir());
     }
 
     /// Regression: a failed fill leaves no staging directory or lock behind.
@@ -2559,6 +2732,90 @@ mod tests {
         assert!(err.to_string().contains("more than 1000 bytes"), "{err}");
         assert!(!dest.exists());
         assert!(leftovers(f.tmp.path()).is_empty());
+    }
+
+    /// A single-frame bundle (what a hostile producer writes: no seek table, so
+    /// the old path decoded all of it to temporary storage) of a valid
+    /// `meta.json`, `junk` non-layer bytes and a `layer/` holding `layer_bytes`.
+    fn bomb_bundle(
+        f: &Fixture,
+        name: &str,
+        junk: usize,
+        layer_bytes: usize,
+        meta_last: bool,
+    ) -> PathBuf {
+        let meta = checked_meta(&f.dir).unwrap();
+        let meta_json = serde_json::to_vec(meta.values()).unwrap();
+        let mut tar = tar::Builder::new(Vec::new());
+        if !meta_last {
+            append_bytes(&mut tar, "meta.json", &meta_json).unwrap();
+        }
+        let mut dir = header(0o755, 0, 0, tar::EntryType::Directory);
+        tar.append_data(&mut dir, "layer/", &[][..]).unwrap();
+        for (path, size) in [("junk", junk), ("layer/big", layer_bytes)] {
+            let mut h = header(0o644, 0, size as u64, tar::EntryType::Regular);
+            tar.append_data(&mut h, path, std::io::repeat(0).take(size as u64))
+                .unwrap();
+        }
+        if meta_last {
+            append_bytes(&mut tar, "meta.json", &meta_json).unwrap();
+        }
+        let bundle = f.tmp.path().join(name);
+        let mut writer =
+            ratarmount_compress::ZstdFrameWriter::new(File::create(&bundle).unwrap(), 3);
+        writer.write_frame(&tar.into_inner().unwrap()[..]).unwrap();
+        writer.finish().unwrap();
+        bundle
+    }
+
+    /// Regression: `--max-bytes 100` still decoded a whole single-frame bundle
+    /// to temporary storage before any counter ran, and read `meta.json`
+    /// through the session factory with no cap. Decoding must stop near the cap.
+    #[test]
+    fn regression_unpack_caps_bound_decompression() {
+        let f = Fixture::new(true);
+        let limits = Limits {
+            max_bytes: 100,
+            max_entries: 1_000_000,
+        };
+        // 48 MiB of zeros in a non-layer member, then the layer, meta last.
+        for (name, junk, layer, meta_last) in [
+            ("junk-last.tar.zst", 48 << 20, 1 << 10, true),
+            ("layer-big.tar.zst", 0, 48 << 20, false),
+        ] {
+            let bundle = bomb_bundle(&f, name, junk, layer, meta_last);
+            DECODED_BYTES.with(|c| c.set(0));
+            let dest = f.tmp.path().join(format!("dest-{name}"));
+            let err = unpack_with_limits(&bundle, &dest, limits).unwrap_err();
+            let decoded = DECODED_BYTES.with(|c| c.get());
+            assert!(
+                err.to_string().contains("more than 100 bytes"),
+                "{name}: {err}"
+            );
+            assert!(
+                decoded < (4 << 20),
+                "{name}: decoded {decoded} bytes before refusing"
+            );
+            assert!(!dest.exists());
+            assert!(leftovers(f.tmp.path()).is_empty());
+        }
+    }
+
+    /// Regression: an oversized `meta.json` is refused at 1 MiB, not read whole.
+    #[test]
+    fn regression_unpack_caps_meta_json_read() {
+        let f = Fixture::new(true);
+        let mut tar = tar::Builder::new(Vec::new());
+        append_bytes(&mut tar, "meta.json", &vec![b' '; 32 << 20]).unwrap();
+        let bundle = f.tmp.path().join("meta-bomb.tar.zst");
+        let mut writer =
+            ratarmount_compress::ZstdFrameWriter::new(File::create(&bundle).unwrap(), 3);
+        writer.write_frame(&tar.into_inner().unwrap()[..]).unwrap();
+        writer.finish().unwrap();
+        DECODED_BYTES.with(|c| c.set(0));
+        let err = bundle_meta(&bundle, Limits::resolve(None, None).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("meta.json is larger"), "{err}");
+        assert!(DECODED_BYTES.with(|c| c.get()) < (4 << 20));
     }
 
     /// Mutant gaps: path components that alias another path are unsafe.
