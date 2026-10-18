@@ -1629,6 +1629,32 @@ mod tests {
         assert!(cached_lower_in(&bundle, &cache, f.base.clone(), None).is_err());
     }
 
+    /// Regression (Keystone mutant `!= || !=` -> `&&` on the cache-hit meta
+    /// check): a cached layer whose `layer_digest` still matches but whose other
+    /// meta rows differ from the bundle's is refused, not served.
+    #[test]
+    fn regression_cache_hit_refused_when_only_other_meta_rows_differ() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("bundle.tar.zst");
+        let cache = f.tmp.path().join("cache");
+        let entry = cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
+        // A hit still works untouched.
+        assert!(cached_lower_in(&bundle, &cache, f.base.clone(), None).is_ok());
+        for dir in [&entry, &entry.join("layer")] {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+        }
+        let db = entry.join(HIDDEN_DB);
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE meta SET value='elsewhere' WHERE key='base_url'", [])
+            .unwrap();
+        drop(conn);
+        let error = cached_lower_in(&bundle, &cache, f.base.clone(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not match the bundle"), "{error}");
+    }
+
     /// Regression: unpack must report a seal mismatch rather than accepting a
     /// bundled payload that was changed after sealing; sentinel-only checks
     /// still detect mismatches without the base.

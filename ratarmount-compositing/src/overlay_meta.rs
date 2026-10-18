@@ -1563,6 +1563,210 @@ mod tests {
         }
     }
 
+    fn meta_with(rows: &[(&str, &str)]) -> OverlayMeta {
+        OverlayMeta {
+            values: rows
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn probe<'a>(
+        path: Option<&'a Path>,
+        git_tree: Option<&'a str>,
+        supplied: Option<&'a str>,
+        index: Option<&'a Path>,
+    ) -> BaseProbe<'a> {
+        BaseProbe {
+            path,
+            git_tree,
+            supplied,
+            index,
+            extra_excludes: &[],
+        }
+    }
+
+    /// Regression (Keystone mutant `recorded_tree != tree` -> `==`): the Git
+    /// branch of the `--lower` / seal / pack / diff base check refuses another
+    /// tree and accepts the recorded one.
+    #[test]
+    fn regression_compare_base_git_tree_mismatch_and_match() {
+        let meta = meta_with(&[
+            ("base_digest_kind", "git-tree"),
+            ("base_digest", "git-tree:aaa"),
+            ("base_git_tree", "aaa"),
+        ]);
+        let other =
+            compare_base_identity(Some(&meta), &probe(None, Some("bbb"), None, None)).unwrap();
+        assert_eq!(other.mismatch.as_deref(), Some("git-tree:bbb"));
+        assert_eq!(other.identity, "git-tree:bbb");
+        let same =
+            compare_base_identity(Some(&meta), &probe(None, Some("aaa"), None, None)).unwrap();
+        assert_eq!(same.mismatch, None);
+        // A record taken from a directory or archive is not this tree.
+        let dir_record = meta_with(&[("base_digest_kind", "weak"), ("base_weak_digest", "weak:x")]);
+        assert!(
+            compare_base_identity(Some(&dir_record), &probe(None, Some("aaa"), None, None))
+                .unwrap()
+                .mismatch
+                .is_some()
+        );
+        // Kind `none` recorded nothing to compare.
+        let none = meta_with(&[("base_digest_kind", "none"), ("base_git_tree", "aaa")]);
+        assert_eq!(
+            compare_base_identity(Some(&none), &probe(None, Some("bbb"), None, None))
+                .unwrap()
+                .mismatch,
+            None
+        );
+    }
+
+    /// Regression (Keystone mutant on `need_walk`): a supplied digest skips the
+    /// walk only when there is no recorded manifest to compare; with one, the
+    /// walk runs and a strong record is confirmed by the supplied digest.
+    #[test]
+    fn regression_compare_base_need_walk_with_supplied_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), b"one").unwrap();
+        let weak = directory_weak_digest(dir.path(), &BaseExcludes::default()).unwrap();
+        let strong = format!("sha256:{}", "a".repeat(64));
+        fs::write(dir.path().join("f"), b"edited").unwrap();
+        let record = |extra: &[(&'static str, &str)]| {
+            let mut rows = vec![
+                ("base_digest_kind", "strong"),
+                ("base_digest", strong.as_str()),
+            ];
+            rows.extend_from_slice(extra);
+            meta_with(&rows)
+        };
+        // Recorded manifest + supplied digest: walked (the edit is seen), then
+        // confirmed by the equal supplied digest.
+        let with_weak = record(&[("base_weak_digest", weak.as_str())]);
+        let walks = directory_weak_walks_this_thread();
+        let ok = compare_base_identity(
+            Some(&with_weak),
+            &probe(Some(dir.path()), None, Some(&strong), None),
+        )
+        .unwrap();
+        assert_eq!(directory_weak_walks_this_thread() - walks, 1);
+        assert!(ok.weak.as_ref().is_some_and(|w| *w != weak));
+        assert_eq!(ok.mismatch, None);
+        assert_eq!(ok.identity, strong);
+        // A different supplied digest, or none, is a mismatch.
+        let other = format!("sha256:{}", "b".repeat(64));
+        for supplied in [Some(other.as_str()), None] {
+            let bad = compare_base_identity(
+                Some(&with_weak),
+                &probe(Some(dir.path()), None, supplied, None),
+            )
+            .unwrap();
+            assert!(bad.mismatch.is_some(), "{supplied:?}");
+        }
+        // No recorded manifest and a supplied digest: nothing to walk.
+        let without = record(&[]);
+        let walks = directory_weak_walks_this_thread();
+        let ok = compare_base_identity(
+            Some(&without),
+            &probe(Some(dir.path()), None, Some(&strong), None),
+        )
+        .unwrap();
+        assert_eq!(directory_weak_walks_this_thread(), walks);
+        assert_eq!((ok.weak, ok.mismatch), (None, None));
+        // Kind `none` with a recorded manifest: undecidable, so no walk either.
+        let none = meta_with(&[
+            ("base_digest_kind", "none"),
+            ("base_weak_digest", weak.as_str()),
+        ]);
+        let walks = directory_weak_walks_this_thread();
+        let ok = compare_base_identity(
+            Some(&none),
+            &probe(Some(dir.path()), None, Some(&strong), None),
+        )
+        .unwrap();
+        assert_eq!(directory_weak_walks_this_thread(), walks);
+        assert_eq!(ok.mismatch, None);
+    }
+
+    /// An archive whose stamp differs is confirmed by the digest already
+    /// cached in its index (never hashed here), or by a supplied one.
+    #[test]
+    fn regression_compare_base_archive_confirmed_by_cached_or_supplied_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("copy.tar");
+        fs::write(&archive, b"bytes").unwrap();
+        let index = dir.path().join("copy.tar.index.sqlite");
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let record = meta_with(&[
+            ("base_digest_kind", "strong"),
+            ("base_digest", digest.as_str()),
+            ("base_size", "999"),
+            ("base_mtime_ns", "1"),
+        ]);
+        // Nothing cached: not confirmed.
+        let miss = compare_base_identity(
+            Some(&record),
+            &probe(Some(&archive), None, None, Some(&index)),
+        )
+        .unwrap();
+        assert!(miss.mismatch.is_some());
+        // Cache the (recorded) digest without hashing anything here.
+        Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT);")
+            .unwrap();
+        ratarmount_index::cached_archive_digest_with(
+            &archive,
+            Some(&index),
+            |_| Ok("c".repeat(64)),
+        )
+        .unwrap();
+        let hit = compare_base_identity(
+            Some(&record),
+            &probe(Some(&archive), None, None, Some(&index)),
+        )
+        .unwrap();
+        assert_eq!(
+            (hit.mismatch, hit.identity.as_str()),
+            (None, digest.as_str())
+        );
+        // A cached digest that is not the recorded one does not confirm.
+        let other = meta_with(&[
+            ("base_digest_kind", "strong"),
+            ("base_digest", "sha256:dd"),
+            ("base_size", "999"),
+            ("base_mtime_ns", "1"),
+        ]);
+        assert!(compare_base_identity(
+            Some(&other),
+            &probe(Some(&archive), None, None, Some(&index))
+        )
+        .unwrap()
+        .mismatch
+        .is_some());
+        // Supplied equals recorded: confirmed even with no cache.
+        let supplied = compare_base_identity(
+            Some(&record),
+            &probe(Some(&archive), None, Some(&digest), None),
+        )
+        .unwrap();
+        assert_eq!(supplied.mismatch, None);
+        // A weak record is never rescued by a digest.
+        let weak = meta_with(&[
+            ("base_digest_kind", "weak"),
+            ("base_digest", digest.as_str()),
+            ("base_size", "999"),
+            ("base_mtime_ns", "1"),
+        ]);
+        assert!(compare_base_identity(
+            Some(&weak),
+            &probe(Some(&archive), None, Some(&digest), Some(&index))
+        )
+        .unwrap()
+        .mismatch
+        .is_some());
+    }
+
     /// Regression: committing must preserve digest opt-out and legacy identities.
     #[test]
     fn regression_overlay_meta_commit_preserves_kind_and_legacy() {
