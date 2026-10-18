@@ -853,17 +853,59 @@ static QUARANTINE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// directories swept are the caller's own. Returns whether the entry was removed.
 fn unlink_if_same(dir: &OwnedFd, name: &str, locked: &File) -> bool {
     use std::sync::atomic::Ordering;
+    unlink_if_same_named(dir, name, locked, &mut || {
+        format!(
+            ".ratarmount-quarantine-{}-{}",
+            std::process::id(),
+            QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    })
+}
+
+/// `renameat` that fails with `EEXIST` instead of replacing `to`.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> rustix::io::Result<()> {
+    host::renameat_with(dir, from, dir, to, host::RenameFlags::NOREPLACE)
+}
+
+/// No atomic no-replace rename here: `linkat` never replaces, then the old
+/// name is unlinked. The inode check after the call still guards the result.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> rustix::io::Result<()> {
+    host::linkat(dir, from, dir, to, AtFlags::empty())?;
+    host::unlinkat(dir, from, AtFlags::empty())
+}
+
+/// How many quarantine names are tried before the entry is left alone.
+const QUARANTINE_ATTEMPTS: usize = 8;
+
+/// [`unlink_if_same`] with the quarantine names supplied by `next_name`.
+fn unlink_if_same_named(
+    dir: &OwnedFd,
+    name: &str,
+    locked: &File,
+    next_name: &mut dyn FnMut() -> String,
+) -> bool {
     let Ok(held) = ratarmount_compositing::host_stat::fstat(locked) else {
         return false;
     };
-    let quarantine = format!(
-        ".ratarmount-quarantine-{}-{}",
-        std::process::id(),
-        QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
-    if host::renameat(dir, name, dir, quarantine.as_str()).is_err() {
-        return false;
+    let mut quarantine = None;
+    for _ in 0..QUARANTINE_ATTEMPTS {
+        let candidate = next_name();
+        match rename_no_replace(dir, name, &candidate) {
+            Ok(()) => {
+                quarantine = Some(candidate);
+                break;
+            }
+            // Taken (an orphan that outlived a pid, a planted file): leave it
+            // alone and try another name.
+            Err(e) if e == rustix::io::Errno::EXIST => {}
+            Err(_) => return false,
+        }
     }
+    let Some(quarantine) = quarantine else {
+        return false;
+    };
     let same = ratarmount_compositing::host_stat::statat(
         dir,
         quarantine.as_str(),
@@ -2347,6 +2389,43 @@ mod tests {
             "deleted through the swapped path"
         );
         assert!(!tmp.path().join("moved").join(name).exists());
+    }
+
+    /// Regression (R4-S13): the quarantine rename replaced an existing
+    /// destination (an orphan after PID reuse, or any file under that name)
+    /// before the inode was verified. An occupied name is never overwritten:
+    /// the next name is tried, and the occupant keeps its content.
+    #[test]
+    fn regression_quarantine_never_replaces_an_occupied_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim.tmp");
+        let occupied = tmp.path().join(".ratarmount-quarantine-1-0");
+        let spare = tmp.path().join(".ratarmount-quarantine-1-1");
+        fs::write(&occupied, b"someone else's orphan").unwrap();
+        fs::write(&victim, b"pack temp").unwrap();
+        let locked = File::open(&victim).unwrap();
+        let dir = open_root(tmp.path()).unwrap();
+        let mut names = [
+            ".ratarmount-quarantine-1-0".to_owned(),
+            ".ratarmount-quarantine-1-1".to_owned(),
+        ]
+        .into_iter();
+        let removed = unlink_if_same_named(&dir, "victim.tmp", &locked, &mut || {
+            names.next().expect("only two attempts expected")
+        });
+        assert!(removed);
+        assert_eq!(fs::read(&occupied).unwrap(), b"someone else's orphan");
+        assert!(!victim.exists() && !spare.exists());
+        // Every name taken: nothing is removed and nothing replaced.
+        let victim = tmp.path().join("victim2.tmp");
+        fs::write(&victim, b"pack temp 2").unwrap();
+        let locked = File::open(&victim).unwrap();
+        let removed = unlink_if_same_named(&dir, "victim2.tmp", &locked, &mut || {
+            ".ratarmount-quarantine-1-0".to_owned()
+        });
+        assert!(!removed);
+        assert!(victim.exists());
+        assert_eq!(fs::read(&occupied).unwrap(), b"someone else's orphan");
     }
 
     /// Regression (R4-S9a): the stage sweep deleted recursively through the
