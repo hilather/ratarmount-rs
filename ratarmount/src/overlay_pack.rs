@@ -632,7 +632,23 @@ impl StageLock {
         if !try_flock(&file) {
             return Err(io::Error::other("staging lock is held by another process"));
         }
-        Ok(Self { _file: file, path })
+        let lock = Self { _file: file, path };
+        // A sweeper that locked first may have removed the lock file (and the
+        // stage) and released: the lock we hold is then on an unlinked inode.
+        lock_names_current_inode(&lock)?;
+        Ok(lock)
+    }
+}
+
+/// Whether the lock file's path still names the inode the lock was taken on.
+fn lock_names_current_inode(lock: &StageLock) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let held = lock._file.metadata()?;
+    match fs::symlink_metadata(&lock.path) {
+        Ok(now) if now.dev() == held.dev() && now.ino() == held.ino() => Ok(()),
+        _ => Err(io::Error::other(
+            "staging lock file was removed by a concurrent sweep",
+        )),
     }
 }
 
@@ -675,7 +691,15 @@ impl Stage {
         for _ in 0..ATTEMPTS {
             let dir = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
             match lock_for(dir.path()) {
-                Ok(lock) => return Ok(Self { dir, _lock: lock }),
+                // The sweeper may also have removed the stage itself.
+                Ok(lock) if fs::symlink_metadata(dir.path()).is_ok() => {
+                    return Ok(Self { dir, _lock: lock })
+                }
+                Ok(_) => {
+                    last = Some(io::Error::other(
+                        "staging was removed by a concurrent sweep",
+                    ))
+                }
                 Err(e) => last = Some(e),
             }
         }
@@ -2059,6 +2083,44 @@ mod tests {
         .unwrap();
         assert_eq!(attempts.get(), 2);
         assert!(stage.path().is_dir());
+    }
+
+    /// Regression: a sweeper that took the lock first and finished (stage and
+    /// lock file removed) before the stage's own flock succeeded left a lock on
+    /// an unlinked inode and a missing stage dir; the first write was ENOENT.
+    #[test]
+    fn regression_stage_new_in_retries_when_sweeper_removed_stage_before_our_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let stage = Stage::new_in_with(tmp.path(), ".ratarmount-unpack-", false, |dir| {
+            attempts.set(attempts.get() + 1);
+            let lock = StageLock::beside(dir)?;
+            if attempts.get() == 1 {
+                // The sweeper locked, removed stage and lock file, and released
+                // before our flock ran against the old inode.
+                fs::remove_dir_all(dir).unwrap();
+                fs::remove_file(lock_path(dir)).unwrap();
+            }
+            Ok(lock)
+        })
+        .unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert!(stage.path().is_dir());
+        fs::write(stage.path().join("f"), b"x").unwrap();
+    }
+
+    /// Regression: a lock taken on an inode the sweeper already unlinked is
+    /// refused, so the stage cannot run unprotected.
+    #[test]
+    fn regression_stage_lock_refuses_unlinked_inode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join(".ratarmount-unpack-x");
+        fs::create_dir(&stage).unwrap();
+        let first = StageLock::beside(&stage).unwrap();
+        fs::remove_file(lock_path(&stage)).unwrap();
+        assert!(lock_names_current_inode(&first).is_err());
+        fs::write(lock_path(&stage), b"").unwrap();
+        assert!(lock_names_current_inode(&first).is_err());
     }
 
     /// Regression: a failed fill leaves no staging directory or lock behind.
