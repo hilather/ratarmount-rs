@@ -67,7 +67,10 @@ fn apply_remote_index_discovery(
                 if drop_stale_local_cache(p, input, archive_size, layer, opts.read_only_index)? {
                     // deleted; continue discovery
                 } else {
-                    log::debug!("local index cache hit; skip remote discovery ({input})");
+                    log::debug!(
+                        "local index cache hit; skip remote discovery ({})",
+                        ratarmount_core::redact_base_url(input)
+                    );
                     return Ok(());
                 }
             }
@@ -844,7 +847,8 @@ fn smb_live_range_kind(kind: &str) -> bool {
 
 fn smb_unsupported_range_error(input: &str) -> String {
     format!(
-        "SMB Range format unsupported for {input}; 7z, ISO, SquashFS, and pre-ustar tar are not read here (set RATARMOUNT_SMB_USE_SMBCLIENT=1)"
+        "SMB Range format unsupported for {}; 7z, ISO, SquashFS, and pre-ustar tar are not read here (set RATARMOUNT_SMB_USE_SMBCLIENT=1)",
+        ratarmount_core::redact_base_url(input)
     )
 }
 
@@ -871,7 +875,11 @@ fn open_hf_input(
     nested: &mut Option<ratarmount_compositing::OpenNestedReaderFn>,
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
     let repo = ratarmount_remote::HfRepo::resolve(input).map_err(|e| e.to_string())?;
-    eprintln!("hf: {input} commit {}", repo.commit);
+    eprintln!(
+        "hf: {} commit {}",
+        ratarmount_core::redact_base_url(input),
+        repo.commit
+    );
     let label = repo.resolve_url(&repo.location.path);
     if let Some(source) = repo.folder().map_err(|e| e.to_string())? {
         *nested = Some(folder_nested_reader_fn(
@@ -1208,7 +1216,10 @@ pub(super) fn open_remote_input_with_nested(
         }
         let mut range = ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())?;
         if !range.uses_ranges() {
-            return Err(format!("SMB Range unavailable for {input}"));
+            return Err(format!(
+                "SMB Range unavailable for {}",
+                ratarmount_core::redact_base_url(input)
+            ));
         }
         let len = range.len();
         // Peek before open_from_live_range. Its unsupported arm logs
@@ -1230,7 +1241,10 @@ pub(super) fn open_remote_input_with_nested(
         match open_rclone(input) {
             Ok(handle) => {
                 let len = handle.len();
-                eprintln!("rclone: {input} ({len} bytes, materialized cat)");
+                eprintln!(
+                    "rclone: {} ({len} bytes, materialized cat)",
+                    ratarmount_core::redact_base_url(input)
+                );
                 let input_owned = input.to_string();
                 match open_from_live_range(
                     handle,
@@ -1243,13 +1257,19 @@ pub(super) fn open_remote_input_with_nested(
                 )? {
                     Some(opened) => return Ok(opened),
                     None => {
-                        eprintln!("info: rclone format unsupported for {input}; materializing");
+                        eprintln!(
+                            "info: rclone format unsupported for {}; materializing",
+                            ratarmount_core::redact_base_url(input)
+                        );
                         return materialize_remote_input(input, opts, recreate, remotes);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("info: rclone open failed for {input}: {e}; materializing");
+                eprintln!(
+                    "info: rclone open failed for {}: {e}; materializing",
+                    ratarmount_core::redact_base_url(input)
+                );
                 return materialize_remote_input(input, opts, recreate, remotes);
             }
         }
@@ -1303,14 +1323,20 @@ where
     match opened {
         Ok(range) if range.live_ranges() => {
             let len = range.body_len();
-            eprintln!("{transport}: {input} ({len} bytes, live Range)");
+            eprintln!(
+                "{transport}: {} ({len} bytes, live Range)",
+                ratarmount_core::redact_base_url(input)
+            );
             apply_remote_index_discovery(input, opts, recreate, len, None)?;
             match open_from_live_range(range, len, input, opts, recreate, transport, || {
                 reopen().map_err(|e| e.to_string())
             })? {
                 Some(opened) => Ok(opened),
                 None => {
-                    eprintln!("info: {transport} format unsupported for {input}; materializing");
+                    eprintln!(
+                        "info: {transport} format unsupported for {}; materializing",
+                        ratarmount_core::redact_base_url(input)
+                    );
                     materialize_remote_input(input, opts, recreate, remotes)
                 }
             }
@@ -1318,14 +1344,18 @@ where
         Ok(range) => {
             let len = range.body_len();
             eprintln!(
-                "info: {transport} unavailable for {input} (full body buffered); materializing"
+                "info: {transport} unavailable for {} (full body buffered); materializing",
+                ratarmount_core::redact_base_url(input)
             );
             apply_remote_index_discovery(input, opts, recreate, len, None)?;
             drop(range);
             materialize_remote_input(input, opts, recreate, remotes)
         }
         Err(e) => {
-            eprintln!("info: {transport} open failed for {input}: {e}; materializing");
+            eprintln!(
+                "info: {transport} open failed for {}: {e}; materializing",
+                ratarmount_core::redact_base_url(input)
+            );
             materialize_remote_input(input, opts, recreate, remotes)
         }
     }
@@ -1378,7 +1408,10 @@ fn open_oci_image(
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
     let image = ratarmount_remote::fetch_oci_image(input).map_err(|e| e.to_string())?;
     if image.layers.is_empty() {
-        return Err(format!("oci image {input} has no layers"));
+        return Err(format!(
+            "oci image {} has no layers",
+            ratarmount_core::redact_base_url(input)
+        ));
     }
     let mut layers: Vec<Arc<dyn MountSource>> = Vec::with_capacity(image.layers.len());
     for layer in &image.layers {

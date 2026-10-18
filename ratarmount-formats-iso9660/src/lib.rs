@@ -193,7 +193,7 @@ impl Iso9660MountSource {
 
         println!(
             "Creating offset dictionary for {} ...",
-            archive_path.display()
+            ratarmount_core::redacted_display(&archive_path)
         );
         let t0 = Instant::now();
 
@@ -216,7 +216,7 @@ impl Iso9660MountSource {
         let secs = t0.elapsed().as_secs_f64();
         println!(
             "Creating offset dictionary for {} took {secs:.2}s",
-            archive_path.display()
+            ratarmount_core::redacted_display(&archive_path)
         );
 
         Ok(Self {
@@ -264,7 +264,7 @@ impl Iso9660MountSource {
         let _ = options;
         println!(
             "Creating offset dictionary for {} ...",
-            archive_path.display()
+            ratarmount_core::redacted_display(archive_path)
         );
         let t0 = Instant::now();
 
@@ -280,7 +280,7 @@ impl Iso9660MountSource {
         let secs = t0.elapsed().as_secs_f64();
         println!(
             "Creating offset dictionary for {} took {secs:.2}s",
-            archive_path.display()
+            ratarmount_core::redacted_display(archive_path)
         );
 
         Ok(Self {

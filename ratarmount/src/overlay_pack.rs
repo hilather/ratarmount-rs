@@ -121,7 +121,54 @@ fn header(mode: u32, mtime: i64, size: u64, kind: tar::EntryType) -> tar::Header
     h
 }
 
-fn append_host<W: Write>(tar: &mut tar::Builder<W>, root: &OwnedFd, path: &str) -> io::Result<()> {
+/// Copy of the layer database with credentials removed from its URL-bearing
+/// `meta` values, or `None` when it already holds none. The source is only
+/// read (immutable, read-only); the copy lives in `staging`.
+fn sanitized_db(
+    directory: &Path,
+    staging: &Path,
+    meta: &OverlayMeta,
+) -> io::Result<Option<PathBuf>> {
+    let clean = meta.redacted_values();
+    if &clean == meta.values() {
+        return Ok(None);
+    }
+    let source = directory.join(HIDDEN_DB).canonicalize()?;
+    let mut uri =
+        url::Url::from_file_path(source).map_err(|()| invalid("invalid database path"))?;
+    uri.set_query(Some("mode=ro&immutable=1"));
+    let conn = rusqlite::Connection::open_with_flags(
+        uri.as_str(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(io::Error::other)?;
+    let copy = staging.join(HIDDEN_DB);
+    conn.execute("VACUUM INTO ?1", [copy.to_string_lossy().as_ref()])
+        .map_err(io::Error::other)?;
+    drop(conn);
+    let conn = rusqlite::Connection::open(&copy).map_err(io::Error::other)?;
+    // Overwrite freed pages and compact, so the old text is not left behind.
+    conn.execute_batch("PRAGMA secure_delete=ON;")
+        .map_err(io::Error::other)?;
+    for (key, value) in &clean {
+        if meta.values().get(key) != Some(value) {
+            conn.execute("UPDATE meta SET value=?1 WHERE key=?2", [value, key])
+                .map_err(io::Error::other)?;
+        }
+    }
+    conn.execute_batch("VACUUM;").map_err(io::Error::other)?;
+    drop(conn);
+    Ok(Some(copy))
+}
+
+fn append_host<W: Write>(
+    tar: &mut tar::Builder<W>,
+    root: &OwnedFd,
+    path: &str,
+    replacement: Option<&Path>,
+) -> io::Result<()> {
     let (fd, name) = if path.is_empty() {
         (
             host::openat(root, ".", directory_flags(), Mode::empty())?,
@@ -163,7 +210,10 @@ fn append_host<W: Write>(tar: &mut tar::Builder<W>, root: &OwnedFd, path: &str) 
         }
         0o100000 => {
             let file = host::openat(&fd, name.as_str(), regular_flags(), Mode::empty())?;
-            let mut file = File::from(file);
+            let mut file = match replacement {
+                Some(copy) => File::open(copy)?,
+                None => File::from(file),
+            };
             h.set_entry_type(tar::EntryType::Regular);
             h.set_size(file.metadata()?.len());
             tar.append_data(&mut h, archive_path, &mut file)
@@ -208,6 +258,10 @@ pub fn pack(
     let mut paths = BTreeSet::new();
     collect(&root, "", &mut paths)?;
     let mut plain = tempfile::tempfile()?;
+    // An overlay from an earlier build may hold a credentialed base URL: export
+    // a redacted copy of its database; the source is never modified.
+    let staging = tempfile::tempdir_in(output_parent)?;
+    let sanitized = sanitized_db(directory, staging.path(), &meta)?;
     {
         let mut tar = tar::Builder::new(BufWriter::new(&mut plain));
         // Top-level members and all layer entries use bytewise sorted paths.
@@ -244,9 +298,12 @@ pub fn pack(
             let mut h = header(0o444, 0, file.metadata()?.len(), tar::EntryType::Regular);
             tar.append_data(&mut h, "journal.jsonl", file)?;
         }
-        append_host(&mut tar, &root, "")?;
+        append_host(&mut tar, &root, "", None)?;
         for path in paths {
-            append_host(&mut tar, &root, &path)?;
+            let replacement = (path == HIDDEN_DB)
+                .then_some(sanitized.as_deref())
+                .flatten();
+            append_host(&mut tar, &root, &path, replacement)?;
         }
         manifest.rewind()?;
         let mut h = header(
@@ -256,7 +313,11 @@ pub fn pack(
             tar::EntryType::Regular,
         );
         tar.append_data(&mut h, "manifest.jsonl", &mut manifest)?;
-        append_bytes(&mut tar, "meta.json", &serde_json::to_vec(meta.values())?)?;
+        append_bytes(
+            &mut tar,
+            "meta.json",
+            &serde_json::to_vec(&meta.redacted_values())?,
+        )?;
         tar.into_inner()?.flush()?;
     }
     plain.rewind()?;
@@ -1105,9 +1166,9 @@ mod tests {
         let mut paths = BTreeSet::new();
         collect(&root, "", &mut paths).unwrap();
         let mut tar = tar::Builder::new(Vec::new());
-        append_host(&mut tar, &root, "").unwrap();
+        append_host(&mut tar, &root, "", None).unwrap();
         for path in paths {
-            append_host(&mut tar, &root, &path).unwrap();
+            append_host(&mut tar, &root, &path, None).unwrap();
         }
         append_bytes(
             &mut tar,

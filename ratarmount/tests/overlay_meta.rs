@@ -6,6 +6,10 @@ use std::process::{Command, Output};
 use ratarmount_compositing::{OverlayMeta, HIDDEN_DB};
 use sha2::{Digest, Sha256};
 
+#[path = "support/http_tar.rs"]
+mod http_tar;
+use http_tar::serve_tar_stub;
+
 fn open(overlay: &Path, base: &Path, flags: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ratarmount"))
         .args(["--no-mount", "--index-file", ":memory:", "-w"])
@@ -630,4 +634,133 @@ fn regression_pending_digest_recorded_after_hashing_finishes() {
     assert_eq!(meta.base_digest_kind(), Some("strong"));
     assert_eq!(meta.base_digest(), Some(expected.as_str()));
     assert!(meta.stack_digest().is_some());
+}
+
+/// Regression: a credentialed base URL (userinfo, presigned query) was stored in the
+/// overlay DB and printed by `overlay info`, mount progress and `pack` meta.json.
+#[test]
+fn regression_credentialed_base_url_is_never_stored_or_printed() {
+    let root = tempfile::tempdir().unwrap();
+    let stub = serve_tar_stub();
+    let port = stub.rsplit(':').next().unwrap();
+    let url = format!("http://user:s3cr3t@127.0.0.1:{port}/base.tar?X-Amz-Signature=deadbeef");
+    let overlay = root.path().join("overlay");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    private_env(&mut cmd, root.path());
+    let mount = cmd
+        .args(["--no-mount", "--index-file", ":memory:", "-w"])
+        .arg(&overlay)
+        .arg(&url)
+        .output()
+        .unwrap();
+    assert_success(&mount);
+    let mut seen = String::from_utf8_lossy(&mount.stdout).into_owned();
+    seen.push_str(&String::from_utf8_lossy(&mount.stderr));
+    let secrets = ["s3cr3t", "deadbeef"];
+    for secret in secrets {
+        assert!(
+            !seen.contains(secret),
+            "mount output leaked {secret}: {seen}"
+        );
+    }
+    for json in [true, false] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        private_env(&mut cmd, root.path());
+        cmd.args(["overlay", "info"]).arg(&overlay);
+        if json {
+            cmd.arg("--json");
+        }
+        let info = cmd.output().unwrap();
+        assert_success(&info);
+        let text = String::from_utf8_lossy(&info.stdout).into_owned();
+        assert!(text.contains("127.0.0.1"), "{text}");
+        for secret in secrets {
+            assert!(
+                !text.contains(secret),
+                "overlay info leaked {secret}: {text}"
+            );
+        }
+    }
+    let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
+    for (key, value) in meta.values() {
+        for secret in secrets {
+            assert!(
+                !value.contains(secret),
+                "meta {key} leaked {secret}: {value}"
+            );
+        }
+    }
+}
+
+fn set_meta(overlay: &Path, key: &str, value: &str) {
+    let conn = rusqlite::Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+        [key, value],
+    )
+    .unwrap();
+}
+
+/// Regression: an overlay written by an earlier build holds a credentialed
+/// `base_url` and a raw-input `base_remote_token`; `overlay info` printed both.
+#[test]
+fn regression_overlay_info_redacts_earlier_build_database() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    let overlay = root.path().join("overlay");
+    assert_success(&open(&overlay, &base, &["--base-digest", "none"]));
+    let raw = "https://user:s3cr3t@h.example/b.tar?X-Amz-Signature=deadbeef";
+    set_meta(&overlay, "base_url", raw);
+    set_meta(
+        &overlay,
+        "base_remote_token",
+        &serde_json::to_string(&[raw, "/plain"]).unwrap(),
+    );
+    set_meta(
+        &overlay,
+        "base_index_path",
+        "/c/http:__user:s3cr3t@h_b.tar.index",
+    );
+    for json in [true, false] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        private_env(&mut cmd, root.path());
+        cmd.args(["overlay", "info"]).arg(&overlay);
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.output().unwrap();
+        assert_success(&out);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(text.contains("https://h.example/b.tar"), "{text}");
+        assert!(
+            !text.contains("s3cr3t") && !text.contains("deadbeef"),
+            "{text}"
+        );
+    }
+}
+
+/// Regression: a recorded remote base is stored without credentials, so an
+/// offline verb that cannot reopen it must say to pass BASE explicitly.
+#[test]
+fn regression_recorded_redacted_remote_base_asks_for_explicit_base() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    let overlay = root.path().join("overlay");
+    assert_success(&open(&overlay, &base, &["--base-digest", "none"]));
+    set_meta(&overlay, "base_url", "http://127.0.0.1:1/b.tar");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    private_env(&mut cmd, root.path());
+    let out = cmd
+        .args(["overlay", "seal"])
+        .arg(&overlay)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stored without credentials; pass BASE explicitly"),
+        "{stderr}"
+    );
 }

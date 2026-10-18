@@ -376,7 +376,7 @@ impl SevenZipMountSource {
     {
         println!(
             "Creating offset dictionary for {} ...",
-            archive_path.display()
+            ratarmount_core::redacted_display(archive_path)
         );
         let t0 = Instant::now();
         if options.index_build.is_cancelled() {
@@ -547,7 +547,7 @@ impl SevenZipMountSource {
         let secs = t0.elapsed().as_secs_f64();
         println!(
             "Creating offset dictionary for {} took {secs:.2}s",
-            archive_path.display()
+            ratarmount_core::redacted_display(archive_path)
         );
         info!(
             "7z {}: index ready in {secs:.2}s files={n_files} folders={n_folders} \

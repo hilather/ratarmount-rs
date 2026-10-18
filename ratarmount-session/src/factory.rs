@@ -4162,7 +4162,10 @@ where
 
     match kind {
         "tar" => {
-            eprintln!("{transport} TAR: {input} ({range_len} bytes, live Range)");
+            eprintln!(
+                "{transport} TAR: {} ({range_len} bytes, live Range)",
+                ratarmount_core::redact_base_url(input)
+            );
             if !recreate && !o.clear_index_cache {
                 if let Some(path) = ip.filter(|p| p.is_file()) {
                     match SqliteIndexedTar::open_with_existing_index_from_reader(
@@ -4190,7 +4193,10 @@ where
             Ok(Some((label, Arc::new(src))))
         }
         "zip" => {
-            eprintln!("{transport} ZIP: {input} ({range_len} bytes, live Range)");
+            eprintln!(
+                "{transport} ZIP: {} ({range_len} bytes, live Range)",
+                ratarmount_core::redact_base_url(input)
+            );
             let src = ZipMountSource::open_from_reader(range, &label, ip, &o, VERSION)
                 .map_err(|e| e.to_string())?;
             Ok(Some((label, Arc::new(src))))

@@ -1514,6 +1514,23 @@ pub fn materialize_input(input: &str) -> Result<RemoteLocal> {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: a remote scheme missing from the redaction tables would let
+    /// credentials in its URLs be stored and printed.
+    #[test]
+    fn regression_redaction_tables_cover_every_remote_scheme() {
+        use ratarmount_core::{REDACTED_SCHEMES, UNREDACTED_SCHEMES};
+        for scheme in super::REMOTE_SCHEMES {
+            let hits = usize::from(REDACTED_SCHEMES.contains(scheme))
+                + usize::from(UNREDACTED_SCHEMES.contains(scheme));
+            assert_eq!(hits, 1, "scheme {scheme} must be in exactly one list");
+        }
+        for scheme in REDACTED_SCHEMES.iter().chain(UNREDACTED_SCHEMES) {
+            assert!(
+                super::REMOTE_SCHEMES.contains(scheme),
+                "{scheme} is not a remote scheme"
+            );
+        }
+    }
 
     /// Regression: a tiny memory budget must degrade without corrupting reads.
     #[test]

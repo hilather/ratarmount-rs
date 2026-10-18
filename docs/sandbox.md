@@ -111,14 +111,14 @@ repaired. A mounted overlay's exclusive database lock is reported as "in use".
 | `format_version` | `2` for new overlays; `1` for migrated legacy overlays |
 | `ratarmount_version` | Creator's version |
 | `created_at` | Creation time, RFC 3339 UTC |
-| `base_url` | Original base positional |
+| `base_url` | Original base positional, with credentials removed: remote URLs lose userinfo, query and fragment (`https://user:pw@h/b.tar?sig=x` is stored as `https://h/b.tar`), a magnet URI keeps only `xt` and `dn`, and local paths and `git:///` URLs are unchanged. A remote base recorded this way cannot be reopened by `seal`, `verify`, `pack` or `diff` from the overlay alone: pass BASE explicitly |
 | `base_digest` | `sha256:<hex>`, `git-tree:<sha>`, `weak:<hex>` (also the default for a directory base), or `none`; empty while `pending` |
 | `base_digest_kind` | `strong`, `git-tree`, `weak`, `pending`, or `none` |
 | `base_digest_source` | `computed` or `supplied` (absent for `none`) |
 | `base_weak_digest`, `base_weak_excludes` | Directory bases: the weak manifest digest (also recorded beside a supplied strong digest) and the JSON array of base-relative paths left out of it |
 | `base_size`, `base_mtime_ns` | Local archive size and modification time used for cheap remount checks |
 | `base_git_tree` | Selected Git tree, also retained when a SHA-256 digest was supplied |
-| `base_remote_token` | Available remote validators, or known multi-source inputs |
+| `base_remote_token` | Available remote validators, or known multi-source inputs (each redacted like `base_url`) |
 | `lower_layers` | JSON array, bottom to top, of `{path, layer_digest, sealed_at}` records; empty for an ordinary mount |
 | `stack_digest` | SHA-256 of the base digest and ordered lower-layer digests, each followed by a newline |
 | `base_mismatch_forced_at` | Last explicit override of a failed base check, RFC 3339 UTC |
@@ -1048,6 +1048,12 @@ that selection, including for the in-tree test stub. The runtime must use the
 local host's mount namespace; a remote Docker daemon cannot bind this mount.
 Non-root FUSE mounts require `user_allow_other` in `/etc/fuse.conf`; the command
 checks this before mounting and reports the existing actionable diagnostic.
+
+A credentialed remote `--base URL` is passed to the mount child on its command line, so
+other local users can see it in `ps`. Everything ratarmount itself prints or stores
+(mount progress, error text, the JSON report, the overlay metadata, a packed bundle) shows
+the URL with credentials removed. Prefer a credential source the remote layer reads from the
+environment or a config file over userinfo in the URL.
 
 Stdout contains exactly one JSON object. Container stdout/stderr goes to stderr;
 `--json` suppresses harness progress messages. The report contains `exit_code`,

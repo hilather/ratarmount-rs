@@ -272,7 +272,15 @@ pub(super) fn lower_view(
         false,
         factory::CompositingOptions::default(),
     )
-    .map_err(|e| e.to_string())?
+    .map_err(|e| {
+        // A recorded remote URL is stored without credentials, so a
+        // credentialed remote cannot be reopened from the overlay alone.
+        if args.base.is_none() && ratarmount_remote::is_remote_url(&base.to_string_lossy()) {
+            format!("{e}; recorded base URL is stored without credentials; pass BASE explicitly")
+        } else {
+            e.to_string()
+        }
+    })?
     .source;
     // Offline: bundle lowers are verified against this base, never trusted by
     // a previous verification (no strong key here).
@@ -402,9 +410,9 @@ pub fn info(args: &InfoArgs) -> Result<String, String> {
         serde_json::from_str(&super::overlay_stats::render(stats, true)).expect("stats JSON");
     if let Some(meta) = &meta {
         fields.extend(
-            meta.values()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone().into())),
+            meta.redacted_values()
+                .into_iter()
+                .map(|(k, v)| (k, v.into())),
         );
     }
     // A lazily hashed archive base has no digest yet (spec 1.2): say so rather

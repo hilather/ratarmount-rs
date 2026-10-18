@@ -187,7 +187,7 @@ impl WarcMountSource {
 
         println!(
             "Creating offset dictionary for {} ...",
-            archive_path.display()
+            ratarmount_core::redacted_display(&archive_path)
         );
         let t0 = Instant::now();
 
@@ -213,7 +213,7 @@ impl WarcMountSource {
         let secs = t0.elapsed().as_secs_f64();
         println!(
             "Creating offset dictionary for {} took {secs:.2}s",
-            archive_path.display()
+            ratarmount_core::redacted_display(&archive_path)
         );
 
         // Rewind and retain for member open (shared stencil backend).
@@ -254,7 +254,7 @@ impl WarcMountSource {
         let _ = options;
         println!(
             "Creating offset dictionary for {} ...",
-            archive_path.display()
+            ratarmount_core::redacted_display(archive_path)
         );
         let t0 = Instant::now();
 
@@ -278,7 +278,7 @@ impl WarcMountSource {
         let secs = t0.elapsed().as_secs_f64();
         println!(
             "Creating offset dictionary for {} took {secs:.2}s",
-            archive_path.display()
+            ratarmount_core::redacted_display(archive_path)
         );
 
         let index = index.into_read_only()?;

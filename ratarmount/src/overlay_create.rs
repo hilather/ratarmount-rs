@@ -22,14 +22,19 @@ pub fn create_overlay(
         );
     }
     if inputs.len() > 1 || has_source_binds {
-        info.remote_token = Some(serde_json::to_string(inputs).expect("input paths"));
+        let redacted: Vec<String> = inputs
+            .iter()
+            .map(|p| ratarmount_core::redact_base_url(&p.to_string_lossy()))
+            .collect();
+        info.remote_token = Some(serde_json::to_string(&redacted).expect("input paths"));
     } else if info.base_digest == BaseDigestRequest::Compute
         && !dir.join(HIDDEN_DB).exists()
         && ratarmount_remote::is_remote_url(&info.base_url)
     {
         info.remote_token = Some(
-            super::overlay_cmd::remote_base_token(&info.base_url)
-                .unwrap_or_else(|| format!("url:{}", info.base_url)),
+            super::overlay_cmd::remote_base_token(&info.base_url).unwrap_or_else(|| {
+                format!("url:{}", ratarmount_core::redact_base_url(&info.base_url))
+            }),
         );
     }
     if inputs.len() == 1
@@ -40,4 +45,52 @@ pub fn create_overlay(
         info.local_path = Some(inputs[0].clone());
     }
     WriteOverlay::new_with_create_info(stack, dir, &info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratarmount_compositing::HIDDEN_DB;
+    use ratarmount_core::MountSource;
+
+    fn token_for(inputs: &[&str], binds: bool) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let stack: Arc<dyn MountSource> =
+            Arc::new(ratarmount_compositing::FolderMountSource::new(src.path()).unwrap());
+        let info = OverlayCreateInfo {
+            base_url: inputs[0].into(),
+            ..Default::default()
+        };
+        let paths: Vec<PathBuf> = inputs.iter().map(PathBuf::from).collect();
+        let overlay = create_overlay(stack, &dir.path().join("ov"), info, &paths, binds).unwrap();
+        drop(overlay);
+        let meta = ratarmount_compositing::OverlayMeta::read(dir.path().join("ov"))
+            .unwrap()
+            .unwrap();
+        assert!(dir.path().join("ov").join(HIDDEN_DB).exists());
+        for (key, value) in meta.values() {
+            assert!(!value.contains("s3cr3t"), "{key} leaked: {value}");
+            assert!(!value.contains("deadbeef"), "{key} leaked: {value}");
+        }
+        meta.get("base_remote_token").map(str::to_owned)
+    }
+
+    /// Regression: several inputs were stored as a raw JSON array, leaking credentials.
+    #[test]
+    fn regression_remote_token_redacts_each_input() {
+        let token = token_for(
+            &[
+                "https://u:s3cr3t@h.example/b.tar?X-Amz-Signature=deadbeef",
+                "git:///srv/repo?copy.git#HEAD",
+            ],
+            false,
+        )
+        .unwrap();
+        let items: Vec<String> = serde_json::from_str(&token).unwrap();
+        assert_eq!(
+            items,
+            ["https://h.example/b.tar", "git:///srv/repo?copy.git#HEAD"]
+        );
+    }
 }

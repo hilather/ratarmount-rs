@@ -406,3 +406,124 @@ fn regression_cow_fuse_bundle_direct_and_as_lower() {
         assert!(!mount.path.join("layer").exists());
     }
 }
+
+/// Regression: an overlay from an earlier build holds a credentialed `base_url`
+/// and `base_remote_token`; `pack` exported both raw, in `meta.json` and in the
+/// bundled database.
+#[test]
+fn regression_pack_redacts_credentialed_base_in_meta_and_db() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("f"), b"x").unwrap();
+    let overlay = tmp.path().join("overlay");
+    let source = Arc::new(FolderMountSource::new(&base).unwrap());
+    let writer = WriteOverlay::new_with_create_info(
+        source.clone(),
+        &overlay,
+        &OverlayCreateInfo {
+            base_url: base.to_str().unwrap().into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    cow::cow_write(&writer, "/f", b"changed\n");
+    drop(writer);
+    // Earlier-build shape: raw URL and a JSON array of raw inputs.
+    let raw = "https://user:s3cr3t@h.example/b.tar?X-Amz-Signature=deadbeef";
+    {
+        let conn = rusqlite::Connection::open(overlay.join(".ratarmount.overlay.sqlite")).unwrap();
+        conn.execute("UPDATE meta SET value=?1 WHERE key='base_url'", [raw])
+            .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('base_remote_token', ?1)",
+            [serde_json::to_string(&[raw, "/plain/second"]).unwrap()],
+        )
+        .unwrap();
+    }
+    ratarmount_compositing::overlay_seal::seal(&overlay, source).unwrap();
+    let before = fs::read(overlay.join(".ratarmount.overlay.sqlite")).unwrap();
+    let bundle = tmp.path().join("bundle.tar.zst");
+    let cache = tmp.path().join("cache");
+    expect(
+        command(
+            &[
+                Path::new("overlay"),
+                Path::new("pack"),
+                &overlay,
+                &bundle,
+                &base,
+            ],
+            &cache,
+        ),
+        0,
+    );
+    assert_eq!(
+        fs::read(overlay.join(".ratarmount.overlay.sqlite")).unwrap(),
+        before,
+        "pack must not modify the source overlay"
+    );
+    let bytes = fs::read(&bundle).unwrap();
+    let mut tar_bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut zstd::stream::read::Decoder::new(&bytes[..]).unwrap(),
+        &mut tar_bytes,
+    )
+    .unwrap();
+    let mut archive = tar::Archive::new(&tar_bytes[..]);
+    let (mut meta_json, mut db) = (Vec::new(), Vec::new());
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        if path == "meta.json" {
+            std::io::Read::read_to_end(&mut entry, &mut meta_json).unwrap();
+        } else if path == "layer/.ratarmount.overlay.sqlite" {
+            std::io::Read::read_to_end(&mut entry, &mut db).unwrap();
+        }
+    }
+    assert!(!db.is_empty() && !meta_json.is_empty());
+    for (name, data) in [("meta.json", &meta_json), ("database", &db)] {
+        let text = String::from_utf8_lossy(data);
+        for secret in ["s3cr3t", "deadbeef"] {
+            assert!(!text.contains(secret), "{name} leaked {secret}");
+        }
+    }
+    let extracted = tmp.path().join("db.sqlite");
+    fs::write(&extracted, &db).unwrap();
+    let conn = rusqlite::Connection::open(&extracted).unwrap();
+    let mut stmt = conn.prepare("SELECT key, value FROM meta").unwrap();
+    let rows: std::collections::BTreeMap<String, String> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let json: std::collections::BTreeMap<String, String> =
+        serde_json::from_slice(&meta_json).unwrap();
+    assert_eq!(rows, json, "meta.json must equal the bundled database meta");
+    assert_eq!(rows["base_url"], "https://h.example/b.tar");
+    assert_eq!(
+        rows["base_remote_token"],
+        r#"["https://h.example/b.tar","/plain/second"]"#
+    );
+    // The redacted bundle still unpacks.
+    let restored = tmp.path().join("restored");
+    let out = command(
+        &[
+            Path::new("overlay"),
+            Path::new("unpack"),
+            &bundle,
+            &restored,
+        ],
+        &cache,
+    );
+    assert!(
+        out.status.code().is_some_and(|c| c == 0 || c == 1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("does not match"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

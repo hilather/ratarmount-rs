@@ -613,7 +613,7 @@ fn refuse_top_inside_base(args: &RunArgs) -> io::Result<()> {
     }
 }
 
-fn mount_ready(cleanup: &mut Cleanup, stderr: &mut File) -> io::Result<()> {
+fn mount_ready(cleanup: &mut Cleanup, stderr: &mut File, base: &Path) -> io::Result<()> {
     let start = Instant::now();
     loop {
         if mounted(&cleanup.record.mountpoint)? {
@@ -627,6 +627,13 @@ fn mount_ready(cleanup: &mut Cleanup, stderr: &mut File) -> io::Result<()> {
             stderr.rewind()?;
             let mut diagnostic = String::new();
             stderr.take(64 * 1024).read_to_string(&mut diagnostic)?;
+            // Defence in depth: the mount child already redacts, but a library
+            // error may still echo the raw `--base` URL it was given.
+            let raw = base.to_string_lossy();
+            let shown = ratarmount_core::redact_base_url(&raw);
+            if shown != raw {
+                diagnostic = diagnostic.replace(raw.as_ref(), &shown);
+            }
             return Err(io::Error::other(format!(
                 "mount did not become ready: {diagnostic}"
             )));
@@ -744,7 +751,7 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
     cleanup.record.mount_child = Some(ProcessIdentity::new(child.id()));
     cleanup.mount_child = Some(child);
     cleanup.save()?;
-    mount_ready(&mut cleanup, &mut mount_stderr)?;
+    mount_ready(&mut cleanup, &mut mount_stderr, &args.base)?;
     if !args.json {
         eprintln!("sandbox run: starting {}", args.image);
     }

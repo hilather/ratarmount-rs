@@ -436,3 +436,87 @@ fn regression_run_base_digest_recorded() {
     assert_eq!(info["base_digest_source"], "supplied");
     assert_eq!(info["base_digest_kind"], "strong");
 }
+
+#[path = "support/http_tar.rs"]
+mod http_tar;
+
+fn assert_no_secrets(text: &str, what: &str) {
+    for secret in ["s3cr3t", "deadbeef"] {
+        assert!(!text.contains(secret), "{what} leaked {secret}: {text}");
+    }
+}
+
+/// Regression: `sandbox run --base URL` put the credentialed URL in the mount
+/// error text and JSON report.
+#[test]
+fn regression_run_credentialed_base_url_is_redacted_in_failure() {
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let command = fixture.command(&[], "exit 0");
+    let url = "http://user:s3cr3t@127.0.0.1:1/b.tar?X-Amz-Signature=deadbeef";
+    let args: Vec<_> = command
+        .get_args()
+        .map(|a| a.to_os_string())
+        .map(|a| {
+            if a == fixture.base.as_os_str() {
+                url.into()
+            } else {
+                a
+            }
+        })
+        .collect();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    command
+        .args(args)
+        .env("RATARMOUNT_SANDBOX_RUNTIME", stub())
+        .env("RATARMOUNT_STUB_STATE", fixture.temp.path().join("runtime"));
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert_no_secrets(&String::from_utf8_lossy(&output.stdout), "stdout");
+    assert_no_secrets(&String::from_utf8_lossy(&output.stderr), "stderr");
+}
+
+/// Regression: a successful `sandbox run` over a credentialed URL base printed
+/// the secrets in mount progress, the report or the overlay it left behind.
+#[test]
+fn regression_run_credentialed_base_url_is_redacted_on_success() {
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let port = http_tar::serve_tar_stub();
+    let port = port.rsplit(':').next().unwrap().to_owned();
+    let url = format!("http://user:s3cr3t@127.0.0.1:{port}/b.tar?X-Amz-Signature=deadbeef");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    command
+        .args(["sandbox", "run", "--base", &url, "--top"])
+        .arg(&fixture.top)
+        .args([
+            "--image",
+            "busybox",
+            "--json",
+            "--seal",
+            "--",
+            "sh",
+            "-c",
+            "printf x > out",
+        ])
+        .env("RATARMOUNT_SANDBOX_RUNTIME", stub())
+        .env("RATARMOUNT_STUB_STATE", fixture.temp.path().join("runtime"))
+        .env("HOME", fixture.temp.path().join("home"))
+        .env("XDG_CACHE_HOME", fixture.temp.path().join("home/.cache"));
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_no_secrets(&stdout, "stdout");
+    assert_no_secrets(&stderr, "stderr");
+    let meta = ratarmount_compositing::OverlayMeta::read(&fixture.top)
+        .unwrap()
+        .unwrap();
+    for (key, value) in meta.values() {
+        assert_no_secrets(value, key);
+    }
+}

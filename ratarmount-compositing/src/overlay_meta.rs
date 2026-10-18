@@ -163,6 +163,11 @@ impl OverlayMeta {
     pub fn values(&self) -> &BTreeMap<String, String> {
         &self.values
     }
+    /// `values()` with every URL-bearing key passed through the redactor, for
+    /// overlays written by a build that stored credentials.
+    pub fn redacted_values(&self) -> BTreeMap<String, String> {
+        redact_meta_values(&self.values)
+    }
     pub fn get(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(String::as_str)
     }
@@ -782,10 +787,44 @@ impl OverlayCreateInfo {
                 None => (String::new(), "pending"),
             });
         }
-        let token =
-            serde_json::to_vec(&(&self.base_url, &self.remote_token)).expect("strings serialize");
+        let token = serde_json::to_vec(&(
+            ratarmount_core::redact_base_url(&self.base_url),
+            &self.remote_token,
+        ))
+        .expect("strings serialize");
         Ok((format!("weak:{}", sha256_hex(&token)), "weak"))
     }
+}
+
+/// Redact credentials in `base_url` and `base_remote_token` (a JSON array of
+/// inputs, or `url:<URL>`; an etag object has no URL and is left alone).
+pub fn redact_meta_values(values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut out = values.clone();
+    if let Some(url) = out.get_mut("base_url") {
+        let clean = ratarmount_core::redact_base_url(url);
+        if clean != *url {
+            // The default index path embeds the credentialed URL.
+            out.remove("base_index_path");
+        }
+        out.insert("base_url".into(), clean);
+    }
+    if let Some(token) = out.get_mut("base_remote_token") {
+        if token.starts_with('[') {
+            *token = match serde_json::from_str::<Vec<String>>(token) {
+                Ok(items) => serde_json::to_string(
+                    &items
+                        .iter()
+                        .map(|i| ratarmount_core::redact_base_url(i))
+                        .collect::<Vec<_>>(),
+                )
+                .expect("strings serialize"),
+                Err(_) => ratarmount_core::redact_base_url(token),
+            };
+        } else if let Some(url) = token.strip_prefix("url:") {
+            *token = format!("url:{}", ratarmount_core::redact_base_url(url));
+        }
+    }
+    out
 }
 
 /// Called only during WriteOverlay open, before tombstone repair or COW sweep.
@@ -825,7 +864,7 @@ pub(crate) fn initialize(
         ("format_version", "2".to_owned()),
         ("ratarmount_version", env!("CARGO_PKG_VERSION").to_owned()),
         ("created_at", timestamp()),
-        ("base_url", info.base_url.clone()),
+        ("base_url", ratarmount_core::redact_base_url(&info.base_url)),
         ("base_digest", digest.clone()),
         ("base_digest_kind", kind.to_owned()),
         (
@@ -869,7 +908,9 @@ pub(crate) fn initialize(
             path.canonicalize()?.to_string_lossy().into_owned(),
         );
     }
-    if let Some(index) = &info.index_path {
+    // The default index name embeds the whole URL, credentials included.
+    let credentialed = ratarmount_core::redact_base_url(&info.base_url) != info.base_url;
+    if let Some(index) = info.index_path.as_ref().filter(|_| !credentialed) {
         values.insert(
             "base_index_path",
             std::path::absolute(index)?.to_string_lossy().into_owned(),
