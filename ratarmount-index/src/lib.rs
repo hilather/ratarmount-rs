@@ -25,8 +25,9 @@ mod range_cache;
 mod search;
 
 pub use digest_cache::{
-    cached_archive_digest, cached_archive_digest_with, peek_archive_digest, refresh_archive_digest,
-    ArchiveDigestStamp,
+    archive_digest_cache_available, cached_archive_digest, cached_archive_digest_cancellable,
+    cached_archive_digest_with, peek_archive_digest, refresh_archive_digest, ArchiveDigestStamp,
+    DIGEST_LOCK_SUFFIX,
 };
 pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
 pub use hashing::{

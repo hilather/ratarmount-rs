@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ratarmount_index::{
-    cached_archive_digest_with, peek_archive_digest, sha256_hex, sha256_hex_stream,
+    cached_archive_digest_cancellable, peek_archive_digest, sha256_hex, sha256_hex_stream,
     ArchiveDigestStamp,
 };
 use rusqlite::{params, Connection, OpenFlags};
@@ -654,6 +654,13 @@ impl PendingBase {
         }))
     }
 
+    /// Whether a hash computed now would be cached in the base's index. The
+    /// mount's background hasher leaves the digest pending when it would not:
+    /// an archive digest is computed once and cached, never on every mount.
+    pub fn cache_available(&self) -> bool {
+        ratarmount_index::archive_digest_cache_available(self.index.as_deref())
+    }
+
     fn stamp_matches(&self) -> Result<bool> {
         let now = ArchiveDigestStamp::read(&self.path)?;
         Ok(now.size == self.size && now.mtime_ns == self.mtime_ns)
@@ -669,21 +676,43 @@ impl PendingBase {
                 self.path.display()
             )));
         }
-        let digest = cached_archive_digest_with(&self.path, self.index.as_deref(), |path| {
-            struct Checked<'a, R>(R, &'a dyn Fn() -> std::io::Result<()>);
-            impl<R: std::io::Read> std::io::Read for Checked<'_, R> {
-                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                    (self.1)()?;
-                    self.0.read(buf)
+        let digest =
+            cached_archive_digest_cancellable(&self.path, self.index.as_deref(), check, |path| {
+                struct Checked<'a, R>(R, &'a dyn Fn() -> std::io::Result<()>);
+                impl<R: std::io::Read> std::io::Read for Checked<'_, R> {
+                    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                        (self.1)()?;
+                        self.0.read(buf)
+                    }
                 }
-            }
-            sha256_hex_stream(&mut Checked(fs::File::open(path)?, check))
-        })
-        .map_err(|e| OverlayError::Msg(format!("cannot hash base {}: {e}", self.path.display())))?;
+                test_hash_seam(path);
+                sha256_hex_stream(&mut Checked(fs::File::open(path)?, check))
+            })
+            .map_err(|e| {
+                OverlayError::Msg(format!("cannot hash base {}: {e}", self.path.display()))
+            })?;
         if !self.stamp_matches()? {
             return Err(OverlayError::Msg("base changed while hashing".into()));
         }
         Ok(digest)
+    }
+}
+
+/// Test seam, read only where a full archive hash really starts: append one
+/// line to `RATARMOUNT_TEST_HASH_LOG` (so separate mount processes can be
+/// counted) and sleep `RATARMOUNT_TEST_HASH_DELAY_MS` (widens race windows).
+fn test_hash_seam(path: &Path) {
+    use std::io::Write;
+    if let Some(log) = std::env::var_os("RATARMOUNT_TEST_HASH_LOG") {
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log) {
+            let _ = file.write_all(format!("{}\n", path.display()).as_bytes());
+        }
+    }
+    if let Some(ms) = std::env::var("RATARMOUNT_TEST_HASH_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
     }
 }
 

@@ -484,14 +484,9 @@ impl GatedMount {
         private_env(&mut cmd, root.path());
         let child = cmd
             .env("RATARMOUNT_TEST_HASH_GATE", &gate)
-            .args([
-                "-f",
-                "--passthrough",
-                "off",
-                "--index-file",
-                ":memory:",
-                "-w",
-            ])
+            .args(["-f", "--passthrough", "off", "--index-file"])
+            .arg(root.path().join("base.index.sqlite"))
+            .arg("-w")
             .arg(&overlay)
             .arg(&archive)
             .arg(&mnt)
@@ -763,4 +758,214 @@ fn regression_recorded_redacted_remote_base_asks_for_explicit_base() {
         stderr.contains("stored without credentials; pass BASE explicitly"),
         "{stderr}"
     );
+}
+
+/// One foreground `-w` mount of `archive` with its own overlay and mountpoint,
+/// sharing `index`; hashes append a line to `log`. Linux with /dev/fuse only.
+#[cfg(target_os = "linux")]
+struct LoggedMount {
+    mnt: std::path::PathBuf,
+    child: std::process::Child,
+}
+
+#[cfg(target_os = "linux")]
+impl LoggedMount {
+    fn spawn(
+        root: &Path,
+        n: usize,
+        archive: &Path,
+        index: Option<&Path>,
+        log: &Path,
+        delay_ms: u64,
+    ) -> Self {
+        let mnt = root.join(format!("mnt{n}"));
+        std::fs::create_dir_all(&mnt).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        private_env(&mut cmd, root);
+        cmd.env("RATARMOUNT_TEST_HASH_LOG", log)
+            .env("RATARMOUNT_TEST_HASH_DELAY_MS", delay_ms.to_string())
+            .args(["-f", "--passthrough", "off", "--index-file"])
+            .arg(index.unwrap_or(Path::new(":memory:")))
+            .arg("-w")
+            .arg(root.join(format!("overlay{n}")))
+            .arg(archive)
+            .arg(&mnt)
+            .stdin(std::process::Stdio::null());
+        Self {
+            mnt,
+            child: cmd.spawn().unwrap(),
+        }
+    }
+
+    fn xattr(&self, name: &str) -> String {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(self.mnt.as_os_str().as_bytes()).unwrap();
+        let key = std::ffi::CString::new(format!("user.ratarmount.{name}")).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                key.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return String::new();
+        }
+        String::from_utf8(buf[..n as usize].to_vec()).unwrap()
+    }
+
+    fn serving(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+            && std::fs::read(self.mnt.join("member.txt")).ok().as_deref()
+                == Some(b"member bytes\n".as_slice())
+    }
+
+    fn unmount(&mut self) {
+        let _ = Command::new("fusermount3")
+            .arg("-u")
+            .arg(&self.mnt)
+            .status();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LoggedMount {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&self.mnt)
+                .status();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// A tar plus a warm index that has no cached base digest. `None` skips.
+#[cfg(target_os = "linux")]
+fn logged_fixture(root: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    if !Path::new("/dev/fuse").exists()
+        || Command::new("fusermount3")
+            .arg("--version")
+            .output()
+            .is_err()
+    {
+        eprintln!("skip: /dev/fuse or fusermount3 unavailable");
+        return None;
+    }
+    let src = root.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("member.txt"), b"member bytes\n").unwrap();
+    let archive = root.join("base.tar");
+    assert!(Command::new("tar")
+        .arg("cf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&src)
+        .arg("member.txt")
+        .status()
+        .unwrap()
+        .success());
+    let index = root.join("idx").join("base.index.sqlite");
+    std::fs::create_dir(root.join("idx")).unwrap();
+    // `--no-mount` builds the index and never hashes the archive.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    private_env(&mut cmd, root);
+    let out = cmd
+        .args(["--no-mount", "--index-file"])
+        .arg(&index)
+        .arg("-w")
+        .arg(root.join("overlay-warm"))
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert_success(&out);
+    Some((archive, index))
+}
+
+#[cfg(target_os = "linux")]
+fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "not ready: {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn hash_lines(log: &Path) -> usize {
+    std::fs::read_to_string(log).map_or(0, |s| s.lines().count())
+}
+
+/// Regression: C3, a cached archive digest is computed once per archive, not on
+/// every mount: eight sequential mounts of one archive hash it exactly once.
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_digest_once_eight_sequential_mounts() {
+    let root = tempfile::tempdir().unwrap();
+    let Some((archive, index)) = logged_fixture(root.path()) else {
+        return;
+    };
+    let log = root.path().join("hash.log");
+    for n in 0..8 {
+        let mut m = LoggedMount::spawn(root.path(), n, &archive, Some(&index), &log, 0);
+        wait_until("serving", || m.serving());
+        wait_until("digest recorded", || !m.xattr("base_digest").is_empty());
+        m.unmount();
+    }
+    assert_eq!(hash_lines(&log), 1, "{:?}", std::fs::read_to_string(&log));
+}
+
+/// Regression: C3, eight first mounts of one uncached archive started together
+/// (separate processes) all hashed it; the others must wait and read the cache.
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_digest_once_eight_concurrent_mounts() {
+    let root = tempfile::tempdir().unwrap();
+    let Some((archive, index)) = logged_fixture(root.path()) else {
+        return;
+    };
+    let log = root.path().join("hash.log");
+    let mut mounts: Vec<_> = (0..8)
+        .map(|n| LoggedMount::spawn(root.path(), n, &archive, Some(&index), &log, 400))
+        .collect();
+    for m in &mut mounts {
+        wait_until("serving", || m.serving());
+    }
+    for m in &mounts {
+        wait_until("digest recorded", || !m.xattr("base_digest").is_empty());
+    }
+    for m in &mut mounts {
+        m.unmount();
+    }
+    assert_eq!(hash_lines(&log), 1, "{:?}", std::fs::read_to_string(&log));
+}
+
+/// Regression: C3 case 3, with no writable index cache (`:memory:`) every
+/// mount's background hasher rehashed the archive. The digest stays pending.
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_digest_once_no_writable_cache_stays_pending() {
+    let root = tempfile::tempdir().unwrap();
+    let Some((archive, _)) = logged_fixture(root.path()) else {
+        return;
+    };
+    let log = root.path().join("hash.log");
+    for n in 0..2 {
+        let mut m = LoggedMount::spawn(root.path(), n, &archive, None, &log, 0);
+        wait_until("serving", || m.serving());
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert_eq!(m.xattr("base_digest"), "");
+        m.unmount();
+        let meta = OverlayMeta::read(root.path().join(format!("overlay{n}")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.base_digest_kind(), Some("pending"));
+    }
+    assert_eq!(hash_lines(&log), 0, "{:?}", std::fs::read_to_string(&log));
 }

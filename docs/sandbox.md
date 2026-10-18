@@ -177,7 +177,27 @@ the work entirely: no base file is opened for hashing. `--no-mount` creation
 never serves, so it stays `pending`. Hashing never creates an archive index.
 `--no-recreate-index` and immutable index snapshots are not modified for this
 cache. The test-only variable `RATARMOUNT_TEST_HASH_GATE=<path>` holds the
-background hash until that path exists.
+background hash until that path exists; `RATARMOUNT_TEST_HASH_LOG=<path>`
+appends one line per full archive hash and `RATARMOUNT_TEST_HASH_DELAY_MS`
+slows each hash (both are test seams).
+
+**Deferred = after the mount is serving, and only when the digest is not
+cached; computed once per archive and cached in its index.** A mount never
+hashes an archive whose digest is already in the index, and the second to Nth
+mount of the same archive read the cache. The first hash is serialized per
+archive: an in-process entry plus an advisory `flock` on
+`<index>.digest-lock` (hidden from a directory base's digest like the other
+sidecars), taken before hashing and followed by a second cache read, so N
+concurrent first mounts (threads or processes) run SHA-256 once and the rest
+read the result. A mount waiting on that lock is already serving and still
+unmounts promptly. The cache write waits up to 5 s for a busy index and logs a
+warning if it still fails. **Without a writable index cache** (no index,
+`--index-file :memory:`, a read-only or hard-linked index, a published
+snapshot, a remote/meta-cache index, or an index pointer) the background
+hasher does nothing and the digest **stays `pending`**: hashing on every mount
+would repeat the work. `overlay seal`, `verify`, `pack`, `diff --hash` and
+`sandbox run` still resolve it for the one command that needs it; pass
+`--base-digest` or give the base a writable index to resolve it at mount time.
 
 A directory gets a `weak` digest by default: `weak:<hex>` over a sorted
 manifest of relative path, type, size and nanosecond mtime (symlinks include

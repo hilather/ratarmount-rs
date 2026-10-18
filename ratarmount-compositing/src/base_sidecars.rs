@@ -37,7 +37,15 @@ fn is_index_sidecar(name: &str) -> bool {
     let rest = &name[at + ".index.sqlite".len()..];
     if matches!(
         rest,
-        "" | "-wal" | "-shm" | "-journal" | ".gz" | ".zst" | ".zstd" | ".xz" | ".bz2"
+        "" | "-wal"
+            | "-shm"
+            | "-journal"
+            | ".gz"
+            | ".zst"
+            | ".zstd"
+            | ".xz"
+            | ".bz2"
+            | ratarmount_index::DIGEST_LOCK_SUFFIX
     ) {
         return true;
     }
@@ -111,6 +119,7 @@ mod tests {
             "a.tar.index.sqlite.zstd",
             "a.tar.index.sqlite.xz",
             "a.tar.index.sqlite.bz2",
+            "a.tar.index.sqlite.digest-lock",
             "a.tar.index.sqlite.tmp.123.4",
             "a.tar.index.sqlite.tmp.123.4-wal",
             ".ratarmount-index-ptr-x.tmp",

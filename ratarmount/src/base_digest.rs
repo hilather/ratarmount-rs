@@ -56,6 +56,16 @@ pub fn spawn_if_pending(overlay: &Option<Arc<WriteOverlay>>) {
                     thread::sleep(Duration::from_millis(20));
                 }
             }
+            // Computed once per archive and cached in its index: without a
+            // writable cache every mount would hash it again, so stay pending
+            // (seal and the verbs that need the digest resolve it).
+            if !pending.cache_available() {
+                log::info!(
+                    "base digest stays pending: no writable index cache for {}",
+                    pending.path.display()
+                );
+                return;
+            }
             match pending.hash(&check_not_stopping) {
                 Ok(digest) => {
                     let Some(overlay) = weak.upgrade() else {
