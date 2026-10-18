@@ -76,10 +76,50 @@ fn set_write_busy(conn: &Connection) -> rusqlite::Result<()> {
     conn.busy_handler(Some(handler))
 }
 
+/// Wait up to [`CREATE_BUSY_TIMEOUT`] when opening for a hash, not at all for a peek.
+#[cfg(not(test))]
+fn set_open_busy(conn: &Connection, create_table: bool) -> rusqlite::Result<()> {
+    conn.busy_timeout(if create_table {
+        CREATE_BUSY_TIMEOUT
+    } else {
+        Duration::ZERO
+    })
+}
+
+/// Unit tests: a hashing open waits through a handler that records the waiting
+/// thread (see [`set_write_busy`]) and gives up after a per-thread number of
+/// polls, so a test can hold the index "beyond the timeout" without sleeping
+/// for it. A peek installs no handler, so it never appears in the probe.
+#[cfg(test)]
+fn set_open_busy(conn: &Connection, create_table: bool) -> rusqlite::Result<()> {
+    fn handler(attempt: i32) -> bool {
+        let mut waiting = busy_probe::WAITING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !waiting.contains(&std::thread::current().id()) {
+            waiting.push(std::thread::current().id());
+        }
+        drop(waiting);
+        std::thread::sleep(Duration::from_millis(1));
+        attempt < busy_probe::OPEN_POLLS.with(|polls| polls.get())
+    }
+    if create_table {
+        conn.busy_handler(Some(handler))
+    } else {
+        conn.busy_timeout(Duration::ZERO)
+    }
+}
+
 #[cfg(test)]
 mod busy_probe {
+    use std::cell::Cell;
     pub static WAITING: std::sync::Mutex<Vec<std::thread::ThreadId>> =
         std::sync::Mutex::new(Vec::new());
+    thread_local! {
+        /// Busy polls a hashing open makes before it gives up (stands in for
+        /// `CREATE_BUSY_TIMEOUT`); 2 s of 1 ms polls unless a test lowers it.
+        pub static OPEN_POLLS: Cell<i32> = const { Cell::new(2_000) };
+    }
 }
 
 fn never_cancelled() -> std::io::Result<()> {
@@ -183,12 +223,7 @@ fn open_cache(index: Option<&Path>, create_table: bool) -> Option<Cache> {
     // A peek stays instant on a busy index. A caller that goes on to hash and
     // store must not mistake another mount's write lock for "no cache": that
     // would skip the per-archive lock and hash the archive again.
-    conn.busy_timeout(if create_table {
-        CREATE_BUSY_TIMEOUT
-    } else {
-        Duration::ZERO
-    })
-    .ok()?;
+    set_open_busy(&conn, create_table).ok()?;
     let has_files: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='files')",
@@ -611,18 +646,33 @@ mod tests {
         let index = index_with_files(dir.path());
         let holder = Connection::open(&index).unwrap();
         holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            holder.execute_batch("COMMIT").unwrap();
-        });
-        assert!(open_cache(Some(&index), true).is_some());
-        releaser.join().unwrap();
-        // A peek still never waits.
-        let holder = Connection::open(&index).unwrap();
+        let (id_tx, id_rx) = std::sync::mpsc::channel();
+        let opener = {
+            let index = index.clone();
+            std::thread::spawn(move || {
+                id_tx.send(std::thread::current().id()).unwrap();
+                open_cache(Some(&index), true).is_some()
+            })
+        };
+        // Release the lock only once the open has hit the busy database.
+        let opener_id = id_rx.recv().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !busy_probe::WAITING.lock().unwrap().contains(&opener_id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the open never waited on the busy index"
+            );
+            std::thread::yield_now();
+        }
+        holder.execute_batch("COMMIT").unwrap();
+        assert!(opener.join().unwrap(), "the open gave up on a busy index");
+        // A peek never waits: it installs no busy handler, so it is absent
+        // from the probe and returns a miss while the index stays locked.
         holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        let started = std::time::Instant::now();
+        let me = std::thread::current().id();
+        busy_probe::WAITING.lock().unwrap().retain(|id| *id != me);
         assert!(open_cache(Some(&index), false).is_none());
-        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(!busy_probe::WAITING.lock().unwrap().contains(&me));
     }
 
     /// Regression: C3, the cache INSERT ran with busy timeout zero and its
