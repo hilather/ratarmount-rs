@@ -8480,7 +8480,7 @@ mod lower_marker_key_tests {
         let lowers = [bundle];
         let key = |inputs: &[PathBuf]| lower_base_key(inputs, Some(&index), &lowers);
         // One archive: keyed by its cached digest.
-        assert_eq!(key(&[a.clone()]), Some(digest.clone()));
+        assert_eq!(key(std::slice::from_ref(&a)), Some(digest.clone()));
         // A directory beside it has no computed strong identity: no marker, so
         // every use verifies against the union as it is now.
         assert_eq!(key(&[a.clone(), b.clone()]), None);

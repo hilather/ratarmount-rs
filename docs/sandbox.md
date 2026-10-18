@@ -198,6 +198,13 @@ hasher does nothing and the digest **stays `pending`**: hashing on every mount
 would repeat the work. `overlay seal`, `verify`, `pack`, `diff --hash` and
 `sandbox run` still resolve it for the one command that needs it; pass
 `--base-digest` or give the base a writable index to resolve it at mount time.
+A mount only *peeks* at the cache: it never waits for another mount that is
+hashing the same archive. The second mount serves at once with a `pending`
+digest and its background hasher waits (cancellably, so unmount is never stuck
+behind it) for the first, then reads the cached result: the archive is hashed
+once. While a digest is `pending`, `diff --hash --json` and the `sandbox run`
+report give `base` and `stack` as `null` and `base_pending: true` (never a
+stack derived from an empty digest).
 
 A directory gets a `weak` digest by default: `weak:<hex>` over a sorted
 manifest of relative path, type, size and nanosecond mtime (symlinks include
@@ -231,7 +238,10 @@ recorded in `base_weak_excludes` (base-relative, append-only). When the
 overlay's parent does not exist yet (`-w BASE/new/ov`) the topmost new
 component (`new`) is recorded, because creating the overlay adds it. A later
 mount may append a journal path that is not in the base yet; one that already
-exists is base content and is refused. Index and sidecar files that ratarmount
+exists is base content and is refused. A read-only `--lower` mount (no `-w`)
+has nowhere to record anything, so an invocation path (`--journal`, mount
+point) that already exists in the base is not excluded from the base check: it
+counts as a change to the base (`--force-stack-mismatch` to override). Index and sidecar files that ratarmount
 itself writes beside an archive (`X.index.sqlite` and its `-wal`/`-shm`,
 `.index.ptr`, pinned `.index.<id>.sqlite`, `.rgzi`, `.gzidx`, commit journals,
 manifests, staging temp names) never count. Archives written, replaced or
@@ -1027,7 +1037,13 @@ tree is removed, so a decompression bomb cannot fill the disk. Override with
 `overlay unpack BUNDLE DIR --max-bytes SIZE --max-entries N` (`SIZE` takes
 `K`/`M`/`G`/`T`) or the environment variables `RATARMOUNT_BUNDLE_MAX_BYTES`
 and `RATARMOUNT_BUNDLE_MAX_ENTRIES`; a flag beats the variable. `--lower`
-bundle fills use the variables or the defaults.
+bundle fills use the variables or the defaults. The caps are enforced while
+the bundle is **streamed** through a size-limited zstd decoder (nothing is
+spooled to disk first): the decoder stops with `bundle decodes to more than N
+bytes` once the payload cap plus tar framing is exceeded, so even a hostile
+single-frame bundle stops early. `meta.json` and `bundle.json` are read
+through the same scan, at most 1 MiB each (a sequential pass: it decodes
+the bundle up to those members, which a packed bundle writes last).
 Exit codes are 0 for a match, 1 for a digest/content mismatch, and 2 for invalid
 input or an operational error. Unsafe archive paths, duplicate entries,
 hardlinks, device entries and writes through symlink components are refused.
@@ -1062,7 +1078,9 @@ therefore leaves a tree `rm -rf` can delete. Each stage holds an `flock` on a
 sibling `<stage>.lock` file (never inside the layer), and the next `unpack` or
 cache fill removes stages of dead processes whose lock it can take; a stage
 another process still holds, directories with other names and symlinks are left
-alone. Leftover `.copy-*` bundle copies are swept the same way.
+alone. Leftover `.ratarmount-copy-*` bundle copies are swept the same way, only
+in the `--lower` cache: `overlay unpack` never touches other files in the
+destination's parent directory.
 
 This check reads base and lower content only for the paths the layer mentions
 (plus the descendants of directories it deletes or replaces), once per cache
@@ -1071,14 +1089,13 @@ or a directory lower reads no base content at mount.
 
 A later use of a cached entry checks its immutable database and sentinel, and
 either trusts a *verified marker* (`layers/<sha256>.verified/<view key>`) or
-verifies again. Markers are written and trusted only when the base has a
-strong digest the mount already holds without reading content (a supplied
-`--base-digest`, or an archive digest already in the index digest cache) and
-every lower beneath the bundle is a sealed, immutable layer. A directory base
-without `--base-digest` (only a weak manifest), a remote or git base, and any
+verifies again. Markers are written and trusted only when the base is a
+**single archive** whose SHA-256 the mount already holds in the index digest
+cache (computed, never merely claimed) and every lower beneath the bundle is a
+sealed, immutable layer. A directory base, a union of several inputs, a
+supplied `--base-digest` that was not computed, a remote or git base, and any
 `--allow-unsealed-lower` directory lower always re-verify, so an edit to the
-base or an unsealed lower between two mounts fails closed. The view key also
-folds in the weak manifest of a directory base. Directory lowers continue to
+base or an unsealed lower between two mounts fails closed. Directory lowers continue to
 work normally and are not seal-verified at mount (they are trusted like the
 base; this is not a boundary against the owner).
 

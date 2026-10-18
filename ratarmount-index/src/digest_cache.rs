@@ -675,7 +675,7 @@ mod tests {
             );
             // After the hash lands, the peek is a hit and nothing hashes again.
             assert_eq!(
-                peek_archive_digest(&archive, Some(&index)).unwrap(),
+                peek_archive_digest(archive, Some(index)).unwrap(),
                 Some(digest)
             );
         });

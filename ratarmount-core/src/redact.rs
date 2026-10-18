@@ -50,10 +50,9 @@ pub fn redact_urls_in_text(text: &str) -> String {
         let hit = rest
             .match_indices("://")
             .map(|(at, _)| {
-                let start = rest[..at]
+                rest[..at]
                     .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-                    .map_or(0, |i| i + 1);
-                start
+                    .map_or(0, |i| i + 1)
             })
             .next();
         let magnet = rest.to_ascii_lowercase().find("magnet:?");
