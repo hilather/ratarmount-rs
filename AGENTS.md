@@ -390,6 +390,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Kernel overlayfs with a ratarmount `lowerdir` (user namespace): build fails or the imported upperdir differs from the merged view (SBX-UPPER, opt-in) | `RATARMOUNT_TEST_OVERLAYFS=1 cargo test -p ratarmount --test overlayfs_interop -- --nocapture` |
 | Copy-on-write edits of existing files (no `files` row) missing from `diff`/hash/manifest/`--between`, counted as fsck orphans so `overlay seal` refused them, or losing pinned modes (SBX-COW) | `cargo test -p ratarmount-compositing --lib regression_cow_` · `cargo test -p ratarmount --test diff --test overlay_seal --test overlay_import --test overlay_pack --test overlay_lower regression_cow_` |
 | Journal header records the mount/overlay as typed (relative) | `cargo test -p ratarmount-fuse --lib regression_oplog_header_paths_are_absolute` |
+| Sandbox subcommand long help omits exit status or examples (SBX-HELP) | `cargo test -p ratarmount --bin ratarmount regression_help_states_exit_status` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
