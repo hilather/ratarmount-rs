@@ -140,6 +140,8 @@ tested on every change; see the regression catalog in `AGENTS.md`.
 
 ## Known limits
 
+- File names must be UTF-8 on writable FUSE mounts; invalid names are refused with `EILSEQ`.
+
 - ZIP commits rebuild the whole archive; encrypted and multi-part ZIPs cannot be committed.
 - Gzip, bzip2 and xz TARs commit offline only, through GNU tar, and are rewritten in full.
 - A live commit cannot delete or replace members in earlier zstd frames.

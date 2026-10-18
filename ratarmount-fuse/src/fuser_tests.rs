@@ -246,6 +246,65 @@ mod protocol {
         }
     }
 
+    /// Regression: every name-taking write callback rejects invalid UTF-8 before mutation.
+    #[test]
+    fn regression_non_utf8_name_write_callbacks_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let ov = Arc::new(WriteOverlay::new(Arc::new(Source), dir.path()).unwrap());
+        let fs = RatarmountFs::new(ov.clone(), Some(ov.clone()));
+        let mut h = Harness::with_fs(mount_config(true, ""), 1024, fs);
+        let invalid = b"caf\xe9\0";
+        let body = |mut prefix: Vec<u8>, suffix: &[u8]| {
+            prefix.extend(suffix);
+            prefix
+        };
+        // CREATE, MKNOD (regular and unsupported type), MKDIR, SYMLINK, LINK,
+        // RENAME source/destination, and RENAME2 source/destination.
+        let mut cases = vec![
+            (35, body(words(&[0, S_IFREG | 0o644, 0, 0]), invalid)),
+            (8, body(words(&[S_IFREG | 0o644, 0, 0, 0]), invalid)),
+            (8, body(words(&[libc::S_IFIFO | 0o644, 0, 0, 0]), invalid)),
+            (9, body(words(&[0o755, 0]), invalid)),
+            (6, body(invalid.to_vec(), b"target\0")),
+            (13, body(1u64.to_ne_bytes().to_vec(), invalid)),
+        ];
+        for opcode in [12, 45] {
+            let mut prefix = 1u64.to_ne_bytes().to_vec();
+            if opcode == 45 {
+                prefix.extend(words(&[0, 0]));
+            }
+            cases.push((opcode, body(body(prefix.clone(), invalid), b"dest\0")));
+            cases.push((opcode, body(body(prefix, b"f\0"), invalid)));
+        }
+        let uid = unsafe { libc::geteuid() };
+        for (opcode, body) in cases {
+            let reply = h.call_as(opcode, 1, uid, &body);
+            assert_eq!(u32_at(&reply, 4) as i32, -libc::EILSEQ, "opcode {opcode}");
+        }
+        assert!(ov.lookup("/caf�", 0).is_none());
+        assert!(ov.lookup("/dest", 0).is_none());
+        assert!(ov.lookup("/f", 0).is_some());
+        // Valid UTF-8 links retain the existing unsupported-operation response.
+        for (opcode, body) in [
+            (6, "café\0target\0".as_bytes().to_vec()),
+            (13, body(1u64.to_ne_bytes().to_vec(), "café\0".as_bytes())),
+        ] {
+            let reply = h.call_as(opcode, 1, uid, &body);
+            assert_eq!(u32_at(&reply, 4) as i32, -libc::EPERM);
+        }
+        // A legitimate replacement-character entry must remain unreachable by
+        // invalid byte names, including lookup before a kernel getattr.
+        ov.create_file("/caf�", 0o644)
+            .map(|fd| ov.close_overlay_fd(fd))
+            .unwrap();
+        for opcode in [1, 10, 11] {
+            let reply = h.call_as(opcode, 1, uid, invalid);
+            assert_eq!(u32_at(&reply, 4) as i32, -libc::ENOENT, "opcode {opcode}");
+        }
+        assert!(ov.lookup("/caf�", 0).is_some());
+        h.finish();
+    }
+
     /// Regression: writable FUSE xattrs must preserve flags, probes, ERANGE, and removals.
     #[test]
     fn regression_provenance_fuser_xattr_wire() {
