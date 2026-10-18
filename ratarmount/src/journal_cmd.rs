@@ -111,6 +111,13 @@ pub fn summarize(
             }
             Err(error) => return Err(invalid(format!("journal line {line_number}: {error}"))),
         };
+        if let Some(version) = record["journal"].as_u64() {
+            if version > JOURNAL_VERSION {
+                return Err(invalid(format!(
+                    "journal version {version} is newer than supported ({JOURNAL_VERSION}); upgrade ratarmount"
+                )));
+            }
+        }
         if record["journal"] == 1 {
             header = true;
             session += 1;
@@ -243,6 +250,9 @@ pub fn summarize(
     Ok(summary)
 }
 
+/// The journal format this reader understands (`{"journal":N}` header).
+const JOURNAL_VERSION: u64 = 1;
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -349,6 +359,25 @@ mod tests {
         "{\"op\":\"mark\",\"label\":\"turn2\"}\n",
         "{\"op\":\"read\",\"path\":\"c\",\"bytes\":5,\"ts\":5}\n",
     );
+
+    /// Regression: a `{"journal":2}` header fell through to "missing journal
+    /// header" (or a record error) instead of naming the version problem.
+    #[test]
+    fn regression_journal_newer_version_is_refused_by_name() {
+        for newer in [
+            "{\"journal\":2}\n{\"op\":\"read\",\"path\":\"a\",\"bytes\":1,\"ts\":1}\n",
+            "{\"journal\":1}\n{\"op\":\"read\",\"path\":\"a\",\"bytes\":1,\"ts\":1}\n{\"journal\":99}\n",
+        ] {
+            let error = summarize(newer.as_bytes(), None, None).unwrap_err();
+            let text = error.to_string();
+            assert!(
+                text.contains("is newer than supported (1); upgrade ratarmount"),
+                "{text}"
+            );
+            assert!(text.starts_with("journal version "), "{text}");
+        }
+        assert!(summarize(JOURNAL.as_bytes(), None, None).is_ok());
+    }
 
     #[test]
     fn regression_journal_summary_classifies_reads_writes_and_marks() {
