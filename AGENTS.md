@@ -380,6 +380,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | `diff` positionals, byte hunks (Latin-1 stays text), `git apply` round trip per case, `--between`, exit 3 limits, renames delete + add unless `--detect-renames` (SBX-DIFF) | `cargo test -p ratarmount --bin ratarmount diff` · `cargo test -p ratarmount --test diff` |
 | Live sandbox diff reopens the locked DB or corrupts Latin-1 patch bytes (SBX-DIFF) | `cargo test -p ratarmount --bin ratarmount sandbox` · `cargo test -p ratarmount --test sandbox` · `uv run --with pytest python -m pytest -q clients/python/tests/test_ratarmount_sandbox.py` |
 | 10 GiB sparse file: `--max-patch-bytes` reads it all, or `--manifest` buffers it (SBX-DIFF) | `cargo test -p ratarmount --bin ratarmount regression_diff_limits_and_sparse_file_exit_three` · (slow, ignored) `cargo test -p ratarmount --bin ratarmount regression_diff_sparse_manifest_streams_ten_gib -- --ignored` |
+| Seal changes visible modes, follows symlinks, accepts a mounted or inconsistent overlay, or misses tampering; `verify` does not name the path (SBX-SEAL) | `cargo test -p ratarmount-compositing --lib overlay_seal` · `cargo test -p ratarmount --test overlay_seal` · `cargo test -p ratarmount --test fuse_lower` |
+| `--lower` stack check masks the #89 overlay-open errors (corrupt / locked / misplaced DB) | `cargo test -p ratarmount --test overlay_open_error` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
