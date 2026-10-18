@@ -373,6 +373,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Killed overlay writers leave inconsistent rows/content; `overlay fsck --repair` follows unsafe paths or modifies sealed/mounted overlays (SBX-LOWER) | `cargo test -p ratarmount-compositing --lib overlay_fsck` |
 | `--lower` stacks lose identity, accept unsealed lowers or a different stack, allow `-w` on a sealed top or a layered commit, or serve wrong composed content (SBX-LOWER) | `cargo test -p ratarmount --bin ratarmount lower_stack_tests` · `cargo test -p ratarmount --test overlay_lower` · `cargo test -p ratarmount --test fuse_lower` |
+
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
 ## Workspace layout
