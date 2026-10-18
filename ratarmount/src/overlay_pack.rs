@@ -2487,7 +2487,11 @@ mod tests {
         ratarmount_compositing::overlay_seal::seal(&replace, f.base.clone()).unwrap();
         let bundle = f.tmp.path().join("replace.tar.zst");
         pack(&replace, &bundle, f.base.clone(), &PackOptions::default()).unwrap();
-        let key = crate::lower_base_key(None, Some(&base_dir), None, std::slice::from_ref(&bundle));
+        let key = crate::lower_base_key(
+            std::slice::from_ref(&base_dir),
+            None,
+            std::slice::from_ref(&bundle),
+        );
         assert_eq!(key, None);
         let cache = f.tmp.path().join("cache");
         let paths = [bundle.clone()];
@@ -2522,11 +2526,10 @@ mod tests {
         .err()
         .expect("edited base must fail closed");
         assert!(error.contains("deleted"), "{error}");
-        // With a supplied strong digest the weak manifest is folded in, so the
-        // key exists and differs per base state.
-        let supplied = format!("sha256:{}", "a".repeat(64));
-        let strong = crate::lower_base_key(Some(&supplied), Some(&base_dir), None, &paths);
-        assert!(strong.is_some_and(|k| k.starts_with(&supplied)));
+        // A directory has no computed strong digest, and a supplied
+        // `--base-digest` is only a claim: still no marker.
+        let strong = crate::lower_base_key(std::slice::from_ref(&base_dir), None, &paths);
+        assert_eq!(strong, None);
     }
 
     fn write_crafted(f: &Fixture, name: &str, paths: &[(&str, Option<&str>)]) -> PathBuf {

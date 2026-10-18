@@ -1284,31 +1284,19 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
 }
 
 /// Strong identity of the mounted base that may key trusted bundle
-/// verifications, obtained without hashing any content: a supplied
-/// `--base-digest`, or an archive digest already in the index digest cache.
-/// A directory base also folds in its weak manifest, because a supplied digest
-/// is only the caller's claim. `None` (no markers, every use re-verifies) for
-/// everything else. Computed only when a `--lower` bundle needs it.
-fn lower_base_key(
-    supplied: Option<&str>,
-    base: Option<&Path>,
-    index: Option<&Path>,
-    lowers: &[PathBuf],
-) -> Option<String> {
-    let base = base?;
-    if !lowers.iter().any(|p| p.is_file()) {
+/// verifications, obtained without hashing any content: the digest of a single
+/// archive base that is already in its index's digest cache. Everything else
+/// returns `None` (no markers, every use re-verifies): a directory has no
+/// computed strong digest, a union (several inputs) would need every input's
+/// identity and its index only covers the first, and a supplied
+/// `--base-digest` is just the caller's unchecked claim, so it never keys a
+/// marker. Computed only when a `--lower` bundle needs it.
+fn lower_base_key(bases: &[PathBuf], index: Option<&Path>, lowers: &[PathBuf]) -> Option<String> {
+    let [base] = bases else {
         return None;
-    }
-    if base.is_dir() {
-        let weak = ratarmount_compositing::overlay_meta::directory_weak_digest(
-            base,
-            &ratarmount_compositing::overlay_meta::BaseExcludes::default(),
-        )
-        .ok()?;
-        return supplied.map(|strong| format!("{strong}|{weak}"));
-    }
-    if let Some(strong) = supplied {
-        return Some(strong.to_owned());
+    };
+    if !lowers.iter().any(|p| p.is_file()) || !base.is_file() {
+        return None;
     }
     ratarmount_index::peek_archive_digest(base, index)
         .ok()
@@ -2353,17 +2341,7 @@ fn main() {
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
-    let lower_key = lower_base_key(
-        match &args.base_digest {
-            Some(ratarmount_compositing::BaseDigestRequest::Supplied(digest)) => {
-                Some(digest.as_str())
-            }
-            _ => None,
-        },
-        inputs.first().map(PathBuf::as_path),
-        index_sidecar.as_deref(),
-        &args.lower,
-    );
+    let lower_key = lower_base_key(&inputs, index_sidecar.as_deref(), &args.lower);
     let lower_identity = BaseIdentity::Enforce {
         base: MountedBase {
             extra_excludes: lower_extra_excludes(
@@ -8437,5 +8415,68 @@ mod lower_stack_tests {
         let metadata = stack.read_only_metadata();
         assert_eq!(metadata["base_digest"], "");
         assert_eq!(metadata["stack_digest"], "");
+    }
+}
+
+#[cfg(test)]
+mod lower_marker_key_tests {
+    use super::*;
+
+    /// An archive plus a warm index whose digest cache already holds its digest.
+    fn cached_archive(dir: &Path, name: &str, bytes: &[u8]) -> (PathBuf, PathBuf, String) {
+        let archive = dir.join(name);
+        std::fs::write(&archive, bytes).unwrap();
+        let index = dir.join(format!("{name}.index.sqlite"));
+        rusqlite::Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT);")
+            .unwrap();
+        let digest = ratarmount_index::cached_archive_digest(&archive, Some(&index)).unwrap();
+        (archive, index, digest)
+    }
+
+    /// Regression: `A.tar B --lower bundle` keyed the verification marker by A's
+    /// cached digest alone, so a bundle that edits `B/f` kept its marker after
+    /// `B/f` changed and skipped verification against the changed union.
+    #[test]
+    fn regression_marker_key_covers_every_base_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, index, digest) = cached_archive(dir.path(), "a.tar", b"aaaa");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(b.join("f"), b"one").unwrap();
+        let bundle = dir.path().join("l.tar.zst");
+        std::fs::write(&bundle, b"x").unwrap();
+        let lowers = [bundle];
+        let key = |inputs: &[PathBuf]| lower_base_key(inputs, Some(&index), &lowers);
+        // One archive: keyed by its cached digest.
+        assert_eq!(key(&[a.clone()]), Some(digest.clone()));
+        // A directory beside it has no computed strong identity: no marker, so
+        // every use verifies against the union as it is now.
+        assert_eq!(key(&[a.clone(), b.clone()]), None);
+        // A second archive without its own digest cache is unidentified too.
+        let (a2, _, _) = cached_archive(dir.path(), "a2.tar", b"bbbb");
+        assert_eq!(key(&[a.clone(), a2]), None);
+    }
+
+    /// Nit: a directory base has no computed strong digest, so a supplied
+    /// `--base-digest` claim cannot key a marker for it, and an archive without
+    /// a cached digest has no key either.
+    #[test]
+    fn regression_marker_key_needs_a_computed_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("l.tar.zst");
+        std::fs::write(&bundle, b"x").unwrap();
+        let lowers = [bundle];
+        assert_eq!(lower_base_key(&[a_dir(dir.path())], None, &lowers), None);
+        let bare = dir.path().join("bare.tar");
+        std::fs::write(&bare, b"zz").unwrap();
+        assert_eq!(lower_base_key(&[bare], None, &lowers), None);
+    }
+
+    fn a_dir(parent: &Path) -> PathBuf {
+        let d = parent.join("adir");
+        std::fs::create_dir(&d).unwrap();
+        d
     }
 }
