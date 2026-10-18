@@ -1006,6 +1006,126 @@ pub(crate) fn refresh_committed_base_offline(overlay: &Path, archive: &Path) -> 
     refresh_committed_base(&conn, archive)
 }
 
+/// How strong a [`BaseCheck`] comparison is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseStrength {
+    /// A content digest (archive bytes, or file contents of a directory).
+    Strong,
+    /// The lstat manifest of a directory: blind to a same-size edit whose
+    /// mtime was restored.
+    Weak,
+}
+
+impl BaseStrength {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strong => "strong",
+            Self::Weak => "weak",
+        }
+    }
+}
+
+/// Result of [`verify_base`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BaseCheck {
+    Matches {
+        current: String,
+        strength: BaseStrength,
+    },
+    Mismatch {
+        recorded: String,
+        current: String,
+        strength: BaseStrength,
+    },
+    Skipped {
+        reason: String,
+    },
+}
+
+/// Compare `base` with the digest the overlay recorded at creation, without
+/// resolving or writing anything and without the index digest cache (which can
+/// reuse a stale hash after a size-and-mtime-preserving edit).
+///
+/// A strong digest (computed archive digest, or any supplied one) is
+/// recomputed from the bytes; a weak directory digest is recomputed from the
+/// lstat manifest with the *recorded* exclusions. Git trees, remote bases,
+/// `none`, `pending` and unreadable bases are `Skipped`.
+pub fn verify_base(dir: &Path, base: &Path) -> BaseCheck {
+    let skipped = |reason: &str| BaseCheck::Skipped {
+        reason: reason.to_owned(),
+    };
+    let meta = match OverlayMeta::read(dir) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return skipped("overlay has no metadata"),
+        Err(error) => return skipped(&format!("cannot read overlay metadata: {error}")),
+    };
+    let kind = meta.base_digest_kind();
+    if meta.get("base_git_tree").is_some() {
+        return skipped("git-tree base");
+    }
+    let Some(recorded) = meta.base_digest().filter(|d| !d.is_empty()) else {
+        return skipped("no base digest recorded");
+    };
+    let Ok(base_meta) = fs::symlink_metadata(base) else {
+        return skipped("base is not a local path");
+    };
+    let excludes = || match meta.get("base_weak_excludes") {
+        Some(text) => BaseExcludes::from_json(text),
+        None => Ok(BaseExcludes::default()),
+    };
+    let result: Result<(String, String, BaseStrength)> = if base_meta.is_dir() {
+        match kind {
+            Some("strong") => excludes()
+                .and_then(|e| directory_digest_excluding(base, &e))
+                .map(|now| (recorded.to_owned(), now, BaseStrength::Strong)),
+            Some("weak") => match meta.get("base_weak_digest") {
+                Some(weak) => excludes()
+                    .and_then(|e| directory_weak_digest(base, &e))
+                    .map(|now| (weak.to_owned(), now, BaseStrength::Weak)),
+                None => return skipped("no weak directory digest recorded"),
+            },
+            Some("pending") => return skipped("base digest is still pending"),
+            _ => return skipped("no comparable base digest"),
+        }
+    } else if base_meta.is_file() {
+        match kind {
+            Some("strong") => fs::File::open(base)
+                .and_then(|mut f| sha256_hex_stream(&mut f))
+                .map(|hex| {
+                    (
+                        recorded.to_owned(),
+                        format!("sha256:{hex}"),
+                        BaseStrength::Strong,
+                    )
+                })
+                .map_err(Into::into),
+            Some("pending") => return skipped("base digest is still pending"),
+            _ => return skipped("no comparable base digest"),
+        }
+    } else {
+        return skipped("base is not a file or directory");
+    };
+    match result {
+        Ok((recorded, current, strength)) if recorded == current => {
+            BaseCheck::Matches { current, strength }
+        }
+        Ok((recorded, current, strength)) => BaseCheck::Mismatch {
+            recorded,
+            current,
+            strength,
+        },
+        Err(error) => {
+            let reason = format!("cannot hash: {error}");
+            // Not eprintln!: a closed stderr must not panic a read-only verb.
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!("warning: base check skipped: {reason}\n"),
+            );
+            BaseCheck::Skipped { reason }
+        }
+    }
+}
+
 fn verify(
     conn: &Connection,
     meta: &OverlayMeta,
@@ -1469,6 +1589,80 @@ mod tests {
             meta_of(&root.path().join("overlay")).base_digest_kind(),
             Some("weak")
         );
+    }
+
+    /// `verify_base` table: recorded kind and base type decide strength; a
+    /// FIFO under a strong directory digest, `none` and a missing digest are
+    /// `Skipped`, never an error.
+    #[cfg(unix)]
+    #[test]
+    fn verify_base_strong_weak_skipped_table() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir(&basedir).unwrap();
+        fs::write(basedir.join("f"), b"abc").unwrap();
+        // Weak (default) directory digest.
+        let overlay = root.path().join("weak");
+        open_dir_base(&basedir, &overlay, &info(&basedir)).unwrap();
+        assert!(matches!(
+            verify_base(&overlay, &basedir),
+            BaseCheck::Matches {
+                strength: BaseStrength::Weak,
+                ..
+            }
+        ));
+        fs::write(basedir.join("f"), b"abcd").unwrap();
+        assert!(matches!(
+            verify_base(&overlay, &basedir),
+            BaseCheck::Mismatch {
+                strength: BaseStrength::Weak,
+                ..
+            }
+        ));
+        fs::write(basedir.join("f"), b"abc").unwrap();
+        // Strong (supplied) directory digest; a FIFO added later cannot be hashed.
+        let strong = root.path().join("strong");
+        let mut request = info(&basedir);
+        request.base_digest = BaseDigestRequest::Supplied(directory_digest(&basedir).unwrap());
+        open_dir_base(&basedir, &strong, &request).unwrap();
+        assert!(matches!(
+            verify_base(&strong, &basedir),
+            BaseCheck::Matches {
+                strength: BaseStrength::Strong,
+                ..
+            }
+        ));
+        assert!(std::process::Command::new("mkfifo")
+            .arg(basedir.join("pipe"))
+            .status()
+            .unwrap()
+            .success());
+        assert!(matches!(
+            verify_base(&strong, &basedir),
+            BaseCheck::Skipped { .. }
+        ));
+        fs::remove_file(basedir.join("pipe")).unwrap();
+        // `none` and a missing base are skipped.
+        let none = root.path().join("none");
+        let mut request = info(&basedir);
+        request.base_digest = BaseDigestRequest::None;
+        open_dir_base(&basedir, &none, &request).unwrap();
+        assert!(matches!(
+            verify_base(&none, &basedir),
+            BaseCheck::Skipped { .. }
+        ));
+        assert!(matches!(
+            verify_base(&overlay, &root.path().join("missing")),
+            BaseCheck::Skipped { .. }
+        ));
+        // A git-tree base is skipped.
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        OverlayMeta::set(&conn, "base_git_tree", "abc").unwrap();
+        drop(conn);
+        assert!(matches!(
+            verify_base(&overlay, &basedir),
+            BaseCheck::Skipped { .. }
+        ));
     }
 
     /// Regression: the weak digest is order independent and sees exactly

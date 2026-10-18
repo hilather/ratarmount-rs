@@ -215,3 +215,251 @@ fn regression_seal_of_pending_overlay_computes_and_records_digest() {
     assert!(meta.layer_sealed());
     expect(command(&["overlay", "verify", dir]), 0);
 }
+
+// ---- overlay verify compares the base (section D) ----
+
+fn env_command(home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .env("HOME", home)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// A sealed overlay over a directory base holding `file` (modified by the
+/// layer), `other` (untouched) and `link -> aaaa`. `strong` records a supplied
+/// strong digest of the base; otherwise the default weak digest.
+fn dir_base_fixture(root: &Path, strong: bool) -> (std::path::PathBuf, String, String) {
+    let base = root.join("base");
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("file"), b"base\n").unwrap();
+    fs::write(base.join("other"), b"other\n").unwrap();
+    std::os::unix::fs::symlink("aaaa", base.join("link")).unwrap();
+    let dir = root.join("overlay");
+    let base_digest = if strong {
+        ratarmount_compositing::BaseDigestRequest::Supplied(
+            ratarmount_compositing::directory_digest(&base).unwrap(),
+        )
+    } else {
+        Default::default()
+    };
+    let writer = WriteOverlay::new_with_create_info(
+        Arc::new(FolderMountSource::new(&base).unwrap()),
+        &dir,
+        &OverlayCreateInfo {
+            base_url: base.to_str().unwrap().into(),
+            base_digest,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    cow::cow_write(&writer, "/file", b"change\n");
+    drop(writer);
+    let dir = dir.to_str().unwrap().to_owned();
+    expect(env_command(root, &["overlay", "seal", &dir]), 0);
+    (base.clone(), base.to_str().unwrap().into(), dir)
+}
+
+/// Same-size edit of `path` with its mtime restored.
+fn edit_keeping_mtime(path: &Path, bytes: &[u8]) {
+    let mtime = fs::metadata(path).unwrap().modified().unwrap();
+    fs::write(path, bytes).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
+fn verify_json(root: &Path, dir: &str, extra: &[&str], code: i32) -> serde_json::Value {
+    let mut args = vec!["overlay", "verify", dir, "--json"];
+    args.extend_from_slice(extra);
+    serde_json::from_str(&expect(env_command(root, &args), code)).unwrap()
+}
+
+/// Regression: `overlay verify` hashed only the layer's paths, so an archive
+/// base edited with the same size and a restored mtime verified clean.
+#[test]
+fn regression_verify_base_archive_same_size_mtime_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("base.tar");
+    fs::write(&archive, [0u8; 2048]).unwrap();
+    let dir = tmp.path().join("overlay");
+    let (dir, archive_s) = (dir.to_str().unwrap(), archive.to_str().unwrap());
+    expect(
+        env_command(
+            tmp.path(),
+            &[
+                "--no-mount",
+                "--index-file",
+                ":memory:",
+                "-w",
+                dir,
+                archive_s,
+            ],
+        ),
+        0,
+    );
+    expect(env_command(tmp.path(), &["overlay", "seal", dir]), 0);
+    let ok = verify_json(tmp.path(), dir, &[], 0);
+    assert_eq!(ok["base_ok"], true, "{ok}");
+    assert_eq!(ok["base_check"], "strong", "{ok}");
+    let mut bytes = vec![0u8; 2048];
+    bytes[1500] = 1;
+    edit_keeping_mtime(&archive, &bytes);
+    let bad = verify_json(tmp.path(), dir, &[], 1);
+    assert_eq!(bad["base_ok"], false, "{bad}");
+    assert_eq!(bad["base_check"], "strong", "{bad}");
+    let text =
+        String::from_utf8(env_command(tmp.path(), &["overlay", "verify", dir]).stdout).unwrap();
+    assert!(text.contains("base mismatch: recorded sha256:"), "{text}");
+    assert!(text.contains(", current sha256:"), "{text}");
+    // The opt-out never opens the base.
+    let skipped = verify_json(tmp.path(), dir, &["--no-base-check"], 0);
+    assert_eq!(skipped["base_check"], "skipped", "{skipped}");
+    assert!(skipped["base_ok"].is_null(), "{skipped}");
+}
+
+/// Regression: a directory base with a supplied strong digest was never
+/// compared at verify; an untouched file edited with its mtime restored passed.
+#[test]
+fn regression_verify_base_directory_untouched_file_with_supplied_strong_digest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, _, dir) = dir_base_fixture(tmp.path(), true);
+    let ok = verify_json(tmp.path(), &dir, &[], 0);
+    assert_eq!(
+        (ok["base_ok"].clone(), ok["base_check"].clone()),
+        (true.into(), "strong".into())
+    );
+    edit_keeping_mtime(&base.join("other"), b"OTHER\n");
+    let bad = verify_json(tmp.path(), &dir, &[], 1);
+    assert_eq!(bad["base_ok"], false, "{bad}");
+    assert_eq!(bad["base_check"], "strong", "{bad}");
+}
+
+/// Regression: same for a file the layer replaced (its base counterpart changed).
+#[test]
+fn regression_verify_base_directory_replaced_file_with_supplied_strong_digest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, _, dir) = dir_base_fixture(tmp.path(), true);
+    edit_keeping_mtime(&base.join("file"), b"BASE\n");
+    let bad = verify_json(tmp.path(), &dir, &[], 1);
+    assert_eq!(bad["base_ok"], false, "{bad}");
+}
+
+fn retarget_same_length(base: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let link = base.join("link");
+    let before = fs::symlink_metadata(&link).unwrap();
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("bbbb", &link).unwrap();
+    // Restore the symlink's own mtime so only its target differs.
+    let times = [
+        libc::timespec {
+            tv_sec: std::os::unix::fs::MetadataExt::atime(&before),
+            tv_nsec: std::os::unix::fs::MetadataExt::atime_nsec(&before),
+        },
+        libc::timespec {
+            tv_sec: std::os::unix::fs::MetadataExt::mtime(&before),
+            tv_nsec: std::os::unix::fs::MetadataExt::mtime_nsec(&before),
+        },
+    ];
+    let c = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    assert_eq!(rc, 0);
+}
+
+/// Regression: a symlink retargeted to a same-length name verified clean, under
+/// the default weak digest and under a supplied strong one.
+#[test]
+fn regression_verify_base_symlink_retargeted_same_length() {
+    for strong in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, _, dir) = dir_base_fixture(tmp.path(), strong);
+        let ok = verify_json(tmp.path(), &dir, &[], 0);
+        assert_eq!(ok["base_ok"], true, "{ok}");
+        retarget_same_length(&base);
+        let bad = verify_json(tmp.path(), &dir, &[], 1);
+        assert_eq!(bad["base_ok"], false, "{bad}");
+        assert_eq!(
+            bad["base_check"],
+            if strong { "strong" } else { "weak" },
+            "{bad}"
+        );
+    }
+}
+
+/// Documents the limit of the default weak digest: a same-size content edit
+/// with a restored mtime is invisible to it (docs/sandbox.md, verify section).
+#[test]
+fn regression_verify_weak_directory_cannot_see_restored_mtime_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, _, dir) = dir_base_fixture(tmp.path(), false);
+    edit_keeping_mtime(&base.join("other"), b"OTHER\n");
+    let out = verify_json(tmp.path(), &dir, &[], 0);
+    assert_eq!(out["base_check"], "weak", "{out}");
+    assert_eq!(out["base_ok"], true, "{out}");
+}
+
+/// Regression: a size change of an untouched base file under the weak digest.
+#[test]
+fn regression_verify_weak_directory_catches_size_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, _, dir) = dir_base_fixture(tmp.path(), false);
+    fs::write(base.join("other"), b"much longer content\n").unwrap();
+    let bad = verify_json(tmp.path(), &dir, &[], 1);
+    assert_eq!(bad["base_ok"], false, "{bad}");
+    assert_eq!(bad["base_check"], "weak", "{bad}");
+    let text =
+        String::from_utf8(env_command(tmp.path(), &["overlay", "verify", &dir]).stdout).unwrap();
+    assert!(text.contains("base mismatch: recorded weak:"), "{text}");
+    assert!(
+        text.contains("(weak digest: size/mtime manifest)"),
+        "{text}"
+    );
+}
+
+/// Regression: verify of an unsealed overlay stays refused.
+#[test]
+fn regression_verify_unsealed_still_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, _, dir) = dir_base_fixture(tmp.path(), false);
+    expect(
+        env_command(tmp.path(), &["overlay", "unseal", &dir, "--i-know"]),
+        0,
+    );
+    let out = env_command(tmp.path(), &["overlay", "verify", &dir]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not sealed"));
+    expect(out, 2);
+}
+
+/// A base with no comparable digest is skipped, not an error.
+#[test]
+fn regression_verify_base_without_digest_is_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("file"), b"x\n").unwrap();
+    let dir = tmp.path().join("overlay");
+    let (dir, base) = (dir.to_str().unwrap(), base.to_str().unwrap());
+    expect(
+        env_command(
+            tmp.path(),
+            &["--no-mount", "-w", dir, "--base-digest", "none", base],
+        ),
+        0,
+    );
+    expect(env_command(tmp.path(), &["overlay", "seal", dir]), 0);
+    let out = verify_json(tmp.path(), dir, &[], 0);
+    assert_eq!(out["base_check"], "skipped", "{out}");
+    assert!(out["base_ok"].is_null(), "{out}");
+}

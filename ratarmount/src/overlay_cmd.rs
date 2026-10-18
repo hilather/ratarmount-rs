@@ -65,7 +65,7 @@ pub enum OverlayCommand {
     #[command(
         after_help = "Example: ratarmount overlay verify attempt base.tar.zst --json\n\nExit status:\n  0  Seal matches.\n  1  Seal mismatch.\n  2  Invalid input, operational error, or overlay not sealed."
     )]
-    Verify(SealArgs),
+    Verify(VerifyArgs),
     /// Print the strong digest of a directory or archive base (experimental).
     ///
     /// Reads the whole base once and prints `sha256:<hex>`, for `--base-digest`. Opens no overlay, index or cache.
@@ -135,6 +135,18 @@ pub struct SealArgs {
     pub lower: Vec<PathBuf>,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    #[command(flatten)]
+    pub seal: SealArgs,
+    /// Skip comparing the base with its recorded digest (experimental).
+    ///
+    /// By default verify also recomputes the base: a full read when the
+    /// recorded digest is strong, a stat walk when it is a weak directory digest.
+    #[arg(long)]
+    pub no_base_check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -232,22 +244,24 @@ pub fn unpack(bundle: &Path, directory: &Path) -> Result<(String, i32), String> 
     Ok((output, i32::from(!result.ok)))
 }
 
+/// The base named on the command line, else the one recorded in the overlay.
+fn select_base(args: &SealArgs, meta: Option<&OverlayMeta>) -> Result<PathBuf, String> {
+    let recorded = meta
+        .and_then(OverlayMeta::base_url)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    args.base.clone().or(recorded).ok_or_else(|| {
+        "no metadata base_url; pass BASE explicitly (including for legacy overlays)".into()
+    })
+}
+
 pub(super) fn lower_view(
     args: &SealArgs,
 ) -> Result<std::sync::Arc<dyn ratarmount_core::MountSource>, String> {
     use ratarmount_session::factory;
     let meta = OverlayMeta::read(&args.directory)
         .map_err(|e| super::overlay_open_error(&args.directory, &e))?;
-    let recorded = meta
-        .as_ref()
-        .and_then(OverlayMeta::base_url)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-    let base = args
-        .base
-        .as_ref()
-        .or(recorded.as_ref())
-        .ok_or("no metadata base_url; pass BASE explicitly (including for legacy overlays)")?;
+    let base = &select_base(args, meta.as_ref())?;
     let lowers = if args.lower.is_empty() {
         meta.as_ref()
             .map(|m| m.lower_layers())
@@ -340,34 +354,70 @@ pub fn unseal(directory: &Path, i_know: bool) -> Result<(String, i32), String> {
     Ok((format!("unsealed {}", directory.display()), 0))
 }
 
-pub fn verify(args: &SealArgs) -> Result<(String, i32), String> {
-    let meta = OverlayMeta::read(&args.directory)
-        .map_err(|e| super::overlay_open_error(&args.directory, &e))?;
+pub fn verify(args: &VerifyArgs) -> Result<(String, i32), String> {
+    use ratarmount_compositing::{BaseCheck, BaseStrength};
+    let seal = &args.seal;
+    let meta = OverlayMeta::read(&seal.directory)
+        .map_err(|e| super::overlay_open_error(&seal.directory, &e))?;
     if !meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
         return Err("overlay is not sealed".into());
     }
     let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
-    let report = ratarmount_compositing::overlay_seal::verify(&args.directory, lower_view(args)?)
-        .map_err(|e| format!("verify {}: {e}", args.directory.display()))?;
-    let code = i32::from(!report.ok);
-    let output = if args.json {
+    let report = ratarmount_compositing::overlay_seal::verify(&seal.directory, lower_view(seal)?)
+        .map_err(|e| format!("verify {}: {e}", seal.directory.display()))?;
+    let base_check = if args.no_base_check {
+        BaseCheck::Skipped {
+            reason: "--no-base-check".into(),
+        }
+    } else {
+        ratarmount_compositing::verify_base(&seal.directory, &select_base(seal, meta.as_ref())?)
+    };
+    let base_mismatch = matches!(base_check, BaseCheck::Mismatch { .. });
+    let code = i32::from(!report.ok || base_mismatch);
+    let (base_ok, base_kind, base_current) = match &base_check {
+        BaseCheck::Matches { current, strength } => {
+            (Some(true), strength.as_str(), Some(current.as_str()))
+        }
+        BaseCheck::Mismatch {
+            current, strength, ..
+        } => (Some(false), strength.as_str(), Some(current.as_str())),
+        BaseCheck::Skipped { .. } => (None, "skipped", None),
+    };
+    let output = if args.seal.json {
         serde_json::json!({"ok":report.ok,"recorded":report.recorded,"computed":report.computed,
-            "sentinel_ok":report.sentinel_ok,"mismatched":report.mismatched})
+            "sentinel_ok":report.sentinel_ok,"mismatched":report.mismatched,
+            "base_ok":base_ok,"base_check":base_kind,"base_current":base_current})
         .to_string()
-    } else if report.ok {
+    } else if report.ok && !base_mismatch {
         report.computed
     } else {
-        let mut output = format!(
-            "seal mismatch: recorded {}, computed {}",
-            report.recorded, report.computed
-        );
-        if !report.sentinel_ok {
-            output.push_str("\n.ratarmount-sealed: sentinel mismatch");
+        let mut lines = Vec::new();
+        if !report.ok {
+            let mut text = format!(
+                "seal mismatch: recorded {}, computed {}",
+                report.recorded, report.computed
+            );
+            if !report.sentinel_ok {
+                text.push_str("\n.ratarmount-sealed: sentinel mismatch");
+            }
+            for path in report.mismatched {
+                text.push_str(&format!("\n{path}"));
+            }
+            lines.push(text);
         }
-        for path in report.mismatched {
-            output.push_str(&format!("\n{path}"));
+        if let BaseCheck::Mismatch {
+            recorded,
+            current,
+            strength,
+        } = &base_check
+        {
+            let mut text = format!("base mismatch: recorded {recorded}, current {current}");
+            if *strength == BaseStrength::Weak {
+                text.push_str("\n(weak digest: size/mtime manifest)");
+            }
+            lines.push(text);
         }
-        output
+        lines.join("\n")
     };
     Ok((output, code))
 }

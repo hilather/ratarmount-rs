@@ -347,6 +347,26 @@ means an operational error, including an unsealed overlay. `--json` also returns
 `ok`, `recorded`, `computed`, `sentinel_ok`, and `mismatched`. It works on the
 read-only tree and detects unindexed host additions as well as changed bytes.
 
+Verify also compares the **base** with the digest recorded at creation (mounts
+never do; this is where a supplied `--base-digest` is checked). The base is the
+BASE argument, else the recorded `base_url`. What is compared depends on the
+recorded kind:
+
+| Recorded digest | Check | Cost |
+|---|---|---|
+| strong: a computed archive digest, or any supplied digest | recomputed from the bytes (directory: file contents and symlink targets, without the recorded `base_weak_excludes` and ratarmount's own sidecars); the index digest cache is never consulted | one full read of the base |
+| weak directory digest (the default for a directory base) | the size/mtime/symlink-target manifest is rewalked with the recorded exclusions | a stat walk |
+| `none`, `pending`, git tree, remote, unreadable or unhashable (FIFO under a strong directory digest) | skipped, with a warning when hashing failed | none |
+
+A mismatch exits 1 with `base mismatch: recorded X, current Y` (weak digests add
+`(weak digest: size/mtime manifest)`). `--json` adds `base_ok` (`true`, `false`,
+or `null` when skipped), `base_check` (`strong`, `weak` or `skipped`) and
+`base_current`, so a grader can tell what `true` means. A weak digest cannot see
+a same-size content edit whose mtime was restored (pass a strong digest from
+`overlay digest-base` for that); it does catch size changes, added or removed
+entries and a retargeted symlink. `--no-base-check` (experimental) skips the
+comparison and never opens the base, for bases too large to rehash.
+
 Unseal requires `--i-know` (otherwise exit 2), restores owner write permission
 on files and directories, removes the sentinel, clears the seal and per-path
 hashes, and records `unsealed_at`. Saved mode overrides stay in place. Host
