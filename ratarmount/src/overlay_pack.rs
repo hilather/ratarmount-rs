@@ -147,7 +147,10 @@ fn sanitized_db(
             | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(io::Error::other)?;
-    let copy = staging.join(HIDDEN_DB);
+    // VACUUM INTO opens its target with this connection's flags, so NOFOLLOW
+    // rejects a symlink in any component of the staging path (every macOS temp
+    // dir lives under /var -> /private/var): hand SQLite the resolved path.
+    let copy = staging.canonicalize()?.join(HIDDEN_DB);
     conn.execute("VACUUM INTO ?1", [copy.to_string_lossy().as_ref()])
         .map_err(io::Error::other)?;
     drop(conn);
@@ -1392,6 +1395,34 @@ mod tests {
         fn drop(&mut self) {
             cleanup_dirs(&open_root(self.tmp.path()).unwrap());
         }
+    }
+
+    /// Regression: the sanitized database copy was written through the staging
+    /// path as given; with NOFOLLOW inherited from the source connection,
+    /// `VACUUM INTO` failed with "unable to open database" when any staging
+    /// component is a symlink (macOS `/var`). Credentials must still be gone.
+    #[test]
+    fn regression_sanitized_db_staging_below_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("stage")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let dir = tmp.path().join("layer");
+        fs::create_dir(&dir).unwrap();
+        let raw = "https://user:s3cr3t@h.example/b.tar?X-Amz-Signature=deadbeef";
+        let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+        conn.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO meta VALUES('base_url', ?1)", [raw])
+            .unwrap();
+        let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
+        drop(conn);
+        let copy = sanitized_db(&dir, &link.join("stage"), &meta)
+            .unwrap()
+            .unwrap();
+        let bytes = fs::read(copy).unwrap();
+        assert!(!bytes.windows(6).any(|w| w == b"s3cr3t"));
     }
 
     /// Regression: pack must refuse a layer sealed under canonical hash
