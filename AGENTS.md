@@ -429,6 +429,10 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | `overlay seal`/`pack`/`diff` ignored an edited dir or archive base (sealed a layer its own verify rejects; `diff --hash --json` reported the stale recorded base); `--force-base-mismatch` records/reports the base actually used (R4-B1) | `cargo test -p ratarmount --test overlay_base_gate` |
 | `--lower` refused a byte-identical copy of a strong base despite a matching `--base-digest` or cached index digest; Git-tree and `need_walk` branches, cache-hit meta check (R4-B2) | `cargo test -p ratarmount --test overlay_lower_strong` · `cargo test -p ratarmount-compositing --lib regression_compare_base` · `cargo test -p ratarmount --bin ratarmount regression_cache_hit_refused` |
+| Digest hashed unserialized when the index stayed write-locked past the open timeout (no per-archive lock); busy-index open test used a wall-clock bound (R4-F1/F2) | `cargo test -p ratarmount-index --lib regression_digest_once_lock_held_when_index_stays_busy` · `cargo test -p ratarmount-index --lib regression_digest_once_open_waits_for_busy_index` |
+| Journal header newer than supported fell through to "missing journal header" (R4-F5) | `cargo test -p ratarmount --bin ratarmount regression_journal_newer_version` |
+| Credentials leaked: `sandbox run` cleanup warning, rclone/restic/torrent/tracker URLs, userinfo containing `/`, `?` or `#` (R4-F4) | `cargo test -p ratarmount-core --lib regression_redact` · `cargo test -p ratarmount --bin ratarmount regression_run_cleanup_warning_is_redacted` |
+| overlay_exclusions: unmount helper passed on a `-z` fallback; empty refusal text hid a signal death (R4-F3/F3b) | `cargo test -p ratarmount --test overlay_exclusions` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
