@@ -382,6 +382,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | 10 GiB sparse file: `--max-patch-bytes` reads it all, or `--manifest` buffers it (SBX-DIFF) | `cargo test -p ratarmount --bin ratarmount regression_diff_limits_and_sparse_file_exit_three` · (slow, ignored) `cargo test -p ratarmount --bin ratarmount regression_diff_sparse_manifest_streams_ten_gib -- --ignored` |
 | Seal changes visible modes, follows symlinks, accepts a mounted or inconsistent overlay, or misses tampering; `verify` does not name the path (SBX-SEAL) | `cargo test -p ratarmount-compositing --lib overlay_seal` · `cargo test -p ratarmount --test overlay_seal` · `cargo test -p ratarmount --test fuse_lower` |
 | `--lower` stack check masks the #89 overlay-open errors (corrupt / locked / misplaced DB) | `cargo test -p ratarmount --test overlay_open_error` |
+| Bundles lose seals, modes, timestamps, tombstones or journal/index files; unpack follows traversal/symlink entries; racing `--lower` bundle cache publication (SBX-PACK) | `cargo test -p ratarmount --bin ratarmount overlay_pack::tests` · `cargo test -p ratarmount --test overlay_pack` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
