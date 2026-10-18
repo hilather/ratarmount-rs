@@ -209,11 +209,75 @@ mod mounted {
         true
     }
 
-    /// `fusermount3 -u` with a bounded retry: the kernel keeps the mount busy
-    /// until the daemon has answered the asynchronous FUSE RELEASE of a file
-    /// the test just closed. Falls back to a lazy unmount so none is left stale.
-    fn unmount_with_retry(mnt: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    /// Mountpoint references held by other processes, for a failure report:
+    /// `fuser -vm` and every `/proc/*/{fd,cwd,root,exe}` link under `mnt`.
+    fn log_holders(mnt: &Path) {
+        eprintln!("holders of {}:", mnt.display());
+        match Command::new("fuser").arg("-vm").arg(mnt).output() {
+            Ok(out) => eprintln!(
+                "fuser -vm: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => eprintln!("fuser unavailable: {e}"),
+        }
+        let roots: Vec<PathBuf> = [Some(mnt.to_path_buf()), mnt.canonicalize().ok()]
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut found = 0;
+        for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let pid = entry.file_name();
+            if !pid.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let dir = entry.path();
+            let comm = fs::read_to_string(dir.join("comm")).unwrap_or_default();
+            let mut links = vec![
+                ("cwd".to_string(), dir.join("cwd")),
+                ("root".to_string(), dir.join("root")),
+                ("exe".to_string(), dir.join("exe")),
+            ];
+            for fd in fs::read_dir(dir.join("fd")).into_iter().flatten().flatten() {
+                links.push((
+                    format!("fd {}", fd.file_name().to_string_lossy()),
+                    fd.path(),
+                ));
+            }
+            for (kind, link) in links {
+                if let Ok(target) = fs::read_link(&link) {
+                    if roots.iter().any(|root| target.starts_with(root)) {
+                        found += 1;
+                        eprintln!(
+                            "  pid {} ({}) {kind} -> {}",
+                            pid.to_string_lossy(),
+                            comm.trim(),
+                            target.display()
+                        );
+                    }
+                }
+            }
+        }
+        if found == 0 {
+            eprintln!("  no process holds an fd, cwd, root or exe under the mount");
+        }
+    }
+
+    fn is_mounted(mnt: &Path) -> bool {
+        fs::metadata(mnt).is_ok_and(|m| {
+            Some(m.dev()) != fs::metadata(mnt.parent().unwrap()).ok().map(|p| p.dev())
+        })
+    }
+
+    /// `fusermount3 -u` with a bounded retry. An external prober of a new mount
+    /// (the desktop's `gvfsd-trash` looks up `.Trash` and `.Trash-<uid>` on
+    /// every mount) can hold a transient reference that makes the first `-u`
+    /// return EBUSY; it is not a pending FUSE RELEASE, and a retry clears it.
+    /// If the mount is still busy after `limit`, the holders are logged, a lazy
+    /// unmount leaves nothing stale, and the result is an `Err` so the test
+    /// fails instead of passing on the fallback.
+    fn unmount_within(mnt: &Path, limit: Duration, label: &str) -> Result<(), String> {
+        let deadline = Instant::now() + limit;
         loop {
             let ok = Command::new("fusermount3")
                 .arg("-u")
@@ -222,27 +286,31 @@ mod mounted {
                 .status()
                 .is_ok_and(|s| s.success());
             // Already unmounted by an earlier attempt also ends the loop.
-            if ok
-                || !fs::metadata(mnt).is_ok_and(|m| {
-                    Some(m.dev()) != fs::metadata(mnt.parent().unwrap()).ok().map(|p| p.dev())
-                })
-            {
-                return;
+            if ok || !is_mounted(mnt) {
+                return Ok(());
             }
             if Instant::now() > deadline {
                 eprintln!(
-                    "fusermount3 -u {} still busy after 5 s; using -z",
+                    "{label}: fusermount3 -u {} still busy after {limit:?}",
                     mnt.display()
                 );
+                log_holders(mnt);
                 let _ = Command::new("fusermount3")
                     .arg("-u")
                     .arg("-z")
                     .arg(mnt)
                     .status();
-                return;
+                return Err(format!(
+                    "{label}: fusermount3 -u {} stayed busy for {limit:?} (lazy unmount used for cleanup; holders logged above)",
+                    mnt.display()
+                ));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    fn unmount_with_retry(mnt: &Path) -> Result<(), String> {
+        unmount_within(mnt, Duration::from_secs(5), "unmount")
     }
 
     /// The stderr of a mount that exited before it was ready. A refusal always
@@ -284,6 +352,20 @@ mod mounted {
         flags: &[&OsStr],
         work: &dyn Fn(&Path),
     ) -> Result<(), String> {
+        cycle_using(root, overlay, base, mnt, flags, work, &unmount_with_retry)
+    }
+
+    /// [`cycle_with`] with the unmount step supplied. A failed unmount reaps the
+    /// daemon and then fails the test.
+    fn cycle_using(
+        root: &Path,
+        overlay: Option<&Path>,
+        base: &Path,
+        mnt: &Path,
+        flags: &[&OsStr],
+        work: &dyn Fn(&Path),
+        unmount_step: &dyn Fn(&Path) -> Result<(), String>,
+    ) -> Result<(), String> {
         let stderr_path = root.join("mount.stderr");
         let stderr = fs::File::create(&stderr_path).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
@@ -304,7 +386,7 @@ mod mounted {
             .unwrap();
         let parent_dev = fs::metadata(mnt.parent().unwrap()).ok().map(|m| m.dev());
         let deadline = Instant::now() + Duration::from_secs(30);
-        let unmount = || unmount_with_retry(mnt);
+        let unmount = || unmount_step(mnt);
         let ready = loop {
             if fs::metadata(mnt).is_ok_and(|m| Some(m.dev()) != parent_dev)
                 && fs::read_dir(mnt).is_ok()
@@ -316,7 +398,7 @@ mod mounted {
                 break false;
             }
             if Instant::now() > deadline {
-                unmount();
+                let _ = unmount();
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!("mount not ready within 30 s");
@@ -331,7 +413,11 @@ mod mounted {
             ));
         }
         work(mnt);
-        unmount();
+        if let Err(message) = unmount() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{message}");
+        }
         let start = Instant::now();
         loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -372,6 +458,39 @@ mod mounted {
         let message = *silent.unwrap_err().downcast::<String>().unwrap();
         assert!(message.contains("printed no refusal reason"), "{message}");
         assert_eq!(refusal_text(run("exit 1"), "why\n".into()), "why\n");
+    }
+
+    /// Regression: a plain `fusermount3 -u` (no `-z`, at most 500 ms of
+    /// retry) must succeed right after the last close of a file in the mount.
+    /// A holder that outlives that is a product or harness problem, and the
+    /// failure logs who holds the mount.
+    #[test]
+    fn regression_plain_unmount_succeeds_promptly_after_last_close() {
+        if !available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = base_dir(tmp.path());
+        let overlay = base.join(".ov");
+        let mnt = tmp.path().join("mnt");
+        fs::create_dir(&mnt).unwrap();
+        cycle_using(
+            tmp.path(),
+            Some(&overlay),
+            &base,
+            &mnt,
+            &[],
+            &write_through("closed.txt"),
+            &|mnt| {
+                unmount_within(
+                    mnt,
+                    Duration::from_millis(500),
+                    "plain unmount after the last close",
+                )
+            },
+        )
+        .unwrap();
+        assert!(!is_mounted(&mnt), "{} is still mounted", mnt.display());
     }
 
     /// Regression: after sealing L against B, an ordinary `B/new.log` appeared
