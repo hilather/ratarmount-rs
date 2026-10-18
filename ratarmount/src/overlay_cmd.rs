@@ -19,6 +19,8 @@ pub struct OverlayArgs {
 pub enum OverlayCommand {
     /// Show metadata, counts, and writability without modifying the overlay.
     Info(InfoArgs),
+    /// Import a unified or Git patch into a new overlay. Exit 1: rejected hunks, 2: error.
+    Import(super::overlay_import::ImportArgs),
     /// Seal exact changes and make the overlay read-only. Exit 0: sealed, 2: error.
     Seal(SealArgs),
     /// Restore owner write permission and remove the seal. Requires --i-know.
@@ -78,6 +80,7 @@ pub struct InfoArgs {
 pub fn run(args: &OverlayArgs) -> Result<(String, i32), String> {
     match &args.command {
         OverlayCommand::Info(args) => info(args).map(|output| (output, 0)),
+        OverlayCommand::Import(args) => super::overlay_import::run(args),
         OverlayCommand::Seal(args) => seal(args),
         OverlayCommand::Unseal { directory, i_know } => unseal(directory, *i_know),
         OverlayCommand::Verify(args) => verify(args),
