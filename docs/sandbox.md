@@ -1023,3 +1023,71 @@ getfattr -n user.ratarmount.stats mnt
 getfattr -n user.ratarmount.base_digest mnt
 python3 -c 'import os; os.setxattr("mnt", "user.ratarmount.mark", b"turn 2")'
 ```
+
+## Overlay import
+
+`ratarmount overlay import` builds a new write overlay from a unified or Git
+patch against a base and optional lower overlays. It uses the same write APIs
+and creation metadata as a mounted write session; no mount or external patch
+program is needed.
+
+```sh
+ratarmount diff attempt base.tar.zst --git -o attempt.patch
+ratarmount overlay import --mtime 1700000000 attempt.patch replay base.tar.zst
+cat attempt.patch | ratarmount overlay import --lower prepared - replay2 base.tar.zst
+ratarmount diff replay base.tar.zst --hash --normalize exact
+```
+
+The destination must not exist or must be an empty directory. `--lower DIR` is
+repeatable, bottom to top; unsealed lower layers require
+`--allow-unsealed-lower`. The base positional accepts the same local archive,
+folder, committed Git source and remote source forms as other offline overlay
+commands. Import pins Git references before opening the source and records the
+base identity and lower-layer stack identity.
+
+Accepted patches include `git diff --binary` literal sections (Git base85 plus
+zlib), additions, deletions, executable mode changes, symlinks, rename/copy
+headers and ordinary unified hunks. Rename means copy the preimage to the new
+name, apply its hunks, then delete the old name. Copy keeps the old name.
+Reverse binary literals are validated and ignored. Binary delta sections and
+`Binary files … differ` without content are errors naming the affected file;
+regenerate these as literal patches, for example with `ratarmount diff --git`.
+Index object IDs are accepted without verification.
+
+Hunks require exact context bytes. Their location may move; context is never
+trimmed to force a match. CRLF, Latin-1 file content and missing final newlines
+are preserved. Git C-quoted names are decoded, and header paths have one
+leading component removed (`-p1`); plain `diff -u` headers may include a tab
+followed by a timestamp. Both old and new names are validated. Absolute paths,
+NUL, empty, `.` or `..` components, reserved overlay bookkeeping names, and
+symlink parents in either the lower view or the new overlay are refused.
+Symlink targets are stored as link data, never followed. Paths and symlink
+targets must be UTF-8 because the workspace's mount and overlay APIs use
+strings; non-UTF-8 names are refused, rather than changed silently.
+
+If a hunk fails, the default is to abort and remove the partial overlay.
+`--reject` keeps that file's original lower content and writes only its failed
+hunks to `PATH.rej`, while applying other files. Later sections for an already
+rejected file cannot replace its original content. Import exits 0 on success, 1 when hunks
+were rejected with `--reject`, and 2 on invalid input or I/O errors. A preexisting
+nonempty destination is left intact.
+
+`--mtime now` is the default. An explicit epoch timestamp (including fractional
+or negative seconds) is applied after content writes to files, symlinks and
+reject files. It does not alter tombstones. Import seals by default after
+closing the writer and prints the layer digest. `--no-seal` leaves the overlay
+writable. `--json` prints `{ "overlay": "…", "files": N, "rejected": N,
+"layer_digest": "…" }`; the digest is null with `--no-seal`. `files` counts
+successfully applied distinct paths (both sides of renames), excluding reject
+files and rejected originals.
+
+`--max-patch-bytes N` defaults to 268435456 (256 MiB). It bounds input bytes,
+the total retained decoded literals, each reverse literal, and each file's
+preimage/postimage. Import buffers the bounded patch and one file's text at a
+time; increase the limit explicitly for larger patches.
+
+Git/unified patches cannot represent empty directories, directory metadata or
+extended attributes. Empty directories therefore do not round-trip, and Git
+patches project regular-file permissions to 0644/0755. Exact canonical hashes
+round-trip for representable changes with those modes; use manifests or packed
+overlays when the full directory/mode/xattr state is needed.

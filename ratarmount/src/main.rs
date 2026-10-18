@@ -41,6 +41,8 @@ mod find;
 mod journal_cmd;
 mod overlay_cmd;
 mod overlay_commit;
+mod overlay_create;
+mod overlay_import;
 mod overlay_stats;
 mod publish_index;
 mod sandbox;
@@ -1475,7 +1477,8 @@ fn main() {
                 std::process::exit(
                     if matches!(
                         overlay.command,
-                        overlay_cmd::OverlayCommand::Fsck { .. }
+                        overlay_cmd::OverlayCommand::Import(_)
+                            | overlay_cmd::OverlayCommand::Fsck { .. }
                             | overlay_cmd::OverlayCommand::Seal(_)
                             | overlay_cmd::OverlayCommand::Unseal { .. }
                             | overlay_cmd::OverlayCommand::Verify(_)
@@ -2098,7 +2101,7 @@ fn main() {
                 eprintln!("error: {error}");
                 std::process::exit(1);
             });
-        let mut create_info = ratarmount_compositing::OverlayCreateInfo {
+        let create_info = ratarmount_compositing::OverlayCreateInfo {
             base_url: overlay_base_url,
             base_digest: args.base_digest.clone().unwrap_or_default(),
             force_base_mismatch: args.force_base_mismatch,
@@ -2109,33 +2112,12 @@ fn main() {
             git_tree: overlay_git_tree,
             ..Default::default()
         };
-        if create_info.base_digest == ratarmount_compositing::BaseDigestRequest::None {
-            eprintln!(
-                "warning: --base-digest none disables base identity verification for new overlays"
-            );
-        }
-        if inputs.len() > 1 || !args.source_binds.is_empty() {
-            create_info.remote_token = Some(serde_json::to_string(&inputs).expect("input paths"));
-        } else if create_info.base_digest == ratarmount_compositing::BaseDigestRequest::Compute
-            && !overlay_path.join(HIDDEN_DB).exists()
-            && ratarmount_remote::is_remote_url(&create_info.base_url)
-        {
-            create_info.remote_token = Some(
-                overlay_cmd::remote_base_token(&create_info.base_url)
-                    .unwrap_or_else(|| format!("url:{}", create_info.base_url)),
-            );
-        }
-        if inputs.len() == 1
-            && args.source_binds.is_empty()
-            && create_info.git_tree.is_none()
-            && !ratarmount_remote::is_remote_url(&create_info.base_url)
-        {
-            create_info.local_path = Some(inputs[0].clone());
-        }
-        match WriteOverlay::new_with_create_info(
+        match overlay_create::create_overlay(
             Arc::clone(&bundle.source),
             &overlay_path,
-            &create_info,
+            create_info,
+            &inputs,
+            !args.source_binds.is_empty(),
         ) {
             Ok(mut ov) => {
                 if let Some(series) = &rolling {
