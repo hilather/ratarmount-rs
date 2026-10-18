@@ -132,8 +132,12 @@ fn recover_hot_journal(dir: &Path, db: &Path) -> Result<()> {
             journal.display()
         ))
     };
-    if fs::symlink_metadata(dir.join(crate::overlay_seal::SENTINEL)).is_ok() {
-        return Err(refuse("the overlay is sealed and is not rolled back"));
+    // Sealing exists only where `overlay_seal` is compiled.
+    #[cfg(unix)]
+    {
+        if fs::symlink_metadata(dir.join(crate::overlay_seal::SENTINEL)).is_ok() {
+            return Err(refuse("the overlay is sealed and is not rolled back"));
+        }
     }
     if !path_writable(dir) || !path_writable(db) {
         return Err(refuse("the overlay or its directory is read-only"));
@@ -1344,12 +1348,12 @@ pub struct BaseComparison {
     pub stamp: Option<ArchiveDigestStamp>,
     /// The archive digest the index cache already holds (never hashed here).
     pub cached_digest: Option<String>,
+    /// A recorded row (tree id, manifest or stamp) was compared with the base.
+    pub compared: bool,
 }
 
 /// The one cheap identity check: reopen, `overlay seal`/`pack`, `diff` and the
 /// `--lower` mount all compare a base with what the overlay recorded through
-    /// A recorded row (tree id, manifest or stamp) was compared with the base.
-    pub compared: bool,
 /// this. Metadata only, never a content read:
 ///
 /// * directories: the weak walk with the *recorded* exclusions (plus the
@@ -1379,11 +1383,11 @@ pub fn compare_base_identity(
     let mut mismatch: Option<String> = None;
     if let Some(tree) = probe.git_tree {
         let current = format!("git-tree:{tree}");
+        out.compared = recorded_tree.is_some();
         if decidable
             && (recorded_tree.is_some_and(|r| r != tree)
                 || recorded_weak.is_some()
                 || recorded_stamp.is_some())
-        out.compared = recorded_tree.is_some();
         {
             mismatch = Some(current.clone());
         }
@@ -1404,11 +1408,11 @@ pub fn compare_base_identity(
                     .map_err(|e| format!("cannot measure base {}: {e}", dir.display()))?,
             );
         }
+        out.compared = recorded_weak.is_some();
         if decidable {
             let differs = match (recorded_weak, &out.weak) {
                 (Some(recorded), Some(now)) => recorded != now,
                 _ => recorded_stamp.is_some() || recorded_tree.is_some(),
-        out.compared = recorded_weak.is_some();
             };
             if differs && !confirms(probe.supplied) {
                 mismatch = out.weak.clone().or_else(|| Some("a directory".into()));
@@ -1428,11 +1432,11 @@ pub fn compare_base_identity(
         if probe.supplied.is_none() || (decidable && strong) {
             out.cached_digest = peek_archive_digest(file, probe.index).ok().flatten();
         }
+        out.compared = recorded_stamp.is_some();
         if let Some(stamp) = &out.stamp {
             let differs = match recorded_stamp {
                 Some((size, mtime)) => {
                     stamp.size.to_string() != size || stamp.mtime_ns.to_string() != mtime
-        out.compared = recorded_stamp.is_some();
                 }
                 None => recorded_weak.is_some() || recorded_tree.is_some(),
             };
@@ -1448,10 +1452,6 @@ pub fn compare_base_identity(
     } else {
         out.identity = probe.supplied.unwrap_or_default().to_owned();
     }
-    // A supplied digest that is not the strong one recorded is a different base.
-    if mismatch.is_none() && decidable && strong {
-        if let Some(supplied) = probe.supplied.filter(|s| Some(*s) != recorded_digest) {
-            mismatch = Some(supplied.to_owned());
     // A strong record with nothing local to compare (an overlay made over an
     // HTTP base has no stamp, manifest or tree) agrees with a local base only
     // if the same strong digest comes from elsewhere.
@@ -1466,6 +1466,10 @@ pub fn compare_base_identity(
             });
         }
     }
+    // A supplied digest that is not the strong one recorded is a different base.
+    if mismatch.is_none() && decidable && strong {
+        if let Some(supplied) = probe.supplied.filter(|s| Some(*s) != recorded_digest) {
+            mismatch = Some(supplied.to_owned());
         }
     }
     out.mismatch = mismatch;
@@ -1525,6 +1529,9 @@ pub fn forced_base_record(
                 "computed",
             ),
         }
+    } else if let Some(supplied) = probe.supplied {
+        // A remote base: nothing is read, the supplied digest is the identity.
+        (supplied.to_owned(), "strong", "supplied")
     } else {
         return Err("the base is not a local directory, archive or Git tree; pass --base-digest sha256:<hex> to record its identity".into());
     };
@@ -1717,6 +1724,42 @@ mod tests {
                 .mismatch,
             None
         );
+    }
+
+    /// Regression (R4-S3): a strong record with no stamp, manifest or tree (an
+    /// overlay made over an HTTP base) was accepted over any unrelated local
+    /// directory, archive or Git tree. Only the same strong digest, supplied or
+    /// cached, confirms it; a remote probe (no local path) keeps its behaviour.
+    #[test]
+    fn regression_compare_base_strong_without_local_rows_needs_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), b"unrelated").unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, b"not the base").unwrap();
+        let strong = format!("sha256:{}", "a".repeat(64));
+        let other = format!("sha256:{}", "b".repeat(64));
+        let record = meta_with(&[
+            ("base_digest_kind", "strong"),
+            ("base_digest", strong.as_str()),
+        ]);
+        for path in [dir.path(), archive.as_path()] {
+            let bad =
+                compare_base_identity(Some(&record), &probe(Some(path), None, None, None)).unwrap();
+            assert!(bad.mismatch.is_some(), "{path:?} accepted unconfirmed");
+            let wrong =
+                compare_base_identity(Some(&record), &probe(Some(path), None, Some(&other), None))
+                    .unwrap();
+            assert!(wrong.mismatch.is_some(), "{path:?} accepted a wrong digest");
+            let ok =
+                compare_base_identity(Some(&record), &probe(Some(path), None, Some(&strong), None))
+                    .unwrap();
+            assert_eq!(ok.mismatch, None, "{path:?}");
+        }
+        let git =
+            compare_base_identity(Some(&record), &probe(None, Some("abc"), None, None)).unwrap();
+        assert!(git.mismatch.is_some(), "git tree accepted unconfirmed");
+        let remote = compare_base_identity(Some(&record), &probe(None, None, None, None)).unwrap();
+        assert_eq!(remote.mismatch, None);
     }
 
     /// Regression (Keystone mutant on `need_walk`): a supplied digest skips the
