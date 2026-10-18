@@ -706,7 +706,9 @@ impl PendingBase {
 
 /// Test seam, read only where a full archive hash really starts: append one
 /// line to `RATARMOUNT_TEST_HASH_LOG` (so separate mount processes can be
-/// counted) and sleep `RATARMOUNT_TEST_HASH_DELAY_MS` (widens race windows).
+/// counted), sleep `RATARMOUNT_TEST_HASH_DELAY_MS` (widens race windows) and
+/// block until the path in `RATARMOUNT_TEST_HASH_HOLD` exists (an explicit
+/// release instead of a timed delay; capped at 60 s so a lost test cannot hang).
 fn test_hash_seam(path: &Path) {
     use std::io::Write;
     if let Some(log) = std::env::var_os("RATARMOUNT_TEST_HASH_LOG") {
@@ -719,6 +721,12 @@ fn test_hash_seam(path: &Path) {
         .and_then(|v| v.parse::<u64>().ok())
     {
         std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    if let Some(hold) = std::env::var_os("RATARMOUNT_TEST_HASH_HOLD").map(PathBuf::from) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !hold.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 

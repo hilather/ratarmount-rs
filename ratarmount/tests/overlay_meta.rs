@@ -778,12 +778,26 @@ impl LoggedMount {
         log: &Path,
         delay_ms: u64,
     ) -> Self {
+        Self::spawn_held(root, n, archive, index, log, delay_ms, None)
+    }
+
+    /// [`Self::spawn`] whose archive hash blocks (lock held) until `hold` exists.
+    fn spawn_held(
+        root: &Path,
+        n: usize,
+        archive: &Path,
+        index: Option<&Path>,
+        log: &Path,
+        delay_ms: u64,
+        hold: Option<&Path>,
+    ) -> Self {
         let mnt = root.join(format!("mnt{n}"));
         std::fs::create_dir_all(&mnt).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
         private_env(&mut cmd, root);
         cmd.env("RATARMOUNT_TEST_HASH_LOG", log)
             .env("RATARMOUNT_TEST_HASH_DELAY_MS", delay_ms.to_string())
+            .envs(hold.map(|h| ("RATARMOUNT_TEST_HASH_HOLD", h)))
             .args(["-f", "--passthrough", "off", "--index-file"])
             .arg(index.unwrap_or(Path::new(":memory:")))
             .arg("-w")
@@ -948,8 +962,9 @@ fn regression_digest_once_eight_concurrent_mounts() {
 
 /// Regression: a second mount's cache peek waited for the first mount's hash
 /// (it took the same lock), so it was not serving until that hash finished.
-/// While mount 0 is hashing (delay), mount 1 must be serving and show a pending
-/// digest; afterwards both resolve and the archive was hashed exactly once.
+/// The first mount's hash is held (lock taken) until the test releases it; the
+/// second mount must be serving with a pending digest meanwhile. Afterwards
+/// both resolve and the archive was hashed exactly once. No timed delay.
 #[cfg(target_os = "linux")]
 #[test]
 fn regression_second_mount_serves_while_the_first_is_hashing() {
@@ -958,18 +973,18 @@ fn regression_second_mount_serves_while_the_first_is_hashing() {
         return;
     };
     let log = root.path().join("hash.log");
-    let hashing = 8000;
-    let mut first = LoggedMount::spawn(root.path(), 0, &archive, Some(&index), &log, hashing);
+    let hold = root.path().join("release-hash");
+    let mut first =
+        LoggedMount::spawn_held(root.path(), 0, &archive, Some(&index), &log, 0, Some(&hold));
     wait_until("first serving", || first.serving());
     wait_until("first started hashing", || hash_lines(&log) == 1);
-    let started = std::time::Instant::now();
-    let mut second = LoggedMount::spawn(root.path(), 1, &archive, Some(&index), &log, hashing);
+    let mut second =
+        LoggedMount::spawn_held(root.path(), 1, &archive, Some(&index), &log, 0, Some(&hold));
     wait_until("second serving", || second.serving());
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(hashing),
-        "second mount was not serving until the first hash finished"
-    );
+    // The first hash is still blocked: nothing can have resolved yet.
+    assert_eq!(first.xattr("base_digest"), "", "first digest still pending");
     assert_eq!(second.xattr("base_digest"), "", "digest still pending");
+    std::fs::write(&hold, b"").unwrap();
     wait_until("first digest", || !first.xattr("base_digest").is_empty());
     wait_until("second digest", || !second.xattr("base_digest").is_empty());
     assert_eq!(first.xattr("base_digest"), second.xattr("base_digest"));
