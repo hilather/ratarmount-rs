@@ -245,6 +245,23 @@ mod mounted {
         }
     }
 
+    /// The stderr of a mount that exited before it was ready. A refusal always
+    /// prints its reason and exits normally; an empty message or a death by
+    /// signal is not a refusal (the flake behind an empty "refusal" under load
+    /// was a child with no stderr at all), so say what happened instead of
+    /// handing the caller an empty string to compare.
+    fn refusal_text(status: std::process::ExitStatus, stderr: String) -> String {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            panic!("mount child was killed by signal {signal} (OOM kill or crash), not refused; stderr: {stderr:?}");
+        }
+        assert!(
+            !stderr.trim().is_empty(),
+            "mount child exited with {status} and printed no refusal reason"
+        );
+        stderr
+    }
+
     /// One foreground `-w` mount; `Ok` once it was ready, served and unmounted
     /// cleanly, `Err(stderr)` if it exited first (a refusal).
     fn cycle(
@@ -307,7 +324,11 @@ mod mounted {
             std::thread::sleep(Duration::from_millis(20));
         };
         if !ready {
-            return Err(fs::read_to_string(&stderr_path).unwrap());
+            let status = child.wait().unwrap();
+            return Err(refusal_text(
+                status,
+                fs::read_to_string(&stderr_path).unwrap(),
+            ));
         }
         work(mnt);
         unmount();
@@ -332,6 +353,25 @@ mod mounted {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Regression: a refusal reported as an empty string (child killed, or
+    /// exited without a reason) failed `contains(..)` with a blank message.
+    #[test]
+    fn regression_refusal_text_names_signal_and_empty_stderr() {
+        let run = |script: &str| {
+            Command::new("sh")
+                .args(["-c", script])
+                .status()
+                .expect("sh")
+        };
+        let killed = std::panic::catch_unwind(|| refusal_text(run("kill -9 $$"), String::new()));
+        let message = *killed.unwrap_err().downcast::<String>().unwrap();
+        assert!(message.contains("killed by signal 9"), "{message}");
+        let silent = std::panic::catch_unwind(|| refusal_text(run("exit 1"), "\n".into()));
+        let message = *silent.unwrap_err().downcast::<String>().unwrap();
+        assert!(message.contains("printed no refusal reason"), "{message}");
+        assert_eq!(refusal_text(run("exit 1"), "why\n".into()), "why\n");
     }
 
     /// Regression: after sealing L against B, an ordinary `B/new.log` appeared
