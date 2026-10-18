@@ -19,6 +19,14 @@ pub struct OverlayArgs {
 pub enum OverlayCommand {
     /// Show metadata, counts, and writability without modifying the overlay.
     Info(InfoArgs),
+    /// Check overlay consistency. Exit 0: clean/repaired, 1: inconsistencies, 2: error.
+    Fsck {
+        directory: PathBuf,
+        #[arg(long)]
+        repair: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -28,10 +36,43 @@ pub struct InfoArgs {
     pub json: bool,
 }
 
-pub fn run(args: &OverlayArgs) -> Result<String, String> {
+pub fn run(args: &OverlayArgs) -> Result<(String, i32), String> {
     match &args.command {
-        OverlayCommand::Info(args) => info(args),
+        OverlayCommand::Info(args) => info(args).map(|output| (output, 0)),
+        OverlayCommand::Fsck {
+            directory,
+            repair,
+            json,
+        } => fsck(directory, *repair, *json),
     }
+}
+
+pub fn fsck(directory: &Path, repair: bool, json: bool) -> Result<(String, i32), String> {
+    let report = ratarmount_compositing::overlay_fsck::fsck(directory, repair)
+        .map_err(|e| format!("fsck {}: {e}", directory.display()))?;
+    let code = i32::from(!report.is_clean());
+    let mut fields = serde_json::to_value(&report).expect("fsck report");
+    fields["result"] = report.result().into();
+    let output = if json {
+        fields.to_string()
+    } else {
+        fields
+            .as_object()
+            .expect("fsck fields")
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{key}: {}",
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Ok((output, code))
 }
 
 pub fn info(args: &InfoArgs) -> Result<String, String> {
@@ -169,7 +210,9 @@ mod tests {
         let parsed =
             crate::parse_args_from(["ratarmount", "overlay", "info", "DIR", "--json"]).unwrap();
         assert!(parsed.paths.is_empty());
-        let OverlayCommand::Info(args) = parsed.overlay.unwrap().command;
+        let OverlayCommand::Info(args) = parsed.overlay.unwrap().command else {
+            panic!("expected info")
+        };
         assert_eq!(args.directory, Path::new("DIR"));
         assert!(args.json);
         assert!(crate::parse_args_from(["ratarmount", "overlay", "info"]).is_err());

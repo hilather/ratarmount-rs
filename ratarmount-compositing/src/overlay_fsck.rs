@@ -1,0 +1,626 @@
+//! Offline consistency checking and confined repair of overlay bookkeeping.
+
+use std::collections::{BTreeMap, HashSet};
+use std::io;
+use std::os::fd::OwnedFd;
+use std::path::Path;
+
+use rusqlite::{params, Connection, OpenFlags};
+use rustix::fs::{self, AtFlags, Dir, Mode, OFlags, Stat};
+use serde::Serialize;
+
+use crate::{is_overlay_internal_path, OverlayError, OverlayMeta, HIDDEN_DB};
+
+/// Counts describe the initial check; `repaired` counts resolved findings, not
+/// SQL statements. A clean second check has all six category counts at zero.
+#[derive(Debug, Default, Serialize)]
+pub struct FsckReport {
+    pub missing_content: usize,
+    pub orphan_content: usize,
+    pub tombstone_content: usize,
+    pub type_mismatch: usize,
+    pub invalid_path: usize,
+    pub missing_parent: usize,
+    pub repaired: usize,
+}
+
+impl FsckReport {
+    pub fn errors(&self) -> usize {
+        self.missing_content
+            + self.orphan_content
+            + self.tombstone_content
+            + self.type_mismatch
+            + self.invalid_path
+            + self.missing_parent
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.errors() == self.repaired
+    }
+
+    pub fn result(&self) -> String {
+        if !self.is_clean() {
+            format!("errors:{}", self.errors() - self.repaired)
+        } else if self.repaired > 0 {
+            format!("repaired:{}", self.repaired)
+        } else {
+            "ok".into()
+        }
+    }
+}
+
+struct Row {
+    parent: String,
+    name: String,
+    mode: Option<u32>,
+    deleted: bool,
+    metadata_only: bool,
+}
+
+// `files.path` is a mount-root parent: "" at root, "/a/b" below it.
+// The leading slash is part of the existing schema, never a host absolute path.
+fn relative_path(parent: &str, name: &str, metadata_only: bool) -> Option<String> {
+    fn component(s: &str) -> bool {
+        !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\0'])
+    }
+    if parent.is_empty() && name.is_empty() && metadata_only {
+        return Some(String::new()); // chmod/utime on the overlay root
+    }
+    if !component(name) {
+        return None;
+    }
+    let path = if parent.is_empty() {
+        name.to_owned()
+    } else {
+        let parent = parent.strip_prefix('/')?;
+        if !parent.split('/').all(component) {
+            return None;
+        }
+        format!("{parent}/{name}")
+    };
+    (!internal(&path)).then_some(path)
+}
+
+fn internal(path: &str) -> bool {
+    is_overlay_internal_path(path)
+        || path.split('/').any(|part| {
+            part.eq_ignore_ascii_case(".ratarmount-sealed")
+                || part.to_ascii_lowercase().starts_with(".ratarmount-spool-")
+        })
+}
+
+fn directory_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+fn file_type(stat: &Stat) -> u32 {
+    // mode_t is u16 on macOS and u32 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let mode = stat.st_mode as u32;
+    mode & 0o170000
+}
+
+fn open_directory(root: &OwnedFd, path: &str) -> io::Result<OwnedFd> {
+    let mut fd = fs::openat(root, ".", directory_flags(), Mode::empty())?;
+    if !path.is_empty() {
+        for part in path.split('/') {
+            fd = fs::openat(&fd, part, directory_flags(), Mode::empty())?;
+        }
+    }
+    Ok(fd)
+}
+
+fn walk(fd: &OwnedFd, parent: &str, hosts: &mut BTreeMap<String, Stat>) -> io::Result<()> {
+    for entry in Dir::read_from(fd)? {
+        let entry = entry?;
+        let name = entry.file_name().to_str().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overlay contains a non-UTF-8 name",
+            )
+        })?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        let path = if parent.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{parent}/{name}")
+        };
+        if internal(&path) {
+            continue;
+        }
+        let stat = fs::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child = fs::openat(fd, name, directory_flags(), Mode::empty())?;
+            walk(&child, &path, hosts)?;
+        }
+        hosts.insert(path, stat);
+    }
+    Ok(())
+}
+
+fn split(path: &str) -> (&str, &str) {
+    path.rsplit_once('/').unwrap_or(("", path))
+}
+
+fn store_host(conn: &Connection, path: &str, stat: &Stat) -> io::Result<()> {
+    let (parent, name) = split(path);
+    let parent = if parent.is_empty() {
+        String::new()
+    } else {
+        format!("/{parent}")
+    };
+    conn.execute(
+        "INSERT INTO files(path,name,mode,mtime,uid,gid,deleted) VALUES (?1,?2,?3,?4,?5,?6,0)
+         ON CONFLICT(path,name) DO UPDATE SET mode=excluded.mode,mtime=excluded.mtime,
+         uid=excluded.uid,gid=excluded.gid,deleted=0",
+        params![
+            parent,
+            name,
+            stat.st_mode,
+            stat.st_mtime as f64 + stat.st_mtime_nsec as f64 / 1e9,
+            stat.st_uid,
+            stat.st_gid
+        ],
+    )
+    .map_err(io::Error::other)?;
+    Ok(())
+}
+
+fn overlay_error(error: OverlayError) -> io::Error {
+    if error.is_locked() {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "overlay is in use (database locked)",
+        )
+    } else {
+        io::Error::other(error)
+    }
+}
+
+/// Check with one directory walk and one `files` scan. Repair holds a SQLite
+/// exclusive transaction throughout; host removals use no-follow parent FDs.
+/// Sealed overlays are checked read-only, without updating their metadata.
+/// A missing/unreadable database is an error and is never created.
+pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
+    let meta = OverlayMeta::read(dir).map_err(overlay_error)?;
+    let sealed = meta.as_ref().is_some_and(OverlayMeta::layer_sealed);
+    if repair && sealed {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "overlay is sealed; fsck --repair is refused",
+        ));
+    }
+    let root = fs::open(dir, directory_flags(), Mode::empty())?;
+    let flags = if sealed {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    };
+    let conn =
+        Connection::open_with_flags(dir.join(HIDDEN_DB), flags | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+            .map_err(io::Error::other)?;
+    conn.busy_timeout(std::time::Duration::ZERO)
+        .map_err(io::Error::other)?;
+    conn.execute_batch(if sealed { "BEGIN" } else { "BEGIN EXCLUSIVE" })
+        .map_err(|e| overlay_error(e.into()))?;
+    // Recheck after acquiring the transaction: a seal may have won the race.
+    if !sealed
+        && OverlayMeta::from_connection(&conn)
+            .map_err(overlay_error)?
+            .as_ref()
+            .is_some_and(OverlayMeta::layer_sealed)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "overlay was sealed while fsck started; retry read-only",
+        ));
+    }
+    let has_metadata: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='overlay_metadata')", [], |r| r.get(0),
+    ).map_err(io::Error::other)?;
+    // chmod/utime rows can intentionally refer to inherited content. Preserve
+    // them without requiring the base (including a metadata row for '/').
+    let sql = if has_metadata {
+        "SELECT f.path,f.name,f.mode,f.deleted,EXISTS(SELECT 1 FROM overlay_metadata m WHERE m.path=f.path || '/' || f.name) FROM files f"
+    } else {
+        "SELECT path,name,mode,deleted,0 FROM files"
+    };
+    let rows = conn
+        .prepare(sql)
+        .map_err(io::Error::other)?
+        .query_map([], |r| {
+            Ok(Row {
+                parent: r.get(0)?,
+                name: r.get(1)?,
+                mode: r.get(2)?,
+                deleted: r.get::<_, Option<bool>>(3)?.unwrap_or(false),
+                metadata_only: r.get(4)?,
+            })
+        })
+        .map_err(io::Error::other)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(io::Error::other)?;
+    let mut hosts = BTreeMap::new();
+    walk(&root, "", &mut hosts)?;
+    let mut report = FsckReport::default();
+    let mut valid = BTreeMap::new();
+    for row in &rows {
+        if let Some(path) = relative_path(&row.parent, &row.name, row.metadata_only) {
+            valid.insert(path, row);
+        } else {
+            report.invalid_path += 1;
+            if repair {
+                conn.execute(
+                    "DELETE FROM files WHERE path=?1 AND name=?2",
+                    params![row.parent, row.name],
+                )
+                .map_err(io::Error::other)?;
+            }
+        }
+    }
+    let tombstones: HashSet<&str> = valid
+        .iter()
+        .filter(|(_, row)| row.deleted)
+        .map(|(p, _)| p.as_str())
+        .collect();
+    let hidden = |path: &str| {
+        let mut p = path;
+        loop {
+            if tombstones.contains(p) {
+                return true;
+            }
+            let Some((parent, _)) = p.rsplit_once('/') else {
+                return false;
+            };
+            p = parent;
+        }
+    };
+    for (path, row) in &valid {
+        if path.is_empty() {
+            continue;
+        }
+        let host = hosts.get(path);
+        if row.deleted {
+            if host.is_some() {
+                report.tombstone_content += 1;
+            }
+        } else if host.is_none() || hidden(path) {
+            if !row.metadata_only || hidden(path) {
+                report.missing_content += 1;
+                if repair {
+                    conn.execute(
+                        "DELETE FROM files WHERE path=?1 AND name=?2",
+                        params![row.parent, row.name],
+                    )
+                    .map_err(io::Error::other)?;
+                }
+            }
+        } else if row.mode.map(|m| m & 0o170000) != host.map(file_type) {
+            report.type_mismatch += 1;
+            if repair {
+                store_host(&conn, path, host.expect("host checked"))?;
+            }
+        }
+        let parent = split(path).0;
+        if !parent.is_empty()
+            && !hidden(parent)
+            && !row.metadata_only
+            && !hosts
+                .get(parent)
+                .is_some_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR)
+        {
+            report.missing_parent += 1;
+            if repair && row.deleted {
+                let mut fd = open_directory(&root, "")?;
+                let mut prefix = String::new();
+                for part in parent.split('/') {
+                    if !prefix.is_empty() {
+                        prefix.push('/');
+                    }
+                    prefix.push_str(part);
+                    match fs::mkdirat(&fd, part, Mode::from_raw_mode(0o755)) {
+                        Ok(()) => {
+                            let stat = fs::statat(&fd, part, AtFlags::SYMLINK_NOFOLLOW)?;
+                            store_host(&conn, &prefix, &stat)?;
+                        }
+                        Err(rustix::io::Errno::EXIST) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    fd = fs::openat(&fd, part, directory_flags(), Mode::empty())?;
+                }
+            }
+        }
+    }
+    for (path, stat) in &hosts {
+        if !valid.contains_key(path) && !hidden(path) {
+            report.orphan_content += 1;
+            if repair {
+                store_host(&conn, path, stat)?;
+            }
+        }
+    }
+    if repair {
+        // Reverse lexical order puts descendants before their parents. Never
+        // join a DB path to a host path or follow a symlink during removal.
+        for (path, stat) in hosts.iter().rev().filter(|(path, _)| hidden(path)) {
+            let (parent, name) = split(path);
+            let fd = open_directory(&root, parent)?;
+            let flags = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                AtFlags::REMOVEDIR
+            } else {
+                AtFlags::empty()
+            };
+            fs::unlinkat(&fd, name, flags)?;
+        }
+        report.repaired = report.errors();
+    }
+    if !sealed {
+        conn.execute_batch(crate::overlay_meta::META_SCHEMA)
+            .map_err(io::Error::other)?;
+        OverlayMeta::set_many(
+            &conn,
+            &[
+                ("fsck_at", &chrono::Utc::now().to_rfc3339()),
+                ("fsck_result", &report.result()),
+            ],
+        )
+        .map_err(overlay_error)?;
+    }
+    conn.execute_batch("COMMIT").map_err(io::Error::other)?;
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FolderMountSource, OverlayMetadata, WriteOverlay};
+    use std::fs as host;
+    use std::sync::Arc;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<FolderMountSource>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        host::create_dir(&base).unwrap();
+        let source = Arc::new(FolderMountSource::new(&base).unwrap());
+        let overlay = tmp.path().join("overlay");
+        drop(WriteOverlay::new(source.clone(), &overlay).unwrap());
+        (tmp, overlay, source)
+    }
+
+    fn db(dir: &Path) -> Connection {
+        Connection::open(dir.join(HIDDEN_DB)).unwrap()
+    }
+
+    /// Regression: killed writers leave host-only files, stale rows, and tombstone content.
+    #[test]
+    fn regression_fsck_killed_writer_reports_and_repairs_each_category() {
+        let (_tmp, dir, _source) = fixture();
+        let conn = db(&dir);
+        conn.execute_batch(
+            "INSERT INTO files(path,name,mode,deleted) VALUES
+            ('','missing',33188,0), ('','deleted',NULL,1),
+            ('','wrong-type',16877,0), ('/..','escape',33188,0);",
+        )
+        .unwrap();
+        drop(conn);
+        // Crash after publishing the host file, before pending_rows reaches SQLite.
+        host::write(dir.join("orphan"), b"killed writer").unwrap();
+        host::write(dir.join("deleted"), b"must go").unwrap();
+        host::write(dir.join("wrong-type"), b"file, not directory").unwrap();
+        let report = fsck(&dir, false).unwrap();
+        assert_eq!(
+            (
+                report.missing_content,
+                report.orphan_content,
+                report.tombstone_content,
+                report.type_mismatch,
+                report.invalid_path,
+                report.missing_parent
+            ),
+            (1, 1, 1, 1, 1, 0)
+        );
+        assert_eq!(report.result(), "errors:5");
+        assert_eq!(
+            OverlayMeta::read(&dir).unwrap().unwrap().get("fsck_result"),
+            Some("errors:5")
+        );
+        let report = fsck(&dir, true).unwrap();
+        assert!(report.is_clean());
+        assert_eq!(report.result(), "repaired:5");
+        assert!(!dir.join("deleted").exists());
+        let stat = host::symlink_metadata(dir.join("orphan")).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let stored: (u32, f64, u32, u32) = db(&dir)
+            .query_row(
+                "SELECT mode,mtime,uid,gid FROM files WHERE name='orphan'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, stat.mode());
+        assert!(
+            (stored.1 - (stat.mtime() as f64 + stat.mtime_nsec() as f64 / 1e9)).abs() < 0.000001
+        );
+        assert_eq!((stored.2, stored.3), (stat.uid(), stat.gid()));
+        assert_eq!(fsck(&dir, false).unwrap().errors(), 0);
+    }
+
+    /// Regression: repair must refuse mounted and sealed overlays; checks cannot alter seals.
+    #[test]
+    fn regression_fsck_locked_or_sealed_overlay_is_not_repaired() {
+        let (_tmp, dir, source) = fixture();
+        let mounted = WriteOverlay::new(source.clone(), &dir).unwrap();
+        assert_eq!(
+            fsck(&dir, true).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            fsck(&dir, false).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(mounted);
+        OverlayMeta::set(&db(&dir), "sealed_at", "2026-10-17T00:00:00Z").unwrap();
+        host::write(dir.join(".ratarmount-sealed"), b"digest").unwrap();
+        let before = host::read(dir.join(HIDDEN_DB)).unwrap();
+        assert!(WriteOverlay::new(source, &dir)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("sealed"));
+        assert_eq!(
+            fsck(&dir, true).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(fsck(&dir, false).unwrap().is_clean());
+        assert_eq!(host::read(dir.join(HIDDEN_DB)).unwrap(), before);
+        assert!(OverlayMeta::read(&dir)
+            .unwrap()
+            .unwrap()
+            .get("fsck_at")
+            .is_none());
+    }
+
+    /// Regression: malformed rows and symlink parents must never delete outside the overlay.
+    #[test]
+    fn regression_fsck_traversal_and_symlink_never_remove_external_content() {
+        let (tmp, dir, _source) = fixture();
+        let outside = tmp.path().join("outside");
+        host::create_dir(&outside).unwrap();
+        host::write(outside.join("keep"), b"safe").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+        let conn = db(&dir);
+        for (parent, name) in [
+            ("/..", "outside"),
+            ("//absolute", "x"),
+            ("", "/absolute"),
+            ("/a//b", "x"),
+            ("", ""),
+            ("", "nul\0name"),
+            ("/a/./b", "x"),
+            ("", "../outside"),
+        ] {
+            conn.execute(
+                "INSERT INTO files(path,name,deleted) VALUES (?1,?2,1)",
+                params![parent, name],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO files(path,name,deleted) VALUES ('','link',1),('/link','keep',0)",
+        )
+        .unwrap();
+        drop(conn);
+        let report = fsck(&dir, true).unwrap();
+        assert_eq!(report.invalid_path, 8);
+        assert_eq!(host::read(outside.join("keep")).unwrap(), b"safe");
+        assert!(host::symlink_metadata(dir.join("link")).is_err());
+        assert!(fsck(&dir, false).unwrap().is_clean());
+    }
+
+    /// Regression: a tombstone below a live symlink must not unlink its external target.
+    #[test]
+    fn regression_fsck_tombstone_below_symlink_fails_closed() {
+        let (tmp, dir, _source) = fixture();
+        let outside = tmp.path().join("outside");
+        host::create_dir(&outside).unwrap();
+        host::write(outside.join("keep"), b"safe").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+        db(&dir)
+            .execute_batch("INSERT INTO files(path,name,deleted) VALUES ('/link','keep',1)")
+            .unwrap();
+        assert_eq!(fsck(&dir, false).unwrap().missing_parent, 1);
+        assert!(fsck(&dir, true).is_err());
+        assert_eq!(host::read(outside.join("keep")).unwrap(), b"safe");
+        assert!(host::symlink_metadata(dir.join("link"))
+            .unwrap()
+            .is_symlink());
+    }
+
+    /// Regression: tombstoned directories leave descendants and missing parents inconsistent.
+    #[test]
+    fn regression_fsck_nested_tombstones_and_missing_parents() {
+        let (_tmp, dir, _source) = fixture();
+        host::create_dir_all(dir.join("gone/sub")).unwrap();
+        host::write(dir.join("gone/sub/file"), b"old").unwrap();
+        db(&dir)
+            .execute_batch(
+                "INSERT INTO files(path,name,mode,deleted) VALUES
+            ('','gone',NULL,1), ('/gone/sub','file',33188,0),
+            ('/missing','child',33188,0), ('/deleted-parent','child',NULL,1);",
+            )
+            .unwrap();
+        let report = fsck(&dir, true).unwrap();
+        assert_eq!(report.missing_parent, 2);
+        assert!(!dir.join("gone").exists());
+        assert!(dir.join("deleted-parent").is_dir());
+        assert!(fsck(&dir, false).unwrap().is_clean());
+    }
+
+    /// Regression: inherited chmod rows and internal staging files are not orphan payloads.
+    #[test]
+    fn regression_fsck_metadata_only_and_internal_names_are_preserved() {
+        let (tmp, dir, source) = fixture();
+        host::create_dir(tmp.path().join("base/sub")).unwrap();
+        host::write(tmp.path().join("base/sub/file"), b"base").unwrap();
+        let overlay = WriteOverlay::new(source, &dir).unwrap();
+        for path in ["/", "/sub/file"] {
+            overlay
+                .set_metadata(
+                    path,
+                    &OverlayMetadata {
+                        mode: Some(0o700),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        drop(overlay);
+        for name in [
+            ".ratarmount.overlay.cow-1",
+            ".ratarmount-spool-1",
+            ".ratarmount-sealed",
+        ] {
+            host::write(dir.join(name), b"internal").unwrap();
+        }
+        assert_eq!(fsck(&dir, true).unwrap().errors(), 0);
+        assert_eq!(
+            db(&dir)
+                .query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    /// Regression: 10k recovered files must not require a directory walk for every row.
+    #[test]
+    fn regression_fsck_ten_thousand_rows_single_scan() {
+        let (_tmp, dir, _source) = fixture();
+        for i in 0..10_000 {
+            host::write(dir.join(format!("file-{i}")), []).unwrap();
+        }
+        let start = std::time::Instant::now();
+        assert_eq!(fsck(&dir, true).unwrap().repaired, 10_000);
+        assert!(fsck(&dir, false).unwrap().is_clean());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(15),
+            "fsck took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Regression: checking a missing directory/database must not create an overlay.
+    #[test]
+    fn regression_fsck_missing_database_is_not_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        for repair in [false, true] {
+            assert!(fsck(tmp.path(), repair).is_err());
+        }
+        assert!(!tmp.path().join(HIDDEN_DB).exists());
+    }
+}

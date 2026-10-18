@@ -4919,6 +4919,7 @@ dependencies = [
  "ratarmount-index",
  "regex",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",

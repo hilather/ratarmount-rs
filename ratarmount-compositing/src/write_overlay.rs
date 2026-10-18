@@ -1093,6 +1093,14 @@ impl WriteOverlay {
             conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
             let transaction = conn.transaction()?;
             transaction.execute_batch(SCHEMA)?;
+            if crate::OverlayMeta::from_connection(&transaction)?
+                .as_ref()
+                .is_some_and(crate::OverlayMeta::layer_sealed)
+            {
+                return Err(OverlayError::Msg(
+                    "overlay is sealed; mount it with --lower, or `overlay unseal`".into(),
+                ));
+            }
             crate::overlay_meta::initialize(&transaction, had_files, info, &root)?;
             let tombstones = tombstone_set_from_conn(&transaction)?;
             transaction.commit()?;

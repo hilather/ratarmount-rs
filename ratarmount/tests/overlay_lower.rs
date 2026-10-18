@@ -1,0 +1,196 @@
+//! Regression: layered mount startup and offline fsck, without /dev/fuse.
+
+use ratarmount_compositing::{
+    stack_digest, FolderMountSource, OverlayMeta, WriteOverlay, HIDDEN_DB,
+};
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
+use std::sync::Arc;
+
+fn open(base: &Path, top: Option<&Path>, lowers: &[&Path], flags: &[&str]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    cmd.args(["--no-mount", "--index-file", ":memory:"]);
+    if let Some(top) = top {
+        cmd.arg("-w").arg(top);
+    }
+    for lower in lowers {
+        cmd.arg("--lower").arg(lower);
+    }
+    cmd.args(flags).arg(base).output().unwrap()
+}
+
+fn success(out: Output) {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn seal(dir: &Path, digest: &str) {
+    let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+    OverlayMeta::set_many(
+        &conn,
+        &[
+            ("sealed_at", "2026-10-17T00:00:00Z"),
+            ("layer_digest", digest),
+        ],
+    )
+    .unwrap();
+}
+
+/// Regression: top creation lost ordered lower digests, and remount accepted another stack.
+#[test]
+fn regression_lower_cli_records_stack_and_refuses_mismatch_unless_forced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+    for (dir, digest) in [(&first, "sha256:first"), (&second, "sha256:second")] {
+        success(open(&base, Some(dir), &[], &[]));
+        seal(dir, digest);
+    }
+    let top = tmp.path().join("top");
+    success(open(&base, Some(&top), &[&first, &second], &[]));
+    let meta = OverlayMeta::read(&top).unwrap().unwrap();
+    let lowers = meta.lower_layers().unwrap();
+    assert_eq!(lowers[0].path, first.canonicalize().unwrap());
+    assert_eq!(lowers[1].path, second.canonicalize().unwrap());
+    assert_eq!(lowers[0].layer_digest, "sha256:first");
+    assert_eq!(lowers[0].sealed_at, "2026-10-17T00:00:00Z");
+    assert_eq!(
+        meta.stack_digest(),
+        Some(
+            stack_digest(
+                meta.base_digest().unwrap(),
+                &["sha256:first", "sha256:second"]
+            )
+            .as_str()
+        )
+    );
+    success(open(&base, Some(&top), &[&first, &second], &[]));
+    for given in [
+        vec![first.as_path()],
+        vec![second.as_path(), first.as_path()],
+        vec![],
+    ] {
+        let refused = open(&base, Some(&top), &given, &[]);
+        assert_eq!(refused.status.code(), Some(1));
+        let error = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            error.contains("recorded lower_layers") && error.contains("given --lower"),
+            "{error}"
+        );
+        assert!(
+            error.contains(first.to_str().unwrap()) && error.contains(second.to_str().unwrap())
+        );
+    }
+    seal(&first, "sha256:changed");
+    assert!(!open(&base, Some(&top), &[&first, &second], &[])
+        .status
+        .success());
+    success(open(
+        &base,
+        Some(&top),
+        &[&first, &second],
+        &["--force-stack-mismatch"],
+    ));
+    assert!(OverlayMeta::read(&top)
+        .unwrap()
+        .unwrap()
+        .get("stack_mismatch_forced_at")
+        .is_some());
+    // Forcing does not rewrite the original stack identity.
+    assert_eq!(
+        OverlayMeta::read(&top)
+            .unwrap()
+            .unwrap()
+            .lower_layers()
+            .unwrap(),
+        lowers
+    );
+    success(open(&base, None, &[&first, &second], &[]));
+}
+
+/// Regression: sealed tops could be written using -w or the sandbox preset.
+#[test]
+fn regression_lower_cli_sealed_top_and_unsealed_lower_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let lower = tmp.path().join("lower");
+    success(open(&base, Some(&lower), &[], &[]));
+    let refused = open(&base, None, &[&lower], &[]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("unsealed"));
+    success(open(&base, None, &[&lower], &["--allow-unsealed-lower"]));
+    let top = tmp.path().join("top");
+    success(open(
+        &base,
+        Some(&top),
+        &[&lower],
+        &["--allow-unsealed-lower"],
+    ));
+    let record = OverlayMeta::read(&top)
+        .unwrap()
+        .unwrap()
+        .lower_layers()
+        .unwrap()
+        .remove(0);
+    assert!(record.layer_digest.is_empty() && record.sealed_at.is_empty());
+    seal(&lower, "sha256:sealed");
+    let before = fs::read(lower.join(HIDDEN_DB)).unwrap();
+    for flags in [vec![], vec!["--sandbox"], vec!["--force-stack-mismatch"]] {
+        let refused = open(&base, Some(&lower), &[], &flags);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&refused.stderr)
+            .contains("sealed; mount it with --lower, or `overlay unseal`"));
+    }
+    assert_eq!(fs::read(lower.join(HIDDEN_DB)).unwrap(), before);
+    success(open(&base, None, &[&lower], &[]));
+}
+
+fn fsck(dir: &Path, repair: bool) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    cmd.args(["overlay", "fsck"]).arg(dir).arg("--json");
+    if repair {
+        cmd.arg("--repair");
+    }
+    cmd.output().unwrap()
+}
+
+/// Regression: fsck exit codes distinguish inconsistencies, successful repair, and errors.
+#[test]
+fn regression_lower_fsck_cli_json_exit_codes_and_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let dir = tmp.path().join("overlay");
+    assert_eq!(fsck(&dir, false).status.code(), Some(2));
+    success(open(&base, Some(&dir), &[], &[]));
+    fs::write(dir.join("orphan"), b"crashed writer").unwrap();
+    let output = fsck(&dir, false);
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["orphan_content"], 1);
+    assert_eq!(json["result"], "errors:1");
+    let human = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["overlay", "fsck"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("orphan_content: 1") && text.contains("result: errors:1"));
+    success(fsck(&dir, true));
+    success(fsck(&dir, false));
+    let mounted = WriteOverlay::new(Arc::new(FolderMountSource::new(base).unwrap()), &dir).unwrap();
+    let busy = fsck(&dir, true);
+    assert_eq!(busy.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&busy.stderr).contains("in use"));
+    drop(mounted);
+    seal(&dir, "sha256:sealed");
+    assert_eq!(fsck(&dir, true).status.code(), Some(2));
+    success(fsck(&dir, false));
+}

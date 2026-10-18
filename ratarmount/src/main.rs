@@ -493,6 +493,18 @@ struct Args {
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
 
+    /// Read-only overlay layer (repeatable, bottom to top).
+    #[arg(long, value_name = "DIR", action = ArgAction::Append)]
+    lower: Vec<PathBuf>,
+
+    /// Allow unsealed or legacy lower layers (read-only, without immutable SQLite).
+    #[arg(long, requires = "lower")]
+    allow_unsealed_lower: bool,
+
+    /// Allow a different lower stack for an existing top and record the override.
+    #[arg(long, requires = "overlay_target")]
+    force_stack_mismatch: bool,
+
     /// Trust a known sha256:<hex> base digest, or skip hashing with none (warns).
     #[arg(
         long,
@@ -834,6 +846,16 @@ where
                 "--roll-every requires an untransformed archive series without find, --bind, --prefix or recursion"));
         }
         args.commit_overlay_on_exit = true;
+    }
+    if !args.lower.is_empty()
+        && (args.commit_overlay
+            || args.commit_overlay_on_exit
+            || args.commit_overlay_interval != "0")
+    {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "commit of a layered stack is not supported; flatten first",
+        ));
     }
     expand_sandbox(&mut args, caller_ids())
         .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
@@ -1197,6 +1219,117 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
     None
 }
 
+struct MountLowerStack {
+    layers: Vec<(PathBuf, ratarmount_compositing::Immutability)>,
+    records: Vec<ratarmount_compositing::LowerLayerRecord>,
+}
+
+impl MountLowerStack {
+    fn read(paths: &[PathBuf], allow_unsealed: bool) -> Result<Self, String> {
+        use ratarmount_compositing::{Immutability, LowerLayerRecord, OverlayMeta};
+        let mut stack = Self {
+            layers: Vec::new(),
+            records: Vec::new(),
+        };
+        for path in paths {
+            let path = path
+                .canonicalize()
+                .map_err(|e| format!("lower {}: {e}", path.display()))?;
+            let meta = OverlayMeta::read(&path).map_err(|e| overlay_open_error(&path, &e))?;
+            let sealed = meta.as_ref().is_some_and(OverlayMeta::layer_sealed);
+            if !sealed && !allow_unsealed {
+                return Err(format!(
+                    "lower {} is unsealed; pass --allow-unsealed-lower to use it",
+                    path.display()
+                ));
+            }
+            stack.records.push(LowerLayerRecord {
+                path: path.clone(),
+                layer_digest: meta
+                    .as_ref()
+                    .and_then(|m| m.get("layer_digest"))
+                    .unwrap_or("")
+                    .into(),
+                sealed_at: meta
+                    .as_ref()
+                    .and_then(|m| m.get("sealed_at"))
+                    .unwrap_or("")
+                    .into(),
+            });
+            stack.layers.push((
+                path,
+                if sealed {
+                    Immutability::Immutable
+                } else {
+                    Immutability::Shared
+                },
+            ));
+        }
+        Ok(stack)
+    }
+
+    fn check_top(&self, dir: &Path, force: bool) -> Result<(), String> {
+        use ratarmount_compositing::OverlayMeta;
+        match std::fs::symlink_metadata(dir.join(HIDDEN_DB)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+            Ok(_) => {}
+        }
+        let meta = OverlayMeta::read(dir).map_err(|e| overlay_open_error(dir, &e))?;
+        if meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
+            return Err(format!(
+                "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
+                dir.display()
+            ));
+        }
+        let recorded = meta
+            .as_ref()
+            .map(OverlayMeta::lower_layers)
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let same = recorded.len() == self.records.len()
+            && recorded.iter().zip(&self.records).all(|(a, b)| {
+                std::path::absolute(&a.path).is_ok_and(|path| path == b.path)
+                    && a.layer_digest == b.layer_digest
+            });
+        if same {
+            return Ok(());
+        }
+        if !force {
+            return Err(format!("overlay {} stack mismatch: recorded lower_layers {}; given --lower {}; pass --force-stack-mismatch to override",
+                dir.display(), serde_json::to_string(&recorded).expect("lower records"),
+                serde_json::to_string(&self.records).expect("lower records")));
+        }
+        let mut conn = rusqlite::Connection::open_with_flags(
+            dir.join(HIDDEN_DB),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .map_err(|e| e.to_string())?;
+        conn.busy_timeout(Duration::ZERO)
+            .map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+            .map_err(|e| e.to_string())?;
+        if OverlayMeta::from_connection(&tx)
+            .map_err(|e| e.to_string())?
+            .as_ref()
+            .is_some_and(OverlayMeta::layer_sealed)
+        {
+            return Err("overlay is sealed; mount it with --lower, or `overlay unseal`".into());
+        }
+        tx.execute_batch(ratarmount_compositing::overlay_meta::META_SCHEMA)
+            .map_err(|e| e.to_string())?;
+        let timestamp: String = tx
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        OverlayMeta::set(&tx, "stack_mismatch_forced_at", &timestamp).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+}
+
 fn main() {
     // #93: a desktop launcher can hand us a pipe with no reader as
     // stdout/stderr. println!/eprintln! panic on EPIPE (exit 101) before the
@@ -1251,10 +1384,21 @@ fn main() {
 
     if let Some(overlay) = &args.overlay {
         match overlay_cmd::run(overlay) {
-            Ok(output) => println!("{}", output.trim_end()),
+            Ok((output, code)) => {
+                println!("{}", output.trim_end());
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
             Err(error) => {
                 eprintln!("{error}");
-                std::process::exit(1);
+                std::process::exit(
+                    if matches!(overlay.command, overlay_cmd::OverlayCommand::Fsck { .. }) {
+                        2
+                    } else {
+                        1
+                    },
+                );
             }
         }
         return;
@@ -1832,6 +1976,17 @@ fn main() {
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
+    let lower_stack =
+        MountLowerStack::read(&args.lower, args.allow_unsealed_lower).unwrap_or_else(|error| {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        });
+    bundle.source = ratarmount_compositing::compose_stack(bundle.source, &lower_stack.layers)
+        .unwrap_or_else(|error| {
+            eprintln!("error opening lower stack: {error}");
+            std::process::exit(1);
+        });
+
     if let Some(w) = &args.write_overlay {
         let overlay_path = if w.as_os_str() == ":temp:" {
             let td = if args.overlay_tmpfs.is_some() {
@@ -1850,10 +2005,17 @@ fn main() {
         } else {
             w.clone()
         };
+        lower_stack
+            .check_top(&overlay_path, args.force_stack_mismatch)
+            .unwrap_or_else(|error| {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            });
         let mut create_info = ratarmount_compositing::OverlayCreateInfo {
             base_url: overlay_base_url,
             base_digest: args.base_digest.clone().unwrap_or_default(),
             force_base_mismatch: args.force_base_mismatch,
+            lower_layers: lower_stack.records.clone(),
             index_path: (!open_opts.read_only_index)
                 .then(|| index_sidecar.clone())
                 .flatten(),
@@ -7338,5 +7500,108 @@ mod torrent_policy_tests {
         let (inputs, mount) = split_inputs_mountpoint(&paths, false);
         assert_eq!(inputs, vec![PathBuf::from("source.tar")]);
         assert_eq!(mount, Some(mountpoint));
+    }
+}
+
+#[cfg(test)]
+mod lower_stack_tests {
+    use super::*;
+    use ratarmount_compositing::{FolderMountSource, Immutability, OverlayMeta};
+
+    /// Regression: --lower consumes exactly one value and never steals base/mount positionals.
+    #[test]
+    fn regression_lower_flags_keep_positionals_and_optional_top() {
+        let args = parse_args_from([
+            "ratarmount",
+            "--lower",
+            "first",
+            "--lower",
+            "second",
+            "base.tar",
+            "mnt",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.lower,
+            [PathBuf::from("first"), PathBuf::from("second")]
+        );
+        assert_eq!(
+            args.paths,
+            [PathBuf::from("base.tar"), PathBuf::from("mnt")]
+        );
+        assert!(args.write_overlay.is_none());
+        for flag in ["--overlay-tmpfs", "--sandbox"] {
+            let args = parse_args_from(["ratarmount", flag, "--lower", "first", "base.tar", "mnt"])
+                .unwrap();
+            assert!(args.overlay_tmpfs.is_some());
+        }
+        assert!(
+            parse_args_from(["ratarmount", "--allow-unsealed-lower", "base.tar", "mnt"]).is_err()
+        );
+    }
+
+    /// Regression: layered offline/live/interval/rolling commits could overwrite the base.
+    #[test]
+    fn regression_lower_stack_commit_is_refused() {
+        for extra in [
+            vec!["--commit-overlay"],
+            vec!["--commit-overlay-on-exit"],
+            vec!["--commit-overlay-interval", "2s"],
+            vec!["--roll-every", "1h"],
+        ] {
+            let mut argv = vec!["ratarmount", "-w", "top", "--lower", "prepared"];
+            argv.extend(extra);
+            argv.extend(["base.tar", "mnt"]);
+            let error = parse_args_from(argv).unwrap_err().to_string();
+            assert!(
+                error.contains("commit of a layered stack is not supported; flatten first"),
+                "{error}"
+            );
+        }
+    }
+
+    /// Regression: overlay fsck DIR was mistaken for ordinary archive/mount positionals.
+    #[test]
+    fn regression_lower_fsck_dispatch_keeps_directory() {
+        let args = parse_args_from(["ratarmount", "overlay", "fsck", "DIR", "--repair", "--json"])
+            .unwrap();
+        assert!(args.paths.is_empty());
+        assert!(
+            matches!(args.overlay.unwrap().command, overlay_cmd::OverlayCommand::Fsck { directory, repair: true, json: true } if directory == Path::new("DIR"))
+        );
+        assert!(parse_args_from(["ratarmount", "overlay", "fsck"]).is_err());
+        assert!(parse_args_from(["ratarmount", "overlay", "fsck", "a", "b"]).is_err());
+    }
+
+    /// Regression: unsealed/legacy lowers require opt-in, sealed lowers use immutable SQLite.
+    #[test]
+    fn regression_lower_unsealed_and_legacy_require_opt_in() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let dir = root.path().join("lower");
+        drop(WriteOverlay::new(Arc::new(FolderMountSource::new(base).unwrap()), &dir).unwrap());
+        let paths = [dir.clone()];
+        assert!(MountLowerStack::read(&paths, false)
+            .err()
+            .unwrap()
+            .contains("unsealed"));
+        let stack = MountLowerStack::read(&paths, true).unwrap();
+        assert_eq!(stack.layers[0].1, Immutability::Shared);
+        assert!(stack.records[0].layer_digest.is_empty());
+        let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+        conn.execute_batch("DROP TABLE meta").unwrap();
+        drop(conn);
+        assert!(MountLowerStack::read(&paths, false).is_err());
+        assert!(MountLowerStack::read(&paths, true).is_ok());
+        let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+        conn.execute_batch(ratarmount_compositing::overlay_meta::META_SCHEMA)
+            .unwrap();
+        OverlayMeta::set(&conn, "sealed_at", "2026-10-17T00:00:00Z").unwrap();
+        drop(conn);
+        assert_eq!(
+            MountLowerStack::read(&paths, false).unwrap().layers[0].1,
+            Immutability::Immutable
+        );
     }
 }
