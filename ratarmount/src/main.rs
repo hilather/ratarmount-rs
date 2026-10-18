@@ -1313,6 +1313,20 @@ fn lower_base_key(
     Some(format!("{digest}.{view_key}"))
 }
 
+/// The verification marker key for this invocation: `None` unless the mount
+/// serves the base unchanged (see [`mounted_view_is_default`]) and the base has
+/// a computed identity; otherwise the base digest plus [`mounted_view_key`].
+fn lower_key_for(
+    args: &Args,
+    rolling: bool,
+    inputs: &[PathBuf],
+    index: Option<&Path>,
+) -> Option<String> {
+    mounted_view_is_default(args, rolling)
+        .then(|| lower_base_key(inputs, index, &args.lower, &mounted_view_key(args)))
+        .flatten()
+}
+
 /// The options that change which members an archive lists or how their paths
 /// are synthesized (file-version folders, zero-block handling, GNU incremental
 /// stripping, name encoding). They are part of the marker key itself, so a
@@ -2415,16 +2429,7 @@ fn main() {
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
-    let lower_key = mounted_view_is_default(&args, rolling.is_some())
-        .then(|| {
-            lower_base_key(
-                &inputs,
-                index_sidecar.as_deref(),
-                &args.lower,
-                &mounted_view_key(&args),
-            )
-        })
-        .flatten();
+    let lower_key = lower_key_for(&args, rolling.is_some(), &inputs, index_sidecar.as_deref());
     let lower_identity = BaseIdentity::Enforce {
         base: MountedBase {
             extra_excludes: lower_extra_excludes(

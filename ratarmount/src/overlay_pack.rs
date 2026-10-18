@@ -2359,6 +2359,52 @@ mod tests {
         assert_eq!(verify_calls() - before, 4);
     }
 
+    /// Regression (K1 e2e): a bundle verified under `--no-file-versions` left a
+    /// marker that a plain remount trusted, although the plain view lists
+    /// `f.versions/N`. Drives the real key derivation (`lower_key_for`) from
+    /// parsed CLI args into the cache: the plain remount must verify again, and
+    /// each view then hits its own marker.
+    #[test]
+    fn regression_marker_no_file_versions_then_plain_remount_reverifies() {
+        use clap::Parser;
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let cache = f.tmp.path().join("cache");
+        let archive = f.tmp.path().join("a.tar");
+        fs::write(&archive, b"aaaa").unwrap();
+        let index = f.tmp.path().join("a.tar.index.sqlite");
+        rusqlite::Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT);")
+            .unwrap();
+        ratarmount_index::cached_archive_digest(&archive, Some(&index)).unwrap();
+        let mount = |extra: &[&str]| {
+            let mut argv = vec!["ratarmount", "--lower", bundle.to_str().unwrap()];
+            argv.extend_from_slice(extra);
+            argv.push("a.tar");
+            let args = crate::Args::try_parse_from(argv).unwrap();
+            let key =
+                crate::lower_key_for(&args, false, std::slice::from_ref(&archive), Some(&index));
+            assert!(key.is_some());
+            let before = verify_calls();
+            crate::MountLowerStack::open_in(
+                f.base.clone(),
+                key.as_deref(),
+                &args.lower,
+                false,
+                Some(&cache),
+            )
+            .unwrap();
+            verify_calls() - before
+        };
+        assert_eq!(mount(&["--no-file-versions"]), 1, "first use verifies");
+        assert_eq!(mount(&["--no-file-versions"]), 0, "same view hits");
+        assert_eq!(mount(&[]), 1, "plain remount must re-verify");
+        assert_eq!(mount(&[]), 0, "plain view then hits its own marker");
+        let hex = cache_entries(&cache).remove(0);
+        assert_eq!(fs::read_dir(marker_dir(&cache, &hex)).unwrap().count(), 2);
+    }
+
     /// Regression: the entry is named by the bytes of the bundle, and the bytes
     /// that are hashed are the bytes that are extracted even when the original
     /// path is swapped (or modified in place) after the copy.
