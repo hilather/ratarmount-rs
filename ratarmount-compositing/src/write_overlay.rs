@@ -570,7 +570,8 @@ pub enum OverlayMutation {
 /// `check_write` authorizes the prospective extent (including sparse growth),
 /// with the current host file length, not the archive member's size. A truncate
 /// checks `(offset = new_size, len = 0)`. COW reserves the final extent before
-/// copying outside the policy lock; accounting releases unused reservations.
+/// copying outside the policy lock; on Unix the staging file's mode, times, and
+/// file fsync also run outside that lock. Accounting releases unused reservations.
 ///
 /// Accounting counts logical host file lengths, including symlinks and COW
 /// copies, but excludes directories and overlay bookkeeping. Removal releases
@@ -651,6 +652,10 @@ pub struct WriteOverlay {
     account_reset_failure: AtomicBool,
     #[cfg(test)]
     cow_before_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only: taken once and run from `publish_cow_staging` after staging
+    /// metadata and the file fsync, before `persist_noclobber`.
+    #[cfg(test)]
+    cow_before_persist_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     base: Arc<dyn MountSource>,
     rolling: Option<Arc<crate::RollingMountSource>>,
     /// After a live TAR commit, the reopened archive.
@@ -1180,6 +1185,8 @@ impl WriteOverlay {
             account_reset_failure: AtomicBool::new(false),
             #[cfg(test)]
             cow_before_read_hook: Mutex::new(None),
+            #[cfg(test)]
+            cow_before_persist_hook: Mutex::new(None),
             base,
             rolling: None,
             replacement: RwLock::new(None),
@@ -1581,7 +1588,13 @@ impl WriteOverlay {
             drop(dst);
             return Err(cow_length_mismatch(copied, fi.size).into());
         }
-        publish_cow_staging(dst, &real, &metadata_from_info(&fi), |_| Ok(()))?;
+        publish_cow_staging(
+            dst,
+            &real,
+            Some(&metadata_from_info(&fi)),
+            take_cow_before_persist(self),
+            |_| Ok(()),
+        )?;
         Ok(())
     }
 
@@ -1638,7 +1651,8 @@ impl WriteOverlay {
             )
         };
         // Hidden staging keeps other writers from observing a partial copy.
-        // No policy lock is held during archive open/decompression or host I/O.
+        // No policy lock is held during archive open/decompression, host copy,
+        // or (on Unix) staging-fd metadata and the file fsync.
         // `take(limit)` stops a truncate hint early. The read must yield
         // `min(member size, limit)` before publish: a shorter hint copies
         // that prefix, a longer hint still needs the whole member before
@@ -1698,22 +1712,44 @@ impl WriteOverlay {
         // refunds it. Drop of `dst` removes the staging file.
         copied.map_err(OverlayError::Io)?;
         let actual = dst.as_file().metadata()?.len();
-        // Declared after `reservation` so this guard drops first. Drop of the
-        // reservation takes the same lock to refund; returning the parent
-        // fsync error must not deadlock on it.
+        let attrs = metadata_from_info(&fi);
+        // Fd metadata and the file fsync do not publish the final name and do
+        // not change quota counters. They use the open staging descriptor, so
+        // a concurrent path rename cannot retarget them, and they stay outside
+        // the second lock. Path metadata is not applied again on this Unix
+        // path. Settlement, persist, and the parent fsync stay inside the lock
+        // below. `_policy` is declared after `reservation` so it drops first:
+        // Drop of the reservation takes the same lock.
+        #[cfg(unix)]
+        {
+            set_host_metadata_file(dst.as_file(), &attrs)?;
+            dst.as_file().sync_all()?;
+        }
         let _policy = self.policy_lock();
         self.ensure_under_root(&real)?;
-        let attrs = metadata_from_info(&fi);
-        publish_cow_staging(dst, &real, &attrs, |_| {
-            // Settle to the published length. A short read never reaches here.
-            // Zero `bytes` before `file_created` so Drop cannot refund a file
-            // that already exists. `AlreadyExists` skips this closure and Drop
-            // refunds the whole charge.
-            policy.bytes_changed(&path, 0, reservation.bytes - actual);
-            reservation.bytes = 0;
-            policy.file_created(&path);
-            Ok(())
-        })?;
+        // Take the test hook only after ensure succeeds, so a rejected path
+        // leaves the one-shot hook in place. It still runs inside publish,
+        // after this check and before `persist_noclobber`.
+        let before_persist = take_cow_before_persist(self);
+        publish_cow_staging(
+            dst,
+            &real,
+            #[cfg(unix)]
+            None,
+            #[cfg(not(unix))]
+            Some(&attrs),
+            before_persist,
+            |_| {
+                // Settle to the published length. A short read never reaches here.
+                // Zero `bytes` before `file_created` so Drop cannot refund a file
+                // that already exists. `AlreadyExists` and any other persist
+                // error skip this closure and Drop refunds the whole charge.
+                policy.bytes_changed(&path, 0, reservation.bytes - actual);
+                reservation.bytes = 0;
+                policy.file_created(&path);
+                Ok(())
+            },
+        )?;
         Ok(())
     }
 
@@ -4495,6 +4531,27 @@ fn set_host_metadata(path: &Path, attrs: &OverlayMetadata) -> io::Result<()> {
     }
 }
 
+/// Mode and times on an open staging file. No owner or xattr changes.
+/// The descriptor is the inode, so a concurrent path rename cannot retarget it.
+#[cfg(unix)]
+fn set_host_metadata_file(file: &File, attrs: &OverlayMetadata) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if let Some(mode) = attrs.mode {
+        // SAFETY: `fchmod` only changes permission bits on this open file.
+        if unsafe { libc::fchmod(file.as_raw_fd(), (mode & 0o7777) as libc::mode_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if attrs.atime.is_some() || attrs.mtime.is_some() {
+        let times = metadata_times(attrs);
+        // SAFETY: `futimens` writes two timespecs for this open file.
+        if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn file_info_from_overlay_meta(
     path: &str,
     host: &Path,
@@ -5086,6 +5143,11 @@ thread_local! {
     static FAIL_MANIFEST_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(all(test, not(windows)))]
+thread_local! {
+    static FAIL_COW_DIR_FSYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Capture reusable hashes before suffix patching removes their old offset rows.
 fn known_manifest_hashes(archive: &Path) -> Result<BTreeMap<String, String>> {
     let sidecar = ratarmount_index::default_index_path(archive);
@@ -5237,12 +5299,15 @@ fn write_commit_manifest(
     Ok(())
 }
 
+/// Linux and Windows libc spell a missing xattr `ENODATA`. Other targets spell
+/// it `ENOATTR` (absent from the Windows libc). Windows has the constant, not
+/// working xattrs; host metadata stays Unix-only.
 fn missing_xattr_errno() -> i32 {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         libc::ENODATA
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         libc::ENOATTR
     }
@@ -5870,33 +5935,75 @@ fn create_cow_staging(parent: &Path) -> io::Result<tempfile::NamedTempFile> {
         })
 }
 
-/// Metadata, file fsync, and rename onto `real`, then fsync `real`'s parent.
+/// Rename `dst` onto `real`, then fsync `real`'s parent.
+///
+/// `attrs == Some` applies path metadata and fsyncs the staging file first
+/// (no-policy caller, and the non-Unix policy caller). `None` means the Unix
+/// policy path already did that on the staging fd, outside the policy lock.
+/// `before_persist` runs after that metadata and before `persist_noclobber`.
 ///
 /// `after_publish` runs once the final name exists and before the parent
 /// fsync. A parent-fsync error is returned after that, so settlement is not
 /// undone for a file that was already renamed into place. `AlreadyExists`
-/// leaves `real` untouched and does not call `after_publish`. Any error before
-/// the rename drops the temp.
+/// leaves `real` untouched and does not call `after_publish`. Any other
+/// persist error is returned the same way, so `Drop` refunds the reservation.
+/// Any error before the rename drops the temp.
 fn publish_cow_staging(
     dst: tempfile::NamedTempFile,
     real: &Path,
-    attrs: &OverlayMetadata,
+    attrs: Option<&OverlayMetadata>,
+    before_persist: impl FnOnce(),
     after_publish: impl FnOnce(&File) -> Result<()>,
 ) -> Result<()> {
-    set_host_metadata(dst.path(), attrs)?;
-    dst.as_file().sync_all()?;
+    if let Some(attrs) = attrs {
+        set_host_metadata(dst.path(), attrs)?;
+        dst.as_file().sync_all()?;
+    }
+    before_persist();
     match dst.persist_noclobber(real) {
         Ok(published) => {
             after_publish(&published)?;
             // Windows cannot open a directory as a File to fsync it.
             #[cfg(not(windows))]
             if let Some(parent) = real.parent() {
-                File::open(parent)?.sync_all()?;
+                let r = {
+                    #[cfg(test)]
+                    {
+                        if FAIL_COW_DIR_FSYNC.replace(false) {
+                            Err(io::Error::other("injected directory fsync failure"))
+                        } else {
+                            File::open(parent).and_then(|d| d.sync_all())
+                        }
+                    }
+                    #[cfg(not(test))]
+                    {
+                        File::open(parent).and_then(|d| d.sync_all())
+                    }
+                };
+                r?;
             }
             Ok(())
         }
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(e.error.into()),
+    }
+}
+
+fn take_cow_before_persist(overlay: &WriteOverlay) -> impl FnOnce() {
+    #[cfg(test)]
+    let hook = overlay.cow_before_persist_hook.lock().unwrap().take();
+    #[cfg(test)]
+    {
+        move || {
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = overlay;
+        || {}
     }
 }
 
@@ -8763,6 +8870,7 @@ mod tests {
     ///
     /// Symptom: the copy-on-write staging sweep returned the directory error,
     /// so `WriteOverlay::new` failed when a subdirectory was mode 000.
+    #[cfg(unix)]
     #[test]
     fn regression_cow_v3_unreadable_dir_reopen() {
         if unsafe { libc::geteuid() } == 0 {
@@ -8861,6 +8969,70 @@ mod tests {
         );
     }
 
+    /// Regression: a persist error other than `AlreadyExists` refunds the reservation (#126 v3).
+    ///
+    /// Symptom: replacing the parent directory with a regular file makes
+    /// `persist_noclobber` return `ENOTDIR` (`NotADirectory`, not `ENOENT`:
+    /// the path component exists and is not a directory). That must not
+    /// publish `/d/race`, must not run `file_created`, and Drop must refund.
+    #[cfg(unix)]
+    #[test]
+    fn regression_cow_v3_persist_error_refunds() {
+        let (td, ov, policy) =
+            policy_overlay(Arc::new(MemBase::with(&[("/d/race", b"abcdef")])), 64);
+        fs::create_dir(td.path().join("d")).unwrap();
+        let overlay = td.path().to_path_buf();
+        *ov.cow_before_persist_hook.lock().unwrap() = Some(Box::new(move || {
+            let parent = overlay.join("d");
+            fs::rename(&parent, overlay.join("d.held")).unwrap();
+            fs::write(&parent, b"not-a-directory").unwrap();
+        }));
+        let before = policy.usage();
+        let err = match ov.ensure_modifiable("/d/race").unwrap_err() {
+            OverlayError::Io(err) => err,
+            other => panic!("persist error must be io, got {other}"),
+        };
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotADirectory,
+            "non-AlreadyExists persist error must surface, got {err}"
+        );
+        assert_eq!(
+            policy.usage(),
+            before,
+            "persist error must skip file_created and let Drop refund the reservation"
+        );
+        assert!(
+            !td.path().join("d").join("race").exists(),
+            "final name must not be published"
+        );
+    }
+
+    /// Regression: a directory fsync error after publish keeps the charge (#126 v3).
+    ///
+    /// Symptom: ignoring the parent `sync_all` error would report success, and
+    /// refunding after `file_created` would drop a file that is already named.
+    #[cfg(unix)]
+    #[test]
+    fn regression_cow_v3_dir_fsync_error_keeps_charge() {
+        let (td, ov, policy) = policy_overlay(Arc::new(MemBase::with(&[("/m", b"abcdef")])), 64);
+        FAIL_COW_DIR_FSYNC.set(true);
+        let err = match ov.ensure_modifiable("/m").unwrap_err() {
+            OverlayError::Io(err) => err,
+            other => panic!("directory fsync error must be io, got {other}"),
+        };
+        assert!(
+            err.to_string().contains("injected directory fsync failure"),
+            "{err}"
+        );
+        assert_eq!(fs::read(td.path().join("m")).unwrap(), b"abcdef");
+        assert_eq!(
+            policy.usage(),
+            (6, 1),
+            "published file must stay charged after a parent fsync error"
+        );
+    }
+
     /// Regression: read-only opens of an existing host file must not invoke a write policy.
     #[cfg(unix)]
     #[test]
@@ -8929,6 +9101,31 @@ mod tests {
         fn file_removed(&self, _: &str) {
             self.usage.lock().unwrap().1 -= 1;
         }
+    }
+
+    /// Regression: policy-path COW applies the member's mode and mtime on the
+    /// staging fd before publish (#126 v3, Keystone).
+    ///
+    /// Symptom: dropping the fd `fchmod`/`futimens` step on the Unix policy
+    /// path publishes the copy with the umask mode and the current time.
+    #[cfg(unix)]
+    #[test]
+    fn regression_cow_policy_applies_member_mode_and_mtime() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut base = MemBase::with(&[("/m", b"abcdef")]);
+        let info = base.files.get_mut("/m").unwrap();
+        info.mode = ratarmount_core::S_IFREG | 0o751;
+        info.mtime = 1_000_000_000.0;
+        let (td, ov, _policy) = policy_overlay(Arc::new(base), 64);
+        ov.ensure_modifiable("/m").unwrap();
+        let md = fs::symlink_metadata(td.path().join("m")).unwrap();
+        assert_eq!(
+            md.permissions().mode() & 0o7777,
+            0o751,
+            "member mode must be applied"
+        );
+        assert_eq!(md.mtime(), 1_000_000_000, "member mtime must be applied");
+        assert_eq!(fs::read(td.path().join("m")).unwrap(), b"abcdef");
     }
 
     fn policy_overlay(

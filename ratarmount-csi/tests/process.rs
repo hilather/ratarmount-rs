@@ -6,7 +6,9 @@ use ratarmount_csi::{
     Mounter,
 };
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tonic::Status;
 
 #[test]
 fn regression_mountinfo_escaped_target_is_not_a_prefix_match() {
@@ -14,6 +16,48 @@ fn regression_mountinfo_escaped_target_is_not_a_prefix_match() {
     assert!(mountinfo_contains(info, "/pods/a b\\c"));
     assert!(!mountinfo_contains(info, "/pods/a"));
     assert!(!mountinfo_contains(b"1 2 3 4 /pods/\\777", "/pods/x"));
+}
+
+/// Regression: `mount_retrying_spawn` retries one `cannot spawn ratarmount`
+/// Internal error and then returns the later success (`calls == 2`).
+#[tokio::test]
+async fn regression_mount_spawn_retries_once() {
+    struct RetryMounter {
+        calls: AtomicUsize,
+    }
+
+    #[tonic::async_trait]
+    impl Mounter for RetryMounter {
+        async fn mounted(&self, _: &str) -> Result<bool, Status> {
+            Ok(false)
+        }
+        async fn healthy(&self, _: &str) -> Result<bool, Status> {
+            Ok(true)
+        }
+        async fn mount(
+            &self,
+            _: &options::MountSpec,
+            _: BTreeMap<String, String>,
+        ) -> Result<(), Status> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err(Status::internal("cannot spawn ratarmount"))
+            } else {
+                Ok(())
+            }
+        }
+        async fn unmount(&self, _: &str) -> Result<(), Status> {
+            Ok(())
+        }
+    }
+
+    let mounter = RetryMounter {
+        calls: AtomicUsize::new(0),
+    };
+    let spec = options::parse(&common::request("/mnt/vol")).unwrap();
+    let result = common::mount_retrying_spawn(&mounter, &spec, BTreeMap::new()).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(mounter.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

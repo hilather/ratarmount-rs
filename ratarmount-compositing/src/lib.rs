@@ -1,6 +1,8 @@
 //! Compositing layers: folder bind, union, recursive auto-mount, write overlay,
 //! file versions, path prefix, path transform, in-FS control folder, OCI overlayfs,
 //! G-3 payload cache.
+//!
+//! Session's Windows check compiles this crate; `missing_xattr_errno` uses `libc::ENODATA` on Linux and Windows and `libc::ENOATTR` only on other targets.
 
 #[macro_use]
 mod quiet_print;
