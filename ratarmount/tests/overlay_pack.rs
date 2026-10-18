@@ -151,17 +151,14 @@ fn regression_cow_bundle_cli_roundtrip_and_lower_cache() {
             0,
         );
     }
-    let cached = f
-        .cache
-        .join("ratarmount/layers")
-        .join(digest.trim().strip_prefix("sha256:").unwrap());
+    // The entry is named by the SHA-256 of the bundle bytes (not by the
+    // layer digest it claims) and has no stray copy or staging directory.
+    let bundle_hex =
+        ratarmount_index::sha256_hex_stream(&mut fs::File::open(&f.bundle).unwrap()).unwrap();
+    let cached = f.cache.join("ratarmount/layers").join(&bundle_hex);
+    assert_ne!(bundle_hex, digest.trim().strip_prefix("sha256:").unwrap());
     assert_eq!(fs::read(cached.join("payload")).unwrap(), b"bundle bytes\n");
-    assert_eq!(
-        fs::read_dir(f.cache.join("ratarmount/layers"))
-            .unwrap()
-            .count(),
-        1
-    );
+    assert_eq!(layer_entries(&f.cache), vec![bundle_hex]);
     fs::set_permissions(f.overlay.join("payload"), fs::Permissions::from_mode(0o751)).unwrap();
     fs::write(f.overlay.join("payload"), b"tampered payload").unwrap();
     let tampered = f.tmp.path().join("tampered.tar.zst");
@@ -215,6 +212,107 @@ fn regression_cow_bundle_cli_roundtrip_and_lower_cache() {
         2,
     );
     assert!(!refused.exists());
+}
+
+/// Entries of the lower cache that are neither hidden staging nor `.verified`.
+fn layer_entries(cache: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(cache.join("ratarmount/layers"))
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| !n.starts_with('.') && !n.ends_with(".verified"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Re-tar `bundle` with one member's payload replaced; the seal metadata is
+/// untouched, so the bundle is self-consistent but lies about its content.
+fn retar_with(bundle: &Path, out: &Path, member: &str, payload: &[u8]) {
+    use std::io::Read;
+    let body = ratarmount_compress::open_seekable_zstd(bundle).unwrap();
+    let mut archive = tar::Archive::new(body.open_reader().unwrap());
+    let mut builder = tar::Builder::new(Vec::new());
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        let mut header = entry.header().clone();
+        let pax: Vec<(String, Vec<u8>)> = entry
+            .pax_extensions()
+            .unwrap()
+            .map(|exts| {
+                exts.map(|e| {
+                    let e = e.unwrap();
+                    (e.key().unwrap().to_owned(), e.value_bytes().to_vec())
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        if path == member {
+            data = payload.to_vec();
+            header.set_size(data.len() as u64);
+        }
+        if !pax.is_empty() {
+            builder
+                .append_pax_extensions(pax.iter().map(|(k, v)| (k.as_str(), v.as_slice())))
+                .unwrap();
+        }
+        header.set_cksum();
+        builder.append(&header, &data[..]).unwrap();
+    }
+    let bytes = builder.into_inner().unwrap();
+    let mut writer = ratarmount_compress::ZstdFrameWriter::new(fs::File::create(out).unwrap(), 3);
+    writer.write_frame(&bytes[..]).unwrap();
+    writer.finish().unwrap();
+}
+
+/// Regression (Keystone blocker 1): a tampered bundle that claims a valid
+/// `layer_digest` is refused as a `--lower` against the base it is mounted
+/// on, even when the base is not at its recorded path; nothing is cached, and
+/// the genuine bundle still serves afterwards.
+#[test]
+fn regression_cow_evil_lower_bundle_refused_then_good_serves() {
+    let f = Fixture::new();
+    let evil = f.tmp.path().join("evil.tar.zst");
+    retar_with(&f.bundle, &evil, "layer/payload", b"EVIL bytes!\n");
+    let moved = f.tmp.path().join("base-away");
+    fs::rename(&f.base, &moved).unwrap();
+    let output = command(
+        &[Path::new("--no-mount"), Path::new("--lower"), &evil, &moved],
+        &f.cache,
+    );
+    assert_ne!(output.status.code(), Some(0), "evil lower was accepted");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("payload"), "{stderr}");
+    assert!(layer_entries(&f.cache).is_empty());
+    expect(
+        command(
+            &[
+                Path::new("--no-mount"),
+                Path::new("--lower"),
+                &f.bundle,
+                &moved,
+            ],
+            &f.cache,
+        ),
+        0,
+    );
+    let entries = layer_entries(&f.cache);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        fs::read(
+            f.cache
+                .join("ratarmount/layers")
+                .join(&entries[0])
+                .join("payload")
+        )
+        .unwrap(),
+        b"bundle bytes\n"
+    );
 }
 
 #[cfg(target_os = "linux")]

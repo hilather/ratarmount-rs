@@ -1272,6 +1272,38 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
     None
 }
 
+/// Strong identity of the mounted base that may key trusted bundle
+/// verifications, obtained without hashing any content: a supplied
+/// `--base-digest`, or an archive digest already in the index digest cache.
+/// A directory base also folds in its weak manifest, because a supplied digest
+/// is only the caller's claim. `None` (no markers, every use re-verifies) for
+/// everything else. Computed only when a `--lower` bundle needs it.
+fn lower_base_key(
+    supplied: Option<&str>,
+    base: Option<&Path>,
+    index: Option<&Path>,
+    lowers: &[PathBuf],
+) -> Option<String> {
+    let base = base?;
+    if !lowers.iter().any(|p| p.is_file()) {
+        return None;
+    }
+    if base.is_dir() {
+        let weak = ratarmount_compositing::overlay_meta::directory_weak_digest(
+            base,
+            &ratarmount_compositing::overlay_meta::BaseExcludes::default(),
+        )
+        .ok()?;
+        return supplied.map(|strong| format!("{strong}|{weak}"));
+    }
+    if let Some(strong) = supplied {
+        return Some(strong.to_owned());
+    }
+    ratarmount_index::peek_archive_digest(base, index)
+        .ok()
+        .flatten()
+}
+
 struct MountLowerStack {
     layers: Vec<(PathBuf, ratarmount_compositing::Immutability)>,
     records: Vec<ratarmount_compositing::LowerLayerRecord>,
@@ -1285,22 +1317,71 @@ impl MountLowerStack {
         base: Arc<dyn ratarmount_core::MountSource>,
         paths: &[PathBuf],
     ) -> std::io::Result<Arc<dyn ratarmount_core::MountSource>> {
-        let stack = Self::read(paths, false).map_err(std::io::Error::other)?;
-        ratarmount_compositing::compose_stack(base, &stack.layers)
+        Self::open(base, None, paths, false)
+            .map(|(_, view)| view)
+            .map_err(std::io::Error::other)
     }
 
-    fn read(paths: &[PathBuf], allow_unsealed: bool) -> Result<Self, String> {
+    /// Open the lower stack on top of an existing `base`, bottom-up. A bundle
+    /// is verified against the view beneath it (base plus the lowers below)
+    /// before it is cached, so the base must exist first. `base_key` is the
+    /// base's strong digest when the caller already has one without reading
+    /// content (a supplied `--base-digest`, or a cached archive digest); only
+    /// then, and only above sealed immutable lowers, may a previous
+    /// verification be trusted instead of repeated.
+    pub(crate) fn open(
+        base: Arc<dyn ratarmount_core::MountSource>,
+        base_key: Option<&str>,
+        paths: &[PathBuf],
+        allow_unsealed: bool,
+    ) -> Result<(Self, Arc<dyn ratarmount_core::MountSource>), String> {
+        Self::open_in(base, base_key, paths, allow_unsealed, None)
+    }
+
+    /// [`Self::open`] with an explicit bundle cache directory (tests).
+    pub(crate) fn open_in(
+        base: Arc<dyn ratarmount_core::MountSource>,
+        base_key: Option<&str>,
+        paths: &[PathBuf],
+        allow_unsealed: bool,
+        cache: Option<&Path>,
+    ) -> Result<(Self, Arc<dyn ratarmount_core::MountSource>), String> {
         use ratarmount_compositing::{Immutability, LowerLayerRecord, OverlayMeta};
+        use sha2::{Digest, Sha256};
         let mut stack = Self {
             layers: Vec::new(),
             records: Vec::new(),
             base_digest: None,
         };
+        let mut view = base;
         for path in paths {
             let cached;
             let path = if path.is_file() {
-                cached = overlay_pack::cached_lower(path)
-                    .map_err(|e| format!("lower bundle {}: {e}", path.display()))?;
+                let marker_key = base_key
+                    .filter(|_| {
+                        stack.layers.iter().zip(&stack.records).all(|((_, im), r)| {
+                            *im == Immutability::Immutable && !r.layer_digest.is_empty()
+                        })
+                    })
+                    .map(|key| {
+                        let mut hasher = Sha256::new();
+                        hasher.update(key.as_bytes());
+                        for record in &stack.records {
+                            hasher.update([0]);
+                            hasher.update(record.layer_digest.as_bytes());
+                        }
+                        format!("{:x}", hasher.finalize())
+                    });
+                cached = match cache {
+                    Some(cache) => overlay_pack::cached_lower_in(
+                        path,
+                        cache,
+                        view.clone(),
+                        marker_key.as_deref(),
+                    ),
+                    None => overlay_pack::cached_lower(path, view.clone(), marker_key.as_deref()),
+                }
+                .map_err(|e| format!("lower bundle {}: {e}", path.display()))?;
                 &cached
             } else {
                 path
@@ -1335,16 +1416,16 @@ impl MountLowerStack {
                     .unwrap_or("")
                     .into(),
             });
-            stack.layers.push((
-                path,
-                if sealed {
-                    Immutability::Immutable
-                } else {
-                    Immutability::Shared
-                },
-            ));
+            let immutability = if sealed {
+                Immutability::Immutable
+            } else {
+                Immutability::Shared
+            };
+            view = ratarmount_compositing::compose_stack(view, &[(path.clone(), immutability)])
+                .map_err(|e| format!("error opening lower stack: {e}"))?;
+            stack.layers.push((path, immutability));
         }
-        Ok(stack)
+        Ok((stack, view))
     }
 
     /// Identity a read-only composed mount (no `-w` top) serves through the
@@ -2103,16 +2184,28 @@ fn main() {
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
-    let lower_stack =
-        MountLowerStack::read(&args.lower, args.allow_unsealed_lower).unwrap_or_else(|error| {
-            eprintln!("error: {error}");
-            std::process::exit(1);
-        });
-    bundle.source = ratarmount_compositing::compose_stack(bundle.source, &lower_stack.layers)
-        .unwrap_or_else(|error| {
-            eprintln!("error opening lower stack: {error}");
-            std::process::exit(1);
-        });
+    let lower_key = lower_base_key(
+        match &args.base_digest {
+            Some(ratarmount_compositing::BaseDigestRequest::Supplied(digest)) => {
+                Some(digest.as_str())
+            }
+            _ => None,
+        },
+        inputs.first().map(PathBuf::as_path),
+        index_sidecar.as_deref(),
+        &args.lower,
+    );
+    let (lower_stack, lower_view) = MountLowerStack::open(
+        bundle.source.clone(),
+        lower_key.as_deref(),
+        &args.lower,
+        args.allow_unsealed_lower,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    });
+    bundle.source = lower_view;
 
     if let Some(w) = &args.write_overlay {
         let overlay_path = if w.as_os_str() == ":temp:" {
@@ -7857,28 +7950,25 @@ mod lower_stack_tests {
         let base = root.path().join("base");
         std::fs::create_dir(&base).unwrap();
         let dir = root.path().join("lower");
-        drop(WriteOverlay::new(Arc::new(FolderMountSource::new(base).unwrap()), &dir).unwrap());
+        let view: Arc<dyn ratarmount_core::MountSource> =
+            Arc::new(FolderMountSource::new(base).unwrap());
+        drop(WriteOverlay::new(view.clone(), &dir).unwrap());
         let paths = [dir.clone()];
-        assert!(MountLowerStack::read(&paths, false)
-            .err()
-            .unwrap()
-            .contains("unsealed"));
-        let stack = MountLowerStack::read(&paths, true).unwrap();
+        let open = |allow| MountLowerStack::open(view.clone(), None, &paths, allow).map(|r| r.0);
+        assert!(open(false).err().unwrap().contains("unsealed"));
+        let stack = open(true).unwrap();
         assert_eq!(stack.layers[0].1, Immutability::Shared);
         assert!(stack.records[0].layer_digest.is_empty());
         let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
         conn.execute_batch("DROP TABLE meta").unwrap();
         drop(conn);
-        assert!(MountLowerStack::read(&paths, false).is_err());
-        assert!(MountLowerStack::read(&paths, true).is_ok());
+        assert!(open(false).is_err());
+        assert!(open(true).is_ok());
         let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
         conn.execute_batch(ratarmount_compositing::overlay_meta::META_SCHEMA)
             .unwrap();
         OverlayMeta::set(&conn, "sealed_at", "2026-10-17T00:00:00Z").unwrap();
         drop(conn);
-        assert_eq!(
-            MountLowerStack::read(&paths, false).unwrap().layers[0].1,
-            Immutability::Immutable
-        );
+        assert_eq!(open(false).unwrap().layers[0].1, Immutability::Immutable);
     }
 }

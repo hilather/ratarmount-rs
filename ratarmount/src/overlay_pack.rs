@@ -597,10 +597,10 @@ fn verify_recorded(directory: &Path, meta: &OverlayMeta) -> io::Result<Option<bo
 /// Restore into a nonexistent or empty directory. Always checks immutable DB
 /// metadata and the sentinel; verifies changes when the recorded stack exists.
 pub fn unpack(bundle: &Path, directory: &Path) -> io::Result<UnpackOutcome> {
-    unpack_impl(bundle, directory, false)
+    unpack_impl(bundle, directory)
 }
 
-fn unpack_impl(bundle: &Path, directory: &Path, require_match: bool) -> io::Result<UnpackOutcome> {
+fn unpack_impl(bundle: &Path, directory: &Path) -> io::Result<UnpackOutcome> {
     let metadata = bundle_meta(bundle)?;
     match fs::symlink_metadata(directory) {
         Ok(m) if m.is_dir() && fs::read_dir(directory)?.next().is_none() => {}
@@ -632,49 +632,190 @@ fn unpack_impl(bundle: &Path, directory: &Path, require_match: bool) -> io::Resu
         ok: verified.unwrap_or(true) && metadata_ok && sentinel_ok,
         verified: verified.is_some(),
     };
-    if require_match && !outcome.ok {
-        return Err(invalid("bundle seal verification failed"));
-    }
-    // macOS (like the BSDs) needs write permission on a directory to rename
-    // it, even within one parent, and the sealed layer root is read-only.
-    // Hold the root by fd so the permission change follows the renamed inode.
+    publish_layer(layer, directory)?;
+    Ok(outcome)
+}
+
+/// Move a staged layer into place. macOS (like the BSDs) needs write
+/// permission on a directory to rename it, even within one parent, and the
+/// sealed layer root is read-only. Hold the root by fd so the permission
+/// change follows the renamed inode.
+fn publish_layer(layer: &Path, directory: &Path) -> io::Result<()> {
     let root = host::open(layer, directory_flags(), Mode::empty())?;
     let sealed = ratarmount_compositing::host_stat::fstat(&root)?.st_mode;
     host::fchmod(&root, Mode::from_raw_mode(sealed | 0o200))?;
     fs::rename(layer, directory)
         .map_err(|e| io::Error::new(e.kind(), format!("publish layer: {e}")))?;
     host::fchmod(&root, Mode::from_raw_mode(sealed))?;
-    Ok(outcome)
+    Ok(())
 }
 
-pub fn cached_lower(bundle: &Path) -> io::Result<PathBuf> {
+/// Resolve a `--lower` bundle to a verified, immutable cache directory.
+///
+/// `view` is the composed view the bundle sits on (base plus the lowers
+/// beneath it). `marker_key` is `Some` only when a previous verification
+/// against exactly this view may be trusted (a strong base digest and a
+/// sealed immutable stack beneath); otherwise every use re-verifies.
+pub fn cached_lower(
+    bundle: &Path,
+    view: Arc<dyn MountSource>,
+    marker_key: Option<&str>,
+) -> io::Result<PathBuf> {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cache")))
         .ok_or_else(|| invalid("neither XDG_CACHE_HOME nor HOME is set"))?;
-    cached_lower_in(bundle, &cache.join("ratarmount/layers"))
+    cached_lower_in(bundle, &cache.join("ratarmount/layers"), view, marker_key)
 }
 
-fn cached_lower_in(bundle: &Path, cache: &Path) -> io::Result<PathBuf> {
-    let meta = bundle_meta(bundle)?;
-    let digest = meta.get("layer_digest").expect("checked digest");
-    fs::create_dir_all(cache)?;
-    let destination = cache.join(valid_digest(digest)?);
-    if destination.try_exists()? {
-        if checked_meta(&destination)?.get("layer_digest") != Some(digest.as_str()) {
-            return Err(invalid("cached layer digest mismatch"));
-        }
-        return Ok(destination);
+#[cfg(test)]
+thread_local! {
+    static VERIFY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AFTER_COPY: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Copy the bundle into a private file inside the cache while hashing it, so
+/// everything after reads exactly the hashed bytes and never the original path.
+fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempFile, String)> {
+    use sha2::{Digest, Sha256};
+    let mut source = File::open(bundle)?;
+    let mut copy = tempfile::Builder::new()
+        .prefix(".copy-")
+        .suffix(".tar.zst")
+        .tempfile_in(cache)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let n = match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        hasher.update(&buffer[..n]);
+        copy.write_all(&buffer[..n])?;
     }
-    match unpack_impl(bundle, &destination, true) {
-        Ok(_) => {}
-        Err(e) if destination.is_dir() => {
-            if checked_meta(&destination)?.get("layer_digest") != Some(digest.as_str()) {
-                return Err(e);
+    copy.flush()?;
+    Ok((copy, format!("{:x}", hasher.finalize())))
+}
+
+/// Check a layer directory against the view it sits on; error names the paths.
+fn verify_against_view(layer: &Path, view: &Arc<dyn MountSource>) -> io::Result<()> {
+    #[cfg(test)]
+    VERIFY_CALLS.with(|c| c.set(c.get() + 1));
+    let report = ratarmount_compositing::overlay_seal::verify(layer, view.clone())?;
+    if report.ok {
+        return Ok(());
+    }
+    let mut paths = report.mismatched.join(", ");
+    if paths.is_empty() {
+        paths = if report.sentinel_ok {
+            format!("digest {} != recorded {}", report.computed, report.recorded)
+        } else {
+            "seal sentinel".into()
+        };
+    }
+    Err(invalid(format!(
+        "lower bundle does not match the base and lowers it is mounted on: {paths}"
+    )))
+}
+
+fn marker_dir(cache: &Path, hex: &str) -> PathBuf {
+    cache.join(format!("{hex}.verified"))
+}
+
+fn write_marker(cache: &Path, hex: &str, key: &str) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = marker_dir(cache, hex);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    match File::options()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(key))
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn cached_lower_in(
+    bundle: &Path,
+    cache: &Path,
+    view: Arc<dyn MountSource>,
+    marker_key: Option<&str>,
+) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(cache)?;
+    let (copy, hex) = private_copy(bundle, cache)?;
+    #[cfg(test)]
+    AFTER_COPY.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+    let metadata = bundle_meta(copy.path())?;
+    let digest = metadata
+        .get("layer_digest")
+        .expect("checked digest")
+        .clone();
+    let destination = cache.join(&hex);
+    let hit = |destination: &Path| -> io::Result<PathBuf> {
+        let meta = checked_meta(destination)?;
+        if meta.get("layer_digest") != Some(digest.as_str()) || meta.values() != &metadata {
+            return Err(invalid("cached layer does not match the bundle"));
+        }
+        if let Some(key) = marker_key {
+            if marker_dir(cache, &hex).join(key).try_exists()? {
+                return Ok(destination.into());
             }
         }
+        verify_against_view(destination, &view)?;
+        if let Some(key) = marker_key {
+            write_marker(cache, &hex, key)?;
+        }
+        Ok(destination.into())
+    };
+    if destination.try_exists()? {
+        return hit(&destination);
+    }
+    // Stage beside the destination; nothing is published before it verifies.
+    let stage = Stage(
+        tempfile::Builder::new()
+            .prefix(".ratarmount-layer-")
+            .tempdir_in(cache)?,
+    );
+    let layer = stage.0.path();
+    extract(copy.path(), layer)
+        .map_err(|e| io::Error::new(e.kind(), format!("extract layer: {e}")))?;
+    let meta = immutable_meta(layer)
+        .map_err(|e| io::Error::new(e.kind(), format!("read layer database: {e}")))?;
+    if meta.values() != &metadata {
+        return Err(invalid(
+            "bundle meta.json does not match its layer database",
+        ));
+    }
+    if !sentinel_matches(layer, &digest)? {
+        return Err(invalid("sentinel digest does not match metadata"));
+    }
+    verify_against_view(layer, &view)?;
+    match publish_layer(layer, &destination) {
+        Ok(()) => {}
+        // Lost a concurrent fill (renaming onto a non-empty directory fails):
+        // verify the published directory, never our staging copy.
+        Err(_) if destination.is_dir() => return hit(&destination),
         Err(e) => return Err(e),
+    }
+    if let Some(key) = marker_key {
+        write_marker(cache, &hex, key)?;
     }
     Ok(destination)
 }
@@ -907,28 +1048,32 @@ mod tests {
         let f = Fixture::new(true);
         let bundle = f.bundle("bundle.tar.zst");
         let cache = f.tmp.path().join("cache");
-        let first = cached_lower_in(&bundle, &cache).unwrap();
+        let first = cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
         let inode = fs::metadata(&first).unwrap().ino();
-        let second = cached_lower_in(&bundle, &cache).unwrap();
+        let second = cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
         assert_eq!(first, second);
         assert_eq!(inode, fs::metadata(&second).unwrap().ino());
         let concurrent_cache = f.tmp.path().join("concurrent-cache");
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..4)
-                .map(|_| scope.spawn(|| cached_lower_in(&bundle, &concurrent_cache).unwrap()))
+                .map(|_| {
+                    scope.spawn(|| {
+                        cached_lower_in(&bundle, &concurrent_cache, f.base.clone(), None).unwrap()
+                    })
+                })
                 .collect();
             let paths: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
             assert!(paths.iter().all(|p| p == &paths[0]));
             assert_eq!(fs::read_dir(&concurrent_cache).unwrap().count(), 1);
         });
-        let digest = checked_meta(&first)
-            .unwrap()
-            .get("layer_digest")
-            .unwrap()
-            .to_owned();
-        assert_eq!(first.file_name().unwrap(), valid_digest(&digest).unwrap());
-        let stack = crate::MountLowerStack::read(std::slice::from_ref(&first), false).unwrap();
-        let view = ratarmount_compositing::compose_stack(f.base.clone(), &stack.layers).unwrap();
+        // The entry is named by the SHA-256 of the bundle bytes, not by the
+        // layer digest the bundle claims.
+        let bundle_hex =
+            ratarmount_index::sha256_hex_stream(&mut File::open(&bundle).unwrap()).unwrap();
+        assert_eq!(first.file_name().unwrap().to_str().unwrap(), bundle_hex);
+        let (_, view) =
+            crate::MountLowerStack::open(f.base.clone(), None, std::slice::from_ref(&first), false)
+                .unwrap();
         assert!(view.lookup("/deleted", 0).is_none());
         assert!(view.lookup("/sub/file", 0).is_some());
         fs::rename(f.tmp.path().join("base"), f.tmp.path().join("base-away")).unwrap();
@@ -936,7 +1081,7 @@ mod tests {
         assert!(report.ok && !report.verified);
         fs::set_permissions(first.join(SENTINEL), fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(first.join(SENTINEL), b"wrong").unwrap();
-        assert!(cached_lower_in(&bundle, &cache).is_err());
+        assert!(cached_lower_in(&bundle, &cache, f.base.clone(), None).is_err());
     }
 
     /// Regression: unpack must report a seal mismatch rather than accepting a
@@ -1065,6 +1210,484 @@ mod tests {
             assert!(paths.iter().any(|p| p == name), "{paths:?}");
         }
         assert!(!paths.iter().any(|p| omitted(p)));
+    }
+
+    /// Re-tar `bundle` with the payload of one member replaced (same seal
+    /// metadata, so the bundle stays self-consistent but lies about content).
+    fn retar_with(bundle: &Path, out: &Path, member: &str, payload: &[u8]) {
+        let body = ratarmount_compress::open_seekable_zstd(bundle).unwrap();
+        let mut archive = tar::Archive::new(body.open_reader().unwrap());
+        let mut builder = tar::Builder::new(Vec::new());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut header = entry.header().clone();
+            let pax: Vec<(String, Vec<u8>)> = entry
+                .pax_extensions()
+                .unwrap()
+                .map(|exts| {
+                    exts.map(|e| {
+                        let e = e.unwrap();
+                        (e.key().unwrap().to_owned(), e.value_bytes().to_vec())
+                    })
+                    .collect()
+                })
+                .unwrap_or_default();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            if path == member {
+                data = payload.to_vec();
+                header.set_size(data.len() as u64);
+            }
+            if !pax.is_empty() {
+                builder
+                    .append_pax_extensions(pax.iter().map(|(k, v)| (k.as_str(), v.as_slice())))
+                    .unwrap();
+            }
+            header.set_cksum();
+            builder.append(&header, &data[..]).unwrap();
+        }
+        let bytes = builder.into_inner().unwrap();
+        let mut writer = ratarmount_compress::ZstdFrameWriter::new(File::create(out).unwrap(), 3);
+        writer.write_frame(&bytes[..]).unwrap();
+        writer.finish().unwrap();
+    }
+
+    fn cache_entries(cache: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(cache)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| !n.starts_with('.') && !n.ends_with(".verified"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn verify_calls() -> usize {
+        VERIFY_CALLS.with(|c| c.get())
+    }
+
+    fn folder(path: PathBuf) -> Arc<dyn MountSource> {
+        Arc::new(FolderMountSource::new(path).unwrap())
+    }
+
+    /// A top sealed over the fixture layer (`f.dir`): deletes `/sub/file`, adds `/new`.
+    fn stacked_bundle(f: &Fixture, name: &str) -> PathBuf {
+        use ratarmount_compositing::{compose_stack, Immutability, LowerLayerRecord};
+        let lower_meta = checked_meta(&f.dir).unwrap();
+        let lower =
+            compose_stack(f.base.clone(), &[(f.dir.clone(), Immutability::Immutable)]).unwrap();
+        let top = f.tmp.path().join(format!("{name}-top"));
+        let writer = WriteOverlay::new_with_create_info(
+            lower.clone(),
+            &top,
+            &OverlayCreateInfo {
+                base_url: lower_meta.base_url().unwrap().into(),
+                lower_layers: vec![LowerLayerRecord {
+                    path: f.dir.clone(),
+                    layer_digest: lower_meta.get("layer_digest").unwrap().into(),
+                    sealed_at: lower_meta.get("sealed_at").unwrap().into(),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.unlink("/sub/file").unwrap();
+        let fd = writer.create_file("/new", 0o640).unwrap();
+        writer.close_overlay_fd(fd);
+        fs::write(top.join("new"), b"new bytes").unwrap();
+        drop(writer);
+        ratarmount_compositing::overlay_seal::seal(&top, lower.clone()).unwrap();
+        let bundle = f.tmp.path().join(name);
+        pack(&top, &bundle, lower, &PackOptions::default()).unwrap();
+        bundle
+    }
+
+    /// Regression (Keystone blocker 1): a tampered bundle that claims a valid
+    /// `layer_digest` must not be cached or served when the base it was sealed
+    /// against is only available as the mounted view (not at its recorded path).
+    #[test]
+    fn regression_lower_cache_evil_bundle_fails_closed_then_good_serves_good() {
+        let f = Fixture::new(true);
+        let good = f.bundle("good.tar.zst");
+        let evil = f.tmp.path().join("evil.tar.zst");
+        retar_with(&good, &evil, "layer/sub/file", b"EVIL!!!\n");
+        fs::rename(f.tmp.path().join("base"), f.tmp.path().join("base-away")).unwrap();
+        let view = folder(f.tmp.path().join("base-away"));
+        for order in [0, 1] {
+            let cache = f.tmp.path().join(format!("cache{order}"));
+            if order == 1 {
+                let served = cached_lower_in(&good, &cache, view.clone(), None).unwrap();
+                assert_eq!(fs::read(served.join("sub/file")).unwrap(), b"payload\n");
+            }
+            let error = cached_lower_in(&evil, &cache, view.clone(), None).unwrap_err();
+            assert!(error.to_string().contains("sub/file"), "{error}");
+            if order == 0 {
+                assert!(
+                    cache_entries(&cache).is_empty(),
+                    "{:?}",
+                    cache_entries(&cache)
+                );
+                let served = cached_lower_in(&good, &cache, view.clone(), None).unwrap();
+                assert_eq!(fs::read(served.join("sub/file")).unwrap(), b"payload\n");
+            }
+            assert_eq!(cache_entries(&cache).len(), 1);
+            let entry = cache.join(&cache_entries(&cache)[0]);
+            assert_eq!(fs::read(entry.join("sub/file")).unwrap(), b"payload\n");
+        }
+    }
+
+    /// Regression: a cache hit is checked again; an entry altered in place
+    /// after it was published (same length) fails closed.
+    #[test]
+    fn regression_lower_cache_hit_reverifies_altered_entry() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let cache = f.tmp.path().join("cache");
+        let entry = cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
+        let file = entry.join("sub/file");
+        let dir = entry.join("sub");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&file, b"PAYLOAD\n").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let error = cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap_err();
+        assert!(error.to_string().contains("sub/file"), "{error}");
+        // A marker for this view must not let an altered entry through either
+        // when the marker is absent.
+        assert!(cached_lower_in(&bundle, &cache, f.base.clone(), Some("view-a")).is_err());
+    }
+
+    /// Regression: with a marker key the second use of an unchanged view skips
+    /// verification; a different view key verifies once and gets its own marker.
+    #[test]
+    fn regression_lower_cache_marker_hit_skips_verify() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let cache = f.tmp.path().join("cache");
+        let before = verify_calls();
+        cached_lower_in(&bundle, &cache, f.base.clone(), Some("view-a")).unwrap();
+        assert_eq!(verify_calls() - before, 1);
+        cached_lower_in(&bundle, &cache, f.base.clone(), Some("view-a")).unwrap();
+        assert_eq!(verify_calls() - before, 1, "marker hit must not re-verify");
+        cached_lower_in(&bundle, &cache, f.base.clone(), Some("view-b")).unwrap();
+        assert_eq!(verify_calls() - before, 2);
+        let hex = cache_entries(&cache).remove(0);
+        let markers = fs::read_dir(marker_dir(&cache, &hex)).unwrap().count();
+        assert_eq!(markers, 2);
+        // Without a key every use verifies.
+        cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
+        cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
+        assert_eq!(verify_calls() - before, 4);
+    }
+
+    /// Regression: the entry is named by the bytes of the bundle, and the bytes
+    /// that are hashed are the bytes that are extracted even when the original
+    /// path is swapped (or modified in place) after the copy.
+    #[test]
+    fn regression_lower_cache_keyed_on_bundle_bytes() {
+        let f = Fixture::new(true);
+        let good = f.bundle("good.tar.zst");
+        let evil = f.tmp.path().join("evil.tar.zst");
+        retar_with(&good, &evil, "layer/sub/file", b"EVIL!!!\n");
+        let good_hex =
+            ratarmount_index::sha256_hex_stream(&mut File::open(&good).unwrap()).unwrap();
+        for variant in ["swap", "in-place"] {
+            let target = f.tmp.path().join(format!("target-{variant}.tar.zst"));
+            fs::copy(&good, &target).unwrap();
+            let (t, e) = (target.clone(), evil.clone());
+            let variant_owned = variant.to_string();
+            AFTER_COPY.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if variant_owned == "swap" {
+                        fs::rename(&e, &t).unwrap();
+                    } else {
+                        fs::copy(&e, &t).unwrap();
+                    }
+                }))
+            });
+            let cache = f.tmp.path().join(format!("cache-{variant}"));
+            let entry = cached_lower_in(&target, &cache, f.base.clone(), None).unwrap();
+            AFTER_COPY.with(|hook| *hook.borrow_mut() = None);
+            assert_eq!(entry.file_name().unwrap().to_str().unwrap(), good_hex);
+            assert_eq!(fs::read(entry.join("sub/file")).unwrap(), b"payload\n");
+            fs::copy(&good, &evil).ok();
+            retar_with(&good, &evil, "layer/sub/file", b"EVIL!!!\n");
+        }
+    }
+
+    /// Regression: concurrent fills of one bundle publish one entry, one marker
+    /// per view, and leave no copy or staging directories behind.
+    #[test]
+    fn regression_lower_cache_concurrent_fill_with_markers() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let cache = f.tmp.path().join("cache");
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        cached_lower_in(&bundle, &cache, f.base.clone(), Some("view-a")).unwrap()
+                    })
+                })
+                .collect();
+            let paths: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(paths.iter().all(|p| p == &paths[0]));
+        });
+        let all: Vec<String> = fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(all.iter().any(|n| n.ends_with(".verified")), "{all:?}");
+        assert!(!all
+            .iter()
+            .any(|n| n.starts_with('.') && !n.ends_with(".verified")));
+        let hex = cache_entries(&cache).remove(0);
+        assert_eq!(fs::read_dir(marker_dir(&cache, &hex)).unwrap().count(), 1);
+    }
+
+    /// Regression: a stacked bundle is verified against the lowers beneath it:
+    /// the right stack resolves, a tampered top fails, and the top alone
+    /// (without the lower it was sealed on) fails.
+    #[test]
+    fn regression_lower_bundle_stack_verified_against_lowers_beneath() {
+        let f = Fixture::new(true);
+        let top = stacked_bundle(&f, "top.tar.zst");
+        let evil = f.tmp.path().join("evil-top.tar.zst");
+        retar_with(&top, &evil, "layer/new", b"EVIL bytes");
+        let base_only = f.base.clone();
+        let cache = f.tmp.path().join("cache");
+        let lower_view = ratarmount_compositing::compose_stack(
+            f.base.clone(),
+            &[(
+                f.dir.clone(),
+                ratarmount_compositing::Immutability::Immutable,
+            )],
+        )
+        .unwrap();
+        assert!(cached_lower_in(&top, &cache, lower_view.clone(), None).is_ok());
+        assert!(cached_lower_in(&evil, &cache, lower_view, None).is_err());
+        let cache2 = f.tmp.path().join("cache2");
+        assert!(cached_lower_in(&top, &cache2, base_only, None).is_err());
+        assert!(cache_entries(&cache2).is_empty());
+    }
+
+    struct Recording {
+        inner: Arc<dyn MountSource>,
+        seen: std::sync::Mutex<Vec<String>>,
+        opens: std::sync::atomic::AtomicUsize,
+    }
+    impl MountSource for Recording {
+        fn list(&self, path: &str) -> Option<ratarmount_core::ListResult> {
+            self.seen.lock().unwrap().push(format!("list {path}"));
+            self.inner.list(path)
+        }
+        fn lookup(&self, path: &str, v: i32) -> Option<ratarmount_core::FileInfo> {
+            self.seen.lock().unwrap().push(format!("lookup {path}"));
+            self.inner.lookup(path, v)
+        }
+        fn open(
+            &self,
+            fi: &ratarmount_core::FileInfo,
+            b: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.open(fi, b)
+        }
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
+    }
+
+    /// Keystone (g): verifying a bundle on a first fill reads only the paths
+    /// the layer mentions, never an untouched base file.
+    #[test]
+    fn regression_lower_bundle_verify_reads_only_mentioned_paths() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let untouched = f.tmp.path().join("base/untouched");
+        fs::write(&untouched, b"do not read").unwrap();
+        let recording = Arc::new(Recording {
+            inner: f.base.clone(),
+            seen: Default::default(),
+            opens: Default::default(),
+        });
+        let cache = f.tmp.path().join("cache");
+        cached_lower_in(&bundle, &cache, recording.clone(), None).unwrap();
+        let seen = recording.seen.lock().unwrap().clone();
+        assert!(seen.iter().any(|s| s == "lookup /deleted"), "{seen:?}");
+        assert!(!seen.iter().any(|s| s.contains("untouched")), "{seen:?}");
+        assert_eq!(
+            recording.opens.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the deleted base file's preimage is read: {seen:?}"
+        );
+        // Behavioural half: an unreadable untouched file does not matter.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: root reads mode 000 files");
+            return;
+        }
+        fs::set_permissions(&untouched, fs::Permissions::from_mode(0o000)).unwrap();
+        let cache2 = f.tmp.path().join("cache2");
+        cached_lower_in(&bundle, &cache2, f.base.clone(), None).unwrap();
+        // A marker hit opens nothing on the base at all.
+        let again = Arc::new(Recording {
+            inner: f.base.clone(),
+            seen: Default::default(),
+            opens: Default::default(),
+        });
+        cached_lower_in(&bundle, &cache2, again.clone(), Some("k")).unwrap();
+        let opens_after_fill = again.opens.load(std::sync::atomic::Ordering::SeqCst);
+        cached_lower_in(&bundle, &cache2, again.clone(), Some("k")).unwrap();
+        assert_eq!(
+            again.opens.load(std::sync::atomic::Ordering::SeqCst),
+            opens_after_fill
+        );
+        fs::set_permissions(&untouched, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// A stack over an unsealed (editable) directory lower never gets a marker:
+    /// a second use re-verifies and an edit that breaks the preimage fails closed.
+    #[test]
+    fn regression_lower_cache_unsealed_lower_edit_reverifies() {
+        use ratarmount_compositing::{compose_stack, Immutability, LowerLayerRecord};
+        let f = Fixture::new(true);
+        let unsealed = f.tmp.path().join("unsealed");
+        let writer = WriteOverlay::new(f.base.clone(), &unsealed).unwrap();
+        let fd = writer.create_file("/lf", 0o644).unwrap();
+        writer.close_overlay_fd(fd);
+        drop(writer);
+        fs::write(unsealed.join("lf"), b"aaaa").unwrap();
+        let lower =
+            compose_stack(f.base.clone(), &[(unsealed.clone(), Immutability::Shared)]).unwrap();
+        let top = f.tmp.path().join("top");
+        let writer = WriteOverlay::new_with_create_info(
+            lower.clone(),
+            &top,
+            &OverlayCreateInfo {
+                base_url: f.tmp.path().join("base").to_str().unwrap().into(),
+                lower_layers: vec![LowerLayerRecord {
+                    path: unsealed.clone(),
+                    layer_digest: String::new(),
+                    sealed_at: String::new(),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Replace the lower's file: the row depends on the lower still holding
+        // different bytes (an edit to the new bytes would make it a no-op).
+        writer.unlink("/lf").unwrap();
+        let fd = writer.create_file("/lf", 0o644).unwrap();
+        writer.close_overlay_fd(fd);
+        fs::write(top.join("lf"), b"bbbb").unwrap();
+        drop(writer);
+        ratarmount_compositing::overlay_seal::seal(&top, lower.clone()).unwrap();
+        let bundle = f.tmp.path().join("top.tar.zst");
+        pack(&top, &bundle, lower, &PackOptions::default()).unwrap();
+        let cache = f.tmp.path().join("cache");
+        let paths = [unsealed.clone(), bundle.clone()];
+        let before = verify_calls();
+        for _ in 0..2 {
+            crate::MountLowerStack::open_in(
+                f.base.clone(),
+                Some("strong"),
+                &paths,
+                true,
+                Some(&cache),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            verify_calls() - before,
+            2,
+            "no marker over an unsealed lower"
+        );
+        let hex = cache_entries(&cache).remove(0);
+        assert!(!marker_dir(&cache, &hex).exists());
+        fs::write(unsealed.join("lf"), b"bbbb").unwrap();
+        let error = crate::MountLowerStack::open_in(
+            f.base.clone(),
+            Some("strong"),
+            &paths,
+            true,
+            Some(&cache),
+        )
+        .err()
+        .expect("edited unsealed lower must fail closed");
+        assert!(error.contains("lf"), "{error}");
+    }
+
+    /// A directory base without `--base-digest` has only a weak identity, so no
+    /// marker is trusted: a same-size edit with the mtime restored is caught.
+    #[test]
+    fn regression_lower_cache_weak_directory_base_always_reverifies() {
+        let f = Fixture::new(true);
+        let base_dir = f.tmp.path().join("base");
+        // Replace the base's `deleted` ("old") with same-length "new" bytes.
+        let replace = f.tmp.path().join("replace");
+        let writer = WriteOverlay::new_with_create_info(
+            f.base.clone(),
+            &replace,
+            &OverlayCreateInfo {
+                base_url: base_dir.to_str().unwrap().into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.unlink("/deleted").unwrap();
+        let fd = writer.create_file("/deleted", 0o644).unwrap();
+        writer.close_overlay_fd(fd);
+        fs::write(replace.join("deleted"), b"new").unwrap();
+        drop(writer);
+        ratarmount_compositing::overlay_seal::seal(&replace, f.base.clone()).unwrap();
+        let bundle = f.tmp.path().join("replace.tar.zst");
+        pack(&replace, &bundle, f.base.clone(), &PackOptions::default()).unwrap();
+        let key = crate::lower_base_key(None, Some(&base_dir), None, std::slice::from_ref(&bundle));
+        assert_eq!(key, None);
+        let cache = f.tmp.path().join("cache");
+        let paths = [bundle.clone()];
+        let before = verify_calls();
+        for _ in 0..2 {
+            crate::MountLowerStack::open_in(
+                f.base.clone(),
+                key.as_deref(),
+                &paths,
+                false,
+                Some(&cache),
+            )
+            .unwrap();
+        }
+        assert_eq!(verify_calls() - before, 2);
+        let target = base_dir.join("deleted");
+        let mtime = fs::metadata(&target).unwrap().modified().unwrap();
+        fs::write(&target, b"new").unwrap();
+        File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let error = crate::MountLowerStack::open_in(
+            f.base.clone(),
+            key.as_deref(),
+            &paths,
+            false,
+            Some(&cache),
+        )
+        .err()
+        .expect("edited base must fail closed");
+        assert!(error.contains("deleted"), "{error}");
+        // With a supplied strong digest the weak manifest is folded in, so the
+        // key exists and differs per base state.
+        let supplied = format!("sha256:{}", "a".repeat(64));
+        let strong = crate::lower_base_key(Some(&supplied), Some(&base_dir), None, &paths);
+        assert!(strong.is_some_and(|k| k.starts_with(&supplied)));
     }
 
     fn write_crafted(f: &Fixture, name: &str, paths: &[(&str, Option<&str>)]) -> PathBuf {

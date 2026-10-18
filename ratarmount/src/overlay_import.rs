@@ -101,7 +101,6 @@ impl ImportStack {
         lower: &[PathBuf],
         allow_unsealed_lower: bool,
     ) -> Result<Self, String> {
-        let lowers = super::MountLowerStack::read(lower, allow_unsealed_lower)?;
         let mut inputs = vec![PathBuf::from(base)];
         let mut open = OpenOptions {
             write_index: false,
@@ -118,8 +117,8 @@ impl ImportStack {
         )
         .map_err(|e| e.to_string())?
         .source;
-        let source = ratarmount_compositing::compose_stack(source, &lowers.layers)
-            .map_err(|e| e.to_string())?;
+        let (lowers, source) =
+            super::MountLowerStack::open(source, None, lower, allow_unsealed_lower)?;
         Ok(Self {
             source,
             info: OverlayCreateInfo {

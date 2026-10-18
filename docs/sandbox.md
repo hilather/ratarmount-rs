@@ -940,12 +940,41 @@ ratarmount attempt.tar.zst inspect-mnt
 ratarmount --lower attempt.tar.zst -w next-attempt base.tar.zst work-mnt
 ```
 
-For `--lower`, the metadata is read through the archive session API, then the
-layer is unpacked once into
-`$XDG_CACHE_HOME/ratarmount/layers/<layer_digest without sha256:>` (default:
-`~/.cache/ratarmount/layers/`). Publication is atomic. Later mounts reuse the
-cached sealed directory after checking its immutable database and sentinel;
-a damaged cache entry is refused. Directory lowers continue to work normally.
+For `--lower`, the bundle is first copied into a private file in the cache
+directory while its SHA-256 is computed; everything after that (metadata,
+extraction, verification) reads that copy, never the original path. The layer
+is then unpacked once into
+`$XDG_CACHE_HOME/ratarmount/layers/<sha256 of the bundle file>` (default:
+`~/.cache/ratarmount/layers/`), so a bundle with different bytes can never
+occupy another bundle's entry (entries named by `layer_digest` by earlier
+builds are never looked up again). **Before publication the unpacked layer is
+verified against the view it is mounted on** (the base plus the lowers beneath
+it); a mismatch refuses the mount, names the offending paths and publishes
+nothing. Publication is atomic.
+
+This check reads base and lower content only for the paths the layer mentions
+(plus the descendants of directories it deletes or replaces), once per cache
+fill or marker miss; it never hashes the whole base, and a plain `-w` mount
+or a directory lower reads no base content at mount.
+
+A later use of a cached entry checks its immutable database and sentinel, and
+either trusts a *verified marker* (`layers/<sha256>.verified/<view key>`) or
+verifies again. Markers are written and trusted only when the base has a
+strong digest the mount already holds without reading content (a supplied
+`--base-digest`, or an archive digest already in the index digest cache) and
+every lower beneath the bundle is a sealed, immutable layer. A directory base
+without `--base-digest` (only a weak manifest), a remote or git base, and any
+`--allow-unsealed-lower` directory lower always re-verify, so an edit to the
+base or an unsealed lower between two mounts fails closed. The view key also
+folds in the weak manifest of a directory base. Directory lowers continue to
+work normally and are not seal-verified at mount (they are trusted like the
+base; this is not a boundary against the owner).
+
+`overlay unpack` checks the bundle against its recorded base and lowers when
+they are reachable. Without them it proves only that the database and sentinel
+agree with each other and prints `content not verified; run \`overlay verify
+DIR BASE\` before using it as a lower`; it still exits 0. Verification is not
+authenticity: a re-sealed bundle is a different, valid layer.
 
 ## Git-ref bases and portable snapshots
 

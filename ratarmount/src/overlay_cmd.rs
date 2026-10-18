@@ -222,7 +222,7 @@ pub fn unpack(bundle: &Path, directory: &Path) -> Result<(String, i32), String> 
     let result = super::overlay_pack::unpack(bundle, directory)
         .map_err(|e| format!("unpack {}: {e}", bundle.display()))?;
     if !result.verified {
-        eprintln!("recorded stack unavailable; checked immutable database and seal sentinel only");
+        eprintln!("content not verified; run `overlay verify DIR BASE` before using it as a lower");
     }
     let output = if result.ok {
         result.layer_digest
@@ -260,7 +260,6 @@ pub(super) fn lower_view(
     } else {
         args.lower.clone()
     };
-    let stack = super::MountLowerStack::read(&lowers, false)?;
     let mut options = ratarmount_core::OpenOptions {
         write_index: false,
         index_in_memory: true,
@@ -275,7 +274,9 @@ pub(super) fn lower_view(
     )
     .map_err(|e| e.to_string())?
     .source;
-    ratarmount_compositing::compose_stack(source, &stack.layers).map_err(|e| e.to_string())
+    // Offline: bundle lowers are verified against this base, never trusted by
+    // a previous verification (no strong key here).
+    super::MountLowerStack::open(source, None, &lowers, false).map(|(_, view)| view)
 }
 
 pub fn pack(args: &PackArgs) -> Result<(String, i32), String> {
