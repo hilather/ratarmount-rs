@@ -1259,6 +1259,15 @@ struct MountLowerStack {
 }
 
 impl MountLowerStack {
+    /// Open the same sealed lower stack used by the mount CLI for offline consumers.
+    pub(crate) fn compose(
+        base: Arc<dyn ratarmount_core::MountSource>,
+        paths: &[PathBuf],
+    ) -> std::io::Result<Arc<dyn ratarmount_core::MountSource>> {
+        let stack = Self::read(paths, false).map_err(std::io::Error::other)?;
+        ratarmount_compositing::compose_stack(base, &stack.layers)
+    }
+
     fn read(paths: &[PathBuf], allow_unsealed: bool) -> Result<Self, String> {
         use ratarmount_compositing::{Immutability, LowerLayerRecord, OverlayMeta};
         let mut stack = Self {
@@ -1427,7 +1436,7 @@ fn main() {
     if let Some(command) = &args.sandbox_api {
         if let Err(error) = sandbox::run(command) {
             eprintln!("sandbox: {error}");
-            std::process::exit(1);
+            std::process::exit(sandbox::error_exit_code(command));
         }
         return;
     }

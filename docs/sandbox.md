@@ -1088,3 +1088,78 @@ layer is unpacked once into
 `~/.cache/ratarmount/layers/`). Publication is atomic. Later mounts reuse the
 cached sealed directory after checking its immutable database and sentinel;
 a damaged cache entry is refused. Directory lowers continue to work normally.
+
+## `sandbox run`: one command in a container
+
+`ratarmount sandbox run` mounts a base and optional sealed lowers, runs an OCI
+container, then unmounts and finalizes the writable top. It is independent of the
+sandbox daemon and does not require `--socket`.
+
+```bash
+ratarmount sandbox run --base source.tar.zst --lower prepared \
+  --top attempt --image busybox --network none \
+  --readonly 'tests/**' --allow 'tests/agent/**' --quota 1G \
+  --timeout 120 --journal --seal --pack attempt.tar.zst --json \
+  -- sh -c 'printf "hello\n" > result.txt'
+```
+
+Repeat `--lower`, `--readonly`, `--allow`, and `--env K=V` for multiple values.
+The default container working directory and bind destination are `/repo`; change
+both with `--bind /path`. `--cpus N` and `--memory SIZE` are passed to the runtime.
+`--network` accepts `none` (default), `bridge`, or `host`. The command runs as the
+calling user's UID/GID. Docker is preferred, then Podman, unless `--runtime`
+selects one. `RATARMOUNT_SANDBOX_RUNTIME=/absolute/path/to/executable` overrides
+that selection, including for the in-tree test stub. The runtime must use the
+local host's mount namespace; a remote Docker daemon cannot bind this mount.
+Non-root FUSE mounts require `user_allow_other` in `/etc/fuse.conf`; the command
+checks this before mounting and reports the existing actionable diagnostic.
+
+Stdout contains exactly one JSON object. Container stdout/stderr goes to stderr;
+`--json` suppresses harness progress messages. The report contains `exit_code`,
+`timed_out`, `interrupted`, `wall_time_s`, `patch_hash`, `manifest_path`,
+`journal_summary`, `overlay`, `bundle`, `erofs_denied`, `bytes_written`, and
+`fsck_result`. `patch_hash` has the same fields as `diff --hash --json`, using
+strict normalization, SHA-256, and no excludes. `bytes_written` is the final
+logical overlay payload size, not cumulative I/O. `erofs_denied` comes from the
+mount's control status before unmount. Manifest and journal artifacts live next
+to the top: `<top>.manifest.jsonl`, `<top>.journal.jsonl`, and
+`<top>.journal.summary.json`. The summary report contains its path and counts of
+files read, read then written, and written blind. Without `--journal`, it is null;
+without `--pack`, `bundle` is null.
+
+The harness returns status **0** when the pipeline completes, even if the command
+fails. Inspect `exit_code` for the command result. A timeout kills the container
+and reports 124 with `timed_out: true`. SIGINT/SIGTERM kills the container,
+unmounts, and finalizes the overlay with `interrupted: true` and exit code
+128 + signal. Harness failures return **2** with a JSON error object. A mount
+that fails to become ready within 60 seconds reports captured child diagnostics.
+Unmount and child termination waits are bounded. After all overlay writers exit,
+the command runs `fsck --repair`, optionally seals, optionally packs, and writes
+the hash and manifest. `--pack` implies `--seal`.
+
+`--tmpfs` uses the same private, verified tmpfs allocator as `--overlay-tmpfs`
+(`/dev/shm`, falling back to `$XDG_RUNTIME_DIR` on Linux). It requires an absent
+or empty `--top`. After unmount, the harness copies the RAM overlay, including
+its database, file modes, and symlinks, into `--top`, then removes the RAM copy.
+This preserves the data for fsck/seal/pack; the child does not use the automatic
+throwaway-directory cleanup of a standalone `--overlay-tmpfs` mount. A machine
+reboot loses an unfinished RAM overlay.
+
+Crash recovery uses `<TOP>/../.<topname>.ratarmount-run.pid`, outside the layer.
+The JSON records the supervisor PID and process start time, mount child, runtime
+client, mountpoint, runtime executable, container name, and optional RAM directory.
+On Linux, child processes also receive a kernel parent-death signal, closing the
+window between spawning a child and recording its PID. A sibling `.lock`
+file remains as a stable advisory-lock inode to serialize runs on the same top.
+After SIGKILL, a subsequent run stops the recorded container, detaches the stale
+mount, stops the recorded mount child if its process identity still matches,
+waits for the database lock to clear, and recovers a RAM copy if present. Failed
+cleanup retains the record for retry. Recovery requires the recorded runtime to
+remain executable. Reusing a sealed top requires explicitly unsealing it first;
+for independent episodes, choose a fresh top over the same sealed lower.
+
+Tests use `test-harness/sandbox-run/runtime.sh`, a Bash runtime stand-in that
+executes commands inside the bind path with a separate process group. Run
+`cargo test -p ratarmount --test sandbox_run` on a host with FUSE and
+`user_allow_other`. Set `RATARMOUNT_TEST_DOCKER=1` to also exercise a real local
+Docker daemon with the `busybox` image.
