@@ -389,15 +389,15 @@ pub(super) fn gate_base(
     if meta.base_digest_kind().is_none_or(|k| k == "none") {
         return Ok(None);
     }
-    let git_tree = if meta.get("base_git_tree").is_some() {
-        let mut options = ratarmount_core::OpenOptions {
-            git: true,
-            ..Default::default()
-        };
-        super::overlay_cmd::pin_git_base(&mut [base.to_path_buf()], &mut options)?
-    } else {
-        None
+    // Classify the base actually given, whatever kind the overlay recorded: a
+    // `git://` URL, `repo@rev` or bare repository is Git; a plain path is Git
+    // only when the overlay recorded Git and the path is a repository. The
+    // tree is a lookup, nothing is hashed.
+    let mut options = ratarmount_core::OpenOptions {
+        git: meta.get("base_git_tree").is_some() && ratarmount_formats_git::looks_like_git(base),
+        ..Default::default()
     };
+    let git_tree = super::overlay_cmd::pin_git_base(&mut [base.to_path_buf()], &mut options)?;
     let index = meta.get("base_index_path").map(PathBuf::from).or_else(|| {
         base.is_file()
             .then(|| ratarmount_index::default_index_path(base))

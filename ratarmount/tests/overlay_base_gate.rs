@@ -569,3 +569,95 @@ fn regression_forced_seal_under_symlinked_parent() {
     assert!(meta_of(&overlay).layer_sealed());
     assert!(meta_of(&overlay).get("base_mismatch_forced_at").is_some());
 }
+
+/// A one-commit repository; returns `git://<repo>#<commit>` and the tree id.
+fn git_base(env: &Env, name: &str) -> (String, String) {
+    let dir = env.path(name);
+    let repo = git2::Repository::init(&dir).unwrap();
+    let sig = git2::Signature::new("t", "t@t", &git2::Time::new(0, 0)).unwrap();
+    let blob = repo.blob(b"git content\n").unwrap();
+    let mut builder = repo.treebuilder(None).unwrap();
+    builder.insert("a.txt", blob, 0o100644).unwrap();
+    let tree_id = builder.write().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let commit = repo
+        .commit(Some("HEAD"), &sig, &sig, "c", &tree, &[])
+        .unwrap();
+    (
+        format!("git://{}#{commit}", dir.display()),
+        tree_id.to_string(),
+    )
+}
+
+/// Regression (R4-S12): the Git tree was resolved only when the overlay had
+/// recorded a Git base, so an overlay made over a directory sealed, packed and
+/// diffed against `git:///repo#rev` found no mismatch (seal kept the
+/// directory's identity, `--force-base-mismatch` did nothing). A kind change is
+/// a mismatch; forced, the Git tree is recorded and the directory rows go.
+#[test]
+fn regression_directory_overlay_against_git_base_is_refused_then_forced() {
+    for v in VERBS {
+        let env = Env::new();
+        let (_dir, overlay) = fixture(&env, Kind::Dir, !matches!(v, Verb::Seal));
+        let (url, tree) = git_base(&env, "repo");
+        let out = verb(&env, v, &overlay, Path::new(&url), &[]);
+        refused(&out);
+        assert!(!env.path("bundle.tar.zst").exists(), "{v:?} wrote a bundle");
+        if matches!(v, Verb::Seal) {
+            assert!(!meta_of(&overlay).layer_sealed());
+            let out = verb(
+                &env,
+                v,
+                &overlay,
+                Path::new(&url),
+                &["--force-base-mismatch"],
+            );
+            assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+            let meta = meta_of(&overlay);
+            assert_eq!(meta.get("base_git_tree"), Some(tree.as_str()));
+            assert_eq!(
+                meta.base_digest(),
+                Some(format!("git-tree:{tree}").as_str())
+            );
+            assert!(meta.get("base_weak_digest").is_none());
+        }
+    }
+    // `--lower` mount path.
+    let env = Env::new();
+    let (_dir, overlay) = fixture(&env, Kind::Dir, true);
+    let (url, _) = git_base(&env, "repo");
+    let out = env.run(&["--no-mount", "--lower", s(&overlay), &url]);
+    assert!(!out.status.success(), "git accepted: {}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--force-stack-mismatch"),
+        "{}",
+        text(&out)
+    );
+}
+
+/// The reverse: a Git-recorded overlay against a directory is refused.
+#[test]
+fn regression_git_overlay_against_directory_base_is_refused() {
+    for v in VERBS {
+        let env = Env::new();
+        let (url, _) = git_base(&env, "repo");
+        let overlay = env.path("overlay");
+        env.ok(&["--no-mount", "-w", s(&overlay), &url]);
+        if !matches!(v, Verb::Seal) {
+            env.ok(&["overlay", "seal", s(&overlay)]);
+        }
+        let dir = env.path("plain");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.txt"), b"git content\n").unwrap();
+        refused(&verb(&env, v, &overlay, &dir, &[]));
+    }
+    let env = Env::new();
+    let (url, _) = git_base(&env, "repo");
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), &url]);
+    env.ok(&["overlay", "seal", s(&overlay)]);
+    let dir = env.path("plain");
+    fs::create_dir(&dir).unwrap();
+    let out = env.run(&["--no-mount", "--lower", s(&overlay), s(&dir)]);
+    assert!(!out.status.success(), "dir accepted: {}", text(&out));
+}
