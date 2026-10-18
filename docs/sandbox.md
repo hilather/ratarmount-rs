@@ -288,6 +288,92 @@ digest or sealed state. Library callers using `WriteOverlay::new` without
 creation context create version 2 metadata with digest kind `none`; callers
 that know the base should use `new_with_create_info`.
 
+## Layered overlays
+
+Use repeated `--lower DIR` arguments in bottom-to-top order to share prepared
+content across attempts. With `-w TOP`, all writes go to that top; without it,
+the composed mount is read-only. Copy-up reads the composed lower view, including
+files produced by a prepared layer. The highest layer mentioning a path wins:
+a tombstone hides the layers below, and a higher layer can re-create that name.
+
+```sh
+ratarmount --lower prepared -w attempt source.tar mnt/
+ratarmount --lower prepared --lower attempt source.tar inspect/
+ratarmount --lower prepared --overlay-tmpfs=2G source.tar scratch/
+```
+
+Lower layers must have `sealed_at` metadata. `--allow-unsealed-lower` also accepts
+unsealed and legacy overlays; these open read-only without SQLite's immutable
+option and may fail with “in use” if another mount holds the database. They use
+a construction-time row snapshot, so stop writers before using them. Sealed
+lowers use immutable SQLite and can be shared by concurrent mounts.
+
+A new top records absolute lower paths, their ordered layer digests and seal
+timestamps, and `stack_digest`. An unavailable digest or seal timestamp on an
+opted-in unsealed lower is recorded as an empty string. Remounting an existing
+top compares ordered absolute paths and digests, including an omitted lower
+list. A mismatch names both stacks and is refused. `--force-stack-mismatch`
+allows it and records `stack_mismatch_forced_at`; it preserves the original
+stack identity. A sealed top cannot be opened with `-w`, including when using
+`--sandbox`: mount it with `--lower` or unseal it first.
+
+Committing a layered stack is unsupported: `--commit-overlay`, on-exit commit,
+a nonzero commit interval, and rolling commits with `--lower` are refused with
+“commit of a layered stack is not supported; flatten first”. RAM tops are
+supported; the sandbox supervisor API does not yet accept lower stacks.
+
+## fsck
+
+```sh
+ratarmount overlay fsck attempt --json
+ratarmount overlay fsck attempt --repair
+```
+
+Run this after unmounting, especially after a writer was killed before its
+pending database rows were saved. The checker makes one directory walk and one
+`files` scan. Reports contain `missing_content`, `orphan_content`,
+`tombstone_content`, `type_mismatch`, `invalid_path`, `missing_parent`,
+`repaired`, and `result`. Category counts describe the state before repair;
+`repaired` counts resolved findings. Exit codes are 0 for clean or repaired,
+1 for unrepaired inconsistencies, and 2 for an operational error.
+
+Repair removes rows whose content disappeared, inserts orphan entries using
+host mode/mtime/uid/gid, corrects type mismatches, removes content under
+tombstones, and drops malformed path rows. Missing parents of tombstones are
+created where safe. Removal uses directory-relative, no-follow operations;
+symlinks are entries, never traversal paths. Repair does not delete an external
+file named by a corrupt row. Invalid host UTF-8 names are reported as an error.
+Database files, overlay markers, COW/spool staging files and `.ratarmount-sealed`
+are excluded. Existing metadata-only chmod/utime rows for inherited content
+are valid without a host copy. A `files.path` such as `/lib` is the schema's
+mount-relative parent, not a host absolute path.
+
+Unsealed checks record `fsck_at` and `fsck_result` (`ok`, `errors:N`, or
+`repaired:N`). Sealed overlays can be checked without modifying any metadata;
+`--repair` is refused. A database locked by a mount returns “in use”. Repairs
+hold an exclusive SQLite transaction, but host changes and SQLite are not one
+atomic transaction: stop direct host writers and rerun after an interrupted
+repair. A consistency check does not verify content hashes.
+
+## Branching an episode
+
+Once the `overlay seal` command is available, a harness can fork an attempt at
+turn *k* by stopping writers, unmounting, and sealing that attempt. Then each
+branch gets its own writable top over the same ordered lower stack:
+
+```sh
+fusermount3 -u attempt-mnt
+ratarmount overlay fsck attempt-k --repair
+ratarmount overlay seal attempt-k
+ratarmount --lower prepared --lower attempt-k -w branch-a source.tar branch-a-mnt/
+ratarmount --lower prepared --lower attempt-k -w branch-b source.tar branch-b-mnt/
+```
+
+The prepared layer must also be sealed. Branches share the saved filesystem
+state and copy up only what they modify. Shell state, processes, and runtime
+isolation remain the harness's responsibility. Seal/unseal/verify are delivered
+separately from the lower-stack and fsck commands described here.
+
 ## overlay-stats
 
 ```sh
