@@ -794,37 +794,74 @@ fn is_pack_temp_name(name: &str) -> bool {
 /// names of earlier builds cannot be told from other programs' temp files and
 /// are left alone. Best effort.
 fn sweep_pack_temps(parent: &Path) {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(entries) = fs::read_dir(parent) else {
+    // Resolve the caller's path once, then work only relative to the opened
+    // directory: replacing `parent` with a symlink afterwards redirects nothing.
+    let Ok(canonical) = parent.canonicalize() else {
+        return;
+    };
+    let Ok(dir) = open_root(&canonical) else {
+        return;
+    };
+    sweep_pack_temps_in(&dir);
+}
+
+fn sweep_pack_temps_in(dir: &OwnedFd) {
+    let Ok(entries) = Dir::read_from(dir) else {
         return;
     };
     let euid = unsafe { libc::geteuid() };
     for entry in entries.flatten() {
-        if !is_pack_temp_name(&entry.file_name().to_string_lossy()) {
+        let name = entry.file_name();
+        if !name.to_str().ok().is_some_and(is_pack_temp_name) {
             continue;
         }
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
+        let Ok(stat) =
+            ratarmount_compositing::host_stat::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+        else {
             continue;
         };
-        if !meta.is_file() || meta.uid() != euid {
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_uid != euid {
             continue;
         }
-        let old_enough = meta
-            .modified()
-            .ok()
-            .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
-            .is_some_and(|age| age >= PACK_TEMP_MIN_AGE);
+        #[allow(clippy::unnecessary_cast)]
+        let modified = std::time::UNIX_EPOCH
+            + std::time::Duration::new(
+                u64::try_from(stat.st_mtime).unwrap_or(0),
+                u32::try_from(stat.st_mtime_nsec).unwrap_or(0),
+            );
+        let old_enough = std::time::SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age >= PACK_TEMP_MIN_AGE);
         if !old_enough {
             continue;
         }
-        if let Ok(file) = open_nofollow(&path) {
-            if try_flock(&file) {
-                let _ = fs::remove_file(&path);
-            }
+        let Ok(fd) = host::openat(dir, name, regular_flags(), Mode::empty()) else {
+            continue;
+        };
+        let file = File::from(fd);
+        if !try_flock(&file) {
+            continue;
+        }
+        // Still the file that was checked, not one swapped in under the name.
+        let same = ratarmount_compositing::host_stat::fstat(&file)
+            .is_ok_and(|now| now.st_dev == stat.st_dev && now.st_ino == stat.st_ino);
+        if same {
+            let _ = host::unlinkat(dir, name, AtFlags::empty());
         }
     }
 }
+
+/// Whether `name` is a stage directory ratarmount generated: a stage prefix and
+/// the six random alphanumerics `tempfile` appends. `.ratarmount-pack-stage-notes`
+/// is somebody's directory, not ours.
+fn is_stage_name(name: &str) -> bool {
+    STAGE_PREFIXES.iter().any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|random| {
+            random.len() == 6 && random.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+    })
+}
+
 const COPY_PREFIX: &str = ".ratarmount-copy-";
 
 /// Builds before the `.ratarmount-copy-` rename staged bundle copies as
@@ -881,7 +918,7 @@ fn sweep_stale_stages(parent: &Path, sweep_copies: bool) {
             if try_flock(&file) {
                 let _ = fs::remove_file(&path);
             }
-        } else if STAGE_PREFIXES.iter().any(|p| name.starts_with(p)) && name.ends_with(".lock") {
+        } else if name.strip_suffix(".lock").is_some_and(is_stage_name) {
             // Orphan lock whose stage is gone.
             let stage = parent.join(name.trim_end_matches(".lock"));
             if fs::symlink_metadata(&stage).is_err() {
@@ -891,7 +928,7 @@ fn sweep_stale_stages(parent: &Path, sweep_copies: bool) {
                     }
                 }
             }
-        } else if STAGE_PREFIXES.iter().any(|p| name.starts_with(p)) && meta.is_dir() {
+        } else if is_stage_name(&name) && meta.is_dir() {
             let lock = lock_path(&path);
             let held = match open_nofollow(&lock) {
                 Ok(file) => {
@@ -2131,17 +2168,85 @@ mod tests {
         let bundle = f.bundle("b.tar.zst");
         let parent = f.tmp.path().join("work");
         fs::create_dir(&parent).unwrap();
-        let stale = make_stale(&parent, ".ratarmount-unpack-stale", true);
+        let stale = make_stale(&parent, ".ratarmount-unpack-Stale1", true);
         let foreign = make_stale(&parent, "other-stale", false);
         let target = parent.join("target");
         fs::create_dir(&target).unwrap();
         std::os::unix::fs::symlink(&target, parent.join(".ratarmount-unpack-link")).unwrap();
         unpack(&bundle, &parent.join("out")).unwrap();
         assert!(!stale.exists(), "stale stage survived");
-        assert!(!parent.join(".ratarmount-unpack-stale.lock").exists());
+        assert!(!parent.join(".ratarmount-unpack-Stale1.lock").exists());
         assert!(foreign.exists(), "foreign prefix must survive");
         assert!(target.exists());
         assert!(fs::symlink_metadata(parent.join(".ratarmount-unpack-link")).is_ok());
+    }
+
+    /// Regression (R4-S5): the sweep matched stage names by prefix only and
+    /// recursively deleted a user's `.ratarmount-pack-stage-notes/` once it was
+    /// a day old. Only the generated shape (prefix + six alphanumerics) matches.
+    #[test]
+    fn regression_stage_sweep_requires_exact_generated_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day = std::time::Duration::from_secs(3 * 24 * 3600);
+        let old = std::time::SystemTime::now() - day;
+        let mut foreign = Vec::new();
+        for name in [
+            ".ratarmount-pack-stage-notes",
+            ".ratarmount-pack-stage-",
+            ".ratarmount-pack-stage-abc12345",
+            ".ratarmount-unpack-keep",
+            ".ratarmount-layer-a_b123",
+        ] {
+            let dir = tmp.path().join(name);
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("precious"), b"mine").unwrap();
+            File::open(&dir)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+            foreign.push(dir);
+        }
+        let ours = tmp.path().join(".ratarmount-pack-stage-Ab3xY9");
+        fs::create_dir(&ours).unwrap();
+        File::open(&ours)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        sweep_stale_stages(tmp.path(), false);
+        assert!(!ours.exists(), "generated stale stage survived");
+        for dir in foreign {
+            assert!(dir.join("precious").exists(), "{dir:?} was swept");
+        }
+    }
+
+    /// Regression (R4-S5): the pack-temp sweep unlinked through the parent
+    /// pathname after taking the flock; replacing the parent with a symlink
+    /// then deleted a same-named file in another directory. Cleanup is relative
+    /// to the directory opened once.
+    #[test]
+    fn regression_pack_temp_sweep_is_directory_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let decoy = tmp.path().join("decoy");
+        fs::create_dir(&out).unwrap();
+        fs::create_dir(&decoy).unwrap();
+        let name = ".ratarmount-pack-Ab3xY9.tmp";
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for dir in [&out, &decoy] {
+            let file = File::create(dir.join(name)).unwrap();
+            file.set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let pinned = open_root(&out).unwrap();
+        // The parent path now names the decoy.
+        fs::rename(&out, tmp.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&decoy, &out).unwrap();
+        sweep_pack_temps_in(&pinned);
+        assert!(
+            decoy.join(name).exists(),
+            "deleted through the swapped path"
+        );
+        assert!(!tmp.path().join("moved").join(name).exists());
     }
 
     /// Regression: a stage whose lock another process holds is never swept,
@@ -2170,7 +2275,7 @@ mod tests {
         let bundle = f.bundle("b.tar.zst");
         let cache = f.tmp.path().join("cache");
         fs::create_dir(&cache).unwrap();
-        let stale = make_stale(&cache, ".ratarmount-layer-stale", true);
+        let stale = make_stale(&cache, ".ratarmount-layer-Stale1", true);
         let active = make_stale(&cache, ".ratarmount-layer-active", true);
         let _held = hold_lock(&cache.join(".ratarmount-layer-active.lock"));
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
@@ -2190,7 +2295,7 @@ mod tests {
         let _live = hold_lock(&live_copy);
         cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
         assert!(!stale.exists());
-        assert!(!cache.join(".ratarmount-layer-stale.lock").exists());
+        assert!(!cache.join(".ratarmount-layer-Stale1.lock").exists());
         assert!(!dead_copy.exists());
         assert!(active.exists());
         assert!(live_copy.exists());
