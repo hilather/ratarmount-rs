@@ -785,17 +785,26 @@ fn parse_erofs_denied(status: &str) -> io::Result<u64> {
 pub fn run(args: &RunArgs) -> io::Result<()> {
     let _signals = Signals::install()?;
     let result = pipeline(args);
+    let interrupted = SIGNAL.load(Ordering::Relaxed) != 0;
+    report_result(result, interrupted, &mut io::stdout().lock())
+}
+
+/// Write the JSON report and return the pipeline's result to `main`. The error
+/// also goes to `main`, which prints it to stderr: it must not carry a signed
+/// URL a library put in its text (finish() reopens the base).
+fn report_result(
+    result: io::Result<Value>,
+    interrupted: bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let value = match &result {
         Ok(report) => report.clone(),
         Err(error) => {
-            json!({"error":ratarmount_core::redact_urls_in_text(&error.to_string()), "interrupted":SIGNAL.load(Ordering::Relaxed) != 0})
+            json!({"error":ratarmount_core::redact_urls_in_text(&error.to_string()), "interrupted":interrupted})
         }
     };
-    let mut out = io::stdout().lock();
-    serde_json::to_writer(&mut out, &value)?;
+    serde_json::to_writer(&mut *out, &value)?;
     writeln!(out)?;
-    // The error also goes to `main`, which prints it to stderr: it must not
-    // carry a signed URL a library put in its text (finish() reopens the base).
     result.map(|_| ()).map_err(redacted_error)
 }
 
@@ -1063,6 +1072,25 @@ mod tests {
             assert!(!text.contains(secret), "{text}");
         }
         assert!(text.contains("403"), "{text}");
+    }
+
+    /// Regression: the error `run` returns to `main` (printed on stderr) must
+    /// be redacted at the return boundary itself, not only in the JSON report.
+    #[test]
+    fn regression_run_return_boundary_redacts_error() {
+        let raw = io::Error::other(
+            "http: HTTP 403 for http://u:s3cr3t@127.0.0.1:1/f.tar?token=deadbeef&X-Amz-Signature=abc",
+        );
+        let mut report = Vec::new();
+        let error = report_result(Err(raw), false, &mut report).unwrap_err();
+        let (returned, printed) = (error.to_string(), String::from_utf8(report).unwrap());
+        for secret in ["s3cr3t", "deadbeef", "X-Amz-Signature=abc"] {
+            assert!(!returned.contains(secret), "returned: {returned}");
+            assert!(!printed.contains(secret), "report: {printed}");
+        }
+        assert!(returned.contains("403"), "{returned}");
+        let ok = report_result(Ok(json!({"a":1})), false, &mut Vec::new());
+        assert!(ok.is_ok());
     }
 
     fn args(extra: &[&str]) -> RunArgs {
