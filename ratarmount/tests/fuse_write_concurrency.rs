@@ -526,10 +526,9 @@ impl MountGuard {
     }
 
     fn graceful_unmount(&mut self) -> Result<(), String> {
-        if !run_fusermount(&["-u"], &self.mnt, UNMOUNT_DEADLINE) {
+        if let Err(e) = graceful_fusermount_u(&self.mnt) {
             return Err(format!(
-                "fusermount3 -u {} did not succeed within 10s (daemon pid {})\n{}",
-                self.mnt.display(),
+                "{e} (daemon pid {})\n{}",
                 self.daemon_pid,
                 tail(&self.daemon_log)
             ));
@@ -607,6 +606,58 @@ fn mount_visible(mnt: &Path) -> bool {
     let want = mnt.to_string_lossy();
     text.lines()
         .any(|line| line.split_whitespace().nth(4).is_some_and(|mp| mp == want))
+}
+
+/// How long a graceful unmount keeps retrying a busy mount (desktop watchers such as
+/// gvfsd-trash probe each new mount). Separate from the per-attempt `UNMOUNT_DEADLINE`.
+const BUSY_RETRY: Duration = Duration::from_secs(1);
+
+/// EBUSY from fusermount: stderr ends with the strerror (`failed to unmount <path>: <strerror>`),
+/// so the echoed mountpoint is never inspected.
+fn stderr_is_busy(stderr: &str) -> bool {
+    stderr.trim_end().ends_with(": Device or resource busy")
+}
+
+/// `fusermount3 -u` with stderr captured, retried every 50 ms while it reports
+/// "Device or resource busy". Never lazy: a mount that stays busy fails the test.
+fn graceful_fusermount_u(mnt: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + BUSY_RETRY;
+    loop {
+        let mut cmd = Command::new("fusermount3");
+        cmd.arg("-u")
+            .arg(mnt)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = cmd.spawn().map_err(|e| format!("spawn fusermount3: {e}"))?;
+        let pgid = i32::try_from(child.id()).unwrap_or(0);
+        let Some(st) = reap_child(&mut child, UNMOUNT_DEADLINE) else {
+            kill_process_group(pgid);
+            signal_kill_pid(child.id());
+            let _ = reap_child(&mut child, KILL_REAP);
+            return Err(format!(
+                "fusermount3 -u {} did not finish within {UNMOUNT_DEADLINE:?}",
+                mnt.display()
+            ));
+        };
+        if st.success() {
+            return Ok(());
+        }
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = io::Read::read_to_string(&mut pipe, &mut stderr);
+        }
+        if !stderr_is_busy(&stderr) || Instant::now() >= deadline {
+            return Err(format!(
+                "fusermount3 -u {} failed ({st}): {}",
+                mnt.display(),
+                stderr.trim()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn run_fusermount(args: &[&str], mnt: &Path, timeout: Duration) -> bool {

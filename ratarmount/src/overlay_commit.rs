@@ -5,7 +5,7 @@
 //! the whole overlay.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,8 +28,15 @@ use ratarmount_nfs::NfsStop;
 const LIVE_COMMIT_WARN_LAST_FRAME: u64 = 64 * 1024 * 1024;
 
 static GOT_TERM: AtomicBool = AtomicBool::new(false);
+/// Last signal number seen by [`on_term_signal`]; 0 until a real signal arrives.
+static TERM_SIGNAL: AtomicI32 = AtomicI32::new(0);
+/// Real signals delivered so far. Lets the unmount watcher tell a new signal from the sticky flag.
+static TERM_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-extern "C" fn on_term_signal(_: libc::c_int) {
+extern "C" fn on_term_signal(sig: libc::c_int) {
+    // Only atomic stores: async-signal-safe.
+    TERM_SIGNAL.store(sig, Ordering::SeqCst);
+    TERM_COUNT.fetch_add(1, Ordering::SeqCst);
     GOT_TERM.store(true, Ordering::SeqCst);
 }
 
@@ -121,16 +128,135 @@ pub fn spawn_signal_export_stops(stops: Vec<Arc<dyn Fn() + Send + Sync>>) {
 /// Watch [`term_requested`] and unmount FUSE so `mount_blocking` returns
 /// (then the caller can `--commit-overlay-on-exit`). Replaces default SIGINT
 /// terminate — without this, Ctrl-C only sets a flag and the mount stays up.
+///
+/// The unmount retries while the mount is briefly busy. SIGTERM, and only
+/// SIGTERM, falls back to a logged lazy unmount if it is still busy after that.
 pub fn spawn_signal_fuse_unmount(mp: PathBuf) {
     thread::Builder::new()
         .name("ratarmount-fuse-signal".into())
         .spawn(move || {
-            while !GOT_TERM.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(50));
-            }
-            let _ = ratarmount_fuse::unmount(&mp);
+            signal_unmount_watcher(
+                &mp,
+                &term_state,
+                &|p| ratarmount_fuse::unmount(p),
+                &|p| ratarmount_fuse::unmount_lazy(p),
+                Duration::from_millis(50),
+            );
         })
         .expect("fuse signal unmount thread");
+}
+
+/// Snapshot of the termination flags.
+struct TermState {
+    count: usize,
+    signal: Option<libc::c_int>,
+    /// [`GOT_TERM`]: set by a signal or by [`request_shutdown`].
+    flagged: bool,
+}
+
+fn term_state() -> TermState {
+    // The handler stores signal, count, then flag. Reading in the reverse order
+    // means a flag seen set implies the count and signal that set it are visible.
+    let flagged = GOT_TERM.load(Ordering::SeqCst);
+    let count = TERM_COUNT.load(Ordering::SeqCst);
+    let signal = TERM_SIGNAL.load(Ordering::SeqCst);
+    TermState {
+        count,
+        signal: (signal != 0).then_some(signal),
+        flagged,
+    }
+}
+
+/// Error payloads are read through `Debug` (tests and diagnostics) only.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum SignalUnmountOutcome {
+    Unmounted,
+    LazyFallback,
+    /// Both the retried unmount and the lazy fallback failed.
+    LazyFailed(std::io::Error, std::io::Error),
+    Failed(std::io::Error),
+    /// No real signal: a programmatic [`request_shutdown`].
+    Skipped,
+}
+
+fn signal_name(sig: libc::c_int) -> String {
+    match sig {
+        libc::SIGTERM => "SIGTERM".to_string(),
+        libc::SIGINT => "SIGINT".to_string(),
+        other => format!("signal {other}"),
+    }
+}
+
+/// One unmount attempt for `signal`. Lazy (`-z`) runs only for SIGTERM and only
+/// when the retried unmount still reported the mount busy.
+fn signal_unmount(
+    mp: &Path,
+    signal: Option<libc::c_int>,
+    unmount: &dyn Fn(&Path) -> std::io::Result<()>,
+    lazy: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> SignalUnmountOutcome {
+    let Some(sig) = signal else {
+        return SignalUnmountOutcome::Skipped;
+    };
+    let name = signal_name(sig);
+    match unmount(mp) {
+        Ok(()) => SignalUnmountOutcome::Unmounted,
+        Err(e) if sig == libc::SIGTERM && e.kind() == std::io::ErrorKind::ResourceBusy => {
+            log::warn!(
+                "{name}: {} still busy after retries ({e}); lazy unmount (fusermount3 -u -z)",
+                mp.display()
+            );
+            match lazy(mp) {
+                Ok(()) => {
+                    log::info!("{name}: lazy unmount of {} succeeded", mp.display());
+                    SignalUnmountOutcome::LazyFallback
+                }
+                Err(lazy_err) => {
+                    log::error!(
+                        "{name}: could not unmount {}: {e}; lazy unmount also failed: {lazy_err}",
+                        mp.display()
+                    );
+                    SignalUnmountOutcome::LazyFailed(e, lazy_err)
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("{name}: unmount of {} failed: {e}", mp.display());
+            SignalUnmountOutcome::Failed(e)
+        }
+    }
+}
+
+/// Run [`signal_unmount`] for each new signal until one ends the attempt
+/// (unmounted or lazy-detached, or both failed). A failed attempt keeps the
+/// watcher alive for the next signal. A programmatic shutdown before any signal
+/// ends it without unmounting.
+fn signal_unmount_watcher(
+    mp: &Path,
+    state: &dyn Fn() -> TermState,
+    unmount: &dyn Fn(&Path) -> std::io::Result<()>,
+    lazy: &dyn Fn(&Path) -> std::io::Result<()>,
+    poll: Duration,
+) {
+    let mut seen = 0;
+    loop {
+        let st = state();
+        // A recorded signal counts as at least one even if the snapshot was torn.
+        let count = st.count.max(usize::from(st.signal.is_some()));
+        if count != seen {
+            seen = count;
+            match signal_unmount(mp, st.signal, unmount, lazy) {
+                SignalUnmountOutcome::Unmounted
+                | SignalUnmountOutcome::LazyFallback
+                | SignalUnmountOutcome::LazyFailed(..) => return,
+                SignalUnmountOutcome::Failed(_) | SignalUnmountOutcome::Skipped => {}
+            }
+        } else if st.flagged && seen == 0 {
+            return;
+        }
+        thread::sleep(poll);
+    }
 }
 
 pub fn spawn_interval_commits(
@@ -1974,20 +2100,171 @@ mod tests {
         assert_eq!(parse_interval("3").unwrap(), Some(Duration::from_secs(3)));
     }
 
+    fn busy() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::ResourceBusy, "busy")
+    }
+
+    /// Records the order of unmount/lazy calls.
+    fn run_signal_unmount(
+        signal: Option<libc::c_int>,
+        unmount: fn() -> std::io::Result<()>,
+        lazy: fn() -> std::io::Result<()>,
+    ) -> (SignalUnmountOutcome, Vec<&'static str>) {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let out = signal_unmount(
+            Path::new("/m"),
+            signal,
+            &|_| {
+                calls.borrow_mut().push("unmount");
+                unmount()
+            },
+            &|_| {
+                calls.borrow_mut().push("lazy");
+                lazy()
+            },
+        );
+        (out, calls.into_inner())
+    }
+
+    /// Regression: SIGTERM on a still-busy mount unmounted once, ignored the error and left it.
     #[test]
-    fn fuse_unmount_watcher_runs_after_term_flag() {
-        let _guard = super::term_flag_test_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let mp = dir.path().join("mnt");
-        std::fs::create_dir_all(&mp).unwrap();
-        set_term_flag_for_test(false);
-        spawn_signal_fuse_unmount(mp);
-        set_term_flag_for_test(true);
-        // Watcher must observe the flag and return (unmount of a non-mount is fine).
-        thread::sleep(Duration::from_millis(200));
-        set_term_flag_for_test(false);
+    fn regression_sigterm_busy_falls_back_to_lazy() {
+        let (out, calls) = run_signal_unmount(Some(libc::SIGTERM), || Err(busy()), || Ok(()));
+        assert!(matches!(out, SignalUnmountOutcome::LazyFallback), "{out:?}");
+        assert_eq!(calls, ["unmount", "lazy"]);
+        let (out, calls) = run_signal_unmount(
+            Some(libc::SIGTERM),
+            || Err(busy()),
+            || Err(std::io::Error::other("no")),
+        );
+        assert!(
+            matches!(out, SignalUnmountOutcome::LazyFailed(..)),
+            "{out:?}"
+        );
+        assert_eq!(calls, ["unmount", "lazy"]);
+    }
+
+    #[test]
+    fn regression_sigterm_not_busy_or_ok_never_lazy() {
+        let (out, calls) = run_signal_unmount(
+            Some(libc::SIGTERM),
+            || Err(std::io::Error::other("not mounted")),
+            || Ok(()),
+        );
+        assert!(matches!(out, SignalUnmountOutcome::Failed(_)), "{out:?}");
+        assert_eq!(calls, ["unmount"]);
+        let (out, calls) = run_signal_unmount(Some(libc::SIGTERM), || Ok(()), || Ok(()));
+        assert!(matches!(out, SignalUnmountOutcome::Unmounted), "{out:?}");
+        assert_eq!(calls, ["unmount"]);
+    }
+
+    /// SIGINT gets the retrying unmount but never `-z`; a programmatic shutdown does nothing.
+    #[test]
+    fn regression_sigint_and_programmatic_never_lazy() {
+        let (out, calls) = run_signal_unmount(Some(libc::SIGINT), || Err(busy()), || Ok(()));
+        assert!(matches!(out, SignalUnmountOutcome::Failed(_)), "{out:?}");
+        assert_eq!(calls, ["unmount"]);
+        let (out, calls) = run_signal_unmount(None, || Err(busy()), || Ok(()));
+        assert!(matches!(out, SignalUnmountOutcome::Skipped), "{out:?}");
+        assert!(calls.is_empty());
+    }
+
+    fn watcher_thread(
+        count: Arc<AtomicUsize>,
+        signal: Arc<AtomicI32>,
+        flagged: Arc<AtomicBool>,
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> std::sync::mpsc::Receiver<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let c = Arc::clone(&calls);
+            let l = Arc::clone(&calls);
+            signal_unmount_watcher(
+                Path::new("/m"),
+                &|| {
+                    let n = count.load(Ordering::SeqCst);
+                    let s = signal.load(Ordering::SeqCst);
+                    TermState {
+                        count: n,
+                        signal: (s != 0).then_some(s),
+                        flagged: flagged.load(Ordering::SeqCst),
+                    }
+                },
+                &move |_| {
+                    c.lock().unwrap().push("unmount");
+                    Err(busy())
+                },
+                &move |_| {
+                    l.lock().unwrap().push("lazy");
+                    Ok(())
+                },
+                Duration::from_millis(2),
+            );
+            let _ = tx.send(());
+        });
+        rx
+    }
+
+    /// Regression: a failed SIGINT attempt must not end the watcher; a later SIGTERM still
+    /// reaches the lazy fallback.
+    #[test]
+    fn regression_signal_watcher_survives_failed_attempt() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let signal = Arc::new(AtomicI32::new(0));
+        let flagged = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done = watcher_thread(
+            Arc::clone(&count),
+            Arc::clone(&signal),
+            Arc::clone(&flagged),
+            Arc::clone(&calls),
+        );
+        signal.store(libc::SIGINT, Ordering::SeqCst);
+        count.store(1, Ordering::SeqCst);
+        flagged.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            done.try_recv().is_err(),
+            "watcher exited after a failed SIGINT"
+        );
+        assert_eq!(*calls.lock().unwrap(), ["unmount"]);
+        signal.store(libc::SIGTERM, Ordering::SeqCst);
+        count.store(2, Ordering::SeqCst);
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("watcher ends after SIGTERM");
+        assert_eq!(*calls.lock().unwrap(), ["unmount", "unmount", "lazy"]);
+    }
+
+    /// Programmatic `request_shutdown` (flag, no signal) ends the watcher without unmounting.
+    #[test]
+    fn regression_signal_watcher_programmatic_shutdown_does_nothing() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done = watcher_thread(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicI32::new(0)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&calls),
+        );
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("watcher ends");
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// Regression: a SIGTERM landing between the watcher's separate reads gave
+    /// `{count: 0, signal: SIGTERM, flagged: true}`; the watcher took the programmatic-shutdown
+    /// exit and dropped the signal. A recorded signal must always be handled.
+    #[test]
+    fn regression_signal_watcher_torn_snapshot_still_unmounts() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done = watcher_thread(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicI32::new(libc::SIGTERM)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&calls),
+        );
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("watcher ends");
+        assert_eq!(*calls.lock().unwrap(), ["unmount", "lazy"]);
     }
 
     fn write_tiny_tar_zst(path: &std::path::Path) {
