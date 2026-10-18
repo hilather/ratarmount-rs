@@ -59,7 +59,7 @@ pub use overlay_meta::{
     record_base_rows_offline, redact_meta_values, resolve_base_excludes,
     resolve_pending_base_digest, stack_digest, verify_base, BaseCheck, BaseComparison,
     BaseDigestRequest, BaseExcludes, BaseProbe, BaseStrength, LowerLayerRecord, OverlayCreateInfo,
-    OverlayMeta, PendingBase,
+    OverlayMeta, PendingBase, BASE_COMPARISON_KEYS,
 };
 pub use overlay_policy::{
     parse_overlay_size, CompositeOverlayPolicy, OverlayQuota, OverlayStats, OverlayUsage,

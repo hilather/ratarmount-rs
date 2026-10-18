@@ -1551,10 +1551,29 @@ pub fn forced_base_record(
     Ok(rows)
 }
 
+/// Every row that compares a base with the overlay's record (not
+/// `base_weak_excludes`: the overlay's own exclusions are not identity, and the
+/// seal's change set depends on them). A forced
+/// seal or pack replaces the record wholesale: rows of the previous base kind
+/// (an archive's stamp, a directory's walk, a Git tree, the old paths) must not
+/// survive to match the old base later.
+pub const BASE_COMPARISON_KEYS: [&str; 6] = [
+    "base_size",
+    "base_mtime_ns",
+    "base_local_path",
+    "base_index_path",
+    "base_weak_digest",
+    "base_git_tree",
+];
+
 impl OverlayMeta {
-    /// A copy with `rows` written over it (a forced pack's bundle metadata).
+    /// A copy with `rows` written over it (a forced pack's bundle metadata),
+    /// after dropping every old comparison row.
     pub fn with_rows(&self, rows: &BTreeMap<String, String>) -> Self {
         let mut values = self.values.clone();
+        for key in BASE_COMPARISON_KEYS {
+            values.remove(key);
+        }
         values.extend(rows.iter().map(|(k, v)| (k.clone(), v.clone())));
         Self { values }
     }
@@ -1567,13 +1586,26 @@ pub fn record_base_rows_offline(overlay: &Path, rows: &BTreeMap<String, String>)
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     conn.busy_timeout(std::time::Duration::ZERO)?;
-    OverlayMeta::set_many(
-        &conn,
-        &rows
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect::<Vec<_>>(),
-    )
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        for key in BASE_COMPARISON_KEYS {
+            OverlayMeta::remove(&conn, key)?;
+        }
+        OverlayMeta::set_many(
+            &conn,
+            &rows
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 fn verify(

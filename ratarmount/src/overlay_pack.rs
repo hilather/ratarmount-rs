@@ -171,6 +171,12 @@ fn sanitized_db(
             .map_err(io::Error::other)?;
         }
     }
+    // Rows the packed metadata no longer has (a forced pack drops the old
+    // base's comparison rows) must not survive in the copy.
+    for key in meta.values().keys().filter(|k| !clean.contains_key(*k)) {
+        conn.execute("DELETE FROM meta WHERE key=?1", [key])
+            .map_err(io::Error::other)?;
+    }
     conn.execute_batch("VACUUM;").map_err(io::Error::other)?;
     drop(conn);
     Ok(Some(copy))

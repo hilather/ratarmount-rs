@@ -439,3 +439,109 @@ fn regression_forced_pack_non_empty_unrelated_edit_round_trips() {
     ]);
     env.ok(&["overlay", "verify", s(&restored), s(&base)]);
 }
+
+fn tar_of(env: &Env, dir: &Path, name: &str) -> PathBuf {
+    let archive = env.path(name);
+    assert!(Command::new("tar")
+        .args(["cf", s(&archive), "-C", s(dir), "x.txt", "y.txt"])
+        .status()
+        .unwrap()
+        .success());
+    archive
+}
+
+/// Regression (R4-S7): a forced seal onto a base of another kind kept the old
+/// kind's comparison rows (A.tar's size/mtime stamp, the old directory's weak
+/// walk), so `--lower O <old base>` later matched the stale stamp and accepted
+/// the wrong base.
+#[test]
+fn regression_forced_seal_clears_obsolete_identity_rows() {
+    // archive -> directory
+    let env = Env::new();
+    let (archive, overlay) = fixture(&env, Kind::Archive, false);
+    let other = env.path("otherdir");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("x.txt"), b"different\n").unwrap();
+    let out = verb(
+        &env,
+        Verb::Seal,
+        &overlay,
+        &other,
+        &["--force-base-mismatch"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let meta = meta_of(&overlay);
+    for key in ["base_size", "base_mtime_ns", "base_local_path"] {
+        assert!(
+            meta.get(key).is_none(),
+            "{key} survived: {:?}",
+            meta.get(key)
+        );
+    }
+    assert!(meta.get("base_weak_digest").is_some());
+    let out = env.run(&["--no-mount", "--lower", s(&overlay), s(&archive)]);
+    assert!(
+        !out.status.success(),
+        "old archive accepted: {}",
+        text(&out)
+    );
+    let out = env.run(&["--no-mount", "--lower", s(&overlay), s(&other)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+
+    // directory -> archive
+    let env = Env::new();
+    let (dir, overlay) = fixture(&env, Kind::Dir, false);
+    let archive = tar_of(&env, &dir, "other.tar");
+    let out = verb(
+        &env,
+        Verb::Seal,
+        &overlay,
+        &archive,
+        &["--force-base-mismatch"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let meta = meta_of(&overlay);
+    assert!(meta.get("base_weak_digest").is_none());
+    assert!(meta.get("base_mtime_ns").is_some());
+    let out = env.run(&["--no-mount", "--lower", s(&overlay), s(&dir)]);
+    assert!(
+        !out.status.success(),
+        "old directory accepted: {}",
+        text(&out)
+    );
+}
+
+/// Same for a forced pack: the bundle's metadata must not keep the old rows.
+#[test]
+fn regression_forced_pack_clears_obsolete_identity_rows() {
+    let env = Env::new();
+    let (archive, overlay) = fixture(&env, Kind::Archive, true);
+    let other = env.path("otherdir");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("x.txt"), b"base content\n").unwrap();
+    let out = verb(
+        &env,
+        Verb::Pack,
+        &overlay,
+        &other,
+        &["--force-base-mismatch"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let restored = env.path("restored");
+    env.ok(&[
+        "overlay",
+        "unpack",
+        s(&env.path("bundle.tar.zst")),
+        s(&restored),
+    ]);
+    let meta = meta_of(&restored);
+    for key in ["base_size", "base_mtime_ns", "base_local_path"] {
+        assert!(meta.get(key).is_none(), "{key} survived");
+    }
+    let out = env.run(&["--no-mount", "--lower", s(&restored), s(&archive)]);
+    assert!(
+        !out.status.success(),
+        "old archive accepted: {}",
+        text(&out)
+    );
+}
