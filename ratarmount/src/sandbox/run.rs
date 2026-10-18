@@ -448,10 +448,18 @@ const MAX_SOCKET_PATH: usize = 100;
 /// when the default temporary directory would make the socket path too long
 /// for `sun_path`.
 fn create_run_dir() -> io::Result<PathBuf> {
+    create_run_dir_in(&std::env::temp_dir())
+}
+
+fn create_run_dir_in(default: &Path) -> io::Result<PathBuf> {
+    // The directory is canonicalized after creation (`run` resolves it), so the
+    // socket length must be judged on the resolved path: a short `TMPDIR`
+    // symlink to a long directory would otherwise overflow `sun_path`.
+    let resolved = default.canonicalize();
+    let default = resolved.as_deref().unwrap_or(default);
     let probe = control_socket_path(Path::new(""), u32::MAX);
     let mut builder = tempfile::Builder::new();
     builder.prefix(RUN_DIR_PREFIX);
-    let default = std::env::temp_dir();
     let long = default.as_os_str().len()
         + format!("/{RUN_DIR_PREFIX}XXXXXX").len()
         + 1
@@ -460,7 +468,7 @@ fn create_run_dir() -> io::Result<PathBuf> {
     let dir = if long {
         builder.tempdir_in("/tmp")?
     } else {
-        builder.tempdir()?
+        builder.tempdir_in(default)?
     };
     // Created with the umask's mode: restrict it before anything is placed
     // inside (the mode is asserted, not assumed).
@@ -1659,6 +1667,32 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(private_parent(&mnt), None);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Regression: the socket-length check measured `TMPDIR` as written, but
+    /// the run directory is canonicalized afterwards, so a short symlink to a
+    /// long directory passed the check and the socket path overflowed
+    /// `sun_path`. The check must use the resolved directory.
+    #[test]
+    fn regression_run_dir_checks_socket_length_after_canonicalizing_tmpdir() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let mut long = root.path().canonicalize().unwrap();
+        while long.as_os_str().len() < 120 {
+            long.push("a_long_directory_component");
+        }
+        fs::create_dir_all(&long).unwrap();
+        let short = root.path().join("s");
+        std::os::unix::fs::symlink(&long, &short).unwrap();
+        assert!(short.as_os_str().len() < 40);
+        let dir = create_run_dir_in(&short).unwrap().canonicalize().unwrap();
+        let socket = control_socket_path(&dir, u32::MAX);
+        assert!(socket.as_os_str().len() <= MAX_SOCKET_PATH, "{socket:?}");
+        assert!(!dir.starts_with(&long), "{dir:?} is under the long dir");
+        fs::remove_dir_all(&dir).unwrap();
+        // A short real directory is still used as is.
+        let direct = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = create_run_dir_in(direct.path()).unwrap();
+        assert!(dir.starts_with(direct.path()), "{dir:?}");
     }
 
     /// Regression: `sandbox run` reads `erofs_denied` from the mount's control
