@@ -605,3 +605,67 @@ fn regression_import_reject_type_change_and_repeated_file_sections() {
     let rejects = fs::read(args.directory.join("type.rej")).unwrap();
     assert_eq!(rejects, b"diff a/type b/type\t(rejected hunks)\n@@ -1 +0,0 @@\n-wrong preimage\n@@ -1 +1 @@\n-also wrong\n+new\n");
 }
+
+/// Stand-in for SIGKILL during the write phase: same create/open path and
+/// marker as `import`, writes the first `n` entries, then returns without
+/// clearing the marker and without the error cleanup (`import` removes the
+/// whole directory on any error, which would hide the marker).
+fn simulate_killed_import(f: &Fixture, args: &ImportArgs, files: &[(&str, &[u8])], n: usize) {
+    fs::create_dir(&args.directory).unwrap();
+    let overlay = super::super::overlay_create::create_overlay(
+        f.source.clone(),
+        &args.directory,
+        OverlayCreateInfo {
+            base_url: args.base.clone(),
+            ..Default::default()
+        },
+        std::slice::from_ref(&f.base),
+        false,
+    )
+    .unwrap();
+    begin_import(&overlay).unwrap();
+    for (path, data) in files.iter().take(n) {
+        write_entry(&overlay, path, data, S_IFREG | 0o644, 1.0).unwrap();
+    }
+    drop(overlay);
+}
+
+/// Regression: a killed `overlay import --no-seal` left a partial overlay that fsck reported clean.
+#[test]
+fn regression_import_killed_midway_leaves_marker() {
+    let f = Fixture::new();
+    let args = f.args("killed");
+    simulate_killed_import(&f, &args, &[("x", b"1\n"), ("y", b"2\n"), ("z", b"3\n")], 2);
+    let meta = OverlayMeta::read(&args.directory).unwrap().unwrap();
+    assert!(meta.get("import_in_progress").is_some());
+    let report = ratarmount_compositing::overlay_fsck::fsck(&args.directory, false).unwrap();
+    assert!(!report.is_clean());
+    assert_eq!(report.import_incomplete, 1);
+    let err = ratarmount_compositing::overlay_seal::seal(&args.directory, f.source.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("import"), "{err}");
+    assert!(!OverlayMeta::read(&args.directory)
+        .unwrap()
+        .unwrap()
+        .layer_sealed());
+}
+
+/// Compatibility: a normal import (unsealed or sealed) leaves no marker.
+#[test]
+fn regression_import_clears_marker_on_success() {
+    let f = Fixture::new();
+    for seal in [false, true] {
+        let mut args = f.args(if seal { "sealed" } else { "unsealed" });
+        args.no_seal = !seal;
+        f.apply(&args, b"--- /dev/null\n+++ b/ok\n@@ -0,0 +1 @@\n+okay\n")
+            .unwrap();
+        let meta = OverlayMeta::read(&args.directory).unwrap().unwrap();
+        assert!(meta.get("import_in_progress").is_none(), "seal={seal}");
+        assert!(
+            ratarmount_compositing::overlay_fsck::fsck(&args.directory, false)
+                .unwrap()
+                .is_clean()
+        );
+    }
+}

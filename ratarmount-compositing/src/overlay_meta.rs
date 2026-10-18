@@ -210,6 +210,12 @@ impl OverlayMeta {
         Self::set_many(conn, &[(key, value)])
     }
 
+    /// Delete one key through the caller's connection.
+    pub fn remove(conn: &Connection, key: &str) -> Result<()> {
+        conn.execute("DELETE FROM meta WHERE key=?1", params![key])?;
+        Ok(())
+    }
+
     /// An atomic batch, also safe within a caller-owned transaction.
     pub fn set_many(conn: &Connection, values: &[(&str, &str)]) -> Result<()> {
         conn.execute_batch("SAVEPOINT overlay_meta_write")?;

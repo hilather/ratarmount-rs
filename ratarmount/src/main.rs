@@ -2447,6 +2447,12 @@ fn main() {
                     ov.set_rolling(series.clone());
                 }
                 ov.set_encoding(&args.encoding);
+                if let Ok(Some(marker)) = ov.meta_value("import_in_progress") {
+                    eprintln!(
+                        "warning: {} holds a partial `overlay import` ({marker}); delete it and import again before sealing",
+                        overlay_path.display()
+                    );
+                }
                 ov.set_manifest_hashes(args.commit_manifest.then(|| args.manifest_hashes.clone()));
                 ov.set_commit_mode(args.commit_overlay_mode.parse().expect("clap commit mode"));
                 if !args.overlay_readonly.is_empty()

@@ -276,3 +276,40 @@ fn regression_import_lower_stack_identity_and_unsealed_opt_in() {
     ratarmount_compositing::overlay_seal::unseal(&dest).unwrap();
     ratarmount_compositing::overlay_seal::unseal(&lower).unwrap();
 }
+
+/// Regression: a killed `overlay import --no-seal` left an overlay that fsck called clean and seal sealed.
+#[test]
+fn regression_seal_refuses_incomplete_import() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let dest = root.path().join("overlay");
+    let patch = b"--- /dev/null\n+++ b/new\n@@ -0,0 +1 @@\n+hello\n";
+    let out = import(&base, &dest, patch, &["--no-seal"]);
+    assert_eq!(out.status.code(), Some(0));
+    // Leave the marker an interrupted import would have left behind.
+    rusqlite::Connection::open(dest.join(".ratarmount.overlay.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO meta(key,value) VALUES('import_in_progress','1:2')",
+            [],
+        )
+        .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+            .env("HOME", root.path())
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .args(["overlay"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let fsck = run(&["fsck", "--json", dest.to_str().unwrap()]);
+    assert_eq!(fsck.status.code(), Some(1), "{fsck:?}");
+    assert!(String::from_utf8_lossy(&fsck.stdout).contains("\"import_incomplete\":1"));
+    let seal = run(&["seal", dest.to_str().unwrap(), base.to_str().unwrap()]);
+    assert_eq!(seal.status.code(), Some(2), "{seal:?}");
+    let err = String::from_utf8_lossy(&seal.stderr);
+    assert!(err.contains("import"), "{err}");
+    assert!(!OverlayMeta::read(&dest).unwrap().unwrap().layer_sealed());
+}

@@ -211,6 +211,12 @@ pub fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutc
         return Err(io::Error::other("overlay was sealed while starting; retry"));
     }
     let report = crate::overlay_fsck::check_connection(&conn, &root, false, false)?;
+    if report.import_incomplete > 0 {
+        return Err(io::Error::other(
+            "overlay import did not finish (import_in_progress is set); \
+             delete the directory and import again",
+        ));
+    }
     if !report.is_clean() {
         return Err(io::Error::other(format!(
             "overlay has {} inconsistencies; run overlay fsck --repair",

@@ -645,6 +645,13 @@ writable. `--json` prints `{ "overlay": "…", "files": N, "rejected": N,
 successfully applied distinct paths (both sides of renames), excluding reject
 files and rejected originals.
 
+While it writes, import sets the `import_in_progress` meta row (`<pid>:<epoch seconds>`)
+and clears it after the last write. A killed import leaves it: `overlay fsck`
+reports `import_incomplete` (exit 1; `--repair` does not clear it, since fsck cannot
+know the import finished), `overlay seal` refuses, and a `-w` mount prints a warning
+but still opens so the partial result can be inspected. Delete the directory and
+import again.
+
 `--max-patch-bytes N` defaults to 268435456 (256 MiB). It bounds input bytes,
 the total retained decoded literals, each reverse literal, and each file's
 preimage/postimage. Import buffers the bounded patch and one file's text at a

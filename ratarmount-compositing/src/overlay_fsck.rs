@@ -25,6 +25,9 @@ pub struct FsckReport {
     pub type_mismatch: usize,
     pub invalid_path: usize,
     pub missing_parent: usize,
+    /// 1 when an `overlay import` was killed before it finished (`import_in_progress`
+    /// meta row). Never repaired: fsck cannot know the import is complete.
+    pub import_incomplete: usize,
     pub repaired: usize,
 }
 
@@ -35,6 +38,7 @@ impl FsckReport {
             + self.type_mismatch
             + self.invalid_path
             + self.missing_parent
+            + self.import_incomplete
     }
 
     pub fn is_clean(&self) -> bool {
@@ -191,6 +195,29 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
     Ok(report)
 }
 
+/// The `import_in_progress` meta row, if the `meta` table exists and has one.
+fn import_marker(conn: &Connection) -> io::Result<Option<String>> {
+    let has_meta: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(io::Error::other)?;
+    if !has_meta {
+        return Ok(None);
+    }
+    match conn.query_row(
+        "SELECT value FROM meta WHERE key='import_in_progress'",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
 // Seal holds its writer reservation across the check, hash and metadata update.
 pub(crate) fn check_connection(
     conn: &Connection,
@@ -225,7 +252,10 @@ pub(crate) fn check_connection(
         .map_err(io::Error::other)?;
     let mut hosts = BTreeMap::new();
     walk_host_entries(root, "", &mut hosts)?;
-    let mut report = FsckReport::default();
+    let mut report = FsckReport {
+        import_incomplete: usize::from(import_marker(conn)?.is_some()),
+        ..Default::default()
+    };
     let mut valid = BTreeMap::new();
     for row in &rows {
         if let Some(path) = relative_path(&row.parent, &row.name, row.metadata_only) {
@@ -317,7 +347,8 @@ pub(crate) fn check_connection(
             };
             fs::unlinkat(&fd, name, flags)?;
         }
-        report.repaired = report.errors();
+        // The import marker is never repaired.
+        report.repaired = report.errors() - report.import_incomplete;
     }
     if !sealed {
         conn.execute_batch(crate::overlay_meta::META_SCHEMA)
@@ -669,5 +700,46 @@ mod tests {
             assert!(fsck(tmp.path(), repair).is_err());
         }
         assert!(!tmp.path().join(HIDDEN_DB).exists());
+    }
+
+    /// Regression: a killed `overlay import --no-seal` left a partial overlay that fsck reported clean.
+    #[test]
+    fn regression_fsck_reports_incomplete_import() {
+        let (_tmp, dir, source) = fixture();
+        let overlay = WriteOverlay::new(source.clone(), &dir).unwrap();
+        overlay
+            .set_meta("import_in_progress", "123:2026-10-18T00:00:00Z")
+            .unwrap();
+        drop(overlay);
+        for repair in [false, true] {
+            let report = fsck(&dir, repair).unwrap();
+            assert!(!report.is_clean(), "repair={repair}: {}", report.result());
+            assert_eq!(report.import_incomplete, 1);
+            assert!(report.result().starts_with("errors:"));
+        }
+        // --repair cannot know the import finished: the marker stays.
+        assert_eq!(
+            OverlayMeta::read(&dir)
+                .unwrap()
+                .unwrap()
+                .get("import_in_progress"),
+            Some("123:2026-10-18T00:00:00Z")
+        );
+        // Seal refuses, naming the import rather than suggesting fsck --repair.
+        let err = crate::overlay_seal::seal(&dir, source)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("import"), "{err}");
+        assert!(!err.contains("fsck --repair"), "{err}");
+    }
+
+    /// Compatibility: no marker (or a cleared one) is clean.
+    #[test]
+    fn regression_fsck_cleared_import_marker_is_clean() {
+        let (_tmp, dir, _source) = fixture();
+        db(&dir)
+            .execute("DELETE FROM meta WHERE key='import_in_progress'", [])
+            .unwrap();
+        assert!(fsck(&dir, false).unwrap().is_clean());
     }
 }

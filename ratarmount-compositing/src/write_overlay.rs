@@ -2950,6 +2950,12 @@ impl WriteOverlay {
         crate::overlay_meta::OverlayMeta::set(&db, key, value)
     }
 
+    /// Remove one overlay-level `meta` key (no error when absent).
+    pub fn clear_meta(&self, key: &str) -> Result<()> {
+        let db = self.db.lock().expect("overlay db");
+        crate::overlay_meta::OverlayMeta::remove(&db, key)
+    }
+
     /// Change metadata through the same policy gate as data writes. Archive-only
     /// members retain their original read cookie and never copy payload data.
     pub fn set_metadata(&self, path: &str, attrs: &OverlayMetadata) -> Result<()> {

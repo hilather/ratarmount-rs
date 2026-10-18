@@ -199,6 +199,7 @@ fn import(
             false,
         )
         .map_err(|e| e.to_string())?;
+        begin_import(&overlay)?;
         let mut written = BTreeSet::new();
         let mut rejected = BTreeSet::new();
         let mut rejects: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -298,6 +299,7 @@ fn import(
             check_parents(&overlay, stack.source.as_ref(), &name)?;
             write_entry(&overlay, &name, &reject, S_IFREG | 0o644, time)?;
         }
+        finish_import(&overlay)?;
         drop(overlay); // seal requires the exclusive WriteOverlay connection closed.
         let digest = if args.no_seal {
             None
@@ -334,6 +336,27 @@ fn import(
         }
     }
     result
+}
+
+/// Mark the overlay as partially written before the first entry; a SIGKILL
+/// leaves the row, `overlay fsck` reports `import_incomplete` and `seal` refuses.
+fn begin_import(overlay: &WriteOverlay) -> Result<(), String> {
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    overlay
+        .set_meta(
+            "import_in_progress",
+            &format!("{}:{started}", std::process::id()),
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Clear the marker after the last write, before the overlay closes or seals.
+fn finish_import(overlay: &WriteOverlay) -> Result<(), String> {
+    overlay
+        .clear_meta("import_in_progress")
+        .map_err(|e| e.to_string())
 }
 
 fn check_parents(
