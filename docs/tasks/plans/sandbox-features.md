@@ -141,3 +141,4 @@ wave 0:  META ─┬─────────────┬──────
 | Kernel overlayfs interop (done-when #9) | Pass: ratarmount stack as `lowerdir` in `unshare -Urm`, build ran, imported upperdir manifest == kernel merged view | Linux 7.2.5, unprivileged, 2026-10-17 |
 | End-to-end scenario (git snapshot → prepared `make` → sealed lower → attempt → diff/apply/tree-equal → strict hash equality → import round trip → seal/verify/tamper → fsck → journal marks → pack/unpack) | Pass, no mounts left | Linux 7.2.5, debug build, 2026-10-17 |
 | `sandbox run` with real Docker (busybox) | Pass (`RATARMOUNT_TEST_DOCKER=1`) | Docker 29.7.2 |
+| `diff --manifest` / `--hash` over a 1 GiB sparse modified file (release) | 5.1 s / 4.6 s (~210 MB/s) | Load average ~13; the ignored 10 GiB test's 1,029 s was a debug build |
