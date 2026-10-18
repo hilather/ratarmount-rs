@@ -1291,27 +1291,45 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
 /// identity and its index only covers the first, and a supplied
 /// `--base-digest` is just the caller's unchecked claim, so it never keys a
 /// marker. Any option that reshapes the mounted view (see
-/// [`mounted_view_is_default`]) also disables markers: the archive's digest
-/// says nothing about the paths the bundle is verified against then.
+/// [`mounted_view_is_default`]) disables markers (the caller never asks), and
+/// the listing options of [`mounted_view_key`] are appended to the digest so a
+/// check made under one listing never serves another.
 /// Computed only when a `--lower` bundle needs it.
 fn lower_base_key(
     bases: &[PathBuf],
     index: Option<&Path>,
     lowers: &[PathBuf],
-    default_view: bool,
+    view_key: &str,
 ) -> Option<String> {
     let [base] = bases else {
         return None;
     };
-    if !default_view {
-        return None;
-    }
     if !lowers.iter().any(|p| p.is_file()) || !base.is_file() {
         return None;
     }
-    ratarmount_index::peek_archive_digest(base, index)
+    let digest = ratarmount_index::peek_archive_digest(base, index)
         .ok()
-        .flatten()
+        .flatten()?;
+    Some(format!("{digest}.{view_key}"))
+}
+
+/// The options that change which members an archive lists or how their paths
+/// are synthesized (file-version folders, zero-block handling, GNU incremental
+/// stripping, name encoding). They are part of the marker key itself, so a
+/// verification made under one listing is never reused under another. A new
+/// listing option must be added here.
+fn mounted_view_key(args: &Args) -> String {
+    format!(
+        "fv{}.iz{}.gi{}.dgi{}.enc-{}",
+        u8::from(!args.no_file_versions),
+        u8::from(args.ignore_zeros),
+        u8::from(args.gnu_incremental),
+        u8::from(args.detect_gnu_incremental),
+        args.encoding
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    )
 }
 
 /// Whether the mount serves the base's paths unchanged, so a bundle verified
@@ -2383,12 +2401,16 @@ fn main() {
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
-    let lower_key = lower_base_key(
-        &inputs,
-        index_sidecar.as_deref(),
-        &args.lower,
-        mounted_view_is_default(&args, rolling.is_some()),
-    );
+    let lower_key = mounted_view_is_default(&args, rolling.is_some())
+        .then(|| {
+            lower_base_key(
+                &inputs,
+                index_sidecar.as_deref(),
+                &args.lower,
+                &mounted_view_key(&args),
+            )
+        })
+        .flatten();
     let lower_identity = BaseIdentity::Enforce {
         base: MountedBase {
             extra_excludes: lower_extra_excludes(
@@ -8604,9 +8626,9 @@ mod lower_marker_key_tests {
         let bundle = dir.path().join("l.tar.zst");
         std::fs::write(&bundle, b"x").unwrap();
         let lowers = [bundle];
-        let key = |inputs: &[PathBuf]| lower_base_key(inputs, Some(&index), &lowers, true);
+        let key = |inputs: &[PathBuf]| lower_base_key(inputs, Some(&index), &lowers, "v");
         // One archive: keyed by its cached digest.
-        assert_eq!(key(std::slice::from_ref(&a)), Some(digest.clone()));
+        assert_eq!(key(std::slice::from_ref(&a)), Some(format!("{digest}.v")));
         // A directory beside it has no computed strong identity: no marker, so
         // every use verifies against the union as it is now.
         assert_eq!(key(&[a.clone(), b.clone()]), None);
@@ -8625,12 +8647,12 @@ mod lower_marker_key_tests {
         std::fs::write(&bundle, b"x").unwrap();
         let lowers = [bundle];
         assert_eq!(
-            lower_base_key(&[a_dir(dir.path())], None, &lowers, true),
+            lower_base_key(&[a_dir(dir.path())], None, &lowers, "v"),
             None
         );
         let bare = dir.path().join("bare.tar");
         std::fs::write(&bare, b"zz").unwrap();
-        assert_eq!(lower_base_key(&[bare], None, &lowers, true), None);
+        assert_eq!(lower_base_key(&[bare], None, &lowers, "v"), None);
     }
 
     /// Regression: a marker cached for the plain view skipped verification when
@@ -8650,14 +8672,22 @@ mod lower_marker_key_tests {
             Args::try_parse_from(argv).unwrap()
         };
         let key = |extra: &[&str]| {
-            lower_base_key(
-                std::slice::from_ref(&a),
-                Some(&index),
-                &lowers,
-                mounted_view_is_default(&parse(extra), false),
-            )
+            let args = parse(extra);
+            mounted_view_is_default(&args, false)
+                .then(|| {
+                    lower_base_key(
+                        std::slice::from_ref(&a),
+                        Some(&index),
+                        &lowers,
+                        &mounted_view_key(&args),
+                    )
+                })
+                .flatten()
         };
-        assert_eq!(key(&[]), Some(digest));
+        assert_eq!(
+            key(&[]),
+            Some(format!("{digest}.{}", mounted_view_key(&parse(&[]))))
+        );
         for extra in [
             &["--prefix", "p"][..],
             &["--transform", "a", "b"],
@@ -8671,6 +8701,49 @@ mod lower_marker_key_tests {
             assert_eq!(key(extra), None, "{extra:?}");
         }
         assert!(!mounted_view_is_default(&parse(&[]), true));
+    }
+
+    /// Regression: the marker key ignored `--no-file-versions`, `--ignore-zeros`
+    /// and the GNU-incremental options, so a bundle verified with
+    /// `f.versions/1` hidden was trusted on a normal remount where the base
+    /// synthesizes that path. Every listing option must change the key.
+    #[test]
+    fn regression_marker_key_covers_listing_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, index, digest) = cached_archive(dir.path(), "a.tar", b"aaaa");
+        let bundle = dir.path().join("l.tar.zst");
+        std::fs::write(&bundle, b"x").unwrap();
+        let lowers = [bundle];
+        let key = |extra: &[&str]| {
+            let mut argv = vec!["ratarmount"];
+            argv.extend_from_slice(extra);
+            argv.push("a.tar");
+            let args = Args::try_parse_from(argv).unwrap();
+            assert!(mounted_view_is_default(&args, false));
+            lower_base_key(
+                std::slice::from_ref(&a),
+                Some(&index),
+                &lowers,
+                &mounted_view_key(&args),
+            )
+            .unwrap()
+        };
+        let plain = key(&[]);
+        assert!(plain.starts_with(&digest), "{plain}");
+        let mut seen = vec![plain.clone()];
+        for extra in [
+            &["--no-file-versions"][..],
+            &["--ignore-zeros"],
+            &["--gnu-incremental"],
+            &["--detect-gnu-incremental"],
+            &["--encoding", "latin1"],
+        ] {
+            let k = key(extra);
+            assert!(!seen.contains(&k), "{extra:?} reuses a key: {k}");
+            seen.push(k);
+        }
+        // `--file-versions` is the default and keeps the plain key.
+        assert_eq!(key(&["--file-versions"]), plain);
     }
 
     fn a_dir(parent: &Path) -> PathBuf {
