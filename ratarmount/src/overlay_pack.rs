@@ -733,6 +733,18 @@ fn open_nofollow(path: &Path) -> io::Result<File> {
 const STAGE_PREFIXES: [&str; 2] = [".ratarmount-unpack-", ".ratarmount-layer-"];
 const COPY_PREFIX: &str = ".ratarmount-copy-";
 
+/// Builds before the `.ratarmount-copy-` rename staged bundle copies as
+/// `.copy-` + tempfile's six random alphanumerics + `.tar.zst`. Only that exact
+/// shape is swept, and only inside the layer cache, so a user's own `.copy-*`
+/// files never match.
+fn is_legacy_copy_name(name: &str) -> bool {
+    name.strip_prefix(".copy-")
+        .and_then(|rest| rest.strip_suffix(".tar.zst"))
+        .is_some_and(|random| {
+            random.len() == 6 && random.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+}
+
 /// Remove staging left by killed processes. Only our own prefixes, owned by
 /// us, never symlinks. A stage is abandoned when its sibling lock can be
 /// taken; no mtime heuristic is used for stages with a lock (the root mtime
@@ -760,7 +772,10 @@ fn sweep_stale_stages(parent: &Path, sweep_copies: bool) {
         if meta.file_type().is_symlink() || meta.uid() != euid {
             continue;
         }
-        if sweep_copies && name.starts_with(COPY_PREFIX) && meta.is_file() {
+        if sweep_copies
+            && (name.starts_with(COPY_PREFIX) || is_legacy_copy_name(&name))
+            && meta.is_file()
+        {
             // A copy being written has a fresh mtime; the age check closes the
             // gap between its creation and its flock.
             if age(&meta) < minute {
@@ -2030,6 +2045,65 @@ mod tests {
         assert!(!dead_copy.exists());
         assert!(active.exists());
         assert!(live_copy.exists());
+    }
+
+    /// Regression: bundle copies staged by builds before the
+    /// `.ratarmount-copy-` rename (`.copy-XXXXXX.tar.zst`) were never swept
+    /// from the layer cache. Only that exact shape is swept, and only there,
+    /// under the same lock, owner and age rules.
+    #[test]
+    fn regression_cache_fill_sweeps_legacy_copy_files() {
+        let f = Fixture::new(true);
+        let bundle = f.bundle("b.tar.zst");
+        let cache = f.tmp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let make = |name: &str, age: std::time::SystemTime| {
+            let path = cache.join(name);
+            fs::write(&path, b"partial").unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(age))
+                .unwrap();
+            path
+        };
+        let dead = make(".copy-aB3xY9.tar.zst", old);
+        let live = make(".copy-Zz9Aa0.tar.zst", old);
+        let _live = hold_lock(&live);
+        let young = make(".copy-Qw3Er4.tar.zst", std::time::SystemTime::now());
+        let keep: Vec<_> = [
+            ".copy-notes",
+            ".copy-dead.tar.zst",
+            ".copy-aB3xY.tar.zst",
+            ".copy-aB3xY99.tar.zst",
+            ".copy-aB3x_9.tar.zst",
+            ".copy-aB3xY9.tar.zst.bak",
+            "x.copy-aB3xY9.tar.zst",
+        ]
+        .iter()
+        .map(|name| make(name, old))
+        .collect();
+        cached_lower_in(&bundle, &cache, f.base.clone(), None).unwrap();
+        assert!(!dead.exists(), "legacy copy not swept");
+        assert!(live.exists() && young.exists());
+        for path in keep {
+            assert!(path.exists(), "swept {}", path.display());
+        }
+        // Outside the layer cache (unpack destination parent) nothing is swept.
+        let parent = f.tmp.path().join("work");
+        fs::create_dir(&parent).unwrap();
+        let mine = parent.join(".copy-aB3xY9.tar.zst");
+        fs::write(&mine, b"mine").unwrap();
+        File::options()
+            .write(true)
+            .open(&mine)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        unpack(&bundle, &parent.join("out")).unwrap();
+        assert!(mine.exists());
     }
 
     /// Regression: `overlay unpack bundle work/out` swept `work` and deleted the
