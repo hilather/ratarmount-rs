@@ -626,14 +626,10 @@ fn reap(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 /// gvfsd-trash probe each new mount). Separate from the per-attempt `UNMOUNT_DEADLINE`.
 const BUSY_RETRY: Duration = Duration::from_secs(1);
 
-/// EBUSY from fusermount, ignoring the echoed mountpoint (`failed to unmount <path>: <strerror>`).
-fn stderr_is_busy(stderr: &str, mnt: &Path) -> bool {
-    let mp = mnt.to_string_lossy();
-    stderr.lines().any(|l| {
-        l.replace(mp.as_ref(), "")
-            .trim_end()
-            .ends_with("Device or resource busy")
-    })
+/// EBUSY from fusermount: stderr ends with the strerror (`failed to unmount <path>: <strerror>`),
+/// so the echoed mountpoint is never inspected.
+fn stderr_is_busy(stderr: &str) -> bool {
+    stderr.trim_end().ends_with(": Device or resource busy")
 }
 
 /// `fusermount3 -u` with stderr captured, retried every 50 ms while it reports
@@ -664,7 +660,7 @@ fn graceful_fusermount_u(mnt: &Path) -> Result<(), String> {
         if let Some(mut pipe) = child.stderr.take() {
             let _ = io::Read::read_to_string(&mut pipe, &mut stderr);
         }
-        if !stderr_is_busy(&stderr, mnt) || Instant::now() >= deadline {
+        if !stderr_is_busy(&stderr) || Instant::now() >= deadline {
             return Err(format!(
                 "fusermount3 -u {} failed ({st}): {}",
                 mnt.display(),
