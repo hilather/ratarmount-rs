@@ -388,6 +388,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | `overlay fsck` reported `missing_parent` for tombstones (a delete inside an untouched base directory, or a directory replaced by a file or symlink), so `overlay seal` refused ordinary agent edits and `--repair` invented host directories | `cargo test -p ratarmount-compositing --lib regression_fsck_tombstones_need_no_host_parent` · `cargo test -p ratarmount-compositing --lib overlay_fsck` |
 | `overlay import-upperdir`: whiteouts, recursive opacity, type replacements or metadata disagree with the lower stack; redirect/metacopy accepted (SBX-UPPER) | `cargo test -p ratarmount --bin ratarmount regression_upperdir` · `cargo test -p ratarmount --test overlayfs_interop` |
 | Kernel overlayfs with a ratarmount `lowerdir` (user namespace): build fails or the imported upperdir differs from the merged view (SBX-UPPER, opt-in) | `RATARMOUNT_TEST_OVERLAYFS=1 cargo test -p ratarmount --test overlayfs_interop -- --nocapture` |
+| Copy-on-write edits of existing files (no `files` row) missing from `diff`/hash/manifest/`--between`, counted as fsck orphans so `overlay seal` refused them, or losing pinned modes (SBX-COW) | `cargo test -p ratarmount-compositing --lib regression_cow_` · `cargo test -p ratarmount --test diff --test overlay_seal --test overlay_import --test overlay_pack --test overlay_lower regression_cow_` |
+| Journal header records the mount/overlay as typed (relative) | `cargo test -p ratarmount-fuse --lib regression_oplog_header_paths_are_absolute` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

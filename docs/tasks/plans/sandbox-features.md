@@ -113,8 +113,8 @@ Model: **astra** = `gpt-6-astra`, **sol** = `gpt-6.1-sol`, **luna** = `gpt-6-lun
 | SBX-PACK | §8 | 2 | sol [high] | new `ratarmount/src/overlay_pack.rs` | Pack refuses unsealed; pack → unpack → verify; bundle mounts directly and as `--lower` (unpacked to a cache keyed by `layer_digest`); `--include-journal`, `--include-index` | done |
 | SBX-RUN | §10 | 3 | astra [high] | `ratarmount/src/sandbox/run.rs` | Stub runtime test: mount → run → unmount → fsck → seal → pack → JSON; timeout; stale mount under `--top` cleaned via PID file | done |
 | SBX-UPPER | §15.9 | 3 | sol [high] | `overlay import-upperdir` arm, env-gated test, `docs/sandbox.md` interop section | Whiteouts → tombstones, opaque dirs → per-child tombstones; read-only ratarmount stack as overlayfs `lowerdir` (unshare user ns, skip if unavailable) | done |
-| SBX-COW | §2.2, §4 (correction 14) | 4 | astra [xhigh] | `overlay_changes.rs`, `overlay_fsck.rs`, `overlay_seal.rs`, tests | Copy-on-write fixtures: `M f` in diff, fsck clean, seal+verify, import round trip, `--lower` COW served; e2e script reaches ALL-DONE | in progress |
-| SBX-DOCS | §14 | 3 | luna [medium] | `docs/sandbox.md`, README, `docs/formats.md`/CLI tour | End-to-end flow, branching recipe, xattr protocol, meta keys, hash definition, renames, exit codes; README subcommand list + comparison rows | todo |
+| SBX-COW | §2.2, §4 (correction 14) | 4 | astra [xhigh] | `overlay_changes.rs`, `overlay_fsck.rs`, `overlay_seal.rs`, tests | Copy-on-write fixtures: `M f` in diff, fsck clean, seal+verify, import round trip, `--lower` COW served; e2e script reaches ALL-DONE | done |
+| SBX-DOCS | §14 | 3 | luna [medium] | `docs/sandbox.md`, README, `docs/formats.md`/CLI tour | End-to-end flow, branching recipe, xattr protocol, meta keys, hash definition, renames, exit codes; README subcommand list + comparison rows | done |
 
 ## 4. Dependency graph
 
@@ -139,3 +139,5 @@ wave 0:  META ─┬─────────────┬──────
 |---|---|---|
 | Journal overhead (`benchmarks/journal-overhead.sh`, release, 3+3 runs) | -3.0% (journal median 1.511 s vs baseline 1.558 s) | Within noise; laptop load average ~13 from another build. Rerun on a quiet machine before quoting. |
 | Kernel overlayfs interop (done-when #9) | Pass: ratarmount stack as `lowerdir` in `unshare -Urm`, build ran, imported upperdir manifest == kernel merged view | Linux 7.2.5, unprivileged, 2026-10-17 |
+| End-to-end scenario (git snapshot → prepared `make` → sealed lower → attempt → diff/apply/tree-equal → strict hash equality → import round trip → seal/verify/tamper → fsck → journal marks → pack/unpack) | Pass, no mounts left | Linux 7.2.5, debug build, 2026-10-17 |
+| `sandbox run` with real Docker (busybox) | Pass (`RATARMOUNT_TEST_DOCKER=1`) | Docker 29.7.2 |
