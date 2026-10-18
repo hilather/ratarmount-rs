@@ -172,6 +172,15 @@ fn regression_fuse_cow_edits_agree_across_diff_fsck_seal_verify_pack() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    // Seal makes the tree read-only; restore write access even on failure so
+    // TempDir can remove it.
+    struct Writable<'a>(&'a Path);
+    impl Drop for Writable<'_> {
+        fn drop(&mut self) {
+            make_writable(self.0);
+        }
+    }
+    let _writable = Writable(tmp.path());
     let root = tmp.path();
     let cache = root.join("cache");
     let base = root.join("base.tar");
@@ -300,6 +309,4 @@ fn regression_fuse_cow_edits_agree_across_diff_fsck_seal_verify_pack() {
         ),
         hash
     );
-
-    make_writable(root);
 }
