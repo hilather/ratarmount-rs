@@ -562,7 +562,63 @@ fn regression_run_container_tree_has_no_control_dir() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert!(
-        !left.iter().any(|n| n.starts_with("ratarmount-ctl-")),
-        "control dir leaked: {left:?}"
+        !left.iter().any(|n| n.starts_with("ratarmount-run-")),
+        "run dir leaked: {left:?}"
     );
+}
+
+/// Regression (J): the mountpoint used to be a directory made directly in the
+/// shared temporary directory, so with `allow_other` other local users could
+/// enter the mounted tree. It now sits inside a private 0700 parent that also
+/// holds the control socket, and the whole parent is removed afterwards.
+#[test]
+fn regression_run_mountpoint_parent_is_private_0700() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    // A world-writable sticky directory stands in for a shared `/tmp`.
+    let shared = tempfile::Builder::new()
+        .prefix("rrs-j-tmp-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    fs::set_permissions(shared.path(), fs::Permissions::from_mode(0o1777)).unwrap();
+    let mut command = fixture.command(
+        &[],
+        "stat -c '%a %u' .. > parent.txt; (cd .. && pwd -P) > parent-path.txt; \
+         ls -a .. > parent-ls.txt; pwd -P > mount-path.txt",
+    );
+    let output = command.env("TMPDIR", shared.path()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parent = fs::read_to_string(fixture.top.join("parent.txt")).unwrap();
+    let (mode, uid) = parent.trim().split_once(' ').unwrap();
+    assert_eq!(mode, "700", "mountpoint parent mode: {parent}");
+    assert_eq!(uid, unsafe { libc::geteuid() }.to_string());
+    let parent_path = fs::read_to_string(fixture.top.join("parent-path.txt")).unwrap();
+    let parent_name = Path::new(parent_path.trim())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(parent_name.starts_with("ratarmount-run-"), "{parent_path}");
+    let mount_path = fs::read_to_string(fixture.top.join("mount-path.txt")).unwrap();
+    assert_eq!(
+        Path::new(mount_path.trim()),
+        Path::new(parent_path.trim()).join("mnt")
+    );
+    // The control socket lives in the private parent, beside the mount.
+    let listing = fs::read_to_string(fixture.top.join("parent-ls.txt")).unwrap();
+    assert!(listing.contains("ratarmount-control-"), "{listing}");
+    // Nothing is left in the shared directory afterwards.
+    let left: Vec<_> = fs::read_dir(shared.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+    assert!(fs::metadata(shared.path()).unwrap().mode() & 0o1000 != 0);
 }

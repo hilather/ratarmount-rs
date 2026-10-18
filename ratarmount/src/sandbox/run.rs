@@ -415,29 +415,62 @@ fn control_socket_path(dir: &Path, mount_pid: u32) -> PathBuf {
     dir.join(format!("ratarmount-control-{mount_pid}.sock"))
 }
 
-/// A 0700 directory owned by the caller that holds the mount child's control
-/// socket, outside the container's bind. Under `/tmp` when the default
-/// temporary directory would make the socket path too long for `sun_path`.
-fn create_control_dir() -> io::Result<PathBuf> {
+/// The private `ratarmount-run-XXXXXX` parent: a 0700 directory owned by the
+/// caller that holds the mountpoint (`mnt`) and the mount child's control
+/// socket, outside the container's bind. A user who is not the caller cannot
+/// traverse it, so `allow_other` does not expose the mounted tree. Under `/tmp`
+/// when the default temporary directory would make the socket path too long
+/// for `sun_path`.
+fn create_run_dir() -> io::Result<PathBuf> {
     let probe = control_socket_path(Path::new(""), u32::MAX);
     let mut builder = tempfile::Builder::new();
-    builder.prefix("ratarmount-ctl-");
+    builder.prefix(RUN_DIR_PREFIX);
     let default = std::env::temp_dir();
-    let long =
-        default.as_os_str().len() + "/ratarmount-ctl-XXXXXX".len() + 1 + probe.as_os_str().len()
-            > MAX_SOCKET_PATH;
+    let long = default.as_os_str().len()
+        + format!("/{RUN_DIR_PREFIX}XXXXXX").len()
+        + 1
+        + probe.as_os_str().len()
+        > MAX_SOCKET_PATH;
     let dir = if long {
         builder.tempdir_in("/tmp")?
     } else {
         builder.tempdir()?
     };
-    // The directory is created with the umask's mode: restrict it before the
-    // mount child binds its socket inside.
+    // Created with the umask's mode: restrict it before anything is placed
+    // inside (the mode is asserted, not assumed).
     fs::set_permissions(
         dir.path(),
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     )?;
     Ok(dir.keep())
+}
+
+/// Name prefix of the private parent (also the container name's prefix).
+const RUN_DIR_PREFIX: &str = "ratarmount-run-";
+
+/// The private parent of a recorded mountpoint, when the mountpoint is
+/// `<parent>/mnt` and the parent is one this module made: named
+/// `ratarmount-run-*`, not `/tmp`, owned by the caller, mode 0700. Records
+/// written before the private parent existed (mountpoint directly in `/tmp`)
+/// have none.
+fn private_parent(mountpoint: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    if mountpoint.file_name()? != "mnt" {
+        return None;
+    }
+    let parent = mountpoint.parent()?;
+    if parent == Path::new("/tmp")
+        || !parent
+            .file_name()?
+            .to_string_lossy()
+            .starts_with(RUN_DIR_PREFIX)
+    {
+        return None;
+    }
+    let meta = fs::symlink_metadata(parent).ok()?;
+    let (uid, _) = crate::caller_ids();
+    (meta.is_dir() && meta.uid() == uid && meta.mode() & 0o7777 == 0o700)
+        .then(|| parent.to_path_buf())
 }
 
 struct Cleanup {
@@ -526,7 +559,14 @@ impl Cleanup {
             }
         }
         let _ = fs::remove_dir(&self.record.mountpoint);
-        if let Some(dir) = self.control_dir.take() {
+        // The private parent also holds the control socket: removing it whole
+        // leaves nothing behind however the mount child died. A recovered
+        // record has no `control_dir`; derive it under the same ownership rule.
+        let parent = self
+            .control_dir
+            .take()
+            .or_else(|| private_parent(&self.record.mountpoint));
+        if let Some(dir) = parent {
             let _ = fs::remove_dir_all(dir);
         }
         self.stopped = true;
@@ -759,17 +799,18 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
     } else {
         None
     };
-    let mount = tempfile::Builder::new()
-        .prefix("ratarmount-run-")
-        .tempdir()?;
-    let container = mount
-        .path()
+    let control_dir = create_run_dir()?.canonicalize()?;
+    let container = control_dir
         .file_name()
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let mountpoint = mount.path().canonicalize()?;
-    let _ = mount.keep();
+    let mountpoint = control_dir.join("mnt");
+    fs::create_dir(&mountpoint)?;
+    fs::set_permissions(
+        &mountpoint,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
     let record = PidRecord {
         owner: ProcessIdentity::new(std::process::id()),
         mountpoint,
@@ -779,7 +820,6 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
         runtime_child: None,
         ram_top: ram.map(tempfile::TempDir::keep),
     };
-    let control_dir = create_control_dir()?;
     let mut cleanup = Cleanup {
         control_dir: Some(control_dir.clone()),
         record,
@@ -1448,13 +1488,40 @@ mod tests {
         );
     }
 
+    /// Regression (J): the private parent is 0700 and only a directory this
+    /// module made (`ratarmount-run-*/mnt`, caller-owned, 0700, not `/tmp`) is
+    /// removed with a recovered record.
+    #[test]
+    fn regression_run_private_parent_rules() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = create_run_dir().unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o700);
+        assert!(dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("ratarmount-run-"));
+        let mnt = dir.join("mnt");
+        assert_eq!(private_parent(&mnt), Some(dir.clone()));
+        // Old records: the mountpoint itself sits in the shared directory.
+        assert_eq!(private_parent(&dir), None);
+        assert_eq!(private_parent(Path::new("/tmp/mnt")), None);
+        // Not named like ours, or wider than 0700: refused.
+        let other = tempfile::tempdir().unwrap();
+        assert_eq!(private_parent(&other.path().join("mnt")), None);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(private_parent(&mnt), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Regression: `sandbox run` reads `erofs_denied` from the mount's control
     /// socket (the in-FS control folder is not mounted) and the socket path is
     /// `<dir>/ratarmount-control-<pid>.sock`.
     #[test]
     fn regression_control_socket_counters_and_path() {
         use std::io::{Read, Write};
-        let dir = create_control_dir().unwrap();
+        let dir = create_run_dir().unwrap();
         let mode =
             std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&dir).unwrap().permissions());
         assert_eq!(mode & 0o777, 0o700);

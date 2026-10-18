@@ -1114,6 +1114,14 @@ other local users can see it in `ps`. Everything ratarmount itself prints or sto
 the URL with credentials removed. Prefer a credential source the remote layer reads from the
 environment or a config file over userinfo in the URL.
 
+The mount is made on `<dir>/mnt`, where `<dir>` is a private `ratarmount-run-XXXXXX`
+directory (mode 0700, owned by the caller) in the temporary directory. The mount uses
+`allow_other`, so without the private parent another local user could enter the mounted
+tree through a shared `/tmp`; they cannot traverse a 0700 parent. The same directory is
+the mount child's `TMPDIR` and holds its control socket, and it is removed whole at the
+end (and by crash recovery, which removes only a caller-owned 0700 `ratarmount-run-*`
+parent of a recorded `mnt`).
+
 Stdout contains exactly one JSON object. Container stdout/stderr goes to stderr;
 `--json` suppresses harness progress messages. The report contains `exit_code`,
 `timed_out`, `interrupted`, `wall_time_s`, `patch_hash`, `manifest_path`,
