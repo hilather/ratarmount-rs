@@ -112,8 +112,10 @@ repaired. A mounted overlay's exclusive database lock is reported as "in use".
 | `ratarmount_version` | Creator's version |
 | `created_at` | Creation time, RFC 3339 UTC |
 | `base_url` | Original base positional |
-| `base_digest` | `sha256:<hex>`, `git-tree:<sha>`, `weak:<hex>`, or `none` |
+| `base_digest` | `sha256:<hex>`, `git-tree:<sha>`, `weak:<hex>` (also the default for a directory base), or `none` |
 | `base_digest_kind` | `strong`, `git-tree`, `weak`, or `none` |
+| `base_digest_source` | `computed` or `supplied` (absent for `none`) |
+| `base_weak_digest`, `base_weak_excludes` | Directory bases: the weak manifest digest (also recorded beside a supplied strong digest) and the JSON array of base-relative paths left out of it |
 | `base_size`, `base_mtime_ns` | Local archive size and modification time used for cheap remount checks |
 | `base_git_tree` | Selected Git tree, also retained when a SHA-256 digest was supplied |
 | `base_remote_token` | Available remote validators, or known multi-source inputs |
@@ -160,17 +162,47 @@ for the same canonical path, size, nanosecond mtime, and inode. Hashing never
 creates an archive index. `--no-recreate-index` and immutable index snapshots
 are not modified for this cache.
 
-A directory gets a `strong` digest of a sorted manifest of relative path,
-mode, size and content SHA-256. The root and empty directories participate;
-directory sizes are zero. Symlinks hash their target bytes without following
-them; special files cannot be hashed. Paths are sorted as OS bytes and fields
-are length-framed, so names containing delimiters remain distinct. A Git base
-gets the selected tree id, including `--git-prefix`, and startup pins the
-resolved commit before opening the mount.
+A directory gets a `weak` digest by default: `weak:<hex>` over a sorted
+manifest of relative path, type, size and nanosecond mtime (symlinks include
+their target; directories and unreadable subdirectories are typed entries
+without size or mtime). The walk only reads directory entries and `lstat`s
+them: no file is opened, so a 1 GiB base mounts in milliseconds and FIFOs or
+unreadable files cannot break creation. Mode, owner and ctime are excluded.
+**A mount never hashes a base it was not asked to.** The consequence: a content
+edit that keeps a file's size and mtime is invisible to a weak digest. When a
+strong identity is needed, compute it once and supply it:
 
-For a computed directory digest, keep the overlay outside the base directory.
-Otherwise its own SQLite metadata would become part of the input being hashed;
-creation refuses that arrangement. A supplied digest or `none` allows it.
+```bash
+digest=$(ratarmount overlay digest-base ./repo --exclude-overlay ./repo/.ov)
+ratarmount -w ./repo/.ov --base-digest "$digest" ./repo mnt/
+```
+
+`ratarmount overlay digest-base PATH [--json]` (experimental) reads a directory
+or archive once and prints `sha256:<hex>` (JSON adds `kind`, and `excluded` for
+a directory). It opens no overlay, index or cache and writes nothing. For a
+directory it refuses to run while an un-excluded write overlay lives inside
+it; pass one `--exclude-overlay PATH` per overlay, journal or lower layer that
+is inside the directory. `ratarmount snapshot` prints an `archive_digest` that
+`--base-digest` accepts as is. A supplied directory digest is also recorded
+with its weak companion (`base_weak_digest`), so remounts still check the base
+cheaply. `ratarmount sandbox run --base-digest` passes the value to its mount.
+
+An overlay, `--journal` file or `--lower` layer inside a directory base is left
+out of the walk: the overlay is not part of the base. The excluded paths are
+recorded in `base_weak_excludes` (base-relative, append-only). When the
+overlay's parent does not exist yet (`-w BASE/new/ov`) the topmost new
+component (`new`) is recorded, because creating the overlay adds it. A later
+mount may append a journal path that is not in the base yet; one that already
+exists is base content and is refused. Index and sidecar files that ratarmount
+itself writes beside an archive (`X.index.sqlite` and its `-wal`/`-shm`,
+`.index.ptr`, pinned `.index.<id>.sqlite`, `.rgzi`, `.gzidx`, commit journals,
+manifests, staging temp names) never count. Archives written, replaced or
+repacked inside the base are base content: the weak digest changes and the next
+remount of an older overlay is refused. Keep generated archives outside the
+base, or create a fresh overlay.
+
+A Git base gets the selected tree id, including `--git-prefix`, and startup pins
+the resolved commit before opening the mount.
 
 Remote bases use a `weak` digest of the URL and cheaply available validators:
 HTTP HEAD ETag/Content-Length/Last-Modified or S3 ETag/size. Failed HEADs,
@@ -181,9 +213,13 @@ cases when stronger identity is required.
 
 `--base-digest sha256:<hex>` trusts the caller and skips base-content hashing.
 `--base-digest none` warns and disables identity checking for new overlays.
-Both it and `--force-base-mismatch` require `-w`, `--overlay-tmpfs`, or
-`--sandbox`. On remount, only local archive size/mtime and Git tree ids are
-checked; directory contents and remote objects are not rehashed. Deliberately
+`--base-digest` also applies to a read-only `--lower` mount; `--force-base-mismatch`
+requires `-w`, `--overlay-tmpfs`, or `--sandbox`. On remount, local archive
+size/mtime, Git tree ids and the weak manifest of a directory base (re-walked with
+the recorded exclusions) are checked; file contents and remote objects are
+not rehashed. A directory base edited between sessions is refused, naming
+`--force-base-mismatch`. For a copy of a base on another host or filesystem
+(mtimes differ), take the strong digest on the source and pass it with `--base-digest`. Deliberately
 preserving file size and mtime can therefore evade the cheap check. A mismatch
 refuses the mount; its message shows the recorded digest and current identity
 (stat values for a local archive, without recomputing SHA-256).

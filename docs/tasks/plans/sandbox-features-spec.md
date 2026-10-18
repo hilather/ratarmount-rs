@@ -80,6 +80,8 @@ Keys (all strings; JSON where noted):
 
 ### 1.2 Base digest
 
+> **Correction 1 (2026-10-18, fix round for #133):** the "Directory base" bullet below is superseded. A mount never hashes a base it was not asked to: a directory base records a `weak` digest (sorted path, size, mtime manifest) by default, and a strong one only when supplied from `ratarmount snapshot` or `ratarmount overlay digest-base`. See `docs/tasks/plans/sandbox-features.md` lines 22-26. The original text is kept for history.
+
 Computed at overlay creation (first `-w` mount of a new or empty overlay directory, or `overlay import`), never on later mounts unless asked:
 
 - **Local archive file:** SHA-256 of the file bytes, streamed. Cached in the archive's index database keyed by `(path, size, mtime_ns, inode)` so a second overlay on the same snapshot does not re-hash; the index already lives next to the archive.

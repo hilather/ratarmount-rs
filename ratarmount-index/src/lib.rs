@@ -28,7 +28,8 @@ pub use digest_cache::{cached_archive_digest, refresh_archive_digest, ArchiveDig
 pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
 pub use hashing::{
     compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm, sha256_hex,
-    sha256_hex_stream, HASH_STREAM_CHUNK, SUPPORTED_HASH_ALGORITHMS,
+    sha256_hex_stream, sha256_stream_calls_this_thread, HASH_STREAM_CHUNK,
+    SUPPORTED_HASH_ALGORITHMS,
 };
 pub use local_cache::{
     enforce_local_index_budget_if_path, find_existing_user_cache_index, is_local_index_cache_path,

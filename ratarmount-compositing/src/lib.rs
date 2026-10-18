@@ -7,6 +7,7 @@
 #[macro_use]
 mod quiet_print;
 mod automount;
+pub mod base_sidecars;
 mod control;
 mod empty_archive;
 mod folder;
@@ -37,6 +38,7 @@ pub use automount::{
     strip_archive_extension, AutoMountLayer, AutoMountOptions, NestedOpenContext, OpenNestedFn,
     OpenNestedReaderFn, RecursiveExtSet,
 };
+pub use base_sidecars::is_ratarmount_sidecar_name;
 pub use control::{
     live_search_tsv, ControlFolderMountSource, ControlFolderOptions, CONTROL_DIR_NAME,
     CONTROL_DIR_PATH,
@@ -51,7 +53,10 @@ pub use overlay_layer::{
     compose_stack, serving_layer, Immutability, LayerIndex, ReadOnlyOverlayLayer,
 };
 pub use overlay_meta::{
-    stack_digest, BaseDigestRequest, LowerLayerRecord, OverlayCreateInfo, OverlayMeta,
+    append_base_excludes, directory_digest, directory_digest_calls_this_thread,
+    directory_digest_excluding, directory_weak_digest, directory_weak_walks_this_thread,
+    resolve_base_excludes, stack_digest, BaseDigestRequest, BaseExcludes, LowerLayerRecord,
+    OverlayCreateInfo, OverlayMeta,
 };
 pub use overlay_policy::{
     parse_overlay_size, CompositeOverlayPolicy, OverlayQuota, OverlayStats, OverlayUsage,

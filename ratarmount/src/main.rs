@@ -506,14 +506,13 @@ struct Args {
     allow_unsealed_lower: bool,
 
     /// Allow a different lower stack for an existing top and record the override.
-    #[arg(long, requires = "overlay_target")]
+    #[arg(long)]
     force_stack_mismatch: bool,
 
     /// Trust a known sha256:<hex> base digest, or skip hashing with none (warns).
     #[arg(
         long,
         value_name = "sha256:HEX|none",
-        requires = "overlay_target",
         conflicts_with = "commit_overlay"
     )]
     base_digest: Option<ratarmount_compositing::BaseDigestRequest>,
@@ -718,6 +717,24 @@ struct Args {
     find_offset_order: bool,
 }
 
+/// `--base-digest` and `--force-stack-mismatch` apply to a write overlay or to a
+/// read-only `--lower` stack; clap's `requires` cannot express that OR.
+fn base_flag_needs_target_or_lower(args: &Args) -> Result<(), clap::Error> {
+    let target = args.write_overlay.is_some() || args.overlay_tmpfs.is_some() || args.sandbox;
+    for (given, flag) in [
+        (args.base_digest.is_some(), "--base-digest"),
+        (args.force_stack_mismatch, "--force-stack-mismatch"),
+    ] {
+        if given && !target && args.lower.is_empty() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                format!("{flag} requires -w/--overlay-tmpfs/--sandbox or --lower"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse `--parallel-nested`: non-negative integer or `auto` (→ 0).
 fn parse_parallel_nested(s: &str) -> Result<u32, String> {
     let t = s.trim();
@@ -889,6 +906,7 @@ where
             "commit of a layered stack is not supported; flatten first",
         ));
     }
+    base_flag_needs_target_or_lower(&args)?;
     expand_sandbox(&mut args, caller_ids())
         .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
     ratarmount_compositing::ReadOnlyGlobs::new(&args.journal_exclude)
@@ -2128,6 +2146,13 @@ fn main() {
                 .then(|| index_sidecar.clone())
                 .flatten(),
             git_tree: overlay_git_tree,
+            // Journal and lower layers inside a directory base stay out of its digest.
+            weak_exclude: args
+                .journal
+                .iter()
+                .cloned()
+                .chain(lower_stack.records.iter().map(|r| r.path.clone()))
+                .collect(),
             ..Default::default()
         };
         match overlay_create::create_overlay(
@@ -4592,6 +4617,50 @@ mod parallel_nested_cli_tests {
             ratarmount_session::factory::CompositingOptions::default().parallel_nested_threads,
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod base_flag_cli_tests {
+    use super::parse_args_from;
+
+    fn parse(args: &[&str]) -> Result<super::Args, clap::Error> {
+        parse_args_from(std::iter::once("ratarmount").chain(args.iter().copied()))
+    }
+
+    /// Regression: clap rejected `--base-digest` / `--force-stack-mismatch` on a
+    /// read-only `--lower` mount, where A2 tells the user to pass them.
+    #[test]
+    fn regression_base_digest_flag_allowed_with_lower_only() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let a = parse(&["--lower", "L", "--base-digest", &digest, "base", "mnt"]).expect("parse");
+        assert_eq!(a.paths.len(), 2, "the value must not steal a positional");
+        assert!(a.base_digest.is_some());
+        assert!(parse(&["--lower", "L", "--base-digest", "none", "base", "mnt"]).is_ok());
+        assert!(parse(&["--lower", "L", "--force-stack-mismatch", "base", "mnt"]).is_ok());
+        assert!(parse(&[
+            "-w",
+            "ov",
+            "--lower",
+            "L",
+            "--force-stack-mismatch",
+            "base",
+            "mnt"
+        ])
+        .is_ok());
+        assert!(parse(&["-w", "ov", "--base-digest", &digest, "base", "mnt"]).is_ok());
+        let error = parse(&["--base-digest", &digest, "base", "mnt"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("--base-digest requires"), "{error}");
+        let error = parse(&["--force-stack-mismatch", "base", "mnt"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("--force-stack-mismatch requires"), "{error}");
+        // --force-base-mismatch still needs an overlay target.
+        assert!(parse(&["--lower", "L", "--force-base-mismatch", "base", "mnt"]).is_err());
     }
 }
 

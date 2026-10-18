@@ -28,6 +28,9 @@ pub struct RunArgs {
     lower: Vec<PathBuf>,
     #[arg(long)]
     top: PathBuf,
+    /// Trust a known sha256:<hex> base digest (from `overlay digest-base` or `snapshot`), or `none`.
+    #[arg(long, value_name = "sha256:HEX|none")]
+    base_digest: Option<ratarmount_compositing::BaseDigestRequest>,
     /// Use a private RAM overlay; copy it to --top after unmount.
     #[arg(long)]
     tmpfs: bool,
@@ -580,8 +583,34 @@ fn mount_argv(args: &RunArgs, top: &Path, mount: &Path, journal: &Path) -> Vec<O
     if args.journal {
         argv.extend(["--journal".into(), journal.into()]);
     }
+    // Before `--`: after it clap would read the flag as a positional input.
+    match &args.base_digest {
+        Some(ratarmount_compositing::BaseDigestRequest::Supplied(digest)) => {
+            argv.extend(["--base-digest".into(), digest.into()]);
+        }
+        Some(ratarmount_compositing::BaseDigestRequest::None) => {
+            argv.extend(["--base-digest".into(), "none".into()]);
+        }
+        _ => {}
+    }
     argv.extend(["--".into(), args.base.as_os_str().into(), mount.into()]);
     argv
+}
+
+/// The mount keeps its overlay, journal and report files beside `--top`; a
+/// `--top` inside a directory base would change that base's identity.
+fn refuse_top_inside_base(args: &RunArgs) -> io::Result<()> {
+    if !args.base.is_dir() {
+        return Ok(());
+    }
+    let (_, inside) =
+        ratarmount_compositing::resolve_base_excludes(&args.base, std::slice::from_ref(&args.top))
+            .map_err(io::Error::other)?;
+    if inside.paths().is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other("--top must be outside --base"))
+    }
 }
 
 fn mount_ready(cleanup: &mut Cleanup, stderr: &mut File) -> io::Result<()> {
@@ -644,6 +673,7 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
     {
         return Err(io::Error::other("--env requires K=V"));
     }
+    refuse_top_inside_base(args)?;
     let top = absolute_top(&args.top)?;
     let pid_file = pid_path(&top);
     let _lock = RunLock::acquire(&sidecar(&pid_file, ".lock"))?;
@@ -887,6 +917,52 @@ mod tests {
             super::super::Command::Run(args) => *args,
             _ => unreachable!(),
         }
+    }
+
+    /// Regression: `sandbox run` had no `--base-digest`, so cpanmine could not
+    /// pass its snapshot digest; the flag must precede `--` in the mount argv.
+    #[test]
+    fn regression_run_mount_argv_passes_base_digest() {
+        let digest = format!("sha256:{}", "b".repeat(64));
+        for (extra, want) in [
+            (vec![], None),
+            (
+                vec!["--base-digest", digest.as_str()],
+                Some(digest.as_str()),
+            ),
+            (vec!["--base-digest", "none"], Some("none")),
+        ] {
+            let args = args(&extra);
+            let argv = mount_argv(&args, Path::new("/top"), Path::new("/mnt"), Path::new("/j"));
+            let separator = argv.iter().position(|a| a == "--").unwrap();
+            assert_eq!(&argv[separator + 1..], ["/base", "/mnt"]);
+            match want {
+                None => assert!(!argv.iter().any(|a| a == "--base-digest")),
+                Some(want) => {
+                    let at = argv.iter().position(|a| a == "--base-digest").unwrap();
+                    assert!(at < separator);
+                    assert_eq!(argv[at + 1], want);
+                }
+            }
+        }
+    }
+
+    /// Regression: a `--top` inside a directory `--base` would be hashed as base content.
+    #[test]
+    fn regression_run_refuses_top_inside_directory_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut run = args(&[]);
+        run.base = dir.path().to_path_buf();
+        run.top = dir.path().join("top");
+        let error = refuse_top_inside_base(&run).unwrap_err().to_string();
+        assert!(error.contains("--top must be outside --base"), "{error}");
+        let outside = tempfile::tempdir().unwrap();
+        run.top = outside.path().join("top");
+        refuse_top_inside_base(&run).unwrap();
+        // Not a directory base: nothing to protect.
+        run.base = dir.path().join("a.tar");
+        run.top = dir.path().join("top");
+        refuse_top_inside_base(&run).unwrap();
     }
 
     /// Regression: docker/podman options must not absorb command flags or interpolate env values.

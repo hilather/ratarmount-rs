@@ -982,6 +982,12 @@ impl WriteOverlay {
         overlay: &Path,
         info: Option<&crate::OverlayCreateInfo>,
     ) -> Result<Self> {
+        // Before the directory is created: the topmost-new exclusion rule
+        // depends on which parents of the overlay exist right now.
+        let exclude_plan = info
+            .map(|info| crate::overlay_meta::plan_excludes(info, overlay))
+            .transpose()?
+            .flatten();
         let root = overlay.to_path_buf();
         if root.exists() {
             if !root.is_dir() {
@@ -1107,7 +1113,7 @@ impl WriteOverlay {
                     "overlay is sealed; mount it with --lower, or `overlay unseal`".into(),
                 ));
             }
-            crate::overlay_meta::initialize(&transaction, had_files, info, &root)?;
+            crate::overlay_meta::initialize(&transaction, had_files, info, exclude_plan.as_ref())?;
             let tombstones = tombstone_set_from_conn(&transaction)?;
             transaction.commit()?;
             Ok(tombstones)

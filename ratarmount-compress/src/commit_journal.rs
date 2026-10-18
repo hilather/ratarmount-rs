@@ -8,12 +8,15 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Suffix of the commit journal written beside an archive.
+pub const COMMIT_JOURNAL_SUFFIX: &str = ".ratarmount-commit-journal";
+
 pub fn journal_path(archive: &Path) -> PathBuf {
     let canonical = archive
         .canonicalize()
         .unwrap_or_else(|_| archive.to_path_buf());
     let mut name = canonical.into_os_string();
-    name.push(".ratarmount-commit-journal");
+    name.push(COMMIT_JOURNAL_SUFFIX);
     PathBuf::from(name)
 }
 

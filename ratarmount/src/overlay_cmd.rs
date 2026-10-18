@@ -66,6 +66,13 @@ pub enum OverlayCommand {
         after_help = "Example: ratarmount overlay verify attempt base.tar.zst --json\n\nExit status:\n  0  Seal matches.\n  1  Seal mismatch.\n  2  Invalid input, operational error, or overlay not sealed."
     )]
     Verify(SealArgs),
+    /// Print the strong digest of a directory or archive base (experimental).
+    ///
+    /// Reads the whole base once and prints `sha256:<hex>`, for `--base-digest`. Opens no overlay, index or cache.
+    #[command(
+        after_help = "Example: ratarmount overlay digest-base base-dir --exclude-overlay base-dir/.ov --json\n\nExit status:\n  0  Digest printed.\n  1  Unreadable path, special file, or an un-excluded overlay inside the directory."
+    )]
+    DigestBase(DigestBaseArgs),
     /// Pack a sealed overlay as a portable seekable tar.zst bundle.
     ///
     /// Bundle the sealed overlay with a manifest against the lower view, optionally including its journal and indexes.
@@ -93,6 +100,16 @@ pub enum OverlayCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct DigestBaseArgs {
+    pub path: PathBuf,
+    /// Leave an overlay, journal or lower layer that lives inside the directory out of the digest (repeatable).
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+    pub exclude_overlay: Vec<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -135,6 +152,7 @@ pub fn run(args: &OverlayArgs) -> Result<(String, i32), String> {
         OverlayCommand::Seal(args) => seal(args),
         OverlayCommand::Unseal { directory, i_know } => unseal(directory, *i_know),
         OverlayCommand::Verify(args) => verify(args),
+        OverlayCommand::DigestBase(args) => digest_base(args),
         OverlayCommand::Pack(args) => Ok(bundle_exit(pack(args))),
         OverlayCommand::Unpack { bundle, directory } => Ok(bundle_exit(unpack(bundle, directory))),
         OverlayCommand::Fsck {
@@ -142,6 +160,51 @@ pub fn run(args: &OverlayArgs) -> Result<(String, i32), String> {
             repair,
             json,
         } => fsck(directory, *repair, *json),
+    }
+}
+
+fn digest_base(args: &DigestBaseArgs) -> Result<(String, i32), String> {
+    let meta = std::fs::metadata(&args.path)
+        .map_err(|e| format!("digest-base {}: {e}", args.path.display()))?;
+    let (kind, digest, excluded) = if meta.is_dir() {
+        let (base, excludes) =
+            ratarmount_compositing::resolve_base_excludes(&args.path, &args.exclude_overlay)
+                .map_err(|e| e.to_string())?;
+        if !excludes.paths().is_empty() {
+            let names: Vec<_> = excludes
+                .paths()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            eprintln!("excluding: {}", names.join(", "));
+        }
+        let digest = ratarmount_compositing::directory_digest_excluding(&base, &excludes)
+            .map_err(|e| e.to_string())?;
+        let excluded: Vec<String> = excludes
+            .paths()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        ("directory", digest, excluded)
+    } else {
+        let mut file = std::fs::File::open(&args.path)
+            .map_err(|e| format!("digest-base {}: {e}", args.path.display()))?;
+        let hex = ratarmount_index::sha256_hex_stream(&mut file)
+            .map_err(|e| format!("digest-base {}: {e}", args.path.display()))?;
+        ("file", format!("sha256:{hex}"), Vec::new())
+    };
+    if args.json {
+        let mut value = serde_json::json!({
+            "path": args.path.display().to_string(),
+            "kind": kind,
+            "digest": digest,
+        });
+        if kind == "directory" {
+            value["excluded"] = serde_json::json!(excluded);
+        }
+        Ok((value.to_string(), 0))
+    } else {
+        Ok((digest, 0))
     }
 }
 
@@ -579,7 +642,12 @@ mod tests {
         let output: serde_json::Value = serde_json::from_str(&info(&args).unwrap()).unwrap();
         assert_eq!(output["legacy"], false);
         assert_eq!(output["future_key"], "also reported");
-        assert_eq!(output["base_digest_kind"], "strong");
+        // A directory base records the cheap weak manifest, never a content hash.
+        assert_eq!(output["base_digest_kind"], "weak");
+        assert!(output["base_weak_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("weak:"));
         assert_eq!(output["files_present"], 1);
         assert_eq!(output["bytes_in_overlay"], 7);
         assert_eq!(output["tombstone_count"], 1);

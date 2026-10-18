@@ -181,3 +181,253 @@ fn regression_overlay_meta_records_readonly_rules() {
         serde_json::json!({"readonly": [], "allow": []})
     );
 }
+
+/// Private `HOME`/`XDG_CACHE_HOME` so no test touches the user's caches.
+fn private_env(cmd: &mut Command, dir: &Path) {
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    cmd.env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join(".cache"));
+}
+
+/// Bytes the process has read so far, from `/proc/<pid>/io` (`rchar`).
+#[cfg(target_os = "linux")]
+fn rchar(pid: u32) -> Option<u64> {
+    let io = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    io.lines()
+        .find_map(|l| l.strip_prefix("rchar: "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// Regression: a writable mount over a 1 GiB directory base hashed every file
+/// before it was ready (65-86 s debug, ~4.8 s release). Without `--base-digest`
+/// the mount must read no base content (Linux; needs /dev/fuse).
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_mount_1gib_directory_base_reads_no_content_without_base_digest() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, Instant};
+    if !Path::new("/dev/fuse").exists()
+        || Command::new("fusermount3")
+            .arg("--version")
+            .output()
+            .is_err()
+    {
+        eprintln!("skip: /dev/fuse or fusermount3 unavailable");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    std::fs::create_dir_all(base.join("sub")).unwrap();
+    let big = std::fs::File::create(base.join("big.bin")).unwrap();
+    if big.set_len(1 << 30).is_err() {
+        eprintln!("skip: filesystem refuses sparse files");
+        return;
+    }
+    std::fs::write(base.join("small.txt"), b"hello").unwrap();
+    std::fs::write(base.join("sub/inner.txt"), b"inner").unwrap();
+    let mnt = root.path().join("mnt");
+    std::fs::create_dir(&mnt).unwrap();
+    let overlay = root.path().join("overlay");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    private_env(&mut cmd, root.path());
+    let start = Instant::now();
+    let mut child = cmd
+        .args([
+            "-f",
+            "--passthrough",
+            "off",
+            "--index-file",
+            ":memory:",
+            "-w",
+        ])
+        .arg(&overlay)
+        .arg(&base)
+        .arg(&mnt)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let parent_dev = std::fs::metadata(root.path()).unwrap().dev();
+    let deadline = start + Duration::from_secs(20);
+    let ready = loop {
+        if std::fs::metadata(&mnt).is_ok_and(|m| m.dev() != parent_dev)
+            && std::fs::read_dir(&mnt).is_ok_and(|mut d| d.next().is_some())
+        {
+            break Some(start.elapsed());
+        }
+        if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let read = rchar(child.id());
+    let unmount = || {
+        let _ = Command::new("fusermount3").arg("-u").arg(&mnt).status();
+    };
+    let Some(ready_after) = ready else {
+        unmount();
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("not ready within 20 s (the mount hashes the base)");
+    };
+    unmount();
+    let status = child.wait().unwrap();
+    let read = read.expect("/proc/<pid>/io readable");
+    assert!(
+        read < 4 << 20,
+        "mount read {read} bytes before it was ready"
+    );
+    if !cfg!(debug_assertions) {
+        assert!(
+            ready_after < Duration::from_secs(1),
+            "ready after {ready_after:?}"
+        );
+    }
+    let _ = status;
+    let mut info = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    private_env(&mut info, root.path());
+    let output = info
+        .args(["overlay", "info", "--json"])
+        .arg(&overlay)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["base_digest"].as_str().unwrap().starts_with("weak:"));
+    assert_eq!(value["base_digest_kind"], "weak");
+    assert_eq!(value["base_weak_digest"], value["base_digest"]);
+    assert_eq!(value["base_digest_source"], "computed");
+}
+
+fn digest_base(args: &[&std::ffi::OsStr], dir: &Path) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+    private_env(&mut cmd, dir);
+    cmd.args(["overlay", "digest-base"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn listing(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Regression: there was no way to compute a strong directory digest once and
+/// supply it; `overlay digest-base` prints exactly `directory_digest`/sha256.
+#[test]
+fn regression_overlay_digest_base_matches_directory_digest() {
+    use std::ffi::OsStr;
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    std::fs::create_dir_all(base.join("sub")).unwrap();
+    std::fs::write(base.join("sub/a"), b"alpha").unwrap();
+    let before = listing(&base);
+    let out = digest_base(&[base.as_os_str()], root.path());
+    assert_success(&out);
+    let printed = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    assert_eq!(
+        printed,
+        ratarmount_compositing::directory_digest(&base).unwrap()
+    );
+    assert_eq!(listing(&base), before, "digest-base must create nothing");
+
+    let json = digest_base(&[base.as_os_str(), OsStr::new("--json")], root.path());
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["kind"], "directory");
+    assert_eq!(value["digest"], printed.as_str());
+
+    let archive = root.path().join("a.tar");
+    std::fs::write(&archive, [7u8; 100]).unwrap();
+    let out = digest_base(&[archive.as_os_str()], root.path());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        format!("sha256:{:x}", Sha256::digest([7u8; 100]))
+    );
+
+    // The printed value is accepted by --base-digest and recorded as strong,
+    // with the weak companion kept for cheap remount checks.
+    let overlay = root.path().join("overlay");
+    assert_success(&open(&overlay, &base, &["--base-digest", &printed]));
+    let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
+    assert_eq!(meta.base_digest(), Some(printed.as_str()));
+    assert_eq!(meta.base_digest_kind(), Some("strong"));
+    assert_eq!(meta.get("base_digest_source"), Some("supplied"));
+    assert!(meta.get("base_weak_digest").unwrap().starts_with("weak:"));
+
+    let missing = digest_base(&[root.path().join("nope").as_os_str()], root.path());
+    assert_eq!(missing.status.code(), Some(1));
+    let fifo = base.join("pipe");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let refused = digest_base(&[base.as_os_str()], root.path());
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot digest special file"));
+}
+
+/// Regression: a strong digest taken while an overlay lives inside the
+/// directory would hash its SQLite files; it must be excluded explicitly.
+#[test]
+fn regression_digest_base_excludes_overlay_and_refuses_unexcluded_overlay() {
+    use std::ffi::OsStr;
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(base.join("f"), b"one").unwrap();
+    let overlay = base.join(".ov");
+    assert_success(&open(&overlay, &base, &[]));
+    let refused = digest_base(&[base.as_os_str()], root.path());
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--exclude-overlay"));
+    let args = [
+        base.as_os_str(),
+        OsStr::new("--exclude-overlay"),
+        overlay.as_os_str(),
+    ];
+    let out = digest_base(&args, root.path());
+    assert_success(&out);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("excluding: .ov"));
+    let digest = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    assert_ne!(digest, "");
+    // Writing through the overlay (a fresh mount reopens it) leaves it unchanged.
+    assert_success(&open(&overlay, &base, &[]));
+    assert_eq!(
+        String::from_utf8(digest_base(&args, root.path()).stdout)
+            .unwrap()
+            .trim(),
+        digest
+    );
+    // A new overlay with that supplied digest records strong + weak companion.
+    let second = base.join(".ov2");
+    assert_success(&open(&second, &base, &["--base-digest", &digest]));
+    assert_eq!(
+        OverlayMeta::read(&second).unwrap().unwrap().base_digest(),
+        Some(digest.as_str())
+    );
+}
+
+/// Regression: a directory base edited between sessions was never noticed on
+/// remount; it now refuses naming `--force-base-mismatch` (sidecars excepted).
+#[test]
+fn regression_overlay_meta_cli_directory_remount_refuses_edit() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::write(base.join("f"), b"one").unwrap();
+    let overlay = root.path().join("overlay");
+    assert_success(&open(&overlay, &base, &[]));
+    std::fs::write(base.join("f.index.sqlite"), b"idx").unwrap();
+    assert_success(&open(&overlay, &base, &[]));
+    std::fs::write(base.join("f"), b"edited").unwrap();
+    let refused = open(&overlay, &base, &[]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--force-base-mismatch"));
+    assert_success(&open(&overlay, &base, &["--force-base-mismatch"]));
+}

@@ -64,6 +64,40 @@ pub struct OverlayCreateInfo {
     pub git_tree: Option<String>,
     /// Cheap remote identity, e.g. ETag or Content-Length + Last-Modified.
     pub remote_token: Option<String>,
+    /// Paths of the caller (journal file, `--lower` layer directories) that may
+    /// lie inside a directory base and must stay out of its digest.
+    pub weak_exclude: Vec<PathBuf>,
+}
+
+/// Exclusions for a directory base, resolved before the overlay directory exists.
+pub(crate) struct ExcludePlan {
+    pub base: PathBuf,
+    pub excludes: BaseExcludes,
+    /// Entry for the overlay directory itself (when it lies inside the base).
+    pub overlay: Option<PathBuf>,
+}
+
+/// Resolve the exclusion set for a directory base. Must run before the
+/// overlay directory is created: the topmost-new rule depends on what exists.
+pub(crate) fn plan_excludes(
+    info: &OverlayCreateInfo,
+    overlay: &Path,
+) -> Result<Option<ExcludePlan>> {
+    if info.git_tree.is_some() || info.base_digest == BaseDigestRequest::None {
+        return Ok(None);
+    }
+    let Some(path) = info.path().filter(|p| p.is_dir()) else {
+        return Ok(None);
+    };
+    let (base, own) = resolve_base_excludes(path, &[overlay.to_path_buf()])?;
+    let mut paths = vec![overlay.to_path_buf()];
+    paths.extend(info.weak_exclude.iter().cloned());
+    let (_, excludes) = resolve_base_excludes(path, &paths)?;
+    Ok(Some(ExcludePlan {
+        base,
+        excludes,
+        overlay: own.paths().first().cloned(),
+    }))
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -195,25 +229,335 @@ pub fn stack_digest(base: &str, layers: &[&str]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+thread_local! {
+    static DIRECTORY_DIGEST_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static WEAK_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Strong directory digests started on this thread (test instrumentation).
+pub fn directory_digest_calls_this_thread() -> u64 {
+    DIRECTORY_DIGEST_CALLS.with(std::cell::Cell::get)
+}
+
+/// Weak directory walks started on this thread (test instrumentation).
+pub fn directory_weak_walks_this_thread() -> u64 {
+    WEAK_WALKS.with(std::cell::Cell::get)
+}
+
+/// Base-relative paths a directory digest leaves out (the overlay directory,
+/// the journal, `--lower` layers living inside the base). Sorted, duplicate
+/// free and never containing the base root itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BaseExcludes(Vec<PathBuf>);
+
+impl BaseExcludes {
+    pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut paths: Vec<PathBuf> = paths.into_iter().collect();
+        paths.sort_by(|a, b| {
+            a.as_os_str()
+                .as_encoded_bytes()
+                .cmp(b.as_os_str().as_encoded_bytes())
+        });
+        paths.dedup();
+        Self(paths)
+    }
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.0
+    }
+    /// True when `rel` equals an entry or lies below one.
+    pub fn covers(&self, rel: &Path) -> bool {
+        self.0.iter().any(|entry| rel.starts_with(entry))
+    }
+    /// JSON array of `/`-separated paths, as stored in `base_weak_excludes`.
+    pub fn to_json(&self) -> Result<String> {
+        let names = self
+            .0
+            .iter()
+            .map(|p| {
+                p.to_str()
+                    .map(|s| s.replace(std::path::MAIN_SEPARATOR, "/"))
+                    .ok_or_else(|| {
+                        OverlayError::Msg(format!(
+                            "cannot exclude non-UTF-8 path {} from the base digest",
+                            p.display()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        serde_json::to_string(&names).map_err(|e| OverlayError::Msg(e.to_string()))
+    }
+    pub fn from_json(text: &str) -> Result<Self> {
+        let names: Vec<String> = serde_json::from_str(text)
+            .map_err(|e| OverlayError::Msg(format!("invalid base_weak_excludes: {e}")))?;
+        Ok(Self::new(names.into_iter().map(PathBuf::from)))
+    }
+}
+
+/// Resolve paths that may not exist yet to canonical base-relative excludes.
+///
+/// The longest existing ancestor is canonicalized and the rest appended
+/// lexically. Topmost-new rule: when part of the path does not exist, only the
+/// first missing component is recorded (the directory creation that follows
+/// will add it to the base). Paths outside the base are dropped.
+pub fn resolve_base_excludes(base: &Path, paths: &[PathBuf]) -> Result<(PathBuf, BaseExcludes)> {
+    let base = base.canonicalize()?;
+    let mut out = Vec::new();
+    for path in paths {
+        let mut existing = std::path::absolute(path)?;
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        while fs::symlink_metadata(&existing).is_err() {
+            let Some(name) = existing.file_name().map(|n| n.to_owned()) else {
+                return Err(OverlayError::Msg(format!(
+                    "exclude path {}: cannot normalise a non-existent '..'",
+                    path.display()
+                )));
+            };
+            tail.push(name);
+            existing.pop();
+        }
+        let canonical = existing.canonicalize()?;
+        let Ok(rel) = canonical.strip_prefix(&base) else {
+            continue;
+        };
+        let mut entry = rel.to_path_buf();
+        if let Some(first) = tail.last() {
+            entry.push(first);
+        }
+        if entry.as_os_str().is_empty() {
+            return Err(OverlayError::Msg(
+                "cannot use the base directory itself as the overlay".into(),
+            ));
+        }
+        out.push(entry);
+    }
+    Ok((base, BaseExcludes::new(out)))
+}
+
+/// Union `new` into the stored `base_weak_excludes`. Append-only: no entry is
+/// ever removed or rewritten.
+pub fn append_base_excludes(conn: &Connection, new: &[PathBuf]) -> Result<()> {
+    let meta = OverlayMeta::from_connection(conn)?.unwrap_or_default();
+    let mut all: Vec<PathBuf> = match meta.get("base_weak_excludes") {
+        Some(text) => BaseExcludes::from_json(text)?.0,
+        None => Vec::new(),
+    };
+    all.extend(new.iter().cloned());
+    OverlayMeta::set(
+        conn,
+        "base_weak_excludes",
+        &BaseExcludes::new(all).to_json()?,
+    )
+}
+
+/// What a directory walk saw at one path.
+struct WalkEntry {
+    rel: PathBuf,
+    kind: u8,
+    size: u64,
+    mtime_ns: i128,
+    target: Vec<u8>,
+}
+
+#[cfg(unix)]
+fn mtime_ns(meta: &fs::Metadata) -> i128 {
+    use std::os::unix::fs::MetadataExt;
+    i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec())
+}
+
+#[cfg(not(unix))]
+fn mtime_ns(meta: &fs::Metadata) -> i128 {
+    match meta.modified() {
+        Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_nanos() as i128,
+            Err(e) => -(e.duration().as_nanos() as i128),
+        },
+        Err(_) => 0,
+    }
+}
+
+fn special_kind(file_type: &fs::FileType) -> u8 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_fifo() {
+            return b'p';
+        }
+        if file_type.is_socket() {
+            return b's';
+        }
+        if file_type.is_char_device() {
+            return b'c';
+        }
+        if file_type.is_block_device() {
+            return b'b';
+        }
+    }
+    let _ = file_type;
+    b'o'
+}
+
+/// Names in one directory listing, for the sibling test of the sidecar predicate.
+fn read_names(rd: fs::ReadDir) -> Result<Vec<std::ffi::OsString>> {
+    rd.map(|e| Ok(e?.file_name())).collect()
+}
+
+fn is_sidecar(name: &std::ffi::OsStr, names: &std::collections::HashSet<&str>) -> bool {
+    name.to_str().is_some_and(|name| {
+        crate::base_sidecars::is_ratarmount_sidecar_name(name, &|stem| names.contains(stem))
+    })
+}
+
+fn weak_walk(
+    root: &Path,
+    rel: &Path,
+    rd: fs::ReadDir,
+    excludes: &BaseExcludes,
+    out: &mut Vec<WalkEntry>,
+) -> Result<()> {
+    let names = read_names(rd)?;
+    let utf8: std::collections::HashSet<&str> = names.iter().filter_map(|n| n.to_str()).collect();
+    for name in &names {
+        let child = rel.join(name);
+        if excludes.covers(&child) {
+            continue;
+        }
+        let path = root.join(&child);
+        let meta = fs::symlink_metadata(&path)?;
+        let file_type = meta.file_type();
+        if file_type.is_dir() {
+            match fs::read_dir(&path) {
+                Ok(sub) => {
+                    out.push(WalkEntry {
+                        rel: child.clone(),
+                        kind: b'd',
+                        size: 0,
+                        mtime_ns: 0,
+                        target: Vec::new(),
+                    });
+                    weak_walk(root, &child, sub, excludes, out)?;
+                }
+                Err(_) => out.push(WalkEntry {
+                    rel: child,
+                    kind: b'u',
+                    size: 0,
+                    mtime_ns: 0,
+                    target: Vec::new(),
+                }),
+            }
+            continue;
+        }
+        if is_sidecar(name, &utf8) {
+            continue;
+        }
+        let (kind, size, target) = if file_type.is_file() {
+            (b'f', meta.len(), Vec::new())
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(&path)?;
+            (b'l', 0, target.as_os_str().as_encoded_bytes().to_vec())
+        } else {
+            (special_kind(&file_type), 0, Vec::new())
+        };
+        out.push(WalkEntry {
+            rel: child,
+            kind,
+            size,
+            mtime_ns: mtime_ns(&meta),
+            target,
+        });
+    }
+    Ok(())
+}
+
+/// Cheap identity of a directory base: a sorted manifest of path, type, size
+/// and mtime (symlink targets included). Only `lstat`/`readlink`/`readdir`:
+/// no file is opened, so FIFOs and unreadable files cannot block or fail it.
+/// A content edit that keeps size and mtime is invisible to it.
+pub fn directory_weak_digest(root: &Path, excludes: &BaseExcludes) -> Result<String> {
+    WEAK_WALKS.with(|c| c.set(c.get() + 1));
+    let mut entries = Vec::new();
+    weak_walk(
+        root,
+        Path::new(""),
+        fs::read_dir(root)?,
+        excludes,
+        &mut entries,
+    )?;
+    entries.sort_by(|a, b| {
+        a.rel
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(b.rel.as_os_str().as_encoded_bytes())
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(b"ratarmount-weak-dir-v1\0");
+    for e in entries {
+        let name = e.rel.as_os_str().as_encoded_bytes();
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name);
+        hasher.update([e.kind]);
+        match e.kind {
+            b'f' => {
+                hasher.update(e.size.to_le_bytes());
+                hasher.update(e.mtime_ns.to_le_bytes());
+            }
+            b'l' => {
+                hasher.update((e.target.len() as u64).to_le_bytes());
+                hasher.update(&e.target);
+                hasher.update(e.mtime_ns.to_le_bytes());
+            }
+            b'd' | b'u' => {}
+            _ => hasher.update(e.mtime_ns.to_le_bytes()),
+        }
+    }
+    Ok(format!("weak:{:x}", hasher.finalize()))
+}
+
 /// Sorted, length-framed manifest of relative OS path bytes, mode, size and
 /// content SHA-256. Symlinks hash their target bytes and are never followed.
 /// Directories use size zero; special files are refused instead of opened.
 pub fn directory_digest(root: &Path) -> Result<String> {
-    fn visit(root: &Path, rel: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    directory_digest_excluding(root, &BaseExcludes::default())
+}
+
+/// [`directory_digest`] leaving out `excludes` and ratarmount's own sidecar
+/// names. Refuses a directory that still holds an un-excluded write overlay.
+pub fn directory_digest_excluding(root: &Path, excludes: &BaseExcludes) -> Result<String> {
+    DIRECTORY_DIGEST_CALLS.with(|c| c.set(c.get() + 1));
+    fn visit(
+        root: &Path,
+        rel: &Path,
+        excludes: &BaseExcludes,
+        paths: &mut Vec<PathBuf>,
+    ) -> Result<()> {
         paths.push(rel.to_path_buf());
-        for entry in fs::read_dir(root.join(rel))? {
-            let entry = entry?;
-            let child = rel.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                visit(root, &child, paths)?;
-            } else {
+        let names = read_names(fs::read_dir(root.join(rel))?)?;
+        let utf8: std::collections::HashSet<&str> =
+            names.iter().filter_map(|n| n.to_str()).collect();
+        for name in &names {
+            let child = rel.join(name);
+            if excludes.covers(&child) {
+                continue;
+            }
+            if fs::symlink_metadata(root.join(&child))?
+                .file_type()
+                .is_dir()
+            {
+                visit(root, &child, excludes, paths)?;
+            } else if name.to_str() == Some(HIDDEN_DB) {
+                return Err(OverlayError::Msg(format!(
+                    "directory {} contains a write overlay at {}; pass --exclude-overlay {} to leave it out of the digest (a mount with that overlay inside the base measures without it)",
+                    root.display(),
+                    root.join(rel).display(),
+                    root.join(rel).display(),
+                )));
+            } else if !is_sidecar(name, &utf8) {
                 paths.push(child);
             }
         }
         Ok(())
     }
     let mut paths = Vec::new();
-    visit(root, Path::new(""), &mut paths)?;
+    visit(root, Path::new(""), excludes, &mut paths)?;
     paths.sort_by(|a, b| {
         a.as_os_str()
             .as_encoded_bytes()
@@ -271,7 +615,8 @@ impl OverlayCreateInfo {
             .map_err(Into::into)
     }
 
-    fn digest(&self) -> Result<(String, &'static str)> {
+    /// `dir_weak` is the weak manifest of a directory base, measured by the caller.
+    fn digest(&self, dir_weak: Option<&str>) -> Result<(String, &'static str)> {
         match &self.base_digest {
             BaseDigestRequest::Supplied(digest) => {
                 let validated: BaseDigestRequest = digest.parse().map_err(OverlayError::Msg)?;
@@ -290,7 +635,11 @@ impl OverlayCreateInfo {
         }
         if let Some(path) = self.path() {
             if path.is_dir() {
-                return Ok((directory_digest(path)?, "strong"));
+                let weak = match dir_weak {
+                    Some(weak) => weak.to_owned(),
+                    None => directory_weak_digest(path, &BaseExcludes::default())?,
+                };
+                return Ok((weak, "weak"));
             }
             let digest = cached_archive_digest(path, self.index_path.as_deref()).map_err(|e| {
                 OverlayError::Msg(format!("cannot hash base {}: {e}", path.display()))
@@ -308,14 +657,14 @@ pub(crate) fn initialize(
     conn: &Connection,
     had_files: bool,
     info: Option<&OverlayCreateInfo>,
-    overlay_root: &Path,
+    plan: Option<&ExcludePlan>,
 ) -> Result<()> {
     let previous = OverlayMeta::from_connection(conn)?;
     if had_files {
         if let Some(meta) = previous.filter(|m| !m.values.is_empty()) {
             if !meta.legacy() {
                 if let Some(info) = info {
-                    verify(conn, &meta, info)?;
+                    verify(conn, &meta, info, plan)?;
                 }
             }
             return Ok(());
@@ -328,17 +677,11 @@ pub(crate) fn initialize(
         ..Default::default()
     };
     let info = info.unwrap_or(&default);
-    if info.base_digest == BaseDigestRequest::Compute && info.git_tree.is_none() {
-        if let Some(path) = info.path().filter(|path| path.is_dir()) {
-            if overlay_root.starts_with(path.canonicalize()?) {
-                return Err(OverlayError::Msg(
-                    "cannot compute a directory base digest with the overlay inside the base; place the overlay outside the base or supply --base-digest".into(),
-                ));
-            }
-        }
-    }
+    let dir_weak = plan
+        .map(|plan| directory_weak_digest(&plan.base, &plan.excludes))
+        .transpose()?;
     let before = info.stamp()?;
-    let (digest, kind) = info.digest()?;
+    let (digest, kind) = info.digest(dir_weak.as_deref())?;
     if info.stamp()? != before {
         return Err(OverlayError::Msg("base changed while hashing".into()));
     }
@@ -366,6 +709,17 @@ pub(crate) fn initialize(
             ),
         ),
     ]);
+    if kind != "none" {
+        let supplied = matches!(info.base_digest, BaseDigestRequest::Supplied(_));
+        values.insert(
+            "base_digest_source",
+            if supplied { "supplied" } else { "computed" }.to_owned(),
+        );
+    }
+    if let (Some(plan), Some(weak)) = (plan, &dir_weak) {
+        values.insert("base_weak_digest", weak.clone());
+        values.insert("base_weak_excludes", plan.excludes.to_json()?);
+    }
     if let Some(stamp) = before {
         values.insert("base_size", stamp.size.to_string());
         values.insert("base_mtime_ns", stamp.mtime_ns.to_string());
@@ -457,12 +811,18 @@ pub(crate) fn refresh_committed_base_offline(overlay: &Path, archive: &Path) -> 
     refresh_committed_base(&conn, archive)
 }
 
-fn verify(conn: &Connection, meta: &OverlayMeta, info: &OverlayCreateInfo) -> Result<()> {
+fn verify(
+    conn: &Connection,
+    meta: &OverlayMeta,
+    info: &OverlayCreateInfo,
+    plan: Option<&ExcludePlan>,
+) -> Result<()> {
     if meta.base_digest_kind() == Some("none") {
         return Ok(());
     }
     let old = meta.base_digest().unwrap_or("none");
-    let mismatch = if let Some(recorded) = meta.get("base_git_tree") {
+    let mut to_append: Vec<PathBuf> = Vec::new();
+    let mut mismatch = if let Some(recorded) = meta.get("base_git_tree") {
         (info.git_tree.as_deref() != Some(recorded)).then(|| {
             format!(
                 "git-tree:{}",
@@ -478,10 +838,31 @@ fn verify(conn: &Connection, meta: &OverlayMeta, info: &OverlayCreateInfo) -> Re
             )),
             None => Some("unavailable (local archive missing)".into()),
         }
+    } else if let (Some(recorded_weak), Some(plan)) = (meta.get("base_weak_digest"), plan) {
+        // Always re-walk with the *recorded* exclusions; this invocation's
+        // paths only matter for the append check below.
+        let recorded = match meta.get("base_weak_excludes") {
+            Some(text) => BaseExcludes::from_json(text)?,
+            None => BaseExcludes::new(plan.overlay.iter().cloned()),
+        };
+        for entry in plan.excludes.paths() {
+            if recorded.covers(entry) {
+                continue;
+            }
+            if fs::symlink_metadata(plan.base.join(entry)).is_ok() {
+                return Err(OverlayError::Msg(format!(
+                    "{} is inside the base and already exists, so it is base content; it cannot be excluded after the overlay was created. Move the journal outside the base, or remove that file from the base",
+                    plan.base.join(entry).display()
+                )));
+            }
+            to_append.push(entry.clone());
+        }
+        let current = directory_weak_digest(&plan.base, &recorded)?;
+        (current != recorded_weak).then_some(current)
     } else {
         None
     };
-    let mismatch = mismatch.or_else(|| match &info.base_digest {
+    mismatch = mismatch.or_else(|| match &info.base_digest {
         BaseDigestRequest::Supplied(digest) if digest != old => Some(digest.clone()),
         _ => None,
     });
@@ -490,6 +871,8 @@ fn verify(conn: &Connection, meta: &OverlayMeta, info: &OverlayCreateInfo) -> Re
             return Err(OverlayError::Msg(format!("base mismatch: recorded digest {old}; current digest {current}; use --force-base-mismatch to override")));
         }
         OverlayMeta::set(conn, "base_mismatch_forced_at", &timestamp())?;
+    } else if !to_append.is_empty() {
+        append_base_excludes(conn, &to_append)?;
     }
     Ok(())
 }
@@ -745,13 +1128,16 @@ mod tests {
             base_url: "hf://datasets/a/b@main/snapshot.tar".into(),
             ..Default::default()
         };
-        assert_eq!(remote.digest().unwrap().1, "weak");
-        assert_eq!(remote.digest().unwrap(), remote.digest().unwrap());
+        assert_eq!(remote.digest(None).unwrap().1, "weak");
+        assert_eq!(remote.digest(None).unwrap(), remote.digest(None).unwrap());
         let with_token = OverlayCreateInfo {
             remote_token: Some("etag:123".into()),
             ..remote.clone()
         };
-        assert_ne!(remote.digest().unwrap().0, with_token.digest().unwrap().0);
+        assert_ne!(
+            remote.digest(None).unwrap().0,
+            with_token.digest(None).unwrap().0
+        );
         let overlay = root.path().join("no-context");
         drop(WriteOverlay::new(base(root.path()), &overlay).unwrap());
         let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
@@ -790,28 +1176,335 @@ mod tests {
         }
     }
 
-    /// Regression: a directory digest included its own SQLite journal and changed as metadata was written.
+    fn meta_of(overlay: &Path) -> OverlayMeta {
+        OverlayMeta::read(overlay).unwrap().unwrap()
+    }
+
+    fn open_dir_base(
+        base_dir: &Path,
+        overlay: &Path,
+        context: &OverlayCreateInfo,
+    ) -> Result<WriteOverlay> {
+        WriteOverlay::new_with_create_info(base(base_dir), overlay, context)
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// Regression: a directory base was hashed (every file read) at overlay
+    /// creation; it now records the cheap weak manifest and reads no content.
     #[test]
-    fn regression_overlay_meta_directory_cannot_hash_its_own_overlay() {
+    fn regression_mount_without_base_digest_hashes_no_directory_content() {
         let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir_all(basedir.join("sub")).unwrap();
+        fs::write(basedir.join("sub/a"), b"a").unwrap();
+        let (dirs, streams, walks) = (
+            directory_digest_calls_this_thread(),
+            ratarmount_index::sha256_stream_calls_this_thread(),
+            directory_weak_walks_this_thread(),
+        );
         let overlay = root.path().join("overlay");
-        let mut context = info(root.path());
-        let error = WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context)
+        drop(open_dir_base(&basedir, &overlay, &info(&basedir)).unwrap());
+        // Reopen, and an overlay inside the base.
+        drop(open_dir_base(&basedir, &overlay, &info(&basedir)).unwrap());
+        drop(open_dir_base(&basedir, &basedir.join(".ov"), &info(&basedir)).unwrap());
+        assert_eq!(directory_digest_calls_this_thread(), dirs);
+        assert_eq!(ratarmount_index::sha256_stream_calls_this_thread(), streams);
+        assert_eq!(directory_weak_walks_this_thread(), walks + 3);
+        let meta = meta_of(&overlay);
+        assert_eq!(meta.base_digest_kind(), Some("weak"));
+        assert!(meta.base_digest().unwrap().starts_with("weak:"));
+        assert_eq!(meta.get("base_weak_digest"), meta.base_digest());
+        assert_eq!(meta.get("base_digest_source"), Some("computed"));
+        // Positive controls: the counters are wired.
+        let archive = root.path().join("a.tar");
+        fs::write(&archive, b"abc").unwrap();
+        drop(open_dir_base(root.path(), &root.path().join("ov2"), &info(&archive)).unwrap());
+        assert!(ratarmount_index::sha256_stream_calls_this_thread() > streams);
+        directory_digest(root.path().join("base").join("sub").as_path()).unwrap();
+        assert_eq!(directory_digest_calls_this_thread(), dirs + 1);
+    }
+
+    /// Regression: a base holding a FIFO or an unreadable file failed creation
+    /// ("cannot digest special file"); the weak walk never opens anything.
+    #[cfg(unix)]
+    #[test]
+    fn regression_directory_base_with_fifo_creates_weak() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir_all(basedir.join("locked")).unwrap();
+        fs::write(basedir.join("secret"), b"x").unwrap();
+        fs::set_permissions(basedir.join("secret"), fs::Permissions::from_mode(0o0)).unwrap();
+        fs::write(basedir.join("locked/in"), b"x").unwrap();
+        fs::set_permissions(basedir.join("locked"), fs::Permissions::from_mode(0o0)).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(basedir.join("pipe"))
+            .status()
+            .unwrap()
+            .success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (b, o) = (basedir.clone(), root.path().join("overlay"));
+        std::thread::spawn(move || {
+            let result = open_dir_base(&b, &o, &info(&b)).map(drop);
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(20));
+        fs::set_permissions(basedir.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        result.expect("creation blocked on the FIFO").unwrap();
+        assert_eq!(
+            meta_of(&root.path().join("overlay")).base_digest_kind(),
+            Some("weak")
+        );
+    }
+
+    /// Regression: the weak digest is order independent and sees exactly
+    /// path, type, size, mtime and symlink targets.
+    #[test]
+    fn regression_directory_weak_digest_deterministic_and_sensitive() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        for (root, names) in [(a.path(), ["one", "two"]), (b.path(), ["two", "one"])] {
+            for name in names {
+                fs::write(root.join(name), name).unwrap();
+                set_mtime(&root.join(name), 1_000_000);
+            }
+            fs::create_dir(root.join("empty")).unwrap();
+        }
+        let none = BaseExcludes::default();
+        let digest = |p: &Path| directory_weak_digest(p, &none).unwrap();
+        assert_eq!(digest(a.path()), digest(b.path()));
+        assert!(digest(a.path()).starts_with("weak:"));
+        let before = digest(a.path());
+        // Same size, restored mtime: invisible (documented limitation).
+        fs::write(a.path().join("one"), "ONE").unwrap();
+        set_mtime(&a.path().join("one"), 1_000_000);
+        assert_eq!(digest(a.path()), before);
+        // Size, mtime, new/removed entries: visible.
+        fs::write(a.path().join("one"), "longer").unwrap();
+        set_mtime(&a.path().join("one"), 1_000_000);
+        assert_ne!(digest(a.path()), before);
+        fs::write(a.path().join("one"), "ONE").unwrap();
+        set_mtime(&a.path().join("one"), 1_000_001);
+        assert_ne!(digest(a.path()), before);
+        set_mtime(&a.path().join("one"), 1_000_000);
+        assert_eq!(digest(a.path()), before);
+        fs::write(a.path().join("new"), "").unwrap();
+        assert_ne!(digest(a.path()), before);
+        fs::remove_file(a.path().join("new")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::os::unix::fs::symlink("/aaa", a.path().join("link")).unwrap();
+            let linked = digest(a.path());
+            fs::remove_file(a.path().join("link")).unwrap();
+            std::os::unix::fs::symlink("/bbb", a.path().join("link")).unwrap();
+            assert_ne!(digest(a.path()), linked, "same-length retarget must show");
+            // Directory mode never counts.
+            let now = digest(a.path());
+            fs::set_permissions(a.path().join("empty"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(digest(a.path()), now);
+        }
+        // Sidecars written by ratarmount are invisible; look-alikes are not.
+        let now = digest(a.path());
+        fs::write(a.path().join("a.tar"), "x").unwrap();
+        let with_tar = digest(a.path());
+        for name in [
+            "a.tar.index.sqlite",
+            "a.tar.index.ptr",
+            "a.tar.rgzi",
+            "a.tar.ratarmount-commit-journal",
+        ] {
+            fs::write(a.path().join(name), "x").unwrap();
+        }
+        assert_eq!(digest(a.path()), with_tar);
+        assert_ne!(with_tar, now);
+        fs::write(a.path().join("x.index.txt"), "x").unwrap();
+        assert_ne!(digest(a.path()), with_tar);
+    }
+
+    /// Regression: reopening an overlay over an edited directory base was never
+    /// checked; it now refuses naming `--force-base-mismatch`.
+    #[test]
+    fn regression_overlay_meta_directory_reopen_refuses_after_edit_naming_force_flag() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir(&basedir).unwrap();
+        fs::write(basedir.join("f"), b"one").unwrap();
+        let overlay = root.path().join("overlay");
+        let mut context = info(&basedir);
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        // A sidecar written into the base does not count.
+        fs::write(basedir.join("f.index.sqlite"), b"idx").unwrap();
+        fs::write(basedir.join("f.ratarmount-commit-journal"), b"j").unwrap();
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        fs::write(basedir.join("f"), b"edited!").unwrap();
+        let error = open_dir_base(&basedir, &overlay, &context)
             .err()
             .unwrap()
             .to_string();
-        assert!(error.contains("overlay inside the base"), "{error}");
-        assert!(!overlay.join(HIDDEN_DB).exists());
-        assert!(!overlay.join(crate::OVERLAY_MARKER).exists());
-        context.base_digest = BaseDigestRequest::Supplied(format!("sha256:{}", "a".repeat(64)));
-        drop(WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context).unwrap());
-        assert_eq!(
-            OverlayMeta::read(&overlay)
-                .unwrap()
-                .unwrap()
-                .base_digest_kind(),
-            Some("strong")
+        assert!(
+            error.contains("--force-base-mismatch") && error.contains("weak:"),
+            "{error}"
         );
+        assert!(meta_of(&overlay).get("base_mismatch_forced_at").is_none());
+        context.force_base_mismatch = true;
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        assert!(meta_of(&overlay).get("base_mismatch_forced_at").is_some());
+    }
+
+    /// Regression: `Compute` refused an overlay inside a directory base. It is
+    /// now excluded from the digest, so writing through it never changes it.
+    #[test]
+    fn regression_overlay_inside_directory_base_excluded_from_weak_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir(&basedir).unwrap();
+        fs::write(basedir.join("f"), b"one").unwrap();
+        let outside = directory_weak_digest(&basedir, &BaseExcludes::default()).unwrap();
+        let overlay = basedir.join(".ov");
+        let context = info(&basedir);
+        let ov = open_dir_base(&basedir, &overlay, &context).unwrap();
+        ov.create_file("/new.txt", 0o644).unwrap();
+        drop(ov);
+        let meta = meta_of(&overlay);
+        assert_eq!(meta.base_digest(), Some(outside.as_str()));
+        assert_eq!(meta.get("base_weak_excludes"), Some(r#"[".ov"]"#));
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        fs::write(basedir.join("f"), b"changed").unwrap();
+        let error = open_dir_base(&basedir, &overlay, &context)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("--force-base-mismatch"), "{error}");
+        // The overlay may never be the base itself.
+        let error = open_dir_base(&basedir, &basedir, &context)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("base directory itself"), "{error}");
+        // A supplied digest still records the weak companion.
+        let supplied = OverlayCreateInfo {
+            base_digest: BaseDigestRequest::Supplied(format!("sha256:{}", "a".repeat(64))),
+            ..info(&basedir)
+        };
+        let overlay = basedir.join(".ov2");
+        drop(open_dir_base(&basedir, &overlay, &supplied).unwrap());
+        let meta = meta_of(&overlay);
+        assert_eq!(meta.base_digest_kind(), Some("strong"));
+        assert_eq!(meta.get("base_digest_source"), Some("supplied"));
+        assert!(meta.get("base_weak_digest").unwrap().starts_with("weak:"));
+        fs::write(basedir.join("f"), b"changed again").unwrap();
+        assert!(open_dir_base(&basedir, &overlay, &supplied).is_err());
+    }
+
+    /// Regression: an overlay in a not-yet-existing parent (`B/new/ov`) must
+    /// record `new` (topmost-new), since creating the overlay adds `B/new`.
+    #[test]
+    fn regression_overlay_in_new_parent_remount_and_verify_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir(&basedir).unwrap();
+        fs::write(basedir.join("f"), b"one").unwrap();
+        let expected = directory_weak_digest(&basedir, &BaseExcludes::default()).unwrap();
+        let overlay = basedir.join("new/ov");
+        let context = info(&basedir);
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        let meta = meta_of(&overlay);
+        assert_eq!(meta.get("base_weak_excludes"), Some(r#"["new"]"#));
+        assert_eq!(meta.base_digest(), Some(expected.as_str()));
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+    }
+
+    /// Regression: the recorded exclusion set only ever grows, and a journal
+    /// added on a later mount is appended (absent) or refused (base content).
+    #[test]
+    fn regression_journal_added_later_is_appended_and_recorded_excludes_are_append_only() {
+        let a = BaseExcludes::new(["a".into(), "c".into()]);
+        assert_eq!(a.to_json().unwrap(), r#"["a","c"]"#);
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(META_SCHEMA).unwrap();
+        OverlayMeta::set(&conn, "base_weak_excludes", r#"["a","c"]"#).unwrap();
+        append_base_excludes(&conn, &["b".into()]).unwrap();
+        append_base_excludes(&conn, &["a".into()]).unwrap();
+        let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
+        assert_eq!(meta.get("base_weak_excludes"), Some(r#"["a","b","c"]"#));
+
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir(&basedir).unwrap();
+        fs::write(basedir.join("existing.txt"), b"x").unwrap();
+        let overlay = basedir.join(".ov");
+        let mut context = info(&basedir);
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        context.weak_exclude = vec![basedir.join("j.jsonl")];
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        assert_eq!(
+            meta_of(&overlay).get("base_weak_excludes"),
+            Some(r#"[".ov","j.jsonl"]"#)
+        );
+        // The journal grows; a journal-free remount still passes.
+        fs::write(basedir.join("j.jsonl"), b"lots of lines").unwrap();
+        context.weak_exclude.clear();
+        drop(open_dir_base(&basedir, &overlay, &context).unwrap());
+        // A journal path that is base content is refused and appends nothing.
+        context.weak_exclude = vec![basedir.join("existing.txt")];
+        context.force_base_mismatch = true;
+        let error = open_dir_base(&basedir, &overlay, &context)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("already exists, so it is base content"),
+            "{error}"
+        );
+        assert_eq!(
+            meta_of(&overlay).get("base_weak_excludes"),
+            Some(r#"[".ov","j.jsonl"]"#)
+        );
+    }
+
+    /// Regression: exclusion paths that do not exist yet, symlinks and `..`.
+    #[cfg(unix)]
+    #[test]
+    fn regression_resolve_base_excludes_cases() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().join("base");
+        fs::create_dir_all(basedir.join("real")).unwrap();
+        fs::create_dir(basedir.join("new_parent")).unwrap();
+        std::os::unix::fs::symlink(basedir.join("real"), basedir.join("link")).unwrap();
+        let rel = |paths: &[PathBuf]| -> Vec<PathBuf> {
+            resolve_base_excludes(&basedir, paths)
+                .unwrap()
+                .1
+                .paths()
+                .to_vec()
+        };
+        assert_eq!(
+            rel(&[basedir.join("new_parent/ov")]),
+            [PathBuf::from("new_parent/ov")]
+        );
+        assert_eq!(rel(&[basedir.join("a/b/c")]), [PathBuf::from("a")]);
+        assert_eq!(rel(&[basedir.join("link/ov")]), [PathBuf::from("real/ov")]);
+        assert_eq!(rel(&[basedir.join("link/x/ov")]), [PathBuf::from("real/x")]);
+        assert_eq!(rel(&[basedir.join("real")]), [PathBuf::from("real")]);
+        assert!(rel(&[root.path().join("outside/ov")]).is_empty());
+        let error = resolve_base_excludes(&basedir, &[basedir.join("a/../b")])
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("'..'"), "{error}");
+        // A symlink loop and a dangling link never get followed by the walk.
+        std::os::unix::fs::symlink("/absent-target", basedir.join("dangling")).unwrap();
+        std::os::unix::fs::symlink("b", basedir.join("loop_a")).unwrap();
+        std::os::unix::fs::symlink("loop_a", basedir.join("b")).unwrap();
+        directory_weak_digest(&basedir, &BaseExcludes::default()).unwrap();
     }
 
     /// Regression: read-only metadata inspection created files or hid SQLITE_BUSY.
