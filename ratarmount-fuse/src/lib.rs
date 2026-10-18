@@ -3651,6 +3651,21 @@ fn run_fusermount(args: &[&OsStr]) -> std::io::Result<std::process::Output> {
     run("fusermount3").or_else(|_| run("fusermount"))
 }
 
+/// True when fusermount reported EBUSY. The mountpoint is echoed in the message
+/// (`failed to unmount <path>: <strerror>`), so it is removed before matching.
+#[cfg(not(target_os = "macos"))]
+fn is_busy_diagnostic(stderr: &str, mp: &Path) -> bool {
+    let mp = mp.to_string_lossy();
+    stderr.lines().any(|l| {
+        let l = if mp.is_empty() {
+            l.to_string()
+        } else {
+            l.replace(mp.as_ref(), "")
+        };
+        l.trim_end().ends_with("Device or resource busy")
+    })
+}
+
 #[cfg(not(target_os = "macos"))]
 fn unmount_linux_with(
     mp: &Path,
@@ -3679,7 +3694,7 @@ fn unmount_linux_with(
         } else {
             last.to_string()
         };
-        if !stderr.contains("Device or resource busy") {
+        if !is_busy_diagnostic(&stderr, mp) {
             return Err(std::io::Error::other(format!(
                 "fusermount failed for {}: {detail}",
                 mp.display()
@@ -8364,5 +8379,41 @@ mod unmount_retry_tests {
         };
         let e = unmount_linux_with(Path::new("/m"), &["-u"], fast_retry(), &mut run).unwrap_err();
         assert_eq!((calls, e.kind()), (1, ErrorKind::NotFound));
+    }
+
+    /// Regression: the echoed mountpoint is not the diagnostic. A path that contains
+    /// "Device or resource busy" with a "No such file or directory" error must fail fast.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_unmount_busy_text_in_mountpoint_is_not_busy() {
+        let mp = "/tmp/Device or resource busy/mnt";
+        let mut calls = 0;
+        let mut run = |_: &[&OsStr]| {
+            calls += 1;
+            Ok(fake_fusermount(
+                1,
+                &format!("fusermount3: failed to unmount {mp}: No such file or directory\n"),
+            ))
+        };
+        let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run).unwrap_err();
+        assert_eq!((calls, e.kind()), (1, ErrorKind::Other));
+    }
+
+    /// A genuinely busy mount whose path also contains the phrase still retries.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_unmount_busy_with_busy_text_in_mountpoint_retries() {
+        let mp = "/tmp/Device or resource busy/mnt";
+        let mut calls = 0;
+        let mut run = |_: &[&OsStr]| {
+            calls += 1;
+            Ok(fake_fusermount(
+                1,
+                &format!("fusermount3: failed to unmount {mp}: Device or resource busy\n"),
+            ))
+        };
+        let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run).unwrap_err();
+        assert!(calls > 2, "retried only {calls} times");
+        assert_eq!(e.kind(), ErrorKind::ResourceBusy);
     }
 }
