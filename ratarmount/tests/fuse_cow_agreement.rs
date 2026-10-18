@@ -415,22 +415,43 @@ fn edit(mnt: &Path) {
 /// diff, fsck (check and repair), seal, verify, pack, unpack + verify agree on
 /// one digest, which is returned. `verify_args` is added to every `verify`.
 fn agree(root: &Path, overlay: &Path, cache: &Path, verify_args: &[&str]) -> String {
+    agree_with(root, overlay, cache, verify_args, &[])
+}
+
+/// `agree` with `base_args` (e.g. `--force-base-mismatch`) added to every
+/// `diff`, `seal` and `pack` of the live overlay; the unpacked bundle is not given them.
+fn agree_with(
+    root: &Path,
+    overlay: &Path,
+    cache: &Path,
+    verify_args: &[&str],
+    base_args: &[&str],
+) -> String {
     let (o, p) = (overlay, Path::new);
-    let hash = expect(run(&[p("diff"), o, p("--hash")], cache), 0);
+    let with = |head: &[&'static str], tail: &[&Path]| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = head.iter().map(PathBuf::from).collect();
+        v.push(o.to_path_buf());
+        v.extend(tail.iter().map(|t| t.to_path_buf()));
+        v.extend(base_args.iter().map(PathBuf::from));
+        v
+    };
+    let run_with = |head: &[&'static str], tail: &[&Path]| {
+        let v = with(head, tail);
+        let refs: Vec<&Path> = v.iter().map(PathBuf::as_path).collect();
+        expect(run(&refs, cache), 0)
+    };
+    let hash = run_with(&["diff"], &[p("--hash")]);
     assert!(hash.trim().starts_with("sha256:"), "{hash}");
     expect(run(&[p("overlay"), p("fsck"), o], cache), 0);
     expect(run(&[p("overlay"), p("fsck"), o, p("--repair")], cache), 0);
     assert_eq!(
-        expect(run(&[p("diff"), o, p("--hash")], cache), 0),
+        run_with(&["diff"], &[p("--hash")]),
         hash,
         "diff --hash changed across fsck --repair"
     );
+    assert_eq!(run_with(&["overlay", "seal"], &[]).trim(), hash.trim());
     assert_eq!(
-        expect(run(&[p("overlay"), p("seal"), o], cache), 0).trim(),
-        hash.trim()
-    );
-    assert_eq!(
-        expect(run(&[p("diff"), o, p("--hash")], cache), 0),
+        run_with(&["diff"], &[p("--hash")]),
         hash,
         "diff --hash changed across seal"
     );
@@ -442,7 +463,7 @@ fn agree(root: &Path, overlay: &Path, cache: &Path, verify_args: &[&str]) -> Str
     assert_eq!(verify(o).trim(), hash.trim());
     let bundle = root.join("agree.tar.zst");
     let restored = root.join("agree-restored");
-    expect(run(&[p("overlay"), p("pack"), o, &bundle], cache), 0);
+    run_with(&["overlay", "pack"], &[&bundle]);
     assert_eq!(
         expect(
             run(&[p("overlay"), p("unpack"), &bundle, &restored], cache),
@@ -520,9 +541,31 @@ fn weak_base_digest_reopen_refusal_and_force() {
         "Makefile",
     );
     mount.unmount();
+    // Regression: diff against the edited base is refused without the override
+    // and reports a forced run (recorded and actual base) with it.
+    let diff_json = |extra: &[&str]| {
+        let mut args = vec![
+            Path::new("diff"),
+            &overlay,
+            Path::new("--hash"),
+            Path::new("--json"),
+        ];
+        args.extend(extra.iter().map(|a| Path::new(a)));
+        run(&args, &cache)
+    };
+    assert_ne!(diff_json(&[]).status.code(), Some(0));
+    let report = expect(diff_json(&["--force-base-mismatch"]), 0);
+    assert!(report.contains("\"base_forced\":true"), "{report}");
+    assert!(report.contains("\"base_identity\":\"forced\""), "{report}");
     // The weak digest cannot vouch for the edited base, so verify skips it;
     // the layer hash is what must agree.
-    agree(root, &overlay, &cache, &["--no-base-check"]);
+    agree_with(
+        root,
+        &overlay,
+        &cache,
+        &["--no-base-check"],
+        &["--force-base-mismatch"],
+    );
 }
 
 /// A supplied strong digest (from `overlay digest-base`) is recorded without
