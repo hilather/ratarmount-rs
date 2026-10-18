@@ -4,6 +4,8 @@
 
 ### Changes
 
+- **Gate-3 fixes (#133):** the verified-bundle marker is keyed on the listing options too (`--no-file-versions`, `--ignore-zeros`, `--gnu-incremental`, `--detect-gnu-incremental`, `--encoding`), so a check made under one view is never reused under another; reopening an existing overlay always compares the base with the recorded identity, and `--base-digest` (including `none`) applies only at creation; the `RATARMOUNT_TEST_HASH_*` seams exist only in test builds (release binaries contain no `RATARMOUNT_TEST_` string); `sandbox run` checks the control-socket length after resolving `TMPDIR` (a short symlink to a long directory now takes the short-base fallback); the layer cache also sweeps old `.copy-XXXXXX.tar.zst` leftovers (exact shape, cache only); a read-only `--lower` mount refused because an existing `--journal` file lies inside the base names that file and `--force-stack-mismatch`.
+
 - **Digest states:** `overlay info`, the root xattr `user.ratarmount.base_digest_state`, `diff --hash --json` and the `sandbox run` `patch_hash` report carry a stable `base_digest_state` of `present`, `pending` or `none` (see docs/sandbox.md, "Digest states"); `base_pending` stays for compatibility. A digest resolved by `overlay seal` is written back to a writable index cache (and to the overlay database only otherwise); concurrent seals over a read-only archive hash once per seal, and `overlay verify` always rehashes the base. (#133)
 
 - Git mounts (`git:///…`, `--git`) show writable-style modes `0644`/`0755`/`0777` instead of read-only modes. (#133)

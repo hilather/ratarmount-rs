@@ -179,7 +179,10 @@ never serves, so it stays `pending`. Hashing never creates an archive index.
 cache. The test-only variable `RATARMOUNT_TEST_HASH_GATE=<path>` holds the
 background hash until that path exists; `RATARMOUNT_TEST_HASH_LOG=<path>`
 appends one line per full archive hash and `RATARMOUNT_TEST_HASH_DELAY_MS`
-slows each hash (both are test seams).
+slows each hash (both are test seams, compiled only into test builds and the
+`test-hooks` feature; a release binary contains no `RATARMOUNT_TEST_*` string,
+which `packaging/test-no-test-hooks-in-release.sh` checks). A plain
+`cargo test --workspace` enables the feature through the dev-dependencies.
 
 **Deferred = after the mount is serving, and only when the digest is not
 cached; computed once per archive and cached in its index.** A mount never
@@ -301,6 +304,12 @@ cases when stronger identity is required.
 
 `--base-digest sha256:<hex>` trusts the caller and skips base-content hashing.
 `--base-digest none` warns and disables identity checking for new overlays.
+`--base-digest` applies only when an overlay is created: reopening an existing
+overlay always compares the base with the identity the overlay recorded (weak
+manifest with the recorded exclusions, size/mtime, Git tree, or the strong digest
+per its kind), so `none` cannot be used to skip that check or to accept a changed
+base without `--force-base-mismatch`. A `sha256:` value given on reopen is still
+compared with the recorded digest and refused when it differs.
 `--base-digest` also applies to a read-only `--lower` mount; `--force-base-mismatch`
 requires `-w`, `--overlay-tmpfs`, or `--sandbox`. On remount, local archive
 size/mtime, Git tree ids and the weak manifest of a directory base (re-walked with
@@ -1129,7 +1138,11 @@ A later use of a cached entry checks its immutable database and sentinel, and
 either trusts a *verified marker* (`layers/<sha256>.verified/<view key>`) or
 verifies again. Markers are written and trusted only when the base is a
 **single archive** whose SHA-256 the mount already holds in the index digest
-cache (computed, never merely claimed) and every lower beneath the bundle is a
+cache (computed, never merely claimed). The marker name also carries the listing
+options that change which members the archive shows (`--no-file-versions`,
+`--ignore-zeros`, `--gnu-incremental`, `--detect-gnu-incremental`, `--encoding`),
+so a check made under one listing is never reused under another; options that
+reshape the tree (prefix, transforms, recursion, binds, ...) get no marker and every lower beneath the bundle is a
 sealed, immutable layer. A directory base, a union of several inputs, a
 supplied `--base-digest` that was not computed, a remote or git base, and any
 `--allow-unsealed-lower` directory lower always re-verify, so an edit to the
