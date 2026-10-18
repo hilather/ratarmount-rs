@@ -1473,7 +1473,13 @@ fn main() {
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(
-                    if matches!(overlay.command, overlay_cmd::OverlayCommand::Fsck { .. }) {
+                    if matches!(
+                        overlay.command,
+                        overlay_cmd::OverlayCommand::Fsck { .. }
+                            | overlay_cmd::OverlayCommand::Seal(_)
+                            | overlay_cmd::OverlayCommand::Unseal { .. }
+                            | overlay_cmd::OverlayCommand::Verify(_)
+                    ) {
                         2
                     } else {
                         1

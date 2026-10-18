@@ -217,6 +217,18 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
             "overlay was sealed while fsck started; retry read-only",
         ));
     }
+    let report = check_connection(&conn, &root, repair, sealed)?;
+    conn.execute_batch("COMMIT").map_err(io::Error::other)?;
+    Ok(report)
+}
+
+// Seal holds its writer reservation across the check, hash and metadata update.
+pub(crate) fn check_connection(
+    conn: &Connection,
+    root: &OwnedFd,
+    repair: bool,
+    sealed: bool,
+) -> io::Result<FsckReport> {
     let has_metadata: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='overlay_metadata')", [], |r| r.get(0),
     ).map_err(io::Error::other)?;
@@ -243,7 +255,7 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(io::Error::other)?;
     let mut hosts = BTreeMap::new();
-    walk(&root, "", &mut hosts)?;
+    walk(root, "", &mut hosts)?;
     let mut report = FsckReport::default();
     let mut valid = BTreeMap::new();
     for row in &rows {
@@ -300,7 +312,7 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
         } else if row.mode.map(|m| m & 0o170000) != host.map(file_type) {
             report.type_mismatch += 1;
             if repair {
-                store_host(&conn, path, host.expect("host checked"))?;
+                store_host(conn, path, host.expect("host checked"))?;
             }
         }
         let parent = split(path).0;
@@ -313,7 +325,7 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
         {
             report.missing_parent += 1;
             if repair && row.deleted {
-                let mut fd = open_directory(&root, "")?;
+                let mut fd = open_directory(root, "")?;
                 let mut prefix = String::new();
                 for part in parent.split('/') {
                     if !prefix.is_empty() {
@@ -323,7 +335,7 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
                     match fs::mkdirat(&fd, part, Mode::from_raw_mode(0o755)) {
                         Ok(()) => {
                             let stat = fs::statat(&fd, part, AtFlags::SYMLINK_NOFOLLOW)?;
-                            store_host(&conn, &prefix, &stat)?;
+                            store_host(conn, &prefix, &stat)?;
                         }
                         Err(rustix::io::Errno::EXIST) => {}
                         Err(e) => return Err(e.into()),
@@ -337,7 +349,7 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
         if !valid.contains_key(path) && !hidden(path) {
             report.orphan_content += 1;
             if repair {
-                store_host(&conn, path, stat)?;
+                store_host(conn, path, stat)?;
             }
         }
     }
@@ -346,7 +358,7 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
         // join a DB path to a host path or follow a symlink during removal.
         for (path, stat) in hosts.iter().rev().filter(|(path, _)| hidden(path)) {
             let (parent, name) = split(path);
-            let fd = open_directory(&root, parent)?;
+            let fd = open_directory(root, parent)?;
             let flags = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
                 AtFlags::REMOVEDIR
             } else {
@@ -360,7 +372,7 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
         conn.execute_batch(crate::overlay_meta::META_SCHEMA)
             .map_err(io::Error::other)?;
         OverlayMeta::set_many(
-            &conn,
+            conn,
             &[
                 ("fsck_at", &chrono::Utc::now().to_rfc3339()),
                 ("fsck_result", &report.result()),
@@ -368,7 +380,6 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
         )
         .map_err(overlay_error)?;
     }
-    conn.execute_batch("COMMIT").map_err(io::Error::other)?;
     Ok(report)
 }
 

@@ -121,16 +121,11 @@ fn regression_diff_unified_golden() {
         .set_metadata(
             "/mode",
             &ratarmount_compositing::OverlayMetadata {
-                mode: Some(0o644),
+                mode: Some(0o755),
                 ..Default::default()
             },
         )
         .unwrap();
-    fs::set_permissions(
-        overlay.root().join("mode"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
     put(&overlay, "/nested/new", b"new");
     let overlay_root = overlay.root().to_path_buf();
     drop(overlay);
@@ -485,16 +480,11 @@ fn regression_diff_git_ignores_unrepresentable_permissions() {
         .set_metadata(
             "/mode",
             &ratarmount_compositing::OverlayMetadata {
-                mode: Some(0o644),
+                mode: Some(0o600),
                 ..Default::default()
             },
         )
         .unwrap();
-    fs::set_permissions(
-        overlay.root().join("mode"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
     let overlay_root = overlay.root().to_path_buf();
     drop(overlay);
     let mut args = args(&overlay_root);

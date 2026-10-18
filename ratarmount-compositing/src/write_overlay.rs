@@ -72,6 +72,7 @@ fn has_ascii_prefix(name: &str, prefix: &str) -> bool {
 fn is_overlay_internal_name(name: &str) -> bool {
     has_ascii_prefix(name, HIDDEN_DB)
         || has_ascii_prefix(name, COW_STAGING_PREFIX)
+        || name.eq_ignore_ascii_case(".ratarmount-sealed")
         || name.eq_ignore_ascii_case(OVERLAY_MARKER)
 }
 
@@ -4394,7 +4395,12 @@ impl WriteOverlay {
         let real = self.realpath(path);
         // symlink_metadata so a dangling overlay symlink is still visible.
         let meta = fs::symlink_metadata(&real).ok()?;
-        Some(file_info_from_overlay_meta(path, &real, &meta))
+        let mut fi = file_info_from_overlay_meta(path, &real, &meta);
+        // Seal preserves visible permissions here before chmod removes host write bits.
+        if let Some(mode) = self.metadata_for_path(path).and_then(|m| m.mode) {
+            fi.mode = (fi.mode & !0o7777) | (mode & 0o7777);
+        }
+        Some(fi)
     }
 }
 
