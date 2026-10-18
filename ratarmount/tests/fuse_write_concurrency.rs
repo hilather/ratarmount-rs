@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
+#[path = "support/unmount.rs"]
+mod unmount;
+
 const MOUNT_DEADLINE: Duration = Duration::from_secs(10);
 const PHASE1_DEADLINE: Duration = Duration::from_secs(20);
 const WAVE_DEADLINE: Duration = Duration::from_secs(30);
@@ -576,10 +579,11 @@ impl MountGuard {
     }
 
     fn graceful_unmount(&mut self) -> Result<(), String> {
-        if !run_fusermount(&["-u"], &self.mnt, UNMOUNT_DEADLINE) {
+        // Shared bounded retry (transient EBUSY from a desktop prober); a mount
+        // that stays busy fails with the holders logged.
+        if let Err(e) = unmount::unmount_within(&self.mnt, UNMOUNT_DEADLINE, "graceful_unmount") {
             return Err(format!(
-                "fusermount3 -u {} did not succeed within 10s (daemon pid {})\n{}",
-                self.mnt.display(),
+                "{e} (daemon pid {})\n{}",
                 self.daemon_pid,
                 tail(&self.daemon_log)
             ));

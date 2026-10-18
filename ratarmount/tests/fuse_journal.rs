@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+#[path = "support/unmount.rs"]
+mod unmount;
+
 struct Mount {
     child: Child,
     path: PathBuf,
@@ -50,12 +53,9 @@ impl Mount {
     }
 
     fn stop(&mut self) {
-        assert!(Command::new("fusermount3")
-            .arg("-u")
-            .arg(&self.path)
-            .status()
-            .unwrap()
-            .success());
+        // The shared bounded retry: a desktop prober's transient EBUSY clears,
+        // a mount that stays busy still fails the test.
+        unmount::unmount_within(&self.path, Duration::from_secs(5), "journal_stop").unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
