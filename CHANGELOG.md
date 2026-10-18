@@ -4,7 +4,7 @@
 
 ### Changes
 
-- FUSE unmount: `ratarmount -u`, the control socket `unmount` command and the in-mount `.ratarmount-control/unmount` file retry `fusermount3 -u` every 50 ms for about a second while the mount is briefly busy (desktop mount watchers such as gvfsd-trash probe every new mount), instead of failing on the first `Device or resource busy`. A mount that serves a `:temp:` overlay or live commit and receives SIGTERM falls back to a logged lazy unmount (`fusermount3 -u -z`) if it is still busy after the retries; SIGINT only retries. The control-file `unmount` used to always fail because it unmounted inside the FUSE request that opened it; it now unmounts on its own thread, logs a failure and can be tried again. The control socket answers `error: …` and stays available when the unmount fails. (#TBD)
+- FUSE unmount: `ratarmount -u`, the control socket `unmount` command and the in-mount `.ratarmount-control/unmount` file retry `fusermount3 -u` every 50 ms for about a second while the mount is briefly busy (desktop mount watchers such as gvfsd-trash probe every new mount), instead of failing on the first `Device or resource busy`. A mount that serves a `:temp:` overlay or live commit and receives SIGTERM falls back to a logged lazy unmount (`fusermount3 -u -z`) if it is still busy after the retries; SIGINT only retries. The control-file `unmount` used to always fail because it unmounted inside the FUSE request that opened it; it now unmounts on its own thread, logs a failure and can be tried again. The control socket answers `error: …` and stays available when the unmount fails. If both the retries and the SIGTERM lazy unmount fail, the daemon logs an error and keeps serving. (#TBD)
 
 ## 0.1.35
 

@@ -8290,7 +8290,6 @@ mod sandbox_attr_tests {
 mod unmount_retry_tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     fn fake_fusermount(code: i32, stderr: &str) -> std::process::Output {
         use std::os::unix::process::ExitStatusExt;
         std::process::Output {
@@ -8300,10 +8299,8 @@ mod unmount_retry_tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     const BUSY: &str = "fusermount3: failed to unmount /m: Device or resource busy\n";
 
-    #[cfg(target_os = "linux")]
     fn fast_retry() -> RetryPolicy {
         RetryPolicy {
             interval: Duration::from_millis(2),
@@ -8312,7 +8309,6 @@ mod unmount_retry_tests {
     }
 
     /// Regression: one transient EBUSY (desktop mount watcher) failed the unmount.
-    #[cfg(target_os = "linux")]
     #[test]
     fn regression_unmount_retries_busy_until_success() {
         let mut calls = 0;
@@ -8330,7 +8326,6 @@ mod unmount_retry_tests {
     }
 
     /// Anything other than EBUSY is final: one run, `ErrorKind::Other`, stderr kept.
-    #[cfg(target_os = "linux")]
     #[test]
     fn regression_unmount_not_mounted_is_not_retried() {
         let mut calls = 0;
@@ -8350,7 +8345,6 @@ mod unmount_retry_tests {
     }
 
     /// Persistent EBUSY ends in a typed `ResourceBusy` after the deadline.
-    #[cfg(target_os = "linux")]
     #[test]
     fn regression_unmount_busy_forever_is_resource_busy() {
         let mut calls = 0;
@@ -8369,7 +8363,6 @@ mod unmount_retry_tests {
     }
 
     /// A runner that cannot spawn fusermount surfaces the spawn error unretried.
-    #[cfg(target_os = "linux")]
     #[test]
     fn regression_unmount_spawn_error_is_returned() {
         let mut calls = 0;
@@ -8383,7 +8376,6 @@ mod unmount_retry_tests {
 
     /// Regression: the echoed mountpoint is not the diagnostic. A path that contains
     /// "Device or resource busy" with a "No such file or directory" error must fail fast.
-    #[cfg(target_os = "linux")]
     #[test]
     fn regression_unmount_busy_text_in_mountpoint_is_not_busy() {
         let mp = "/tmp/Device or resource busy/mnt";
@@ -8400,7 +8392,6 @@ mod unmount_retry_tests {
     }
 
     /// A genuinely busy mount whose path also contains the phrase still retries.
-    #[cfg(target_os = "linux")]
     #[test]
     fn regression_unmount_busy_with_busy_text_in_mountpoint_retries() {
         let mp = "/tmp/Device or resource busy/mnt";
