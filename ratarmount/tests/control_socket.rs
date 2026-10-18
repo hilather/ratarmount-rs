@@ -11,6 +11,9 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "support/unmount.rs"]
+mod unmount;
+
 const DEADLINE: Duration = Duration::from_secs(30);
 
 fn reap(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
@@ -120,12 +123,10 @@ fn regression_control_socket_removed_after_external_unmount() {
     // A socket owned by another pid is never ours to unlink.
     let foreign = tmpdir.join("ratarmount-control-1.sock");
     fs::write(&foreign, b"").unwrap();
-    assert!(Command::new("fusermount3")
-        .arg("-u")
-        .arg(&mnt)
-        .status()
-        .unwrap()
-        .success());
+    // Still an external `fusermount3 -u`; the helper retries the transient
+    // EBUSY from the desktop trash probe of a fresh mount and fails if the
+    // mount stays busy.
+    unmount::unmount_within(&mnt, Duration::from_secs(5), "external_unmount").unwrap();
     assert!(reap(&mut d.0, DEADLINE).is_some(), "daemon did not exit");
     assert_eq!(
         sockets(&tmpdir),
