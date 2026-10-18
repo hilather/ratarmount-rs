@@ -3,8 +3,12 @@
 //! Paths are mount-relative UTF-8 at the MountSource boundary. The manifest and
 //! canonical row writers accept bytes, including synthetic non-UTF-8 paths.
 
+#[cfg(unix)]
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,6 +18,8 @@ use ratarmount_core::{
 };
 use regex::bytes::Regex;
 use rusqlite::{Connection, OpenFlags};
+#[cfg(unix)]
+use rustix::fs::{self as host, AtFlags, Dir, Mode, OFlags, Stat};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -587,9 +593,7 @@ impl Excludes {
         })
     }
     pub fn matches(&self, path: &str, is_dir: bool) -> bool {
-        if is_overlay_internal_path(path)
-            || (!self.include_git && path.split('/').any(|p| p == ".git"))
-        {
+        if internal_path(path) || (!self.include_git && path.split('/').any(|p| p == ".git")) {
             return true;
         }
         let path = path.trim_start_matches('/');
@@ -629,7 +633,83 @@ pub fn validate_relative_path(path: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Enumerate the files table and metadata-only mentions. The database stores
+// Shared by diff, fsck and seal. Internal directories are pruned before opening
+// them; every other entry is lstat'ed and directory opens refuse symlinks.
+pub(crate) fn internal_path(path: &str) -> bool {
+    is_overlay_internal_path(path)
+        || path
+            .split('/')
+            .any(|part| part.to_ascii_lowercase().starts_with(".ratarmount-spool-"))
+}
+
+#[cfg(unix)]
+fn directory_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+#[cfg(unix)]
+pub(crate) fn walk_host_entries(
+    fd: &OwnedFd,
+    parent: &str,
+    hosts: &mut BTreeMap<String, Stat>,
+) -> io::Result<()> {
+    for entry in Dir::read_from(fd)? {
+        let entry = entry?;
+        let name = entry.file_name().to_str().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overlay contains a non-UTF-8 name",
+            )
+        })?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        let path = if parent.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{parent}/{name}")
+        };
+        if internal_path(&path) {
+            continue;
+        }
+        let stat = host::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child = host::openat(fd, name, directory_flags(), Mode::empty())?;
+            walk_host_entries(&child, &path, hosts)?;
+        }
+        hosts.insert(path, stat);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn walk_host_paths(top: &Path, parent: &str, paths: &mut BTreeSet<String>) -> io::Result<()> {
+    for entry in std::fs::read_dir(top)? {
+        let entry = entry?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "overlay contains a non-UTF-8 name",
+            )
+        })?;
+        let path = if parent.is_empty() {
+            name
+        } else {
+            format!("{parent}/{name}")
+        };
+        if internal_path(&path) {
+            continue;
+        }
+        if std::fs::symlink_metadata(entry.path())?.is_dir() {
+            walk_host_paths(&entry.path(), &path, paths)?;
+        }
+        paths.insert(path);
+    }
+    Ok(())
+}
+
+/// Enumerate host entries, files rows and metadata-only mentions. COW files
+/// need no row: host entries are authoritative for presence. The database stores
 /// absolute *mount* parent directories ("", "/", "/lib"), not host paths;
 /// names must be one relative component. Do not trim arbitrary leading slashes.
 pub fn mentioned_paths(top: &Path) -> io::Result<BTreeSet<String>> {
@@ -706,6 +786,16 @@ pub(crate) fn mentioned_paths_with_immutability(
             paths.insert(path.to_owned());
         }
     }
+    #[cfg(unix)]
+    {
+        let root = host::open(top, directory_flags(), Mode::empty())?;
+        let mut hosts = BTreeMap::new();
+        walk_host_entries(&root, "", &mut hosts)?;
+        paths.extend(hosts.into_keys());
+    }
+    #[cfg(not(unix))]
+    walk_host_paths(top, "", &mut paths)?;
+    paths.retain(|path| !internal_path(path));
     Ok(paths)
 }
 
@@ -1065,6 +1155,22 @@ fn entry(
 #[cfg(test)]
 thread_local! { static TOP_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
+/// Use the same copy-up and truncating open as FUSE's open_inode.
+#[cfg(test)]
+pub(crate) fn cow_write(overlay: &crate::WriteOverlay, path: &str, bytes: &[u8]) {
+    use std::os::fd::FromRawFd;
+    assert!(
+        overlay.lookup(path, 0).is_some(),
+        "COW needs an existing {path}"
+    );
+    let fd = overlay
+        .open_overlay_fd(path, libc::O_WRONLY | libc::O_TRUNC)
+        .unwrap();
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(bytes).unwrap();
+    overlay.finish_owned_write_fd(file);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,12 +1201,188 @@ mod tests {
     ) -> Vec<Change> {
         let dir = tmp.join(name);
         let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
-        put(&ov, "/a", content);
+        cow_write(&ov, "/a", content);
         drop(ov);
         change_set(&dir, base, opts).unwrap()
     }
     fn hash(mut data: &[u8], normalize: Normalize) -> String {
         content_hash(&mut data, normalize, Algorithm::Sha256).unwrap()
+    }
+
+    /// Regression: COW open and setattr truncate publish host content without files rows.
+    #[test]
+    fn regression_cow_open_and_truncate_leave_no_files_rows() {
+        let (tmp, base) = fixture();
+        for operation in ["open", "truncate"] {
+            let dir = tmp.path().join(operation);
+            let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+            if operation == "open" {
+                cow_write(&ov, "/a", b"changed\n");
+            } else {
+                ov.set_attributes("/a", Some(2), &OverlayMetadata::default())
+                    .unwrap();
+            }
+            drop(ov);
+            assert_eq!(
+                fs::read(dir.join("a")).unwrap(),
+                if operation == "open" {
+                    b"changed\n".as_slice()
+                } else {
+                    b"ol"
+                }
+            );
+            let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    /// Regression: host-only COW edits disappeared from diff, manifest and canonical hash.
+    #[test]
+    fn regression_cow_changes_match_rowed_edits() {
+        let (tmp, base) = fixture();
+        let opts = ChangeOptions::default();
+        let dir = tmp.path().join("cow");
+        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        cow_write(&ov, "/a", b"new\n");
+        drop(ov);
+        let changes = change_set(&dir, base.clone(), &opts).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].status, Status::Modified);
+        assert_eq!(
+            changes[0].manifest_row()["base_hash"],
+            hash(b"old\n", Normalize::Exact)
+        );
+        let digest = canonical_hash(&changes, &opts).unwrap();
+        assert_ne!(digest, EMPTY_SHA256);
+        let rowed_dir = tmp.path().join("rowed");
+        let ov = WriteOverlay::new(base.clone(), &rowed_dir).unwrap();
+        put(&ov, "/a", b"new\n");
+        drop(ov);
+        let rowed = change_set(&rowed_dir, base, &opts).unwrap();
+        assert_eq!(digest, canonical_hash(&rowed, &opts).unwrap());
+    }
+
+    /// Regression: between and base-less diff ignored host-only edits on either side.
+    #[test]
+    fn regression_cow_between_and_without_base() {
+        let (tmp, base) = fixture();
+        fs::write(tmp.path().join("base/b"), b"old b").unwrap();
+        let a = tmp.path().join("one");
+        let b = tmp.path().join("two");
+        for (dir, path) in [(&a, "/a"), (&b, "/b")] {
+            let ov = WriteOverlay::new(base.clone(), dir).unwrap();
+            cow_write(&ov, path, b"changed");
+            drop(ov);
+        }
+        let opts = ChangeOptions::default();
+        let changes = between(&b, &a, base.clone(), &opts).unwrap();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| c.path.as_slice())
+                .collect::<Vec<_>>(),
+            [b"a", b"b"]
+        );
+        assert!(changes.iter().all(|c| c.status == Status::Modified));
+        assert_eq!(
+            changes[0].old.as_ref().unwrap().read_bytes().unwrap(),
+            b"changed"
+        );
+        assert_eq!(
+            changes[0].new.as_ref().unwrap().read_bytes().unwrap(),
+            b"old\n"
+        );
+        assert!(between(&a, &a, base, &opts).unwrap().is_empty());
+        let changes = change_set_without_base(&b, &opts).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, b"b");
+        assert_eq!(changes[0].status, Status::Written);
+    }
+
+    /// Regression: implicit COW parents were added directories; reverted edits must disappear.
+    #[test]
+    fn regression_cow_implicit_parents_and_reverted_content() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, base) = fixture();
+        let parent = tmp.path().join("base/lib");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(parent.join("f"), b"base").unwrap();
+        let dir = tmp.path().join("overlay");
+        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        cow_write(&ov, "/lib/f", b"changed");
+        drop(ov);
+        fs::set_permissions(dir.join("lib"), fs::Permissions::from_mode(0o755)).unwrap();
+        let opts = ChangeOptions::default();
+        let changes = change_set(&dir, base.clone(), &opts).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, b"lib/f");
+        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        cow_write(&ov, "/lib/f", b"base");
+        drop(ov);
+        assert!(change_set(&dir, base.clone(), &opts).unwrap().is_empty());
+        // Host-only directories still have meaning if absent below, or if their mode changes.
+        fs::create_dir(dir.join("empty")).unwrap();
+        fs::set_permissions(dir.join("lib"), fs::Permissions::from_mode(0o700)).unwrap();
+        let changes = change_set(&dir, base, &opts).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(
+            (
+                changes[0].path.as_slice(),
+                changes[0].status,
+                changes[0].kind()
+            ),
+            (b"empty".as_slice(), Status::Added, "dir")
+        );
+        assert_eq!(
+            (changes[1].path.as_slice(), changes[1].status),
+            (b"lib".as_slice(), Status::Modified)
+        );
+    }
+
+    /// Regression: host walking followed symlinks or exposed staging and bookkeeping entries.
+    #[test]
+    fn regression_cow_host_walk_skips_internal_entries_and_symlink_targets() {
+        let (tmp, base) = fixture();
+        let dir = tmp.path().join("overlay");
+        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        cow_write(&ov, "/a", b"changed");
+        drop(ov);
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret"), b"do not read").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+        fs::create_dir(dir.join("sub")).unwrap();
+        for parent in [dir.clone(), dir.join("sub")] {
+            for name in [
+                ".ratarmount.overlay.cow-partial",
+                ".ratarmount-spool-partial",
+                ".ratarmount-sealed",
+                crate::OVERLAY_MARKER,
+            ] {
+                if parent.join(name).is_file() {
+                    fs::remove_file(parent.join(name)).unwrap();
+                }
+                fs::create_dir(parent.join(name)).unwrap();
+                fs::write(parent.join(name).join("hidden"), b"internal").unwrap();
+            }
+        }
+        let paths = mentioned_paths(&dir).unwrap();
+        assert_eq!(
+            paths,
+            BTreeSet::from(["a".into(), "link".into(), "sub".into()])
+        );
+        let changes = change_set(&dir, base, &ChangeOptions::default()).unwrap();
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[1].kind(), "symlink");
+        assert_eq!(
+            changes[1].new.as_ref().unwrap().target.as_deref(),
+            Some(outside.to_str().unwrap().as_bytes())
+        );
     }
 
     /// Regression: the same edit through independent overlays has one canonical hash.
@@ -1296,8 +1578,8 @@ mod tests {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
         let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
-        put(&ov, "/a", b"new");
-        put(&ov, "/a", b"old\n");
+        cow_write(&ov, "/a", b"new");
+        cow_write(&ov, "/a", b"old\n");
         put(&ov, "/transient", b"x");
         ov.unlink("/transient").unwrap();
         drop(ov);
@@ -1413,7 +1695,7 @@ mod tests {
     }
     /// Regression: exclude blib before all 1,000 host/lower content opens.
     #[test]
-    fn regression_changes_excludes_short_circuit_thousand_files() {
+    fn regression_cow_excludes_short_circuit_thousand_files() {
         let (tmp, base) = fixture();
         fs::create_dir(tmp.path().join("base/blib")).unwrap();
         let count = Arc::new(AtomicUsize::new(0));
@@ -1426,7 +1708,7 @@ mod tests {
         let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
         for i in 0..1000 {
             fs::write(tmp.path().join(format!("base/blib/{i}")), b"old").unwrap();
-            put(&ov, &format!("/blib/{i}"), b"new");
+            cow_write(&ov, &format!("/blib/{i}"), b"new");
         }
         drop(ov);
         count.store(0, Ordering::Relaxed);
@@ -1527,6 +1809,8 @@ mod tests {
     #[test]
     fn regression_changes_lower_view_only_attempt_edits() {
         let (tmp, base) = fixture();
+        fs::create_dir(tmp.path().join("base/lib")).unwrap();
+        fs::write(tmp.path().join("base/lib/Foo.pm"), b"source").unwrap();
         let prepared = tmp.path().join("prepared");
         let ov = WriteOverlay::new(base.clone(), &prepared).unwrap();
         put(&ov, "/blib/x", b"build");
@@ -1535,7 +1819,7 @@ mod tests {
         let lower = crate::compose_stack(base, &[(prepared, Immutability::Shared)]).unwrap();
         let attempt = tmp.path().join("attempt");
         let ov = WriteOverlay::new(lower.clone(), &attempt).unwrap();
-        put(&ov, "/lib/Foo.pm", b"attempt");
+        cow_write(&ov, "/lib/Foo.pm", b"attempt");
         ov.unlink("/blib/x").unwrap();
         drop(ov);
         let changes = change_set(&attempt, lower, &ChangeOptions::default()).unwrap();
@@ -1548,6 +1832,42 @@ mod tests {
         );
         assert_eq!(changes[0].base_layer, Some(LayerIndex::Lower(1)));
         assert_eq!(changes[0].manifest_row()["base_layer"], "lower:1");
+    }
+
+    /// Regression: a COW source edit and rebuilt lower-layer output produced an empty diff.
+    #[test]
+    fn regression_cow_lower_view_lists_base_and_build_edits() {
+        let (tmp, base) = fixture();
+        fs::create_dir(tmp.path().join("base/lib")).unwrap();
+        fs::write(tmp.path().join("base/lib/Foo.pm"), b"source\n").unwrap();
+        let prepared = tmp.path().join("prepared");
+        let ov = WriteOverlay::new(base.clone(), &prepared).unwrap();
+        ov.mkdir("/blib", 0o755).unwrap();
+        put(&ov, "/blib/x", b"build\n");
+        drop(ov);
+        let lower = crate::compose_stack(base, &[(prepared, Immutability::Shared)]).unwrap();
+        let attempt = tmp.path().join("attempt");
+        let ov = WriteOverlay::new(lower.clone(), &attempt).unwrap();
+        cow_write(&ov, "/lib/Foo.pm", b"edited\n");
+        cow_write(&ov, "/blib/x", b"rebuilt\n");
+        drop(ov);
+        let conn = Connection::open(attempt.join(HIDDEN_DB)).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let changes = change_set(&attempt, lower, &ChangeOptions::default()).unwrap();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| c.path.as_slice())
+                .collect::<Vec<_>>(),
+            [b"blib/x".as_slice(), b"lib/Foo.pm".as_slice()]
+        );
+        assert!(changes.iter().all(|c| c.status == Status::Modified));
+        assert_eq!(changes[0].base_layer, Some(LayerIndex::Lower(1)));
+        assert_eq!(changes[1].base_layer, Some(LayerIndex::Base));
     }
     /// Regression: identical composed trees compare empty, even with different mentions.
     #[test]

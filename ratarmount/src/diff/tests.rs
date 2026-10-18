@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 
+#[path = "../../tests/diff/cow.rs"]
+pub(crate) mod cow;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SnapshotEntry {
     mode: u32,
@@ -369,11 +372,11 @@ fn regression_diff_renames_summaries_and_internal_paths() {
     let changes = collect(&args, base.source.clone()).unwrap();
     assert_eq!(
         render_text(&changes, &args).unwrap(),
-        "R100\ta\ty\nR100\tb\tz\n"
+        "R100\ta\ty\nR100\tb\tz\nA\tnested\n"
     );
     args.name_status = false;
     args.stat = true;
-    assert_eq!(render_text(&changes, &args).unwrap(), " a => y | 0 (+0 -0)\n b => z | 0 (+0 -0)\n 2 files changed, 0 insertions(+), 0 deletions(-), 10 bytes written\n");
+    assert_eq!(render_text(&changes, &args).unwrap(), " a => y | 0 (+0 -0)\n b => z | 0 (+0 -0)\n nested | 0 (+0 -0)\n 3 files changed, 0 insertions(+), 0 deletions(-), 10 bytes written\n");
     args.include_git_dir = true;
     assert!(collect(&args, base.source.clone())
         .unwrap()
@@ -522,7 +525,7 @@ fn git_roundtrip_case(case: &str) {
     let overlay = WriteOverlay::new(base.source.clone(), &dir).unwrap();
     match case {
         "added" => put(&overlay, "/file", b"added\n"),
-        "modified" => put(&overlay, "/file", b"modified\n"),
+        "modified" => cow::cow_write(&overlay, "/file", b"modified\n"),
         "deleted" => overlay.unlink("/file").unwrap(),
         "type_changed" => {
             overlay.unlink("/file").unwrap();
@@ -542,11 +545,11 @@ fn git_roundtrip_case(case: &str) {
                 },
             )
             .unwrap(),
-        "binary" => put(&overlay, "/file", b"\0new\xfe"),
+        "binary" => cow::cow_write(&overlay, "/file", b"\0new\xfe"),
         "nested" => put(&overlay, "/dir/subdir/file", b"nested\n"),
-        "crlf" => put(&overlay, "/file", b"a\r\nB\r\n"),
-        "no_newline" => put(&overlay, "/file", b"after"),
-        "latin1" => put(&overlay, "/file", b"caf\xe9\nnew\xfe\n"),
+        "crlf" => cow::cow_write(&overlay, "/file", b"a\r\nB\r\n"),
+        "no_newline" => cow::cow_write(&overlay, "/file", b"after"),
+        "latin1" => cow::cow_write(&overlay, "/file", b"caf\xe9\nnew\xfe\n"),
         _ => unreachable!(),
     }
     let mut expected = BTreeMap::new();
@@ -558,7 +561,14 @@ fn git_roundtrip_case(case: &str) {
         ..Default::default()
     };
     let changes = core::change_set(&dir, base.source.clone(), &opts.options()).unwrap();
-    assert_eq!(changes.len(), 1);
+    assert_eq!(changes.len(), if case == "nested" { 3 } else { 1 });
+    if case == "nested" {
+        assert_eq!(changes[0].manifest_row()["path"], "dir");
+        assert_eq!(changes[1].manifest_row()["path"], "dir/subdir");
+        assert!(changes[..2]
+            .iter()
+            .all(|c| c.kind() == "dir" && c.status == core::Status::Added));
+    }
     if case == "empty_dir" {
         assert_eq!(changes[0].manifest_row()["type"], "dir");
     }

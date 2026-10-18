@@ -8,6 +8,9 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+#[path = "diff/cow.rs"]
+mod cow;
+
 fn open(base: &Path, top: Option<&Path>, lowers: &[&Path], flags: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
     cmd.args(["--no-mount", "--index-file", ":memory:"]);
@@ -162,18 +165,40 @@ fn fsck(dir: &Path, repair: bool) -> Output {
 
 /// Regression: fsck exit codes distinguish inconsistencies, successful repair, and errors.
 #[test]
-fn regression_lower_fsck_cli_json_exit_codes_and_lock() {
+fn regression_cow_lower_fsck_cli_json_exit_codes_and_lock() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("base");
     fs::create_dir(&base).unwrap();
     let dir = tmp.path().join("overlay");
     assert_eq!(fsck(&dir, false).status.code(), Some(2));
     success(open(&base, Some(&dir), &[], &[]));
-    fs::write(dir.join("orphan"), b"crashed writer").unwrap();
+    fs::write(base.join("cow"), b"base").unwrap();
+    let ov = WriteOverlay::new(Arc::new(FolderMountSource::new(&base).unwrap()), &dir).unwrap();
+    cow::cow_write(&ov, "/cow", b"changed");
+    drop(ov);
+    let output = fsck(&dir, true);
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["unrowed"], 1);
+    assert_eq!(json["orphan_content"], 0);
+    assert_eq!(json["repaired"], 0);
+    assert_eq!(json["result"], "ok");
+    let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    conn.execute(
+        "INSERT INTO files(path,name,mode,deleted) VALUES ('','missing',33188,0)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
     let output = fsck(&dir, false);
     assert_eq!(output.status.code(), Some(1));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["orphan_content"], 1);
+    assert_eq!(json["missing_content"], 1);
     assert_eq!(json["result"], "errors:1");
     let human = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
         .args(["overlay", "fsck"])
@@ -182,7 +207,7 @@ fn regression_lower_fsck_cli_json_exit_codes_and_lock() {
         .unwrap();
     assert_eq!(human.status.code(), Some(1));
     let text = String::from_utf8_lossy(&human.stdout);
-    assert!(text.contains("orphan_content: 1") && text.contains("result: errors:1"));
+    assert!(text.contains("missing_content: 1") && text.contains("result: errors:1"));
     success(fsck(&dir, true));
     success(fsck(&dir, false));
     let mounted = WriteOverlay::new(Arc::new(FolderMountSource::new(base).unwrap()), &dir).unwrap();

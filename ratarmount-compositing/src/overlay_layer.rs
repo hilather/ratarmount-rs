@@ -1087,6 +1087,32 @@ mod tests {
         );
     }
 
+    /// Regression: row caches must not hide COW files from lookups, listings or reads.
+    #[test]
+    fn regression_cow_read_only_layer_matches_writer_without_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("overlay");
+        let base: Arc<dyn MountSource> = Arc::new(Base::new());
+        let writer = WriteOverlay::new(base.clone(), &dir).unwrap();
+        crate::overlay_changes::cow_write(&writer, "/lib/Foo.pm", b"changed\n");
+        drop(writer);
+        let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(conn);
+        let layer = ReadOnlyOverlayLayer::new(base.clone(), &dir, Immutability::Shared).unwrap();
+        let writer = WriteOverlay::new(base, &dir).unwrap();
+        compare_views(&writer, &layer, "/");
+        assert_eq!(bytes(&layer, "/lib/Foo.pm"), b"changed\n");
+        assert_eq!(
+            layer.serving_layer("/lib/Foo.pm"),
+            Some(LayerIndex::Lower(1))
+        );
+    }
+
     /// Regression: opening a sealed chmod -w directory must not create SQLite
     /// sidecars or mutate the database, even for URI-special path characters.
     #[cfg(unix)]
