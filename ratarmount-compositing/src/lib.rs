@@ -15,6 +15,8 @@ pub mod overlay_fsck;
 pub mod overlay_layer;
 pub mod overlay_meta;
 mod overlay_policy;
+#[cfg(unix)]
+pub mod overlay_seal;
 mod path_intern;
 mod payload;
 mod prefix;

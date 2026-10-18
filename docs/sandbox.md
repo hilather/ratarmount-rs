@@ -355,9 +355,57 @@ hold an exclusive SQLite transaction, but host changes and SQLite are not one
 atomic transaction: stop direct host writers and rerun after an interrupted
 repair. A consistency check does not verify content hashes.
 
+## Seal and verify
+
+```sh
+ratarmount overlay seal attempt [--lower prepared] [BASE]
+ratarmount overlay verify attempt [--lower prepared] [BASE]
+ratarmount diff attempt --strict --hash --include-git-dir
+ratarmount overlay unseal attempt --i-know
+```
+
+Stop writers and unmount before sealing. BASE defaults to `meta.base_url` and
+lower layers default to `meta.lower_layers`; repeated `--lower` values replace
+that list in bottom-to-top order. Lowers must themselves be sealed. A legacy
+overlay without a recorded base requires explicit BASE. Sealing creates minimal
+metadata for such an overlay without inventing a base identity; keep supplying
+BASE to verify it.
+
+Seal refuses a database held by another mount (“in use by another ratarmount
+process”). It runs fsck without repair under a writer reservation and refuses
+inconsistencies with an `overlay fsck --repair` hint. The digest is the canonical
+SHA-256 change hash against the composed lower view, with exact bytes, modes,
+no excludes, and `.git` included. `--json` prints `layer_digest` and `sealed_at`;
+plain output is the digest. Repeating seal prints the recorded digest and exits
+0 even if the base is no longer available; use verify to check integrity.
+
+Before chmod, the same transaction records per-path hashes in `seal_rows`,
+`sealed_at`, `layer_digest`, and each materialized entry's permission bits in
+`overlay_metadata.mode` where no override exists. Thus lookup and directory
+listing modes stay unchanged. Seal removes host write bits recursively from
+files, directories, and the database, with the overlay root last; it skips
+symlinks and never follows them. `.ratarmount-sealed` contains the digest and
+is hidden from mounted listings. Sealed layers are accepted by `--lower` and
+`diff --strict`; writable mounts with `-w` are refused.
+
+Verify opens the top database immutable and read-only, recomputes the exact
+hash and compares both metadata and sentinel. Exit 0 means a match; exit 1
+reports differing, added, or removed paths (or a sentinel mismatch); exit 2
+means an operational error, including an unsealed overlay. `--json` also returns
+`ok`, `recorded`, `computed`, `sentinel_ok`, and `mismatched`. It works on the
+read-only tree and detects unindexed host additions as well as changed bytes.
+
+Unseal requires `--i-know` (otherwise exit 2), restores owner write permission
+on files and directories, removes the sentinel, clears the seal and per-path
+hashes, and records `unsealed_at`. Saved mode overrides stay in place. Host
+permissions and SQLite cannot be changed in one transaction: after an interrupted
+seal, run unseal, fsck, and seal again. Stop direct host writers during these
+commands; chmod is not a security boundary against the owner or root. The seal
+covers canonical changes, not timestamps, ownership or xattrs.
+
 ## Branching an episode
 
-Once the `overlay seal` command is available, a harness can fork an attempt at
+A harness can fork an attempt at
 turn *k* by stopping writers, unmounting, and sealing that attempt. Then each
 branch gets its own writable top over the same ordered lower stack:
 
@@ -371,8 +419,7 @@ ratarmount --lower prepared --lower attempt-k -w branch-b source.tar branch-b-mn
 
 The prepared layer must also be sealed. Branches share the saved filesystem
 state and copy up only what they modify. Shell state, processes, and runtime
-isolation remain the harness's responsibility. Seal/unseal/verify are delivered
-separately from the lower-stack and fsck commands described here.
+isolation remain the harness's responsibility.
 
 ## overlay-stats
 

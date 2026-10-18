@@ -19,6 +19,16 @@ pub struct OverlayArgs {
 pub enum OverlayCommand {
     /// Show metadata, counts, and writability without modifying the overlay.
     Info(InfoArgs),
+    /// Seal exact changes and make the overlay read-only. Exit 0: sealed, 2: error.
+    Seal(SealArgs),
+    /// Restore owner write permission and remove the seal. Requires --i-know.
+    Unseal {
+        directory: PathBuf,
+        #[arg(long)]
+        i_know: bool,
+    },
+    /// Verify a seal. Exit 0: match, 1: mismatches, 2: error or not sealed.
+    Verify(SealArgs),
     /// Check overlay consistency. Exit 0: clean/repaired, 1: inconsistencies, 2: error.
     Fsck {
         directory: PathBuf,
@@ -27,6 +37,18 @@ pub enum OverlayCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct SealArgs {
+    pub directory: PathBuf,
+    /// Base source (defaults to recorded base_url).
+    pub base: Option<PathBuf>,
+    /// Sealed lower layer, bottom to top (defaults to recorded lower_layers).
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub lower: Vec<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -39,12 +61,122 @@ pub struct InfoArgs {
 pub fn run(args: &OverlayArgs) -> Result<(String, i32), String> {
     match &args.command {
         OverlayCommand::Info(args) => info(args).map(|output| (output, 0)),
+        OverlayCommand::Seal(args) => seal(args),
+        OverlayCommand::Unseal { directory, i_know } => unseal(directory, *i_know),
+        OverlayCommand::Verify(args) => verify(args),
         OverlayCommand::Fsck {
             directory,
             repair,
             json,
         } => fsck(directory, *repair, *json),
     }
+}
+
+fn lower_view(args: &SealArgs) -> Result<std::sync::Arc<dyn ratarmount_core::MountSource>, String> {
+    use ratarmount_session::factory;
+    let meta = OverlayMeta::read(&args.directory)
+        .map_err(|e| super::overlay_open_error(&args.directory, &e))?;
+    let recorded = meta
+        .as_ref()
+        .and_then(OverlayMeta::base_url)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let base = args
+        .base
+        .as_ref()
+        .or(recorded.as_ref())
+        .ok_or("no metadata base_url; pass BASE explicitly (including for legacy overlays)")?;
+    let lowers = if args.lower.is_empty() {
+        meta.as_ref()
+            .map(|m| m.lower_layers())
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|l| l.path)
+            .collect()
+    } else {
+        args.lower.clone()
+    };
+    let stack = super::MountLowerStack::read(&lowers, false)?;
+    let mut options = ratarmount_core::OpenOptions {
+        write_index: false,
+        index_in_memory: true,
+        git: base.join(".git").exists(),
+        ..Default::default()
+    };
+    let source = factory::build_mount_source_ex(
+        std::slice::from_ref(base),
+        &mut options,
+        false,
+        factory::CompositingOptions::default(),
+    )
+    .map_err(|e| e.to_string())?
+    .source;
+    ratarmount_compositing::compose_stack(source, &stack.layers).map_err(|e| e.to_string())
+}
+
+pub fn seal(args: &SealArgs) -> Result<(String, i32), String> {
+    // Idempotence does not require the base still to be available.
+    let meta = OverlayMeta::read(&args.directory)
+        .map_err(|e| super::overlay_open_error(&args.directory, &e))?;
+    let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
+    let lower = if meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
+        std::sync::Arc::new(ratarmount_compositing::overlay_changes::EmptySource)
+            as std::sync::Arc<dyn ratarmount_core::MountSource>
+    } else {
+        lower_view(args)?
+    };
+    let outcome = ratarmount_compositing::overlay_seal::seal(&args.directory, lower)
+        .map_err(|e| format!("seal {}: {e}", args.directory.display()))?;
+    let output = if args.json {
+        serde_json::json!({"layer_digest": outcome.layer_digest, "sealed_at": outcome.sealed_at})
+            .to_string()
+    } else {
+        outcome.layer_digest
+    };
+    Ok((output, 0))
+}
+
+pub fn unseal(directory: &Path, i_know: bool) -> Result<(String, i32), String> {
+    if !i_know {
+        return Err("unseal removes the layer's immutability guarantee; pass --i-know to restore write access".into());
+    }
+    ratarmount_compositing::overlay_seal::unseal(directory)
+        .map_err(|e| format!("unseal {}: {e}", directory.display()))?;
+    Ok((format!("unsealed {}", directory.display()), 0))
+}
+
+pub fn verify(args: &SealArgs) -> Result<(String, i32), String> {
+    let meta = OverlayMeta::read(&args.directory)
+        .map_err(|e| super::overlay_open_error(&args.directory, &e))?;
+    if !meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
+        return Err("overlay is not sealed".into());
+    }
+    let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
+    let report = ratarmount_compositing::overlay_seal::verify(&args.directory, lower_view(args)?)
+        .map_err(|e| format!("verify {}: {e}", args.directory.display()))?;
+    let code = i32::from(!report.ok);
+    let output = if args.json {
+        serde_json::json!({"ok":report.ok,"recorded":report.recorded,"computed":report.computed,
+            "sentinel_ok":report.sentinel_ok,"mismatched":report.mismatched})
+        .to_string()
+    } else if report.ok {
+        report.computed
+    } else {
+        let mut output = format!(
+            "seal mismatch: recorded {}, computed {}",
+            report.recorded, report.computed
+        );
+        if !report.sentinel_ok {
+            output.push_str("\n.ratarmount-sealed: sentinel mismatch");
+        }
+        for path in report.mismatched {
+            output.push_str(&format!("\n{path}"));
+        }
+        output
+    };
+    Ok((output, code))
 }
 
 pub fn fsck(directory: &Path, repair: bool, json: bool) -> Result<(String, i32), String> {

@@ -2,7 +2,7 @@
 #![cfg(target_os = "linux")]
 
 use ratarmount_compositing::{
-    compose_stack, FolderMountSource, Immutability, OverlayMeta, WriteOverlay, HIDDEN_DB,
+    compose_stack, FolderMountSource, Immutability, OverlayMeta, WriteOverlay,
 };
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -97,13 +97,9 @@ fn fixture(root: &Path) -> (PathBuf, PathBuf) {
     fs::write(prepared.join("blib/copy"), b"prepared bytes").unwrap();
     fs::write(prepared.join("Makefile"), b"prepared makefile").unwrap();
     ratarmount_compositing::overlay_fsck::fsck(&prepared, true).unwrap();
-    let conn = rusqlite::Connection::open(prepared.join(HIDDEN_DB)).unwrap();
-    OverlayMeta::set_many(
-        &conn,
-        &[
-            ("sealed_at", "2026-10-17T00:00:00Z"),
-            ("layer_digest", "sha256:prepared"),
-        ],
+    ratarmount_compositing::overlay_seal::seal(
+        &prepared,
+        Arc::new(FolderMountSource::new(&base).unwrap()),
     )
     .unwrap();
     (base, prepared)
@@ -166,13 +162,14 @@ fn regression_fuse_lower_composed_reads_listing_and_copy_up() {
     let stack = compose_stack(
         Arc::new(FolderMountSource::new(base).unwrap()),
         &[
-            (lower, Immutability::Immutable),
+            (lower.clone(), Immutability::Immutable),
             (top, Immutability::Shared),
         ],
     )
     .unwrap();
     assert!(stack.lookup("/blib/x", 0).is_none());
     assert!(stack.lookup("/recreated", 0).is_some());
+    ratarmount_compositing::overlay_seal::unseal(&lower).unwrap();
 }
 
 /// Regression: sealed lower SQLite locks prevented two writable tops from sharing content.
@@ -193,6 +190,8 @@ fn regression_fuse_lower_two_tops_share_sealed_bytes() {
     );
     fs::write(a.join("blib/copy"), b"first attempt").unwrap();
     assert_eq!(fs::read(b.join("blib/copy")).unwrap(), b"prepared bytes");
+    drop((_first, _second));
+    ratarmount_compositing::overlay_seal::unseal(&lower).unwrap();
 }
 
 /// Regression: a composed mount without -w must serve the lower view read-only.
@@ -217,6 +216,8 @@ fn regression_fuse_lower_read_only_without_top() {
             .raw_os_error(),
         Some(libc::EROFS)
     );
+    drop(_mount);
+    ratarmount_compositing::overlay_seal::unseal(&lower).unwrap();
 }
 
 fn root_xattr(mount: &Path, name: &str) -> String {
@@ -249,6 +250,12 @@ fn regression_fuse_lower_read_only_root_xattrs_name_the_stack() {
     let (base, lower) = fixture(root.path());
     let path = root.path().join("mnt");
     let _mount = Mount::start(&base, &lower, None, &path);
+    let layer_digest = OverlayMeta::read(&lower)
+        .unwrap()
+        .unwrap()
+        .get("layer_digest")
+        .unwrap()
+        .to_owned();
     let base_digest = OverlayMeta::read(&lower)
         .unwrap()
         .unwrap()
@@ -257,7 +264,7 @@ fn regression_fuse_lower_read_only_root_xattrs_name_the_stack() {
         .to_owned();
     assert_eq!(
         root_xattr(&path, "user.ratarmount.stack_digest"),
-        ratarmount_compositing::stack_digest(&base_digest, &["sha256:prepared"])
+        ratarmount_compositing::stack_digest(&base_digest, &[&layer_digest])
     );
     assert_eq!(
         root_xattr(&path, "user.ratarmount.base_digest"),
@@ -266,9 +273,11 @@ fn regression_fuse_lower_read_only_root_xattrs_name_the_stack() {
     assert_eq!(root_xattr(&path, "user.ratarmount.sealed"), "1");
     let layers: serde_json::Value =
         serde_json::from_str(&root_xattr(&path, "user.ratarmount.layers")).unwrap();
-    assert_eq!(layers[0]["layer_digest"], "sha256:prepared");
+    assert_eq!(layers[0]["layer_digest"], layer_digest);
     assert_eq!(
         layers[0]["path"],
         lower.canonicalize().unwrap().to_str().unwrap()
     );
+    drop(_mount);
+    ratarmount_compositing::overlay_seal::unseal(&lower).unwrap();
 }

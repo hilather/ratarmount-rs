@@ -207,10 +207,10 @@ fn detect_renames(changes: &mut Vec<Change>) {
 
 // Factory backends print cold-index progress to stdout. During the single-threaded
 // CLI open, send it to stderr so stdout remains a patch. Restore on all errors.
-struct ProgressToStderr(OwnedFd);
+pub(crate) struct ProgressToStderr(OwnedFd);
 
 impl ProgressToStderr {
-    fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         io::stdout().flush()?;
         let fd = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {

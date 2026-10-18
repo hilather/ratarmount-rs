@@ -46,8 +46,9 @@ impl std::fmt::Display for LayerIndex {
 /// in one transaction and closes the database; lookups never query SQLite.
 /// Host files remain on disk and are opened independently for each reader.
 ///
-/// Like `WriteOverlay`, host metadata is authoritative for materialized entries;
-/// `overlay_metadata` overrides apply to entries inherited from the inner view.
+/// Like `WriteOverlay`, host metadata supplies materialized entries, with
+/// permission overrides from `overlay_metadata` (also used to preserve sealed
+/// modes). All metadata overrides apply to entries inherited from the inner view.
 /// This includes rows created by chmod/utime without copying a payload.
 pub struct ReadOnlyOverlayLayer {
     inner: Arc<dyn MountSource>,
@@ -235,6 +236,9 @@ impl ReadOnlyOverlayLayer {
         let host = self.host_path(path).ok()?;
         let meta = fs::symlink_metadata(&host).ok()?;
         let mut fi = file_info_from_overlay_meta(path, &host, &meta);
+        if let Some(mode) = self.metadata.get(path).and_then(|m| m.mode) {
+            fi.mode = (fi.mode & !0o7777) | (mode & 0o7777);
+        }
         fi.userdata.pop(); // Replace WriteOverlay's cookie with this layer's cookie.
         self.tag(&mut fi, "host", path);
         Some(fi)
@@ -463,7 +467,13 @@ impl MountSource for ReadOnlyOverlayLayer {
                         name.clone(),
                         CheapDirent {
                             name,
-                            mode: metadata_mode(&meta),
+                            mode: self
+                                .metadata
+                                .get(&full)
+                                .and_then(|m| m.mode)
+                                .map_or(metadata_mode(&meta), |mode| {
+                                    (metadata_mode(&meta) & !0o7777) | (mode & 0o7777)
+                                }),
                             size: meta.len(),
                         },
                     );
@@ -641,7 +651,7 @@ fn database_error(dir: &Path, error: rusqlite::Error) -> io::Error {
     )
 }
 
-fn immutable_uri(path: &Path) -> String {
+pub(crate) fn immutable_uri(path: &Path) -> String {
     use std::fmt::Write;
     let mut uri = String::from("file:");
     for byte in path.as_os_str().as_encoded_bytes() {

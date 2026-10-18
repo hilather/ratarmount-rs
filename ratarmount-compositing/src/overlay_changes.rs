@@ -633,6 +633,13 @@ pub fn validate_relative_path(path: &str) -> io::Result<()> {
 /// absolute *mount* parent directories ("", "/", "/lib"), not host paths;
 /// names must be one relative component. Do not trim arbitrary leading slashes.
 pub fn mentioned_paths(top: &Path) -> io::Result<BTreeSet<String>> {
+    mentioned_paths_with_immutability(top, Immutability::Shared)
+}
+
+pub(crate) fn mentioned_paths_with_immutability(
+    top: &Path,
+    immutability: Immutability,
+) -> io::Result<BTreeSet<String>> {
     let db = top.join(HIDDEN_DB);
     if !std::fs::symlink_metadata(&db)?.is_file() {
         return Err(io::Error::new(
@@ -640,10 +647,14 @@ pub fn mentioned_paths(top: &Path) -> io::Result<BTreeSet<String>> {
             "overlay database must be a regular file",
         ));
     }
-    let conn = Connection::open_with_flags(
-        &db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = match immutability {
+        Immutability::Shared => Connection::open_with_flags(&db, flags),
+        Immutability::Immutable => Connection::open_with_flags(
+            crate::overlay_layer::immutable_uri(&db.canonicalize()?),
+            flags | OpenFlags::SQLITE_OPEN_URI,
+        ),
+    }
     .map_err(io::Error::other)?;
     conn.busy_timeout(std::time::Duration::ZERO)
         .map_err(io::Error::other)?;
