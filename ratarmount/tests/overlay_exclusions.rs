@@ -219,14 +219,29 @@ mod mounted {
         flags: &[&OsStr],
         work: &dyn Fn(&Path),
     ) -> Result<(), String> {
+        cycle_with(root, Some(overlay), base, mnt, flags, work)
+    }
+
+    /// [`cycle`], optionally without `-w` (a read-only mount of a `--lower`).
+    fn cycle_with(
+        root: &Path,
+        overlay: Option<&Path>,
+        base: &Path,
+        mnt: &Path,
+        flags: &[&OsStr],
+        work: &dyn Fn(&Path),
+    ) -> Result<(), String> {
         let stderr_path = root.join("mount.stderr");
         let stderr = fs::File::create(&stderr_path).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
         private_env(&mut cmd, root);
         let mut child = cmd
             .args(["-f", "--passthrough", "off", "--index-file", ":memory:"])
-            .arg("-w")
-            .arg(overlay)
+            .args(
+                overlay
+                    .iter()
+                    .flat_map(|o| [OsStr::new("-w"), o.as_os_str()]),
+            )
             .args(flags)
             .arg(base)
             .arg(mnt)
@@ -275,6 +290,46 @@ mod mounted {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Regression: after sealing L against B, an ordinary `B/new.log` appeared
+    /// and a read-only `--lower L --journal B/new.log` mount excluded that
+    /// existing file from the base check and accepted the changed base. Only a
+    /// path that does not exist yet (this mount creates it) may be excluded.
+    #[test]
+    fn regression_invocation_exclusion_cannot_hide_an_existing_base_file() {
+        if !available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = base_dir(tmp.path());
+        let lower = tmp.path().join("lower");
+        ok(no_mount(tmp.path(), &lower, &base, &[]));
+        ok(cli(
+            tmp.path(),
+            &[OsStr::new("overlay"), OsStr::new("seal"), lower.as_os_str()],
+        ));
+        let mnt = tmp.path().join("mnt");
+        fs::create_dir(&mnt).unwrap();
+        let ro = |journal: &Path, extra: &[&OsStr]| {
+            let mut flags = vec![
+                OsStr::new("--lower"),
+                lower.as_os_str(),
+                OsStr::new("--journal"),
+                journal.as_os_str(),
+            ];
+            flags.extend_from_slice(extra);
+            cycle_with(tmp.path(), None, &base, &mnt, &flags, &|_| {})
+        };
+        // A journal path that does not exist is created by this mount: allowed.
+        ro(&tmp.path().join("fresh.jsonl"), &[]).unwrap();
+        // An ordinary file that is already in the base is a base change.
+        let existing = base.join("new.log");
+        fs::write(&existing, b"someone's file").unwrap();
+        let error = ro(&existing, &[]).unwrap_err();
+        assert!(error.contains("different base"), "{error}");
+        // The explicit override still works.
+        ro(&existing, &[OsStr::new("--force-stack-mismatch")]).unwrap();
     }
 
     fn write_through(name: &'static str) -> impl Fn(&Path) {

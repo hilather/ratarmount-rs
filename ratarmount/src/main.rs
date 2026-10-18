@@ -4627,6 +4627,12 @@ fn lower_extra_excludes(
     let Some(base) = base.filter(|b| !lowers.is_empty() && b.is_dir()) else {
         return Vec::new();
     };
+    // Without a `-w` overlay nothing records these paths, so a path that is
+    // already in the base is a change to it, not this invocation's own file;
+    // only paths this invocation will create are excluded.
+    if overlay.is_none() {
+        paths.retain(|p| std::fs::symlink_metadata(p).is_err());
+    }
     let mut out: Vec<PathBuf> = Vec::new();
     if let Some(overlay) = overlay.filter(|o| o.as_os_str() != ":temp:") {
         paths.push(overlay.to_path_buf());
@@ -8415,6 +8421,30 @@ mod lower_stack_tests {
         let metadata = stack.read_only_metadata();
         assert_eq!(metadata["base_digest"], "");
         assert_eq!(metadata["stack_digest"], "");
+    }
+}
+
+#[cfg(test)]
+mod lower_extra_excludes_tests {
+    use super::*;
+
+    /// Regression: a read-only `--lower` mount excluded an existing
+    /// `B/new.log` named by `--journal`, hiding a change to the base. Only
+    /// paths that do not exist yet are excluded without a `-w` overlay.
+    #[test]
+    fn regression_read_only_lower_excludes_only_new_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(base.join("new.log"), b"x").unwrap();
+        let lowers = [dir.path().join("lower")];
+        let out = lower_extra_excludes(
+            Some(&base),
+            &lowers,
+            None,
+            vec![base.join("new.log"), base.join("fresh/j.jsonl")],
+        );
+        assert_eq!(out, vec![PathBuf::from("fresh")]);
     }
 }
 
