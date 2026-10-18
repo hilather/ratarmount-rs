@@ -155,12 +155,15 @@ struct TermState {
 }
 
 fn term_state() -> TermState {
+    // The handler stores signal, count, then flag. Reading in the reverse order
+    // means a flag seen set implies the count and signal that set it are visible.
+    let flagged = GOT_TERM.load(Ordering::SeqCst);
     let count = TERM_COUNT.load(Ordering::SeqCst);
     let signal = TERM_SIGNAL.load(Ordering::SeqCst);
     TermState {
         count,
         signal: (signal != 0).then_some(signal),
-        flagged: GOT_TERM.load(Ordering::SeqCst),
+        flagged,
     }
 }
 
@@ -239,8 +242,10 @@ fn signal_unmount_watcher(
     let mut seen = 0;
     loop {
         let st = state();
-        if st.count != seen {
-            seen = st.count;
+        // A recorded signal counts as at least one even if the snapshot was torn.
+        let count = st.count.max(usize::from(st.signal.is_some()));
+        if count != seen {
+            seen = count;
             match signal_unmount(mp, st.signal, unmount, lazy) {
                 SignalUnmountOutcome::Unmounted
                 | SignalUnmountOutcome::LazyFallback
@@ -2243,6 +2248,23 @@ mod tests {
         done.recv_timeout(Duration::from_secs(5))
             .expect("watcher ends");
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// Regression: a SIGTERM landing between the watcher's separate reads gave
+    /// `{count: 0, signal: SIGTERM, flagged: true}`; the watcher took the programmatic-shutdown
+    /// exit and dropped the signal. A recorded signal must always be handled.
+    #[test]
+    fn regression_signal_watcher_torn_snapshot_still_unmounts() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done = watcher_thread(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicI32::new(libc::SIGTERM)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&calls),
+        );
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("watcher ends");
+        assert_eq!(*calls.lock().unwrap(), ["unmount", "lazy"]);
     }
 
     fn write_tiny_tar_zst(path: &std::path::Path) {
