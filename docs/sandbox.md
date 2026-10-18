@@ -449,8 +449,8 @@ pre-release builds of the sandbox branch, also hashed symlink modes; any
 digest covering a symlink changed when format 2 dropped them, which also changed
 the golden digests. Seal records `canonical_hash_format` = `2` in the layer
 metadata, and bundles carry it in `meta.json`. Verify, pack, unpack and repeated
-seal refuse a layer recorded under another format (missing means 1) with exit 2,
-because this build cannot recompute that digest. To move such a layer to format 2,
+seal refuse a layer recorded under another format (missing means 1), because this
+build cannot recompute that digest: verify and seal exit 2, pack and unpack exit 1. To move such a layer to format 2,
 run `overlay unseal --i-know` and seal it again.
 
 Choosing `--algo`: on a CPU without SHA extensions (i7-8750H), `diff --hash` of
@@ -461,6 +461,11 @@ Use `blake3` for hashes that stay inside a grading loop, and `sha256` for
 published digests such as seals and bundles. With `--hash` or `--manifest` the
 cost is hashing only: `--max-diff-bytes` keeps large files out of the diff
 algorithm, and memory stays around 20 MiB.
+
+On macOS, a timestamp between −1 s and 0 is reported as `{0 s, negative ns}`,
+and rustix 1.1's `stat` panics on it. Fsck, seal, verify, diff and pack therefore
+read metadata through `ratarmount_compositing::host_stat`, which calls libc on
+Apple platforms and normalizes such timestamps instead of crashing.
 
 `--normalize exact` hashes bytes as written. `strict` converts CRLF to LF, strips
 trailing ASCII whitespace per line (space, tab, CR, LF and form feed; not vertical
