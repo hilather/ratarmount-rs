@@ -868,12 +868,34 @@ fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> rustix::io::Result<
     host::renameat_with(dir, from, dir, to, host::RenameFlags::NOREPLACE)
 }
 
-/// No atomic no-replace rename here: `linkat` never replaces, then the old
-/// name is unlinked. The inode check after the call still guards the result.
+/// No atomic no-replace rename on this platform (e.g. BSD). `linkat` followed
+/// by `unlinkat` is not a substitute: the old name can be replaced by a live
+/// file between the two calls and then be deleted. So nothing is quarantined
+/// and stale temps are left for manual deletion; see
+/// [`no_replace_rename_available`].
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> rustix::io::Result<()> {
-    host::linkat(dir, from, dir, to, AtFlags::empty())?;
-    host::unlinkat(dir, from, AtFlags::empty())
+fn rename_no_replace(_: &OwnedFd, _: &str, _: &str) -> rustix::io::Result<()> {
+    Err(rustix::io::Errno::NOSYS)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: pretend this platform has no no-replace rename.
+    static FORCE_NO_REPLACE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`rename_no_replace`] is atomic here. Without it the sweep never
+/// unlinks a temp.
+fn no_replace_rename_available() -> bool {
+    #[cfg(test)]
+    if FORCE_NO_REPLACE_FALLBACK.with(std::cell::Cell::get) {
+        return false;
+    }
+    cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    ))
 }
 
 /// How many quarantine names are tried before the entry is left alone.
@@ -886,6 +908,10 @@ fn unlink_if_same_named(
     locked: &File,
     next_name: &mut dyn FnMut() -> String,
 ) -> bool {
+    // No atomic no-replace rename: leave the stale file for manual deletion.
+    if !no_replace_rename_available() {
+        return false;
+    }
     let Ok(held) = ratarmount_compositing::host_stat::fstat(locked) else {
         return false;
     };
@@ -2389,6 +2415,48 @@ mod tests {
             "deleted through the swapped path"
         );
         assert!(!tmp.path().join("moved").join(name).exists());
+    }
+
+    /// Regression (R5-2, round-4 skeptic G2): where no atomic no-replace rename
+    /// exists (BSD), the `linkat` + `unlinkat` fallback could delete a live file
+    /// that replaced the stale one between the two calls. The sweep now skips
+    /// quarantine entirely there and leaves the stale temps (forced on Linux by
+    /// the test hook; a control run proves the sweep removes them otherwise).
+    #[test]
+    fn regression_sweep_without_no_replace_rename_unlinks_nothing() {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let names = [
+            ".ratarmount-pack-Ab3xY9.tmp".to_owned(),
+            format!("{COPY_PREFIX}Ab3xY9"),
+            ".ratarmount-pack-stage-Zz9Zz9.lock".to_owned(),
+        ];
+        for forced in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            for name in &names {
+                let file = File::create(tmp.path().join(name)).unwrap();
+                file.set_times(fs::FileTimes::new().set_modified(old))
+                    .unwrap();
+            }
+            FORCE_NO_REPLACE_FALLBACK.with(|f| f.set(forced));
+            let dir = open_root(tmp.path()).unwrap();
+            sweep_pack_temps_in(&dir);
+            sweep_stale_stages_in(&dir, true);
+            FORCE_NO_REPLACE_FALLBACK.with(|f| f.set(false));
+            for name in &names {
+                assert_eq!(
+                    tmp.path().join(name).exists(),
+                    forced,
+                    "forced={forced}: {name}"
+                );
+            }
+            // Nothing was quarantined or left under a quarantine name either.
+            let stray = fs::read_dir(tmp.path())
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains("quarantine"))
+                .count();
+            assert_eq!(stray, 0);
+        }
     }
 
     /// Regression (R4-S13): the quarantine rename replaced an existing
