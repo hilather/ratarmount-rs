@@ -1,204 +1,85 @@
-# Write-overlay sandbox controls
+# Agent sandboxes and grading
 
-Run untrusted or automated writers on top of a read-only base. Each attempt
-gets its own overlay, chosen paths stay read-only, the amount an attempt may
-write is capped, ownership is mapped for containers, and a supervisor creates
-and destroys hundreds of attempts and exports each one's patch. The
-[SWE-bench recipe](recipes/swe-bench-sandboxes.md) is the worked example; this
-page is the reference.
+Build a snapshot once, share a sealed prepared layer, and give each attempt its
+own writable top. Seal the result, inspect its changes, grade it against the
+same stack, and pack the layer for transport. Ordinary overlay writes leave
+the base unchanged. The [SWE-bench recipe](recipes/swe-bench-sandboxes.md)
+shows a larger harness; the [supervisor API](#sandbox-supervisor-api) manages
+fleets of attempts.
 
+## Worked example: snapshot to graded bundle
 
-Protect source paths and bound a sandbox's writable content with a persistent
-or temporary write overlay:
-
-```sh
-ratarmount -w attempt-overlay --overlay-readonly 't/**,tests/**' \
-  --overlay-quota 2G --overlay-quota-files 100000 source.tar mnt/
-```
-
-These options require an overlay from `-w` / `--write-overlay`,
-`--overlay-tmpfs`, or `--sandbox`, and conflict with the offline
-`--commit-overlay` command, which does not install mount policies. They apply through the shared
-overlay to FUSE, NFS, 9P, SFTP, SMB and WebDAV. Reads and read-only opens remain
-available. The base archive is unchanged by ordinary overlay writes.
-
-## Git-ref bases and portable snapshots
-
-Use a committed Git tree directly as an attempt's base:
+This small episode runs entirely offline: patch import supplies the edits that
+an agent or build would normally make through a writable mount. It needs Git,
+Python 3 and a built `ratarmount` on PATH, but no FUSE device or container runtime.
+Use a fresh scratch directory; all generated overlays stay outside the Git base.
 
 ```sh
-ratarmount -w attempt-overlay 'git:///srv/repos/project.git#v1.0' mnt
-ratarmount sandbox create-base --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" \
-  task 'git:///srv/repos/project.git#v1.0'
+mkdir sandbox-example
+cd sandbox-example
+git init -q repo
+printf 'pending\n' > repo/answer.txt
+git -C repo add answer.txt
+git -C repo -c user.name=Example -c user.email=example@example.invalid commit -qm base
+
+# Snapshot the committed tree and its mount index.
+ratarmount snapshot "git://$(pwd)/repo#HEAD" base.tar.zst --with-index --json
+
+# Prepare shared content once, then seal it.
+cat > prepared.patch <<'PATCH'
+diff --git a/prepared.txt b/prepared.txt
+new file mode 100644
+--- /dev/null
++++ b/prepared.txt
+@@ -0,0 +1 @@
++shared build output
+PATCH
+ratarmount overlay import --no-seal prepared.patch prepared base.tar.zst
+ratarmount overlay seal prepared
+
+# The attempt changes only its answer, inheriting prepared.txt from the lower.
+cat > attempt.patch <<'PATCH'
+diff --git a/answer.txt b/answer.txt
+--- a/answer.txt
++++ b/answer.txt
+@@ -1 +1 @@
+-pending
++42
+PATCH
+ratarmount overlay import --no-seal --lower prepared attempt.patch attempt base.tar.zst
+ratarmount overlay fsck attempt --repair
+ratarmount overlay seal attempt
+ratarmount overlay verify attempt
+
+# Inspect exact changes and record a grading cache key (stack + strict patch).
+ratarmount diff attempt --manifest > attempt.manifest.jsonl
+ratarmount diff attempt --hash --normalize strict --json > grade-key.json
+
+# Grade this toy task against its known answer without materializing the tree.
+python3 - <<'GRADE'
+import hashlib, json
+from pathlib import Path
+rows = [json.loads(line) for line in Path('attempt.manifest.jsonl').read_text().splitlines()]
+assert len(rows) == 1 and rows[0]['path'] == 'answer.txt'
+assert rows[0]['hash'] == 'sha256:' + hashlib.sha256(b'42\n').hexdigest()
+print('grade: pass')
+GRADE
+
+ratarmount overlay pack attempt attempt.tar.zst --include-index
+ratarmount overlay unpack attempt.tar.zst restored
+ratarmount overlay verify restored
 ```
 
-`git:///absolute/path#REV` accepts bare repositories, working directories, and
-`.git` directories. It forces Git mode; an omitted revision selects HEAD. Paths
-are percent-decoded and may contain literal `@`. Network Git URLs are refused:
-clone locally first. `repo@REV` and `--git-ref` remain supported. Pin a commit ID
-for reproducible attempts. Git base digests use `git-tree:<selected tree id>`.
+The manifest contains only `answer.txt`; shared preparation does not pollute the
+attempt's change set. For real tasks, run the test suite on the composed tree
+with [`sandbox run`](#sandbox-run-one-command-in-a-container), or mount
+`ratarmount --lower prepared -w attempt base.tar.zst mnt` before sealing.
+Use a fresh top for each attempt. Store both `stack` and `patch` from
+`grade-key.json` in a grade-cache key, together with the grader/version and its
+options; the patch hash alone does not identify the environment.
 
-To distribute the same tree as an archive, export it with its mount index:
-
-```sh
-ratarmount snapshot 'git:///srv/repos/project.git#v1.0' base.tar.zst --with-index --json
-```
-
-Ship `base.tar.zst` and `base.tar.zst.index.sqlite` together. Mounts discover the
-sidecar alongside the archive and reuse it. The archive is deterministic for the
-selected tree, commit time, and frame size: sorted paths, uid/gid 0, committed
-file permissions, directories 0755, preserved symlinks, and commit-time mtimes.
-There is no `.git` or synthetic HEAD; submodules are skipped with a stderr
-warning. Independent zstd frames and a seek table support random access;
-`--frame-size SIZE` changes the default 1 MiB frame size. JSON output reports
-`archive_digest` (`sha256:…`) and `base_digest` (`git-tree:…`); text output prints
-those values on two lines. Existing restic `snapshot add|list` commands are
-unchanged. See [Git mounts](git-mounts.md) for selectors and synthetic HEAD.
-
-## Executables and file metadata
-
-Writable FUSE mounts honor chmod and access/modification time updates, including
-“now” and omitted timestamps. New files and directories use the requested mode
-masked by the FUSE request's umask; the daemon's umask is not applied a second
-time. Archive members with execute bits and executables built inside the overlay
-can run normally. Mounts default to `exec`; an explicit `-o noexec` still wins.
-A configured `-o umask=...` continues to mask the attributes exposed to clients.
-
-Changing an archive member's mode or times records metadata without copying its
-payload into the overlay. Reads still come from the archive. The changes survive
-reopening the overlay, and a later data write preserves the mode during copy-up.
-TAR and compressed-TAR commit preserve executable bits and modification times;
-the current TAR writer stores whole-second mtime and does not store atime.
-Metadata-only commit uses the same temporary payload staging as provenance
-xattrs and is limited to the TAR commit formats. Offline `ratarmount diff`
-includes metadata-only mode changes without requiring a payload copy-up.
-Time-only changes do not enter its change set.
-
-NFSv3/v4 SETATTR, 9P Tsetattr and SFTP SETSTAT also apply mode and time changes.
-SFTP OPEN honors requested creation permissions. The current NFSv3 server dependency
-does not forward MKDIR attributes to the filesystem adapter, so newly created
-NFSv3 directories initially use mode 0755; SETATTR can change it afterwards.
-Ownership changes are refused
-with `EPERM` (the corresponding permission status for SFTP); they neither chown
-host files nor invent stored owners. Use `-o uid=...,gid=...` for presentation
-mapping. chmod on a symlink itself is unsupported. SMB Basic Information has no
-Unix mode field; unsupported SET_INFO classes continue to return an error.
-
-## Read-only path rules
-
-`--overlay-readonly GLOBS` and `--overlay-allow GLOBS` accept comma-separated
-lists and can be repeated. Both require `-w`, `--overlay-tmpfs` or `--sandbox`;
-`--overlay-allow` also requires at least one `--overlay-readonly` rule.
-Quote patterns to prevent expansion by your shell. Matching is case-sensitive
-and anchored at the mount root: `tests/**` and `/tests/**` are equivalent and
-match `tests`, `tests/a`, and `tests/a/b.t`, but not `other/tests/a`.
-
-- `*` matches zero or more characters within one path component.
-- `?` matches one Unicode character within one path component.
-- `**` must occupy a whole component and matches zero or more components.
-  `**/tests/**` protects a `tests` directory at any depth; `a/**/z` also
-  matches `a/z`.
-- A matching directory protects its entire subtree. A trailing `/` is accepted
-  and has the same effect as omitting it. `tests/**` explicitly includes the
-  directory node itself, whereas `tests/*` matches children.
-- Other characters are literal, including `[`, `]`, `!`, `#` and backslash.
-  There is no negation syntax, brace expansion, escaping, or comments.
-  A comma always separates rules. Whitespace around each rule is trimmed.
-  Empty rules, empty interior components, `.` and `..` are rejected.
-
-The matching rule with the most **literal path components** wins: a component
-counts as literal only if it contains neither `*` nor `?`. Wildcard components
-(including `**`) contribute zero; literal character count and rule order do not
-break ties. **Allow wins every specificity tie.** A path with no matching rule
-is writable. Every rule applies to its matched root and descendants, including
-exceptions: `t/agent/**` permits creating `t/agent` itself.
-
-```sh
-ratarmount -w attempt-overlay --overlay-readonly 't/**' \
-  --overlay-allow 't/agent/**' source.tar mnt/
-```
-
-For these rules:
-
-| Operation | `t/suite` | `t/agent` | `t/agent/leaf` | `outside` |
-| --- | --- | --- | --- | --- |
-| Create, mkdir, write, truncate, unlink, chmod, setxattr | EROFS | allowed | allowed | allowed |
-| Rename endpoint, rmdir, reset | EROFS | EROFS | allowed | allowed |
-
-The second row also checks possible protected descendants. Exception roots inside
-protected subtrees stay anchored: renaming `t` or `t/agent` is refused; renaming an allowed leaf within
-`t/agent` succeeds. A more specific read-only rule such as
-`t/agent/private/**` protects that subtree again and prevents moving its parents.
-These are policy decisions; normal filesystem errors and directory-rename
-limitations still apply.
-
-A protected path rejects creation, write opens, writes, truncate, COW copy-up,
-unlink, rmdir, mkdir, chmod, timestamp updates, setxattr and symlink creation
-with `EROFS` (read-only filesystem).
-Both rename endpoints are checked. Host parent symlinks are resolved as well,
-so a symlink alias cannot bypass rules for pre-existing overlay content; unlinking
-the alias itself remains allowed. Rename, rmdir and overlay reset also reject
-an ancestor of a possible read-only match that outranks the allow rule at that
-ancestor: with `a/*/test`, renaming `a` is refused even if no matching child
-currently exists. This conservative rule prevents moving protected paths through
-a parent, including when a descendant exception might later override that match.
-While a COW copy is in flight, replacing any of its parent directories or parent
-symlink aliases is also temporarily refused
-with `EROFS`. This keeps the copy's publication path stable; the restriction is
-released when the copy completes or fails. Unprotected directory renames still have
-the overlay's existing directory-rename limitations.
-
-Every `EROFS` returned by the rule policy increments its live `erofs_denied`
-counter once, including temporary COW-parent denials. With `--control-interface`,
-the socket `status` reply and `/.ratarmount-control/status` include an
-`erofs_denied N` line alongside quota usage, even when no quota is configured.
-The counter starts at zero for each policy instance; offline `overlay-stats`
-does not include it. An observer hook receives the requested path and policy
-operation once per denial for journal integration. Rules are available in input
-order as `{"readonly":[...],"allow":[...]}` for metadata integration.
-
-Supervisor protocol version 1 also accepts optional base `options.allow_globs`
-(an array of strings), forwarded as `--overlay-allow` to attempt mounts. It
-requires base `readonly_globs`; attempts cannot supply new allow exceptions.
-
-## Quota
-
-`--overlay-quota SIZE` accepts a nonnegative integer byte count or a binary
-`K`, `M`, `G`, or `T` suffix (1024-based, case-insensitive). `0` permits no
-growth. `--overlay-quota-files N` independently limits regular files plus
-symlinks; directories do not consume file slots. Either quota can be used alone,
-or combined with read-only rules. Protected-path errors take precedence.
-
-Usage starts with a scan of existing overlay content. Quotas count logical file
-lengths, including sparse extents, full COW copies, and symlink target lengths.
-Internal database/marker files are excluded and symlinks are never followed.
-A write or truncate that would grow beyond the byte cap fails with `EDQUOT`;
-creating a file beyond the file cap does too. NFSv4 reports `NOSPC`. Overwrites
-within the current extent and shrinking remain possible when an existing
-overlay starts above its limit. Unlink and truncate release the corresponding
-charge. COW reserves bytes and a file slot before copying, so concurrent copies
-and writes cannot overrun the cap; competing copies may be refused conservatively.
-
-The accounting covers operations through ratarmount. External edits directly
-inside the overlay directory bypass enforcement; use an overlay directory only
-the mount owner can modify. This is a logical content quota, not a filesystem
-block quota or a complete process isolation boundary. Removal releases the
-named file's original extent. Growth through a held, unlinked descriptor stays
-charged until its last tracked descriptor closes.
-
-With `--control-interface`, both the socket `status` command and
-`/.ratarmount-control/status` append these live fields whenever any sandbox
-policy is installed:
-
-```text
-overlay_bytes 1234
-overlay_quota_bytes 2147483648
-overlay_files 3
-overlay_quota_files 100000
-```
-
-An absent limit is printed as `unlimited`. In-flight COW reservations are
-included in live usage; offline statistics describe named content only.
+The remaining sections describe offline commands and mount controls. Mount
+examples require FUSE; container examples also require the stated runtime.
 
 ## Overlay metadata
 
@@ -209,9 +90,12 @@ the overlay:
 ```bash
 ratarmount overlay info ./attempt
 ratarmount overlay info ./attempt --json
-ratarmount -w ./attempt --base-digest sha256:<64-hex-digits> snapshot.tar mnt/
+ratarmount -w ./attempt --base-digest "$KNOWN_BASE_DIGEST" snapshot.tar mnt/
 ratarmount -w ./throwaway --base-digest none snapshot.tar mnt/
 ```
+
+Set `KNOWN_BASE_DIGEST` to the snapshot's known `sha256:` identity (64 hex
+digits) before using the supplied-digest example.
 
 The JSON object contains every stored metadata key (string values, including
 JSON-encoded `lower_layers`), plus the numeric `overlay-stats` fields
@@ -236,9 +120,36 @@ repaired. A mounted overlay's exclusive database lock is reported as "in use".
 | `lower_layers` | JSON array, bottom to top, of `{path, layer_digest, sealed_at}` records; empty for an ordinary mount |
 | `stack_digest` | SHA-256 of the base digest and ordered lower-layer digests, each followed by a newline |
 | `base_mismatch_forced_at` | Last explicit override of a failed base check, RFC 3339 UTC |
-| `sealed_at`, `layer_digest` | Reserved for sealing; absent on new writable overlays |
-| `journal_path` | Reserved for the last journal file used |
-| `fsck_at`, `fsck_result` | Reserved for consistency checks |
+| `sealed_at`, `layer_digest` | Seal time and exact canonical change hash against the recorded stack; absent while writable |
+| `journal_path` | Last resolved operation-journal path |
+| `fsck_at`, `fsck_result` | Last consistency-check time and `ok`, `errors:N`, or `repaired:N` |
+| `readonly_rules` | JSON object containing `readonly` and `allow` pattern arrays |
+| `stack_mismatch_forced_at` | Last explicit lower-stack override, RFC 3339 UTC |
+| `base_committed_at` | Time of the last successful base-archive commit |
+| `unsealed_at` | Last explicit unseal time |
+
+Offline command exit codes:
+
+| Command | Exit status |
+|---|---|
+| `overlay info`, `seal`, `unseal`, `pack`, `import-upperdir` | 0 success; 2 invalid input or operational error |
+| `overlay verify`, `unpack` | 0 match; 1 mismatch; 2 invalid input or operational error |
+| `overlay fsck` | 0 clean/repaired; 1 unrepaired inconsistencies; 2 operational error |
+| `overlay import` | 0 imported; 1 rejected hunks with `--reject`; 2 invalid input or operational error |
+| `diff` | 0 unchanged; 1 changed; 2 error; 3 limits; successful hash/manifest output always exits 0 |
+| `journal summarize`, `journal mark` | 0 success; 2 invalid arguments, data or I/O error |
+| `snapshot` (Git export) | 0 success; 1 operational error; 2 argument error |
+| `sandbox run` | 0 completed pipeline (inspect JSON `exit_code`); 2 harness failure |
+
+### Base and stack digests
+
+```text
+stack_digest = sha256(base_digest + "\n" + layer_digest_1 + "\n" + … + layer_digest_n + "\n")
+```
+
+The input is the UTF-8 digest strings, including their algorithm prefixes, in
+bottom-to-top order. With no lowers, hash only the base digest and newline.
+The stored result has the `sha256:` prefix.
 
 A local archive gets a streaming SHA-256 of all file bytes at creation. If an
 existing writable archive index is available, a small cache reuses the digest
@@ -322,44 +233,11 @@ a nonzero commit interval, and rolling commits with `--lower` are refused with
 “commit of a layered stack is not supported; flatten first”. RAM tops are
 supported; the sandbox supervisor API does not yet accept lower stacks.
 
-## fsck
-
-```sh
-ratarmount overlay fsck attempt --json
-ratarmount overlay fsck attempt --repair
-```
-
-Run this after unmounting, especially after a writer was killed before its
-pending database rows were saved. The checker makes one directory walk and one
-`files` scan. Reports contain `missing_content`, `orphan_content`,
-`tombstone_content`, `type_mismatch`, `invalid_path`, `missing_parent`,
-`repaired`, and `result`. Category counts describe the state before repair;
-`repaired` counts resolved findings. Exit codes are 0 for clean or repaired,
-1 for unrepaired inconsistencies, and 2 for an operational error.
-
-Repair removes rows whose content disappeared, inserts orphan entries using
-host mode/mtime/uid/gid, corrects type mismatches, removes content under
-tombstones, and drops malformed path rows. Missing parents of tombstones are
-created where safe. Removal uses directory-relative, no-follow operations;
-symlinks are entries, never traversal paths. Repair does not delete an external
-file named by a corrupt row. Invalid host UTF-8 names are reported as an error.
-Database files, overlay markers, COW/spool staging files and `.ratarmount-sealed`
-are excluded. Existing metadata-only chmod/utime rows for inherited content
-are valid without a host copy. A `files.path` such as `/lib` is the schema's
-mount-relative parent, not a host absolute path.
-
-Unsealed checks record `fsck_at` and `fsck_result` (`ok`, `errors:N`, or
-`repaired:N`). Sealed overlays can be checked without modifying any metadata;
-`--repair` is refused. A database locked by a mount returns “in use”. Repairs
-hold an exclusive SQLite transaction, but host changes and SQLite are not one
-atomic transaction: stop direct host writers and rerun after an interrupted
-repair. A consistency check does not verify content hashes.
-
 ## Seal and verify
 
 ```sh
-ratarmount overlay seal attempt [--lower prepared] [BASE]
-ratarmount overlay verify attempt [--lower prepared] [BASE]
+ratarmount overlay seal attempt --lower prepared base.tar.zst
+ratarmount overlay verify attempt --lower prepared base.tar.zst
 ratarmount diff attempt --strict --hash --include-git-dir
 ratarmount overlay unseal attempt --i-know
 ```
@@ -403,50 +281,38 @@ seal, run unseal, fsck, and seal again. Stop direct host writers during these
 commands; chmod is not a security boundary against the owner or root. The seal
 covers canonical changes, not timestamps, ownership or xattrs.
 
-## Branching an episode
-
-A harness can fork an attempt at
-turn *k* by stopping writers, unmounting, and sealing that attempt. Then each
-branch gets its own writable top over the same ordered lower stack:
+## fsck
 
 ```sh
-fusermount3 -u attempt-mnt
-ratarmount overlay fsck attempt-k --repair
-ratarmount overlay seal attempt-k
-ratarmount --lower prepared --lower attempt-k -w branch-a source.tar branch-a-mnt/
-ratarmount --lower prepared --lower attempt-k -w branch-b source.tar branch-b-mnt/
+ratarmount overlay fsck attempt --json
+ratarmount overlay fsck attempt --repair
 ```
 
-The prepared layer must also be sealed. Branches share the saved filesystem
-state and copy up only what they modify. Shell state, processes, and runtime
-isolation remain the harness's responsibility.
+Run this after unmounting, especially after a writer was killed before its
+pending database rows were saved. The checker makes one directory walk and one
+`files` scan. Reports contain `missing_content`, `orphan_content`,
+`tombstone_content`, `type_mismatch`, `invalid_path`, `missing_parent`,
+`repaired`, and `result`. Category counts describe the state before repair;
+`repaired` counts resolved findings. Exit codes are 0 for clean or repaired,
+1 for unrepaired inconsistencies, and 2 for an operational error.
 
-## overlay-stats
+Repair removes rows whose content disappeared, inserts orphan entries using
+host mode/mtime/uid/gid, corrects type mismatches, removes content under
+tombstones, and drops malformed path rows. Tombstones need no host parent: deleting an inherited path does not
+materialize its directory. Only present entries require host parent directories. Removal uses directory-relative, no-follow operations;
+symlinks are entries, never traversal paths. Repair does not delete an external
+file named by a corrupt row. Invalid host UTF-8 names are reported as an error.
+Database files, overlay markers, COW/spool staging files and `.ratarmount-sealed`
+are excluded. Existing metadata-only chmod/utime rows for inherited content
+are valid without a host copy. A `files.path` such as `/lib` is the schema's
+mount-relative parent, not a host absolute path.
 
-```sh
-ratarmount overlay-stats attempt-overlay
-ratarmount overlay-stats attempt-overlay --json
-```
-
-This offline command opens the existing overlay database read-only and scans
-the directory without mounting or creating a database. Stop the mount first
-for a consistent view: host content and SQLite are separate snapshots. Missing,
-malformed, or exclusively locked databases produce an error.
-
-Stable JSON keys (integer counts):
-
-| Key | Meaning |
-| --- | --- |
-| `bytes_in_overlay` | Logical bytes in regular files and symlink targets |
-| `files_present` | Regular files present, combining additions and modifications |
-| `files_deleted` | Durable tombstone rows, including removed directories |
-| `directories_created` | Host directories in the overlay, including implicit COW parents |
-| `symlinks` | Symlinks present, including dangling symlinks |
-
-Database files, SQLite sidecars, staging files using the internal database
-prefix, and current/legacy overlay markers are omitted at every depth.
-Statistics do not require or compare against the original archive; additions
-and modifications are consequently reported together.
+Unsealed checks record `fsck_at` and `fsck_result` (`ok`, `errors:N`, or
+`repaired:N`). Sealed overlays can be checked without modifying any metadata;
+`--repair` is refused. A database locked by a mount returns “in use”. Repairs
+hold an exclusive SQLite transaction, but host changes and SQLite are not one
+atomic transaction: stop direct host writers and rerun after an interrupted
+repair. A consistency check does not verify content hashes.
 
 ## diff
 
@@ -582,6 +448,655 @@ Exit status is **0** for no changes, **1** for changes, **2** for errors and **3
 for size/file limits. Hash and manifest modes always exit **0** on success.
 Harnesses consuming patch/name/stat modes should accept both 0 and 1.
 
+## Overlay import
+
+`ratarmount overlay import` builds a new write overlay from a unified or Git
+patch against a base and optional lower overlays. It uses the same write APIs
+and creation metadata as a mounted write session; no mount or external patch
+program is needed.
+
+```sh
+ratarmount diff attempt base.tar.zst --git -o attempt.patch
+ratarmount overlay import --mtime 1700000000 attempt.patch replay base.tar.zst
+cat attempt.patch | ratarmount overlay import --lower prepared - replay2 base.tar.zst
+ratarmount diff replay base.tar.zst --hash --normalize exact
+```
+
+The destination must not exist or must be an empty directory. `--lower DIR` is
+repeatable, bottom to top; unsealed lower layers require
+`--allow-unsealed-lower`. The base positional accepts the same local archive,
+folder, committed Git source and remote source forms as other offline overlay
+commands. Import pins Git references before opening the source and records the
+base identity and lower-layer stack identity.
+
+Accepted patches include `git diff --binary` literal sections (Git base85 plus
+zlib), additions, deletions, executable mode changes, symlinks, rename/copy
+headers and ordinary unified hunks. Rename means copy the preimage to the new
+name, apply its hunks, then delete the old name. Copy keeps the old name.
+Reverse binary literals are validated and ignored. Binary delta sections and
+`Binary files … differ` without content are errors naming the affected file;
+regenerate these as literal patches, for example with `ratarmount diff --git`.
+Index object IDs are accepted without verification.
+
+Hunks require exact context bytes. Their location may move; context is never
+trimmed to force a match. CRLF, Latin-1 file content and missing final newlines
+are preserved. Git C-quoted names are decoded, and header paths have one
+leading component removed (`-p1`); plain `diff -u` headers may include a tab
+followed by a timestamp. Both old and new names are validated. Absolute paths,
+NUL, empty, `.` or `..` components, reserved overlay bookkeeping names, and
+symlink parents in either the lower view or the new overlay are refused.
+Symlink targets are stored as link data, never followed. Paths and symlink
+targets must be UTF-8 because the workspace's mount and overlay APIs use
+strings; non-UTF-8 names are refused, rather than changed silently.
+
+If a hunk fails, the default is to abort and remove the partial overlay.
+`--reject` keeps that file's original lower content and writes only its failed
+hunks to `PATH.rej`, while applying other files. Later sections for an already
+rejected file cannot replace its original content. Import exits 0 on success, 1 when hunks
+were rejected with `--reject`, and 2 on invalid input or I/O errors. A preexisting
+nonempty destination is left intact.
+
+`--mtime now` is the default. An explicit epoch timestamp (including fractional
+or negative seconds) is applied after content writes to files, symlinks and
+reject files. It does not alter tombstones. Import seals by default after
+closing the writer and prints the layer digest. `--no-seal` leaves the overlay
+writable. `--json` prints `{ "overlay": "…", "files": N, "rejected": N,
+"layer_digest": "…" }`; the digest is null with `--no-seal`. `files` counts
+successfully applied distinct paths (both sides of renames), excluding reject
+files and rejected originals.
+
+`--max-patch-bytes N` defaults to 268435456 (256 MiB). It bounds input bytes,
+the total retained decoded literals, each reverse literal, and each file's
+preimage/postimage. Import buffers the bounded patch and one file's text at a
+time; increase the limit explicitly for larger patches.
+
+Git/unified patches cannot represent empty directories, directory metadata or
+extended attributes. Empty directories therefore do not round-trip, and Git
+patches project regular-file permissions to 0644/0755. Exact canonical hashes
+round-trip for representable changes with those modes; use manifests or packed
+overlays when the full directory/mode/xattr state is needed.
+
+## Journal
+
+`--journal FILE` appends a JSONL operation journal on FUSE mounts, with or without
+`-w`. Put the file outside both the mountpoint and write-overlay directory;
+existing symlink aliases into either are rejected. A writable overlay records
+the resolved path in its `journal_path` metadata. This operation journal is
+separate from the archive append-commit journal.
+
+```sh
+ratarmount -w attempt --journal attempt.jsonl \
+  --journal-exclude '.git/**' --journal-exclude 'blib/**' source.tar mnt
+ratarmount journal mark mnt 'turn 1'
+ratarmount journal summarize attempt.jsonl --json
+ratarmount journal summarize attempt.jsonl --since-mark 'turn 1' --until-mark 'turn 2'
+```
+
+| Record | Fields / meaning |
+| --- | --- |
+| Header | `journal: 1`, `mount`, `base_digest`, `stack_digest`, `overlay`, `t0`, `clock` |
+| `open` | Path, access `flags`, caller `pid`/`uid`/`gid`, optional `comm`, source `layer` |
+| `read`, `write` | Per-handle `bytes`, `count`, `ranges`, `first_ts`, `layer`; optional `ranges_truncated` |
+| `create`, `mkdir`, `unlink`, `rmdir`, `symlink`, `truncate`, `chmod` | Successful path mutation and caller |
+| `rename` | Source path and destination `to` |
+| `readdir` | First successful directory listing, `entries` count |
+| `denied` | Attempted `what`, path and numeric `errno` |
+| `mark` | UTF-8 `label` identifying a turn boundary |
+
+Each mount appends a version-1 header containing `mount`, `base_digest`,
+`stack_digest`, `overlay`, UTC RFC 3339 `t0`, and `clock: "monotonic_ns"`.
+Subsequent `ts` values are monotonic nanoseconds since that header. Paths are
+mount-relative, without a leading slash; the root is `""`. JSON writers use
+`path_b64` for invalid UTF-8 bytes, although the FUSE frontend currently rejects
+such names. `open` includes access flags (`r`, `w`, `rw`), the request's `pid`,
+`uid`, `gid`, best-effort Linux `/proc/PID/comm`, and `layer` (`base`, `lower:N`,
+or `top`). The process-name cache is bounded to 1024 PIDs.
+
+Successful creates, mkdirs, unlinks, rmdirs, renames (with `to`), symlinks,
+truncates, and chmods are recorded as they happen. The first successful readdir
+on each directory handle records its child-entry count (excluding `.` and
+`..`). Lookups and getattr/stat are omitted. Failed mutations returning
+`EROFS`, `EDQUOT`, or `ENOSPC` produce `denied` records with the attempted `what`
+and numeric `errno`; rule observers and callback errors are deduplicated.
+Denials from non-FUSE callers of the same rule observer have PID/UID/GID zero.
+
+Reads and writes aggregate per open handle and emit on RELEASE, or at unmount
+for outstanding handles. `bytes` counts bytes actually returned or written,
+including repeated accesses; `count` counts successful I/O requests, including EOF. `ranges`
+merges adjacent and overlapping `[offset, length]` pairs. At most 64 ranges are
+retained; additional disjoint ranges set `ranges_truncated: true` while byte
+counts remain complete. `--journal-reads first` retains only the first non-empty
+read range per handle; byte and request counts still include all reads. The
+default is `--journal-reads all`. `first_ts` preserves the first successful I/O timestamp
+when handles release out of order. Reads/writes retain the opened path and
+layer even after rename or unlink.
+
+`--journal-exclude GLOB` is repeatable and accepts the same comma-separated,
+root-anchored patterns as `--overlay-readonly`. It omits matching paths and
+renames with a matching endpoint. Status counters still include excluded
+activity. Marks are never excluded.
+
+The writer uses a bounded 1024-record queue and flushes buffered output at least
+every 100 ms while processing. A full queue blocks request processing until
+space is available; records are not dropped to relieve pressure. Unmount joins
+the writer and flushes pending records; `--journal-sync` also fsyncs the file.
+Write failures appear in the daemon log and `user.ratarmount.stats`'s `journal_error`; mark
+requests then fail with EIO and unmount reports the failure. Abrupt termination
+can lose buffered records. Summaries tolerate an incomplete final record and
+an incomplete record immediately before a subsequent mount header.
+
+`summarize` streams the input, keeping a per-path table and mark-to-path sets.
+It reports first read/write timestamps, bytes, read request counts, layer and
+process-name set; lists `files_read`, `files_read_then_written`, and
+`files_written_blind`; and groups `reads_by_mark` by label. The leading `""`
+bucket contains reads released before the first mark. Repeated labels combine
+into one bucket. `--since-mark` starts after the first matching mark;
+`--until-mark` stops before the first match after the start. Missing labels are
+errors. Because read records emit at RELEASE, a handle spanning marks is
+assigned to its release bucket; close file handles before marking a turn when
+exact turn attribution matters. Byte-path fallback keys appear as
+`path_b64:BASE64` in the summary. Both `journal` commands exit 0 on success and
+2 on argument, input, or I/O errors.
+
+The journal describes operations reaching FUSE. Kernel page-cache hits, mmap
+accesses and accesses through other export protocols do not produce read
+callbacks. Passthrough is disabled when journaling. With `--journal`, mounts without `-w` permit root control requests at the
+kernel boundary; file mutations still return EROFS in the frontend. These
+journaled mounts consequently report a writable kernel mount flag even though
+their data is read-only. Without `--journal`, read-only mounts stay kernel `ro`. Explicit
+`-o ro` also prevents control writes (the kernel returns EROFS before the root
+control handler, including when journaling is off).
+
+Run `RATARMOUNT=target/release/ratarmount benchmarks/journal-overhead.sh` on a
+machine with `/dev/fuse`, Python 3, `fusermount3`, `make`, and a C compiler. It
+alternates fresh overlay mounts with and without journaling, runs three
+build/test loops per sample, and prints median workload overhead. `RUNS`
+(default 6) and `JOBS` (default 4) tune the run. The under-3% target is not a CI
+gate; absent tools yield an explicit skip (exit 77).
+
+## Control and status xattrs
+
+The mount root exposes these synthetic read attributes, including on mounts
+without a write overlay:
+
+| Xattr | Value |
+| --- | --- |
+| `user.ratarmount.base_digest` | Recorded base identity, or empty string |
+| `user.ratarmount.stack_digest` | Recorded stack identity, or empty string |
+| `user.ratarmount.sealed` | `1` when the supplied metadata is sealed, otherwise `0` |
+| `user.ratarmount.layers` | JSON `lower_layers`, or `[]` without metadata |
+| `user.ratarmount.journal` | Resolved active journal path, or empty string |
+| `user.ratarmount.stats` | JSON counters described below |
+
+`stats` contains `bytes_read`, `bytes_written`, `files_touched` (distinct paths
+observed), `overlay_bytes` (quota usage, or null without a quota policy), `ops`
+(counts by journal operation), `erofs_denied`, and `journal_error` (null or an
+error string). Byte counters update during I/O; aggregated read/write operation
+counts update on RELEASE. All counters are for this mount's lifetime.
+
+Set `user.ratarmount.mark` on the root to append a UTF-8 label of at most 4096
+bytes. `ratarmount journal mark MOUNT LABEL` performs this same xattr call.
+Invalid labels return EINVAL. Without `--journal`, marks return ENOTSUP on a
+writable mount and EROFS on a read-only one (a read-only mount without
+`--journal` stays kernel `ro`). Other
+`user.ratarmount.*` root writes and removals return EPERM. These controls are
+intercepted before the overlay's xattr implementation. The existing
+`user.ratarmount.git.commit` read attribute continues to come from the source.
+
+```sh
+getfattr -n user.ratarmount.stats mnt
+getfattr -n user.ratarmount.base_digest mnt
+python3 -c 'import os; os.setxattr("mnt", "user.ratarmount.mark", b"turn 2")'
+```
+
+## Read-only path rules
+
+Protect source paths and cap writable content with a persistent or temporary top:
+
+```sh
+ratarmount -w attempt-overlay --overlay-readonly 't/**,tests/**' \
+  --overlay-quota 2G --overlay-quota-files 100000 source.tar mnt/
+```
+
+These controls require `-w` / `--write-overlay`, `--overlay-tmpfs`, or
+`--sandbox`. They conflict with offline `--commit-overlay`, which does not
+install mount policies. The shared overlay enforces them through FUSE, NFS,
+9P, SFTP, SMB and WebDAV; reads and read-only opens remain available.
+
+`--overlay-readonly GLOBS` and `--overlay-allow GLOBS` accept comma-separated
+lists and can be repeated. Both require `-w`, `--overlay-tmpfs` or `--sandbox`;
+`--overlay-allow` also requires at least one `--overlay-readonly` rule.
+Quote patterns to prevent expansion by your shell. Matching is case-sensitive
+and anchored at the mount root: `tests/**` and `/tests/**` are equivalent and
+match `tests`, `tests/a`, and `tests/a/b.t`, but not `other/tests/a`.
+
+- `*` matches zero or more characters within one path component.
+- `?` matches one Unicode character within one path component.
+- `**` must occupy a whole component and matches zero or more components.
+  `**/tests/**` protects a `tests` directory at any depth; `a/**/z` also
+  matches `a/z`.
+- A matching directory protects its entire subtree. A trailing `/` is accepted
+  and has the same effect as omitting it. `tests/**` explicitly includes the
+  directory node itself, whereas `tests/*` matches children.
+- Other characters are literal, including `[`, `]`, `!`, `#` and backslash.
+  There is no negation syntax, brace expansion, escaping, or comments.
+  A comma always separates rules. Whitespace around each rule is trimmed.
+  Empty rules, empty interior components, `.` and `..` are rejected.
+
+The matching rule with the most **literal path components** wins: a component
+counts as literal only if it contains neither `*` nor `?`. Wildcard components
+(including `**`) contribute zero; literal character count and rule order do not
+break ties. **Allow wins every specificity tie.** A path with no matching rule
+is writable. Every rule applies to its matched root and descendants, including
+exceptions: `t/agent/**` permits creating `t/agent` itself.
+
+```sh
+ratarmount -w attempt-overlay --overlay-readonly 't/**' \
+  --overlay-allow 't/agent/**' source.tar mnt/
+```
+
+For these rules:
+
+| Operation | `t/suite` | `t/agent` | `t/agent/leaf` | `outside` |
+| --- | --- | --- | --- | --- |
+| Create, mkdir, write, truncate, unlink, chmod, setxattr | EROFS | allowed | allowed | allowed |
+| Rename endpoint, rmdir, reset | EROFS | EROFS | allowed | allowed |
+
+The second row also checks possible protected descendants. Exception roots inside
+protected subtrees stay anchored: renaming `t` or `t/agent` is refused; renaming an allowed leaf within
+`t/agent` succeeds. A more specific read-only rule such as
+`t/agent/private/**` protects that subtree again and prevents moving its parents.
+These are policy decisions; normal filesystem errors and directory-rename
+limitations still apply.
+
+A protected path rejects creation, write opens, writes, truncate, COW copy-up,
+unlink, rmdir, mkdir, chmod, timestamp updates, setxattr and symlink creation
+with `EROFS` (read-only filesystem).
+Both rename endpoints are checked. Host parent symlinks are resolved as well,
+so a symlink alias cannot bypass rules for pre-existing overlay content; unlinking
+the alias itself remains allowed. Rename, rmdir and overlay reset also reject
+an ancestor of a possible read-only match that outranks the allow rule at that
+ancestor: with `a/*/test`, renaming `a` is refused even if no matching child
+currently exists. This conservative rule prevents moving protected paths through
+a parent, including when a descendant exception might later override that match.
+While a COW copy is in flight, replacing any of its parent directories or parent
+symlink aliases is also temporarily refused
+with `EROFS`. This keeps the copy's publication path stable; the restriction is
+released when the copy completes or fails. Unprotected directory renames still have
+the overlay's existing directory-rename limitations.
+
+Every `EROFS` returned by the rule policy increments its live `erofs_denied`
+counter once, including temporary COW-parent denials. With `--control-interface`,
+the socket `status` reply and `/.ratarmount-control/status` include an
+`erofs_denied N` line alongside quota usage, even when no quota is configured.
+The counter starts at zero for each policy instance; offline `overlay-stats`
+does not include it. An observer hook receives the requested path and policy
+operation once per denial for journal integration. Rules are recorded in input
+order as `{"readonly":[...],"allow":[...]}` in `meta.readonly_rules`.
+
+Supervisor protocol version 1 also accepts optional base `options.allow_globs`
+(an array of strings), forwarded as `--overlay-allow` to attempt mounts. It
+requires base `readonly_globs`; attempts cannot supply new allow exceptions.
+
+## Quota
+
+`--overlay-quota SIZE` accepts a nonnegative integer byte count or a binary
+`K`, `M`, `G`, or `T` suffix (1024-based, case-insensitive). `0` permits no
+growth. `--overlay-quota-files N` independently limits regular files plus
+symlinks; directories do not consume file slots. Either quota can be used alone,
+or combined with read-only rules. Protected-path errors take precedence.
+
+Usage starts with a scan of existing overlay content. Quotas count logical file
+lengths, including sparse extents, full COW copies, and symlink target lengths.
+Internal database/marker files are excluded and symlinks are never followed.
+A write or truncate that would grow beyond the byte cap fails with `EDQUOT`;
+creating a file beyond the file cap does too. NFSv4 reports `NOSPC`. Overwrites
+within the current extent and shrinking remain possible when an existing
+overlay starts above its limit. Unlink and truncate release the corresponding
+charge. COW reserves bytes and a file slot before copying, so concurrent copies
+and writes cannot overrun the cap; competing copies may be refused conservatively.
+
+The accounting covers operations through ratarmount. External edits directly
+inside the overlay directory bypass enforcement; use an overlay directory only
+the mount owner can modify. This is a logical content quota, not a filesystem
+block quota or a complete process isolation boundary. Removal releases the
+named file's original extent. Growth through a held, unlinked descriptor stays
+charged until its last tracked descriptor closes.
+
+With `--control-interface`, both the socket `status` command and
+`/.ratarmount-control/status` append these live fields whenever any sandbox
+policy is installed:
+
+```text
+overlay_bytes 1234
+overlay_quota_bytes 2147483648
+overlay_files 3
+overlay_quota_files 100000
+```
+
+An absent limit is printed as `unlimited`. In-flight COW reservations are
+included in live usage; offline statistics describe named content only.
+
+## Bundles
+
+Pack a sealed overlay into one portable, seekable `.tar.zst` archive:
+
+```bash
+ratarmount overlay seal attempt
+ratarmount overlay pack attempt attempt.tar.zst \
+  --include-journal attempt-journal.jsonl --include-index
+ratarmount overlay unpack attempt.tar.zst restored
+ratarmount overlay verify restored
+```
+
+`pack DIR BUNDLE [--lower LAYER …] [BASE]` uses the recorded base URL and lower
+layers unless overridden. It refuses unsealed overlays and existing output
+files, publishes the completed bundle atomically, and prints `layer_digest`.
+Packing the same layer with the same optional inputs produces identical bytes.
+Paths are sorted, archive uid/gid are zero, and layer modes, mtimes and symlink
+targets are preserved. File content is streamed; symlinks are never followed.
+In-use markers and COW/spool temporary files are excluded.
+
+The ordinary TAR layout is:
+
+```text
+layer/                         # overlay content and directories
+layer/.ratarmount.overlay.sqlite
+layer/.ratarmount-sealed
+manifest.jsonl                 # exact changes against the composed stack
+meta.json                      # all overlay meta keys, as JSON string values
+journal.jsonl                  # with --include-journal FILE
+journal-summary.json           # journal summarize output
+index/BASE.index.sqlite        # with --include-index, if an adjacent sidecar exists
+```
+
+The index is the local base archive's adjacent `BASE.index.sqlite` sidecar;
+remote and directory bases do not contribute an index. Unpacking restores only
+`layer/`. To use a shipped index on another machine, copy it beside the matching
+base archive under its original sidecar name. A bundle carries layer changes,
+not the base archive or its lower layers.
+
+`unpack BUNDLE DIR` accepts a nonexistent or empty directory, restores sealed
+read-only permissions, checks that the database opens read-only and immutable,
+and compares the seal sentinel with the recorded digest. It also recomputes the
+seal against the recorded stack when that base and its lowers are reachable.
+When they are absent it reports that only the database and sentinel were
+checked; run `overlay verify` after restoring the stack to validate content.
+Exit codes are 0 for a match, 1 for a digest/content mismatch, and 2 for invalid
+input or an operational error. Unsafe archive paths, duplicate entries,
+hardlinks, device entries and writes through symlink components are refused.
+Extraction uses a private staging directory and publishes the result by rename.
+
+A bundle can be mounted directly as an ordinary archive, or used as a lower:
+
+```bash
+ratarmount attempt.tar.zst inspect-mnt
+# inspect-mnt contains layer/, manifest.jsonl and meta.json
+ratarmount --lower attempt.tar.zst -w next-attempt base.tar.zst work-mnt
+```
+
+For `--lower`, the metadata is read through the archive session API, then the
+layer is unpacked once into
+`$XDG_CACHE_HOME/ratarmount/layers/<layer_digest without sha256:>` (default:
+`~/.cache/ratarmount/layers/`). Publication is atomic. Later mounts reuse the
+cached sealed directory after checking its immutable database and sentinel;
+a damaged cache entry is refused. Directory lowers continue to work normally.
+
+## Git-ref bases and portable snapshots
+
+Use a committed Git tree directly as an attempt's base:
+
+```sh
+ratarmount -w attempt-overlay 'git:///srv/repos/project.git#v1.0' mnt
+ratarmount sandbox create-base --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" \
+  task 'git:///srv/repos/project.git#v1.0'
+```
+
+`git:///absolute/path#REV` accepts bare repositories, working directories, and
+`.git` directories. It forces Git mode; an omitted revision selects HEAD. Paths
+are percent-decoded and may contain literal `@`. Network Git URLs are refused:
+clone locally first. `repo@REV` and `--git-ref` remain supported. Pin a commit ID
+for reproducible attempts. Git base digests use `git-tree:<selected tree id>`.
+
+To distribute the same tree as an archive, export it with its mount index:
+
+```sh
+ratarmount snapshot 'git:///srv/repos/project.git#v1.0' base.tar.zst --with-index --json
+```
+
+Ship `base.tar.zst` and `base.tar.zst.index.sqlite` together. Mounts discover the
+sidecar alongside the archive and reuse it. The archive is deterministic for the
+selected tree, commit time, and frame size: sorted paths, uid/gid 0, committed
+file permissions, directories 0755, preserved symlinks, and commit-time mtimes.
+There is no `.git` or synthetic HEAD; submodules are skipped with a stderr
+warning. Independent zstd frames and a seek table support random access;
+`--frame-size SIZE` changes the default 1 MiB frame size. JSON output reports
+`archive_digest` (`sha256:…`) and `base_digest` (`git-tree:…`); text output prints
+those values on two lines. Existing restic `snapshot add|list` commands are
+unchanged. See [Git mounts](git-mounts.md) for selectors and synthetic HEAD.
+
+## `sandbox run`: one command in a container
+
+`ratarmount sandbox run` mounts a base and optional sealed lowers, runs an OCI
+container, then unmounts and finalizes the writable top. It is independent of the
+sandbox daemon and does not require `--socket`.
+
+```bash
+ratarmount sandbox run --base source.tar.zst --lower prepared \
+  --top attempt --image busybox --network none \
+  --readonly 'tests/**' --allow 'tests/agent/**' --quota 1G \
+  --timeout 120 --journal --seal --pack attempt.tar.zst --json \
+  -- sh -c 'printf "hello\n" > result.txt'
+```
+
+Repeat `--lower`, `--readonly`, `--allow`, and `--env K=V` for multiple values.
+The default container working directory and bind destination are `/repo`; change
+both with `--bind /path`. `--cpus N` and `--memory SIZE` are passed to the runtime.
+`--network` accepts `none` (default), `bridge`, or `host`. The command runs as the
+calling user's UID/GID. Docker is preferred, then Podman, unless `--runtime`
+selects one. `RATARMOUNT_SANDBOX_RUNTIME=/absolute/path/to/executable` overrides
+that selection, including for the in-tree test stub. The runtime must use the
+local host's mount namespace; a remote Docker daemon cannot bind this mount.
+Non-root FUSE mounts require `user_allow_other` in `/etc/fuse.conf`; the command
+checks this before mounting and reports the existing actionable diagnostic.
+
+Stdout contains exactly one JSON object. Container stdout/stderr goes to stderr;
+`--json` suppresses harness progress messages. The report contains `exit_code`,
+`timed_out`, `interrupted`, `wall_time_s`, `patch_hash`, `manifest_path`,
+`journal_summary`, `overlay`, `bundle`, `erofs_denied`, `bytes_written`, and
+`fsck_result`. `patch_hash` has the same fields as `diff --hash --json`, using
+strict normalization, SHA-256, and no excludes. `bytes_written` is the final
+logical overlay payload size, not cumulative I/O. `erofs_denied` comes from the
+mount's control status before unmount. Manifest and journal artifacts live next
+to the top: `<top>.manifest.jsonl`, `<top>.journal.jsonl`, and
+`<top>.journal.summary.json`. The summary report contains its path and counts of
+files read, read then written, and written blind. Without `--journal`, it is null;
+without `--pack`, `bundle` is null.
+
+The harness returns status **0** when the pipeline completes, even if the command
+fails. Inspect `exit_code` for the command result. A timeout kills the container
+and reports 124 with `timed_out: true`. SIGINT/SIGTERM kills the container,
+unmounts, and finalizes the overlay with `interrupted: true` and exit code
+128 + signal. Harness failures return **2** with a JSON error object. A mount
+that fails to become ready within 60 seconds reports captured child diagnostics.
+Unmount and child termination waits are bounded. After all overlay writers exit,
+the command runs `fsck --repair`, optionally seals, optionally packs, and writes
+the hash and manifest. `--pack` implies `--seal`.
+
+`--tmpfs` uses the same private, verified tmpfs allocator as `--overlay-tmpfs`
+(`/dev/shm`, falling back to `$XDG_RUNTIME_DIR` on Linux). It requires an absent
+or empty `--top`. After unmount, the harness copies the RAM overlay, including
+its database, file modes, and symlinks, into `--top`, then removes the RAM copy.
+This preserves the data for fsck/seal/pack; the child does not use the automatic
+throwaway-directory cleanup of a standalone `--overlay-tmpfs` mount. A machine
+reboot loses an unfinished RAM overlay.
+
+Crash recovery uses `<TOP>/../.<topname>.ratarmount-run.pid`, outside the layer.
+The JSON records the supervisor PID and process start time, mount child, runtime
+client, mountpoint, runtime executable, container name, and optional RAM directory.
+On Linux, child processes also receive a kernel parent-death signal, closing the
+window between spawning a child and recording its PID. A sibling `.lock`
+file remains as a stable advisory-lock inode to serialize runs on the same top.
+After SIGKILL, a subsequent run stops the recorded container, detaches the stale
+mount, stops the recorded mount child if its process identity still matches,
+waits for the database lock to clear, and recovers a RAM copy if present. Failed
+cleanup retains the record for retry. Recovery requires the recorded runtime to
+remain executable. Reusing a sealed top requires explicitly unsealing it first;
+for independent episodes, choose a fresh top over the same sealed lower.
+
+Tests use `test-harness/sandbox-run/runtime.sh`, a Bash runtime stand-in that
+executes commands inside the bind path with a separate process group. Run
+`cargo test -p ratarmount --test sandbox_run` on a host with FUSE and
+`user_allow_other`. Set `RATARMOUNT_TEST_DOCKER=1` to also exercise a real local
+Docker daemon with the `busybox` image.
+## Branching an episode
+
+A harness can fork an attempt at
+turn *k* by stopping writers, unmounting, and sealing that attempt. Then each
+branch gets its own writable top over the same ordered lower stack:
+
+```sh
+fusermount3 -u attempt-mnt
+ratarmount overlay fsck attempt-k --repair
+ratarmount overlay seal attempt-k
+ratarmount --lower prepared --lower attempt-k -w branch-a source.tar branch-a-mnt/
+ratarmount --lower prepared --lower attempt-k -w branch-b source.tar branch-b-mnt/
+```
+
+The prepared layer must also be sealed. Branches share the saved filesystem
+state and copy up only what they modify. Shell state, processes, and runtime
+isolation remain the harness's responsibility.
+
+## Kernel overlayfs interop
+
+`ratarmount overlay import-upperdir` converts a stopped kernel overlayfs
+upperdir into a ratarmount overlay. Pass the same base and sealed lower layers
+that supplied the kernel's lowerdir, in the same bottom-to-top order:
+
+```bash
+ratarmount overlay import-upperdir --lower prepared upperdir attempt base.tar.zst
+ratarmount diff --manifest attempt
+```
+
+The destination must be new or empty. Import seals it by default and prints
+its layer digest; `--no-seal` leaves it writable. Success exits 0, errors exit 2.
+The importer shares patch import's base opening, Git revision pinning, lower
+stack composition and overlay creation metadata. It reads files in bounded
+chunks, preserves modes, mtimes and symlink targets, and never traverses a
+symlink entry. Stop writers and unmount the kernel overlay before importing;
+if copying its upperdir, preserve xattrs and whiteouts.
+
+Character devices with device number 0:0 and `.wh.NAME` markers become
+tombstones. The importer also accepts regular-file whiteouts carrying
+`user.overlay.whiteout` or `trusted.overlay.whiteout`. A directory with
+`trusted.overlay.opaque=y`, `user.overlay.opaque=y`, or a `.wh..wh..opq` marker
+hides lower children absent from its upper tree, including descendants under
+retained upper directories. Marker files are not exposed in the imported view.
+Redirect and metacopy xattrs cause an error: use `redirect_dir=off,metacopy=off`
+when creating the kernel overlay. Other special files and non-UTF-8 names or
+symlink targets are refused. Ownership, hardlink relationships and arbitrary
+xattrs are not imported.
+
+The intended forker layout mounts a read-only ratarmount stack outside the user
+namespace, then uses that mountpoint as overlayfs's `lowerdir` inside
+`unshare -Urm`. Both `upperdir` and `workdir` live on one tmpfs. The opt-in test
+uses these mount options:
+
+```text
+lowerdir=MNT,upperdir=TMPFS/up,workdir=TMPFS/work,userxattr,index=off,xino=off,redirect_dir=off,metacopy=off
+```
+
+It uses the same mapped user for the FUSE mount and namespace, without
+`allow_other` by default. Set `RATARMOUNT_OVERLAYFS_ALLOW_OTHER=1` to probe
+`-o allow_other` when the host's FUSE policy permits it. FUSE lowerdir support
+depends on the host kernel and filesystem behavior, including directory entry
+types; `index` and `xino` are disabled in the baseline probe. No claim is made
+that those options are required on every kernel.
+
+**Result (2026-10-17, Linux 7.2.5, x86_64, unprivileged):** the layout works.
+Kernel overlayfs accepted the read-only ratarmount FUSE mount as `lowerdir`
+inside `unshare -Urm` with the options above; `make` and its check ran in the
+merged view; the native upperdir and its portable copy imported to the same
+layer digest; and both imports' `diff --manifest` rows and composed views
+matched the kernel's merged view exactly. ratarmount can therefore sit under
+an existing overlayfs-based forker as its environment library.
+
+Run the probe on a host with `/dev/fuse`, `fusermount3`, `unshare`, `mount`,
+`umount`, Python 3 and make:
+
+```bash
+RATARMOUNT_TEST_OVERLAYFS=1 cargo test -p ratarmount --test overlayfs_interop -- --nocapture
+```
+
+The test runs a small make/check workload, deletes lower files, replaces an
+opaque directory, changes entry types, and imports both the native upperdir
+and a portable copy. Its copy preserves xattrs and converts device whiteouts
+to `.wh.` markers so copying needs no `mknod` privilege. Independent snapshots
+of the kernel's lower and merged trees validate `diff --manifest` paths,
+types, modes and hashes; the complete composed imported views are also compared
+to the merged snapshot. Missing tools, disabled namespaces, or a rejected
+overlayfs mount print a skip reason, including kernel/options for mount errors.
+Build, import and comparison errors after a successful mount fail the test.
+
+Always-on tests cover marker whiteouts, recursive opacity, metadata and type
+changes without mounting anything.
+
+## Executables and file metadata
+
+Writable FUSE mounts honor chmod and access/modification time updates, including
+“now” and omitted timestamps. New files and directories use the requested mode
+masked by the FUSE request's umask; the daemon's umask is not applied a second
+time. Archive members with execute bits and executables built inside the overlay
+can run normally. Mounts default to `exec`; an explicit `-o noexec` still wins.
+A configured `-o umask=...` continues to mask the attributes exposed to clients.
+
+Changing an archive member's mode or times records metadata without copying its
+payload into the overlay. Reads still come from the archive. The changes survive
+reopening the overlay, and a later data write preserves the mode during copy-up.
+TAR and compressed-TAR commit preserve executable bits and modification times;
+the current TAR writer stores whole-second mtime and does not store atime.
+Metadata-only commit uses the same temporary payload staging as provenance
+xattrs and is limited to the TAR commit formats. Offline `ratarmount diff`
+includes metadata-only mode changes without requiring a payload copy-up.
+Time-only changes do not enter its change set.
+
+NFSv3/v4 SETATTR, 9P Tsetattr and SFTP SETSTAT also apply mode and time changes.
+SFTP OPEN honors requested creation permissions. The current NFSv3 server dependency
+does not forward MKDIR attributes to the filesystem adapter, so newly created
+NFSv3 directories initially use mode 0755; SETATTR can change it afterwards.
+Ownership changes are refused
+with `EPERM` (the corresponding permission status for SFTP); they neither chown
+host files nor invent stored owners. Use `-o uid=...,gid=...` for presentation
+mapping. chmod on a symlink itself is unsupported. SMB Basic Information has no
+Unix mode field; unsupported SET_INFO classes continue to return an error.
+
+## overlay-stats
+
+```sh
+ratarmount overlay-stats attempt-overlay
+ratarmount overlay-stats attempt-overlay --json
+```
+
+This offline command opens the existing overlay database read-only and scans
+the directory without mounting or creating a database. Stop the mount first
+for a consistent view: host content and SQLite are separate snapshots. Missing,
+malformed, or exclusively locked databases produce an error.
+
+Stable JSON keys (integer counts):
+
+| Key | Meaning |
+| --- | --- |
+| `bytes_in_overlay` | Logical bytes in regular files and symlink targets |
+| `files_present` | Regular files present, combining additions and modifications |
+| `files_deleted` | Durable tombstone rows, including removed directories |
+| `directories_created` | Host directories in the overlay, including implicit COW parents |
+| `symlinks` | Symlinks present, including dangling symlinks |
+
+Database files, SQLite sidecars, staging files using the internal database
+prefix, and current/legacy overlay markers are omitted at every depth.
+Statistics do not require or compare against the original archive; additions
+and modifications are consequently reported together.
+
 ## Ownership and container mounts
 
 `-o uid=12345,gid=23456,umask=027` overrides reported Unix ownership and
@@ -692,6 +1207,27 @@ remain an error in synthetic mode. A write overlay wraps the complete union.
 See the [rootfs recipe](recipes/sandbox-rootfs.md) for bubblewrap,
 systemd-nspawn, and microVM exports. This assembles filesystem content; the
 sandbox runtime supplies process isolation.
+
+## Limits and portability
+
+Overlay paths use SQLite TEXT and `MountSource` string APIs. Names must be
+UTF-8: FUSE mutations reject invalid names with EILSEQ and lookups return
+ENOENT. Latin-1 file **content** is supported. JSON's `path_b64` / `target_b64`
+encoding is tested with synthetic byte paths, but arbitrary byte filenames are
+not supported end to end. Import also requires UTF-8 symlink targets.
+
+Legacy overlays remain mountable and diffable, with `legacy: true` and no
+retroactive base identity. Use an explicit base when metadata cannot supply it;
+unsealed legacy lowers require `--allow-unsealed-lower`. A seal is an integrity
+check, not a security boundary against the layer's owner or root. It covers
+canonical content and modes, not timestamps, ownership or arbitrary xattrs.
+
+Linux and arm64 Linux binaries are packaged. Offline subcommands also build
+on macOS through the existing macFUSE build; the binary still depends on FUSE
+libraries even for offline work. An optional FUSE-free build is not implemented.
+The supervisor, verified tmpfs allocator, and kernel overlayfs recipe are
+Linux-specific; see [macOS notes](macos.md) for mount requirements. A single
+daemon serving many mounts (`serve-sandboxes`) remains a design proposal.
 
 ## Sandbox supervisor API
 
@@ -902,410 +1438,3 @@ by `list`. `SandboxError.code` exposes the structured error code. Transport
 errors raise `OSError`/`TimeoutError`; no mutations are retried automatically.
 The default client I/O timeout is 3600 seconds, configurable on construction.
 See the [SWE-bench recipe](recipes/swe-bench-sandboxes.md).
-
-## Journal
-
-`--journal FILE` appends a JSONL operation journal on FUSE mounts, with or without
-`-w`. Put the file outside both the mountpoint and write-overlay directory;
-existing symlink aliases into either are rejected. A writable overlay records
-the resolved path in its `journal_path` metadata. This operation journal is
-separate from the archive append-commit journal.
-
-```sh
-ratarmount -w attempt --journal attempt.jsonl \
-  --journal-exclude '.git/**' --journal-exclude 'blib/**' source.tar mnt
-ratarmount journal mark mnt 'turn 1'
-ratarmount journal summarize attempt.jsonl --json
-ratarmount journal summarize attempt.jsonl --since-mark 'turn 1' --until-mark 'turn 2'
-```
-
-Each mount appends a version-1 header containing `mount`, `base_digest`,
-`stack_digest`, `overlay`, UTC RFC 3339 `t0`, and `clock: "monotonic_ns"`.
-Subsequent `ts` values are monotonic nanoseconds since that header. Paths are
-mount-relative, without a leading slash; the root is `""`. JSON writers use
-`path_b64` for invalid UTF-8 bytes, although the FUSE frontend currently rejects
-such names. `open` includes access flags (`r`, `w`, `rw`), the request's `pid`,
-`uid`, `gid`, best-effort Linux `/proc/PID/comm`, and `layer` (`base`, `lower:N`,
-or `top`). The process-name cache is bounded to 1024 PIDs.
-
-Successful creates, mkdirs, unlinks, rmdirs, renames (with `to`), symlinks,
-truncates, and chmods are recorded as they happen. The first successful readdir
-on each directory handle records its child-entry count (excluding `.` and
-`..`). Lookups and getattr/stat are omitted. Failed mutations returning
-`EROFS`, `EDQUOT`, or `ENOSPC` produce `denied` records with the attempted `what`
-and numeric `errno`; rule observers and callback errors are deduplicated.
-Denials from non-FUSE callers of the same rule observer have PID/UID/GID zero.
-
-Reads and writes aggregate per open handle and emit on RELEASE, or at unmount
-for outstanding handles. `bytes` counts bytes actually returned or written,
-including repeated accesses; `count` counts successful I/O requests, including EOF. `ranges`
-merges adjacent and overlapping `[offset, length]` pairs. At most 64 ranges are
-retained; additional disjoint ranges set `ranges_truncated: true` while byte
-counts remain complete. `--journal-reads first` retains only the first non-empty
-read range per handle; byte and request counts still include all reads. The
-default is `--journal-reads all`. `first_ts` preserves the first successful I/O timestamp
-when handles release out of order. Reads/writes retain the opened path and
-layer even after rename or unlink.
-
-`--journal-exclude GLOB` is repeatable and accepts the same comma-separated,
-root-anchored patterns as `--overlay-readonly`. It omits matching paths and
-renames with a matching endpoint. Status counters still include excluded
-activity. Marks are never excluded.
-
-The writer uses a bounded 1024-record queue and flushes buffered output at least
-every 100 ms while processing. A full queue blocks request processing until
-space is available; records are not dropped to relieve pressure. Unmount joins
-the writer and flushes pending records; `--journal-sync` also fsyncs the file.
-Write failures appear in the daemon log and `.stats`'s `journal_error`; mark
-requests then fail with EIO and unmount reports the failure. Abrupt termination
-can lose buffered records. Summaries tolerate an incomplete final record and
-an incomplete record immediately before a subsequent mount header.
-
-`summarize` streams the input, keeping a per-path table and mark-to-path sets.
-It reports first read/write timestamps, bytes, read request counts, layer and
-process-name set; lists `files_read`, `files_read_then_written`, and
-`files_written_blind`; and groups `reads_by_mark` by label. The leading `""`
-bucket contains reads released before the first mark. Repeated labels combine
-into one bucket. `--since-mark` starts after the first matching mark;
-`--until-mark` stops before the first match after the start. Missing labels are
-errors. Because read records emit at RELEASE, a handle spanning marks is
-assigned to its release bucket; close file handles before marking a turn when
-exact turn attribution matters. Byte-path fallback keys appear as
-`path_b64:BASE64` in the summary. Both `journal` commands exit 0 on success and
-2 on argument, input, or I/O errors.
-
-The journal describes operations reaching FUSE. Kernel page-cache hits, mmap
-accesses and accesses through other export protocols do not produce read
-callbacks. Passthrough is disabled when journaling. Mounts without `-w` permit root control requests at the kernel boundary; file
-mutations still return EROFS in the frontend. These mounts consequently report
-a writable kernel mount flag even though their data is read-only. Explicit
-`-o ro` also prevents control writes (the kernel returns EROFS before the root
-control handler, including when journaling is off).
-
-Run `RATARMOUNT=target/release/ratarmount benchmarks/journal-overhead.sh` on a
-machine with `/dev/fuse`, Python 3, `fusermount3`, `make`, and a C compiler. It
-alternates fresh overlay mounts with and without journaling, runs three
-build/test loops per sample, and prints median workload overhead. `RUNS`
-(default 6) and `JOBS` (default 4) tune the run. The under-3% target is not a CI
-gate; absent tools yield an explicit skip (exit 77).
-
-## Control and status xattrs
-
-The mount root exposes these synthetic read attributes, including on mounts
-without a write overlay:
-
-| Xattr | Value |
-| --- | --- |
-| `user.ratarmount.base_digest` | Recorded base identity, or empty string |
-| `user.ratarmount.stack_digest` | Recorded stack identity, or empty string |
-| `user.ratarmount.sealed` | `1` when the supplied metadata is sealed, otherwise `0` |
-| `user.ratarmount.layers` | JSON `lower_layers`, or `[]` without metadata |
-| `user.ratarmount.journal` | Resolved active journal path, or empty string |
-| `user.ratarmount.stats` | JSON counters described below |
-
-`stats` contains `bytes_read`, `bytes_written`, `files_touched` (distinct paths
-observed), `overlay_bytes` (quota usage, or null without a quota policy), `ops`
-(counts by journal operation), `erofs_denied`, and `journal_error` (null or an
-error string). Byte counters update during I/O; aggregated read/write operation
-counts update on RELEASE. All counters are for this mount's lifetime.
-
-Set `user.ratarmount.mark` on the root to append a UTF-8 label of at most 4096
-bytes. `ratarmount journal mark MOUNT LABEL` performs this same xattr call.
-Invalid labels return EINVAL. Without `--journal`, marks return ENOTSUP on a
-writable mount and EROFS on a read-only one (a read-only mount without
-`--journal` stays kernel `ro`). Other
-`user.ratarmount.*` root writes and removals return EPERM. These controls are
-intercepted before the overlay's xattr implementation. The existing
-`user.ratarmount.git.commit` read attribute continues to come from the source.
-
-```sh
-getfattr -n user.ratarmount.stats mnt
-getfattr -n user.ratarmount.base_digest mnt
-python3 -c 'import os; os.setxattr("mnt", "user.ratarmount.mark", b"turn 2")'
-```
-
-## Bundles
-
-Pack a sealed overlay into one portable, seekable `.tar.zst` archive:
-
-```bash
-ratarmount overlay seal attempt
-ratarmount overlay pack attempt attempt.tar.zst \
-  --include-journal attempt-journal.jsonl --include-index
-ratarmount overlay unpack attempt.tar.zst restored
-ratarmount overlay verify restored
-```
-
-`pack DIR BUNDLE [--lower LAYER …] [BASE]` uses the recorded base URL and lower
-layers unless overridden. It refuses unsealed overlays and existing output
-files, publishes the completed bundle atomically, and prints `layer_digest`.
-Packing the same layer with the same optional inputs produces identical bytes.
-Paths are sorted, archive uid/gid are zero, and layer modes, mtimes and symlink
-targets are preserved. File content is streamed; symlinks are never followed.
-In-use markers and COW/spool temporary files are excluded.
-
-The ordinary TAR layout is:
-
-```text
-layer/                         # overlay content and directories
-layer/.ratarmount.overlay.sqlite
-layer/.ratarmount-sealed
-manifest.jsonl                 # exact changes against the composed stack
-meta.json                      # all overlay meta keys, as JSON string values
-journal.jsonl                  # with --include-journal FILE
-journal-summary.json           # journal summarize output
-index/BASE.index.sqlite        # with --include-index, if an adjacent sidecar exists
-```
-
-The index is the local base archive's adjacent `BASE.index.sqlite` sidecar;
-remote and directory bases do not contribute an index. Unpacking restores only
-`layer/`. To use a shipped index on another machine, copy it beside the matching
-base archive under its original sidecar name. A bundle carries layer changes,
-not the base archive or its lower layers.
-
-`unpack BUNDLE DIR` accepts a nonexistent or empty directory, restores sealed
-read-only permissions, checks that the database opens read-only and immutable,
-and compares the seal sentinel with the recorded digest. It also recomputes the
-seal against the recorded stack when that base and its lowers are reachable.
-When they are absent it reports that only the database and sentinel were
-checked; run `overlay verify` after restoring the stack to validate content.
-Exit codes are 0 for a match, 1 for a digest/content mismatch, and 2 for invalid
-input or an operational error. Unsafe archive paths, duplicate entries,
-hardlinks, device entries and writes through symlink components are refused.
-Extraction uses a private staging directory and publishes the result by rename.
-
-A bundle can be mounted directly as an ordinary archive, or used as a lower:
-
-```bash
-ratarmount attempt.tar.zst inspect-mnt
-# inspect-mnt contains layer/, manifest.jsonl and meta.json
-ratarmount --lower attempt.tar.zst -w next-attempt base.tar.zst work-mnt
-```
-
-For `--lower`, the metadata is read through the archive session API, then the
-layer is unpacked once into
-`$XDG_CACHE_HOME/ratarmount/layers/<layer_digest without sha256:>` (default:
-`~/.cache/ratarmount/layers/`). Publication is atomic. Later mounts reuse the
-cached sealed directory after checking its immutable database and sentinel;
-a damaged cache entry is refused. Directory lowers continue to work normally.
-
-## Kernel overlayfs interop
-
-`ratarmount overlay import-upperdir` converts a stopped kernel overlayfs
-upperdir into a ratarmount overlay. Pass the same base and sealed lower layers
-that supplied the kernel's lowerdir, in the same bottom-to-top order:
-
-```bash
-ratarmount overlay import-upperdir --lower prepared upperdir attempt base.tar.zst
-ratarmount diff --manifest attempt
-```
-
-The destination must be new or empty. Import seals it by default and prints
-its layer digest; `--no-seal` leaves it writable. Success exits 0, errors exit 2.
-The importer shares patch import's base opening, Git revision pinning, lower
-stack composition and overlay creation metadata. It reads files in bounded
-chunks, preserves modes, mtimes and symlink targets, and never traverses a
-symlink entry. Stop writers and unmount the kernel overlay before importing;
-if copying its upperdir, preserve xattrs and whiteouts.
-
-Character devices with device number 0:0 and `.wh.NAME` markers become
-tombstones. The importer also accepts regular-file whiteouts carrying
-`user.overlay.whiteout` or `trusted.overlay.whiteout`. A directory with
-`trusted.overlay.opaque=y`, `user.overlay.opaque=y`, or a `.wh..wh..opq` marker
-hides lower children absent from its upper tree, including descendants under
-retained upper directories. Marker files are not exposed in the imported view.
-Redirect and metacopy xattrs cause an error: use `redirect_dir=off,metacopy=off`
-when creating the kernel overlay. Other special files and non-UTF-8 names or
-symlink targets are refused. Ownership, hardlink relationships and arbitrary
-xattrs are not imported.
-
-The intended forker layout mounts a read-only ratarmount stack outside the user
-namespace, then uses that mountpoint as overlayfs's `lowerdir` inside
-`unshare -Urm`. Both `upperdir` and `workdir` live on one tmpfs. The opt-in test
-uses these mount options:
-
-```text
-lowerdir=MNT,upperdir=TMPFS/up,workdir=TMPFS/work,userxattr,index=off,xino=off,redirect_dir=off,metacopy=off
-```
-
-It uses the same mapped user for the FUSE mount and namespace, without
-`allow_other` by default. Set `RATARMOUNT_OVERLAYFS_ALLOW_OTHER=1` to probe
-`-o allow_other` when the host's FUSE policy permits it. FUSE lowerdir support
-depends on the host kernel and filesystem behavior, including directory entry
-types; `index` and `xino` are disabled in the baseline probe. No claim is made
-that those options are required on every kernel.
-
-**Result (2026-10-17, Linux 7.2.5, x86_64, unprivileged):** the layout works.
-Kernel overlayfs accepted the read-only ratarmount FUSE mount as `lowerdir`
-inside `unshare -Urm` with the options above; `make` and its check ran in the
-merged view; the native upperdir and its portable copy imported to the same
-layer digest; and both imports' `diff --manifest` rows and composed views
-matched the kernel's merged view exactly. ratarmount can therefore sit under
-an existing overlayfs-based forker as its environment library.
-
-Run the probe on a host with `/dev/fuse`, `fusermount3`, `unshare`, `mount`,
-`umount`, Python 3 and make:
-
-```bash
-RATARMOUNT_TEST_OVERLAYFS=1 cargo test -p ratarmount --test overlayfs_interop -- --nocapture
-```
-
-The test runs a small make/check workload, deletes lower files, replaces an
-opaque directory, changes entry types, and imports both the native upperdir
-and a portable copy. Its copy preserves xattrs and converts device whiteouts
-to `.wh.` markers so copying needs no `mknod` privilege. Independent snapshots
-of the kernel's lower and merged trees validate `diff --manifest` paths,
-types, modes and hashes; the complete composed imported views are also compared
-to the merged snapshot. Missing tools, disabled namespaces, or a rejected
-overlayfs mount print a skip reason, including kernel/options for mount errors.
-Build, import and comparison errors after a successful mount fail the test.
-
-Local sandbox probe (2026-10-17): `unshare -Urm true` succeeded, but `/dev/fuse`
-is absent. The real FUSE-lowerdir/overlayfs run therefore remains unverified
-here; no kernel compatibility result is inferred from the offline tests.
-The orchestrator must run the opt-in test to establish the host's outcome.
-Always-on tests cover marker whiteouts, recursive opacity, metadata and type
-changes without mounting anything.
-
-## Overlay import
-
-`ratarmount overlay import` builds a new write overlay from a unified or Git
-patch against a base and optional lower overlays. It uses the same write APIs
-and creation metadata as a mounted write session; no mount or external patch
-program is needed.
-
-```sh
-ratarmount diff attempt base.tar.zst --git -o attempt.patch
-ratarmount overlay import --mtime 1700000000 attempt.patch replay base.tar.zst
-cat attempt.patch | ratarmount overlay import --lower prepared - replay2 base.tar.zst
-ratarmount diff replay base.tar.zst --hash --normalize exact
-```
-
-The destination must not exist or must be an empty directory. `--lower DIR` is
-repeatable, bottom to top; unsealed lower layers require
-`--allow-unsealed-lower`. The base positional accepts the same local archive,
-folder, committed Git source and remote source forms as other offline overlay
-commands. Import pins Git references before opening the source and records the
-base identity and lower-layer stack identity.
-
-Accepted patches include `git diff --binary` literal sections (Git base85 plus
-zlib), additions, deletions, executable mode changes, symlinks, rename/copy
-headers and ordinary unified hunks. Rename means copy the preimage to the new
-name, apply its hunks, then delete the old name. Copy keeps the old name.
-Reverse binary literals are validated and ignored. Binary delta sections and
-`Binary files … differ` without content are errors naming the affected file;
-regenerate these as literal patches, for example with `ratarmount diff --git`.
-Index object IDs are accepted without verification.
-
-Hunks require exact context bytes. Their location may move; context is never
-trimmed to force a match. CRLF, Latin-1 file content and missing final newlines
-are preserved. Git C-quoted names are decoded, and header paths have one
-leading component removed (`-p1`); plain `diff -u` headers may include a tab
-followed by a timestamp. Both old and new names are validated. Absolute paths,
-NUL, empty, `.` or `..` components, reserved overlay bookkeeping names, and
-symlink parents in either the lower view or the new overlay are refused.
-Symlink targets are stored as link data, never followed. Paths and symlink
-targets must be UTF-8 because the workspace's mount and overlay APIs use
-strings; non-UTF-8 names are refused, rather than changed silently.
-
-If a hunk fails, the default is to abort and remove the partial overlay.
-`--reject` keeps that file's original lower content and writes only its failed
-hunks to `PATH.rej`, while applying other files. Later sections for an already
-rejected file cannot replace its original content. Import exits 0 on success, 1 when hunks
-were rejected with `--reject`, and 2 on invalid input or I/O errors. A preexisting
-nonempty destination is left intact.
-
-`--mtime now` is the default. An explicit epoch timestamp (including fractional
-or negative seconds) is applied after content writes to files, symlinks and
-reject files. It does not alter tombstones. Import seals by default after
-closing the writer and prints the layer digest. `--no-seal` leaves the overlay
-writable. `--json` prints `{ "overlay": "…", "files": N, "rejected": N,
-"layer_digest": "…" }`; the digest is null with `--no-seal`. `files` counts
-successfully applied distinct paths (both sides of renames), excluding reject
-files and rejected originals.
-
-`--max-patch-bytes N` defaults to 268435456 (256 MiB). It bounds input bytes,
-the total retained decoded literals, each reverse literal, and each file's
-preimage/postimage. Import buffers the bounded patch and one file's text at a
-time; increase the limit explicitly for larger patches.
-
-Git/unified patches cannot represent empty directories, directory metadata or
-extended attributes. Empty directories therefore do not round-trip, and Git
-patches project regular-file permissions to 0644/0755. Exact canonical hashes
-round-trip for representable changes with those modes; use manifests or packed
-overlays when the full directory/mode/xattr state is needed.
-
-## `sandbox run`: one command in a container
-
-`ratarmount sandbox run` mounts a base and optional sealed lowers, runs an OCI
-container, then unmounts and finalizes the writable top. It is independent of the
-sandbox daemon and does not require `--socket`.
-
-```bash
-ratarmount sandbox run --base source.tar.zst --lower prepared \
-  --top attempt --image busybox --network none \
-  --readonly 'tests/**' --allow 'tests/agent/**' --quota 1G \
-  --timeout 120 --journal --seal --pack attempt.tar.zst --json \
-  -- sh -c 'printf "hello\n" > result.txt'
-```
-
-Repeat `--lower`, `--readonly`, `--allow`, and `--env K=V` for multiple values.
-The default container working directory and bind destination are `/repo`; change
-both with `--bind /path`. `--cpus N` and `--memory SIZE` are passed to the runtime.
-`--network` accepts `none` (default), `bridge`, or `host`. The command runs as the
-calling user's UID/GID. Docker is preferred, then Podman, unless `--runtime`
-selects one. `RATARMOUNT_SANDBOX_RUNTIME=/absolute/path/to/executable` overrides
-that selection, including for the in-tree test stub. The runtime must use the
-local host's mount namespace; a remote Docker daemon cannot bind this mount.
-Non-root FUSE mounts require `user_allow_other` in `/etc/fuse.conf`; the command
-checks this before mounting and reports the existing actionable diagnostic.
-
-Stdout contains exactly one JSON object. Container stdout/stderr goes to stderr;
-`--json` suppresses harness progress messages. The report contains `exit_code`,
-`timed_out`, `interrupted`, `wall_time_s`, `patch_hash`, `manifest_path`,
-`journal_summary`, `overlay`, `bundle`, `erofs_denied`, `bytes_written`, and
-`fsck_result`. `patch_hash` has the same fields as `diff --hash --json`, using
-strict normalization, SHA-256, and no excludes. `bytes_written` is the final
-logical overlay payload size, not cumulative I/O. `erofs_denied` comes from the
-mount's control status before unmount. Manifest and journal artifacts live next
-to the top: `<top>.manifest.jsonl`, `<top>.journal.jsonl`, and
-`<top>.journal.summary.json`. The summary report contains its path and counts of
-files read, read then written, and written blind. Without `--journal`, it is null;
-without `--pack`, `bundle` is null.
-
-The harness returns status **0** when the pipeline completes, even if the command
-fails. Inspect `exit_code` for the command result. A timeout kills the container
-and reports 124 with `timed_out: true`. SIGINT/SIGTERM kills the container,
-unmounts, and finalizes the overlay with `interrupted: true` and exit code
-128 + signal. Harness failures return **2** with a JSON error object. A mount
-that fails to become ready within 60 seconds reports captured child diagnostics.
-Unmount and child termination waits are bounded. After all overlay writers exit,
-the command runs `fsck --repair`, optionally seals, optionally packs, and writes
-the hash and manifest. `--pack` implies `--seal`.
-
-`--tmpfs` uses the same private, verified tmpfs allocator as `--overlay-tmpfs`
-(`/dev/shm`, falling back to `$XDG_RUNTIME_DIR` on Linux). It requires an absent
-or empty `--top`. After unmount, the harness copies the RAM overlay, including
-its database, file modes, and symlinks, into `--top`, then removes the RAM copy.
-This preserves the data for fsck/seal/pack; the child does not use the automatic
-throwaway-directory cleanup of a standalone `--overlay-tmpfs` mount. A machine
-reboot loses an unfinished RAM overlay.
-
-Crash recovery uses `<TOP>/../.<topname>.ratarmount-run.pid`, outside the layer.
-The JSON records the supervisor PID and process start time, mount child, runtime
-client, mountpoint, runtime executable, container name, and optional RAM directory.
-On Linux, child processes also receive a kernel parent-death signal, closing the
-window between spawning a child and recording its PID. A sibling `.lock`
-file remains as a stable advisory-lock inode to serialize runs on the same top.
-After SIGKILL, a subsequent run stops the recorded container, detaches the stale
-mount, stops the recorded mount child if its process identity still matches,
-waits for the database lock to clear, and recovers a RAM copy if present. Failed
-cleanup retains the record for retry. Recovery requires the recorded runtime to
-remain executable. Reusing a sealed top requires explicitly unsealing it first;
-for independent episodes, choose a fresh top over the same sealed lower.
-
-Tests use `test-harness/sandbox-run/runtime.sh`, a Bash runtime stand-in that
-executes commands inside the bind path with a separate process group. Run
-`cargo test -p ratarmount --test sandbox_run` on a host with FUSE and
-`user_allow_other`. Set `RATARMOUNT_TEST_DOCKER=1` to also exercise a real local
-Docker daemon with the `busybox` image.
