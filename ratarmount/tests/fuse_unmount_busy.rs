@@ -255,6 +255,8 @@ impl Drop for Daemon {
         if matches!(self.child.try_wait(), Ok(Some(_))) && !mount_visible(&self.mnt) {
             return;
         }
+        // Failure-path cleanup only: the tests themselves never unmount lazily
+        // (`assert_no_lazy`). This just keeps a failed test from leaking a mount.
         let _ = Command::new("fusermount3")
             .args(["-u", "-z"])
             .arg(&self.mnt)
@@ -262,9 +264,18 @@ impl Drop for Daemon {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        let _ = nix::sys::signal::kill(Pid::from_raw(self.pid()), Signal::SIGKILL);
+        kill_unreaped(&mut self.child);
         let _ = self.child.wait();
     }
+}
+
+/// SIGKILL `child` only while it is still unreaped. Once reaped its pid may belong
+/// to an unrelated process, so it must never be signalled. Returns whether it signalled.
+fn kill_unreaped(child: &mut Child) -> bool {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return false;
+    }
+    child.kill().is_ok()
 }
 
 fn assert_no_lazy(log: &str, what: &str) {
@@ -395,4 +406,21 @@ fn regression_control_file_unmount_exhaustion_then_retry() {
     holder.release_after(Duration::ZERO);
     read_control_unmount(&e.mnt);
     d.assert_clean_exit("control file second read");
+}
+
+/// Regression: cleanup SIGKILLed the saved pid after the daemon was reaped (pid reuse could hit
+/// an unrelated process). A reaped child must not be signalled; a live one must be.
+#[test]
+fn regression_cleanup_never_signals_reaped_child() {
+    let mut gone = Command::new("true").spawn().expect("spawn true");
+    gone.wait().expect("reap");
+    assert!(!kill_unreaped(&mut gone), "signalled a reaped child");
+
+    let mut live = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    assert!(kill_unreaped(&mut live), "did not kill a live child");
+    let st = live.wait().expect("reap sleep");
+    assert!(!st.success());
 }
