@@ -646,9 +646,17 @@ mod tests {
             .contains("unsupported upperdir file type"));
         fs::remove_file(fifo).unwrap();
         let path = f.upper.join(OsString::from_vec(b"bad\xff".to_vec()));
-        fs::write(&path, b"data").unwrap();
-        assert!(run(&f.args()).unwrap_err().contains("EILSEQ"));
-        fs::remove_file(path).unwrap();
+        match fs::write(&path, b"data") {
+            Ok(()) => {
+                assert!(run(&f.args()).unwrap_err().contains("EILSEQ"));
+                fs::remove_file(path).unwrap();
+            }
+            // APFS refuses non-UTF-8 names itself; symlink targets still work.
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+                eprintln!("skip: filesystem rejects non-UTF-8 file names");
+            }
+            Err(e) => panic!("{e}"),
+        }
         symlink(
             OsString::from_vec(b"target\xff".to_vec()),
             f.upper.join("link"),

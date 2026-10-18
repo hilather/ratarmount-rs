@@ -710,8 +710,11 @@ mod tests {
                 .open(dir.join("sub/file"))
                 .unwrap()
                 .set_times(
+                    // Pre-epoch, but not within (-1 s, 0): macOS reports those as
+                    // {0 s, negative ns}, which rustix 1.1's stat conversion
+                    // rejects with a panic.
                     fs::FileTimes::new().set_modified(
-                        std::time::UNIX_EPOCH - std::time::Duration::from_millis(250),
+                        std::time::UNIX_EPOCH - std::time::Duration::from_millis(1250),
                     ),
                 )
                 .unwrap();
