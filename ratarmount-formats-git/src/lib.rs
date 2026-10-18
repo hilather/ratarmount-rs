@@ -210,11 +210,6 @@ impl GitMountSource {
         self.commit_oid
     }
 
-    /// Object ID of the selected tree (including `--git-prefix`, when applied).
-    pub fn tree_id(&self) -> String {
-        self.tree_oid.to_string()
-    }
-
     /// Cache a standalone repository and expose its files under `/.git`.
     pub fn with_synthetic_head(mut self, cache_root: &Path) -> Result<Self> {
         self.synthetic = Some(self.with_repo(|repo| {

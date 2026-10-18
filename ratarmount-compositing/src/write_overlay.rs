@@ -2864,6 +2864,12 @@ impl WriteOverlay {
         Ok(())
     }
 
+    /// Record one overlay-level `meta` key (for example `readonly_rules`).
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let db = self.db.lock().expect("overlay db");
+        crate::overlay_meta::OverlayMeta::set(&db, key, value)
+    }
+
     /// Change metadata through the same policy gate as data writes. Archive-only
     /// members retain their original read cookie and never copy payload data.
     pub fn set_metadata(&self, path: &str, attrs: &OverlayMetadata) -> Result<()> {

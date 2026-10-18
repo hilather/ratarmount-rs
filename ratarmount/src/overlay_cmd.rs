@@ -88,11 +88,25 @@ pub fn pin_git_base(
     paths: &mut [PathBuf],
     options: &mut ratarmount_core::OpenOptions,
 ) -> Result<Option<String>, String> {
-    use ratarmount_formats_git::{looks_like_git, split_inline_reference, GitMountSource};
+    use ratarmount_formats_git::{
+        looks_like_git, parse_git_url, split_inline_reference, GitMountSource,
+    };
     let [path] = paths else {
         return Ok(None);
     };
-    let inline = split_inline_reference(path);
+    // `git:///repo#rev` pins like `repo@rev`; HEAD when no fragment is given.
+    let url = parse_git_url(&path.to_string_lossy()).map_err(|e| e.to_string())?;
+    if url.is_some() {
+        options.git = true;
+    }
+    let inline = match url {
+        Some((repo, Some(rev))) => Some((repo, rev)),
+        Some((repo, None)) => {
+            *path = repo;
+            None
+        }
+        None => split_inline_reference(path),
+    };
     let git_path = inline.as_ref().map_or(path.as_path(), |(p, _)| p.as_path());
     let is_bare = git_path.join("HEAD").is_file()
         && git_path.join("objects").is_dir()

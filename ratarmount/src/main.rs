@@ -1914,19 +1914,35 @@ fn main() {
                         }
                     };
                     let mut policies: Vec<Arc<dyn OverlayPolicy>> = Vec::new();
-                    if !args.overlay_readonly.is_empty() {
+                    let rules_json = if args.overlay_readonly.is_empty() {
+                        serde_json::json!({"readonly": [], "allow": []})
+                    } else {
                         let rules = Arc::new(
                             ReadOnlyGlobs::with_allow(&args.overlay_readonly, &args.overlay_allow)
                                 .and_then(|rules| rules.with_overlay_root(ov.root()))
                                 .expect("validated read-only globs and overlay root"),
                         );
+                        let json = rules.rules_json();
                         quota = quota.with_readonly(rules.clone());
                         policies.push(rules);
+                        json
+                    };
+                    // The rules of the latest -w mount, so `overlay info` shows
+                    // what the agent was allowed to change.
+                    if let Err(e) = ov.set_meta("readonly_rules", &rules_json.to_string()) {
+                        eprintln!("error recording read-only rules in overlay metadata: {e}");
+                        std::process::exit(1);
                     }
                     let quota = Arc::new(quota);
                     policies.push(quota.clone());
                     ov.set_policy(Some(Arc::new(CompositeOverlayPolicy(policies))));
                     overlay_quota = Some(quota);
+                } else if let Err(e) = ov.set_meta(
+                    "readonly_rules",
+                    &serde_json::json!({"readonly": [], "allow": []}).to_string(),
+                ) {
+                    eprintln!("error recording read-only rules in overlay metadata: {e}");
+                    std::process::exit(1);
                 }
                 let ov = Arc::new(ov);
                 bundle.source = Arc::clone(&ov) as Arc<dyn MountSource>;
