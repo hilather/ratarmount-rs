@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::process::{Command, Output};
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use ratarmount_compositing::{FolderMountSource, OverlayCreateInfo, WriteOverlay};
 
