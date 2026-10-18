@@ -550,7 +550,7 @@ fn weak_base_digest_reopen_refusal_and_force() {
             Path::new("--hash"),
             Path::new("--json"),
         ];
-        args.extend(extra.iter().map(|a| Path::new(a)));
+        args.extend(extra.iter().map(Path::new));
         run(&args, &cache)
     };
     assert_ne!(diff_json(&[]).status.code(), Some(0));
