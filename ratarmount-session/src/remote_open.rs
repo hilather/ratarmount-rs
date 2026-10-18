@@ -113,7 +113,10 @@ fn apply_remote_index_discovery(
                     log::debug!("index sibling unusable: {}", redact_remote_url(&cand));
                 }
             }
-            Err(e) => log::debug!("archive HEAD for index discovery failed: {e}"),
+            Err(e) => log::debug!(
+                "archive HEAD for index discovery failed: {}",
+                redact_err(&e)
+            ),
         }
         return Ok(());
     }
@@ -158,7 +161,7 @@ fn apply_remote_index_discovery(
                 );
             }
             Ok(None) => {}
-            Err(e) => log::debug!("OCI referrer miss: {e}"),
+            Err(e) => log::debug!("OCI referrer miss: {}", redact_err(&e)),
         }
     }
     Ok(())
@@ -311,20 +314,15 @@ enum PointerErr {
     Invalid(String),
 }
 
+/// Same redaction as everything else that prints a remote URL: userinfo,
+/// query (`?sig=`, `X-Amz-Signature`, SAS tokens, passkeys) and fragment go.
 fn redact_remote_url(s: &str) -> String {
-    let Some((scheme, rest)) = s.split_once("://") else {
-        return s.to_string();
-    };
-    let Some(at) = rest.find('@') else {
-        return s.to_string();
-    };
-    let userinfo = &rest[..at];
-    let hostpart = &rest[at + 1..];
-    if let Some((user, _)) = userinfo.split_once(':') {
-        format!("{scheme}://{user}:***@{hostpart}")
-    } else {
-        s.to_string()
-    }
+    ratarmount_core::redact_base_url(s)
+}
+
+/// An error text that may quote a URL (reqwest and HTTP clients do).
+fn redact_err(e: &dyn std::fmt::Display) -> String {
+    ratarmount_core::redact_urls_in_text(&e.to_string())
 }
 
 fn pointer_err_is_miss(msg: &str) -> bool {
@@ -335,15 +333,33 @@ fn pointer_err_is_miss(msg: &str) -> bool {
         || l.contains("empty pointer")
 }
 
-fn log_pointer_err(url: &str, err: PointerErr) {
+/// Level (true = warn) and text of a pointer GET failure; secrets removed.
+fn pointer_err_log(url: &str, err: &PointerErr) -> (bool, String) {
     let url = redact_remote_url(url);
     match err {
-        PointerErr::Miss(e) => {
-            log::debug!("index pointer GET {url}: {e}; continue discovery");
-        }
-        PointerErr::Invalid(e) => {
-            log::warn!("index pointer GET {url}: {e}; continue discovery");
-        }
+        PointerErr::Miss(e) => (
+            false,
+            format!(
+                "index pointer GET {url}: {}; continue discovery",
+                redact_err(e)
+            ),
+        ),
+        PointerErr::Invalid(e) => (
+            true,
+            format!(
+                "index pointer GET {url}: {}; continue discovery",
+                redact_err(e)
+            ),
+        ),
+    }
+}
+
+fn log_pointer_err(url: &str, err: PointerErr) {
+    let (warn, text) = pointer_err_log(url, &err);
+    if warn {
+        log::warn!("{text}");
+    } else {
+        log::debug!("{text}");
     }
 }
 
@@ -520,14 +536,22 @@ fn try_fetch_http_index(
     let wire = match cache.get_or_fetch_path(&identity, None, || fetch_http_index_wire(index_url)) {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
+            log::debug!(
+                "index fetch {}: {}",
+                redact_remote_url(index_url),
+                redact_err(&e)
+            );
             return false;
         }
     };
     let path = match materialize_index_file(&wire) {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
+            log::debug!(
+                "index fetch {}: {}",
+                redact_remote_url(index_url),
+                redact_err(&e)
+            );
             invalidate_meta_cache_identity("http", index_url);
             if !is_meta_cache_path(&wire) {
                 let _ = std::fs::remove_file(&wire);
@@ -579,14 +603,22 @@ fn try_fetch_object_store_index(
     }) {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
+            log::debug!(
+                "index fetch {}: {}",
+                redact_remote_url(index_url),
+                redact_err(&e)
+            );
             return false;
         }
     };
     let path = match materialize_fetched_index(fetched.clone()) {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("index materialize {}: {e}", redact_remote_url(index_url));
+            log::debug!(
+                "index materialize {}: {}",
+                redact_remote_url(index_url),
+                redact_err(&e)
+            );
             invalidate_meta_cache_identity("object-store", index_url);
             return false;
         }
@@ -634,13 +666,16 @@ fn try_install_remote_index(
             return false;
         }
         Err(e) => {
-            log::debug!("remote index open failed: {e}");
+            log::debug!("remote index open failed: {}", redact_err(&e));
             drop_fetched_sidecar(&fetched);
             return false;
         }
     };
     if let Err(e) = check_tarstats_matches_remote(&stored, archive_size, prefix, suffix, full) {
-        log::warn!("remote archive fingerprint mismatch ({e}); cold index");
+        log::warn!(
+            "remote archive fingerprint mismatch ({}); cold index",
+            redact_err(&e)
+        );
         drop_fetched_sidecar(&fetched);
         return false;
     }
@@ -1555,7 +1590,11 @@ fn folder_nested_reader_fn(
             // spool owner, whose lifetime is tied to the nested mount.
             Ok(_) => fallback(reader, label, ctx),
             Err(error) => {
-                log::debug!("remote nested opener for {}: {error}", label.display());
+                log::debug!(
+                    "remote nested opener for {}: {}",
+                    label.display(),
+                    redact_err(&error)
+                );
                 fallback(reader, label, ctx)
             }
         }
@@ -3663,15 +3702,58 @@ mod tests {
         assert_eq!(fs::metadata(got).unwrap().len(), good_idx.len() as u64);
     }
 
+    /// Regression (I2): `redact_remote_url` masked only the password, so a
+    /// user name, `?sig=` / SAS / presigned query and fragment reached the logs.
     #[test]
-    fn redact_remote_url_strips_userinfo_password() {
-        assert_eq!(
-            redact_remote_url("https://user:secret@host/a.tar.index.ptr"),
-            "https://user:***@host/a.tar.index.ptr"
-        );
-        assert_eq!(
-            redact_remote_url("s3://bucket/key.index.ptr"),
-            "s3://bucket/key.index.ptr"
+    fn regression_redact_remote_url_strips_userinfo_and_query_secrets() {
+        for (input, want) in [
+            (
+                "https://user:secret@host/a.tar.index.ptr",
+                "https://host/a.tar.index.ptr",
+            ),
+            ("https://tok@host/a", "https://host/a"),
+            ("s3://bucket/key.index.ptr", "s3://bucket/key.index.ptr"),
+        ] {
+            assert_eq!(redact_remote_url(input), want);
+        }
+        for secret in [
+            "sig=SECRETSIG",
+            "signature=SECRETSIG",
+            "token=SECRETSIG",
+            "access_token=SECRETSIG",
+            "X-Amz-Signature=SECRETSIG",
+            "X-Amz-Credential=SECRETSIG",
+            "X-Goog-Signature=SECRETSIG",
+            "Signature=SECRETSIG&Policy=P&Key-Pair-Id=K",
+            "se=2030&sp=r&sv=2020&sr=b&sig=SECRETSIG",
+            "passkey=SECRETSIG",
+        ] {
+            let url = format!("https://user:pw@host.example/a.tar.index.ptr?{secret}#frag");
+            let got = redact_remote_url(&url);
+            assert_eq!(got, "https://host.example/a.tar.index.ptr", "{secret}");
+            assert!(!got.contains("SECRETSIG") && !got.contains("pw"), "{got}");
+        }
+    }
+
+    /// Regression (I2): the index-pointer WARN carried the `?sig=` URL and
+    /// an error text that quotes it.
+    #[test]
+    fn regression_pointer_warn_text_has_no_secret() {
+        let url = "https://svc:hunter2@host.example/a.tar.index.ptr?sig=SECRETSIG&se=2030";
+        let err = PointerErr::Invalid(format!(
+            "bad pointer from {url}: https://other.example/x?X-Amz-Signature=SECRETSIG"
+        ));
+        let (warn, text) = pointer_err_log(url, &err);
+        assert!(warn);
+        for secret in ["SECRETSIG", "hunter2", "svc", "2030"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(text.contains("host.example/a.tar.index.ptr"), "{text}");
+        let (warn, text) = pointer_err_log(url, &PointerErr::Miss(format!("404 for {url}")));
+        assert!(!warn);
+        assert!(
+            !text.contains("SECRETSIG") && !text.contains("hunter2"),
+            "{text}"
         );
     }
 
