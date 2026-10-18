@@ -686,3 +686,124 @@ by `list`. `SandboxError.code` exposes the structured error code. Transport
 errors raise `OSError`/`TimeoutError`; no mutations are retried automatically.
 The default client I/O timeout is 3600 seconds, configurable on construction.
 See the [SWE-bench recipe](recipes/swe-bench-sandboxes.md).
+
+## Journal
+
+`--journal FILE` appends a JSONL operation journal on FUSE mounts, with or without
+`-w`. Put the file outside both the mountpoint and write-overlay directory;
+existing symlink aliases into either are rejected. A writable overlay records
+the resolved path in its `journal_path` metadata. This operation journal is
+separate from the archive append-commit journal.
+
+```sh
+ratarmount -w attempt --journal attempt.jsonl \
+  --journal-exclude '.git/**' --journal-exclude 'blib/**' source.tar mnt
+ratarmount journal mark mnt 'turn 1'
+ratarmount journal summarize attempt.jsonl --json
+ratarmount journal summarize attempt.jsonl --since-mark 'turn 1' --until-mark 'turn 2'
+```
+
+Each mount appends a version-1 header containing `mount`, `base_digest`,
+`stack_digest`, `overlay`, UTC RFC 3339 `t0`, and `clock: "monotonic_ns"`.
+Subsequent `ts` values are monotonic nanoseconds since that header. Paths are
+mount-relative, without a leading slash; the root is `""`. JSON writers use
+`path_b64` for invalid UTF-8 bytes, although the FUSE frontend currently rejects
+such names. `open` includes access flags (`r`, `w`, `rw`), the request's `pid`,
+`uid`, `gid`, best-effort Linux `/proc/PID/comm`, and `layer` (`base`, `lower:N`,
+or `top`). The process-name cache is bounded to 1024 PIDs.
+
+Successful creates, mkdirs, unlinks, rmdirs, renames (with `to`), symlinks,
+truncates, and chmods are recorded as they happen. The first successful readdir
+on each directory handle records its child-entry count (excluding `.` and
+`..`). Lookups and getattr/stat are omitted. Failed mutations returning
+`EROFS`, `EDQUOT`, or `ENOSPC` produce `denied` records with the attempted `what`
+and numeric `errno`; rule observers and callback errors are deduplicated.
+Denials from non-FUSE callers of the same rule observer have PID/UID/GID zero.
+
+Reads and writes aggregate per open handle and emit on RELEASE, or at unmount
+for outstanding handles. `bytes` counts bytes actually returned or written,
+including repeated accesses; `count` counts successful I/O requests, including EOF. `ranges`
+merges adjacent and overlapping `[offset, length]` pairs. At most 64 ranges are
+retained; additional disjoint ranges set `ranges_truncated: true` while byte
+counts remain complete. `--journal-reads first` retains only the first non-empty
+read range per handle; byte and request counts still include all reads. The
+default is `--journal-reads all`. `first_ts` preserves the first successful I/O timestamp
+when handles release out of order. Reads/writes retain the opened path and
+layer even after rename or unlink.
+
+`--journal-exclude GLOB` is repeatable and accepts the same comma-separated,
+root-anchored patterns as `--overlay-readonly`. It omits matching paths and
+renames with a matching endpoint. Status counters still include excluded
+activity. Marks are never excluded.
+
+The writer uses a bounded 1024-record queue and flushes buffered output at least
+every 100 ms while processing. A full queue blocks request processing until
+space is available; records are not dropped to relieve pressure. Unmount joins
+the writer and flushes pending records; `--journal-sync` also fsyncs the file.
+Write failures appear in the daemon log and `.stats`'s `journal_error`; mark
+requests then fail with EIO and unmount reports the failure. Abrupt termination
+can lose buffered records. Summaries tolerate an incomplete final record and
+an incomplete record immediately before a subsequent mount header.
+
+`summarize` streams the input, keeping a per-path table and mark-to-path sets.
+It reports first read/write timestamps, bytes, read request counts, layer and
+process-name set; lists `files_read`, `files_read_then_written`, and
+`files_written_blind`; and groups `reads_by_mark` by label. The leading `""`
+bucket contains reads released before the first mark. Repeated labels combine
+into one bucket. `--since-mark` starts after the first matching mark;
+`--until-mark` stops before the first match after the start. Missing labels are
+errors. Because read records emit at RELEASE, a handle spanning marks is
+assigned to its release bucket; close file handles before marking a turn when
+exact turn attribution matters. Byte-path fallback keys appear as
+`path_b64:BASE64` in the summary. Both `journal` commands exit 0 on success and
+2 on argument, input, or I/O errors.
+
+The journal describes operations reaching FUSE. Kernel page-cache hits, mmap
+accesses and accesses through other export protocols do not produce read
+callbacks. Passthrough is disabled when journaling. Mounts without `-w` permit root control requests at the kernel boundary; file
+mutations still return EROFS in the frontend. These mounts consequently report
+a writable kernel mount flag even though their data is read-only. Explicit
+`-o ro` also prevents control writes (the kernel returns EROFS before the root
+control handler, including when journaling is off).
+
+Run `RATARMOUNT=target/release/ratarmount benchmarks/journal-overhead.sh` on a
+machine with `/dev/fuse`, Python 3, `fusermount3`, `make`, and a C compiler. It
+alternates fresh overlay mounts with and without journaling, runs three
+build/test loops per sample, and prints median workload overhead. `RUNS`
+(default 6) and `JOBS` (default 4) tune the run. The under-3% target is not a CI
+gate; absent tools yield an explicit skip (exit 77).
+
+## Control and status xattrs
+
+The mount root exposes these synthetic read attributes, including on mounts
+without a write overlay:
+
+| Xattr | Value |
+| --- | --- |
+| `user.ratarmount.base_digest` | Recorded base identity, or empty string |
+| `user.ratarmount.stack_digest` | Recorded stack identity, or empty string |
+| `user.ratarmount.sealed` | `1` when the supplied metadata is sealed, otherwise `0` |
+| `user.ratarmount.layers` | JSON `lower_layers`, or `[]` without metadata |
+| `user.ratarmount.journal` | Resolved active journal path, or empty string |
+| `user.ratarmount.stats` | JSON counters described below |
+
+`stats` contains `bytes_read`, `bytes_written`, `files_touched` (distinct paths
+observed), `overlay_bytes` (quota usage, or null without a quota policy), `ops`
+(counts by journal operation), `erofs_denied`, and `journal_error` (null or an
+error string). Byte counters update during I/O; aggregated read/write operation
+counts update on RELEASE. All counters are for this mount's lifetime.
+
+Set `user.ratarmount.mark` on the root to append a UTF-8 label of at most 4096
+bytes. `ratarmount journal mark MOUNT LABEL` performs this same xattr call.
+Invalid labels return EINVAL. Without `--journal`, marks return ENOTSUP on a
+writable mount and EROFS on a read-only one (a read-only mount without
+`--journal` stays kernel `ro`). Other
+`user.ratarmount.*` root writes and removals return EPERM. These controls are
+intercepted before the overlay's xattr implementation. The existing
+`user.ratarmount.git.commit` read attribute continues to come from the source.
+
+```sh
+getfattr -n user.ratarmount.stats mnt
+getfattr -n user.ratarmount.base_digest mnt
+python3 -c 'import os; os.setxattr("mnt", "user.ratarmount.mark", b"turn 2")'
+```

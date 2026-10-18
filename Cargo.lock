@@ -5424,11 +5424,14 @@ dependencies = [
 name = "ratarmount-fuse"
 version = "0.1.35"
 dependencies = [
+ "base64 0.22.1",
+ "chrono",
  "fuser",
  "libc",
  "log",
  "ratarmount-compositing",
  "ratarmount-core",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
 ]

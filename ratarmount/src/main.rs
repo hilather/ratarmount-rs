@@ -19,7 +19,7 @@ use ratarmount_compress::{
 };
 use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
 use ratarmount_fuse::{
-    clamp_readahead, mount_blocking_with_io_options as mount_blocking, parse_byte_size, unmount,
+    clamp_readahead, mount_blocking_with_activity as mount_blocking, parse_byte_size, unmount,
     PassthroughMode, PassthroughOptions, RECOMMENDED_READAHEAD_BYTES,
 };
 use ratarmount_index::{
@@ -38,6 +38,7 @@ mod corpus;
 mod diff;
 mod export_index;
 mod find;
+mod journal_cmd;
 mod overlay_cmd;
 mod overlay_commit;
 mod overlay_stats;
@@ -537,6 +538,25 @@ struct Args {
     #[arg(skip)]
     overlay_stats: Option<overlay_stats::StatsArgs>,
 
+    /// Append filesystem operation records to a JSONL file outside the mount and overlay.
+    #[arg(long, conflicts_with_all = ["no_mount", "commit_overlay"])]
+    journal: Option<PathBuf>,
+
+    /// Exclude root-relative paths using the overlay-readonly glob syntax (repeatable).
+    #[arg(long, action = ArgAction::Append, requires = "journal")]
+    journal_exclude: Vec<String>,
+
+    /// Record all coalesced read ranges, or just the first range per handle.
+    #[arg(long, value_parser = ["all", "first"], default_value = "all", requires = "journal")]
+    journal_reads: String,
+
+    /// Fsync the operation journal at unmount.
+    #[arg(long, requires = "journal")]
+    journal_sync: bool,
+
+    #[arg(skip)]
+    journal_command: Option<journal_cmd::JournalArgs>,
+
     #[arg(skip)]
     overlay: Option<overlay_cmd::OverlayArgs>,
 
@@ -752,6 +772,15 @@ where
         }
         return Ok(args);
     }
+    if raw.get(1).is_some_and(|s| s == "journal") {
+        let journal = journal_cmd::JournalArgs::try_parse_from(
+            std::iter::once(OsString::from("ratarmount journal"))
+                .chain(raw.iter().skip(2).cloned()),
+        )?;
+        let mut args = Args::try_parse_from(&raw[..1])?;
+        args.journal_command = Some(journal);
+        return Ok(args);
+    }
     if raw.get(1).is_some_and(|s| s == "overlay") {
         let overlay = overlay_cmd::OverlayArgs::try_parse_from(
             std::iter::once(OsString::from("ratarmount overlay"))
@@ -837,6 +866,8 @@ where
     }
     expand_sandbox(&mut args, caller_ids())
         .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
+    ratarmount_compositing::ReadOnlyGlobs::new(&args.journal_exclude)
+        .map_err(|e| clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string()))?;
     if !args.overlay_readonly.is_empty() {
         ratarmount_compositing::ReadOnlyGlobs::with_allow(
             &args.overlay_readonly,
@@ -1249,6 +1280,13 @@ fn main() {
         return;
     }
 
+    if let Some(journal) = &args.journal_command {
+        if let Err(error) = journal_cmd::run(journal) {
+            eprintln!("journal: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if let Some(overlay) = &args.overlay {
         match overlay_cmd::run(overlay) {
             Ok(output) => println!("{}", output.trim_end()),
@@ -1828,6 +1866,7 @@ fn main() {
 
     let mut overlay_arc: Option<Arc<WriteOverlay>> = None;
     let mut overlay_quota: Option<Arc<ratarmount_compositing::OverlayQuota>> = None;
+    let mut journal_rules = None;
 
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
@@ -1924,6 +1963,7 @@ fn main() {
                         );
                         let json = rules.rules_json();
                         quota = quota.with_readonly(rules.clone());
+                        journal_rules = Some(rules.clone());
                         policies.push(rules);
                         json
                     };
@@ -2127,6 +2167,38 @@ fn main() {
         std::process::exit(2);
     }
 
+    let journal_options = args.journal.as_ref().map(|path| {
+        let Some(mp) = &fuse_mp else {
+            eprintln!("error: --journal requires a FUSE mountpoint");
+            std::process::exit(2);
+        };
+        let path = ratarmount_fuse::oplog::validate_path(
+            path,
+            mp,
+            overlay_arc.as_ref().map(|ov| ov.root()),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("journal: {error}");
+            std::process::exit(2)
+        });
+        ratarmount_fuse::oplog::JournalOptions {
+            path,
+            exclude: args.journal_exclude.clone(),
+            reads: if args.journal_reads == "first" {
+                ratarmount_fuse::oplog::Reads::First
+            } else {
+                ratarmount_fuse::oplog::Reads::All
+            },
+            sync: args.journal_sync,
+        }
+    });
+    let activity = ratarmount_fuse::oplog::MountActivity {
+        journal: journal_options,
+        quota: overlay_quota.clone(),
+        readonly: journal_rules,
+        ..Default::default()
+    };
+
     let writable = overlay_arc.is_some();
     let fuse_opts = args.fuse.clone();
     let passthrough = PassthroughOptions {
@@ -2214,6 +2286,7 @@ fn main() {
                     overlay_arc,
                     &fuse_opts,
                     passthrough,
+                    activity,
                     readahead,
                     nfs_opts,
                     args.foreground,
@@ -2234,6 +2307,7 @@ fn main() {
             overlay_arc,
             &fuse_opts,
             passthrough,
+            activity,
             readahead,
             Some(nfs_opts),
             plan,
@@ -2256,6 +2330,7 @@ fn main() {
             overlay_arc,
             &fuse_opts,
             passthrough,
+            activity,
             readahead,
             None,
             plan,
@@ -2277,6 +2352,7 @@ fn main() {
         overlay_arc,
         &fuse_opts,
         passthrough,
+        activity,
         readahead,
         args.foreground,
         args.log_file.is_some(),
@@ -2837,6 +2913,7 @@ fn run_exports(
     overlay_arc: Option<Arc<WriteOverlay>>,
     fuse_opts: &str,
     passthrough: PassthroughOptions,
+    activity: ratarmount_fuse::oplog::MountActivity,
     readahead: u64,
     mut nfs_opts: Option<ratarmount_nfs::NfsOptions>,
     mut plan: ExportPlan,
@@ -2960,6 +3037,7 @@ fn run_exports(
                     readahead,
                     passthrough,
                     open_opts.direct_io,
+                    activity,
                 );
                 nfs_stop.request_stop();
                 export_stop.request_stop();
@@ -3035,6 +3113,7 @@ fn run_exports(
                         readahead,
                         passthrough,
                         open_opts.direct_io,
+                        activity,
                     );
                     nfs_stop.request_stop();
                     export_stop.request_stop();
@@ -3142,6 +3221,7 @@ fn run_fuse_and_nfs(
     overlay_arc: Option<Arc<WriteOverlay>>,
     fuse_opts: &str,
     passthrough: PassthroughOptions,
+    activity: ratarmount_fuse::oplog::MountActivity,
     readahead: u64,
     mut nfs_opts: ratarmount_nfs::NfsOptions,
     foreground: bool,
@@ -3194,6 +3274,7 @@ fn run_fuse_and_nfs(
             readahead,
             passthrough,
             open_opts.direct_io,
+            activity,
         );
         stop.request_stop();
         let _ = handle.join();
@@ -3267,6 +3348,7 @@ fn run_fuse_and_nfs(
                 readahead,
                 passthrough,
                 open_opts.direct_io,
+                activity,
             );
             stop.request_stop();
             let _ = handle.join();
@@ -3296,6 +3378,7 @@ fn run_fuse_only(
     overlay_arc: Option<Arc<WriteOverlay>>,
     fuse_opts: &str,
     passthrough: PassthroughOptions,
+    activity: ratarmount_fuse::oplog::MountActivity,
     readahead: u64,
     foreground: bool,
     has_log_file: bool,
@@ -3335,6 +3418,7 @@ fn run_fuse_only(
             readahead,
             passthrough,
             open_opts.direct_io,
+            activity,
         );
         finish_overlay_serve(overlay_arc, None, interval, commit_exit);
         if let Err(e) = mount_err {
@@ -3385,6 +3469,7 @@ fn run_fuse_only(
                 readahead,
                 passthrough,
                 open_opts.direct_io,
+                activity,
             );
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
