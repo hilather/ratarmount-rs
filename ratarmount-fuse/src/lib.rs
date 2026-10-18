@@ -22,7 +22,7 @@ use fuser::{
     ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
     ReplyXattr, Request, SessionACL, WriteFlags,
 };
-use libc::{EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
+use libc::{EACCES, EEXIST, EILSEQ, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
 use log::{debug, info, warn};
 use ratarmount_compositing::{Parked, WriteOverlay};
 use ratarmount_core::{CheapDirent, FileInfo, InodeAttrCookie, MountSource};
@@ -1381,11 +1381,12 @@ impl RatarmountFs {
 
     /// Overlay path for `parent`/`name`, or the errno to reply.
     fn overlay_child_path(&self, parent: u64, name: &OsStr) -> Result<String, i32> {
+        let name = utf8_name(name)?;
         if self.overlay.is_none() {
             return Err(EROFS);
         }
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
-        Ok(join_path(&parent_path, &name.to_string_lossy()))
+        Ok(join_path(&parent_path, name))
     }
 
     fn create_masked_entry(
@@ -1417,7 +1418,7 @@ impl RatarmountFs {
     ) -> Result<(Duration, FileAttr, u64), i32> {
         let path = self.overlay_child_path(parent, name)?;
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
-        let name = name.to_string_lossy();
+        let name = utf8_name(name)?;
         let ov = self.overlay.as_ref().ok_or(EROFS)?;
         let fd = ov.create_file(&path, mode).map_err(|e| {
             debug!("create: {e}");
@@ -1434,7 +1435,7 @@ impl RatarmountFs {
         });
         // Drop a previously cached archive member before the new
         // overlay FileInfo replaces it, or the kernel keeps 60s attrs.
-        self.note_dir_changed(parent, &name);
+        self.note_dir_changed(parent, name);
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
         self.invalidate_dir_cache(&parent_path);
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
@@ -1442,7 +1443,7 @@ impl RatarmountFs {
             .lock()
             .unwrap()
             .insert(fh, OpenBackend::OverlayFd(fd));
-        let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
+        let ttl = self.reply_entry_ttl(parent, name, ino, &fi);
         self.bump_nlookup(ino);
         Ok((ttl, self.mapped_file_attr(ino, &fi), fh))
     }
@@ -1456,7 +1457,7 @@ impl RatarmountFs {
     ) -> Result<(Duration, FileAttr), i32> {
         let path = self.overlay_child_path(parent, name)?;
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
-        let name = name.to_string_lossy();
+        let name = utf8_name(name)?;
         let ov = self.overlay.as_ref().ok_or(EROFS)?;
         ov.mkdir(&path, mode).map_err(|e| {
             debug!("mkdir: {e}");
@@ -1471,19 +1472,20 @@ impl RatarmountFs {
             gid: unsafe { libc::getegid() },
             userdata: vec![],
         });
-        self.note_dir_changed(parent, &name);
+        self.note_dir_changed(parent, name);
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
         self.invalidate_dir_cache(&parent_path);
-        let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
+        let ttl = self.reply_entry_ttl(parent, name, ino, &fi);
         self.bump_nlookup(ino);
         Ok((ttl, self.mapped_file_attr(ino, &fi)))
     }
 
     /// Body of `unlink` / `rmdir`, replying-free so it can be unit-tested.
     fn remove_entry(&self, parent: u64, name: &OsStr, dir: bool) -> Result<(), i32> {
+        let valid_name = name.to_str().ok_or(ENOENT)?;
         let path = self.overlay_child_path(parent, name)?;
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
-        let name = name.to_string_lossy();
+        let name = valid_name;
         let ov = self.overlay.as_ref().ok_or(EROFS)?;
         if dir {
             // Directories are not parked. A held directory fd can still
@@ -1493,7 +1495,7 @@ impl RatarmountFs {
                 overlay_errno(&e)
             })?;
             self.invalidate_dir_cache(&parent_path);
-            self.note_dir_changed(parent, &name);
+            self.note_dir_changed(parent, name);
             return Ok(());
         }
         // Snapshot before unlink: afterwards the name is a tombstone.
@@ -1508,7 +1510,7 @@ impl RatarmountFs {
         self.invalidate_dir_cache(&parent_path);
         // While path_to_ino still maps the name, so a 60s member still gets
         // its Entry + Inode from attr_advertised.
-        self.note_dir_changed(parent, &name);
+        self.note_dir_changed(parent, name);
         self.detach_unlinked(&path, ino, parked, snap, xattrs);
         self.mark_source_handles_detached(&path);
         Ok(())
@@ -1612,13 +1614,17 @@ impl RatarmountFs {
     fn rename_reply(
         &self,
         parent: u64,
-        name: &str,
+        name: &OsStr,
         newparent: u64,
-        newname: &str,
+        newname: &OsStr,
         flags: u32,
         reply: impl FnOnce(Result<(), i32>),
     ) {
-        let result = self.rename_paths(parent, name, newparent, newname, flags);
+        let result = (|| {
+            let name = utf8_name(name)?;
+            let newname = utf8_name(newname)?;
+            self.rename_paths(parent, name, newparent, newname, flags)
+        })();
         let ok = result.is_ok();
         reply(result);
         if ok {
@@ -2018,11 +2024,11 @@ impl RatarmountFs {
     /// entry TTL is recorded by [`Self::reply_entry_ttl`].
     fn lookup_entry(&self, parent: u64, name: &OsStr) -> Option<(u64, FileAttr, Duration)> {
         let parent_path = self.path_for_ino(parent)?;
-        let name = name.to_string_lossy();
-        let path = join_path(&parent_path, name.as_ref());
+        let name = name.to_str()?;
+        let path = join_path(&parent_path, name);
         let fi = self.lookup_file_info(&path)?;
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
-        let ttl = self.reply_entry_ttl(parent, name.as_ref(), ino, &fi);
+        let ttl = self.reply_entry_ttl(parent, name, ino, &fi);
         self.bump_nlookup(ino);
         Some((ino, self.mapped_file_attr(ino, &fi), ttl))
     }
@@ -2566,6 +2572,11 @@ fn file_info_attr_stable(fi: &FileInfo) -> bool {
             .any(|u| matches!(u, ratarmount_core::UserData::Other(s) if s.starts_with("overlay:")))
 }
 
+/// Names entering the string-based overlay must retain their exact bytes.
+fn utf8_name(name: &OsStr) -> Result<&str, i32> {
+    name.to_str().ok_or(EILSEQ)
+}
+
 fn join_path(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
@@ -3069,6 +3080,10 @@ impl Filesystem for RatarmountFs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        if let Err(errno) = utf8_name(name) {
+            reply.error(Errno::from_i32(errno));
+            return;
+        }
         if mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFREG {
             reply.error(Errno::EOPNOTSUPP);
             return;
@@ -3123,6 +3138,33 @@ impl Filesystem for RatarmountFs {
         }
     }
 
+    fn symlink(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        link_name: &OsStr,
+        _target: &Path,
+        reply: ReplyEntry,
+    ) {
+        // Link creation remains unsupported, but must not accept lossy names.
+        reply.error(Errno::from_i32(
+            utf8_name(link_name).err().unwrap_or(libc::EPERM),
+        ));
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::from_i32(
+            utf8_name(newname).err().unwrap_or(libc::EPERM),
+        ));
+    }
+
     fn rename(
         &self,
         _req: &Request,
@@ -3135,9 +3177,9 @@ impl Filesystem for RatarmountFs {
     ) {
         self.rename_reply(
             parent.0,
-            &name.to_string_lossy(),
+            name,
             newparent.0,
-            &newname.to_string_lossy(),
+            newname,
             flags.bits(),
             |result| match result {
                 Ok(()) => reply.ok(),
@@ -4960,6 +5002,60 @@ mod tests {
             Some(Arc::clone(&ov)),
         );
         (dir, ov, fs)
+    }
+
+    /// Regression: distinct Latin-1 names must not collapse to a replacement character.
+    #[test]
+    fn regression_non_utf8_name_path_join_and_create() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        for bytes in [b"caf\xe9".as_slice(), b"caf\xe8".as_slice()] {
+            let name = OsStr::from_bytes(bytes);
+            assert_eq!(utf8_name(name), Err(EILSEQ));
+            assert_eq!(fs.overlay_child_path(FUSE_ROOT_ID, name), Err(EILSEQ));
+            assert_eq!(
+                fs.create_masked_entry(FUSE_ROOT_ID, name, 0o644, 0)
+                    .unwrap_err(),
+                EILSEQ
+            );
+            assert_eq!(
+                fs.mkdir_masked_entry(FUSE_ROOT_ID, name, 0o755, 0)
+                    .unwrap_err(),
+                EILSEQ
+            );
+        }
+        assert!(ov.lookup("/caf�", 0).is_none());
+        let name = OsStr::new("café");
+        assert_eq!(utf8_name(name), Ok("café"));
+        assert_eq!(fs.overlay_child_path(FUSE_ROOT_ID, name).unwrap(), "/café");
+        assert_eq!(join_path("/dir", utf8_name(name).unwrap()), "/dir/café");
+    }
+
+    /// Regression: invalid lookup/remove/rename names must never alias an existing U+FFFD entry.
+    #[test]
+    fn regression_non_utf8_name_no_lossy_lookup_remove_or_rename() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/caf�", b"keep");
+        overlay_write_new(&ov, "/source", b"source");
+        let invalid = OsStr::from_bytes(b"caf\xe9");
+        assert!(fs.lookup_entry(FUSE_ROOT_ID, invalid).is_none());
+        for dir in [false, true] {
+            assert_eq!(fs.remove_entry(FUSE_ROOT_ID, invalid, dir), Err(ENOENT));
+        }
+        for (from, to) in [
+            (invalid, OsStr::new("dest")),
+            (OsStr::new("source"), invalid),
+        ] {
+            fs.rename_reply(FUSE_ROOT_ID, from, FUSE_ROOT_ID, to, 0, |result| {
+                assert_eq!(result, Err(EILSEQ));
+            });
+        }
+        assert!(ov.lookup("/caf�", 0).is_some());
+        assert!(ov.lookup("/source", 0).is_some());
+        assert!(ov.lookup("/dest", 0).is_none());
     }
 
     fn overlay_write_new(ov: &WriteOverlay, path: &str, body: &[u8]) {
@@ -6850,11 +6946,18 @@ mod tests {
         assert_eq!(ttl, TTL);
 
         let mut replied = None;
-        fs.rename_reply(FUSE_ROOT_ID, "m", FUSE_ROOT_ID, "n", 0, |result| {
-            let queued = fs.pending_inval.lock().unwrap().len();
-            let sent = rec.rx.try_recv();
-            replied = Some((result, queued, sent));
-        });
+        fs.rename_reply(
+            FUSE_ROOT_ID,
+            OsStr::new("m"),
+            FUSE_ROOT_ID,
+            OsStr::new("n"),
+            0,
+            |result| {
+                let queued = fs.pending_inval.lock().unwrap().len();
+                let sent = rec.rx.try_recv();
+                replied = Some((result, queued, sent));
+            },
+        );
         let (result, queued, sent) = replied.expect("reply called");
         assert_eq!(result, Ok(()));
         assert_eq!(
@@ -6883,9 +6986,16 @@ mod tests {
         );
 
         let mut missing = None;
-        fs.rename_reply(FUSE_ROOT_ID, "zz", FUSE_ROOT_ID, "y", 0, |result| {
-            missing = Some(result);
-        });
+        fs.rename_reply(
+            FUSE_ROOT_ID,
+            OsStr::new("zz"),
+            FUSE_ROOT_ID,
+            OsStr::new("y"),
+            0,
+            |result| {
+                missing = Some(result);
+            },
+        );
         assert_eq!(missing, Some(Err(ENOENT)));
         assert!(fs.pending_inval.lock().unwrap().is_empty());
         stop_recording(&fs, rec);
