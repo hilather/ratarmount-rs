@@ -77,15 +77,11 @@ fn hash_file(path: &Path) -> (u64, u64) {
     let mut len = 0u64;
     if let Some(f) = f.as_mut() {
         let mut buf = vec![0u8; 64 * 1024];
-        let mut read_total = 0usize;
-        // Contents of the first MiB; larger files (sidecars) are covered by length.
-        while read_total < 1 << 20 {
+        // The complete contents: a same-length rewrite anywhere must be detected.
+        loop {
             match f.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    buf[..n].hash(&mut h);
-                    read_total += n;
-                }
+                Ok(n) => buf[..n].hash(&mut h),
             }
         }
     }
@@ -96,12 +92,18 @@ fn hash_file(path: &Path) -> (u64, u64) {
 }
 
 /// Walks `root` with `symlink_metadata` (never follows symlinks).
+/// FUSE mounts of this test are never touched: a `stat` or `readdir` there goes to the
+/// daemon and hangs when it is wedged. A mount point is recorded as `Entry::Other`.
 fn snapshot(root: &Path) -> Snapshot {
-    fn walk(root: &Path, dir: &Path, out: &mut Snapshot) {
+    fn walk(root: &Path, dir: &Path, mounts: &[PathBuf], out: &mut Snapshot) {
         let Ok(rd) = fs::read_dir(dir) else { return };
         for ent in rd.flatten() {
             let path = ent.path();
             let rel = path.strip_prefix(root).unwrap().to_path_buf();
+            if mounts.contains(&path) {
+                out.insert(rel, Entry::Other);
+                continue;
+            }
             let Ok(md) = fs::symlink_metadata(&path) else {
                 continue;
             };
@@ -110,7 +112,7 @@ fn snapshot(root: &Path) -> Snapshot {
                 out.insert(rel, Entry::Link(fs::read_link(&path).unwrap_or_default()));
             } else if ft.is_dir() {
                 out.insert(rel, Entry::Dir);
-                walk(root, &path, out);
+                walk(root, &path, mounts, out);
             } else if ft.is_file() {
                 let (h, len) = hash_file(&path);
                 out.insert(rel, Entry::File(h, len));
@@ -120,7 +122,8 @@ fn snapshot(root: &Path) -> Snapshot {
         }
     }
     let mut out = Snapshot::new();
-    walk(root, root, &mut out);
+    let mounts = owned_mounts(root);
+    walk(root, root, &mounts, &mut out);
     out
 }
 
@@ -222,6 +225,14 @@ fn owned_connections_from(bytes: &[u8], root: &Path) -> Vec<u32> {
         .filter(|(mp, fstype, _)| mp.starts_with(root) && fstype.starts_with("fuse"))
         .map(|(_, _, minor)| minor)
         .collect()
+}
+
+/// Connection numbers are reused once a mount is gone: a captured number that a FUSE
+/// mount outside `root` (another test, another user) now carries is not ours to abort.
+fn connection_reused_elsewhere(bytes: &[u8], root: &Path, minor: u32) -> bool {
+    mountinfo_entries(bytes)
+        .into_iter()
+        .any(|(mp, fstype, m)| m == minor && fstype.starts_with("fuse") && !mp.starts_with(root))
 }
 
 #[cfg(target_os = "linux")]
@@ -387,29 +398,64 @@ fn scan_marker_pids(token: &str, root: &Path) -> Vec<i32> {
     out
 }
 
-fn run_bounded(cmd: &mut Command, timeout: Duration) -> Option<(ExitStatus, Vec<u8>)> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = stdout.read_to_end(&mut v);
-        v
-    });
+/// Output of a bounded child: a nameless temp file, so a descendant that keeps the
+/// descriptor open can never block collection (no pipe, no reader thread).
+fn bounded_stdout() -> Option<(File, Stdio)> {
+    let f = tempfile::tempfile().ok()?;
+    let w = f.try_clone().ok()?;
+    Some((f, Stdio::from(w)))
+}
+
+fn read_bytes(f: &File) -> Vec<u8> {
+    const CAP: usize = 1 << 20;
+    let mut out = Vec::new();
+    let mut off = 0u64;
+    let mut buf = vec![0u8; 8192];
+    while out.len() < CAP {
+        match f.read_at(&mut buf, off) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                off += n as u64;
+            }
+        }
+    }
+    out
+}
+
+/// Poll `child` until it exits or `timeout` passes.
+fn wait_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(st)) => return Some((st, reader.join().unwrap_or_default())),
+            Ok(Some(st)) => return Some(st),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+            _ => return None,
+        }
+    }
+}
+
+/// SIGKILL, then reap with `try_wait` for at most `grace`; never a blocking `wait()`
+/// (a child stuck in an uninterruptible FUSE call cannot be reaped).
+fn kill_and_reap(child: &mut Child, grace: Duration) -> bool {
+    kill_unreaped(child);
+    wait_deadline(child, grace).is_some()
+}
+
+/// A helper command (`fusermount3`, `umount`) with a hard deadline.
+fn run_bounded(cmd: &mut Command, timeout: Duration) -> Option<(ExitStatus, Vec<u8>)> {
+    let (out, stdio) = bounded_stdout()?;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(stdio)
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    match wait_deadline(&mut child, timeout) {
+        Some(st) => Some((st, read_bytes(&out))),
+        None => {
+            kill_and_reap(&mut child, Duration::from_secs(2));
+            None
         }
     }
 }
@@ -522,6 +568,11 @@ impl CleanupOps for RealOps<'_> {
     fn abort_connection(&mut self, minor: u32) {
         #[cfg(target_os = "linux")]
         {
+            let reused = fs::read("/proc/self/mountinfo")
+                .is_ok_and(|b| connection_reused_elsewhere(&b, self.root, minor));
+            if reused {
+                return;
+            }
             let p = format!("/sys/fs/fuse/connections/{minor}/abort");
             if let Ok(mut f) = OpenOptions::new().write(true).open(p) {
                 let _ = f.write_all(b"1");
@@ -672,19 +723,7 @@ struct Run {
 }
 
 fn read_all(f: &File) -> String {
-    let mut out = Vec::new();
-    let mut off = 0u64;
-    let mut buf = vec![0u8; 8192];
-    loop {
-        match f.read_at(&mut buf, off) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                out.extend_from_slice(&buf[..n]);
-                off += n as u64;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).to_string()
+    String::from_utf8_lossy(&read_bytes(f)).to_string()
 }
 
 impl Run {
@@ -861,6 +900,37 @@ impl Env {
                 tail(&run.stderr_text(), 2000)
             );
         }
+    }
+
+    /// A probe command (`ls`, `cat`, `sh`) on a mount of this test, supervised by the
+    /// guard: registered as a child, bounded, and on timeout the captured FUSE
+    /// connections are aborted before the kill and a bounded reap.
+    fn probe(&mut self, cmd: &mut Command, timeout: Duration) -> Option<(ExitStatus, Vec<u8>)> {
+        let (out, stdio) = bounded_stdout()?;
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(stdio)
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        self.guard.children.push(child);
+        let idx = self.guard.children.len() - 1;
+        if let Some(st) = wait_deadline(&mut self.guard.children[idx], timeout) {
+            return Some((st, read_bytes(&out)));
+        }
+        let found = owned_connections(&self.root);
+        self.guard.connections.extend(found);
+        for c in self.guard.connections.clone() {
+            RealOps {
+                token: &self.token,
+                root: &self.root,
+                children: &mut self.guard.children,
+            }
+            .abort_connection(c);
+        }
+        kill_and_reap(&mut self.guard.children[idx], Duration::from_secs(2));
+        eprintln!("probe timed out after {timeout:?}");
+        None
     }
 
     fn run(&mut self, name: &str, args: &[&str]) -> Run {
@@ -1072,6 +1142,18 @@ fn regression_mount_in_base_guard_cleanup_order_capture_abort_kill() {
     assert!(conns.contains(&85));
 }
 
+/// Regression: a captured connection number reused by a parallel test's mount was
+/// aborted by the first test's cleanup ("Transport endpoint is not connected").
+#[test]
+fn regression_mount_in_base_guard_stale_connection_reused_elsewhere_is_not_aborted() {
+    let root = Path::new("/tmp/rmib-x");
+    let mi = b"10 1 0:89 / /tmp/rmib-y/ov/mnt rw - fuse.ratarmount ratarmount rw\n\
+               11 1 0:90 / /tmp/rmib-x/mnt rw - fuse.ratarmount ratarmount rw\n";
+    assert!(connection_reused_elsewhere(mi, root, 89));
+    assert!(!connection_reused_elsewhere(mi, root, 90));
+    assert!(!connection_reused_elsewhere(mi, root, 91));
+}
+
 #[test]
 fn regression_mount_in_base_guard_pid_alive_zombie_leader_with_live_thread() {
     assert!(!alive_from('Z', &[]));
@@ -1245,6 +1327,47 @@ fn regression_mount_in_base_snapshot_detects_same_length_rewrite() {
     let problems = snapshot_diff(&pre, &snapshot(&env.root), &[]);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].starts_with("changed: B/f1.txt"));
+    done(env);
+}
+
+/// Regression: the snapshot hashed only the first MiB, so a same-length rewrite later
+/// in a larger file (an index sidecar) went unnoticed.
+#[test]
+fn regression_mount_in_base_snapshot_detects_rewrite_beyond_first_mib() {
+    let env = Env::new();
+    let big = env.root.join("B/big.bin");
+    fs::write(&big, vec![7u8; (1 << 20) + 4096]).unwrap();
+    let pre = snapshot(&env.root);
+    let f = OpenOptions::new().write(true).open(&big).unwrap();
+    f.write_all_at(&[8u8], 1 << 20).unwrap();
+    let problems = snapshot_diff(&pre, &snapshot(&env.root), &[]);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].starts_with("changed: B/big.bin"));
+    done(env);
+}
+
+/// Regression: probe children were unsupervised and a descendant holding the output
+/// pipe delayed collection; a probe is bounded by files and a try_wait reap.
+#[test]
+fn regression_mount_in_base_probe_is_bounded_and_ignores_descendant_output_holders() {
+    let mut env = Env::new();
+    let t0 = Instant::now();
+    let (st, out) = env
+        .probe(
+            Command::new("sh").args(["-c", "sleep 5 & echo hi"]),
+            Duration::from_secs(3),
+        )
+        .expect("finished");
+    assert!(st.success());
+    assert_eq!(String::from_utf8_lossy(&out).trim(), "hi");
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    let t0 = Instant::now();
+    assert!(env
+        .probe(Command::new("sleep").arg("30"), Duration::from_millis(300))
+        .is_none());
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    // The detached `sleep 5` carries no token or root path: not ours to kill, and it
+    // exits by itself.
     done(env);
 }
 
@@ -1856,7 +1979,7 @@ fn mount_and_check_with(
     args: &[&str],
     expected_mp_rel: &str,
     expected_entry: Option<&str>,
-    extra: impl FnOnce(&Env, &Path),
+    extra: impl FnOnce(&mut Env, &Path),
 ) {
     if let Some(r) = skip_reason() {
         eprintln!("{r}");
@@ -1888,11 +2011,12 @@ fn mount_and_check_with(
     // Bounded listing in a disposable subprocess, never in the test process.
     // The mount can be listed in mountinfo a moment before the daemon serves it.
     let out = loop {
-        let (st, out) = run_bounded(
-            Command::new("ls").arg("-1A").arg(&mp),
-            Duration::from_secs(10),
-        )
-        .expect("ls finished");
+        let (st, out) = env
+            .probe(
+                Command::new("ls").arg("-1A").arg(&mp),
+                Duration::from_secs(10),
+            )
+            .expect("ls finished");
         if st.success() {
             break out;
         }
@@ -1911,7 +2035,7 @@ fn mount_and_check_with(
             "{entry} missing in:\n{text}"
         );
     }
-    extra(&env, &mp);
+    extra(&mut env, &mp);
     let um = env.run("umount", &["-u", mp.to_str().unwrap()]);
     assert_eq!(um.code(), Some(0), "{}", um.stderr_text());
     env.wait(&mut run, Duration::from_secs(15));
@@ -1989,13 +2113,15 @@ fn regression_mount_in_base_rolling_default_writes_and_reads_back() {
         "logs.000001",
         None,
         |env, _| {
-            let (st, out) = run_bounded(
-                Command::new("sh")
-                    .current_dir(&env.root)
-                    .args(["-c", "echo hi > logs.000001/w.txt && cat logs.000001/w.txt"]),
-                Duration::from_secs(10),
-            )
-            .expect("sh finished");
+            let root = env.root.clone();
+            let (st, out) = env
+                .probe(
+                    Command::new("sh")
+                        .current_dir(&root)
+                        .args(["-c", "echo hi > logs.000001/w.txt && cat logs.000001/w.txt"]),
+                    Duration::from_secs(10),
+                )
+                .expect("sh finished");
             assert!(st.success());
             assert_eq!(String::from_utf8_lossy(&out).trim(), "hi");
         },
@@ -2046,11 +2172,12 @@ fn regression_mount_in_base_index_folder_outside_base_ok() {
         Some("hello.txt"),
         |env, mp| {
             assert!(env.root.join("idx").is_dir());
-            let (_, out) = run_bounded(
-                Command::new("ls").arg("-1A").arg(mp),
-                Duration::from_secs(10),
-            )
-            .expect("ls");
+            let (_, out) = env
+                .probe(
+                    Command::new("ls").arg("-1A").arg(mp),
+                    Duration::from_secs(10),
+                )
+                .expect("ls");
             assert!(String::from_utf8_lossy(&out).lines().any(|l| l == "f1.txt"));
         },
     );

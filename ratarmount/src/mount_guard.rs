@@ -34,6 +34,8 @@ pub(crate) trait FsIdentity {
     fn cwd(&self) -> io::Result<PathBuf>;
     /// `symlink_metadata` (+ `read_link`); `Err(NotFound)` when missing.
     fn lstat(&self, p: &Path) -> io::Result<Node>;
+    /// `metadata` (symlinks followed): `Dir` or `Other`; `Err` when missing or dangling.
+    fn stat(&self, p: &Path) -> io::Result<Node>;
     /// `(st_dev, st_ino)` of an existing directory.
     fn dir_id(&self, p: &Path) -> Option<(u64, u64)>;
     /// Linux: the mount the kernel resolves `p` into. `None` elsewhere.
@@ -82,6 +84,11 @@ impl FsIdentity for RealFs {
         } else {
             Node::Other
         })
+    }
+
+    fn stat(&self, p: &Path) -> io::Result<Node> {
+        let md = std::fs::metadata(p)?;
+        Ok(if md.is_dir() { Node::Dir } else { Node::Other })
     }
 
     fn dir_id(&self, p: &Path) -> Option<(u64, u64)> {
@@ -383,16 +390,38 @@ fn views<'a, F: FsIdentity>(
             t.anchor.strip_prefix(a).ok()?.to_path_buf()
         }
     };
-    let phys = e0.root.join(below).join(&t.tail);
+    let phys = e0.root.join(&below).join(&t.tail);
     Some(
         mi.iter()
             .filter(|e| e.dev == e0.dev)
             .filter_map(|e| {
-                let rest = phys.strip_prefix(&e.root).ok()?;
+                let rest = match phys.strip_prefix(&e.root) {
+                    Ok(r) => r.to_path_buf(),
+                    Err(_) => alias_rest(fs, e0, e, t)?,
+                };
                 Some((e.mount_point.join(rest), e))
             })
             .collect(),
     )
+}
+
+/// `phys` relative to `e.root` when `t` is spelled differently (case/Unicode alias) from
+/// the entry root below the mount boundary: the entry root is reachable through `e0`, so
+/// find the ancestor of the anchor that is that same directory.
+#[cfg(any(target_os = "linux", test))]
+fn alias_rest<F: FsIdentity>(
+    fs: &F,
+    e0: &MountEntry,
+    e: &MountEntry,
+    t: &Target,
+) -> Option<PathBuf> {
+    let under = e.root.strip_prefix(&e0.root).ok()?;
+    let want = fs.dir_id(&e0.mount_point.join(under))?;
+    let a = t
+        .anchor
+        .ancestors()
+        .find(|a| fs.mount_id(a) == Some(e0.id) && fs.dir_id(a) == Some(want))?;
+    Some(t.anchor.strip_prefix(a).ok()?.join(&t.tail))
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -682,19 +711,39 @@ fn resolve_error_message(e: ResolveError, subject: Subject, given: &Path, defaul
 // Bases and checks
 // ---------------------------------------------------------------------------
 
-/// `looks_like_git`, through the abstraction (`p/.git` exists, or a bare repository).
+/// `looks_like_git`, through the abstraction (`p/.git` exists, or a bare repository);
+/// symlinks are followed like the factory's `is_dir`/`is_file`/`exists`.
 fn looks_like_git_fs<F: FsIdentity>(fs: &F, dir: &Path) -> bool {
-    if fs.lstat(&dir.join(".git")).is_ok() {
+    if !matches!(fs.stat(dir), Ok(Node::Dir)) {
+        return false;
+    }
+    if fs.stat(&dir.join(".git")).is_ok() {
         return true;
     }
-    matches!(fs.lstat(&dir.join("HEAD")), Ok(Node::Other))
-        && matches!(fs.lstat(&dir.join("objects")), Ok(Node::Dir))
-        && matches!(fs.lstat(&dir.join("refs")), Ok(Node::Dir))
+    matches!(fs.stat(&dir.join("HEAD")), Ok(Node::Other))
+        && matches!(fs.stat(&dir.join("objects")), Ok(Node::Dir))
+        && matches!(fs.stat(&dir.join("refs")), Ok(Node::Dir))
 }
 
-/// Every possible base root for every raw local operand, at call time. An operand is a
-/// base when it is a directory now (the literal path wins in the factory when it
-/// exists), and so is its `@REV`-stripped prefix when that is a git repository.
+/// `Path::exists` on a raw operand (any kind, symlinks followed), as
+/// `split_inline_reference` asks before splitting `@REV`.
+fn operand_exists<F: FsIdentity>(fs: &F, c: &Path) -> bool {
+    let Some(name) = c.file_name() else {
+        return matches!(resolve(fs, c), Ok(t) if t.exact());
+    };
+    let parent = match c.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    match resolve(fs, parent) {
+        Ok(t) if t.exact() => fs.stat(&t.full.join(name)).is_ok(),
+        _ => false,
+    }
+}
+
+/// Every possible base root for every raw local operand, at call time. An operand that
+/// exists now is a base when it is a directory (the literal path wins in the factory);
+/// otherwise its `@REV`-stripped prefix is a base when that is a git repository.
 pub(crate) fn bases_now<F: FsIdentity>(
     fs: &F,
     candidates: &[PathBuf],
@@ -717,6 +766,10 @@ pub(crate) fn bases_now<F: FsIdentity>(
                 ))
             }
             _ => {}
+        }
+        // An existing literal path (file included) wins over `@REV` in the factory.
+        if operand_exists(fs, c) {
+            continue;
         }
         let Some(text) = c.to_str() else { continue };
         for (at, _) in text.rmatch_indices('@') {

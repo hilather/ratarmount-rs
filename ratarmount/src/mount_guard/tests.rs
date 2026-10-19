@@ -199,6 +199,32 @@ impl FsIdentity for FakeFs {
             Some(N { k: K::Link(t), .. }) => Ok(Node::Symlink(t.clone())),
         }
     }
+    fn stat(&self, p: &Path) -> io::Result<Node> {
+        let mut cur = p.to_path_buf();
+        for _ in 0..40 {
+            match self.lstat(&cur)? {
+                Node::Symlink(t) => {
+                    let mut n = if t.is_absolute() {
+                        PathBuf::from("/")
+                    } else {
+                        cur.parent().unwrap_or(Path::new("/")).to_path_buf()
+                    };
+                    for c in t.components() {
+                        match c {
+                            Component::ParentDir => {
+                                n.pop();
+                            }
+                            Component::Normal(x) => n.push(x),
+                            _ => {}
+                        }
+                    }
+                    cur = n;
+                }
+                n => return Ok(n),
+            }
+        }
+        Err(io::Error::other("loop"))
+    }
     fn dir_id(&self, p: &Path) -> Option<(u64, u64)> {
         match self.nodes.get(&self.key(p)) {
             Some(N {
@@ -743,12 +769,46 @@ fn regression_mount_in_base_rev_non_git_prefix_not_base() {
 }
 
 #[test]
-fn regression_mount_in_base_rev_both_literal_and_repo() {
+fn regression_mount_in_base_rev_existing_literal_wins_over_repo_prefix() {
+    // The literal directory exists, so the factory serves it, not the repository B.
     let mut fs = FakeFs::std();
     fs.dir("/P/B/.git");
     fs.dir("/P/B@HEAD");
-    refused(run(&fs, "B/mnt", &["B@HEAD"]), &["inside the folder"]);
+    run(&fs, "B/mnt", &["B@HEAD"]).unwrap();
     refused(run(&fs, "B@HEAD/mnt", &["B@HEAD"]), &["inside the folder"]);
+}
+
+/// Regression: an existing archive `B@archive.tar` next to a repository `B` was refused as
+/// the folder `B` (the factory gives an existing literal path precedence).
+#[test]
+fn regression_mount_in_base_rev_existing_file_operand_is_not_split() {
+    let mut fs = FakeFs::std();
+    fs.dir("/P/B/.git");
+    fs.file("/P/B@archive.tar");
+    run(&fs, "B/mnt", &["B@archive.tar"]).unwrap();
+    run(&fs, "/P/B/mnt", &["/P/B@archive.tar"]).unwrap();
+    // A dangling symlink does not exist (`Path::exists`), so the split still applies.
+    let mut fs = FakeFs::std();
+    fs.dir("/P/B/.git");
+    fs.link("/P/B@HEAD", "/nowhere");
+    refused(run(&fs, "B/mnt", &["B@HEAD"]), &["inside the folder"]);
+}
+
+/// Regression: a bare repository with `objects -> ../objects` opened as `B@HEAD` had no
+/// base (the guard used `lstat`, the factory follows symlinks).
+#[test]
+fn regression_mount_in_base_rev_symlinked_bare_repo_is_base() {
+    let mut fs = FakeFs::std();
+    fs.dir("/P/shared/objects");
+    fs.dir("/P/B");
+    fs.file("/P/B/HEAD");
+    fs.dir("/P/B/refs");
+    fs.link("/P/B/objects", "../shared/objects");
+    refused(run(&fs, "B/mnt", &["B@HEAD"]), &["inside the folder"]);
+    // `.git` as a dangling symlink is not `exists()`.
+    let mut fs = FakeFs::std();
+    fs.link("/P/B/.git", "/nowhere");
+    run(&fs, "B/mnt", &["B@HEAD"]).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,6 +1115,25 @@ fn regression_mount_in_base_views_case_alias_anchor_maps_by_identity() {
         run(&fs, "/CC/mnt", &["/FS/P/B"]),
         &["also visible at /FS/P/B/sub/mnt"],
     );
+}
+
+/// Regression: `/FS/C` bound at `/FS/P/B/sub` refused `/FS/C/mnt` but accepted `/FS/c/mnt`
+/// (the bind root was matched lexically below the mount boundary).
+#[test]
+fn regression_mount_in_base_views_case_alias_below_bind_boundary() {
+    let mut fs = FakeFs::new();
+    fs.dir("/FS/P/B/sub");
+    fs.dir("/FS/C");
+    fs.bind("/FS/C", "/FS/P/B/sub", 102);
+    fs.alias("/FS/c", "/FS/C");
+    fs.mountinfo = mi_lines(&["102 1 8:1 /FS/C /FS/P/B/sub rw - ext4 /dev/sda1 rw"]);
+    for mp in ["/FS/C/mnt", "/FS/c/mnt"] {
+        refused(
+            run(&fs, mp, &["/FS/P/B"]),
+            &["inside the folder", "also visible at /FS/P/B/sub/mnt"],
+        );
+    }
+    run(&fs, "/FS/other/mnt", &["/FS/P/B"]).unwrap();
 }
 
 #[test]
