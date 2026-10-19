@@ -242,11 +242,9 @@ fn cache_read_target(index: Option<&Path>) -> Option<PathBuf> {
 
 fn open_cache_read_only(index: Option<&Path>) -> Option<Cache> {
     let index = cache_read_target(index)?;
-    let conn = Connection::open_with_flags(
-        &index,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    // A peek is a pure lookup: it must not create `-wal` / `-shm` beside the
+    // index of a WAL sidecar (see `open_lookup_connection`).
+    let conn = crate::open_lookup_connection(&index).ok()?;
     conn.busy_timeout(Duration::ZERO).ok()?;
     let has_cache: bool = conn
         .query_row(

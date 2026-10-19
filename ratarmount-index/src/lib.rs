@@ -696,6 +696,55 @@ fn reap_stale_writable_tmps(dest: &Path) {
     }
 }
 
+/// A read-only connection for a pure LOOKUP of an existing index.
+///
+/// Opening a WAL-mode database read-only still makes SQLite create `-wal` and
+/// `-shm` beside it (and a read-only connection cannot checkpoint or remove
+/// them), so a lookup would write into the archive's directory. When no
+/// `-wal`, `-shm` or `-journal` exists, no connection holds the file open and
+/// nothing is waiting to be replayed: it is opened `immutable=1`, which reads
+/// the main file alone and creates nothing. When one exists, a live writer owns
+/// the file: it is opened normally so its recent writes stay visible (the side
+/// files already exist, so none is created).
+///
+/// The immutable open is for a connection that reads and is dropped; it must
+/// not be held across a time another process may write the index.
+pub(crate) fn open_lookup_connection(path: &Path) -> rusqlite::Result<Connection> {
+    let plain = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    #[cfg(unix)]
+    if let Some(uri) = quiescent_immutable_uri(path) {
+        if let Ok(conn) = Connection::open_with_flags(&uri, plain | OpenFlags::SQLITE_OPEN_URI) {
+            return Ok(conn);
+        }
+    }
+    Connection::open_with_flags(path, plain)
+}
+
+#[cfg(unix)]
+fn quiescent_immutable_uri(path: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let absolute = path.canonicalize().ok()?;
+    let busy = ["-wal", "-shm", "-journal"].iter().any(|suffix| {
+        let mut side = absolute.clone().into_os_string();
+        side.push(suffix);
+        std::fs::symlink_metadata(side).is_ok()
+    });
+    if busy || !absolute.is_file() {
+        return None;
+    }
+    let mut uri = String::from("file:");
+    for byte in absolute.as_os_str().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(char::from(*byte));
+            }
+            other => uri.push_str(&format!("%{other:02X}")),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Some(uri)
+}
+
 impl SqliteIndex {
     /// Open an existing index file read-only (Phase 0).
     ///
@@ -712,16 +761,36 @@ impl SqliteIndex {
         Self::open_read_only_inner(path, false, false)
     }
 
+    /// [`Self::open_catalog_read_only`] for a LOOKUP that reads and lets go (a
+    /// sidecar's block table, a will-I-rebuild probe): it creates nothing
+    /// beside the index. See [`open_lookup_connection`].
+    pub fn open_lookup(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with(path, false, false, true)
+    }
+
     fn open_read_only_inner(
         path: impl AsRef<Path>,
         announce: bool,
         load_mem: bool,
     ) -> Result<Self> {
+        Self::open_read_only_with(path, announce, load_mem, false)
+    }
+
+    fn open_read_only_with(
+        path: impl AsRef<Path>,
+        announce: bool,
+        load_mem: bool,
+        lookup: bool,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let conn = if lookup {
+            open_lookup_connection(path)?
+        } else {
+            Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?
+        };
         // Favor lookup/list latency on warm mounts (find / getattr storms).
         conn.execute_batch(
             r#"
@@ -5190,6 +5259,72 @@ mod tests {
         assert!(leftover.is_empty(), "tmp leftovers: {leftover:?}");
         let after = std::fs::read(&dest).unwrap();
         assert_eq!(before, after, "dest sidecar must stay the previous file");
+    }
+
+    /// Regression (R6-J4, audit D1-D5, D7): a read-only open of a WAL-mode
+    /// sidecar with no `-wal` / `-shm` beside it created both (and left them),
+    /// so a pure lookup (a block-table load, a will-I-rebuild probe, the digest
+    /// peek every gate runs) wrote into the directory beside the archive. A
+    /// lookup of a quiescent sidecar opens it immutable: nothing is created and
+    /// the file is byte-identical. A sidecar a live mount holds (its `-wal`
+    /// exists) is opened normally, so the mount's recent writes stay visible.
+    #[test]
+    fn regression_read_only_lookup_of_wal_index_creates_no_side_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, vec![5u8; 4096]).unwrap();
+        let path = dir.path().join("a.tar.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.insert_files_batch(&[one_file_row()]).unwrap();
+            drop(idx.into_read_only().unwrap());
+        }
+        let mode: String = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "the published sidecar is a WAL database");
+        let digest = cached_archive_digest(&archive, Some(&path)).unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let names = || {
+            let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, bytes) = (names(), std::fs::read(&path).unwrap());
+
+        let idx = SqliteIndex::open_lookup(&path).unwrap();
+        assert_eq!(idx.file_count_db().unwrap(), 1);
+        drop(idx);
+        assert_eq!(names(), listing, "open_lookup created files");
+        assert_eq!(
+            peek_archive_digest(&archive, Some(&path)).unwrap(),
+            Some(digest)
+        );
+        assert_eq!(names(), listing, "the digest peek created files");
+        assert!(std::fs::read(&path).unwrap() == bytes, "sidecar rewritten");
+
+        // A sidecar a live writer holds (its -wal exists) is read normally.
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE live_marker(x);")
+            .unwrap();
+        assert!(SqliteIndex::open_lookup(&path).is_ok());
+        let seen: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='live_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen, 1);
     }
 }
 

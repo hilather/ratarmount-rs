@@ -2637,7 +2637,7 @@ fn try_load_gzip_index_blob(
     // Read-only catalog open: no banner (TAR opens the index itself), no file
     // table in memory, and a sidecar that fails validation is never opened
     // writable here.
-    let idx = SqliteIndex::open_catalog_read_only(ip).ok()?;
+    let idx = SqliteIndex::open_lookup(ip).ok()?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: gzip RGZI skipped (index fingerprint: {e})");
@@ -3172,7 +3172,7 @@ fn try_load_zstd_blocks(
     // banner): a sidecar that is merely consulted must not gain WAL files or
     // schema changes, and one that does not validate read-only is refused,
     // never retried writable.
-    let idx = SqliteIndex::open_catalog_read_only(ip).ok()?;
+    let idx = SqliteIndex::open_lookup(ip).ok()?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: zstdblocks skipped (index fingerprint: {e})");
@@ -3388,7 +3388,7 @@ fn try_load_bzip2_blocks(
     // banner): a sidecar that is merely consulted must not gain WAL files or
     // schema changes, and one that does not validate read-only is refused,
     // never retried writable.
-    let idx = SqliteIndex::open_catalog_read_only(ip).ok()?;
+    let idx = SqliteIndex::open_lookup(ip).ok()?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: bzip2blocks skipped (index fingerprint: {e})");
@@ -6033,6 +6033,59 @@ mod tests {
         assert!(try_load_zstd_blocks(Some(&index), Some(&archive), false).is_some());
         let _ = try_load_bzip2_blocks(Some(&index), Some(&archive), false);
         assert_eq!(names(), listing, "a lookup created files");
+        assert!(std::fs::read(&index).unwrap() == bytes, "sidecar rewritten");
+    }
+
+    /// Regression (R6-J4, audit D2-D4): the zstd, bzip2 and gzip block loaders
+    /// opened a published WAL sidecar read-only and left `-wal` / `-shm`
+    /// beside the archive. (The R6-G5 test above forces DELETE mode.)
+    #[test]
+    fn regression_blocks_loaders_of_a_wal_sidecar_create_no_side_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        {
+            let members = [ratarmount_formats_tar::UstarMember {
+                path: "f",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: &[],
+            }];
+            let mut file = std::fs::File::create(&archive).unwrap();
+            ratarmount_formats_tar::write_ustar_members(&mut file, &members).unwrap();
+            ratarmount_formats_tar::write_tar_eof(&mut file).unwrap();
+        }
+        let index = dir.path().join("a.tar.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            ..Default::default()
+        };
+        drop(open_path(&archive, &opts, true).expect("cold open"));
+        let mode: String = rusqlite::Connection::open(&index)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "the published sidecar is a WAL database");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        let names = || {
+            let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, bytes) = (names(), std::fs::read(&index).unwrap());
+        let _ = try_load_zstd_blocks(Some(&index), Some(&archive), false);
+        assert_eq!(names(), listing, "the zstd loader created files");
+        let _ = try_load_bzip2_blocks(Some(&index), Some(&archive), false);
+        assert_eq!(names(), listing, "the bzip2 loader created files");
+        let _ = try_load_gzip_index_blob(Some(&index), Some(&archive), false);
+        assert_eq!(names(), listing, "the gzip loader created files");
         assert!(std::fs::read(&index).unwrap() == bytes, "sidecar rewritten");
     }
 
