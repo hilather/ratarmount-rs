@@ -1022,3 +1022,44 @@ fn regression_forced_seal_git_to_dir_and_archive_to_git_clear_stale_rows() {
     let out = env.run(&["--no-mount", "--lower", s(&overlay), &git]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
 }
+
+/// Regression (R6-F4): packing a sealed `none` overlay against another archive
+/// is ACCEPTED (kind-only), but the bundle's database still named the previous
+/// base. The accepted relocation rows now travel into the bundle.
+#[test]
+fn regression_accepted_pack_records_the_base_it_was_packed_against() {
+    let env = Env::new();
+    let (base, _) = fixture(&env, Kind::Archive, false);
+    fs::remove_dir_all(env.path("overlay")).unwrap();
+    let overlay = env.path("overlay");
+    env.ok(&[
+        "--no-mount",
+        "--index-file",
+        ":memory:",
+        "-w",
+        s(&overlay),
+        "--base-digest",
+        "none",
+        s(&base),
+    ]);
+    env.ok(&["overlay", "seal", s(&overlay)]);
+    let recorded = meta_of(&overlay);
+    assert_eq!(recorded.base_digest_kind(), Some("none"));
+    let copy = env.path("elsewhere.tar");
+    fs::copy(&base, &copy).unwrap();
+    let out = verb(&env, Verb::Pack, &overlay, &copy, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let restored = env.path("restored");
+    env.ok(&[
+        "overlay",
+        "unpack",
+        s(&env.path("bundle.tar.zst")),
+        s(&restored),
+    ]);
+    let meta = meta_of(&restored);
+    assert_eq!(meta.get("base_url"), Some(s(&copy)), "base_url");
+    let location = meta.get("base_location").unwrap_or_default();
+    assert!(location.ends_with("elsewhere.tar"), "{location}");
+    // The sealed source layer is never modified.
+    assert_eq!(meta_of(&overlay).get("base_url"), recorded.get("base_url"));
+}

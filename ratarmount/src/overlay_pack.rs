@@ -35,6 +35,11 @@ pub struct PackOptions {
     /// Rows describing the base actually used, written over the bundle's
     /// metadata (`meta.json` and the packed database) by a forced pack.
     pub base_rows: Option<std::collections::BTreeMap<String, String>>,
+    /// Rows for a base the identity gate ACCEPTED at another place (a kind-only
+    /// record, or a strong digest confirming a copy): the bundle names the
+    /// base it was packed against. Unlike `base_rows`, the change set is not
+    /// re-hashed, because the record already declared the bases equivalent.
+    pub accepted_rows: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -291,7 +296,11 @@ pub fn pack(
     // a redacted copy of its database; the source is never modified.
     sweep_pack_temps(output_parent);
     let staging = Stage::new_in(output_parent, PACK_STAGE_PREFIX, false)?;
-    let packed = match &options.base_rows {
+    let packed = match options
+        .base_rows
+        .as_ref()
+        .or(options.accepted_rows.as_ref())
+    {
         Some(rows) => meta.with_rows(rows),
         None => meta.clone(),
     };
@@ -2065,6 +2074,7 @@ mod tests {
                 // takes from the token).
                 base: Some(base.clone()),
                 base_rows: None,
+                accepted_rows: None,
             },
         )
         .unwrap();
