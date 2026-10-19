@@ -3659,7 +3659,8 @@ fn run_fusermount(args: &[&OsStr]) -> std::io::Result<std::process::Output> {
 /// the echoed path (which may contain the phrase, a newline, or be a bare word) is never stripped.
 #[cfg(not(target_os = "macos"))]
 fn is_busy_diagnostic(stderr: &str) -> bool {
-    stderr.trim_end().ends_with(": Device or resource busy")
+    let end = stderr.trim_end();
+    end.ends_with(": Device or resource busy") || end.ends_with(": Resource busy")
 }
 
 #[cfg(not(target_os = "macos"))]

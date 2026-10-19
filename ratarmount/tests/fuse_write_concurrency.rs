@@ -613,9 +613,10 @@ fn mount_visible(mnt: &Path) -> bool {
 const BUSY_RETRY: Duration = Duration::from_secs(1);
 
 /// EBUSY from fusermount: stderr ends with the strerror (`failed to unmount <path>: <strerror>`),
-/// so the echoed mountpoint is never inspected.
+/// so the echoed mountpoint is never inspected. glibc and musl spell EBUSY differently.
 fn stderr_is_busy(stderr: &str) -> bool {
-    stderr.trim_end().ends_with(": Device or resource busy")
+    let end = stderr.trim_end();
+    end.ends_with(": Device or resource busy") || end.ends_with(": Resource busy")
 }
 
 /// `fusermount3 -u` with stderr captured, retried every 50 ms while it reports

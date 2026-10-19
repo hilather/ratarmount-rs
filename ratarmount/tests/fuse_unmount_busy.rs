@@ -98,7 +98,9 @@ impl Log {
 
 /// The new debug retry marker, or the literal fusermount3 stderr older builds inherit.
 fn is_busy_trigger(line: &str) -> bool {
-    line.contains("busy (attempt") || line.contains("Device or resource busy")
+    line.contains("busy (attempt")
+        || line.contains("Device or resource busy")
+        || line.contains(": Resource busy")
 }
 
 /// Holds `<mnt>/file` open until told to release.
