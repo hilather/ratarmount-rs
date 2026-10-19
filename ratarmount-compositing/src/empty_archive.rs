@@ -147,11 +147,11 @@ fn initialize_empty_archive(
     path: &Path,
     kind: EmptyArchiveKind,
 ) -> Result<EmptyCreateOutcome, OverlayError> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp = match parent {
-        Some(dir) => NamedTempFile::new_in(dir)?,
-        None => NamedTempFile::new()?,
-    };
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tmp = NamedTempFile::new_in(parent)?;
     write_empty_archive(tmp.as_file_mut(), kind)?;
     apply_create_mode(tmp.as_file())?;
     tmp.as_file().sync_all()?;
@@ -216,6 +216,42 @@ mod tests {
     use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
     use std::sync::Barrier;
     use std::thread;
+
+    /// Regression: #134 `initialize_empty_archive` on a bare relative zero-byte
+    /// `t.tar` staged its temp file in `$TMPDIR` (EXDEV on `persist`).
+    #[test]
+    fn regression_134_initialize_empty_archive_bare_name_stages_beside_dest() {
+        if std::env::var_os("RATARMOUNT_BARE_NAME_CHILD").is_some() {
+            let out = maybe_create_empty_write_archive(Path::new("t.tar"))
+                .unwrap_or_else(|e| panic!("init bare t.tar: {e}"));
+            assert!(matches!(out, EmptyCreateOutcome::InitializedEmpty));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("t.tar")).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("RATARMOUNT_BARE_NAME_CHILD", "1")
+            .env("TMPDIR", dir.path().join("does-not-exist"))
+            .current_dir(dir.path())
+            .args([
+                "empty_archive::tests::regression_134_initialize_empty_archive_bare_name_stages_beside_dest",
+                "--exact",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child stdout: {}\nchild stderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("running 1 test"),
+            "child must have run the test"
+        );
+        assert!(fs::metadata(dir.path().join("t.tar")).unwrap().len() >= 1024);
+    }
 
     fn decode_zst_payload(path: &Path) -> (usize, u64, Vec<u8>) {
         let map = scan_zstd_frames_path(path).unwrap();
