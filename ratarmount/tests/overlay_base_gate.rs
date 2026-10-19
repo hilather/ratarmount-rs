@@ -1078,3 +1078,84 @@ fn regression_accepted_pack_leaves_rows_and_change_set_untouched() {
     // The layer still modifies A's x.txt: verify against A passes.
     env.ok(&["overlay", "verify", s(&restored), s(&base)]);
 }
+
+/// A repository whose branches `main` and `stable` both point at one commit.
+fn repo_with_two_refs(env: &Env, name: &str, body: &[u8]) -> PathBuf {
+    let dir = env.path(name);
+    let repo = git2::Repository::init(&dir).unwrap();
+    let sig = git2::Signature::new("t", "t@t", &git2::Time::new(0, 0)).unwrap();
+    let blob = repo.blob(body).unwrap();
+    let mut builder = repo.treebuilder(None).unwrap();
+    builder.insert("a.txt", blob, 0o100644).unwrap();
+    let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+    let id = repo
+        .commit(Some("HEAD"), &sig, &sig, "c", &tree, &[])
+        .unwrap();
+    let commit = repo.find_commit(id).unwrap();
+    for branch in ["main", "stable"] {
+        repo.branch(branch, &commit, true).unwrap();
+    }
+    dir
+}
+
+/// Regression (R6-G7, #5): a selector-only change (`repo@stable` over a record
+/// of `repo@main`, same repository and tree) kept `main` in the rows. An
+/// accepted seal writes the new selector; a forced pack against another
+/// repository's `@stable` records that selector in the bundle and the packed
+/// database.
+#[test]
+fn regression_repo_stable_over_main_updates_base_url_in_seal_and_forced_pack() {
+    let env = Env::new();
+    let repo = repo_with_two_refs(&env, "repo", b"git content\n");
+    let main = format!("{}@main", repo.display());
+    let stable = format!("{}@stable", repo.display());
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), &main]);
+    assert!(meta_of(&overlay).base_url().unwrap().ends_with("@main"));
+    env.ok(&["overlay", "seal", s(&overlay), &stable]);
+    let sealed = meta_of(&overlay);
+    assert_eq!(sealed.base_url(), Some(stable.as_str()), "accepted seal");
+    // An ACCEPTED pack leaves the rows as recorded (the sealed record decides;
+    // only a forced relocation rewrites them, R6-G1).
+    let accepted_overlay = env.path("accepted-overlay");
+    env.ok(&["--no-mount", "-w", s(&accepted_overlay), &main]);
+    env.ok(&["overlay", "seal", s(&accepted_overlay)]);
+    let accepted = env.path("accepted.tar.zst");
+    let out = env.run(&[
+        "overlay",
+        "pack",
+        s(&accepted_overlay),
+        s(&accepted),
+        &stable,
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        bundle_meta_json(&accepted)["base_url"],
+        main.as_str(),
+        "accepted pack leaves the recorded rows"
+    );
+    // A different repository (another tree), selector @stable: forced pack.
+    let other = repo_with_two_refs(&env, "other", b"other content\n");
+    let other_stable = format!("{}@stable", other.display());
+    let bundle = env.path("bundle.tar.zst");
+    let out = env.run(&[
+        "overlay",
+        "pack",
+        s(&overlay),
+        s(&bundle),
+        &other_stable,
+        "--force-base-mismatch",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let json = bundle_meta_json(&bundle);
+    assert_eq!(json["base_url"], other_stable.as_str(), "{json}");
+    let restored = env.path("restored");
+    env.ok(&["overlay", "unpack", s(&bundle), s(&restored)]);
+    assert_eq!(
+        meta_of(&restored).base_url(),
+        Some(other_stable.as_str()),
+        "packed database"
+    );
+    // The sealed source layer keeps its own record.
+    assert_eq!(meta_of(&overlay).base_url(), Some(stable.as_str()));
+}
