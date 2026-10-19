@@ -36,7 +36,6 @@ pub(crate) enum Restamp {
 pub(crate) enum Rows<'a> {
     None,
     Shared(&'a Mutex<Connection>),
-    Owned(&'a Connection),
     /// An overlay database opened (read-write, never created) when the hook
     /// runs. A raw overlay directory has none: nothing to restamp.
     Path(&'a Path),
@@ -47,7 +46,6 @@ impl Rows<'_> {
         match self {
             Rows::None => Ok(()),
             Rows::Shared(db) => f(&db.lock().unwrap_or_else(|e| e.into_inner())),
-            Rows::Owned(conn) => f(conn),
             Rows::Path(db) => {
                 if !db.is_file() {
                     return Ok(());
