@@ -49,6 +49,39 @@ pub fn recover(archive: &Path) -> io::Result<bool> {
     }
 }
 
+/// What a pending journal says about the archive it was started for. Read
+/// without a lock and without writing, so a caller can decide whether the
+/// journal is its own BEFORE [`recover`] rolls anything back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingJournal {
+    /// Device and inode of the archive when the journal started (hints: device
+    /// numbers may change on reboot).
+    pub dev: u64,
+    pub ino: u64,
+    /// Size and mtime (nanoseconds since the epoch) of the archive BEFORE the
+    /// replacement began: what a rollback restores.
+    pub len: u64,
+    pub mtime_ns: i128,
+    /// Where the replaced suffix starts and the length the replacement ends at.
+    pub offset: u64,
+    pub new_len: u64,
+}
+
+/// The journal pending for `archive`, found the way [`recover`] finds it (the
+/// inode locator first, then the sibling path). `Ok(None)` when there is none
+/// or the platform has no journals. Never writes.
+pub fn pending(archive: &Path) -> io::Result<Option<PendingJournal>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix::pending(archive)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = archive;
+        Ok(None)
+    }
+}
+
 /// Replace a staged suffix. On an ordinary failure, recover before returning.
 pub fn replace_suffix(archive: &Path, offset: u64, suffix: &mut File) -> io::Result<()> {
     replace_suffix_if_original(archive, offset, suffix, None)
@@ -439,6 +472,51 @@ mod unix {
         }
         rollback(&path, &mut file, state == Some(b'C')).map_err(|e| recovery_error(&path, e))?;
         Ok(true)
+    }
+
+    pub(super) fn pending(archive: &Path) -> io::Result<Option<PendingJournal>> {
+        let probe = match File::open(archive) {
+            Ok(f) if f.metadata()?.is_file() => f,
+            Ok(_) => return Ok(None),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        };
+        let path = get_marker(&probe)?
+            .map(|(_, p)| p)
+            .unwrap_or_else(|| journal_path(archive));
+        let mut journal = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(f) if f.metadata()?.is_file() => f,
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut header = [0; HEADER_LEN as usize];
+        journal.read_exact(&mut header)?;
+        if &header[..8] != MAGIC {
+            return Err(io::Error::other("journal header/length mismatch"));
+        }
+        let get = |i: usize| u64::from_le_bytes(header[i..i + 8].try_into().unwrap());
+        Ok(Some(PendingJournal {
+            dev: get(8),
+            ino: get(16),
+            len: get(24),
+            offset: get(32),
+            mtime_ns: i128::from(get(40) as i64) * 1_000_000_000 + i128::from(get(48)),
+            new_len: get(56),
+        }))
     }
 
     fn matches_tail(
@@ -857,5 +935,30 @@ mod tests {
         fs::rename(replacement, &path).unwrap();
         assert!(recover(&path).is_err());
         assert_eq!(fs::read(path).unwrap(), b"unrelated archive");
+    }
+
+    /// Regression (R6-G2): `pending` reads the header a recovery would act on
+    /// without writing: the archive, its journal and the locator are unchanged.
+    #[test]
+    fn append_journal_pending_reads_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        assert_eq!(pending(&path).unwrap(), None);
+        fs::write(&path, b"plain").unwrap();
+        assert_eq!(pending(&path).unwrap(), None);
+        interrupted(&path, "archive truncate");
+        let journal = journal_path(&path);
+        let (archive_before, journal_before) =
+            (fs::read(&path).unwrap(), fs::read(&journal).unwrap());
+        let found = pending(&path).unwrap().expect("a journal is pending");
+        assert_eq!(found.len, b"prefix:old contents".len() as u64);
+        assert_eq!(found.offset, 7);
+        assert_eq!(found.new_len, 7 + b"new contents are longer".len() as u64);
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(found.ino, std::os::unix::fs::MetadataExt::ino(&meta));
+        assert_eq!(fs::read(&path).unwrap(), archive_before);
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
+        assert!(recover(&path).unwrap());
+        assert_eq!(pending(&path).unwrap(), None);
     }
 }

@@ -924,3 +924,194 @@ fn regression_repo_stable_over_main_updates_base_url() {
     .unwrap();
     assert!(open_with(&other, &overlay, BaseDigestRequest::Compute, false).is_err());
 }
+
+/// Leave `archive` mid-commit the way a crash does: the journal and the locator
+/// exist, the archive is truncated at the replaced suffix.
+fn interrupt_append(archive: &Path) {
+    use std::io::Write;
+    let len = fs::metadata(archive).unwrap().len();
+    let mut suffix = tempfile::tempfile().unwrap();
+    suffix.write_all(&[0u8; 1536]).unwrap();
+    let crashed = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+        archive,
+        len - 1024,
+        &mut suffix,
+        &mut |step| {
+            if step == "archive truncate" {
+                Err(std::io::Error::other("crash"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(crashed.is_err());
+}
+
+/// Regression (R6-G2): the mounted base replaced by ANOTHER archive that carries
+/// its own interrupted-append journal was restored (rolled back or truncated)
+/// by `recover` before the identity guard rejected it. The commit is refused
+/// first: the foreign archive and its journal stay byte-identical. Live and
+/// on-exit paths, every digest kind (`none` is caught by the inode).
+#[test]
+fn regression_foreign_archive_with_own_journal_refused_untouched() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        for digest in [BaseDigestRequest::Compute, BaseDigestRequest::None] {
+            let fx = Fixture::new();
+            let ov = fx.open(digest.clone(), false);
+            fs::write(ov.root().join("one"), b"one").unwrap();
+            let foreign = fx.archive.with_file_name("foreign.tar");
+            write_tar(&foreign, &[("other", b"a different base"), ("more", b"x")]);
+            interrupt_append(&foreign);
+            let crashed_bytes = fs::read(&foreign).unwrap();
+            let journal = ratarmount_compress::commit_journal::journal_path(&foreign);
+            let journal_bytes = fs::read(&journal).unwrap();
+            fs::rename(&foreign, &fx.archive).unwrap();
+            let err = commit(&ov, &fx.archive, path).unwrap_err().to_string();
+            assert!(err.contains("--force-base-mismatch"), "{path:?}: {err}");
+            assert!(
+                fs::read(&fx.archive).unwrap() == crashed_bytes,
+                "{path:?}: the foreign archive was modified"
+            );
+            assert!(
+                fs::read(&journal).unwrap() == journal_bytes,
+                "{path:?}: the foreign journal was modified"
+            );
+            assert!(!ov.interval_disabled(), "{path:?}: not failed closed");
+        }
+    }
+}
+
+/// One real crash: kill this very process with SIGKILL at journal step
+/// `RATARMOUNT_TEST_CRASH_STEP` while it replaces the suffix of the archive
+/// named by `RATARMOUNT_TEST_CRASH_ARCHIVE`. A no-op unless both are set (the
+/// parent test below runs it as a child).
+#[test]
+fn journal_crash_child() {
+    use std::io::Write;
+    let (Some(archive), Ok(step)) = (
+        std::env::var_os("RATARMOUNT_TEST_CRASH_ARCHIVE"),
+        std::env::var("RATARMOUNT_TEST_CRASH_STEP"),
+    ) else {
+        return;
+    };
+    let archive = PathBuf::from(archive);
+    let len = fs::metadata(&archive).unwrap().len();
+    let mut suffix = tempfile::tempfile().unwrap();
+    suffix.write_all(&[0u8; 1536]).unwrap();
+    let _ = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+        &archive,
+        len - 1024,
+        &mut suffix,
+        &mut |at| {
+            if at == step {
+                unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+            Ok(())
+        },
+    );
+}
+
+const JOURNAL_STEPS: [&str; 14] = [
+    "journal header",
+    "journal tail",
+    "journal fsync",
+    "locator prepare",
+    "journal publish",
+    "journal directory fsync",
+    "locator active",
+    "archive truncate",
+    "archive write",
+    "archive fsync",
+    "locator complete",
+    "journal unlink",
+    "commit directory fsync",
+    "locator clear",
+];
+
+/// Regression (R6-G2): the guard now runs BEFORE recovery for a foreign
+/// journal, but the overlay's OWN torn append must still recover. A real
+/// SIGKILL at every journal phase: until the replacement is complete the
+/// archive rolls back to the recorded base and the next commit succeeds; once
+/// complete it keeps the new bytes (the recorded stamp no longer matches, so
+/// that commit is refused as a changed base) - never a torn archive, and the
+/// journal is gone after the commit attempt either way.
+#[cfg(unix)]
+#[test]
+fn regression_real_sigkill_at_every_journal_phase_still_recovers() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for step in JOURNAL_STEPS {
+        for path in [Path_::Live, Path_::OnExit] {
+            let fx = Fixture::new();
+            let ov = fx.open(BaseDigestRequest::Compute, false);
+            let original = fs::read(&fx.archive).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "overlay_identity_tests::journal_crash_child"])
+                .args(["--test-threads=1", "--nocapture"])
+                .env("RATARMOUNT_TEST_CRASH_ARCHIVE", &fx.archive)
+                .env("RATARMOUNT_TEST_CRASH_STEP", step)
+                .status()
+                .unwrap();
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(libc::SIGKILL), "{step}: {status:?}");
+            }
+            fs::write(ov.root().join("one"), b"one").unwrap();
+            let result = commit(&ov, &fx.archive, path);
+            let complete = JOURNAL_STEPS.iter().position(|s| *s == step).unwrap()
+                >= JOURNAL_STEPS
+                    .iter()
+                    .position(|s| *s == "locator complete")
+                    .unwrap();
+            let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+            assert!(!journal.exists(), "{step} {path:?}: journal recovered");
+            if complete {
+                let err = result.unwrap_err().to_string();
+                assert!(err.contains("--force-base-mismatch"), "{step}: {err}");
+            } else {
+                assert!(result.unwrap_or_else(|e| panic!("{step} {path:?}: {e}")));
+                let served = fs::read(&fx.archive).unwrap();
+                assert!(served.len() >= original.len(), "{step}");
+            }
+        }
+    }
+}
+
+/// Regression (R6-G2): an archive replaced (new inode) after a crash is
+/// refused: a journal started for the old file never rolls back its successor.
+#[test]
+fn regression_archive_replaced_after_crash_is_refused() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        let fx = Fixture::new();
+        let ov = fx.open(BaseDigestRequest::Compute, false);
+        fs::write(ov.root().join("one"), b"one").unwrap();
+        interrupt_append(&fx.archive);
+        let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+        let journal_bytes = fs::read(&journal).unwrap();
+        let replacement = fx.archive.with_file_name("replacement.tar");
+        write_tar(&replacement, &[("other", b"a different base")]);
+        let replaced = fs::read(&replacement).unwrap();
+        fs::rename(&replacement, &fx.archive).unwrap();
+        let err = commit(&ov, &fx.archive, path).unwrap_err().to_string();
+        assert!(err.contains("--force-base-mismatch"), "{path:?}: {err}");
+        assert!(
+            fs::read(&fx.archive).unwrap() == replaced,
+            "{path:?}: the replacement was modified"
+        );
+        assert!(
+            fs::read(&journal).unwrap() == journal_bytes,
+            "{path:?}: the journal was modified"
+        );
+    }
+}

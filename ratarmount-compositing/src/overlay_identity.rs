@@ -144,6 +144,51 @@ pub struct ActualBase {
     pub(crate) index_for_peek: Option<PathBuf>,
     /// The index the opener selected (never a credentialed one).
     pub(crate) index_path: Option<PathBuf>,
+    /// Device and inode of a local archive when the token was minted (or last
+    /// re-pointed): the file a commit may rewrite, whatever name reaches it.
+    pub(crate) file_id: Option<FileId>,
+    /// The first typed input with only its parent resolved, so a commit that
+    /// names the mounted base through a symlink is still recognised after
+    /// the link is retargeted.
+    pub(crate) typed_named: Option<PathBuf>,
+}
+
+/// Device and inode of a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    /// Of the file `path` resolves to (symlinks followed).
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).ok().map(|m| Self {
+                dev: m.dev(),
+                ino: m.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+}
+
+/// `path` with its parent resolved and the last component left as named: the
+/// name a user gave, even when that name is a symlink that later moves.
+pub(crate) fn named_path(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(std::env::current_dir, |p| p.canonicalize())
+        .ok()?;
+    Some(parent.join(name))
 }
 
 impl std::fmt::Debug for ActualBase {
@@ -374,6 +419,8 @@ pub(crate) struct Inner {
 ///     remote_token: None,
 ///     index_for_peek: None,
 ///     index_path: None,
+///     file_id: None,
+///     typed_named: None,
 /// };
 /// ```
 ///
@@ -902,6 +949,15 @@ impl ClassifiedBase {
             },
             _ => None,
         };
+        let local_archive = match (&base_kind, &location) {
+            (BaseKind::Archive, Some(BaseLocation::Local(path))) => Some(path.clone()),
+            _ => None,
+        };
+        let file_id = local_archive.as_deref().and_then(FileId::of);
+        let typed_named = local_archive
+            .as_ref()
+            .filter(|_| !raw_first.contains("://"))
+            .and_then(|_| named_path(Path::new(raw_first)));
         let actual = ActualBase {
             kind: base_kind,
             location,
@@ -911,6 +967,8 @@ impl ClassifiedBase {
             remote_token,
             index_for_peek,
             index_path,
+            file_id,
+            typed_named,
         };
         Ok(Self {
             inner: Arc::new(Inner {
@@ -937,6 +995,7 @@ impl ClassifiedBase {
         actual.kind = BaseKind::Archive;
         actual.location = Some(BaseLocation::Local(canonical_or_same(archive)));
         actual.git_tree = None;
+        actual.file_id = FileId::of(archive);
         Self {
             inner: Arc::new(Inner {
                 source: self.inner.source.clone(),

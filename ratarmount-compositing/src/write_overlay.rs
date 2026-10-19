@@ -3382,6 +3382,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
+        self.check_pending_journal_is_ours(archive)?;
         ratarmount_compress::commit_journal::recover(archive)?;
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
@@ -4023,6 +4024,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
+        self.check_pending_journal_is_ours(archive)?;
         if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
             self.refuse_base_after_commit_failure();
             return Err(e.into());
@@ -4337,6 +4339,20 @@ impl WriteOverlay {
                 Ok(())
             }
             Err(refusal) => Err(OverlayError::Msg(refusal.0)),
+        }
+    }
+
+    /// Before recovery touches the archive: a pending commit journal may only be
+    /// rolled back when the archive is still the base this overlay recorded.
+    /// A foreign archive that carries its own interrupted journal (a replacement
+    /// moved over the mounted base) is refused here, byte-identical, instead of
+    /// being restored or truncated and only then rejected. Recovery still runs
+    /// first for the overlay's own torn append: its journal describes the
+    /// recorded state. `--force-base-mismatch` accepts the foreign archive.
+    fn check_pending_journal_is_ours(&self, archive: &Path) -> Result<()> {
+        match ratarmount_compress::commit_journal::pending(archive) {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) | Err(_) => self.check_commit_identity(archive),
         }
     }
 

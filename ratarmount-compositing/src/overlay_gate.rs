@@ -462,25 +462,16 @@ pub(crate) fn check_commit_base(
     let canonical = archive
         .canonicalize()
         .map_err(|e| refuse(format!("cannot resolve {}: {e}", archive.display())))?;
-    if &canonical != path {
-        // The path the commit names, with only its parent resolved, is the
-        // mounted base when it equals the token's path: the file there was
-        // replaced (by a symlink to another archive). Any other path is an
-        // archive the token does not describe.
-        let named = archive
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map_or_else(std::env::current_dir, |p| p.canonicalize())
-            .ok()
-            .zip(archive.file_name())
-            .map(|(dir, name)| dir.join(name));
-        if named.as_deref() == Some(path.as_path()) {
-            return Err(refuse(format!(
-                "{} no longer is the archive that was recorded (it now resolves to {})",
-                archive.display(),
-                canonical.display()
-            )));
-        }
+    // The commit names the mounted base when it resolves to the token's path,
+    // or when the name it gives (parent resolved, the last component left as
+    // named) is the token's path or the name the user typed: the file behind
+    // that name may have been replaced or a symlink retargeted since.
+    let named = crate::overlay_identity::named_path(archive);
+    let names_base = &canonical == path
+        || named.as_deref() == Some(path.as_path())
+        || (named.is_some() && named == actual.typed_named);
+    if !names_base {
+        // An archive the token does not describe (a union's other member).
         return Ok(());
     }
     let metadata = std::fs::metadata(&canonical)
@@ -488,6 +479,17 @@ pub(crate) fn check_commit_base(
     if !metadata.is_file() {
         return Err(refuse(format!(
             "{} is no longer a regular file",
+            canonical.display()
+        )));
+    }
+    let same_file = match actual.file_id {
+        Some(id) => crate::overlay_identity::FileId::of(&canonical) == Some(id),
+        None => &canonical == path,
+    };
+    if !same_file {
+        return Err(refuse(format!(
+            "{} no longer is the archive that was recorded (it now resolves to {})",
+            archive.display(),
             canonical.display()
         )));
     }
@@ -502,6 +504,33 @@ pub(crate) fn check_commit_base(
     let (Some(size), Some(mtime)) = (meta.get("base_size"), meta.get("base_mtime_ns")) else {
         return Ok(());
     };
+    // A commit journal is pending: recovery rolls the archive back to the state
+    // the journal recorded BEFORE this commit writes, so that state is what the
+    // recorded stamp must describe. A journal that describes another state
+    // belongs to another archive; it is left unread by recovery and refused.
+    match ratarmount_compress::commit_journal::pending(&canonical) {
+        Ok(None) => {}
+        Ok(Some(journal)) => {
+            return if journal.len.to_string() == size && journal.mtime_ns.to_string() == mtime {
+                Ok(())
+            } else {
+                Err(refuse(format!(
+                    "{} carries a commit journal that was not started for the recorded base \
+                     (it rolls back to size={},mtime_ns={}, size={size},mtime_ns={mtime} recorded); \
+                     the journal was not applied",
+                    canonical.display(),
+                    journal.len,
+                    journal.mtime_ns
+                )))
+            };
+        }
+        Err(e) => {
+            return Err(refuse(format!(
+                "cannot read the commit journal of {}: {e}",
+                canonical.display()
+            )))
+        }
+    }
     let now = ArchiveDigestStamp::read(&canonical)
         .map_err(|e| refuse(format!("cannot stat {}: {e}", canonical.display())))?;
     if now.size.to_string() != size || now.mtime_ns.to_string() != mtime {
