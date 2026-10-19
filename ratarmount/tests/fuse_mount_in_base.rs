@@ -474,7 +474,19 @@ fn kill_unreaped(child: &mut Child) -> bool {
 
 trait CleanupOps {
     fn owned_connections(&mut self) -> Vec<u32>;
-    fn abort_connection(&mut self, minor: u32);
+    /// Open `/sys/fs/fuse/connections/<minor>/abort` for writing and hold the handle.
+    /// Returns the inode of the opened abort file (the identity of that connection);
+    /// `None` when it cannot be opened.
+    fn open_abort(&mut self, minor: u32) -> Option<u64>;
+    /// Inode of `/sys/fs/fuse/connections/<minor>/abort` as the path resolves it now.
+    fn connection_ino(&mut self, minor: u32) -> Option<u64>;
+    /// From a fresh mountinfo read: a FUSE mount under the root carries `minor` and no
+    /// mount outside the root does.
+    fn owns_connection(&mut self, minor: u32) -> bool;
+    /// Write to the held handle (and drop it).
+    fn write_abort(&mut self, minor: u32);
+    /// Drop a held handle without writing.
+    fn drop_abort(&mut self, minor: u32);
     fn kill_children(&mut self);
     fn marker_pids(&mut self) -> Vec<i32>;
     fn pid_alive(&mut self, pid: i32) -> bool;
@@ -487,6 +499,22 @@ trait CleanupOps {
     fn sleep(&mut self, d: Duration);
 }
 
+/// Abort `minor` only when ownership is re-established against the same connection: the
+/// abort file is opened first (the handle pins that connection), then a fresh mountinfo
+/// read must still show a mount of this root carrying it and the connection directory's
+/// identity must be unchanged. Otherwise the connection number may have been reused
+/// since it was captured and nothing is written (kill + lazy unmount still run).
+fn abort_owned(ops: &mut dyn CleanupOps, minor: u32) {
+    let Some(held) = ops.open_abort(minor) else {
+        return;
+    };
+    if ops.owns_connection(minor) && ops.connection_ino(minor) == Some(held) {
+        ops.write_abort(minor);
+    } else {
+        ops.drop_abort(minor);
+    }
+}
+
 fn cleanup_with(
     ops: &mut dyn CleanupOps,
     connections: &mut BTreeSet<u32>,
@@ -497,7 +525,7 @@ fn cleanup_with(
     let mut pids: BTreeSet<i32> = ops.marker_pids().into_iter().collect();
     // 1. Abort every captured connection, independent of the mount still being listed.
     for c in connections.iter() {
-        ops.abort_connection(*c);
+        abort_owned(ops, *c);
     }
     // 2. Registered children.
     ops.kill_children();
@@ -559,27 +587,70 @@ struct RealOps<'a> {
     token: &'a str,
     root: &'a Path,
     children: &'a mut Vec<Child>,
+    held: BTreeMap<u32, fs::File>,
+}
+
+impl<'a> RealOps<'a> {
+    fn new(token: &'a str, root: &'a Path, children: &'a mut Vec<Child>) -> Self {
+        Self {
+            token,
+            root,
+            children,
+            held: BTreeMap::new(),
+        }
+    }
 }
 
 impl CleanupOps for RealOps<'_> {
     fn owned_connections(&mut self) -> Vec<u32> {
         owned_connections(self.root)
     }
-    fn abort_connection(&mut self, minor: u32) {
+    fn open_abort(&mut self, minor: u32) -> Option<u64> {
         #[cfg(target_os = "linux")]
         {
-            let reused = fs::read("/proc/self/mountinfo")
-                .is_ok_and(|b| connection_reused_elsewhere(&b, self.root, minor));
-            if reused {
-                return;
-            }
+            use std::os::unix::fs::MetadataExt;
             let p = format!("/sys/fs/fuse/connections/{minor}/abort");
-            if let Ok(mut f) = OpenOptions::new().write(true).open(p) {
-                let _ = f.write_all(b"1");
-            }
+            let f = OpenOptions::new().write(true).open(p).ok()?;
+            // The abort file's parent directory is the connection; the file's own
+            // inode is stable for the life of that connection and is not reused by
+            // the next one (a new connection creates a new directory and files).
+            let ino = f.metadata().ok()?.ino();
+            self.held.insert(minor, f);
+            Some(ino)
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = minor;
+        {
+            let _ = minor;
+            None
+        }
+    }
+    fn connection_ino(&mut self, minor: u32) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(format!("/sys/fs/fuse/connections/{minor}/abort"))
+                .ok()
+                .map(|m| m.ino())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = minor;
+            None
+        }
+    }
+    fn owns_connection(&mut self, minor: u32) -> bool {
+        fs::read("/proc/self/mountinfo").is_ok_and(|b| {
+            owned_connections_from(&b, self.root).contains(&minor)
+                && !connection_reused_elsewhere(&b, self.root, minor)
+        })
+    }
+    fn write_abort(&mut self, minor: u32) {
+        if let Some(mut f) = self.held.remove(&minor) {
+            let _ = f.write_all(b"1");
+        }
+    }
+    fn drop_abort(&mut self, minor: u32) {
+        self.held.remove(&minor);
     }
     fn kill_children(&mut self) {
         for c in self.children.iter_mut() {
@@ -660,11 +731,7 @@ struct Guard {
 
 impl Guard {
     fn cleanup(&mut self) -> Result<(), String> {
-        let mut ops = RealOps {
-            token: &self.token,
-            root: &self.root_path,
-            children: &mut self.children,
-        };
+        let mut ops = RealOps::new(&self.token, &self.root_path, &mut self.children);
         cleanup_with(&mut ops, &mut self.connections, self.confirm_override)
     }
 
@@ -890,13 +957,9 @@ impl Env {
         let found = owned_connections(&self.root);
         self.guard.connections.extend(found);
         if run.status.is_none() {
-            let mut ops = RealOps {
-                token: &self.token,
-                root: &self.root,
-                children: &mut self.guard.children,
-            };
+            let mut ops = RealOps::new(&self.token, &self.root, &mut self.guard.children);
             for c in self.guard.connections.clone() {
-                ops.abort_connection(c);
+                abort_owned(&mut ops, c);
             }
             ops.kill_children();
             eprintln!(
@@ -925,12 +988,8 @@ impl Env {
         let found = owned_connections(&self.root);
         self.guard.connections.extend(found);
         for c in self.guard.connections.clone() {
-            RealOps {
-                token: &self.token,
-                root: &self.root,
-                children: &mut self.guard.children,
-            }
-            .abort_connection(c);
+            let mut ops = RealOps::new(&self.token, &self.root, &mut self.guard.children);
+            abort_owned(&mut ops, c);
         }
         kill_and_reap(&mut self.guard.children[idx], Duration::from_secs(2));
         eprintln!("probe timed out after {timeout:?}");
@@ -1086,6 +1145,25 @@ struct FakeOps {
     log: Vec<String>,
     alive: Vec<i32>,
     mounts: Vec<PathBuf>,
+    /// Inode the held abort handle reports.
+    held_ino: Option<u64>,
+    /// Inode the connection path resolves to after the handle was opened.
+    path_ino: Option<u64>,
+    /// Fresh mountinfo still shows a mount of this root carrying the connection.
+    owned: bool,
+}
+
+impl FakeOps {
+    fn new(alive: Vec<i32>, mounts: Vec<PathBuf>) -> Self {
+        FakeOps {
+            log: Vec::new(),
+            alive,
+            mounts,
+            held_ino: Some(7),
+            path_ino: Some(7),
+            owned: true,
+        }
+    }
 }
 
 impl CleanupOps for FakeOps {
@@ -1093,8 +1171,23 @@ impl CleanupOps for FakeOps {
         self.log.push("owned_connections".into());
         vec![85]
     }
-    fn abort_connection(&mut self, minor: u32) {
+    fn open_abort(&mut self, minor: u32) -> Option<u64> {
+        self.log.push(format!("open_abort {minor}"));
+        self.held_ino
+    }
+    fn connection_ino(&mut self, minor: u32) -> Option<u64> {
+        self.log.push(format!("connection_ino {minor}"));
+        self.path_ino
+    }
+    fn owns_connection(&mut self, minor: u32) -> bool {
+        self.log.push(format!("owns {minor}"));
+        self.owned
+    }
+    fn write_abort(&mut self, minor: u32) {
         self.log.push(format!("abort {minor}"));
+    }
+    fn drop_abort(&mut self, minor: u32) {
+        self.log.push(format!("drop_abort {minor}"));
     }
     fn kill_children(&mut self) {
         self.log.push("kill_children".into());
@@ -1130,15 +1223,13 @@ impl CleanupOps for FakeOps {
 
 #[test]
 fn regression_mount_in_base_guard_cleanup_order_capture_abort_kill() {
-    let mut ops = FakeOps {
-        log: Vec::new(),
-        alive: vec![4242],
-        mounts: vec![PathBuf::from("/m")],
-    };
+    let mut ops = FakeOps::new(vec![4242], vec![PathBuf::from("/m")]);
     let mut conns = BTreeSet::new();
     cleanup_with(&mut ops, &mut conns, None).unwrap();
     let pos = |needle: &str| ops.log.iter().position(|l| l == needle).unwrap();
-    assert!(pos("owned_connections") < pos("abort 85"));
+    assert!(pos("owned_connections") < pos("open_abort 85"));
+    assert!(pos("open_abort 85") < pos("owns 85"));
+    assert!(pos("owns 85") < pos("abort 85"));
     assert!(pos("abort 85") < pos("kill_children"));
     assert!(pos("kill_children") < pos("kill 4242"));
     assert!(pos("kill 4242") < pos("lazy /m"));
@@ -1156,6 +1247,48 @@ fn regression_mount_in_base_guard_stale_connection_reused_elsewhere_is_not_abort
     assert!(connection_reused_elsewhere(mi, root, 89));
     assert!(!connection_reused_elsewhere(mi, root, 90));
     assert!(!connection_reused_elsewhere(mi, root, 91));
+}
+
+/// Regression: cleanup validated ownership of a captured connection number from
+/// mountinfo, then reopened `/sys/fs/fuse/connections/<n>/abort` by number; a mount
+/// of another test that reused `<n>` between the two was aborted. Ownership must be
+/// re-established after the abort file is open, against the same connection.
+#[test]
+fn regression_mount_in_base_guard_abort_not_written_when_number_reused_after_open() {
+    // Reuse after the handle was opened: mountinfo no longer shows our mount.
+    let mut ops = FakeOps::new(vec![], vec![]);
+    ops.owned = false;
+    cleanup_with(&mut ops, &mut BTreeSet::new(), None).unwrap();
+    assert!(
+        ops.log.contains(&"drop_abort 85".to_string()),
+        "{:?}",
+        ops.log
+    );
+    assert!(!ops.log.contains(&"abort 85".to_string()), "{:?}", ops.log);
+    // The connection directory now resolves to a different inode (replaced).
+    let mut ops = FakeOps::new(vec![], vec![]);
+    ops.path_ino = Some(8);
+    cleanup_with(&mut ops, &mut BTreeSet::new(), None).unwrap();
+    assert!(!ops.log.contains(&"abort 85".to_string()), "{:?}", ops.log);
+    // The connection vanished (path gone) or could not be opened.
+    let mut ops = FakeOps::new(vec![], vec![]);
+    ops.path_ino = None;
+    cleanup_with(&mut ops, &mut BTreeSet::new(), None).unwrap();
+    assert!(!ops.log.contains(&"abort 85".to_string()), "{:?}", ops.log);
+    let mut ops = FakeOps::new(vec![], vec![]);
+    ops.held_ino = None;
+    cleanup_with(&mut ops, &mut BTreeSet::new(), None).unwrap();
+    assert!(
+        !ops.log.iter().any(|l| l.starts_with("owns")),
+        "{:?}",
+        ops.log
+    );
+    // Verified: written, and the kill + lazy unmount steps run regardless.
+    let mut ops = FakeOps::new(vec![], vec![PathBuf::from("/m")]);
+    ops.owned = false;
+    cleanup_with(&mut ops, &mut BTreeSet::new(), None).unwrap();
+    assert!(ops.log.contains(&"kill_children".to_string()));
+    assert!(ops.log.contains(&"lazy /m".to_string()));
 }
 
 #[test]
@@ -1779,9 +1912,25 @@ fn regression_mount_in_base_refuses_rev_literal_created_by_index_folders() {
         );
         assert!(!env.root.join("B@HEAD/mnt").exists());
     } else {
-        // The factory rejected this operand order before the decisive check.
-        assert_ne!(run.code(), Some(0), "{}", run.stderr_text());
+        // The factory rejected this operand order before the decisive check: a completed
+        // run (not a crash or timeout) whose stderr names the failing operand.
+        assert!(
+            matches!(run.code(), Some(1) | Some(2)),
+            "exit {:?} (status {:?}): {}",
+            run.code(),
+            run.status,
+            run.stderr_text()
+        );
+        assert!(
+            run.stderr_text().contains("B@HEAD"),
+            "no factory error naming B@HEAD: {}",
+            run.stderr_text()
+        );
         assert!(owned_mounts(&env.root).is_empty());
+        assert!(
+            scan_marker_pids(&env.token, &env.root).is_empty(),
+            "a daemon survived the failed run"
+        );
     }
     done(env);
 }

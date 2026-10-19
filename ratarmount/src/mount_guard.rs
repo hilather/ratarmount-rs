@@ -416,7 +416,13 @@ fn alias_rest<F: FsIdentity>(
     t: &Target,
 ) -> Option<PathBuf> {
     let under = e.root.strip_prefix(&e0.root).ok()?;
-    let want = fs.dir_id(&e0.mount_point.join(under))?;
+    let via_e0 = e0.mount_point.join(under);
+    // The path may now be overmounted by an unrelated mount: its inode is then not
+    // the entry root inside `e0`.
+    if fs.mount_id(&via_e0) != Some(e0.id) {
+        return None;
+    }
+    let want = fs.dir_id(&via_e0)?;
     let a = t
         .anchor
         .ancestors()
@@ -506,23 +512,31 @@ fn relation_view<F: FsIdentity>(
     }
     let p = e.mount_point.parent().unwrap_or_else(|| Path::new("/"));
     let pid = fs.mount_id(p)?;
-    if Some(pid) != fs.mount_id(&base.anchor) {
-        return None;
-    }
-    let vp = view_of(fs, p)?;
+    let bid = fs.mount_id(&base.anchor)?;
     let vb = view_of(fs, &base.anchor)?;
+    let idp = fs.dir_id(p);
     for a in p.ancestors() {
         let Some(ida) = fs.dir_id(a) else { continue };
-        if view_of(fs, a).as_ref() != Some(&vp) {
-            continue;
-        }
         for b in base.anchor.ancestors() {
             if a == b || fs.dir_id(b) != Some(ida) || view_of(fs, b).as_ref() != Some(&vb) {
                 continue;
             }
-            let (Ok(va), Ok(bb)) = (v.strip_prefix(a), base.full.strip_prefix(b)) else {
+            // The daemon's name walk from `b` must cross into the mount holding `p`
+            // (same mount for the whole chain, or an intervening mount that the walk
+            // enters by name); an overmount on another mount (C3) is not reached.
+            let (Ok(pa), Ok(bb)) = (p.strip_prefix(a), base.full.strip_prefix(b)) else {
                 continue;
             };
+            let walked = b.join(pa);
+            let reaches = if pid == bid {
+                fs.mount_id(a) == Some(pid) && view_of(fs, a) == view_of(fs, p)
+            } else {
+                fs.mount_id(&walked) == Some(pid) && fs.dir_id(&walked) == idp
+            };
+            if !reaches {
+                continue;
+            }
+            let Ok(va) = v.strip_prefix(a) else { continue };
             if let Some(r) = compare_rel(va, bb) {
                 return Some(r);
             }
@@ -566,9 +580,16 @@ fn relation<F: FsIdentity>(fs: &F, mp: &MpCtx<'_>, base: &Target) -> Option<(Rel
     // 3. Same-view inode.
     let vm = view_of(fs, &mp.t.anchor)?;
     let vb = view_of(fs, &base.anchor)?;
+    let anchor_id = fs.dir_id(&mp.t.anchor);
     for a in mp.t.anchor.ancestors() {
         let Some(ida) = fs.dir_id(a) else { continue };
-        if view_of(fs, a).as_ref() != Some(&vm) {
+        let va = view_of(fs, a);
+        // An ancestor above a mount boundary on the mount-point side (the view
+        // differs from the anchor's) still matches when it is in the base's own view
+        // and the base's name walk from the pair reaches the anchor by crossing that
+        // boundary.
+        let crossing = va.as_ref() != Some(&vm);
+        if crossing && va.as_ref() != Some(&vb) {
             continue;
         }
         for b in base.anchor.ancestors() {
@@ -578,6 +599,13 @@ fn relation<F: FsIdentity>(fs: &F, mp: &MpCtx<'_>, base: &Target) -> Option<(Rel
             let (Ok(ma), Ok(bb)) = (mp.t.full.strip_prefix(a), base.full.strip_prefix(b)) else {
                 continue;
             };
+            if crossing {
+                let rest = mp.t.anchor.strip_prefix(a).unwrap_or(Path::new(""));
+                let walked = fs.dir_id(&b.join(rest));
+                if walked.is_none() || walked != anchor_id {
+                    continue;
+                }
+            }
             if let Some(r) = compare_rel(ma, bb) {
                 return Some((r, Via::Inode));
             }
@@ -765,6 +793,9 @@ pub(crate) fn bases_now<F: FsIdentity>(
                     false,
                 ))
             }
+            // Best effort: any other resolve error (not a directory, loops, I/O) means
+            // the operand is not a base the daemon could walk; only a missing current
+            // directory is fatal, since no relative path can be judged.
             _ => {}
         }
         // An existing literal path (file included) wins over `@REV` in the factory.

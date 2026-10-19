@@ -1136,6 +1136,68 @@ fn regression_mount_in_base_views_case_alias_below_bind_boundary() {
     run(&fs, "/FS/other/mnt", &["/FS/P/B"]).unwrap();
 }
 
+/// Regression: a filesystem mounted at `/FS/P/B` and mount point `/FS/P/B/mnt`: base
+/// `/FS/P` is refused, but its case alias `/FS/p` was accepted (check 3 discarded the
+/// ancestors above the mount boundary).
+#[test]
+fn regression_mount_in_base_case_alias_across_intervening_mount() {
+    let mut fs = FakeFs::new();
+    fs.tmpfs("/FS/P/B", 102, 40);
+    fs.alias("/FS/p", "/FS/P");
+    fs.mountinfo = mi_lines(&["102 1 0:40 / /FS/P/B rw - tmpfs tmpfs rw"]);
+    for base in ["/FS/P", "/FS/p"] {
+        refused(run(&fs, "/FS/P/B/mnt", &[base]), &["inside the folder"]);
+    }
+    // Not under the alias: unrelated.
+    run(&fs, "/FS/P/B/mnt", &["/FS/Q"]).unwrap();
+    // macOS-style fallback (no mount ids): same-dev view comparison.
+    fs.mnt_ids = false;
+    refused(run(&fs, "/FS/P/B/mnt", &["/FS/p"]), &["inside the folder"]);
+}
+
+/// Regression (descendant-bind variant): the bind of the mount-point filesystem sits
+/// below an intervening mount (`/FS/P/B`), so the view's parent and the base anchor
+/// are on different mounts; the base `/FS/p` still walks into the copy.
+#[test]
+fn regression_mount_in_base_case_alias_descendant_bind_across_intervening_mount() {
+    let mut fs = FakeFs::new();
+    fs.tmpfs("/FS/P/B", 102, 40);
+    fs.tmpfs("/C", 103, 41);
+    fs.bind("/C", "/FS/P/B/sub", 104);
+    fs.alias("/FS/p", "/FS/P");
+    fs.mountinfo = mi_lines(&[
+        "102 1 0:40 / /FS/P/B rw - tmpfs tmpfs rw",
+        "103 1 0:41 / /C rw - tmpfs tmpfs rw",
+        "104 102 0:41 / /FS/P/B/sub rw - tmpfs tmpfs rw",
+    ]);
+    for base in ["/FS/P", "/FS/p"] {
+        refused(
+            run(&fs, "/C/mnt", &[base]),
+            &["inside the folder", "also visible at /FS/P/B/sub/mnt"],
+        );
+    }
+    run(&fs, "/C/mnt", &["/FS/Q"]).unwrap();
+}
+
+/// Regression: the source of a bind (`/FS/C` bound at `/P/B/sub`) was later overmounted
+/// by an unrelated bind of `/D`; `/D/mnt` was refused against base `/P/B` because
+/// `alias_rest` trusted the inode now reached through `/FS/C`.
+#[test]
+fn regression_mount_in_base_alias_rest_overmounted_source_not_trusted() {
+    let mut fs = FakeFs::std();
+    fs.dir("/FS/C");
+    fs.dir("/D");
+    fs.bind("/FS/C", "/P/B/sub", 102);
+    fs.bind("/D", "/FS/C", 103);
+    fs.mountinfo = mi_lines(&[
+        "102 1 8:1 /FS/C /P/B/sub rw - ext4 /dev/sda1 rw",
+        "103 1 8:1 /D /FS/C rw - ext4 /dev/sda1 rw",
+    ]);
+    run(&fs, "/D/mnt", &["/P/B"]).unwrap();
+    // The same overmount does not hide a real conflict: /FS/C is D's copy.
+    refused(run(&fs, "/P/B/sub/mnt", &["/P/B"]), &["inside the folder"]);
+}
+
 #[test]
 fn regression_mount_in_base_views_case_alias_c3_still_accepted() {
     let mut fs = c3_fs();
