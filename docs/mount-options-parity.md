@@ -105,7 +105,8 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing · `[x]` Rust-only = beyond
 | `--color` / `--no-color` | yes | **added** (logging style) | `~` |
 | `--oss-attributions` | yes | **added** (short list) | `~` |
 | Multi-source union (positional) | yes | yes + folder cache | `[x]` |
-| Default mountpoint (strip extension) | yes | yes | `[x]` |
+| Default mountpoint (strip extension; `<folder>.mounted` when the stem is the folder) | yes | yes | `[x]` |
+| Mount point inside its own folder / `-w` base refused (exit 2) | yes (self-bind served via fchdir; strictly-inside not handled) | yes, also via symlink, bind mount (either direction) and case/Unicode alias | `[x]` |
 
 ## Mount abilities (behavior)
 

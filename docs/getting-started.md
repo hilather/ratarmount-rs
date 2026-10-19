@@ -11,12 +11,33 @@ so. Run `ratarmount --print-features` to see what your binary includes and
 ratarmount archive.tar.gz mnt/     # mount; the process daemonizes once the mount is usable
 ratarmount -f archive.tar mnt/     # stay in the foreground (logs on stderr, Ctrl-C unmounts)
 ratarmount archive.tar             # no mountpoint: mounts at ./archive/
+ratarmount folder                  # a folder mounts at ./folder.mounted/
 ratarmount -u mnt/                 # unmount
 ```
 
 The first mount of an archive scans it and writes a SQLite index next to it
 (`archive.tar.gz.index.sqlite`), or into your user cache when the directory is
 not writable. Later mounts load the index and come up in tens of milliseconds.
+
+A mount point may not be, lie inside, or be an ancestor of a folder being mounted
+(a positional folder or a `--bind` source) or of the `-w` overlay directory. This also
+holds through symlinks, bind mounts (of the whole folder or a subdirectory, a bind hidden
+under a later mount, and a bind mounted *inside* the folder, into which a FUSE mount
+would propagate) and case or Unicode aliases. The single-threaded daemon would `stat` its
+own mount point and hang, so ratarmount refuses with exit code 2 **before the overlay
+database and marker are created, before any daemon is forked and before the FUSE mount**.
+It does not create the mount point itself when it refuses, unless that path lies under a
+directory that indexing creates (for example `--index-folders`). Two layouts are only
+visible to a second check that runs after the archives are opened and the `-w` directory
+is created: a `-w` directory and a mount point that did not exist yet and differ only by
+letter case or Unicode form on a case-insensitive filesystem, and an input directory that
+did not exist until another input's index was written into it (`--index-folders`). As with
+any later failure, index folders and sidecars written while opening the inputs, and an
+empty `-w` directory (no database, no marker), can remain after a refusal.
+`<folder>.mounted` is the default mount point when the usual default would be the folder
+itself (`folder` becomes `folder.mounted`; `folder.d` becomes `folder`; `x.tar.gz` becomes
+`x`). The check is point-in-time and does not read mount propagation flags (a private bind
+is refused too); `--corpus` members are not checked.
 
 ```bash
 ratarmount -c archive.tar mnt/                     # rebuild the index

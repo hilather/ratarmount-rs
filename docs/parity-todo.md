@@ -114,7 +114,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Debug / log-file / color | yes | `-d` + `--log-file` + color env | `[x]` / `~` full NO_COLOR matrix |
 | OSS attributions | yes | yes (`--oss-attributions` / help) | `[x]` |
 | Parallelization matrix (`-P backend:n`) | yes | full matrix incl. zlib/lzma/Z; true parallel where codec allows; AutoMount eager nested fan-out via `--parallel-nested` / `parallel_nested_threads` (default auto) | `[x]` / `~` sequential codecs still API-only |
-| Default mountpoint (strip extension) | yes | yes | `[x]` |
+| Default mountpoint (strip extension; `<folder>.mounted` when the stem is the folder) | yes | yes | `[x]` |
+| Mount point inside its own folder / `-w` base refused (exit 2) | yes (self-bind served via fchdir; strictly-inside not handled) | yes, also via symlink, bind mount (either direction) and case/Unicode alias | `[x]` |
 
 ### Performance (ongoing)
 

@@ -327,31 +327,40 @@ pub fn mountpoints() -> io::Result<Vec<PathBuf>> {
     ))
 }
 
+/// Decode the `\ooo` octal escapes of one mountinfo path field, bytewise.
+/// `None` when an escape is out of byte range.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn unescape_mountinfo_field(field: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    let mut i = 0;
+    while i < field.len() {
+        if field[i] == b'\\'
+            && i + 3 < field.len()
+            && field[i + 1..i + 4]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
+        {
+            let value = u16::from(field[i + 1] - b'0') * 64
+                + u16::from(field[i + 2] - b'0') * 8
+                + u16::from(field[i + 3] - b'0');
+            decoded.push(u8::try_from(value).ok()?);
+            i += 4;
+        } else {
+            decoded.push(field[i]);
+            i += 1;
+        }
+    }
+    Some(decoded)
+}
+
 #[cfg(any(target_os = "linux", test))]
 pub fn parse_mountinfo(info: &[u8]) -> Vec<PathBuf> {
     info.split(|b| *b == b'\n')
         .filter_map(|line| {
             let field = line.split(|b| *b == b' ').nth(4)?;
-            let mut decoded = Vec::new();
-            let mut i = 0;
-            while i < field.len() {
-                if field[i] == b'\\'
-                    && i + 3 < field.len()
-                    && field[i + 1..i + 4]
-                        .iter()
-                        .all(|b| (b'0'..=b'7').contains(b))
-                {
-                    let value = u16::from(field[i + 1] - b'0') * 64
-                        + u16::from(field[i + 2] - b'0') * 8
-                        + u16::from(field[i + 3] - b'0');
-                    decoded.push(u8::try_from(value).ok()?);
-                    i += 4;
-                } else {
-                    decoded.push(field[i]);
-                    i += 1;
-                }
-            }
-            Some(PathBuf::from(OsString::from_vec(decoded)))
+            Some(PathBuf::from(OsString::from_vec(unescape_mountinfo_field(
+                field,
+            )?)))
         })
         .collect()
 }
