@@ -1159,3 +1159,39 @@ fn regression_repo_stable_over_main_updates_base_url_in_seal_and_forced_pack() {
     // The sealed source layer keeps its own record.
     assert_eq!(meta_of(&overlay).base_url(), Some(stable.as_str()));
 }
+
+/// Regression (R6-G1, directory copy case): packing a sealed WEAK directory
+/// overlay against a byte-identical copy of the base (another path, same
+/// manifest) is accepted; the accepted relocation rewrote `base_url` and
+/// dropped `base_weak_digest`, so later `diff` / `--lower` gates stopped
+/// comparing that copy. The bundle keeps every recorded comparison row.
+#[test]
+fn regression_accepted_pack_against_directory_copy_keeps_weak_digest() {
+    let env = Env::new();
+    let (base, overlay) = fixture(&env, Kind::Dir, true);
+    let recorded = meta_of(&overlay);
+    let weak = recorded
+        .get("base_weak_digest")
+        .expect("weak digest")
+        .to_owned();
+    let copy = env.path("copy");
+    assert!(Command::new("cp")
+        .args(["-a", s(&base), s(&copy)])
+        .status()
+        .unwrap()
+        .success());
+    let out = verb(&env, Verb::Pack, &overlay, &copy, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let restored = env.path("restored");
+    env.ok(&[
+        "overlay",
+        "unpack",
+        s(&env.path("bundle.tar.zst")),
+        s(&restored),
+    ]);
+    let meta = meta_of(&restored);
+    assert_eq!(meta.get("base_weak_digest"), Some(weak.as_str()));
+    for key in ["base_url", "base_location", "base_kind"] {
+        assert_eq!(meta.get(key), recorded.get(key), "{key}");
+    }
+}
