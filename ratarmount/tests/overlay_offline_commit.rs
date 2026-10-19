@@ -497,3 +497,29 @@ fn regression_mount_recovery_refuses_foreign_journal() {
     assert!(fs::read(&archive).unwrap() == original, "not rolled back");
     assert!(!ratarmount_compress::commit_journal::journal_path(&archive).exists());
 }
+
+/// Regression (R6-K8, r11 review nit 8): the classifier maps a `file://` base
+/// to its local path, but the commit gate canonicalised the typed URL and
+/// refused with "cannot resolve file:///...". The URL is resolved to its path
+/// first, so the commit goes through (and is gated like the path).
+#[cfg(unix)]
+#[test]
+fn regression_offline_commit_accepts_file_url() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let env = Env::new();
+    let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+    let url = format!("file://{}", archive.display());
+    let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), &url]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let listing = members(&archive);
+    assert!(
+        listing.contains("a.txt") && listing.contains("new.txt"),
+        "{listing}"
+    );
+}

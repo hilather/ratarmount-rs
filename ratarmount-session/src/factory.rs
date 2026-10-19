@@ -1324,7 +1324,8 @@ fn try_load_nested_durable(
     if !path.is_file() {
         return None;
     }
-    let idx = match SqliteIndex::open_read_only(path) {
+    // A pure lookup: nothing is created beside the outer index.
+    let idx = match SqliteIndex::open_lookup(path) {
         Ok(i) => i,
         Err(e) => {
             log::debug!(
@@ -8481,6 +8482,84 @@ mod tests {
         assert_eq!(
             read_all(warm.as_ref(), "/payload.txt"),
             b"tar-durable-payload\n"
+        );
+    }
+
+    /// Regression (R6-K8, r11 review nit 6): the warm load of a nested file
+    /// table opened the outer index with `open_read_only`, which made SQLite
+    /// create `-wal` / `-shm` beside a WAL sidecar it was only asked to read.
+    #[test]
+    fn nested_durable_warm_load_creates_no_side_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("tar-data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("payload.txt"), b"tar-durable-payload\n").unwrap();
+        let tar_path = dir.path().join("inner-durable.tar");
+        assert!(std::process::Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&data)
+            .arg("payload.txt")
+            .status()
+            .unwrap()
+            .success());
+        let tar_bytes = std::fs::read(&tar_path).unwrap();
+        let body_size = tar_bytes.len() as u64;
+        let outer_idx = dir.path().join("outer-tar-nested.index.sqlite");
+        {
+            let mut idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            idx.ensure_nested_indexes_table().unwrap();
+            idx.publish_tmp().unwrap();
+        }
+        let opener = open_nested_reader_fn(OpenOptions::default());
+        let ctx = NestedOpenContext {
+            member_size: body_size,
+            offsetheader: Some(0),
+            member_path: "inner-durable.tar".into(),
+            outer_index_path: Some(outer_idx.clone()),
+            write_nested_index: true,
+            parent_is_root: false,
+            body_seek_is_cheap: true,
+        };
+        drop(
+            opener(
+                Box::new(std::io::Cursor::new(tar_bytes.clone())),
+                Path::new("inner-durable.tar"),
+                ctx.clone(),
+            )
+            .expect("cold nested TAR"),
+        );
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", outer_idx.display()));
+        }
+        let names = || {
+            let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, bytes) = (names(), std::fs::read(&outer_idx).unwrap());
+        let warm = opener(
+            Box::new(std::io::Cursor::new(tar_bytes)),
+            Path::new("inner-durable.tar"),
+            NestedOpenContext {
+                write_nested_index: false,
+                ..ctx
+            },
+        )
+        .expect("warm nested TAR");
+        assert_eq!(
+            read_all(warm.as_ref(), "/payload.txt"),
+            b"tar-durable-payload\n"
+        );
+        drop(warm);
+        assert_eq!(names(), listing, "the warm load created files");
+        assert!(
+            std::fs::read(&outer_idx).unwrap() == bytes,
+            "sidecar rewritten"
         );
     }
 

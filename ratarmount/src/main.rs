@@ -1922,6 +1922,14 @@ fn main() {
             eprintln!("error: {msg}");
             std::process::exit(2);
         }
+        // A `file://` URL names a local archive: everything below (recovery,
+        // the gate, the splice) works on the path it resolves to.
+        let resolved_archive =
+            match &ratarmount_remote::resolve_to_local(&archive.to_string_lossy()) {
+                Ok(ratarmount_remote::RemoteLocal::Local(path)) => path.clone(),
+                _ => archive.clone(),
+            };
+        let archive = &resolved_archive;
         // A database overlay recovers a pending commit journal only after its
         // base identity gate (inside the commit): recovery rewrites the archive,
         // and it must not do that to an archive the overlay does not describe.
