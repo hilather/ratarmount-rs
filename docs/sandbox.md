@@ -295,6 +295,53 @@ archives outside the base, or create a fresh overlay.
 A Git base gets the selected tree id, including `--git-prefix`, and startup pins
 the resolved commit before opening the mount.
 
+### Base kind and place
+
+An overlay records the kind of base (`base_kind`: `git`, `directory` or
+`archive`) and where it is (`base_location`: `local:<path>` or
+`remote:<redacted URL>`). Both are what the factory actually opened for the
+mount or the verb, never a guess from a path or a URL: a bind-only mount, a
+composite (its first element), a bare repository, `RATARMOUNT_FORCE_GIT`, a
+`file://` URL, an HTTP/S3 archive and a torrent each record what they served.
+`seal`, `pack`, `diff`, `overlay verify`, `--lower` and every reopen compare
+that kind under every digest kind, `--base-digest none` included: a base of
+another kind is refused, naming `--force-base-mismatch`. With digest `none` the
+overlay is kind-only: nothing is walked, statted or hashed. A base that moved
+between local and remote agrees only when the overlay's record is strong and a
+supplied `--base-digest` (or an archive's already cached digest) equals it.
+Locations are compared in their redacted form, and a credential in the typed
+URL is never stored. The verbs open the base with an in-memory index but read a
+cached digest of a local copy from the sidecar a mount would have used (the
+sibling sidecar, a `--index-folders` entry; `overlay ... --index-folders` and
+`diff --index-folders` pass the folders), read-only: nothing is created,
+written or locked, so a read-only (`chmod 444`) index answers too.
+
+Overlays from v0.1.35 or earlier have no base metadata. A plain `-w` remount
+keeps working without a flag, and the first open records the kind, place and
+URL (no digest). Only an overlay written by an unreleased build (`format_version`
+2 with no usable `base_kind`) needs one `--force-base-mismatch`, which records
+the base now in use.
+
+### Forced base changes
+
+A forced base-kind change without a supplied digest drops the overlay to
+kind-only identity (`base_digest_kind=none`): later runs compare kind, not
+content, until you supply `--base-digest`. `--base-digest none` accepts a remote
+or local copy of the same archive (location is ignored).
+
+### Commits and the base
+
+A live, interval or on-exit commit, and `--commit-overlay` on an overlay with a
+database, check before they write that the archive is still the base the last
+create, commit or refresh recorded (a `stat` of its size and mtime; the mount's
+`--base-digest` never overrides a changed stamp, and nothing is read under
+`none`). A refused commit refuses that commit only: nothing is written, the
+mount keeps serving, and `--force-base-mismatch` accepts the new base. A swap of
+the base with the same size and mtime cannot be caught without hashing; only
+`overlay seal` or `overlay verify` with a strong digest catches it.
+`--commit-overlay` on a raw directory of files (no overlay database) has no
+identity to check and says so.
+
 Remote bases use a `weak` digest of the URL and cheaply available validators:
 HTTP HEAD ETag/Content-Length/Last-Modified or S3 ETag/size. Failed HEADs,
 redirects, and other schemes fall back to the known URL. This fallback does
@@ -326,15 +373,16 @@ recorded and current identity and naming `--force-base-mismatch` (experimental),
 and `--base-digest sha256:<hex>` when the record is strong: a supplied digest, or
 the digest already cached in an archive's index, equal to the recorded one
 confirms a copy without hashing. Forced, `seal` records the base actually used
-(a directory: its weak manifest, or the supplied strong digest; an archive: its
-size/mtime plus the supplied or cached digest, else the weak
-`weak:size=,mtime_ns=` form; Git: the tree id), recomputes `stack_digest` and
+(its kind, place and URL; with `--base-digest`, that digest as strong plus the
+directory's weak manifest or the archive's size/mtime; without one, kind-only
+`none`; Git: the tree id), recomputes `stack_digest` and
 sets `base_mismatch_forced_at`, so `overlay verify` against that base passes;
 `pack` writes the same rows into the bundle only (the sealed source layer is
 untouched); `diff --hash --json` reports the base actually diffed as `base`,
-with `base_forced: true` and `base_recorded`. A forced run over a strong
-directory record without `--base-digest` downgrades to the weak manifest and
-says so. Sealing an already sealed overlay still needs no base.
+with `base_forced: true` and `base_recorded`. A forced run over a record with a
+digest and without `--base-digest` downgrades to kind-only and says so. Sealing
+an already sealed overlay still needs no base (it is finished from its own
+record and writes nothing).
 `--force-base-mismatch` on reopen records the override time while preserving the original
 base and stack digests. Use it deliberately after an external base replacement.
 Successful local archive commits refresh the recorded size, mtime, base and
@@ -345,10 +393,12 @@ a subsequent external archive change is still refused. Rolling mounts check
 the active generation. Legacy overlays remain legacy and digest kinds stay unchanged.
 
 Existing overlays without `meta` remain usable. Opening one with `-w` adds
-only `format_version=1`: it stays `legacy: true`, with no retroactively assigned
-digest or sealed state. Library callers using `WriteOverlay::new` without
-creation context create version 2 metadata with digest kind `none`; callers
-that know the base should use `new_with_create_info`.
+`format_version=1` and the base kind, place and URL: it stays `legacy: true`,
+with no retroactively assigned digest or sealed state. Library callers open an
+overlay with `WriteOverlay::open(&ClassifiedBase, composed, dir, &CreateOptions)`
+(experimental): the token comes from `ClassifiedBase::open` over an `OpenBase`
+implementation that reports what it served, so the recorded identity is what was
+opened.
 
 ## Layered overlays
 

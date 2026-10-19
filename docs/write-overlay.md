@@ -68,7 +68,7 @@ Internally, `ReadOnlyOverlayLayer` wraps a base `MountSource` and one existing
 overlay directory. `compose_stack` applies directories from bottom to top;
 each layer merges directory entries, hides tombstoned names, and serves its own
 host files before consulting the inner view. A later layer can recreate a
-deleted path. Wrapping the result in `WriteOverlay::new(stack, top)` makes
+deleted path. Wrapping the result in `WriteOverlay::open(&base, stack, top, &options)` (`base` is the classified base the stack sits on) makes
 copy-up read the composed lower bytes, including files created by a lower layer.
 
 The read-only view uses the same host metadata, metadata-only chmod/utime
