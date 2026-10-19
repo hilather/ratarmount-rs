@@ -1362,6 +1362,86 @@ fn regression_union_commit_target_with_foreign_journal_refused() {
     }
 }
 
+/// Leave `archive` crashed right after the replacement was fully written: the
+/// journal is still there and marked complete.
+#[cfg(unix)]
+fn interrupt_complete(archive: &Path) {
+    use std::io::Write;
+    let len = fs::metadata(archive).unwrap().len();
+    let mut suffix = tempfile::tempfile().unwrap();
+    suffix.write_all(&[0u8; 1536]).unwrap();
+    let crashed = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+        archive,
+        len - 1024,
+        &mut suffix,
+        &mut |step| {
+            if step == "locator complete" {
+                Err(std::io::Error::other("crash"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(crashed.is_err());
+}
+
+/// Regression (R6-K1, r11 skeptic #4): a journal touches the overlay's rows
+/// only when its target is the recorded base. The overlay records A; the
+/// commit goes to union member B, which carries its OWN complete journal.
+/// Recovery rolled B forward and then wrote B's stamp into A's rows, so the
+/// next commit to the unchanged A was refused. Both directions, live and
+/// on-exit; a later commit to A succeeds (empty plan: nothing refreshes the
+/// token, so the rows are the only thing recovery could corrupt).
+#[cfg(unix)]
+#[test]
+fn regression_union_member_complete_journal_leaves_recorded_stamp() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        for record_a in [true, false] {
+            let fx = Fixture::new();
+            let other = fx.archive.with_file_name("member.tar");
+            write_tar(&other, &[("m", b"member")]);
+            let (recorded, target) = if record_a {
+                (fx.archive.clone(), other.clone())
+            } else {
+                (other.clone(), fx.archive.clone())
+            };
+            let token = archive_token(&recorded);
+            let ov = WriteOverlay::open(
+                &token,
+                token.source(),
+                &fx.overlay,
+                &CreateOptions {
+                    base_digest: BaseDigestRequest::Compute,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let before = ov.recorded_stamp_for_tests();
+            assert!(before.0.is_some() && before.1.is_some());
+            interrupt_complete(&target);
+            let what = format!("{path:?} record_a={record_a}");
+            // An empty plan: recovery runs, nothing is committed or refreshed.
+            let done = commit(&ov, &target, path);
+            done.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(
+                !ratarmount_compress::commit_journal::journal_path(&target).exists(),
+                "{what}: own journal recovered"
+            );
+            assert_eq!(ov.recorded_stamp_for_tests(), before, "{what}: stamp moved");
+            fs::write(ov.root().join("two"), b"two").unwrap();
+            let again = commit(&ov, &recorded, path);
+            assert!(
+                again.unwrap_or_else(|e| panic!("{what}: later commit to base: {e}")),
+                "{what}"
+            );
+        }
+    }
+}
+
 /// Regression (R6-J2, audit A10 + #9): the journal check compares the inode
 /// only. `commit_journal` calls the device number a hint (it changes on
 /// reboot), so a device change with the same inode is the overlay's own journal.

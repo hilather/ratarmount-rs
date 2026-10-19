@@ -559,11 +559,40 @@ pub fn ensure_journal_is_for_archive(archive: &Path) -> std::result::Result<(), 
     }
 }
 
+/// Does a commit to `archive` (resolved to `canonical`) name the mounted base
+/// `path`? True when it resolves to the token's path, or when the name it gives
+/// (parent resolved, the last component left as named) is the token's path or
+/// the name the user typed.
+fn names_recorded_base(
+    actual: &crate::overlay_identity::ActualBase,
+    path: &Path,
+    archive: &Path,
+    canonical: &Path,
+) -> bool {
+    let named = crate::overlay_identity::named_path(archive);
+    canonical == path
+        || named.as_deref() == Some(path)
+        || (named.is_some() && named == actual.typed_named)
+}
+
 /// After recovery rolled a consistent COMPLETE journal forward: the archive is
 /// now exactly what the crashed commit wrote, so the recorded stamp is
 /// re-baselined to it (the files that commit appended are still in the
 /// overlay; the retry appends them again and the later member wins).
-pub(crate) fn restamp_rolled_forward(conn: &Connection, archive: &Path) {
+pub(crate) fn restamp_rolled_forward(conn: &Connection, base: &ClassifiedBase, archive: &Path) {
+    // The journal touches the overlay's rows only when its target IS the
+    // recorded base: a union member's own journal recovers that member only.
+    let actual = base.actual();
+    let (BaseKind::Archive, Some(BaseLocation::Local(path))) = (actual.kind(), actual.location())
+    else {
+        return;
+    };
+    let Ok(canonical) = archive.canonicalize() else {
+        return;
+    };
+    if !names_recorded_base(actual, path, archive, &canonical) {
+        return;
+    }
     let Ok(Some(meta)) = OverlayMeta::from_connection(conn) else {
         return;
     };
@@ -661,11 +690,7 @@ pub(crate) fn check_commit_base(
     // or when the name it gives (parent resolved, the last component left as
     // named) is the token's path or the name the user typed: the file behind
     // that name may have been replaced or a symlink retargeted since.
-    let named = crate::overlay_identity::named_path(archive);
-    let names_base = &canonical == path
-        || named.as_deref() == Some(path.as_path())
-        || (named.is_some() && named == actual.typed_named);
-    if !names_base {
+    if !names_recorded_base(actual, path, archive, &canonical) {
         // An archive the token does not describe (a union's other member).
         return Ok(());
     }

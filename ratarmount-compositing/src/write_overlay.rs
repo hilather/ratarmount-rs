@@ -4375,10 +4375,27 @@ impl WriteOverlay {
         if self.remote_enabled() {
             return;
         }
-        if self.identity.lock().expect("overlay identity").is_none() {
+        let Some(base) = self.identity.lock().expect("overlay identity").clone() else {
             return;
-        }
-        crate::overlay_gate::restamp_rolled_forward(&self.db.lock().expect("overlay db"), archive);
+        };
+        crate::overlay_gate::restamp_rolled_forward(
+            &self.db.lock().expect("overlay db"),
+            &base,
+            archive,
+        );
+    }
+
+    /// The recorded base stamp rows, read through the mount's own connection.
+    #[cfg(test)]
+    pub(crate) fn recorded_stamp_for_tests(&self) -> (Option<String>, Option<String>) {
+        let conn = self.db.lock().expect("overlay db");
+        let meta = crate::OverlayMeta::from_connection(&conn)
+            .expect("overlay meta")
+            .expect("overlay meta present");
+        (
+            meta.get("base_size").map(str::to_owned),
+            meta.get("base_mtime_ns").map(str::to_owned),
+        )
     }
 
     fn refuse_base_after_commit_failure(&self) {

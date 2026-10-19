@@ -1004,7 +1004,6 @@ impl ClassifiedBase {
     }
 
     /// The same token pointed at the archive a commit just wrote.
-    #[allow(dead_code)]
     pub(crate) fn repointed(&self, archive: &Path) -> Self {
         let mut actual = self.inner.actual.clone();
         actual.kind = BaseKind::Archive;
