@@ -1219,6 +1219,30 @@ fn regression_mount_in_base_case_alias_descendant_bind_across_intervening_mount(
     run(&fs, "/C/mnt", &["/FS/Q"]).unwrap();
 }
 
+/// Regression: `relation_view` dropped base-side ancestors above a mount boundary. `/C`
+/// is bound at `/FS/P/B` and another filesystem is mounted at `/FS/P/B/D`; a mount over
+/// `/C` propagates to `/FS/P/B` and covers base `/FS/P/B/D`, but the case alias
+/// `/FS/p/B/D` was accepted.
+#[test]
+fn regression_mount_in_base_views_case_alias_covering_across_mount() {
+    let mut fs = FakeFs::new();
+    fs.tmpfs("/C", 103, 41);
+    fs.bind("/C", "/FS/P/B", 102);
+    fs.tmpfs("/FS/P/B/D", 105, 42);
+    fs.alias("/FS/p", "/FS/P");
+    fs.mountinfo = mi_lines(&[
+        "103 1 0:41 / /C rw - tmpfs tmpfs rw",
+        "102 1 0:41 / /FS/P/B rw - tmpfs tmpfs rw",
+        "105 102 0:42 / /FS/P/B/D rw - tmpfs tmpfs rw",
+    ]);
+    for base in ["/FS/P/B/D", "/FS/p/B/D"] {
+        refused(run(&fs, "/C", &[base]), &["would cover"]);
+    }
+    // Unrelated base stays accepted.
+    run(&fs, "/C", &["/FS/Q"]).unwrap();
+    // `relation_view` needs mount ids (views come from mountinfo); no Dev-fallback variant.
+}
+
 /// Regression: the source of a bind (`/FS/C` bound at `/P/B/sub`) was later overmounted
 /// by an unrelated bind of `/D`; `/D/mnt` was refused against base `/P/B` because
 /// `alias_rest` trusted the inode now reached through `/FS/C`.

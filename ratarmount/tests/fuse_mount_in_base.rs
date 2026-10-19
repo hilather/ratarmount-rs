@@ -2011,7 +2011,8 @@ fn is_factory_operand_rejection(stderr: &str, operand: &str) -> bool {
     stderr.lines().any(|l| {
         !l.contains("error mounting")
             && ((l.contains("not found:") && l.contains(operand))
-                || l.trim_end().ends_with("is not a git repository"))
+                || (l.trim_end().ends_with("is not a git repository")
+                    && l.contains(operand.split('@').next().unwrap_or(operand))))
     })
 }
 
@@ -2032,6 +2033,11 @@ fn regression_mount_in_base_rev_fallback_rejects_mount_errors() {
     ));
     assert!(is_factory_operand_rejection(
         "error: B is not a git repository",
+        "B@HEAD"
+    ));
+    // The repository message must name the operand's repository path.
+    assert!(!is_factory_operand_rejection(
+        "error: other is not a git repository",
         "B@HEAD"
     ));
 }

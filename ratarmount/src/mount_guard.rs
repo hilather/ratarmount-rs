@@ -515,11 +515,26 @@ fn relation_view<F: FsIdentity>(
     let bid = fs.mount_id(&base.anchor)?;
     let vb = view_of(fs, &base.anchor)?;
     let idp = fs.dir_id(p);
+    let vp = view_of(fs, p)?;
     for a in p.ancestors() {
         let Some(ida) = fs.dir_id(a) else { continue };
         for b in base.anchor.ancestors() {
-            if a == b || fs.dir_id(b) != Some(ida) || view_of(fs, b).as_ref() != Some(&vb) {
+            if a == b || fs.dir_id(b) != Some(ida) {
                 continue;
+            }
+            // A base-side ancestor above a mount boundary (the covering direction) is
+            // accepted when it is in the view's parent view and the name walk from `a`
+            // by the base's names reaches the base anchor.
+            let vbb = view_of(fs, b);
+            if vbb.as_ref() != Some(&vb) {
+                if vbb.as_ref() != Some(&vp) {
+                    continue;
+                }
+                let rest = base.anchor.strip_prefix(b).unwrap_or(Path::new(""));
+                let walked = fs.dir_id(&a.join(rest));
+                if walked.is_none() || walked != fs.dir_id(&base.anchor) {
+                    continue;
+                }
             }
             // The daemon's name walk from `b` must cross into the mount holding `p`
             // (same mount for the whole chain, or an intervening mount that the walk
