@@ -65,6 +65,40 @@ fn sun_path_fits(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Publish `staged` at `path` without replacing anything already there. rename(2)
+/// would silently replace a live socket (#117); RENAME_NOREPLACE restores the
+/// EADDRINUSE a plain bind(path) gave. Other errors (EINVAL on a filesystem without
+/// RENAME_NOREPLACE, ENOSYS under a seccomp profile) pass through: no replacing fallback.
+fn rename_noreplace(staged: &Path, path: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let from = CString::new(staged.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let to = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: both pointers are valid NUL-terminated strings for the call.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EEXIST) {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("socket already in use: {}", path.display()),
+        ));
+    }
+    Err(error)
+}
+
 fn bind_private(path: &Path) -> io::Result<StdUnixListener> {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -77,7 +111,7 @@ fn bind_private(path: &Path) -> io::Result<StdUnixListener> {
     sun_path_fits(&staged)?;
     let listener = StdUnixListener::bind(&staged)?;
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&staged, path)?;
+    rename_noreplace(&staged, path)?;
     Ok(listener)
 }
 
@@ -220,7 +254,7 @@ mod owner_only_socket_tests {
         drop(listener);
     }
 
-    /// Regression: rename onto a directory fails and leaves no staging directory.
+    /// Regression: publishing onto a directory fails (as AddrInUse) and leaves no staging directory.
     #[test]
     fn regression_owner_only_socket_rename_failure_removes_staging() {
         let dir = tempfile::tempdir().unwrap();
@@ -228,9 +262,56 @@ mod owner_only_socket_tests {
         let target = parent.join("csi.sock");
         fs::create_dir(&target).unwrap();
         let error = bind_private(&target).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         assert!(fs::symlink_metadata(&target).unwrap().is_dir());
         assert!(staging_names(parent).is_empty());
+    }
+
+    /// Regression #117: a second bind onto a live socket must not replace it (rename(2) did).
+    #[test]
+    fn regression_owner_only_socket_second_bind_is_addr_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let sock = parent.join("csi.sock");
+        let first = bind_private(&sock).unwrap();
+        let ino = fs::symlink_metadata(&sock).unwrap().ino();
+        let error = bind_private(&sock).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(fs::symlink_metadata(&sock).unwrap().ino(), ino);
+        // The first daemon is still the one reachable at the final path.
+        let client = UnixStream::connect(&sock).unwrap();
+        drop(client);
+        drop(first);
+        assert!(staging_names(parent).is_empty());
+    }
+
+    /// Regression #117: two concurrent starts on one path yield exactly one winner.
+    #[test]
+    fn regression_owner_only_socket_concurrent_bind_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        for i in 0..50 {
+            let sock = parent.join(format!("csi.sock-{i}"));
+            let barrier = std::sync::Barrier::new(2);
+            let results: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            bind_private(&sock)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let oks = results.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(oks, 1, "iteration {i}: expected exactly one winner");
+            for error in results.iter().filter_map(|r| r.as_ref().err()) {
+                assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+            }
+            UnixStream::connect(&sock).unwrap();
+            assert!(staging_names(parent).is_empty());
+        }
     }
 
     /// Regression: a staged path longer than sun_path is rejected and the staging dir is removed.
