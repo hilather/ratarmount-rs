@@ -1115,3 +1115,49 @@ fn regression_archive_replaced_after_crash_is_refused() {
         );
     }
 }
+
+/// Regression (R6-G3, #1): the base was mounted as `alias.tar -> base.tar` and
+/// the link was retargeted to another valid tar while mounted. Neither the
+/// canonical path nor the named path equalled the token's, so the commit guard
+/// returned success without any check and rewrote the other archive. The guard
+/// recognises the typed name and compares device and inode: refused on the live
+/// and on-exit paths with the retarget target untouched; the unchanged link
+/// still commits.
+#[cfg(unix)]
+#[test]
+fn regression_retargeted_symlink_refused() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        for retarget in [false, true] {
+            let fx = Fixture::new();
+            let alias = fx.archive.with_file_name("alias.tar");
+            std::os::unix::fs::symlink(&fx.archive, &alias).unwrap();
+            let token = ClassifiedBase::for_tests_typed(
+                open_tar(&fx.archive),
+                ServedKind::Archive,
+                Some(ServedLocation::Local(fx.archive.clone())),
+                &alias,
+            );
+            let ov = open_with(&token, &fx.overlay, BaseDigestRequest::Compute, false).unwrap();
+            fs::write(ov.root().join("one"), b"one").unwrap();
+            let other = fx.archive.with_file_name("other.tar");
+            write_tar(&other, &[("other", b"a different base"), ("more", b"x")]);
+            let before = fs::read(&other).unwrap();
+            if retarget {
+                fs::remove_file(&alias).unwrap();
+                std::os::unix::fs::symlink(&other, &alias).unwrap();
+            }
+            let result = commit(&ov, &alias, path);
+            if retarget {
+                let err = result.unwrap_err().to_string();
+                assert!(err.contains("--force-base-mismatch"), "{path:?}: {err}");
+                assert!(fs::read(&other).unwrap() == before, "{path:?}: touched");
+            } else {
+                assert!(result.unwrap(), "{path:?}: the unchanged link commits");
+            }
+        }
+    }
+}

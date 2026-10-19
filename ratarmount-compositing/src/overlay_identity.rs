@@ -1025,6 +1025,28 @@ impl ClassifiedBase {
         })
         .expect("test token")
     }
+
+    /// [`Self::for_tests`] for a base typed as `typed` (a path whose last
+    /// component may be a symlink to `location`).
+    #[cfg(test)]
+    pub(crate) fn for_tests_typed(
+        source: Arc<dyn MountSource>,
+        kind: ServedKind,
+        location: Option<ServedLocation>,
+        typed: &Path,
+    ) -> Self {
+        Self::mint(Opened {
+            source,
+            kind,
+            inputs: vec![typed.to_string_lossy().into_owned()],
+            location,
+            index: IndexProvenance::None,
+            sidecar_candidate: None,
+            fetched: false,
+            keep_alive: Box::new(()),
+        })
+        .expect("test token")
+    }
 }
 
 /// **Experimental.** A sealed overlay's own record. It is read from the
