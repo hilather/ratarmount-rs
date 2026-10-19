@@ -65,6 +65,9 @@ pub(crate) struct OverlayCreateInfo {
     pub lower_layers: Vec<LowerLayerRecord>,
     pub force_base_mismatch: bool,
     pub local_path: Option<PathBuf>,
+    /// Built from a classified base: `local_path` is then the only local path,
+    /// and the typed `base_url` is never read as one (`rclone+r:p`, `restic:/r`).
+    pub classified: bool,
     pub index_path: Option<PathBuf>,
     /// Tree id of the source actually mounted, after any Git subtree selection.
     pub git_tree: Option<String>,
@@ -924,7 +927,8 @@ pub(crate) fn timestamp() -> String {
 impl OverlayCreateInfo {
     fn path(&self) -> Option<&Path> {
         self.local_path.as_deref().or_else(|| {
-            (!self.base_url.is_empty()
+            (!self.classified
+                && !self.base_url.is_empty()
                 && !self.base_url.contains("://")
                 && self.git_tree.is_none()
                 && self.remote_token.is_none())

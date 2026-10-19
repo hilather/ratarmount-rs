@@ -1379,7 +1379,10 @@ fn verify_recorded_with(
     }
     // Decided BEFORE the opener is called: catching its error afterwards would
     // already have made the request.
-    if recorded_base_is_remote(base) {
+    let recorded_remote_place = meta
+        .get("base_location")
+        .is_some_and(|row| row.starts_with("remote:"));
+    if recorded_base_is_remote(base) || recorded_remote_place {
         return Ok(None);
     }
     let lowers = meta.lower_layers().map_err(io::Error::other)?;
@@ -3699,6 +3702,21 @@ mod tests {
             .unwrap();
             assert_eq!(verified, None, "{base}");
         }
+        // Regression (R6-F6): an existing local `.torrent` path has no `://`,
+        // but the recorded (classified) location is remote.
+        let torrent = dir.path().join("base.torrent");
+        fs::write(&torrent, b"d4:infod4:name1:xee").unwrap();
+        let meta = meta_of(&[
+            ("format_version", "2"),
+            ("base_url", torrent.to_str().unwrap()),
+            ("base_kind", "archive"),
+            ("base_location", "remote:magnet-or-torrent"),
+        ]);
+        let verified = verify_recorded_with(dir.path(), &meta, &|_| {
+            panic!("the opener was called for a recorded remote location")
+        })
+        .unwrap();
+        assert_eq!(verified, None);
         // A local recorded base still reaches the classifier.
         let local = dir.path().join("base");
         fs::create_dir(&local).unwrap();

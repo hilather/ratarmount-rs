@@ -203,6 +203,7 @@ impl ActualBase {
             lower_layers: options.lower_layers.clone(),
             force_base_mismatch: options.force_base_mismatch,
             local_path,
+            classified: true,
             index_path: self
                 .index_path
                 .clone()

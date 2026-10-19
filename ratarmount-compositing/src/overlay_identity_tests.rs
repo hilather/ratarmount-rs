@@ -295,6 +295,43 @@ fn regression_accepted_remote_relocation_drops_local_stamp() {
     }
 }
 
+/// Regression (R6-F6): a sole-bind `rclone+remote:path` / `restic:/repo` base
+/// has no `://`, so creation took its typed text for a local path, looked for
+/// a cached digest of a file that does not exist and failed. The classified
+/// (remote) location decides, not the shape of the text.
+#[test]
+fn regression_remote_base_without_scheme_creates_without_digest_lookup() {
+    for typed in ["rclone+remote:path/base.tar", "restic:/repo"] {
+        let fx = Fixture::new();
+        let token = ClassifiedBase::mint(crate::Opened {
+            source: open_tar(&fx.archive),
+            kind: ServedKind::Archive,
+            inputs: vec![typed.to_owned()],
+            location: Some(ServedLocation::Remote(typed.to_owned())),
+            index: crate::IndexProvenance::None,
+            sidecar_candidate: None,
+            fetched: false,
+            keep_alive: Box::new(()),
+        })
+        .unwrap();
+        for digest in [BaseDigestRequest::Compute, BaseDigestRequest::None] {
+            let overlay = fx.overlay.with_file_name(format!("o-{}", typed.len()));
+            let ov = WriteOverlay::open(
+                &token,
+                token.source(),
+                &overlay,
+                &CreateOptions {
+                    base_digest: digest.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{typed} {digest:?}: {e}"));
+            drop(ov);
+            fs::remove_dir_all(&overlay).unwrap();
+        }
+    }
+}
+
 /// A directory swapped in at the archive path is refused under every digest
 /// kind, `none` included (the token's kind is static, so only a fresh file
 /// type check can see it); a different valid tar under `none` is accepted
