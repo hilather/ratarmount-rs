@@ -521,3 +521,51 @@ fn regression_local_torrent_classified_same_at_mount_and_commit() {
     assert_eq!(committed.location, mounted.location);
     assert_eq!(committed.location, Some(ServedLocation::Local(archive)));
 }
+
+/// R6-J9 (audit E12): symlinks, dangling links and FIFOs. A symlink to an
+/// archive or a directory is followed the way the mount follows it (the typed
+/// path is the location); a dangling link or a FIFO is not a base, both at
+/// mount and at commit.
+#[cfg(unix)]
+#[test]
+fn regression_served_without_indexing_symlinks_dangling_and_fifo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let archive = root.join("a.tar");
+    tar(&archive);
+    let folder = root.join("plain");
+    std::fs::create_dir(&folder).unwrap();
+    let to_archive = root.join("link.tar");
+    std::os::unix::fs::symlink(&archive, &to_archive).unwrap();
+    let to_folder = root.join("linkdir");
+    std::os::unix::fs::symlink(&folder, &to_folder).unwrap();
+    for (link, kind) in [
+        (&to_archive, ServedKind::Archive),
+        (&to_folder, ServedKind::Folder),
+    ] {
+        let committed = served_without_indexing(link, &[]).unwrap();
+        let mounted = served_of(std::slice::from_ref(link), &mut options());
+        assert_eq!(committed.kind, kind, "{link:?}");
+        assert_eq!(committed.kind, mounted.kind, "{link:?}");
+        assert_eq!(
+            committed.location,
+            Some(ServedLocation::Local(link.clone())),
+            "{link:?}: the typed path is the location"
+        );
+    }
+    let dangling = root.join("dangling.tar");
+    std::os::unix::fs::symlink(root.join("missing.tar"), &dangling).unwrap();
+    assert!(served_without_indexing(&dangling, &[]).is_err());
+    assert!(build_mount_source_ex(
+        std::slice::from_ref(&dangling),
+        &mut options(),
+        false,
+        CompositingOptions::default()
+    )
+    .is_err());
+    let fifo = root.join("fifo");
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let err = served_without_indexing(&fifo, &[]).unwrap_err();
+    assert!(err.contains("neither a file nor a directory"), "{err}");
+}

@@ -2288,6 +2288,40 @@ mod tests {
         assert!(opened.local && !opened.fetched);
     }
 
+    /// R6-J9 (audit nit): the WebDAV row goes through the real opener, not a
+    /// hand-made `RemoteOpened`. A `webdav://` URL against a server that
+    /// answers GET is fetched to a temporary copy and recorded as `Remote` at
+    /// the TYPED URL (never the temp path). (ssh / scp / sftp need an sshd, which
+    /// no test host can assume; those rows stay table-driven in
+    /// `regression_served_kind_table_fetched_and_torrent`.)
+    #[test]
+    fn regression_served_kind_webdav_through_the_real_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = small_tar(&dir.path().join("a.tar"), "f");
+        let http = spawn_index_http("/a.tar", bytes, Default::default(), None, None);
+        let url = format!("webdav://{}/a.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_in_memory: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let bundle =
+            super::super::build_mount_source(&[PathBuf::from(&url)], &mut opts, true, false)
+                .unwrap();
+        let served = bundle
+            .served
+            .expect("an opened input reports what it served");
+        assert_eq!(served.kind, ServedKind::Archive);
+        assert_eq!(
+            served.location,
+            Some(ratarmount_compositing::ServedLocation::Remote(url))
+        );
+        assert!(
+            served.fetched,
+            "a WebDAV body is fetched to a temporary copy"
+        );
+    }
+
     fn small_tar(path: &Path, member: &str) -> Vec<u8> {
         let members = [ratarmount_formats_tar::UstarMember {
             path: member,

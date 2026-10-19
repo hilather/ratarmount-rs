@@ -348,13 +348,28 @@ included (a directory overlay does not commit into an archive), and refuses an
 Unknown record (written by an unreleased build) without
 `--force-base-mismatch`. A mounted base reached through a symlink is the same
 file only while the name and its inode still match: a link retargeted to another
-archive is refused. `--commit-overlay` learns what it is rewriting from a `stat`
-of the archive: it builds no index, reads and writes no sidecar, and recovers a
-pending commit journal only after this check. A journal is rolled back only
-when it belongs to the recorded base (the size and mtime it restores equal the
-recorded stamp; a live mount also requires the mounted inode); another
-archive's interrupted-append journal is refused with the archive and journal
-left untouched.
+archive is refused. `--commit-overlay` classifies what it is rewriting with the
+factory's own dispatch questions, without opening it: a local `.torrent` under
+`--features bittorrent` is a remote folder, a `file://` URL is the local path, a
+bare Git repository (or any repository under `RATARMOUNT_FORCE_GIT`) is Git,
+any other directory a folder and a file an archive. It builds no index, reads
+and writes no sidecar, and recovers a pending commit journal only after this
+check. A commit journal is applied only to the file it was started for: before
+EVERY commit, whatever the digest kind (`none` included), whether or not stamp
+rows were recorded, for a union member the overlay did not describe, for a
+v0.1.35 overlay and for a raw overlay directory, the journal's inode must equal
+the archive's (the device number is only a hint; it changes across reboots).
+Another file's interrupted-append journal (a copy of the interrupted bytes, a
+restored backup) is refused with the archive and journal left untouched, and
+`--force-base-mismatch` accepts it. A journal the overlay owns rolls back when
+the size and mtime it restores equal the recorded stamp; one in the `complete`
+phase that is still on disk rolls FORWARD and re-baselines the recorded stamp
+(the files that commit appended are still in the overlay, so the retry appends
+them again and the later member wins). Once the journal is gone nothing ties a
+changed archive to the crash, and that commit is refused as a changed base.
+Journals exist on Linux and macOS only; elsewhere there is nothing to check.
+`overlay seal` or `pack` against a directory base at another place measures its
+weak manifest there (one walk of the directory).
 
 Remote bases use a `weak` digest of the URL and cheaply available validators:
 HTTP HEAD ETag/Content-Length/Last-Modified or S3 ETag/size. Failed HEADs,

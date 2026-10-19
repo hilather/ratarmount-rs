@@ -50,3 +50,18 @@ fn regression_docs_state_commit_swap_limit() {
         "CHANGELOG.md lost the refused-commit rule"
     );
 }
+
+/// R6-J2: the journal ownership rule (inode only, before every commit) and the
+/// roll-forward of a consistent complete journal stay documented.
+#[test]
+fn regression_docs_state_journal_ownership() {
+    let docs = read("docs/sandbox.md");
+    for sentence in [
+        "A commit journal is applied only to the file it was started for: before EVERY commit, whatever the digest kind (`none` included)",
+        "the journal's inode must equal the archive's (the device number is only a hint; it changes across reboots)",
+        "one in the `complete` phase that is still on disk rolls FORWARD and re-baselines the recorded stamp",
+        "Journals exist on Linux and macOS only; elsewhere there is nothing to check.",
+    ] {
+        assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
+    }
+}
