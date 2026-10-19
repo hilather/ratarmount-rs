@@ -37,7 +37,7 @@ fn regression_docs_state_forced_kind_only_and_none_accepts_copies() {
 #[test]
 fn regression_docs_state_commit_swap_limit() {
     require(&[
-        "A swap of the base with the same size and mtime cannot be caught without hashing; only `overlay seal` or `overlay verify` with a strong digest catches it.",
+        "A swap of the base with the same size and mtime cannot be caught without hashing; only `overlay verify` with a strong digest catches it (`overlay seal` of an already-strong base compares the stamp and does not rehash).",
     ]);
     let docs = read("docs/sandbox.md");
     assert!(
