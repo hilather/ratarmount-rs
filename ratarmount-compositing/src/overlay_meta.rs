@@ -1640,7 +1640,7 @@ fn reopen_classified(
             }
             return forced_rows(conn);
         }
-        Verdict::Same => {}
+        Verdict::Same | Verdict::Confirmed(_) => {}
         Verdict::Content => {
             // Same kind at the same place with a changed content: a forced
             // run overrides this open only (`base_mismatch_forced_at`); the

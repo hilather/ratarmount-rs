@@ -85,9 +85,21 @@ impl Recorded {
 pub enum Verdict {
     /// Agrees; nothing more to read.
     Same,
+    /// A base that moved between local and remote, confirmed by the recorded
+    /// STRONG digest: either the supplied `--base-digest` or the digest the
+    /// copy's own index caches (the value is that digest). Agrees like
+    /// [`Self::Same`], but the evidence is kept for `pack` and `diff`.
+    Confirmed(String),
     /// Same kind at the same place (or a local move): compare content.
     Content,
     Refuse(String),
+}
+
+impl Verdict {
+    /// The base agrees with the record (with or without kept evidence).
+    pub fn agrees(&self) -> bool {
+        matches!(self, Self::Same | Self::Confirmed(_))
+    }
 }
 
 fn kind_only(meta: &OverlayMeta) -> bool {
@@ -162,7 +174,7 @@ pub fn shape_verdict(
             },
         };
     if confirmed {
-        Verdict::Same
+        Verdict::Confirmed(recorded_digest.unwrap_or_default().to_owned())
     } else {
         Verdict::Refuse(format!(
             "the base moved from {} to {}, and no strong digest confirms it",
@@ -202,6 +214,14 @@ pub fn compare_base_identity(
     match shape_verdict(meta, actual, probe) {
         Verdict::Same => Ok(BaseComparison {
             identity,
+            ..Default::default()
+        }),
+        // The evidence reaches `pack` (a confirmed move packs) and `diff`
+        // (reported as confirmed): the digest equals the recorded strong one.
+        Verdict::Confirmed(digest) => Ok(BaseComparison {
+            identity: digest.clone(),
+            cached_digest: Some(digest),
+            compared: true,
             ..Default::default()
         }),
         Verdict::Refuse(reason) => Ok(BaseComparison {
@@ -927,7 +947,7 @@ mod tests {
                         };
                         let same_class = matches!(
                             (&got, &want),
-                            (Verdict::Same, Verdict::Same)
+                            (Verdict::Same | Verdict::Confirmed(_), Verdict::Same)
                                 | (Verdict::Content, Verdict::Content)
                                 | (Verdict::Refuse(_), Verdict::Refuse(_))
                         );
@@ -1005,7 +1025,7 @@ mod tests {
         let remote = place.token(Shape::ArchR);
         for (supplied, same) in [(None, false), (Some(D2), false), (Some(D1), true)] {
             let got = shape_verdict(Some(&r5), remote.actual(), &probe(supplied));
-            assert_eq!(got == Verdict::Same, same, "supplied {supplied:?}: {got:?}");
+            assert_eq!(got.agrees(), same, "supplied {supplied:?}: {got:?}");
             if !same {
                 assert!(matches!(got, Verdict::Refuse(_)), "{got:?}");
             }
@@ -1051,8 +1071,12 @@ mod tests {
                 },
             )
         };
-        assert_eq!(verdict(None), Verdict::Same, "the cache confirms D1");
-        assert_eq!(verdict(Some(D1)), Verdict::Same);
+        assert_eq!(
+            verdict(None),
+            Verdict::Confirmed(D1.to_owned()),
+            "the cache confirms D1"
+        );
+        assert_eq!(verdict(Some(D1)), Verdict::Confirmed(D1.to_owned()));
         assert!(
             matches!(verdict(Some(D2)), Verdict::Refuse(_)),
             "a wrong supplied digest must not be rescued by the cache: {:?}",

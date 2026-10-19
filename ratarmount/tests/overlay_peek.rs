@@ -61,6 +61,7 @@ fn s(path: &Path) -> &str {
 /// `index`.
 struct Setup {
     env: Env,
+    url: String,
     remote: PathBuf,
     copy: PathBuf,
     digest: String,
@@ -121,6 +122,7 @@ fn setup(index_for_copy: impl Fn(&Env, &Path) -> PathBuf) -> Option<Setup> {
     );
     Some(Setup {
         env,
+        url,
         remote,
         copy,
         digest,
@@ -218,4 +220,142 @@ fn regression_no_recreate_index_still_peeks() {
         .map(str::to_owned)
         .unwrap();
     assert!(location.starts_with("local:"), "{location}");
+}
+
+/// The recorded rows of a sealed bundle's `meta.json`.
+fn bundle_meta_json(bundle: &Path) -> serde_json::Value {
+    let decoder = zstd::stream::read::Decoder::new(fs::File::open(bundle).unwrap()).unwrap();
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap().ends_with("meta.json") {
+            let mut text = String::new();
+            entry.read_to_string(&mut text).unwrap();
+            return serde_json::from_str(&text).unwrap();
+        }
+    }
+    panic!("no meta.json in {bundle:?}");
+}
+
+/// Regression (R6-J5, audit B1-B3, B6): a strong remote record over a local
+/// byte-identical copy whose own sidecar caches the SHA-256. The identity gate
+/// accepted the copy (the cache confirmed it), but dropped WHICH evidence
+/// confirmed it, so `overlay pack` saw an unconfirmed move and refused, and
+/// `diff --hash --json` reported `unconfirmed`. The confirmation now reaches
+/// pack and diff; a supplied digest packs the same way; the bundle keeps the
+/// recorded (remote) rows.
+#[test]
+fn regression_cached_strong_confirmation_packs() {
+    let Some(fx) = setup(|_, copy| PathBuf::from(format!("{}.index.sqlite", copy.display())))
+    else {
+        return;
+    };
+    fx.env.ok(&["overlay", "seal", s(&fx.remote), &fx.url]);
+    let diff = fx
+        .env
+        .ok(&["diff", s(&fx.remote), s(&fx.copy), "--hash", "--json"]);
+    assert!(
+        diff.contains("\"base_identity\":\"confirmed\""),
+        "a cached confirmation is reported as confirmed: {diff}"
+    );
+    let bundle = fx.env.path("cached.tar.zst");
+    let out = fx
+        .env
+        .run(&["overlay", "pack", s(&fx.remote), s(&bundle), s(&fx.copy)]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "cached confirmation: {}",
+        text(&out)
+    );
+    let rows = bundle_meta_json(&bundle);
+    assert!(
+        rows["base_location"]
+            .as_str()
+            .is_some_and(|l| l.starts_with("remote:")),
+        "the bundle keeps the recorded base: {rows}"
+    );
+    // A supplied digest packs the same way (audit B4).
+    let supplied = fx.env.path("supplied.tar.zst");
+    let out = fx.env.run(&[
+        "overlay",
+        "pack",
+        s(&fx.remote),
+        s(&supplied),
+        s(&fx.copy),
+        "--base-digest",
+        &fx.digest,
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "supplied digest: {}",
+        text(&out)
+    );
+}
+
+/// Pin (R6-J5, audit B5): a local archive copied to another local path, with
+/// its digest cached only in the copy's sidecar, packs without a flag.
+#[test]
+fn regression_local_copy_cached_digest_packs() {
+    let env = Env::new();
+    let base = env.path("a.tar");
+    fs::write(&base, tar_bytes()).unwrap();
+    let Ok(sum) = Command::new("sha256sum").arg(&base).output() else {
+        eprintln!("skip: sha256sum unavailable");
+        return;
+    };
+    let digest = format!(
+        "sha256:{}",
+        String::from_utf8_lossy(&sum.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+    );
+    let overlay = env.path("ov");
+    env.ok(&[
+        "--no-mount",
+        "--index-file",
+        ":memory:",
+        "-w",
+        s(&overlay),
+        "--base-digest",
+        &digest,
+        s(&base),
+    ]);
+    fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+    env.ok(&["overlay", "seal", s(&overlay), s(&base)]);
+    let copy = env.path("copy.tar");
+    fs::copy(&base, &copy).unwrap();
+    // Cache the copy's digest in its own sidecar via a second overlay's seal.
+    let index = PathBuf::from(format!("{}.index.sqlite", copy.display()));
+    let other = env.path("copy-ov");
+    env.ok(&[
+        "--no-mount",
+        "--index-file",
+        s(&index),
+        "-w",
+        s(&other),
+        s(&copy),
+    ]);
+    env.ok(&["overlay", "seal", s(&other), s(&copy)]);
+    let bundle = env.path("b.tar.zst");
+    let out = env.run(&["overlay", "pack", s(&overlay), s(&bundle), s(&copy)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+}
+
+fn tar_bytes() -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut out);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "x.txt", &b"x\n"[..])
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    out
 }
