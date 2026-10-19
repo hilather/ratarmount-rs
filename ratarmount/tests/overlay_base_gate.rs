@@ -1412,3 +1412,55 @@ fn regression_pending_seal_hashes_the_moved_base_not_the_old_place() {
         );
     }
 }
+
+/// Regression (R6-K3, r11 skeptic #3): a forced `overlay pack` against
+/// repository B holding the SAME tree as the recorded repository A wrote
+/// relocation rows without `base_git_tree`, so the bundle kept
+/// `base_digest_kind=git-tree` but no comparison row and a later changed tree
+/// in B was accepted by `--lower`. The tree actually opened is written.
+#[test]
+fn regression_forced_pack_to_same_tree_repo_keeps_git_tree_row() {
+    let env = Env::new();
+    let (url_a, tree) = git_base(&env, "repo-a");
+    let (url_b, tree_b) = git_base(&env, "repo-b");
+    assert_eq!(tree, tree_b, "the fixture repositories share a tree");
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), &url_a]);
+    env.ok(&["overlay", "seal", s(&overlay)]);
+    let out = verb(
+        &env,
+        Verb::Pack,
+        &overlay,
+        Path::new(&url_b),
+        &["--force-base-mismatch"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let bundle = env.path("bundle.tar.zst");
+    let json = bundle_meta_json(&bundle);
+    assert_eq!(json["base_git_tree"], tree.as_str(), "{json}");
+    let restored = env.path("restored");
+    env.ok(&["overlay", "unpack", s(&bundle), s(&restored)]);
+    assert_eq!(
+        meta_of(&restored).get("base_git_tree"),
+        Some(tree.as_str()),
+        "the unpacked database lost its comparison row"
+    );
+    // A tree change in B is refused.
+    let repo = git2::Repository::open(env.path("repo-b")).unwrap();
+    let sig = git2::Signature::new("t", "t@t", &git2::Time::new(1, 0)).unwrap();
+    let blob = repo.blob(b"changed\n").unwrap();
+    let mut builder = repo.treebuilder(None).unwrap();
+    builder.insert("a.txt", blob, 0o100644).unwrap();
+    let changed = repo.find_tree(builder.write().unwrap()).unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    let commit = repo
+        .commit(Some("HEAD"), &sig, &sig, "d", &changed, &[&parent])
+        .unwrap();
+    let url_changed = format!("git://{}#{commit}", env.path("repo-b").display());
+    let out = env.run(&["--no-mount", "--lower", s(&restored), &url_changed]);
+    assert!(
+        !out.status.success(),
+        "a changed tree was accepted: {}",
+        text(&out)
+    );
+}

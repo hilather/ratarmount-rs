@@ -262,6 +262,11 @@ fn relocation_rows(
 ) -> Result<BTreeMap<String, String>> {
     let actual = base.actual();
     let mut rows = identity_rows(None, base).unwrap_or_default();
+    // A Git base keeps its comparison row: the tree actually opened (equal to
+    // the recorded one for an accepted move, the new one for a forced move).
+    if let Some(tree) = actual.git_tree() {
+        rows.insert("base_git_tree".into(), tree.to_owned());
+    }
     // A directory keeps its comparison baseline: the weak manifest of the
     // place now read, measured with the exclusions the overlay recorded.
     // (It equals the recorded one, or the move would not have been accepted.)
