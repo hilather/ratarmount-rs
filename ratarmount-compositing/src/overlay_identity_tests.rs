@@ -988,7 +988,9 @@ fn regression_foreign_archive_with_own_journal_refused_untouched() {
 /// One real crash: kill this very process with SIGKILL at journal step
 /// `RATARMOUNT_TEST_CRASH_STEP` while it replaces the suffix of the archive
 /// named by `RATARMOUNT_TEST_CRASH_ARCHIVE`. A no-op unless both are set (the
-/// parent test below runs it as a child).
+/// parent test below runs it as a child). Unix only: `libc::kill`/`SIGKILL`
+/// do not exist on Windows.
+#[cfg(unix)]
 #[test]
 fn journal_crash_child() {
     use std::io::Write;
