@@ -236,9 +236,27 @@ pub fn identity_rows(
 
 /// Rows describing the base now in use after a forced or accepted change of
 /// place: identity rows plus, for a local archive, its current stamp.
-fn relocation_rows(base: &ClassifiedBase) -> Result<BTreeMap<String, String>> {
+fn relocation_rows(
+    meta: Option<&OverlayMeta>,
+    base: &ClassifiedBase,
+) -> Result<BTreeMap<String, String>> {
     let actual = base.actual();
     let mut rows = identity_rows(None, base).unwrap_or_default();
+    // A directory keeps its comparison baseline: the weak manifest of the
+    // place now read, measured with the exclusions the overlay recorded.
+    // (It equals the recorded one, or the move would not have been accepted.)
+    if let (BaseKind::Dir, Some(BaseLocation::Local(path))) = (actual.kind(), actual.location()) {
+        if meta.is_some_and(|m| m.get("base_weak_digest").is_some()) {
+            let excludes = match meta.and_then(|m| m.get("base_weak_excludes")) {
+                Some(text) => BaseExcludes::from_json(text)?,
+                None => BaseExcludes::default(),
+            };
+            rows.insert(
+                "base_weak_digest".into(),
+                overlay_meta::directory_weak_digest(path, &excludes)?,
+            );
+        }
+    }
     if let (BaseKind::Archive, Some(BaseLocation::Local(path))) = (actual.kind(), actual.location())
     {
         if path.is_file() {
@@ -269,7 +287,7 @@ pub(crate) fn write_accepted_identity(
         .and_then(|m| m.get("base_location"))
         .is_some_and(|row| Some(row) != identity.get("base_location").map(String::as_str));
     let rows = if moved {
-        relocation_rows(base)?
+        relocation_rows(meta, base)?
     } else {
         identity
     };

@@ -1303,3 +1303,34 @@ fn regression_accepted_pack_against_directory_copy_keeps_weak_digest() {
         assert_eq!(after.get(key), recorded.get(key), "{key}");
     }
 }
+
+/// Regression (R6-H3, B3): an accepted `overlay seal` against a metadata-
+/// preserving copy of a directory base moved the recorded place and deleted
+/// `base_weak_digest` without writing a replacement, so editing that copy
+/// afterwards was accepted by every later gate (nothing left to compare). The
+/// seal writes a weak digest measured from the copy; an edit of the copy is
+/// refused by `diff` and `pack`.
+#[test]
+fn regression_accepted_seal_against_directory_copy_keeps_a_baseline() {
+    let env = Env::new();
+    let (base, overlay) = fixture(&env, Kind::Dir, false);
+    let copy = env.path("copy");
+    assert!(Command::new("cp")
+        .args(["-a", s(&base), s(&copy)])
+        .status()
+        .unwrap()
+        .success());
+    let out = verb(&env, Verb::Seal, &overlay, &copy, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let meta = meta_of(&overlay);
+    assert_eq!(
+        meta.get("base_weak_digest"),
+        Some(weak_now(&copy).as_str()),
+        "the seal measured the copy"
+    );
+    edit(&copy, Kind::Dir);
+    for v in [Verb::Diff, Verb::Pack] {
+        let out = verb(&env, v, &overlay, &copy, &[]);
+        refused(&out);
+    }
+}
