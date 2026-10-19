@@ -1565,6 +1565,14 @@ pub(crate) fn set_term_flag_for_test(v: bool) {
     GOT_TERM.store(v, Ordering::SeqCst);
 }
 
+/// Zero all three termination statics. Callers hold [`term_flag_test_lock`].
+#[cfg(test)]
+pub(crate) fn reset_term_state_for_test() {
+    GOT_TERM.store(false, Ordering::SeqCst);
+    TERM_SIGNAL.store(0, Ordering::SeqCst);
+    TERM_COUNT.store(0, Ordering::SeqCst);
+}
+
 /// Serializes tests that flip [`GOT_TERM`]. The flag is process-global.
 #[cfg(test)]
 pub(crate) fn term_flag_test_lock() -> &'static std::sync::Mutex<()> {
@@ -2264,6 +2272,140 @@ mod tests {
         );
         done.recv_timeout(Duration::from_secs(5))
             .expect("watcher ends");
+        assert_eq!(*calls.lock().unwrap(), ["unmount", "lazy"]);
+    }
+
+    /// Resets the process-global termination statics when dropped.
+    struct ResetTermState;
+
+    impl Drop for ResetTermState {
+        fn drop(&mut self) {
+            reset_term_state_for_test();
+        }
+    }
+
+    /// Regression (mutants `on_term_signal -> ()`, `signal != 0` -> `==`): the real handler and
+    /// the real snapshot must agree. Already passes on 3681863; it pins the pair.
+    #[test]
+    fn regression_term_state_follows_handler() {
+        let _lock = term_flag_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _reset = ResetTermState;
+        reset_term_state_for_test();
+        let st = term_state();
+        assert_eq!((st.count, st.signal, st.flagged), (0, None, false));
+        request_shutdown();
+        let st = term_state();
+        assert_eq!((st.count, st.signal, st.flagged), (0, None, true));
+        reset_term_state_for_test();
+        on_term_signal(libc::SIGTERM);
+        let st = term_state();
+        assert_eq!(
+            (st.count, st.signal, st.flagged),
+            (1, Some(libc::SIGTERM), true)
+        );
+        on_term_signal(libc::SIGINT);
+        let st = term_state();
+        assert_eq!(
+            (st.count, st.signal, st.flagged),
+            (2, Some(libc::SIGINT), true)
+        );
+    }
+
+    type Results = Arc<std::sync::Mutex<std::collections::VecDeque<std::io::Result<()>>>>;
+
+    fn results(items: Vec<std::io::Result<()>>) -> Results {
+        Arc::new(std::sync::Mutex::new(items.into()))
+    }
+
+    /// Watcher whose unmount/lazy results are scripted. Returns (done, calls).
+    #[allow(clippy::type_complexity)]
+    fn scripted_watcher(
+        count: Arc<AtomicUsize>,
+        signal: Arc<AtomicI32>,
+        unmount_results: Results,
+        lazy_results: Results,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (c, l) = (Arc::clone(&calls), Arc::clone(&calls));
+        thread::spawn(move || {
+            signal_unmount_watcher(
+                Path::new("/m"),
+                &|| {
+                    let n = count.load(Ordering::SeqCst);
+                    let s = signal.load(Ordering::SeqCst);
+                    TermState {
+                        count: n,
+                        signal: (s != 0).then_some(s),
+                        flagged: n > 0,
+                    }
+                },
+                &move |_| {
+                    c.lock().unwrap().push("unmount");
+                    unmount_results
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(Ok(()))
+                },
+                &move |_| {
+                    l.lock().unwrap().push("lazy");
+                    lazy_results.lock().unwrap().pop_front().unwrap_or(Ok(()))
+                },
+                Duration::from_millis(2),
+            );
+            let _ = tx.send(());
+        });
+        (rx, calls)
+    }
+
+    /// Regression: after a failed lazy fallback the watcher exited, so a later SIGTERM was
+    /// ignored although the mount was still being served.
+    #[test]
+    fn regression_signal_watcher_lazy_failed_keeps_looping() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let signal = Arc::new(AtomicI32::new(0));
+        let (done, calls) = scripted_watcher(
+            Arc::clone(&count),
+            Arc::clone(&signal),
+            results(vec![Err(busy()), Ok(())]),
+            results(vec![Err(std::io::Error::other("no"))]),
+        );
+        signal.store(libc::SIGTERM, Ordering::SeqCst);
+        count.store(1, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(*calls.lock().unwrap(), ["unmount", "lazy"]);
+        count.store(2, Ordering::SeqCst);
+        let ended = done.recv_timeout(Duration::from_secs(2)).is_ok();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["unmount", "lazy", "unmount"],
+            "a second SIGTERM after LazyFailed must retry the unmount"
+        );
+        assert!(ended, "watcher must end once the retried unmount succeeds");
+    }
+
+    /// A successful lazy detach ends the watcher after exactly one lazy call. Already passes on
+    /// 3681863; it keeps K2 from looping after a lazy success.
+    #[test]
+    fn regression_signal_watcher_lazy_fallback_calls_lazy_once() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let signal = Arc::new(AtomicI32::new(libc::SIGTERM));
+        let (done, calls) = scripted_watcher(
+            Arc::clone(&count),
+            signal,
+            results(vec![Err(busy()), Err(busy())]),
+            results(vec![Ok(())]),
+        );
+        count.store(1, Ordering::SeqCst);
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("watcher ends after the lazy detach");
+        thread::sleep(Duration::from_millis(50));
         assert_eq!(*calls.lock().unwrap(), ["unmount", "lazy"]);
     }
 

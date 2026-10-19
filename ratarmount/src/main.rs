@@ -5869,6 +5869,31 @@ mod create_missing_cli_tests {
         assert_eq!(fs::read(&archive).unwrap(), b"secret");
     }
 
+    /// Regression: the SIGINT (retry only) vs SIGTERM (retry, then lazy) asymmetry was
+    /// undocumented in `--help`.
+    #[test]
+    fn regression_help_documents_signal_unmount() {
+        use clap::CommandFactory;
+        let cmd = Args::command();
+        let find = |long: &str| {
+            cmd.get_arguments()
+                .find(|a| a.get_long() == Some(long))
+                .unwrap_or_else(|| panic!("no --{long}"))
+                .get_long_help()
+                .map(|h| h.to_string())
+                .unwrap_or_default()
+        };
+        let fg = find("foreground");
+        for needle in ["SIGINT", "SIGTERM", "-u -z"] {
+            assert!(
+                fg.contains(needle),
+                "--foreground long help lacks {needle}: {fg}"
+            );
+        }
+        let u = find("unmount");
+        assert!(u.contains("fusermount3 -u"), "--unmount long help: {u}");
+    }
+
     #[test]
     fn create_missing_clap_help_mentions_empty_archive() {
         use clap::CommandFactory;

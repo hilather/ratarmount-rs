@@ -8471,4 +8471,143 @@ mod unmount_retry_tests {
             .unwrap_err();
         assert_eq!((calls, e.kind()), (1, ErrorKind::Other));
     }
+
+    const MUSL_BUSY: &str = "fusermount3: failed to unmount /m: Resource busy\n";
+
+    /// Regression: musl's strerror(EBUSY) is "Resource busy"; Alpine fusermount3 got no retry.
+    #[test]
+    fn regression_unmount_musl_busy_text_retries_then_succeeds() {
+        let mut calls = 0;
+        let mut run = |_: &[&OsStr]| {
+            calls += 1;
+            Ok(if calls < 3 {
+                fake_fusermount(1, MUSL_BUSY)
+            } else {
+                fake_fusermount(0, "")
+            })
+        };
+        let r = unmount_linux_with(
+            Path::new("/m"),
+            &["-u"],
+            fast_retry(),
+            &mut run,
+            &mut |_| {},
+        );
+        assert!(r.is_ok(), "musl busy text was not retried: {r:?}");
+        assert_eq!(calls, 3);
+    }
+
+    /// Regression: persistent musl EBUSY must end in the typed `ResourceBusy`.
+    #[test]
+    fn regression_unmount_musl_busy_forever_is_resource_busy() {
+        let mut calls = 0;
+        let mut run = |_: &[&OsStr]| {
+            calls += 1;
+            Ok(fake_fusermount(1, MUSL_BUSY))
+        };
+        let e = unmount_linux_with(
+            Path::new("/m"),
+            &["-u"],
+            fast_retry(),
+            &mut run,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(calls > 2, "retried only {calls} times");
+        assert_eq!(e.kind(), ErrorKind::ResourceBusy, "{e}");
+    }
+
+    /// Already passes before the musl fix; it keeps the suffix-only match from regressing:
+    /// "Resource busy" in the echoed path with a different error is final.
+    #[test]
+    fn regression_unmount_musl_busy_text_in_mountpoint_is_not_busy() {
+        let mp = "/tmp/Resource busy/mnt";
+        let mut calls = 0;
+        let mut run = |_: &[&OsStr]| {
+            calls += 1;
+            Ok(fake_fusermount(
+                1,
+                &format!("fusermount3: failed to unmount {mp}: No such file or directory\n"),
+            ))
+        };
+        let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run, &mut |_| {})
+            .unwrap_err();
+        assert_eq!((calls, e.kind()), (1, ErrorKind::Other));
+    }
+
+    /// Regression (K3): the lazy path logged `fusermount3 -u ...: busy (attempt 1), retrying`
+    /// with no retry, and the error said "still busy after 1 attempts over ~0ms".
+    #[test]
+    fn regression_unmount_lazy_busy_does_not_claim_retry() {
+        let none = RetryPolicy {
+            interval: Duration::ZERO,
+            deadline: Duration::ZERO,
+        };
+        let mut calls = 0;
+        let mut run = |_: &[&OsStr]| {
+            calls += 1;
+            Ok(fake_fusermount(1, BUSY))
+        };
+        let mut notes: Vec<String> = Vec::new();
+        let e = unmount_linux_with(Path::new("/m"), &["-u", "-z"], none, &mut run, &mut |m| {
+            notes.push(m.to_string())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(e.kind(), ErrorKind::ResourceBusy);
+        let retrying: Vec<_> = notes.iter().filter(|m| m.contains("retrying")).collect();
+        assert!(retrying.is_empty(), "claimed a retry: {notes:?}");
+        let msg = e.to_string();
+        assert!(msg.contains("(busy)"), "{msg}");
+        assert!(!msg.contains("attempts over"), "{msg}");
+        assert!(!msg.contains("still busy after"), "{msg}");
+    }
+
+    /// Regression (K3): retry messages name the real flags and appear only when another
+    /// attempt follows.
+    #[test]
+    fn regression_unmount_retry_messages_name_flags_and_count() {
+        let mut calls = 0;
+        let mut run = |_: &[&OsStr]| {
+            calls += 1;
+            Ok(if calls < 3 {
+                fake_fusermount(1, BUSY)
+            } else {
+                fake_fusermount(0, "")
+            })
+        };
+        let mut notes: Vec<String> = Vec::new();
+        unmount_linux_with(
+            Path::new("/m"),
+            &["-u", "-z"],
+            fast_retry(),
+            &mut run,
+            &mut |m| notes.push(m.to_string()),
+        )
+        .unwrap();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        for m in &notes {
+            assert!(m.contains("fusermount3 -u -z /m"), "{m}");
+            assert!(m.contains("busy (attempt"), "{m}");
+            assert!(m.contains("retrying"), "{m}");
+        }
+    }
+
+    /// Regression (K3): when the deadline is hit, the last busy attempt must not log "retrying".
+    #[test]
+    fn regression_unmount_exhaustion_logs_one_fewer_retry_than_attempts() {
+        let mut calls = 0;
+        let mut run = |_: &[&OsStr]| {
+            calls += 1;
+            Ok(fake_fusermount(1, BUSY))
+        };
+        let mut notes: Vec<String> = Vec::new();
+        let e = unmount_linux_with(Path::new("/m"), &["-u"], fast_retry(), &mut run, &mut |m| {
+            notes.push(m.to_string())
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::ResourceBusy);
+        assert_eq!(notes.len() + 1, calls, "{notes:?}");
+        assert!(e.to_string().contains("still busy after"), "{e}");
+    }
 }
