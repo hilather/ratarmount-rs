@@ -2344,7 +2344,7 @@ mod tests {
     /// the open's selected index is the installed file.
     #[test]
     fn regression_discovered_index_from_is_reported() {
-        let _env = EnvGuard::acquire(&[]);
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("archive.tar");
@@ -2395,7 +2395,7 @@ mod tests {
     /// back for interval commits only).
     #[test]
     fn regression_composite_second_source_index_not_inherited() {
-        let _env = EnvGuard::acquire(&[]);
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let first = root.join("first.tar");
@@ -3737,7 +3737,7 @@ mod tests {
     /// fetches the sidecar when local folder candidates miss (pointer 404 continues).
     #[test]
     fn apply_remote_index_discovery_follows_archive_link() {
-        let _env = EnvGuard::acquire(&[]);
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
 
         let dir = tempfile::tempdir().unwrap();
@@ -3784,7 +3784,7 @@ mod tests {
     /// Regression: pointer + blob + tarstats success skips well-known GET.
     #[test]
     fn apply_remote_index_discovery_pointer_blob_skips_well_known() {
-        let _env = EnvGuard::acquire(&[]);
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("archive.tar");
         let archive_bytes = vec![b'B'; 1024];
@@ -3829,7 +3829,7 @@ mod tests {
     /// Regression: pointer 404 still finds describedby.
     #[test]
     fn apply_remote_index_discovery_pointer_404_falls_back_describedby() {
-        let _env = EnvGuard::acquire(&[]);
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
 
         let dir = tempfile::tempdir().unwrap();
@@ -3958,7 +3958,7 @@ mod tests {
     /// Regression: pointer blob sha256 ≠ index_id continues to well-known.
     #[test]
     fn apply_remote_index_discovery_pointer_blob_id_mismatch_falls_back_well_known() {
-        let _env = EnvGuard::acquire(&[]);
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         let dir = tempfile::tempdir().unwrap();
         let good = dir.path().join("good.tar");
         let other = dir.path().join("other.tar");
