@@ -142,11 +142,16 @@ pub fn shape_verdict(
     // A base that moved between local and remote: only a strong record that a
     // SHA-256 from elsewhere confirms. `pending` and `weak` never rescue.
     let recorded_digest = meta.known_base_digest();
-    let strong = meta.base_digest_kind() == Some("strong") && recorded_digest.is_some();
+    let strong = kind == BaseKind::Archive
+        && meta.base_digest_kind() == Some("strong")
+        && recorded_digest.is_some();
+    // A supplied digest decides alone; the cache answers only when nothing was
+    // supplied, so a wrong `--base-digest` is never rescued by a cached one.
     let confirmed = strong
-        && (probe.supplied == recorded_digest
-            || match (actual.kind(), actual.location()) {
-                (BaseKind::Archive, Some(BaseLocation::Local(path))) => {
+        && match probe.supplied {
+            Some(supplied) => Some(supplied) == recorded_digest,
+            None => match actual.location() {
+                Some(BaseLocation::Local(path)) => {
                     peek_archive_digest(path, actual.index_for_peek())
                         .ok()
                         .flatten()
@@ -154,7 +159,8 @@ pub fn shape_verdict(
                         == recorded_digest
                 }
                 _ => false,
-            });
+            },
+        };
     if confirmed {
         Verdict::Same
     } else {
@@ -516,7 +522,7 @@ pub(crate) fn check_commit_base_offline(
 mod tests {
     use super::*;
     use crate::overlay_identity::BaseKind;
-    use crate::{ServedKind, ServedLocation};
+    use crate::{IndexProvenance, Opened, ServedKind, ServedLocation};
     use std::fs;
     use std::sync::Arc;
 
@@ -734,7 +740,10 @@ mod tests {
                             Verdict::Same
                         } else if recorded == served || (is_local(recorded) && is_local(served)) {
                             Verdict::Content
-                        } else if digest_kind == "strong" && supplied == Some(D1) {
+                        } else if digest_kind == "strong"
+                            && supplied == Some(D1)
+                            && rk == BaseKind::Archive
+                        {
                             Verdict::Same
                         } else {
                             Verdict::Refuse(String::new())
@@ -824,6 +833,72 @@ mod tests {
                 assert!(matches!(got, Verdict::Refuse(_)), "{got:?}");
             }
         }
+    }
+
+    /// Regression (R6-F5): a remote strong record D1 reopened over a local copy
+    /// whose index CACHES D1 accepted an explicitly wrong `--base-digest D2`,
+    /// because the cached digest was consulted next to the supplied one. A
+    /// supplied digest now decides alone; the cache answers only when nothing
+    /// was supplied.
+    #[test]
+    fn regression_supplied_digest_is_not_overridden_by_cache() {
+        let place = Place::new();
+        let index = place.archive.with_extension("tar.index.sqlite");
+        Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT);")
+            .unwrap();
+        ratarmount_index::cached_archive_digest_with(&place.archive, Some(&index), |_| {
+            Ok("1".repeat(64))
+        })
+        .unwrap();
+        let recorded = place.record(Shape::ArchR, "strong", D1);
+        let local = ClassifiedBase::mint(Opened {
+            source: Arc::new(crate::FolderMountSource::new(&place.dir).unwrap()),
+            kind: ServedKind::Archive,
+            inputs: Vec::new(),
+            location: Some(ServedLocation::Local(place.archive.clone())),
+            index: IndexProvenance::None,
+            sidecar_candidate: Some(index),
+            fetched: false,
+            keep_alive: Box::new(()),
+        })
+        .unwrap();
+        let verdict = |supplied| {
+            shape_verdict(
+                Some(&recorded),
+                local.actual(),
+                &BaseProbe {
+                    supplied,
+                    extra_excludes: &[],
+                },
+            )
+        };
+        assert_eq!(verdict(None), Verdict::Same, "the cache confirms D1");
+        assert_eq!(verdict(Some(D1)), Verdict::Same);
+        assert!(
+            matches!(verdict(Some(D2)), Verdict::Refuse(_)),
+            "a wrong supplied digest must not be rescued by the cache: {:?}",
+            verdict(Some(D2))
+        );
+    }
+
+    /// Regression (R6-F5, review nit): only an archive moved between local and
+    /// remote is rescued by a matching strong digest; a directory is not.
+    #[test]
+    fn regression_digest_rescue_is_archive_only() {
+        let place = Place::new();
+        let recorded = place.record(Shape::DirR, "strong", D1);
+        let local = place.token(Shape::DirL);
+        let got = shape_verdict(
+            Some(&recorded),
+            local.actual(),
+            &BaseProbe {
+                supplied: Some(D1),
+                extra_excludes: &[],
+            },
+        );
+        assert!(matches!(got, Verdict::Refuse(_)), "{got:?}");
     }
 
     /// Regression: a forced change with nothing supplied drops a directory or
