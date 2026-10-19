@@ -460,6 +460,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | (Pinning, R6-H7) a non-`none` record without `base_size` / `base_mtime_ns` rows commits on kind and place alone (documented limit; with the rows a swap is refused) | `cargo test -p ratarmount-compositing --lib regression_missing_stamp_rows_on_a_digest_record_skip_only_the_stamp_check` |
 | Selector-only change (`repo@stable` over `repo@main`) not written by seal / forced pack (R6-G7) | `cargo test -p ratarmount --test overlay_base_gate regression_repo_stable_over_main` |
 | ssh/sftp/scp/webdav(s) fetched bodies and torrents served-kind rows; fixture generator deleted the committed README; `--base-digest none` warning said verification is disabled (R6-G8) | `cargo test -p ratarmount-session --lib regression_served_kind_table_fetched_and_torrent` · `./test-harness/test-make-overlay-v0.1.35.sh` · `cargo test -p ratarmount --bin ratarmount regression_none_digest_warning` |
+| Commit refresh chained every historical `ClassifiedBase` (memory grew per interval commit; drop recursed once per commit and could overflow the stack) (R6-J1) | `cargo test -p ratarmount-compositing --lib regression_repointed_token_does_not_chain` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

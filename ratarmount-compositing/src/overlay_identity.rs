@@ -266,7 +266,22 @@ impl ActualBase {
 pub(crate) struct Inner {
     source: Arc<dyn MountSource>,
     actual: ActualBase,
-    _keep_alive: Box<dyn Any + Send + Sync>,
+    /// Shared with every refreshed token (never chained).
+    _keep_alive: Arc<dyn Any + Send + Sync>,
+}
+
+#[cfg(test)]
+impl Inner {
+    /// How many predecessor tokens this one keeps alive (must stay 0).
+    fn chain_depth(&self) -> usize {
+        let mut depth = 0;
+        let mut next: Option<&Arc<Inner>> = (*self._keep_alive).downcast_ref::<Arc<Inner>>();
+        while let Some(inner) = next {
+            depth += 1;
+            next = (*inner._keep_alive).downcast_ref::<Arc<Inner>>();
+        }
+        depth
+    }
 }
 
 /// **Experimental.** Proof that a base was opened and classified.
@@ -974,7 +989,7 @@ impl ClassifiedBase {
             inner: Arc::new(Inner {
                 source,
                 actual,
-                _keep_alive: keep_alive,
+                _keep_alive: Arc::from(keep_alive),
             }),
         })
     }
@@ -1000,8 +1015,9 @@ impl ClassifiedBase {
             inner: Arc::new(Inner {
                 source: self.inner.source.clone(),
                 actual,
-                // The temporary files, if any, stay with the old token's Arc.
-                _keep_alive: Box::new(self.inner.clone()),
+                // The temporary files, if any, stay with the shared owner
+                // (not with the predecessor token, which would chain).
+                _keep_alive: self.inner._keep_alive.clone(),
             }),
         }
     }
@@ -1376,5 +1392,53 @@ mod tests {
         );
         assert_eq!(moved.actual().git_tree(), None);
         assert!(Arc::ptr_eq(&cb.source(), &moved.source()));
+    }
+
+    /// Regression: every `repointed` hop kept its predecessor alive, so
+    /// interval commits grew a chain and dropping it recursed once per commit.
+    #[test]
+    fn regression_repointed_token_does_not_chain() {
+        struct Sentinel(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Sentinel {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let archive = root.join("a.tar");
+        std::fs::write(&archive, b"x").unwrap();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cb = ClassifiedBase::mint(Opened {
+            source: folder(&root),
+            kind: ServedKind::Folder,
+            inputs: Vec::new(),
+            location: None,
+            index: IndexProvenance::None,
+            sidecar_candidate: None,
+            fetched: false,
+            keep_alive: Box::new(Sentinel(drops.clone())),
+        })
+        .unwrap();
+        let mut token = cb.repointed(&archive);
+        for _ in 0..50 {
+            token = token.repointed(&archive);
+        }
+        assert_eq!(token.inner.chain_depth(), 0, "a refresh must not chain");
+        drop(cb);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let mut token = token;
+                for _ in 0..100_000 {
+                    token = token.repointed(&archive);
+                }
+                assert_eq!(token.inner.chain_depth(), 0);
+                drop(token);
+                assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+            })
+            .unwrap();
+        handle.join().unwrap();
     }
 }
