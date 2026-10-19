@@ -1124,8 +1124,19 @@ fn regression_none_pack_against_other_archive_needs_force_and_agrees() {
         manifest.contains("x.txt") && !manifest.contains("\"added\""),
         "{manifest}"
     );
+    // R6-J6 (audit C5): the forced pack measured the manifest against the copy,
+    // so the bundle must describe the copy, not the place it was sealed on.
+    let copy_location = format!("local:{}", copy.canonicalize().unwrap().display());
+    assert_eq!(
+        bundle_meta_json(&bundle)["base_location"].as_str(),
+        Some(copy_location.as_str()),
+        "the bundle still names the old base"
+    );
     let restored = env.path("restored");
     env.ok(&["overlay", "unpack", s(&bundle), s(&restored)]);
+    let unpacked = meta_of(&restored);
+    assert_eq!(unpacked.get("base_location"), Some(copy_location.as_str()));
+    assert_eq!(unpacked.get("base_url"), Some(s(&copy)));
     env.ok(&["overlay", "verify", s(&restored), s(&copy)]);
     // The sealed source layer keeps its own record.
     assert_eq!(
@@ -1302,6 +1313,23 @@ fn regression_accepted_pack_against_directory_copy_keeps_weak_digest() {
     for key in ["base_weak_digest", "base_url", "base_location", "base_kind"] {
         assert_eq!(after.get(key), recorded.get(key), "{key}");
     }
+    // R6-J6 (audit C5): the bundle describes the copy it was measured on, with
+    // a weak digest measured from it.
+    let copy_location = format!("local:{}", copy.canonicalize().unwrap().display());
+    let bundle = env.path("bundle.tar.zst");
+    assert_eq!(
+        bundle_meta_json(&bundle)["base_location"].as_str(),
+        Some(copy_location.as_str()),
+        "the bundle still names the old base"
+    );
+    let restored = env.path("restored");
+    env.ok(&["overlay", "unpack", s(&bundle), s(&restored)]);
+    let unpacked = meta_of(&restored);
+    assert_eq!(unpacked.get("base_location"), Some(copy_location.as_str()));
+    assert_eq!(
+        unpacked.get("base_weak_digest"),
+        Some(weak_now(&copy).as_str())
+    );
 }
 
 /// Regression (R6-H3, B3): an accepted `overlay seal` against a metadata-

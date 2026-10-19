@@ -292,6 +292,24 @@ fn relocation_rows(
     Ok(rows)
 }
 
+/// The rows `overlay pack --force-base-mismatch` writes into the bundle for a
+/// base at another place that nothing confirmed (`none`, or weak-only): the
+/// forced run accepted the move, so the bundle must describe the base the
+/// manifest was measured on, not the place the layer was sealed on. Kind,
+/// place and URL, the stamp or weak manifest measured at the new place, and
+/// the digest rows the record already holds (kept: the force confirmed no
+/// content, so none is invented).
+pub fn forced_relocation_record(
+    meta: &OverlayMeta,
+    base: &ClassifiedBase,
+) -> std::result::Result<BTreeMap<String, String>, String> {
+    let mut rows = relocation_rows(Some(meta), base).map_err(|e| e.to_string())?;
+    if let Some(source) = meta.get("base_digest_source") {
+        rows.insert("base_digest_source".into(), source.to_owned());
+    }
+    Ok(rows)
+}
+
 /// Write the rows an accepted (not forced) change of place needs, through the
 /// caller's connection: a Local archive also moves its stamp so the next
 /// content comparison measures the new place.

@@ -487,7 +487,16 @@ pub fn pack(args: &PackArgs, context: &OverlayRunContext) -> Result<(String, i32
         ));
     }
     let moved = outcome.as_ref().is_some_and(|o| o.moved);
-    let forced = outcome.and_then(|outcome| outcome.forced);
+    // `--force-base-mismatch` over an accepted but unconfirmed move bypassed the
+    // refusal above with no rows, so the bundle kept naming the old place while
+    // its manifest was measured on this one.
+    let relocated = match (&outcome, meta.as_ref()) {
+        (Some(o), Some(m)) if o.unconfirmed_move && o.forced.is_none() => {
+            Some(ratarmount_compositing::overlay_gate::forced_relocation_record(m, &base)?)
+        }
+        _ => None,
+    };
+    let forced = outcome.and_then(|outcome| outcome.forced).or(relocated);
     let lower = lower_view(&base, &args.lower, meta.as_ref())?;
     let options = super::overlay_pack::PackOptions {
         include_journal: args.include_journal.clone(),
