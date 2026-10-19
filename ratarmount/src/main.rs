@@ -2028,7 +2028,7 @@ fn main() {
 
     // Optional control: Unix socket + in-FS `/.ratarmount-control/` (Python parity).
     let control_stop = Arc::new(AtomicBool::new(false));
-    let _control_sock = if args.control_interface {
+    let control = if args.control_interface {
         let mp = fuse_mp.as_ref().expect("control requires FUSE mp");
         let stop = Arc::clone(&control_stop);
         let mp_ctrl = mp.clone();
@@ -2083,7 +2083,7 @@ fn main() {
                     as Arc<dyn Fn() -> String + Send + Sync>
             })),
         ) as Arc<dyn MountSource>;
-        start_control_interface(
+        bind_control_interface(
             mp,
             Arc::clone(&control_stop),
             Some(on_search),
@@ -2140,6 +2140,7 @@ fn main() {
                     args.commit_overlay_on_exit,
                     commit_interval,
                     open_opts,
+                    control,
                 ),
             }
             return;
@@ -2161,6 +2162,7 @@ fn main() {
             args.commit_overlay_on_exit,
             commit_interval,
             open_opts,
+            control,
         );
         return;
     }
@@ -2183,6 +2185,7 @@ fn main() {
             args.commit_overlay_on_exit,
             commit_interval,
             open_opts,
+            control,
         );
         return;
     }
@@ -2202,6 +2205,7 @@ fn main() {
         args.commit_overlay_on_exit,
         commit_interval,
         open_opts,
+        control,
     );
 }
 
@@ -2764,6 +2768,7 @@ fn run_exports(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
+    control: Option<ControlListener>,
 ) {
     overlay_commit::install_term_signal_flag();
     let nfs_stop = ratarmount_nfs::NfsStop::new();
@@ -2837,6 +2842,7 @@ fn run_exports(
         Some(mp) => {
             if foreground {
                 overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+                let control = control.map(ControlListener::serve);
                 let interval = spawn_interval_if(
                     &overlay_arc,
                     &live_archive,
@@ -2877,6 +2883,7 @@ fn run_exports(
                     passthrough,
                     open_opts.direct_io,
                 );
+                wait_control_reply(&control);
                 nfs_stop.request_stop();
                 export_stop.request_stop();
                 join_export_handles(handles);
@@ -2919,6 +2926,7 @@ fn run_exports(
                         let _ = redirect_stdio_to_null();
                     }
                     overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+                    let control = control.map(ControlListener::serve);
                     let interval = spawn_interval_if(
                         &overlay_arc,
                         &live_archive,
@@ -2950,6 +2958,7 @@ fn run_exports(
                         passthrough,
                         open_opts.direct_io,
                     );
+                    wait_control_reply(&control);
                     nfs_stop.request_stop();
                     export_stop.request_stop();
                     join_export_handles(handles);
@@ -3064,6 +3073,7 @@ fn run_fuse_and_nfs(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
+    control: Option<ControlListener>,
 ) {
     let commit_exit = |ov: Option<&WriteOverlay>| {
         overlay_commit::maybe_commit_on_exit(
@@ -3078,6 +3088,7 @@ fn run_fuse_and_nfs(
         nfs_opts.stop = Some(stop.clone());
         overlay_commit::spawn_signal_nfs_stop(stop.clone());
         overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+        let control = control.map(ControlListener::serve);
         let interval = spawn_interval_if(
             &overlay_arc,
             &live_archive,
@@ -3107,6 +3118,7 @@ fn run_fuse_and_nfs(
             passthrough,
             open_opts.direct_io,
         );
+        wait_control_reply(&control);
         stop.request_stop();
         let _ = handle.join();
         finish_overlay_serve(overlay_arc, Some(source), interval, commit_exit);
@@ -3149,6 +3161,7 @@ fn run_fuse_and_nfs(
             nfs_opts.stop = Some(stop.clone());
             overlay_commit::spawn_signal_nfs_stop(stop.clone());
             overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+            let control = control.map(ControlListener::serve);
             let interval = spawn_interval_if(
                 &overlay_arc,
                 &live_archive,
@@ -3178,6 +3191,7 @@ fn run_fuse_and_nfs(
                 passthrough,
                 open_opts.direct_io,
             );
+            wait_control_reply(&control);
             stop.request_stop();
             let _ = handle.join();
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
@@ -3213,10 +3227,8 @@ fn run_fuse_only(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
+    control: Option<ControlListener>,
 ) {
-    if foreground {
-        overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-    }
     let commit_exit = |ov: Option<&WriteOverlay>| {
         overlay_commit::maybe_commit_on_exit(
             ov,
@@ -3226,6 +3238,8 @@ fn run_fuse_only(
         );
     };
     if foreground {
+        overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+        let control = control.map(ControlListener::serve);
         // The interval thread holds an Arc. Join it before the overlay drops,
         // or process exit kills it and the final replay never runs.
         let interval = spawn_interval_if(
@@ -3246,6 +3260,7 @@ fn run_fuse_only(
             passthrough,
             open_opts.direct_io,
         );
+        wait_control_reply(&control);
         finish_overlay_serve(overlay_arc, None, interval, commit_exit);
         if let Err(e) = mount_err {
             eprintln!("error mounting at {}: {e}", mp.display());
@@ -3276,6 +3291,7 @@ fn run_fuse_only(
                 let _ = redirect_stdio_to_null();
             }
             overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+            let control = control.map(ControlListener::serve);
             let interval = spawn_interval_if(
                 &overlay_arc,
                 &live_archive,
@@ -3294,6 +3310,7 @@ fn run_fuse_only(
                 passthrough,
                 open_opts.direct_io,
             );
+            wait_control_reply(&control);
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
                 let _ = std::fs::write(
@@ -3512,13 +3529,71 @@ fn print_oss_attributions(full: bool) {
 
 type SearchFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
-/// Listen for line-based control commands on a Unix socket.
-fn start_control_interface(
+/// A bound control socket that is not yet served. Binding (and printing the path) happens
+/// before any fork so errors reach the user; [`ControlListener::serve`] runs in the process
+/// that serves the mount, because a thread started before `fork` does not exist in the child.
+struct ControlListener {
+    listener: UnixListener,
+    sock: PathBuf,
+    mountpoint: PathBuf,
+    stop: Arc<AtomicBool>,
+    on_search: Option<SearchFn>,
+    quota: Option<Arc<ratarmount_compositing::OverlayQuota>>,
+}
+
+/// Counts control requests being answered. A reply that unmounts is in flight before the
+/// unmount starts and stays so until it is written, so the exit path can wait for it.
+#[derive(Clone, Default)]
+struct ControlInflight(Arc<std::sync::atomic::AtomicUsize>);
+
+/// Marks one control request in flight until dropped (also on panic).
+struct ControlInflightGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ControlInflight {
+    fn enter(&self) -> ControlInflightGuard {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ControlInflightGuard(Arc::clone(&self.0))
+    }
+
+    /// Wait up to `bound` for every in-flight request to finish. True when idle.
+    fn wait_idle(&self, bound: Duration) -> bool {
+        let start = Instant::now();
+        while self.0.load(Ordering::SeqCst) != 0 {
+            if start.elapsed() >= bound {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+}
+
+impl Drop for ControlInflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How long the exit path waits for a control reply that is still being written.
+const CONTROL_REPLY_WAIT: Duration = Duration::from_secs(2);
+
+/// Wait (bounded) for an in-flight control reply before the process exits. No-op without
+/// a control socket.
+fn wait_control_reply(control: &Option<ControlInflight>) {
+    if let Some(inflight) = control {
+        if !inflight.wait_idle(CONTROL_REPLY_WAIT) {
+            log::warn!("control reply still being written after {CONTROL_REPLY_WAIT:?}; exiting");
+        }
+    }
+}
+
+/// Bind the control socket and print its path.
+fn bind_control_interface(
     mountpoint: &Path,
     stop: Arc<AtomicBool>,
     on_search: Option<SearchFn>,
     quota: Option<Arc<ratarmount_compositing::OverlayQuota>>,
-) -> Option<PathBuf> {
+) -> Option<ControlListener> {
     let sock = std::env::temp_dir().join(format!("ratarmount-control-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
@@ -3529,37 +3604,65 @@ fn start_control_interface(
         }
     };
     eprintln!("control interface: {}", sock.display());
-    let mp = mountpoint.to_path_buf();
-    let sock_path = sock.clone();
-    thread::spawn(move || {
-        // Don't block forever if unmount happens
-        let _ = listener.set_nonblocking(false);
-        while !stop.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    use std::io::{BufRead, BufReader};
-                    let mut reader = BufReader::new(&stream);
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).is_ok() {
-                        let reply = control_reply_with_quota(
-                            line.trim(),
-                            &mp,
-                            &stop,
-                            on_search.as_ref(),
-                            quota.as_deref(),
-                            &|p| unmount(p),
-                        );
-                        let _ = stream.write_all(reply.as_bytes());
+    Some(ControlListener {
+        listener,
+        sock,
+        mountpoint: mountpoint.to_path_buf(),
+        stop,
+        on_search,
+        quota,
+    })
+}
+
+impl ControlListener {
+    /// Start the accept thread. Call in the process that serves the mount.
+    fn serve(self) -> ControlInflight {
+        let inflight = ControlInflight::default();
+        let tracker = inflight.clone();
+        let ControlListener {
+            listener,
+            sock,
+            mountpoint: mp,
+            stop,
+            on_search,
+            quota,
+        } = self;
+        thread::spawn(move || {
+            // Don't block forever if unmount happens
+            let _ = listener.set_nonblocking(false);
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        use std::io::{BufRead, BufReader};
+                        let mut reader = BufReader::new(&stream);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_ok() {
+                            // Taken before `control_reply` (which may unmount, after which
+                            // `mount_blocking` returns and the process exits) and released only
+                            // once the reply is written.
+                            let _in_flight = tracker.enter();
+                            let reply = control_reply_with_quota(
+                                line.trim(),
+                                &mp,
+                                &stop,
+                                on_search.as_ref(),
+                                quota.as_deref(),
+                                &|p| unmount(p),
+                            );
+                            let _ = stream.write_all(reply.as_bytes());
+                            let _ = stream.flush();
+                            let _ = stream.shutdown(std::net::Shutdown::Write);
+                        }
+                    }
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(100));
                     }
                 }
-                Err(_) => {
-                    thread::sleep(Duration::from_millis(100));
-                }
             }
-        }
-        let _ = std::fs::remove_file(&sock_path);
-    });
-    Some(sock)
+            let _ = std::fs::remove_file(&sock);
+        });
+        inflight
+    }
 }
 
 fn control_reply_with_quota(
@@ -6738,6 +6841,53 @@ mod sandbox_cli_tests {
         ])
         .is_err());
     }
+    /// Regression (I1): the exit path must wait for an unmount reply that is still being written.
+    #[test]
+    fn regression_control_inflight_idle_returns_immediately() {
+        let inflight = ControlInflight::default();
+        let t = Instant::now();
+        assert!(inflight.wait_idle(Duration::from_secs(5)));
+        assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn regression_control_inflight_waits_for_guard_drop() {
+        let inflight = ControlInflight::default();
+        let guard = inflight.enter();
+        let t = Instant::now();
+        let h = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(guard);
+        });
+        assert!(inflight.wait_idle(Duration::from_secs(5)));
+        assert!(t.elapsed() >= Duration::from_millis(100));
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn regression_control_inflight_never_dropped_returns_at_bound() {
+        let inflight = ControlInflight::default();
+        let _guard = inflight.enter();
+        let t = Instant::now();
+        assert!(!inflight.wait_idle(Duration::from_millis(100)));
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(100), "{took:?}");
+        assert!(took < Duration::from_secs(3), "{took:?}");
+    }
+
+    /// A panic while answering must not leave the exit path waiting for the full bound.
+    #[test]
+    fn regression_control_inflight_guard_dropped_on_panic() {
+        let inflight = ControlInflight::default();
+        let tracker = inflight.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _g = tracker.enter();
+            panic!("handler panic");
+        }));
+        assert!(r.is_err());
+        assert!(inflight.wait_idle(Duration::from_millis(200)));
+    }
+
     /// Regression: socket status includes the same live policy fields as the virtual file.
     #[test]
     fn regression_control_socket_quota_status() {
