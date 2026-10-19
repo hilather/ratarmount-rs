@@ -161,6 +161,23 @@ pub(crate) struct FileId {
 }
 
 impl FileId {
+    /// Of an already-open file's metadata (a locked descriptor's `fstat`).
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            None
+        }
+    }
+
     /// Of the file `path` resolves to (symlinks followed).
     pub(crate) fn of(path: &Path) -> Option<Self> {
         #[cfg(unix)]

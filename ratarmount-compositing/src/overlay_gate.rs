@@ -102,7 +102,7 @@ impl Verdict {
     }
 }
 
-fn kind_only(meta: &OverlayMeta) -> bool {
+pub(crate) fn kind_only(meta: &OverlayMeta) -> bool {
     matches!(meta.base_digest_kind(), None | Some("none"))
 }
 
@@ -580,64 +580,6 @@ fn names_recorded_base(
         || (named.is_some() && named == actual.typed_named)
 }
 
-/// After recovery rolled a consistent COMPLETE journal forward: the archive is
-/// now exactly what the crashed commit wrote, so the recorded stamp is
-/// re-baselined to it (the files that commit appended are still in the
-/// overlay; the retry appends them again and the later member wins).
-pub(crate) fn restamp_rolled_forward(conn: &Connection, base: &ClassifiedBase, archive: &Path) {
-    // The journal touches the overlay's rows only when its target IS the
-    // recorded base: a union member's own journal recovers that member only.
-    let actual = base.actual();
-    let (BaseKind::Archive, Some(BaseLocation::Local(path))) = (actual.kind(), actual.location())
-    else {
-        return;
-    };
-    let Ok(canonical) = archive.canonicalize() else {
-        return;
-    };
-    if !names_recorded_base(actual, path, archive, &canonical) {
-        return;
-    }
-    let Ok(Some(meta)) = OverlayMeta::from_connection(conn) else {
-        return;
-    };
-    if kind_only(&meta) || meta.get("base_size").is_none() || meta.get("base_mtime_ns").is_none() {
-        return;
-    }
-    let Ok(canonical) = archive.canonicalize() else {
-        return;
-    };
-    let Ok(now) = ArchiveDigestStamp::read(&canonical) else {
-        return;
-    };
-    let size = now.size.to_string();
-    let mtime = now.mtime_ns.to_string();
-    let _ = OverlayMeta::set_many(
-        conn,
-        &[
-            ("base_size", size.as_str()),
-            ("base_mtime_ns", mtime.as_str()),
-        ],
-    );
-    // The recorded digest names the PRE-crash bytes. A weak one is the stamp
-    // itself; a strong one is marked `pending` (never cleared) and resolved
-    // lazily by seal, diff, pack or grading, so mounting stays fast.
-    match meta.base_digest_kind() {
-        Some("weak") => {
-            let weak = format!("weak:size={size},mtime_ns={mtime}");
-            let _ = OverlayMeta::set_many(conn, &[("base_digest", weak.as_str())]);
-        }
-        Some("strong") => {
-            let _ = OverlayMeta::set_many(
-                conn,
-                &[("base_digest", ""), ("base_digest_kind", "pending")],
-            );
-            let _ = OverlayMeta::remove(conn, "stack_digest");
-        }
-        _ => {}
-    }
-}
-
 /// Why a commit was refused before it wrote anything.
 #[derive(Debug)]
 pub(crate) struct CommitBaseRefusal(pub String);
@@ -665,6 +607,24 @@ pub(crate) fn check_commit_base(
     conn: &Connection,
     base: &ClassifiedBase,
     archive: &Path,
+) -> std::result::Result<(), CommitBaseRefusal> {
+    check_commit_base_with(conn, base, archive, None)
+}
+
+/// [`check_commit_base`] with the journal header and file metadata read UNDER
+/// the archive lock injected (`locked`): the one rule recovery itself uses to
+/// decide whether a journal is its own. With `locked`, nothing is stat'ed by
+/// path: ownership, file identity and the stamp all come from the locked
+/// descriptor. A journal that names the archive is judged by
+/// [`journal_agrees`](crate::journal_recovery::journal_agrees).
+pub(crate) fn check_commit_base_with(
+    conn: &Connection,
+    base: &ClassifiedBase,
+    archive: &Path,
+    locked: Option<(
+        &ratarmount_compress::commit_journal::PendingJournal,
+        &std::fs::Metadata,
+    )>,
 ) -> std::result::Result<(), CommitBaseRefusal> {
     let refuse = |why: String| {
         CommitBaseRefusal(format!(
@@ -699,9 +659,27 @@ pub(crate) fn check_commit_base(
     // the token describes and whatever digest the record has, recovery would
     // roll a journal into the file it finds, so a journal started for another
     // file is refused here.
-    let journal = match archive.canonicalize() {
-        Ok(resolved) => owned_journal(&resolved)?,
-        Err(_) => None,
+    let journal = match locked {
+        Some((header, file)) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if !journal_started_for(header, file.ino()) {
+                    return Err(refuse(format!(
+                        "{} carries a commit journal that was started for another file \
+                         (journal inode {}, archive inode {}); the journal was not applied",
+                        archive.display(),
+                        header.ino,
+                        file.ino()
+                    )));
+                }
+            }
+            Some(*header)
+        }
+        None => match archive.canonicalize() {
+            Ok(resolved) => owned_journal(&resolved)?,
+            Err(_) => None,
+        },
     };
     let (BaseKind::Archive, Some(BaseLocation::Local(path))) = (actual.kind(), actual.location())
     else {
@@ -718,8 +696,11 @@ pub(crate) fn check_commit_base(
         // An archive the token does not describe (a union's other member).
         return Ok(());
     }
-    let metadata = std::fs::metadata(&canonical)
-        .map_err(|e| refuse(format!("cannot stat {}: {e}", canonical.display())))?;
+    let metadata = match locked {
+        Some((_, file)) => file.clone(),
+        None => std::fs::metadata(&canonical)
+            .map_err(|e| refuse(format!("cannot stat {}: {e}", canonical.display())))?,
+    };
     if !metadata.is_file() {
         return Err(refuse(format!(
             "{} is no longer a regular file",
@@ -727,7 +708,10 @@ pub(crate) fn check_commit_base(
         )));
     }
     let same_file = match actual.file_id {
-        Some(id) => crate::overlay_identity::FileId::of(&canonical) == Some(id),
+        Some(id) => match locked {
+            Some((_, file)) => crate::overlay_identity::FileId::from_metadata(file) == Some(id),
+            None => crate::overlay_identity::FileId::of(&canonical) == Some(id),
+        },
         None => &canonical == path,
     };
     if !same_file {
@@ -746,12 +730,26 @@ pub(crate) fn check_commit_base(
     let (Some(size), Some(mtime)) = (meta.get("base_size"), meta.get("base_mtime_ns")) else {
         return Ok(());
     };
+    // The current stamp: the locked descriptor's, else a path stat.
+    let now = match locked {
+        Some((_, file)) => (file.len(), metadata_mtime_ns(file)),
+        None => {
+            let now = ArchiveDigestStamp::read(&canonical)
+                .map_err(|e| refuse(format!("cannot stat {}: {e}", canonical.display())))?;
+            (now.size, now.mtime_ns)
+        }
+    };
+    let recorded = size.parse::<u64>().ok().zip(mtime.parse::<i128>().ok());
     // A commit journal is pending and is this file's own: recovery rolls the
     // archive back to the state the journal recorded BEFORE this commit
     // writes, so that state is what the recorded stamp must describe. A
-    // consistent complete journal rolls forward and is re-stamped afterwards.
+    // consistent complete journal rolls forward and is re-stamped before its
+    // unlink; if the rows already describe the committed bytes only the unlink
+    // is owed.
     if let Some(journal) = journal {
-        return if journal.len.to_string() == size && journal.mtime_ns.to_string() == mtime {
+        return if recorded.is_some_and(|recorded| {
+            crate::journal_recovery::journal_agrees(recorded, now, &journal)
+        }) {
             Ok(())
         } else {
             Err(refuse(format!(
@@ -764,17 +762,26 @@ pub(crate) fn check_commit_base(
             )))
         };
     }
-    let now = ArchiveDigestStamp::read(&canonical)
-        .map_err(|e| refuse(format!("cannot stat {}: {e}", canonical.display())))?;
-    if now.size.to_string() != size || now.mtime_ns.to_string() != mtime {
+    if now.0.to_string() != size || now.1.to_string() != mtime {
         return Err(refuse(format!(
             "{} changed since it was recorded (size={},mtime_ns={} now, size={size},mtime_ns={mtime} recorded)",
             canonical.display(),
-            now.size,
-            now.mtime_ns
+            now.0,
+            now.1
         )));
     }
     Ok(())
+}
+
+/// Modification time of `metadata` in nanoseconds since the epoch (the unit of
+/// the recorded `base_mtime_ns`).
+fn metadata_mtime_ns(metadata: &std::fs::Metadata) -> i128 {
+    use std::time::UNIX_EPOCH;
+    match metadata.modified().map(|t| t.duration_since(UNIX_EPOCH)) {
+        Ok(Ok(d)) => d.as_nanos() as i128,
+        Ok(Err(e)) => -(e.duration().as_nanos() as i128),
+        Err(_) => 0,
+    }
 }
 
 /// Offline `--commit-overlay` gate for a DB-backed overlay: the archive about
@@ -785,13 +792,27 @@ pub(crate) fn check_commit_base_offline(
     base: &ClassifiedBase,
     archive: &Path,
 ) -> std::result::Result<(), CommitBaseRefusal> {
+    check_commit_base_offline_with(overlay, base, archive, None)
+}
+
+/// [`check_commit_base_offline`] with the journal header and file metadata read
+/// under the archive lock (see [`check_commit_base_with`]).
+pub(crate) fn check_commit_base_offline_with(
+    overlay: &Path,
+    base: &ClassifiedBase,
+    archive: &Path,
+    locked: Option<(
+        &ratarmount_compress::commit_journal::PendingJournal,
+        &std::fs::Metadata,
+    )>,
+) -> std::result::Result<(), CommitBaseRefusal> {
     let db = overlay.join(HIDDEN_DB);
     let conn = Connection::open_with_flags(
         &db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| CommitBaseRefusal(format!("cannot open {}: {e}", db.display())))?;
-    check_commit_base(&conn, base, archive)
+    check_commit_base_with(&conn, base, archive, locked)
 }
 
 #[cfg(test)]

@@ -574,3 +574,112 @@ fn regression_offline_commit_makes_no_network_fetch() {
     server.join().unwrap();
     assert_eq!(hits.load(Ordering::SeqCst), 0, "network contacted");
 }
+
+/// Leave `archive` crashed right after the replacement was fully written: the
+/// journal is on disk and marked complete, so recovery rolls it FORWARD.
+fn interrupt_complete(archive: &Path) {
+    use std::io::Write;
+    let len = fs::metadata(archive).unwrap().len();
+    let mut suffix = tempfile::tempfile().unwrap();
+    suffix.write_all(&[0u8; 1536]).unwrap();
+    let crashed = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+        archive,
+        len - 1024,
+        &mut suffix,
+        &mut |step| {
+            if step == "locator complete" {
+                Err(std::io::Error::other("crash"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(crashed.is_err());
+}
+
+fn info(env: &Env, overlay: &Path) -> serde_json::Value {
+    let out = env.run(&["overlay", "info", "--json", s(overlay)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// Regression (R7-A2): mount-time recovery rolled a COMPLETE journal forward
+/// and unlinked it without restamping the `-w` overlay's recorded base, so the
+/// identity gate that followed (or the next mount) refused the archive recovery
+/// itself had just produced. The rows are restamped from the locked descriptor
+/// before the journal is unlinked (a strong digest is marked `pending`), and
+/// the next mount accepts.
+#[cfg(unix)]
+#[test]
+fn regression_mount_roll_forward_restamps_then_remount_accepts() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for supplied in [false, true] {
+        let env = Env::new();
+        let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+        let overlay = env.path("overlay");
+        let old = if supplied {
+            let out = Command::new("sha256sum").arg(&archive).output().unwrap();
+            let hex = String::from_utf8_lossy(&out.stdout);
+            Some(format!("sha256:{}", hex.split_whitespace().next().unwrap()))
+        } else {
+            None
+        };
+        let mut args = vec!["--no-mount"];
+        if let Some(digest) = &old {
+            args.extend(["--base-digest", digest]);
+        }
+        args.extend(["-w", s(&overlay), s(&archive)]);
+        env.ok(&args);
+        interrupt_complete(&archive);
+        let rolled = fs::read(&archive).unwrap();
+        env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+        assert!(
+            !ratarmount_compress::commit_journal::journal_path(&archive).exists(),
+            "supplied={supplied}: journal recovered"
+        );
+        assert!(fs::read(&archive).unwrap() == rolled, "rolled forward");
+        let record = info(&env, &overlay);
+        // A strong digest of the pre-crash bytes is never kept: it is `pending`
+        // (or already re-resolved against the archive as it is now).
+        if let Some(old) = &old {
+            assert_ne!(
+                record["base_digest"].as_str(),
+                Some(old.as_str()),
+                "{record}"
+            );
+        }
+        // The next gate accepts the archive recovery produced.
+        env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    }
+}
+
+/// Regression (R7-A2): offline `--commit-overlay` recovered a complete journal
+/// at the start of the commit and then ended on an empty plan (or a declined
+/// confirmation) without restamping, so the next commit failed with "changed
+/// since it was recorded". Recovery restamps before the journal is unlinked.
+#[cfg(unix)]
+#[test]
+fn regression_offline_commit_roll_forward_with_empty_plan_restamps() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let env = Env::new();
+    let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    interrupt_complete(&archive);
+    // An empty overlay: recovery rolls forward and the commit has nothing to do.
+    env.ok(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
+    assert!(
+        !ratarmount_compress::commit_journal::journal_path(&archive).exists(),
+        "journal recovered"
+    );
+    // The next commit is accepted by the gate.
+    fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+    env.ok(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
+    assert!(members(&archive).contains("new.txt"));
+}

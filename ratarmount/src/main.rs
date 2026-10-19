@@ -1953,7 +1953,20 @@ fn main() {
                     std::process::exit(2);
                 }
             }
-            if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
+            let recovered = if args.force_base_mismatch {
+                ratarmount_compositing::recover_journal_at(
+                    archive,
+                    None,
+                    &mut ratarmount_compress::commit_journal::authorize_any,
+                )
+            } else {
+                ratarmount_compositing::recover_journal_at(
+                    archive,
+                    None,
+                    &mut ratarmount_compress::commit_journal::authorize_owned,
+                )
+            };
+            if let Err(e) = recovered {
                 eprintln!("error: commit recovery for {}: {e}", archive.display());
                 std::process::exit(2);
             }
@@ -2056,7 +2069,18 @@ fn main() {
     {
         for input in &inputs {
             if !ratarmount_remote::is_remote_url(&input.to_string_lossy()) {
-                if let Err(e) = ratarmount_compress::commit_journal::recover_owned(input) {
+                // A complete journal rolls forward and restamps the `-w` overlay's
+                // recorded base BEFORE the journal is unlinked, so the identity
+                // gate that follows accepts the archive recovery produced.
+                let top_db = args
+                    .write_overlay
+                    .as_ref()
+                    .map(|dir| dir.join(ratarmount_compositing::HIDDEN_DB));
+                if let Err(e) = ratarmount_compositing::recover_journal_at(
+                    input,
+                    top_db.as_deref(),
+                    &mut ratarmount_compress::commit_journal::authorize_owned,
+                ) {
                     eprintln!("error: commit recovery for {}: {e}", input.display());
                     std::process::exit(2);
                 }

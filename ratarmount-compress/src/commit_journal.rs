@@ -30,49 +30,138 @@ fn recovery_error(path: &Path, reason: impl std::fmt::Display) -> io::Error {
     ))
 }
 
-/// Recover before probing an archive or consulting its sidecar, even for a
-/// read-only mount. A pending journal that cannot be recovered refuses the open.
-pub fn recover(archive: &Path) -> io::Result<bool> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        unix::recover(archive)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        if journal_path(archive).try_exists()? {
-            return Err(recovery_error(
-                &journal_path(archive),
-                "recovery requires Linux/macOS inode xattrs",
-            ));
+/// What recovery applied, read from the LOCKED descriptor right before the
+/// journal is unlinked: the only stamp a caller may record for the archive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Applied {
+    /// The journal was complete: the archive keeps the new bytes. `false` is a
+    /// rollback to the state `pre_len`/`pre_mtime_ns` describe.
+    pub rolled_forward: bool,
+    pub pre_len: u64,
+    pub pre_mtime_ns: i128,
+    pub new_len: u64,
+    /// `fstat` of the locked descriptor, taken after the final sync and the
+    /// completion marker, immediately before `before_unlink` runs.
+    pub dev: u64,
+    pub ino: u64,
+    pub final_len: u64,
+    pub final_mtime_ns: i128,
+}
+
+/// Why a recovery or a journaled replacement did not finish.
+#[derive(Debug)]
+pub enum RecoverError {
+    /// The authorizer said no; nothing was written.
+    Refused(io::Error),
+    /// The journal could not be applied or cleaned up and the archive does not
+    /// hold the new bytes (it is untouched or rolled back).
+    Journal(io::Error),
+    /// The archive holds the new bytes but the journal is still pending
+    /// because the `before_unlink` hook (or the cleanup) failed. Never answer
+    /// this with a copy fallback.
+    Committed(io::Error),
+}
+
+impl RecoverError {
+    pub fn into_io(self) -> io::Error {
+        match self {
+            Self::Refused(e) | Self::Journal(e) | Self::Committed(e) => e,
         }
-        Ok(false)
     }
 }
 
-/// [`recover`] for the mount-time openers, which run before any identity gate:
-/// a journal started for ANOTHER file (a new-inode copy of a crashed archive, a
-/// restored backup) is refused with the archive and the journal untouched,
-/// because recovery checks content only and would roll the copy back. The
-/// archive's own journal recovers as before.
-pub fn recover_owned(archive: &Path) -> io::Result<bool> {
+impl std::fmt::Display for RecoverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(e) | Self::Journal(e) | Self::Committed(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for RecoverError {}
+
+impl From<RecoverError> for io::Error {
+    fn from(error: RecoverError) -> Self {
+        error.into_io()
+    }
+}
+
+/// Runs under the archive lock with the header read there and the LOCKED
+/// descriptor's metadata (never a path stat), after the journal was validated
+/// and before the first write. `Err` refuses the recovery.
+pub type Authorize<'a> = &'a mut dyn FnMut(&PendingJournal, &fs::Metadata) -> io::Result<()>;
+
+/// Runs under the archive lock after the final sync and completion marker and
+/// before the journal is unlinked. An error keeps the journal and the marker,
+/// so the next recovery runs the hook again (it must be idempotent).
+pub type BeforeUnlink<'a> = &'a mut dyn FnMut(&Applied) -> io::Result<()>;
+
+/// Ownership only: the journal was started for the very file locked.
+pub fn authorize_owned(journal: &PendingJournal, file: &fs::Metadata) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if let Some(journal) = pending(archive)? {
-            if let Ok(metadata) = fs::metadata(archive) {
-                if journal.ino != metadata.ino() {
-                    return Err(io::Error::other(format!(
-                        "{} carries a commit journal that was started for another file \
-                         (journal inode {}, archive inode {}); the journal was not applied",
-                        archive.display(),
-                        journal.ino,
-                        metadata.ino()
-                    )));
-                }
-            }
+        if journal.ino != file.ino() {
+            return Err(io::Error::other(format!(
+                "the archive carries a commit journal that was started for another file \
+                 (journal inode {}, archive inode {}); the journal was not applied",
+                journal.ino,
+                file.ino()
+            )));
         }
     }
-    recover(archive)
+    #[cfg(not(unix))]
+    let _ = (journal, file);
+    Ok(())
+}
+
+/// Accept any journal (a forced recovery, or in-crate tests).
+pub fn authorize_any(_: &PendingJournal, _: &fs::Metadata) -> io::Result<()> {
+    Ok(())
+}
+
+/// Recover before probing an archive or consulting its sidecar, even for a
+/// read-only mount. A pending journal that cannot be recovered refuses the open.
+///
+/// Callers that own an overlay must use the compositing crate's
+/// `recover_journal_at` (or `WriteOverlay::recover_journal`): this entry
+/// neither authorizes nor restamps.
+pub fn recover(archive: &Path) -> io::Result<bool> {
+    recover_with(archive, &mut authorize_any, &mut |_| Ok(()))
+        .map(|applied| applied.is_some())
+        .map_err(RecoverError::into_io)
+}
+
+/// THE recovery entry. An unlocked probe (marker or sibling journal present?
+/// else `Ok(None)` without locking) → open read-write → flock → `(state, path)`
+/// both re-derived from the locked descriptor's marker (the sibling
+/// [`journal_path`] only when there is no marker) → a missing journal is
+/// metadata-only cleanup (`P`/`C` clear the marker, `A` is an error) → the
+/// header is validated → `authorize(header, fstat)` → writes → marker →
+/// `before_unlink(&Applied)` → unlink → clear.
+pub fn recover_with(
+    archive: &Path,
+    authorize: Authorize,
+    before_unlink: BeforeUnlink,
+) -> std::result::Result<Option<Applied>, RecoverError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix::recover(archive, authorize, before_unlink)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (authorize, before_unlink);
+        if journal_path(archive)
+            .try_exists()
+            .map_err(RecoverError::Journal)?
+        {
+            return Err(RecoverError::Journal(recovery_error(
+                &journal_path(archive),
+                "recovery requires Linux/macOS inode xattrs",
+            )));
+        }
+        Ok(None)
+    }
 }
 
 /// What a pending journal says about the archive it was started for. Read
@@ -113,7 +202,8 @@ pub fn pending(archive: &Path) -> io::Result<Option<PendingJournal>> {
 
 /// Replace a staged suffix. On an ordinary failure, recover before returning.
 pub fn replace_suffix(archive: &Path, offset: u64, suffix: &mut File) -> io::Result<()> {
-    replace_suffix_if_original(archive, offset, suffix, None)
+    replace_suffix_if_original(archive, offset, suffix, None, &mut |_| Ok(()))
+        .map_err(RecoverError::into_io)
 }
 
 pub fn replace_suffix_if_unchanged(
@@ -122,7 +212,22 @@ pub fn replace_suffix_if_unchanged(
     suffix: &mut File,
     original: &fs::Metadata,
 ) -> io::Result<()> {
-    replace_suffix_if_original(archive, offset, suffix, Some(original))
+    replace_suffix_if_original(archive, offset, suffix, Some(original), &mut |_| Ok(()))
+        .map_err(RecoverError::into_io)
+}
+
+/// [`replace_suffix_if_unchanged`] with a `before_unlink` hook that runs under
+/// the archive lock with the final stamp, before the journal is unlinked. A
+/// hook that keeps failing leaves the journal pending and returns
+/// [`RecoverError::Committed`]; the next recovery runs the hook again.
+pub fn replace_suffix_if_unchanged_with(
+    archive: &Path,
+    offset: u64,
+    suffix: &mut File,
+    original: &fs::Metadata,
+    before_unlink: BeforeUnlink,
+) -> std::result::Result<(), RecoverError> {
+    replace_suffix_if_original(archive, offset, suffix, Some(original), before_unlink)
 }
 
 fn replace_suffix_if_original(
@@ -130,7 +235,8 @@ fn replace_suffix_if_original(
     offset: u64,
     suffix: &mut File,
     original: Option<&fs::Metadata>,
-) -> io::Result<()> {
+    before_unlink: BeforeUnlink,
+) -> std::result::Result<(), RecoverError> {
     #[allow(unused_mut)]
     let mut committed = false;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -141,6 +247,7 @@ fn replace_suffix_if_original(
         original,
         &mut committed,
         &mut |_| Ok(()),
+        &mut *before_unlink,
     );
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let result = {
@@ -150,16 +257,30 @@ fn replace_suffix_if_original(
             "append requires Linux/macOS inode xattrs",
         ))
     };
-    finish_replace(archive, result, committed)
+    finish_replace(archive, result, committed, before_unlink)
 }
 
-fn finish_replace(archive: &Path, result: io::Result<()>, committed: bool) -> io::Result<()> {
+fn finish_replace(
+    archive: &Path,
+    result: io::Result<()>,
+    committed: bool,
+    before_unlink: BeforeUnlink,
+) -> std::result::Result<(), RecoverError> {
     if let Err(error) = result {
-        recover(archive).map_err(|recovery| io::Error::other(format!("{error}; {recovery}")))?;
-        if committed {
-            return Ok(());
+        match recover_with(archive, &mut authorize_any, before_unlink) {
+            Ok(_) if committed => return Ok(()),
+            Ok(_) => return Err(RecoverError::Journal(error)),
+            Err(RecoverError::Committed(recovery)) => {
+                return Err(RecoverError::Committed(io::Error::other(format!(
+                    "{error}; {recovery}"
+                ))))
+            }
+            Err(recovery) => {
+                return Err(RecoverError::Journal(io::Error::other(format!(
+                    "{error}; {recovery}"
+                ))))
+            }
         }
-        return Err(error);
     }
     Ok(())
 }
@@ -175,7 +296,9 @@ pub fn replace_suffix_with_hook(
 ) -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        unix::replace(archive, offset, suffix, None, &mut false, hook)
+        unix::replace(archive, offset, suffix, None, &mut false, hook, &mut |_| {
+            Ok(())
+        })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -360,6 +483,7 @@ mod unix {
         original: Option<&fs::Metadata>,
         committed: &mut bool,
         hook: &mut dyn FnMut(&'static str) -> io::Result<()>,
+        before_unlink: BeforeUnlink,
     ) -> io::Result<()> {
         let archive = archive.canonicalize()?;
         let path = journal_path(&archive);
@@ -448,6 +572,13 @@ mod unix {
         *committed = get_marker(&file)?.is_some_and(|(state, _)| state == b'C');
         completion?;
         hook("locator complete")?;
+        before_unlink(&applied_of(
+            &file,
+            true,
+            meta.len(),
+            mtime_ns(&meta),
+            new_len,
+        )?)?;
         fs::remove_file(&path)?;
         hook("journal unlink")?;
         sync_parent(&path)?;
@@ -457,10 +588,46 @@ mod unix {
         Ok(())
     }
 
-    pub(super) fn recover(archive: &Path) -> io::Result<bool> {
+    fn mtime_ns(meta: &fs::Metadata) -> i128 {
+        i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec())
+    }
+
+    /// The locked descriptor's final stamp (`fstat`, never a path stat).
+    fn applied_of(
+        file: &File,
+        rolled_forward: bool,
+        pre_len: u64,
+        pre_mtime_ns: i128,
+        new_len: u64,
+    ) -> io::Result<Applied> {
+        let now = file.metadata()?;
+        Ok(Applied {
+            rolled_forward,
+            pre_len,
+            pre_mtime_ns,
+            new_len,
+            dev: now.dev(),
+            ino: now.ino(),
+            final_len: now.len(),
+            final_mtime_ns: mtime_ns(&now),
+        })
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Runs between the unlocked probe and the flock.
+        pub(super) static AFTER_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn recover(
+        archive: &Path,
+        authorize: Authorize,
+        before_unlink: BeforeUnlink,
+    ) -> std::result::Result<Option<Applied>, RecoverError> {
         let probe = match File::open(archive) {
-            Ok(f) if f.metadata()?.is_file() => f,
-            Ok(_) => return Ok(false),
+            Ok(f) if f.metadata().map_err(RecoverError::Journal)?.is_file() => f,
+            Ok(_) => return Ok(None),
             // With no visible journal, leave ordinary open errors to the
             // caller (Session's NotFound/NotWritable/index-policy contract).
             Err(e)
@@ -471,36 +638,71 @@ mod unix {
                         | io::ErrorKind::PermissionDenied
                 ) && fs::symlink_metadata(journal_path(archive)).is_err() =>
             {
-                return Ok(false)
+                return Ok(None)
             }
-            Err(e) => return Err(recovery_error(&journal_path(archive), e)),
+            Err(e) => {
+                return Err(RecoverError::Journal(recovery_error(
+                    &journal_path(archive),
+                    e,
+                )))
+            }
         };
-        let locator = get_marker(&probe).map_err(|e| recovery_error(&journal_path(archive), e))?;
-        let path = locator
+        let journal_error =
+            |path: &Path, e: io::Error| RecoverError::Journal(recovery_error(path, e));
+        let locator = get_marker(&probe).map_err(|e| journal_error(&journal_path(archive), e))?;
+        let probed = locator
             .as_ref()
             .map(|(_, p)| p.clone())
             .unwrap_or_else(|| journal_path(archive));
-        if locator.is_none() && !path.try_exists()? {
-            return Ok(false);
+        if locator.is_none() && !probed.try_exists().map_err(RecoverError::Journal)? {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        {
+            let hook = AFTER_PROBE.with(|hook| hook.borrow_mut().take());
+            if let Some(mut hook) = hook {
+                hook();
+            }
         }
         let mut file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(archive)
-            .map_err(|e| recovery_error(&path, e))?;
-        let _lock = lock(&file).map_err(|e| recovery_error(&path, e))?;
-        // Re-read under the inode lock; another recovering opener may have won.
-        let locator = get_marker(&file).map_err(|e| recovery_error(&path, e))?;
+            .map_err(|e| journal_error(&probed, e))?;
+        let _lock = lock(&file).map_err(|e| journal_error(&probed, e))?;
+        // Another recovering opener may have won, or another opener (through a
+        // hard link) may have started a different journal: BOTH the state and
+        // the journal path come from the locked descriptor's marker.
+        let locator = get_marker(&file).map_err(|e| journal_error(&probed, e))?;
         let state = locator.as_ref().map(|(s, _)| *s);
-        if !path.try_exists()? {
+        let path = locator
+            .map(|(_, p)| p)
+            .unwrap_or_else(|| journal_path(archive));
+        if !path.try_exists().map_err(RecoverError::Journal)? {
+            // Metadata-only cleanup: `P` means no byte changed, `C` is only
+            // reachable after the hook ran; neither writes archive bytes.
             if state == Some(b'A') {
-                return Err(recovery_error(&path, "active journal is missing or moved"));
+                return Err(journal_error(
+                    &path,
+                    io::Error::other("active journal is missing or moved"),
+                ));
             }
-            clear_marker(&file).map_err(|e| recovery_error(&path, e))?;
-            return Ok(false);
+            clear_marker(&file).map_err(|e| journal_error(&path, e))?;
+            return Ok(None);
         }
-        rollback(&path, &mut file, state == Some(b'C')).map_err(|e| recovery_error(&path, e))?;
-        Ok(true)
+        rollback(
+            &path,
+            &mut file,
+            state == Some(b'C'),
+            authorize,
+            before_unlink,
+        )
+        .map(Some)
+        .map_err(|e| match e {
+            RecoverError::Journal(e) => RecoverError::Journal(recovery_error(&path, e)),
+            RecoverError::Committed(e) => RecoverError::Committed(recovery_error(&path, e)),
+            refused => refused,
+        })
     }
 
     pub(super) fn pending(archive: &Path) -> io::Result<Option<PendingJournal>> {
@@ -539,8 +741,12 @@ mod unix {
         if &header[..8] != MAGIC {
             return Err(io::Error::other("journal header/length mismatch"));
         }
+        Ok(Some(parse_pending(&header, complete)))
+    }
+
+    fn parse_pending(header: &[u8; HEADER_LEN as usize], complete: bool) -> PendingJournal {
         let get = |i: usize| u64::from_le_bytes(header[i..i + 8].try_into().unwrap());
-        Ok(Some(PendingJournal {
+        PendingJournal {
             dev: get(8),
             ino: get(16),
             len: get(24),
@@ -548,7 +754,7 @@ mod unix {
             mtime_ns: i128::from(get(40) as i64) * 1_000_000_000 + i128::from(get(48)),
             new_len: get(56),
             complete,
-        }))
+        }
     }
 
     fn matches_tail(
@@ -589,7 +795,14 @@ mod unix {
             result => result,
         }
     }
-    fn rollback(path: &Path, file: &mut File, complete: bool) -> io::Result<()> {
+    /// Validated journal header fields.
+    struct Header {
+        pending: PendingJournal,
+        seconds: i64,
+        nanos: u64,
+    }
+
+    fn validate(path: &Path, file: &mut File, complete: bool) -> io::Result<(Header, File)> {
         if !fs::symlink_metadata(path)?.is_file() {
             return Err(io::Error::other("commit journal is not a regular file"));
         }
@@ -648,33 +861,78 @@ mod unix {
         if file.metadata()?.dev() != get(8) || file.metadata()?.ino() != get(16) {
             log::info!("commit: journal identity changed; validated archive content instead");
         }
+        Ok((
+            Header {
+                pending: parse_pending(&header, complete),
+                seconds,
+                nanos,
+            },
+            journal,
+        ))
+    }
+
+    fn rollback(
+        path: &Path,
+        file: &mut File,
+        complete: bool,
+        authorize: Authorize,
+        before_unlink: BeforeUnlink,
+    ) -> std::result::Result<Applied, RecoverError> {
+        let (header, mut journal) =
+            validate(path, file, complete).map_err(RecoverError::Journal)?;
+        // The journal is valid for the locked content; whether it is THIS
+        // caller's to apply is decided on the locked descriptor, before any write.
+        let locked = file.metadata().map_err(RecoverError::Journal)?;
+        authorize(&header.pending, &locked).map_err(RecoverError::Refused)?;
+        // After the roll-forward decision the archive holds the new bytes: any
+        // later failure leaves a pending journal over committed content.
+        let late = |e: io::Error| {
+            if complete {
+                RecoverError::Committed(e)
+            } else {
+                RecoverError::Journal(e)
+            }
+        };
+        let PendingJournal {
+            len,
+            offset,
+            mtime_ns: pre_mtime_ns,
+            new_len,
+            ..
+        } = header.pending;
+        let (seconds, nanos) = (header.seconds, header.nanos);
         if !complete {
             // Persist truncation before rollback writes so another crash leaves
             // a prefix of the old tail, never a mixture of old and new tails.
-            file.set_len(offset)?;
-            file.sync_all()?;
-            file.seek(SeekFrom::Start(offset))?;
-            journal.seek(SeekFrom::Start(HEADER_LEN))?;
-            copy_exact(&mut journal, file, len - offset)?;
-            let mtime = if seconds >= 0 {
-                UNIX_EPOCH.checked_add(Duration::new(seconds as u64, nanos as u32))
-            } else {
-                UNIX_EPOCH
-                    .checked_sub(Duration::from_secs(seconds.unsigned_abs()))
-                    .and_then(|t| t.checked_add(Duration::from_nanos(nanos)))
-            }
-            .ok_or_else(|| io::Error::other("commit journal mtime overflow"))?;
-            restore_mtime(file.set_times(fs::FileTimes::new().set_modified(mtime)))?;
-            file.sync_all()?;
+            let rolled = (|| -> io::Result<()> {
+                file.set_len(offset)?;
+                file.sync_all()?;
+                file.seek(SeekFrom::Start(offset))?;
+                journal.seek(SeekFrom::Start(HEADER_LEN))?;
+                copy_exact(&mut journal, file, len - offset)?;
+                let mtime = if seconds >= 0 {
+                    UNIX_EPOCH.checked_add(Duration::new(seconds as u64, nanos as u32))
+                } else {
+                    UNIX_EPOCH
+                        .checked_sub(Duration::from_secs(seconds.unsigned_abs()))
+                        .and_then(|t| t.checked_add(Duration::from_nanos(nanos)))
+                }
+                .ok_or_else(|| io::Error::other("commit journal mtime overflow"))?;
+                restore_mtime(file.set_times(fs::FileTimes::new().set_modified(mtime)))?;
+                file.sync_all()
+            })();
+            rolled.map_err(RecoverError::Journal)?;
         }
         // P with no journal means no mutation. The restored old archive is now
         // durable, so this also makes cleanup idempotent after an unlink crash.
-        marker(file, path, if complete { b'C' } else { b'P' })?;
-        fs::remove_file(path)?;
-        sync_parent(path)?;
-        clear_marker(file)?;
+        marker(file, path, if complete { b'C' } else { b'P' }).map_err(late)?;
+        let applied = applied_of(file, complete, len, pre_mtime_ns, new_len).map_err(late)?;
+        before_unlink(&applied).map_err(late)?;
+        fs::remove_file(path).map_err(late)?;
+        sync_parent(path).map_err(late)?;
+        clear_marker(file).map_err(late)?;
         log::info!("commit: recovered journal {}", path.display());
-        Ok(())
+        Ok(applied)
     }
 }
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -697,7 +955,7 @@ mod tests {
                 Ok(())
             }
         });
-        assert!(finish_replace(&path, result, false).is_err());
+        assert!(finish_replace(&path, result, false, &mut |_| Ok(())).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"prefix:old contents");
         assert!(!journal_path(&path).exists());
     }
@@ -728,14 +986,18 @@ mod tests {
         let copy = dir.path().join("copy");
         fs::write(&copy, &crashed).unwrap();
         fs::rename(&copy, &path).unwrap();
-        let err = recover_owned(&path).unwrap_err().to_string();
+        let err = recover_with(&path, &mut authorize_owned, &mut |_| Ok(()))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("another file"), "{err}");
         assert_eq!(fs::read(&path).unwrap(), crashed);
         assert_eq!(fs::read(journal_path(&path)).unwrap(), journal);
 
         let own = dir.path().join("own");
         crash(&own);
-        assert!(recover_owned(&own).unwrap());
+        assert!(recover_with(&own, &mut authorize_owned, &mut |_| Ok(()))
+            .unwrap()
+            .is_some());
         assert_eq!(fs::read(&own).unwrap(), b"prefix:old contents");
         assert!(!journal_path(&own).exists());
     }
@@ -750,15 +1012,23 @@ mod tests {
             let mut suffix = tempfile::tempfile().unwrap();
             suffix.write_all(b"new contents").unwrap();
             let mut committed = false;
-            let result = unix::replace(&path, 7, &mut suffix, None, &mut committed, &mut |step| {
-                if step == stop {
-                    Err(io::Error::other("cleanup failed"))
-                } else {
-                    Ok(())
-                }
-            });
+            let result = unix::replace(
+                &path,
+                7,
+                &mut suffix,
+                None,
+                &mut committed,
+                &mut |step| {
+                    if step == stop {
+                        Err(io::Error::other("cleanup failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut |_| Ok(()),
+            );
             assert!(committed);
-            finish_replace(&path, result, committed).unwrap();
+            finish_replace(&path, result, committed, &mut |_| Ok(())).unwrap();
             assert_eq!(fs::read(&path).unwrap(), b"prefix:new contents");
             assert!(!recover(&path).unwrap());
         }
@@ -1030,5 +1300,232 @@ mod tests {
         assert_eq!(fs::read(&journal).unwrap(), journal_before);
         assert!(recover(&path).unwrap());
         assert_eq!(pending(&path).unwrap(), None);
+    }
+
+    fn marker_present(path: &Path) -> bool {
+        // A pending marker refuses the next replacement.
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(b"x").unwrap();
+        replace_suffix_with_hook(path, 0, &mut suffix, &mut |_| Ok(())).is_err()
+    }
+
+    /// Regression (R7): the authorizer runs under the lock, after validation and
+    /// before any write, and sees the LOCKED file's metadata.
+    #[test]
+    fn append_journal_authorize_runs_under_the_lock_before_any_write() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        interrupted(&path, "archive truncate");
+        let journal = journal_path(&path);
+        let (archive_before, journal_before) =
+            (fs::read(&path).unwrap(), fs::read(&journal).unwrap());
+        let ino = fs::metadata(&path).unwrap().ino();
+        let mut seen = None;
+        let error = recover_with(
+            &path,
+            &mut |j, m| {
+                seen = Some((*j, m.ino()));
+                Err(io::Error::other("not mine"))
+            },
+            &mut |_| panic!("the hook must not run after a refusal"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RecoverError::Refused(_)), "{error:?}");
+        let (header, seen_ino) = seen.expect("authorize ran");
+        assert_eq!(seen_ino, ino);
+        assert!(!header.complete);
+        assert_eq!(fs::read(&path).unwrap(), archive_before);
+        assert_eq!(fs::read(&journal).unwrap(), journal_before);
+        assert!(pending(&path).unwrap().is_some());
+
+        // A file swapped in after the unlocked probe is judged by the locked
+        // descriptor, not by the earlier stat.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        interrupted(&path, "archive truncate");
+        let crashed = fs::read(&path).unwrap();
+        let journal = fs::read(journal_path(&path)).unwrap();
+        let swap = path.clone();
+        let copy = dir.path().join("copy");
+        unix::AFTER_PROBE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(&copy, fs::read(&swap).unwrap()).unwrap();
+                fs::rename(&copy, &swap).unwrap();
+            }));
+        });
+        let error = recover_with(&path, &mut authorize_owned, &mut |_| Ok(())).unwrap_err();
+        unix::AFTER_PROBE.with(|hook| *hook.borrow_mut() = None);
+        assert!(matches!(error, RecoverError::Refused(_)), "{error:?}");
+        assert!(error.to_string().contains("another file"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), crashed);
+        assert_eq!(fs::read(journal_path(&path)).unwrap(), journal);
+    }
+
+    /// Regression (R7): a failing `before_unlink` keeps the journal and the
+    /// marker; the error is `Committed` exactly when the archive holds the new
+    /// bytes; a second call with a succeeding hook finishes with the locked
+    /// descriptor's final stamp.
+    #[test]
+    fn append_journal_before_unlink_error_keeps_journal_and_marker() {
+        use std::os::unix::fs::MetadataExt;
+        // A fresh replacement.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        fs::write(&path, b"prefix:old contents").unwrap();
+        let original = fs::metadata(&path).unwrap();
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(b"new contents").unwrap();
+        let mut stamps = Vec::new();
+        let error = replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |a| {
+            stamps.push(*a);
+            Err(io::Error::other("rows busy"))
+        })
+        .unwrap_err();
+        assert!(matches!(error, RecoverError::Committed(_)), "{error:?}");
+        // The hook ran for the replacement and again for its recovery attempt.
+        assert_eq!(stamps.len(), 2);
+        assert_eq!(fs::read(&path).unwrap(), b"prefix:new contents");
+        assert!(journal_path(&path).exists());
+        assert!(pending(&path).unwrap().expect("journal pending").complete);
+        let mut finished = None;
+        let applied = recover_with(&path, &mut authorize_any, &mut |a| {
+            finished = Some(*a);
+            Ok(())
+        })
+        .unwrap()
+        .expect("applied");
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(finished, Some(applied));
+        assert!(applied.rolled_forward);
+        assert_eq!(applied.pre_len, b"prefix:old contents".len() as u64);
+        assert_eq!(applied.new_len, b"prefix:new contents".len() as u64);
+        assert_eq!(applied.final_len, meta.len());
+        assert_eq!(applied.ino, meta.ino());
+        assert!(!journal_path(&path).exists());
+        assert!(!marker_present(&path));
+
+        // A crash after the completion marker: recovery hook fails, then works.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        interrupted(&path, "locator complete");
+        let error = recover_with(&path, &mut authorize_any, &mut |_| {
+            Err(io::Error::other("rows busy"))
+        })
+        .unwrap_err();
+        assert!(matches!(error, RecoverError::Committed(_)), "{error:?}");
+        assert!(journal_path(&path).exists());
+        assert!(recover_with(&path, &mut authorize_any, &mut |_| Ok(()))
+            .unwrap()
+            .is_some());
+        assert!(!journal_path(&path).exists());
+
+        // A rollback whose hook fails is a journal error, not a commit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        interrupted(&path, "archive truncate");
+        let error = recover_with(&path, &mut authorize_any, &mut |a| {
+            assert!(!a.rolled_forward);
+            Err(io::Error::other("rows busy"))
+        })
+        .unwrap_err();
+        assert!(matches!(error, RecoverError::Journal(_)), "{error:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"prefix:old contents");
+        assert!(journal_path(&path).exists());
+        assert!(recover_with(&path, &mut authorize_any, &mut |_| Ok(()))
+            .unwrap()
+            .is_some());
+    }
+
+    /// Regression (R7): the journal path comes from the LOCKED marker. A is
+    /// probed (J0 beside A), then another opener finishes J0 and starts J1
+    /// through the hard link B: the locked marker names J1, which the
+    /// authorizer judges. Before: the stale J0 name did not exist, so the `C`
+    /// marker was cleared and J1 dropped without being applied.
+    #[test]
+    fn append_journal_hardlink_second_journal_is_authorized_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (one, two) = (dir.path().join("one"), dir.path().join("two"));
+        fs::create_dir(&one).unwrap();
+        fs::create_dir(&two).unwrap();
+        let (a, b) = (one.join("A"), two.join("B"));
+        interrupted(&a, "archive truncate");
+        fs::hard_link(&a, &b).unwrap();
+        assert_ne!(journal_path(&a), journal_path(&b));
+        let (seam_a, seam_b) = (a.clone(), b.clone());
+        unix::AFTER_PROBE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(recover(&seam_a).unwrap());
+                let mut suffix = tempfile::tempfile().unwrap();
+                suffix.write_all(b"second journal").unwrap();
+                assert!(
+                    replace_suffix_with_hook(&seam_b, 7, &mut suffix, &mut |step| {
+                        if step == "locator complete" {
+                            Err(io::Error::other("crash"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err()
+                );
+            }));
+        });
+        let mut seen = None;
+        let error = recover_with(
+            &b,
+            &mut |j, _| {
+                seen = Some(*j);
+                Err(io::Error::other("pre-stamp does not match the rows"))
+            },
+            &mut |_| panic!("refused"),
+        )
+        .unwrap_err();
+        unix::AFTER_PROBE.with(|hook| *hook.borrow_mut() = None);
+        assert!(matches!(error, RecoverError::Refused(_)), "{error:?}");
+        assert!(seen.expect("authorizer saw J1").complete);
+        assert!(journal_path(&b).exists(), "J1 stays");
+        assert_eq!(fs::read(&a).unwrap(), b"prefix:second journal");
+        assert!(pending(&a).unwrap().is_some());
+        // Authorized (forced), J1 rolls forward through either name.
+        let applied = recover_with(&a, &mut authorize_any, &mut |_| Ok(()))
+            .unwrap()
+            .expect("J1 applied");
+        assert!(applied.rolled_forward);
+        assert!(!journal_path(&b).exists());
+        assert_eq!(fs::read(&a).unwrap(), b"prefix:second journal");
+    }
+
+    /// Regression (R7): a stale locator without a journal is cleared (`P`, `C`)
+    /// without touching the archive; an active one is an error.
+    #[test]
+    fn append_journal_stale_marker_without_journal_is_cleared() {
+        for (step, bytes) in [
+            ("locator prepare", b"prefix:old contents".as_slice()),
+            (
+                "locator complete",
+                b"prefix:new contents are longer".as_slice(),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("archive");
+            interrupted(&path, step);
+            let _ = fs::remove_file(journal_path(&path));
+            assert!(marker_present(&path), "{step}: a marker is left");
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            let applied = recover_with(&path, &mut authorize_owned, &mut |_| {
+                panic!("nothing to restamp")
+            })
+            .unwrap();
+            assert!(applied.is_none());
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{step}");
+            assert!(!marker_present(&path), "{step}: marker cleared");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        interrupted(&path, "locator active");
+        fs::remove_file(journal_path(&path)).unwrap();
+        let error = recover_with(&path, &mut authorize_any, &mut |_| Ok(())).unwrap_err();
+        assert!(matches!(error, RecoverError::Journal(_)), "{error:?}");
+        assert!(error.to_string().contains("missing or moved"), "{error}");
     }
 }

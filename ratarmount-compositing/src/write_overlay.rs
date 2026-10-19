@@ -17,7 +17,7 @@ use flate2::Compression as GzCompression;
 use ratarmount_compress::{
     body_looks_like_tar, decode_zstd_frames_to, detect_compression, export_zstd_blocks,
     materialize, open_seekable_zstd, open_seekable_zstd_with_threads, scan_zstd_frames_path,
-    splice_zstd_last_frames_append, splice_zstd_last_frames_replace, CompressionFormat,
+    splice_zstd_last_frames_append_with, splice_zstd_last_frames_replace, CompressionFormat,
     SpliceStats, ZstdFrameMap, DEFAULT_MEMORY_CAP,
 };
 use ratarmount_core::{
@@ -236,6 +236,11 @@ pub enum OverlayError {
     Sqlite(#[from] rusqlite::Error),
     #[error("{0}")]
     Msg(String),
+    /// A journaled append wrote the new bytes but its journal is still
+    /// pending (the baseline rows could not be updated). Never answered with
+    /// a copy fallback: the archive already holds the commit.
+    #[error("{0}")]
+    Committed(String),
 }
 
 pub type Result<T> = std::result::Result<T, OverlayError>;
@@ -3382,11 +3387,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
-        let rolls_forward = self.check_pending_journal_is_ours(archive)?;
-        ratarmount_compress::commit_journal::recover(archive)?;
-        if rolls_forward {
-            self.restamp_rolled_forward(archive);
-        }
+        self.recover_journal(archive)?;
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
         if self.interval_disabled() {
@@ -4027,13 +4028,10 @@ impl WriteOverlay {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
-        let rolls_forward = self.check_pending_journal_is_ours(archive)?;
-        if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
+        self.gate_pending_journal(archive)?;
+        if let Err(e) = self.recover_journal_after_gate(archive) {
             self.refuse_base_after_commit_failure();
-            return Err(e.into());
-        }
-        if rolls_forward {
-            self.restamp_rolled_forward(archive);
+            return Err(e);
         }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
@@ -4235,7 +4233,7 @@ impl WriteOverlay {
         format: CompressionFormat,
         plan: &OverlayCommitPlan,
     ) -> Result<IndexPatchWindow> {
-        ratarmount_compress::commit_journal::recover(archive)?;
+        self.recover_journal(archive)?;
         self.persist_count.fetch_add(1, Ordering::SeqCst);
         let mut manifest_plan = if self.manifest_hashes.is_some() && !self.remote_enabled() {
             let mut snapshot = plan.clone();
@@ -4259,6 +4257,7 @@ impl WriteOverlay {
                     } else {
                         None
                     },
+                    &self.commit_rows(),
                 )?,
                 0,
             )
@@ -4355,34 +4354,84 @@ impl WriteOverlay {
     /// being restored or truncated and only then rejected. Recovery still runs
     /// first for the overlay's own torn append: its journal describes the
     /// recorded state. `--force-base-mismatch` accepts the foreign archive.
-    ///
-    /// Returns whether recovery will roll the journal FORWARD (a complete
-    /// replacement): the caller then re-baselines the recorded stamp.
-    fn check_pending_journal_is_ours(&self, archive: &Path) -> Result<bool> {
+    fn gate_pending_journal(&self, archive: &Path) -> Result<()> {
         match ratarmount_compress::commit_journal::pending(archive) {
-            Ok(None) => Ok(false),
-            Ok(Some(journal)) => {
-                self.check_commit_identity(archive)?;
-                Ok(journal.complete)
-            }
-            Err(_) => self.check_commit_identity(archive).map(|()| false),
+            Ok(None) => Ok(()),
+            Ok(Some(_)) | Err(_) => self.check_commit_identity(archive),
         }
     }
 
-    /// After recovery rolled a consistent complete journal forward, the
-    /// archive is what the crashed commit wrote: record that as the base stamp.
-    fn restamp_rolled_forward(&self, archive: &Path) {
+    /// The one recovery entry for this overlay: the gate first (for its
+    /// message), then recovery whose authorizer re-takes the same decision on
+    /// the LOCKED file. A complete journal is rolled forward and the rows
+    /// restamped (a strong digest `pending`) BEFORE the journal is unlinked.
+    fn recover_journal(
+        &self,
+        archive: &Path,
+    ) -> Result<Option<ratarmount_compress::commit_journal::Applied>> {
+        self.gate_pending_journal(archive)?;
+        self.recover_journal_after_gate(archive)
+    }
+
+    /// Where a fresh replacement restamps the recorded base before it unlinks
+    /// its journal: this mount's own connection.
+    fn commit_rows(&self) -> crate::journal_recovery::Rows<'_> {
         if self.remote_enabled() {
-            return;
+            crate::journal_recovery::Rows::None
+        } else {
+            crate::journal_recovery::Rows::Shared(&self.db)
         }
-        let Some(base) = self.identity.lock().expect("overlay identity").clone() else {
-            return;
+    }
+
+    fn recover_journal_raw(
+        &self,
+        archive: &Path,
+    ) -> std::result::Result<
+        Option<ratarmount_compress::commit_journal::Applied>,
+        ratarmount_compress::commit_journal::RecoverError,
+    > {
+        use ratarmount_compress::commit_journal as cj;
+        let remote = self.remote_enabled();
+        let identity = if remote {
+            None
+        } else {
+            self.identity.lock().expect("overlay identity").clone()
         };
-        crate::overlay_gate::restamp_rolled_forward(
-            &self.db.lock().expect("overlay db"),
-            &base,
-            archive,
-        );
+        let force = self.force_base_mismatch;
+        let mut authorize = |header: &cj::PendingJournal, locked: &fs::Metadata| {
+            if force {
+                return Ok(());
+            }
+            match &identity {
+                Some(base) => crate::overlay_gate::check_commit_base_with(
+                    &self.db.lock().expect("overlay db"),
+                    base,
+                    archive,
+                    Some((header, locked)),
+                )
+                .map_err(|refusal| io::Error::other(refusal.0)),
+                None => cj::authorize_owned(header, locked),
+            }
+        };
+        crate::journal_recovery::recover_journal(archive, self.commit_rows(), &mut authorize)
+    }
+
+    fn recover_journal_after_gate(
+        &self,
+        archive: &Path,
+    ) -> Result<Option<ratarmount_compress::commit_journal::Applied>> {
+        use ratarmount_compress::commit_journal::RecoverError;
+        self.recover_journal_raw(archive)
+            .map_err(|error| match error {
+                RecoverError::Committed(e) => {
+                    self.refuse_base_after_commit_failure();
+                    OverlayError::Msg(format!(
+                        "{e}; the archive holds the committed bytes but the recorded baseline \
+                     could not be updated (remount required)"
+                    ))
+                }
+                other => OverlayError::Io(other.into_io()),
+            })
     }
 
     /// The recorded base digest kind and digest, read through the mount's own
@@ -4420,7 +4469,7 @@ impl WriteOverlay {
     }
 
     fn recover_failed_append(&self, archive: &Path, error: &dyn std::fmt::Display) -> Result<()> {
-        if let Err(recovery) = ratarmount_compress::commit_journal::recover(archive) {
+        if let Err(recovery) = self.recover_journal_raw(archive) {
             self.refuse_base_after_commit_failure();
             return Err(OverlayError::Msg(format!(
                 "{error}; {recovery}; remount required"
@@ -4480,8 +4529,19 @@ impl WriteOverlay {
             rewrite_tar_suffix(&mut suffix, stream_offset, &opts, &mut out).map(|_| ())
         };
         let stats = if append && last_window_deletes.is_empty() {
-            match splice_zstd_last_frames_append(archive, from_idx, transform) {
+            match splice_zstd_last_frames_append_with(
+                archive,
+                from_idx,
+                transform,
+                &mut self.commit_rows().commit_hook(archive),
+            ) {
                 Ok(stats) => stats,
+                Err(ratarmount_compress::CompressError::Committed(e)) => {
+                    self.refuse_base_after_commit_failure();
+                    return Err(recover_error_to_overlay(
+                        ratarmount_compress::commit_journal::RecoverError::Committed(e),
+                    ));
+                }
                 Err(e) => {
                     self.recover_failed_append(archive, &e)?;
                     if self.commit_mode == CommitMode::Auto {
@@ -4537,9 +4597,19 @@ impl WriteOverlay {
         plan: &OverlayCommitPlan,
     ) -> Result<IndexPatchWindow> {
         if self.commit_mode.may_append(archive)? {
-            match append_uncompressed_tar_plan(archive, &self.root, plan, &self.encoding) {
+            match append_uncompressed_tar_plan(
+                archive,
+                &self.root,
+                plan,
+                &self.encoding,
+                &self.commit_rows(),
+            ) {
                 Ok(Some(window)) => return Ok(window),
                 Ok(None) => {}
+                Err(e @ OverlayError::Committed(_)) => {
+                    self.refuse_base_after_commit_failure();
+                    return Err(e);
+                }
                 Err(e) => {
                     self.recover_failed_append(archive, &e)?;
                     if self.commit_mode != CommitMode::Auto {
@@ -5650,6 +5720,7 @@ fn persist_provenance_plan(
     encoding: &str,
     mode: CommitMode,
     hash_output: Option<&mut BTreeMap<String, String>>,
+    rows: &crate::journal_recovery::Rows<'_>,
 ) -> Result<IndexPatchWindow> {
     live_commit_is_supported(archive)?;
     let base = provenance_base(archive, encoding)?;
@@ -5810,8 +5881,24 @@ fn persist_provenance_plan(
                 rewrite_tar_suffix(&mut input, offset, &rewrite, &mut out).map(|_| ())
             };
             if deleted.is_empty() && map.seek_table.is_some() && mode.may_append(archive)? {
-                if let Err(e) = splice_zstd_last_frames_append(archive, from, transform) {
-                    ratarmount_compress::commit_journal::recover(archive)?;
+                if let Err(e) = splice_zstd_last_frames_append_with(
+                    archive,
+                    from,
+                    transform,
+                    &mut rows.commit_hook(archive),
+                ) {
+                    if matches!(e, ratarmount_compress::CompressError::Committed(_)) {
+                        return Err(recover_error_to_overlay(
+                            ratarmount_compress::commit_journal::RecoverError::Committed(
+                                io::Error::other(e.to_string()),
+                            ),
+                        ));
+                    }
+                    recover_offline(
+                        archive,
+                        &root,
+                        &mut ratarmount_compress::commit_journal::authorize_any,
+                    )?;
                     if mode == CommitMode::Auto {
                         splice_zstd_last_frames_replace(archive, from, transform)
                             .map_err(|e| OverlayError::Msg(e.to_string()))?;
@@ -5844,15 +5931,26 @@ fn persist_provenance_plan(
             ratarmount_formats_tar::write_ustar_members(tmp.as_file_mut(), &members)?;
             ratarmount_formats_tar::write_tar_eof(tmp.as_file_mut())?;
             let original = src.metadata()?;
-            if let Err(e) = ratarmount_compress::commit_journal::replace_suffix_if_unchanged(
+            if let Err(e) = ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with(
                 archive,
                 offset,
                 tmp.as_file_mut(),
                 &original,
+                &mut rows.commit_hook(archive),
             ) {
-                ratarmount_compress::commit_journal::recover(archive)?;
+                if matches!(
+                    e,
+                    ratarmount_compress::commit_journal::RecoverError::Committed(_)
+                ) {
+                    return Err(recover_error_to_overlay(e));
+                }
+                recover_offline(
+                    archive,
+                    &root,
+                    &mut ratarmount_compress::commit_journal::authorize_any,
+                )?;
                 if mode != CommitMode::Auto {
-                    return Err(e.into());
+                    return Err(e.into_io().into());
                 }
                 tmp.as_file_mut().set_len(0)?;
                 tmp.as_file_mut().rewind()?;
@@ -6430,11 +6528,40 @@ thread_local! {
     static APPEND_PREPARE_TOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// A failed journaled replacement: `Committed` keeps its own variant so no
+/// caller answers it with a copy fallback.
+fn recover_error_to_overlay(
+    error: ratarmount_compress::commit_journal::RecoverError,
+) -> OverlayError {
+    use ratarmount_compress::commit_journal::RecoverError;
+    match error {
+        RecoverError::Committed(e) => OverlayError::Committed(format!(
+            "{e}; the archive holds the committed bytes but the recorded baseline could not be \
+             updated (remount required)"
+        )),
+        other => OverlayError::Io(other.into_io()),
+    }
+}
+
+/// Offline recovery before a commit: restamps the overlay database beside
+/// `root` (when it exists) from the locked descriptor before the journal is
+/// unlinked. `authorize` decides under the archive lock.
+fn recover_offline(
+    archive: &Path,
+    root: &Path,
+    authorize: ratarmount_compress::commit_journal::Authorize<'_>,
+) -> Result<()> {
+    crate::journal_recovery::recover_journal_at(archive, Some(&root.join(HIDDEN_DB)), authorize)
+        .map(|_| ())
+        .map_err(recover_error_to_overlay)
+}
+
 fn append_uncompressed_tar_plan(
     archive: &Path,
     root: &Path,
     plan: &OverlayCommitPlan,
     encoding: &str,
+    rows: &crate::journal_recovery::Rows<'_>,
 ) -> Result<Option<IndexPatchWindow>> {
     let original = fs::metadata(archive)?;
     let Some(offset) = uncompressed_append_offset(archive, plan, encoding)? else {
@@ -6456,12 +6583,14 @@ fn append_uncompressed_tar_plan(
             fs::FileTimes::new().set_modified(original.modified()? + Duration::from_secs(2)),
         )?;
     }
-    ratarmount_compress::commit_journal::replace_suffix_if_unchanged(
+    ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with(
         archive,
         offset,
         tail.as_file_mut(),
         &original,
-    )?;
+        &mut rows.commit_hook(archive),
+    )
+    .map_err(recover_error_to_overlay)?;
     log::info!(
         "commit: prefix {:.1} GiB retained via append",
         offset as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -6658,7 +6787,29 @@ fn commit_overlay_inner(
         )));
     }
 
-    ratarmount_compress::commit_journal::recover(archive_file)?;
+    {
+        use ratarmount_compress::commit_journal as cj;
+        // The gate ran before this call (unlocked); the authorizer re-takes the
+        // decision on the LOCKED file, and recovery restamps the rows from it.
+        let mut authorize = |header: &cj::PendingJournal, locked: &fs::Metadata| {
+            if opts.force_base_mismatch {
+                return Ok(());
+            }
+            match identity {
+                Some(base) if write_overlay.join(HIDDEN_DB).exists() => {
+                    crate::overlay_gate::check_commit_base_offline_with(
+                        write_overlay,
+                        base,
+                        archive_file,
+                        Some((header, locked)),
+                    )
+                    .map_err(|refusal| io::Error::other(refusal.0))
+                }
+                _ => cj::authorize_owned(header, locked),
+            }
+        };
+        recover_offline(archive_file, write_overlay, &mut authorize)?;
+    }
     let mut plan = collect_overlay_commit_plan(write_overlay)?;
     if opts.manifest_hashes.is_some() {
         plan.known_hashes = known_manifest_hashes(archive_file)?;
@@ -6679,6 +6830,7 @@ fn commit_overlay_inner(
             return Ok(false);
         }
         let mut written_hashes = BTreeMap::new();
+        let db = write_overlay.join(HIDDEN_DB);
         let window = persist_provenance_plan(
             archive_file,
             write_overlay,
@@ -6686,6 +6838,7 @@ fn commit_overlay_inner(
             &opts.encoding,
             opts.mode,
             hash_payloads.then_some(&mut written_hashes),
+            &crate::journal_recovery::Rows::Path(&db),
         )?;
         crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
         plan.written_hashes = written_hashes;
@@ -7612,8 +7765,14 @@ fn commit_overlay_tar(
                 return Ok(None);
             }
             invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
-            let window =
-                append_uncompressed_tar_plan(tar_file, write_overlay, &plan, &opts.encoding)?;
+            let db = write_overlay.join(HIDDEN_DB);
+            let window = append_uncompressed_tar_plan(
+                tar_file,
+                write_overlay,
+                &plan,
+                &opts.encoding,
+                &crate::journal_recovery::Rows::Path(&db),
+            )?;
             Ok(window)
         })();
         if canceled {
@@ -7625,8 +7784,13 @@ fn commit_overlay_tar(
                 return Ok(true);
             }
             Ok(None) => {}
+            Err(e @ OverlayError::Committed(_)) => return Err(e),
             Err(e) => {
-                ratarmount_compress::commit_journal::recover(tar_file)?;
+                recover_offline(
+                    tar_file,
+                    write_overlay,
+                    &mut ratarmount_compress::commit_journal::authorize_any,
+                )?;
                 if opts.mode != CommitMode::Auto {
                     return Err(e);
                 }
@@ -7921,9 +8085,21 @@ fn commit_overlay_tar_zst(
     };
     invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
     if append {
-        match splice_zstd_last_frames_append(tar_file, from_idx, transform) {
+        let db = write_overlay.join(HIDDEN_DB);
+        let rows = crate::journal_recovery::Rows::Path(&db);
+        let mut hook = rows.commit_hook(tar_file);
+        match splice_zstd_last_frames_append_with(tar_file, from_idx, transform, &mut hook) {
+            Err(ratarmount_compress::CompressError::Committed(e)) => {
+                return Err(recover_error_to_overlay(
+                    ratarmount_compress::commit_journal::RecoverError::Committed(e),
+                ))
+            }
             Err(e) if opts.mode == CommitMode::Auto => {
-                ratarmount_compress::commit_journal::recover(tar_file)?;
+                recover_offline(
+                    tar_file,
+                    write_overlay,
+                    &mut ratarmount_compress::commit_journal::authorize_any,
+                )?;
                 log::warn!("commit: append failed: {e}; falling back to copy");
                 splice_zstd_last_frames_replace(tar_file, from_idx, transform)
             }
@@ -13807,6 +13983,7 @@ mod tests {
             "utf-8",
             CommitMode::Copy,
             Some(&mut hashes),
+            &crate::journal_recovery::Rows::None,
         )
         .unwrap();
         let expected = ratarmount_index::sha256_hex_stream(&mut &b"new payload"[..]).unwrap();

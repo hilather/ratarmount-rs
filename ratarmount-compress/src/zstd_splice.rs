@@ -174,6 +174,21 @@ pub fn splice_zstd_last_frames_append<F>(
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
+    splice_zstd_last_frames_append_with(path, from_idx, transform, &mut |_| Ok(()))
+}
+
+/// [`splice_zstd_last_frames_append`] with a `before_unlink` hook that runs
+/// under the archive lock with the final stamp, before the journal is
+/// unlinked. A hook that keeps failing is [`CompressError::Committed`].
+pub fn splice_zstd_last_frames_append_with<F>(
+    path: &Path,
+    from_idx: usize,
+    transform: F,
+    before_unlink: crate::commit_journal::BeforeUnlink,
+) -> Result<SpliceStats>
+where
+    F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
+{
     let mut src = File::open(path)?;
     let original = src.metadata()?;
     let map = scan_zstd_frames(&mut src)?;
@@ -206,12 +221,17 @@ where
         tmp.persist(path).map_err(|e| e.error)?;
         return Ok(stats);
     }
-    crate::commit_journal::replace_suffix_if_unchanged(
+    crate::commit_journal::replace_suffix_if_unchanged_with(
         path,
         stats.prefix_compressed_bytes,
         tail.as_file_mut(),
         &original,
-    )?;
+        before_unlink,
+    )
+    .map_err(|e| match e {
+        crate::commit_journal::RecoverError::Committed(e) => CompressError::Committed(e),
+        e => CompressError::Io(e.into_io()),
+    })?;
     log::info!(
         "commit: prefix {:.1} GiB retained via append",
         stats.prefix_compressed_bytes as f64 / (1024.0 * 1024.0 * 1024.0)

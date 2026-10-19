@@ -1699,3 +1699,376 @@ fn regression_accepted_archive_move_repoints_base_index_path() {
         }
     }
 }
+
+// ---- R7-A2: one roll-forward -------------------------------------------------
+
+/// The rows recorded in the overlay database at `overlay`.
+fn recorded_rows(overlay: &Path) -> Vec<Option<String>> {
+    read_rows(overlay, &["base_size", "base_mtime_ns", "base_digest_kind"])
+}
+
+/// The stamp rows `archive` would be recorded with now.
+#[cfg(unix)]
+fn stamp_rows(archive: &Path) -> (Option<String>, Option<String>) {
+    let now = ratarmount_index::ArchiveDigestStamp::read(archive).unwrap();
+    (Some(now.size.to_string()), Some(now.mtime_ns.to_string()))
+}
+
+/// Regression (R7-A2): `recover_journal_at` (the entry the mount, the library
+/// openers and the offline verbs share) rolls a COMPLETE journal forward and
+/// restamps the rows before it unlinks the journal, so the NEXT gate accepts
+/// the archive recovery just produced: the offline commit gate, a `-w` remount,
+/// and a live and an on-exit commit. A strong digest is marked `pending`.
+#[cfg(unix)]
+#[test]
+fn regression_recover_journal_at_restamps_and_the_next_gate_accepts() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for supplied in [false, true] {
+        let fx = Fixture::new();
+        let digest = if supplied {
+            BaseDigestRequest::Supplied(sha(&fx.archive))
+        } else {
+            BaseDigestRequest::Compute
+        };
+        drop(fx.open(digest, false));
+        interrupt_complete(&fx.archive);
+        let db = fx.overlay.join(HIDDEN_DB);
+        let applied = crate::recover_journal_at(
+            &fx.archive,
+            Some(&db),
+            &mut ratarmount_compress::commit_journal::authorize_owned,
+        )
+        .unwrap()
+        .expect("a journal was applied");
+        assert!(applied.rolled_forward);
+        assert!(!ratarmount_compress::commit_journal::journal_path(&fx.archive).exists());
+        let rows = recorded_rows(&fx.overlay);
+        let (size, mtime) = stamp_rows(&fx.archive);
+        assert_eq!(
+            (rows[0].clone(), rows[1].clone()),
+            (size, mtime),
+            "{supplied}"
+        );
+        if supplied {
+            assert_eq!(rows[2].as_deref(), Some("pending"));
+        }
+        let token = archive_token(&fx.archive);
+        crate::overlay_gate::check_commit_base_offline(&fx.overlay, &token, &fx.archive)
+            .unwrap_or_else(|e| panic!("{supplied}: offline gate: {e}"));
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        for path in [Path_::Live, Path_::OnExit] {
+            let ov = fx.open(BaseDigestRequest::Compute, false);
+            fs::write(ov.root().join(format!("two-{path:?}")), b"two").unwrap();
+            assert!(
+                commit(&ov, &fx.archive, path)
+                    .unwrap_or_else(|e| panic!("{supplied} {path:?}: {e}")),
+                "{supplied} {path:?}"
+            );
+        }
+    }
+}
+
+/// Regression (R7-A2): offline `commit_overlay` recovered a complete journal
+/// and ended on an EMPTY plan without restamping, so the next offline commit
+/// failed with "changed since it was recorded".
+#[cfg(unix)]
+#[test]
+fn regression_offline_commit_roll_forward_with_empty_plan_restamps() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    interrupt_complete(&fx.archive);
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    let token = archive_token(&fx.archive);
+    assert!(!crate::commit_overlay(&fx.overlay, &fx.archive, &token, &opts).unwrap());
+    assert!(!ratarmount_compress::commit_journal::journal_path(&fx.archive).exists());
+    fs::write(fx.overlay.join("one"), b"one").unwrap();
+    let token = archive_token(&fx.archive);
+    assert!(
+        crate::commit_overlay(&fx.overlay, &fx.archive, &token, &opts).unwrap(),
+        "the second commit is accepted by the gate"
+    );
+}
+
+/// Regression (R7-A2): the rows already describe the committed bytes but the
+/// complete journal is still on disk (the unlink failed after the rows were
+/// written). Every gate accepts that state: the journal's pre-stamp is not the
+/// recorded stamp any more, but the rows equal the archive and `new_len`.
+#[cfg(unix)]
+#[test]
+fn regression_rows_committed_then_unlink_failed_is_accepted_by_every_gate() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for gate in ["live", "on-exit", "offline", "remount"] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        interrupt_complete(&fx.archive);
+        {
+            let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
+            let (size, mtime) = stamp_rows(&fx.archive);
+            OverlayMeta::set_many(
+                &conn,
+                &[
+                    ("base_size", size.as_deref().unwrap()),
+                    ("base_mtime_ns", mtime.as_deref().unwrap()),
+                ],
+            )
+            .unwrap();
+        }
+        let before = recorded_rows(&fx.overlay);
+        match gate {
+            "live" | "on-exit" => {
+                let ov = fx.open(BaseDigestRequest::Compute, false);
+                let path = if gate == "live" {
+                    Path_::Live
+                } else {
+                    Path_::OnExit
+                };
+                commit(&ov, &fx.archive, path).unwrap_or_else(|e| panic!("{gate}: {e}"));
+            }
+            "offline" => {
+                let token = archive_token(&fx.archive);
+                let opts = CommitOverlayOptions {
+                    yes: true,
+                    ..Default::default()
+                };
+                crate::commit_overlay(&fx.overlay, &fx.archive, &token, &opts)
+                    .unwrap_or_else(|e| panic!("{gate}: {e}"));
+            }
+            _ => drop(fx.open(BaseDigestRequest::Compute, false)),
+        }
+        // Recovery finds the rows already final and writes nothing.
+        let after = recorded_rows(&fx.overlay);
+        assert_eq!(&after[..2], &before[..2], "{gate}");
+        if gate != "remount" {
+            assert!(
+                !ratarmount_compress::commit_journal::journal_path(&fx.archive).exists(),
+                "{gate}: journal recovered"
+            );
+        }
+    }
+}
+
+/// Regression (R7-A2, finding 2): the rows are written from the LOCKED
+/// descriptor's final stamp, never from whatever the name resolves to later. An
+/// unrelated archive renamed over the name under the lock leaves the rows as
+/// they were, keeps the journal and marker (`Committed`), and recovery finishes
+/// once the name is A again.
+#[cfg(unix)]
+#[test]
+fn regression_restamp_writes_the_locked_descriptor_not_the_name() {
+    use ratarmount_compress::commit_journal::{authorize_owned, RecoverError};
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let keep = fx.archive.with_file_name("keep.tar");
+    fs::hard_link(&fx.archive, &keep).unwrap();
+    interrupt_complete(&fx.archive);
+    let other = fx.archive.with_file_name("b.tar");
+    write_tar(&other, &[("other", b"a different base"), ("more", b"x")]);
+    let before = recorded_rows(&fx.overlay);
+    let db = fx.overlay.join(HIDDEN_DB);
+    let (swap_to, swap_from) = (fx.archive.clone(), other.clone());
+    let mut swap = move |_: &ratarmount_compress::commit_journal::PendingJournal,
+                         _: &fs::Metadata| {
+        fs::rename(&swap_from, &swap_to).unwrap();
+        Ok(())
+    };
+    let error = crate::recover_journal_at(&fx.archive, Some(&db), &mut swap).unwrap_err();
+    assert!(matches!(error, RecoverError::Committed(_)), "{error:?}");
+    assert_eq!(recorded_rows(&fx.overlay), before, "rows moved");
+    assert!(
+        ratarmount_compress::commit_journal::journal_path(&fx.archive).exists(),
+        "journal kept"
+    );
+    // The name is now an unrelated file: its journal belongs to another inode.
+    let refused = crate::recover_journal_at(&fx.archive, Some(&db), &mut authorize_owned);
+    assert!(refused.is_err());
+    assert_eq!(recorded_rows(&fx.overlay), before, "rows moved");
+    // Restore A's name: recovery finishes with A's final stamp.
+    fs::rename(&keep, &fx.archive).unwrap();
+    crate::recover_journal_at(&fx.archive, Some(&db), &mut authorize_owned)
+        .unwrap()
+        .expect("finished");
+    let rows = recorded_rows(&fx.overlay);
+    let (size, mtime) = stamp_rows(&fx.archive);
+    assert_eq!((rows[0].clone(), rows[1].clone()), (size, mtime));
+    assert!(!ratarmount_compress::commit_journal::journal_path(&fx.archive).exists());
+}
+
+/// Regression (R7-A2, finding 3): the locked authorizer is `check_commit_base`
+/// itself, so a union member's OWN complete journal is recovered without
+/// moving the recorded base's rows, and a member journal started for another
+/// inode is refused.
+#[cfg(unix)]
+#[test]
+fn regression_locked_authorizer_accepts_union_member_journal() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        let fx = Fixture::new();
+        let member = fx.archive.with_file_name("member.tar");
+        write_tar(&member, &[("m", b"member")]);
+        let ov = fx.open(BaseDigestRequest::Compute, false);
+        let before = ov.recorded_stamp_for_tests();
+        interrupt_complete(&member);
+        commit(&ov, &member, path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        assert!(
+            !ratarmount_compress::commit_journal::journal_path(&member).exists(),
+            "{path:?}"
+        );
+        assert_eq!(ov.recorded_stamp_for_tests(), before, "{path:?}: base rows");
+        // A journal started for another inode is refused.
+        let crashed = fx.archive.with_file_name("crashed.tar");
+        write_tar(&crashed, &[("c", b"crashed")]);
+        let (bytes, journal, journal_bytes) = {
+            interrupt_append(&crashed);
+            let journal = ratarmount_compress::commit_journal::journal_path(&crashed);
+            (
+                fs::read(&crashed).unwrap(),
+                journal.clone(),
+                fs::read(&journal).unwrap(),
+            )
+        };
+        let copy = fx.archive.with_file_name("crashed-copy.tmp");
+        fs::write(&copy, &bytes).unwrap();
+        fs::rename(&copy, &crashed).unwrap();
+        let err = commit(&ov, &crashed, path).unwrap_err().to_string();
+        assert!(err.contains("another file"), "{path:?}: {err}");
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes, "{path:?}");
+    }
+}
+
+// ---- R7-A3: symlinked bases --------------------------------------------------
+
+/// Regression (R7-A3, Astra v4 #4): the base is mounted as `alias.tar ->
+/// base.tar`. A COMPLETE journal on the unchanged target recovers THROUGH THE
+/// LINK and restamps the rows from the resolved target (canonical path + the
+/// locked inode); the user's path is only for display.
+#[cfg(unix)]
+#[test]
+fn regression_symlink_unchanged_complete_recovery_restamps() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        let fx = Fixture::new();
+        let alias = fx.archive.with_file_name("alias.tar");
+        std::os::unix::fs::symlink(&fx.archive, &alias).unwrap();
+        let token = ClassifiedBase::for_tests_typed(
+            open_tar(&fx.archive),
+            ServedKind::Archive,
+            Some(ServedLocation::Local(fx.archive.clone())),
+            &alias,
+        );
+        let ov = open_with(&token, &fx.overlay, BaseDigestRequest::Compute, false).unwrap();
+        interrupt_complete(&fx.archive);
+        commit(&ov, &alias, path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        assert!(
+            !ratarmount_compress::commit_journal::journal_path(&fx.archive).exists(),
+            "{path:?}: recovered through the link"
+        );
+        let (size, mtime) = stamp_rows(&fx.archive);
+        assert_eq!(ov.recorded_stamp_for_tests(), (size, mtime), "{path:?}");
+        // The next gate accepts, through the link.
+        fs::write(ov.root().join("one"), b"one").unwrap();
+        assert!(commit(&ov, &alias, path).unwrap(), "{path:?}: next commit");
+    }
+    // The shared entry too (mount, offline and library openers pass the typed path).
+    let fx = Fixture::new();
+    let alias = fx.archive.with_file_name("alias.tar");
+    std::os::unix::fs::symlink(&fx.archive, &alias).unwrap();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    interrupt_complete(&fx.archive);
+    let db = fx.overlay.join(HIDDEN_DB);
+    crate::recover_journal_at(
+        &alias,
+        Some(&db),
+        &mut ratarmount_compress::commit_journal::authorize_owned,
+    )
+    .unwrap()
+    .expect("recovered through the link");
+    let rows = recorded_rows(&fx.overlay);
+    let (size, mtime) = stamp_rows(&fx.archive);
+    assert_eq!((rows[0].clone(), rows[1].clone()), (size, mtime));
+}
+
+/// Regression (R7-A3): a link retargeted to another archive that carries its
+/// own COMPLETE journal, and a target replaced by such an archive, are refused
+/// with the other file, its journal and the rows untouched.
+#[cfg(unix)]
+#[test]
+fn regression_symlink_retargeted_or_replaced_target_is_refused() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        for replace_target in [false, true] {
+            let fx = Fixture::new();
+            let alias = fx.archive.with_file_name("alias.tar");
+            std::os::unix::fs::symlink(&fx.archive, &alias).unwrap();
+            let token = ClassifiedBase::for_tests_typed(
+                open_tar(&fx.archive),
+                ServedKind::Archive,
+                Some(ServedLocation::Local(fx.archive.clone())),
+                &alias,
+            );
+            let ov = open_with(&token, &fx.overlay, BaseDigestRequest::Compute, false).unwrap();
+            fs::write(ov.root().join("one"), b"one").unwrap();
+            let other = fx.archive.with_file_name("other.tar");
+            write_tar(&other, &[("other", b"a different base"), ("more", b"x")]);
+            interrupt_complete(&other);
+            let (bytes, journal) = (
+                fs::read(&other).unwrap(),
+                ratarmount_compress::commit_journal::journal_path(&other),
+            );
+            let journal_bytes = fs::read(&journal).unwrap();
+            let rows = ov.recorded_stamp_for_tests();
+            let what = format!("{path:?} replace_target={replace_target}");
+            if replace_target {
+                // The journal beside `other` moves with its inode: rename it over the base.
+                fs::rename(&other, &fx.archive).unwrap();
+            } else {
+                fs::remove_file(&alias).unwrap();
+                std::os::unix::fs::symlink(&other, &alias).unwrap();
+            }
+            let err = commit(&ov, &alias, path).unwrap_err().to_string();
+            assert!(err.contains("--force-base-mismatch"), "{what}: {err}");
+            let target = if replace_target { &fx.archive } else { &other };
+            assert!(
+                fs::read(target).unwrap() == bytes,
+                "{what}: archive touched"
+            );
+            let journal = if replace_target {
+                ratarmount_compress::commit_journal::journal_path(&fx.archive)
+            } else {
+                journal
+            };
+            if !replace_target {
+                assert!(
+                    fs::read(&journal).unwrap() == journal_bytes,
+                    "{what}: journal"
+                );
+            }
+            assert_eq!(ov.recorded_stamp_for_tests(), rows, "{what}: rows moved");
+        }
+    }
+}

@@ -110,8 +110,8 @@ pub use zstd_seek::{
     zstd_decode_stats, SeekableZstd, ZstdDecodeStats, ZstdFrameInfo, ZstdFrameMap, ZstdReadOptions,
 };
 pub use zstd_splice::{
-    splice_zstd_last_frames, splice_zstd_last_frames_append, splice_zstd_last_frames_replace,
-    write_zstd_splice_suffix, SpliceStats,
+    splice_zstd_last_frames, splice_zstd_last_frames_append, splice_zstd_last_frames_append_with,
+    splice_zstd_last_frames_replace, write_zstd_splice_suffix, SpliceStats,
 };
 
 use std::fs::File;
@@ -134,6 +134,11 @@ pub enum CompressError {
     Unsupported(&'static str),
     #[error("{0}")]
     Msg(String),
+    /// An in-place journaled replacement wrote the new bytes but its journal is
+    /// still pending (the before-unlink hook or the cleanup failed). Never
+    /// answer this with a copy fallback.
+    #[error("{0}")]
+    Committed(io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, CompressError>;
