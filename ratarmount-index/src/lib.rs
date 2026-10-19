@@ -696,46 +696,128 @@ fn reap_stale_writable_tmps(dest: &Path) {
     }
 }
 
-/// A read-only connection for a pure LOOKUP of an existing index.
+/// A read-only connection for a pure LOOKUP of an existing index. Nothing is
+/// created beside the index for ANY set of companion files.
 ///
-/// Opening a WAL-mode database read-only still makes SQLite create `-wal` and
-/// `-shm` beside it (and a read-only connection cannot checkpoint or remove
-/// them), so a lookup would write into the archive's directory. When no
-/// `-wal`, `-shm` or `-journal` exists, no connection holds the file open and
-/// nothing is waiting to be replayed: it is opened `immutable=1`, which reads
-/// the main file alone and creates nothing. When one exists, a live writer owns
-/// the file: it is opened normally so its recent writes stay visible (the side
-/// files already exist, so none is created).
+/// Opening a WAL-mode database read-only still makes SQLite create the `-wal`
+/// and `-shm` it finds missing (and a read-only connection cannot checkpoint or
+/// remove them), so the open depends on which of `-wal`, `-shm` and `-journal`
+/// exist:
 ///
-/// The immutable open is for a connection that reads and is dropped; it must
-/// not be held across a time another process may write the index.
+/// * none: no connection holds the file open and nothing waits to be replayed;
+///   it is opened `immutable=1`, which reads the main file alone and creates
+///   nothing;
+/// * `-wal` and `-shm` (and no `-journal`): a live writer owns the file; it is
+///   opened normally so its recent writes stay visible, and since both side
+///   files exist none is created;
+/// * any other set (a crashed writer's `-wal` without `-shm`, a lone `-shm`, a
+///   `-journal`): a private snapshot of the files is opened in a temporary
+///   directory, so a missing companion is created there, a hot journal is
+///   rolled back there, and the index's directory is never touched. The
+///   snapshot is unlinked as soon as it has been read (where the platform
+///   allows), so it lives as long as the connection.
+///
+/// The immutable open and the snapshot are for a connection that reads and is
+/// dropped; they must not be held across a time another process may write the
+/// index.
 pub(crate) fn open_lookup_connection(path: &Path) -> rusqlite::Result<Connection> {
     let plain = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    #[cfg(unix)]
-    if let Some(uri) = quiescent_immutable_uri(path) {
-        if let Ok(conn) = Connection::open_with_flags(&uri, plain | OpenFlags::SQLITE_OPEN_URI) {
-            return Ok(conn);
-        }
+    let Ok(absolute) = path.canonicalize() else {
+        return Connection::open_with_flags(path, plain);
+    };
+    if !absolute.is_file() {
+        return Connection::open_with_flags(path, plain);
     }
-    Connection::open_with_flags(path, plain)
+    let side = |suffix: &str| {
+        let mut name = absolute.clone().into_os_string();
+        name.push(suffix);
+        std::fs::symlink_metadata(PathBuf::from(name)).is_ok()
+    };
+    match (side("-wal"), side("-shm"), side("-journal")) {
+        (false, false, false) => {
+            if let Some(uri) = immutable_uri(&absolute) {
+                if let Ok(conn) =
+                    Connection::open_with_flags(&uri, plain | OpenFlags::SQLITE_OPEN_URI)
+                {
+                    return Ok(conn);
+                }
+            }
+        }
+        (true, true, false) => {
+            if let Ok(conn) = Connection::open_with_flags(&absolute, plain) {
+                if conn
+                    .query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .is_ok()
+                {
+                    return Ok(conn);
+                }
+            }
+        }
+        _ => {}
+    }
+    snapshot_connection(&absolute)
 }
 
-#[cfg(unix)]
-fn quiescent_immutable_uri(path: &Path) -> Option<String> {
-    use std::os::unix::ffi::OsStrExt;
-    let absolute = path.canonicalize().ok()?;
-    let busy = ["-wal", "-shm", "-journal"].iter().any(|suffix| {
-        let mut side = absolute.clone().into_os_string();
-        side.push(suffix);
-        std::fs::symlink_metadata(side).is_ok()
-    });
-    if busy || !absolute.is_file() {
-        return None;
+/// Copy the index and its existing companions into a private temporary
+/// directory and open the copy (read-write there: recovery of a hot journal
+/// and creation of `-shm` happen on the copy).
+fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
+    let io = |e: std::io::Error| {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(format!("cannot snapshot {}: {e}", absolute.display())),
+        )
+    };
+    let dir = tempfile::tempdir().map_err(io)?;
+    let copy = dir.path().join("snapshot.sqlite");
+    std::fs::copy(absolute, &copy).map_err(io)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut from = absolute.as_os_str().to_owned();
+        from.push(suffix);
+        let mut to = copy.as_os_str().to_owned();
+        to.push(suffix);
+        match std::fs::copy(PathBuf::from(from), PathBuf::from(to)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io(e)),
+        }
     }
+    let conn = Connection::open_with_flags(
+        &copy,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // Open the -wal/-shm and replay a journal now, before the files go.
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })?;
+    // Unix keeps unlinked files alive for the open descriptors; elsewhere the
+    // removal fails and the directory stays in the temporary directory.
+    let _ = dir.close();
+    Ok(conn)
+}
+
+fn immutable_uri(absolute: &Path) -> Option<String> {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        absolute.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = {
+        let text = absolute.to_str()?.replace('\\', "/");
+        let text = text.strip_prefix("//?/").unwrap_or(&text).to_owned();
+        if text.starts_with('/') {
+            text.into_bytes()
+        } else {
+            format!("/{text}").into_bytes()
+        }
+    };
     let mut uri = String::from("file:");
-    for byte in absolute.as_os_str().as_bytes() {
+    for byte in &bytes {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
                 uri.push(char::from(*byte));
             }
             other => uri.push_str(&format!("%{other:02X}")),
@@ -5310,21 +5392,112 @@ mod tests {
         assert_eq!(names(), listing, "the digest peek created files");
         assert!(std::fs::read(&path).unwrap() == bytes, "sidecar rewritten");
 
-        // A sidecar a live writer holds (its -wal exists) is read normally.
+        // A sidecar a live writer holds (its -wal exists) is read normally, and
+        // the lookup sees the writer's uncheckpointed table.
         let writer = rusqlite::Connection::open(&path).unwrap();
         writer
             .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE live_marker(x);")
             .unwrap();
-        assert!(SqliteIndex::open_lookup(&path).is_ok());
-        let seen: i64 = rusqlite::Connection::open(&path)
+        let idx = SqliteIndex::open_lookup(&path).unwrap();
+        assert_eq!(live_marker_count(&idx), 1, "the lookup missed the writer");
+    }
+
+    fn live_marker_count(idx: &SqliteIndex) -> i64 {
+        idx.conn
+            .lock()
             .unwrap()
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name='live_marker'",
                 [],
                 |row| row.get(0),
             )
+            .unwrap()
+    }
+
+    /// Regression (R6-K4, r11 skeptic #1): a WAL index with `-wal` but no `-shm`
+    /// (a crashed writer's leftovers), only `-shm`, or only a `-journal` fell back
+    /// to an ordinary read-only open, which creates the missing companion beside
+    /// the index. Every set of companion files is read without creating anything
+    /// in the directory; a snapshot that carries a `-wal` still shows its rows.
+    #[test]
+    fn regression_lookup_creates_nothing_for_any_companion_set() {
+        // A live writer leaves an uncheckpointed -wal and -shm; copy them.
+        let source = tempfile::tempdir().unwrap();
+        let path = source.path().join("a.tar.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.insert_files_batch(&[one_file_row()]).unwrap();
+            drop(idx.into_read_only().unwrap());
+        }
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+                 CREATE TABLE live_marker(x);",
+            )
             .unwrap();
-        assert_eq!(seen, 1);
+        let named = |suffix: &str| std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+        assert!(named("-wal").exists() && named("-shm").exists());
+        let (main, wal, shm) = (
+            std::fs::read(&path).unwrap(),
+            std::fs::read(named("-wal")).unwrap(),
+            std::fs::read(named("-shm")).unwrap(),
+        );
+        for (with_wal, with_shm, with_journal) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+        ] {
+            let what = format!("wal={with_wal} shm={with_shm} journal={with_journal}");
+            let dir = tempfile::tempdir().unwrap();
+            let copy = dir.path().join("a.tar.index.sqlite");
+            std::fs::write(&copy, &main).unwrap();
+            std::fs::write(dir.path().join("a.tar"), vec![5u8; 4096]).unwrap();
+            if with_wal {
+                std::fs::write(format!("{}-wal", copy.display()), &wal).unwrap();
+            }
+            if with_shm {
+                std::fs::write(format!("{}-shm", copy.display()), &shm).unwrap();
+            }
+            if with_journal {
+                // A zero-length journal is a valid, empty (non-hot) one.
+                std::fs::write(format!("{}-journal", copy.display()), b"").unwrap();
+            }
+            let names = || {
+                let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|e| {
+                        let e = e.unwrap();
+                        (e.file_name(), e.metadata().unwrap().len())
+                    })
+                    .collect();
+                all.sort();
+                all
+            };
+            let before = names();
+            let idx = SqliteIndex::open_lookup(&copy).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(idx.file_count_db().unwrap(), 1, "{what}");
+            if with_wal {
+                assert_eq!(live_marker_count(&idx), 1, "{what}: the -wal rows are lost");
+            }
+            drop(idx);
+            assert_eq!(names(), before, "{what}: the lookup changed the directory");
+            assert!(
+                crate::digest_cache::peek_archive_digest(&dir.path().join("a.tar"), Some(&copy))
+                    .is_ok(),
+                "{what}"
+            );
+            assert_eq!(
+                names(),
+                before,
+                "{what}: the digest peek changed the directory"
+            );
+        }
+        drop(writer);
     }
 }
 

@@ -606,7 +606,8 @@ fn open_catalog_if_path(loc: &CatalogLoc) -> Result<Option<SqliteIndex>, Error> 
     if !p.exists() {
         return Ok(None);
     }
-    SqliteIndex::open_catalog_read_only(p)
+    // A read: it creates nothing beside the sidecar (see `open_lookup`).
+    SqliteIndex::open_lookup(p)
         .map(Some)
         .map_err(|e| Error::Internal(e.to_string()))
 }
@@ -783,6 +784,11 @@ mod tests {
         check_recreate_never(&tar, &loc).unwrap();
         assert!(!will_cold_build(Recreate::IfInvalid, &tar, &loc));
         assert_eq!(names(), listing, "a lookup created files");
+        assert!(std::fs::read(&index).unwrap() == bytes, "sidecar rewritten");
+        // Regression (R6-K4): the catalog the Session HOLDS is a read too.
+        let catalog = open_catalog_if_path(&loc).unwrap().expect("catalog");
+        drop(catalog);
+        assert_eq!(names(), listing, "open_catalog_if_path created files");
         assert!(std::fs::read(&index).unwrap() == bytes, "sidecar rewritten");
     }
 

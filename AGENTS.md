@@ -474,6 +474,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Roll-forward re-stamped size/mtime but left the strong digest naming pre-crash bytes (R6-K7) | `cargo test -p ratarmount-compositing --lib regression_roll_forward_marks_base_digest_pending` · `cargo test -p ratarmount --test docs_base_identity` |
 | `overlay seal` of a `pending` digest hashed the OLD recorded place after an accepted move (vanished A, or A recreated with the recorded stamp) (R6-K2) | `cargo test -p ratarmount --test overlay_base_gate regression_pending_seal_hashes_the_moved_base_not_the_old_place` |
 | Forced `overlay pack` to a same-tree Git repo dropped `base_git_tree` (bundle + unpacked DB lost the comparison row; a changed tree was accepted by `--lower`) (R6-K3) | `cargo test -p ratarmount --test overlay_base_gate regression_forced_pack_to_same_tree_repo_keeps_git_tree_row` |
+| Read-only index lookups created `-shm`/`-wal` for a partial companion set (only `-wal`, only `-shm`, a `-journal`) and `Session::open_catalog_if_path` created side files (R6-K4; none -> immutable, wal+shm -> normal, else private snapshot) | `cargo test -p ratarmount-index --lib regression_lookup_creates_nothing_for_any_companion_set` · `cargo test -p ratarmount-index --lib regression_read_only_lookup_of_wal_index_creates_no_side_files` · `cargo test -p ratarmount-session --lib regression_session_lookups_of_a_wal_sidecar_create_no_side_files` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
