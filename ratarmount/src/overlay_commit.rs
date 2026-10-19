@@ -135,6 +135,8 @@ pub fn spawn_signal_export_stops(stops: Vec<Arc<dyn Fn() + Send + Sync>>) {
 /// Installs the term handler itself (idempotent), so it exists exactly in the process that
 /// serves the mount: a daemon parent that only waits for the mount keeps default signals.
 pub fn spawn_signal_fuse_unmount(mp: PathBuf) {
+    // A signal before the mount is up makes the first unmount fail ("not mounted") and the
+    // watcher waits for the next signal (same as `:temp:` mounts before this change).
     install_term_signal_flag();
     thread::Builder::new()
         .name("ratarmount-fuse-signal".into())

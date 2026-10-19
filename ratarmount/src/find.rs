@@ -99,10 +99,10 @@ pub fn tsv_search_callback(
 /// One SearchFn for control file ≡ socket. Closes over the pre-Control source
 /// plus optional overlay (steps in [`live_search_tsv`]).
 ///
-/// The callback stores [`Weak`] handles. The control thread is detached and,
-/// on a daemon mount, started before `fork`. A strong [`Arc`] would be copied
-/// into the child even though that thread is not, so [`WriteOverlay`]'s last
-/// owner would never drop and the final `pending_rows` replay would not run.
+/// The callback stores [`Weak`] handles. The control thread is detached and
+/// starts in the serving process (the daemon child, after `fork`). A strong
+/// [`Arc`] held by that thread would outlive the mount, so [`WriteOverlay`]'s
+/// last owner would never drop and the final `pending_rows` replay would not run.
 /// After unmount, upgrade fails and search reports that the archive is gone.
 pub fn live_search_callback(
     source: Arc<dyn MountSource>,

@@ -3600,7 +3600,8 @@ struct RetryPolicy {
 }
 
 /// Desktop mount watchers (gvfsd-trash probes `.Trash*` on every new mount and
-/// gvfs-udisks2-volume-monitor can hold the mount root) hold the mount for a few milliseconds; 50 ms steps over about a second ride that out.
+/// gvfs-udisks2-volume-monitor can hold the mount root) hold the mount for a
+/// few milliseconds; 50 ms steps over about a second ride that out.
 #[cfg(not(target_os = "macos"))]
 const UNMOUNT_RETRY: RetryPolicy = RetryPolicy {
     interval: Duration::from_millis(50),

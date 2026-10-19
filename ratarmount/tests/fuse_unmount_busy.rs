@@ -1,5 +1,6 @@
 //! A briefly busy FUSE mount (desktop watchers such as gvfsd-trash and
-//! gvfs-udisks2-volume-monitor probing a new mount) must not turn a one-shot EBUSY into a failed unmount.
+//! gvfs-udisks2-volume-monitor probing a new mount) must not turn a one-shot
+//! EBUSY into a failed unmount.
 //!
 //! Each test holds a file open inside the mount, triggers an unmount, waits
 //! until the first unmount attempt has hit EBUSY, releases the file 200 ms later
@@ -543,10 +544,14 @@ fn pid_gone(pid: i32) -> bool {
     }
 }
 
-/// Failure-path cleanup for a daemonized serving child: lazy unmount, then SIGKILL that pid.
+/// Failure-path cleanup for a daemonized serving child: lazy unmount the unique mnt, SIGKILL the
+/// still-unreaped parent, then SIGKILL the serving pid (0 = not found yet; looked up by exact
+/// mountpoint argument on drop). Created before any readiness assertion so a startup failure or
+/// timeout still cleans up.
 struct ServingChild {
     pid: i32,
     mnt: PathBuf,
+    parent: Option<Child>,
 }
 
 impl Drop for ServingChild {
@@ -560,8 +565,19 @@ impl Drop for ServingChild {
                 .stderr(Stdio::null())
                 .status();
         }
-        if !pid_gone(self.pid) {
-            let _ = nix::sys::signal::kill(Pid::from_raw(self.pid), Signal::SIGKILL);
+        if let Some(parent) = self.parent.as_mut() {
+            kill_unreaped(parent);
+            let _ = parent.wait();
+        }
+        let pids = if self.pid > 0 {
+            vec![self.pid]
+        } else {
+            find_serving_pids(&self.mnt)
+        };
+        for pid in pids {
+            if !pid_gone(pid) {
+                let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
         }
     }
 }
@@ -573,11 +589,12 @@ fn start_daemonized(e: &Env, args: &[&str]) -> (Log, ServingChild) {
     cmd.args(["-d", "3"]).args(args).arg(&e.src).arg(&e.mnt);
     let mut parent = cmd.spawn().expect("spawn ratarmount");
     let log = Log::attach(&mut parent);
-    let st = wait_child(&mut parent, MOUNT_DEADLINE);
-    if st.is_none() {
-        kill_unreaped(&mut parent);
-        let _ = parent.wait();
-    }
+    let mut guard = ServingChild {
+        pid: 0,
+        mnt: e.mnt.clone(),
+        parent: Some(parent),
+    };
+    let st = wait_child(guard.parent.as_mut().unwrap(), MOUNT_DEADLINE);
     log.drain();
     assert!(
         st.is_some_and(|s| s.success()),
@@ -594,14 +611,11 @@ fn start_daemonized(e: &Env, args: &[&str]) -> (Log, ServingChild) {
         thread::sleep(Duration::from_millis(50));
     }
     let pids = find_serving_pids(&e.mnt);
+    if let [pid] = pids[..] {
+        guard.pid = pid;
+    }
     assert_eq!(pids.len(), 1, "serving child pids {pids:?}\n{}", log.text());
-    (
-        log,
-        ServingChild {
-            pid: pids[0],
-            mnt: e.mnt.clone(),
-        },
-    )
+    (log, guard)
 }
 
 fn wait_unmounted_and_gone(c: &ServingChild, what: &str) {
