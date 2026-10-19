@@ -3170,9 +3170,11 @@ fn try_load_zstd_blocks(
     if !meta_ok {
         return None;
     }
-    let idx = match SqliteIndex::open_writable(ip) {
+    // Reading only: a sidecar that is merely consulted must not gain WAL
+    // files or schema changes (a writable open does both).
+    let idx = match SqliteIndex::open_read_only(ip) {
         Ok(i) => i,
-        Err(_) => SqliteIndex::open_read_only(ip).ok()?,
+        Err(_) => SqliteIndex::open_writable(ip).ok()?,
     };
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
@@ -3385,9 +3387,11 @@ fn try_load_bzip2_blocks(
     if !meta_ok {
         return None;
     }
-    let idx = match SqliteIndex::open_writable(ip) {
+    // Reading only: a sidecar that is merely consulted must not gain WAL
+    // files or schema changes (a writable open does both).
+    let idx = match SqliteIndex::open_read_only(ip) {
         Ok(i) => i,
-        Err(_) => SqliteIndex::open_read_only(ip).ok()?,
+        Err(_) => SqliteIndex::open_writable(ip).ok()?,
     };
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
@@ -5927,6 +5931,46 @@ mod tests {
         assert_eq!(blocks2, stored, "warm import must not clobber side table");
         // recreate=true must ignore side table for body build (persist may rewrite).
         assert!(try_load_zstd_blocks(Some(&index), Some(&archive), true).is_none());
+    }
+
+    /// Regression (R6-G5, #6): consulting a sidecar's `zstdblocks` /
+    /// `bzip2blocks` opened it writable, so a DELETE-journal sidecar gained
+    /// WAL files and schema changes from a lookup that only reads.
+    #[test]
+    fn regression_try_load_blocks_never_writes_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_tar_zst(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: zstd CLI unavailable");
+            return;
+        }
+        let index = dir.path().join("tiny.zst.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            ..Default::default()
+        };
+        drop(open_path(&archive, &opts, true).expect("cold open"));
+        {
+            let conn = rusqlite::Connection::open(&index).unwrap();
+            conn.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(()))
+                .unwrap();
+        }
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        let names = || {
+            let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, bytes) = (names(), std::fs::read(&index).unwrap());
+        assert!(try_load_zstd_blocks(Some(&index), Some(&archive), false).is_some());
+        let _ = try_load_bzip2_blocks(Some(&index), Some(&archive), false);
+        assert_eq!(names(), listing, "a lookup created files");
+        assert!(std::fs::read(&index).unwrap() == bytes, "sidecar rewritten");
     }
 
     /// Regression: FR-9 plain `.zst` also auto-wires `zstdblocks` on open.

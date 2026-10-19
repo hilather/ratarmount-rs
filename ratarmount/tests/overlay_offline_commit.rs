@@ -164,6 +164,66 @@ fn regression_unknown_record_refuses_offline_commit() {
     assert!(fs::read(&archive).unwrap() == before, "archive modified");
 }
 
+/// Everything beside the archive: names and bytes.
+fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut all: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let p = e.unwrap().path();
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                fs::read(&p).unwrap_or_default(),
+            )
+        })
+        .collect();
+    all.sort();
+    all
+}
+
+/// A `.tar.zst` of `files` with an indexed sidecar in DELETE journal mode.
+fn zst_with_sidecar(env: &Env, dir: &Path) -> PathBuf {
+    let tar = tar_with(env, "a.tar", &[("f.txt", b"f\n")]);
+    let archive = dir.join("a.tar.zst");
+    fs::write(
+        &archive,
+        zstd::stream::encode_all(&fs::read(&tar).unwrap()[..], 3).unwrap(),
+    )
+    .unwrap();
+    env.ok(&["--no-mount", s(&archive)]);
+    let sidecar = dir.join("a.tar.zst.index.sqlite");
+    assert!(sidecar.exists(), "indexing wrote no sidecar");
+    let conn = rusqlite::Connection::open(&sidecar).unwrap();
+    conn.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(()))
+        .unwrap();
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", sidecar.display()));
+    }
+    archive
+}
+
+/// Regression (R6-G5, #6): the "read-only" classification of a `.tar.zst` loaded
+/// its sidecar through writable loaders, so a DELETE-mode sidecar gained WAL
+/// files and schema changes before a later identity refusal. The refused
+/// commit leaves the archive, the sidecar and the directory byte-identical and
+/// creates nothing (no `-wal`, no `-shm`).
+#[test]
+fn regression_refused_offline_commit_writes_no_sidecar_files() {
+    let env = Env::new();
+    let overlay = directory_overlay(&env);
+    let dir = env.path("zst");
+    fs::create_dir(&dir).unwrap();
+    let archive = zst_with_sidecar(&env, &dir);
+    let before = snapshot(&dir);
+    let out = env.run(&["--commit-overlay", "-w", s(&overlay), s(&archive)]);
+    assert!(!out.status.success(), "must refuse: {}", text(&out));
+    assert!(
+        snapshot(&dir) == before,
+        "the refused commit created or modified files: {:?}",
+        snapshot(&dir).iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+}
+
 /// Leave `archive` mid-commit the way a crash does (journal and locator on
 /// disk, the archive truncated at the replaced suffix).
 fn interrupt_append(archive: &Path) {
