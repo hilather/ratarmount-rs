@@ -29,6 +29,7 @@ mod prefix;
 mod rolling;
 mod transform;
 mod union;
+mod unopened;
 mod versioning;
 mod write_overlay;
 
@@ -80,6 +81,7 @@ pub use prefix::{validate_mount_path, PrefixMountSource, SourceBind};
 pub use rolling::{RollPolicy, RollingMountSource, SeriesName};
 pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};
+pub use unopened::UnopenedSource;
 pub use versioning::FileVersionLayer;
 pub use write_overlay::{
     commit_overlay, commit_overlay_raw_dir, is_control_reserved_path, is_overlay_internal_path,

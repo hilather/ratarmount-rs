@@ -4097,11 +4097,17 @@ fn open_tar_body(
 /// id of `HEAD`. Reads the repository's refs and one tree object; no index.
 #[cfg(feature = "git")]
 fn git_served_kind(path: &Path) -> Result<Option<ServedKind>, String> {
+    git_served_kind_with(path, std::env::var_os("RATARMOUNT_FORCE_GIT").is_some())
+}
+
+/// [`git_served_kind`] with `RATARMOUNT_FORCE_GIT` passed in.
+#[cfg(feature = "git")]
+fn git_served_kind_with(path: &Path, force_git: bool) -> Result<Option<ServedKind>, String> {
     let is_bare = path.join("HEAD").is_file()
         && path.join("objects").is_dir()
         && path.join("refs").is_dir()
         && !path.join(".git").exists();
-    if !(is_bare || (looks_like_git(path) && std::env::var_os("RATARMOUNT_FORCE_GIT").is_some())) {
+    if !(is_bare || (looks_like_git(path) && force_git)) {
         return Ok(None);
     }
     let git = GitMountSource::open(path, None).map_err(|e| e.to_string())?;
@@ -4129,17 +4135,46 @@ pub struct Served {
     pub fetched: bool,
 }
 
-/// written. A file is an archive, a bare Git repository is Git, any other
-/// directory a folder; anything else (a remote URL, a Git reference, a
-/// missing path) is not answered here.
-/// written. A file is an archive, a directory a folder; anything else (a
-/// remote URL, a Git reference, a missing path) is not answered here.
+/// What the factory would serve for `path`, answered without opening it: no
+/// index is built or loaded, no sidecar read or written, no commit journal
+/// recovered. It asks the same questions the mount dispatch asks, in the same
+/// order: a remote input (a local `*.torrent` under `--features bittorrent`
+/// is a remote folder; a `file://` URL is the local path; anything else is
+/// not a local base), then a bare Git repository (or any repository under
+/// `RATARMOUNT_FORCE_GIT`) is Git, any other directory a folder, a file an
+/// archive.
 ///
 /// For a verb that only needs to know what it is about to rewrite
 /// (`--commit-overlay`): indexing a large archive to learn that it is an
 /// archive is the cost this avoids. `sidecar_candidate` is the existing sidecar
 /// a cold open would have used, for a read-only digest peek.
 pub fn served_without_indexing(path: &Path, index_folders: &[PathBuf]) -> Result<Served, String> {
+    let typed = path.to_string_lossy();
+    let mut local = path.to_path_buf();
+    if ratarmount_remote::is_remote_url(&typed) {
+        if ratarmount_remote::is_torrent_input(&typed) {
+            // A torrent mounts as a lazy remote tree even when the metainfo
+            // file is local (`open_remote_input_inner`).
+            return Ok(Served {
+                kind: ServedKind::Folder,
+                location: Some(ServedLocation::Remote(typed.into_owned())),
+                index: IndexProvenance::None,
+                sidecar_candidate: None,
+                fetched: false,
+            });
+        }
+        if ratarmount_remote::remote_url_scheme(&typed).as_deref() != Some("file") {
+            return Err(format!(
+                "{typed} is not a local archive or directory; an offline commit needs a local base"
+            ));
+        }
+        let resolved = ratarmount_remote::resolve_to_local(&typed).map_err(|e| e.to_string())?;
+        match &resolved {
+            ratarmount_remote::RemoteLocal::Local(path) => local = path.clone(),
+            _ => return Err(format!("{typed} is not a local archive or directory")),
+        }
+    }
+    let path = local.as_path();
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let kind = if meta.is_dir() {
         git_served_kind(path)?.unwrap_or(ServedKind::Folder)

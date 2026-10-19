@@ -136,9 +136,11 @@ pub fn classify_offline(
 /// or loaded (a large archive's index build was the whole cost), no sidecar is
 /// read or written and no commit journal is recovered (the identity gate must
 /// judge the file BEFORE recovery touches it). What the commit gate compares is
-/// the kind, the place and the file's stamp, all of which come from `stat`; the
-/// factory decides the kind ([`factory::served_without_indexing`]). The token's
-/// source is an unread placeholder: the commit path reads only its identity.
+/// the kind, the place and the file's stamp; the kind and place come from the
+/// factory's own dispatch questions ([`factory::served_without_indexing`]), so
+/// a local `.torrent` or a `file://` URL is classified as a mount classifies
+/// it. The token's source is an [`ratarmount_compositing::UnopenedSource`]:
+/// the commit path reads only the identity.
 pub fn classify_offline_commit(
     base: &Path,
     context: &OverlayRunContext,
@@ -158,16 +160,9 @@ struct CommitOpener<'a> {
 impl OpenBase for CommitOpener<'_> {
     fn open_base(&mut self) -> Result<Opened, String> {
         let served = factory::served_without_indexing(self.base, self.index_folders)?;
-        // Never read: `commit_overlay` takes the token's identity only.
-        let parent = self
-            .base
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let placeholder = ratarmount_compositing::FolderMountSource::new(parent)
-            .map_err(|error| error.to_string())?;
+        // Nothing is opened: `commit_overlay` takes the token's identity only.
         Ok(Opened {
-            source: std::sync::Arc::new(placeholder),
+            source: std::sync::Arc::new(ratarmount_compositing::UnopenedSource),
             kind: served.kind,
             inputs: vec![self.base.to_string_lossy().into_owned()],
             location: served.location,

@@ -410,7 +410,8 @@ fn regression_served_kind_table_fetched_and_torrent() {
 /// factory serves Git. `served_without_indexing` sniffs what the factory would
 /// serve: a bare repository is Git (with its tree id), a file is an Archive, a
 /// directory a Folder, and nothing is created beside any of them (no index,
-/// sidecar or journal).
+/// sidecar or journal). Without the `git` feature the factory serves a
+/// repository directory as a Folder, and so does the classifier.
 #[test]
 fn regression_served_without_indexing_sniffs_git_and_builds_no_index() {
     fn listing(dir: &Path) -> Vec<String> {
@@ -439,7 +440,13 @@ fn regression_served_without_indexing_sniffs_git_and_builds_no_index() {
     let before = listing(dir.path());
 
     let served = served_without_indexing(&bare, &[]).unwrap();
+    #[cfg(feature = "git")]
     assert_eq!(served.kind, ServedKind::Git { tree }, "bare repo is Git");
+    #[cfg(not(feature = "git"))]
+    {
+        let _ = tree;
+        assert_eq!(served.kind, ServedKind::Folder, "no git feature");
+    }
     assert!(matches!(served.index, IndexProvenance::None));
     let served = served_without_indexing(&archive, &[]).unwrap();
     assert_eq!(served.kind, ServedKind::Archive);
@@ -447,4 +454,70 @@ fn regression_served_without_indexing_sniffs_git_and_builds_no_index() {
     let served = served_without_indexing(&folder, &[]).unwrap();
     assert_eq!(served.kind, ServedKind::Folder);
     assert_eq!(listing(dir.path()), before, "something was created");
+}
+
+/// Regression (R6-J3, audit E6): `RATARMOUNT_FORCE_GIT` serves a plain
+/// repository as Git at mount; the commit classifier asks the same predicate
+/// (the environment is passed explicitly here, tests never set it).
+#[cfg(feature = "git")]
+#[test]
+fn regression_force_git_repository_is_git_at_commit_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("work");
+    let (tree, _) = commit_repo(&repo, false);
+    assert_eq!(git_served_kind_with(&repo, false).unwrap(), None);
+    assert_eq!(
+        git_served_kind_with(&repo, true).unwrap(),
+        Some(ServedKind::Git { tree })
+    );
+}
+
+/// A minimal single-file v1 torrent (`file`, "test"); no trackers, no seeds.
+fn torrent_bytes() -> Vec<u8> {
+    let mut out = b"d4:infod6:lengthi4e4:name4:file12:piece lengthi16384e6:pieces20:".to_vec();
+    out.extend_from_slice(&[
+        0xa9, 0x4a, 0x8f, 0xe5, 0xcc, 0xb1, 0x9b, 0xa6, 0x1c, 0x4c, 0x08, 0x73, 0xd3, 0x91, 0xe9,
+        0x87, 0x98, 0x2f, 0xbb, 0xd3,
+    ]);
+    out.extend_from_slice(b"ee");
+    out
+}
+
+/// Regression (R6-J3, audit E7): a local `x.torrent` mounts as a remote
+/// FOLDER under `--features bittorrent`, but the commit classifier's `stat`
+/// said Archive/Local, so the same input had two identities. Both go through
+/// the same remote dispatch now. Without the feature the file is an opaque
+/// archive file in both. A `file://` URL is the local path in both.
+#[test]
+fn regression_local_torrent_classified_same_at_mount_and_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let torrent = root.join("x.torrent");
+    std::fs::write(&torrent, torrent_bytes()).unwrap();
+    let mounted = served_of(std::slice::from_ref(&torrent), &mut options());
+    let committed = served_without_indexing(&torrent, &[]).unwrap();
+    assert_eq!(committed.kind, mounted.kind);
+    assert_eq!(committed.location, mounted.location);
+    if cfg!(feature = "bittorrent") {
+        assert_eq!(committed.kind, ServedKind::Folder);
+        assert_eq!(
+            committed.location,
+            Some(ServedLocation::Remote(
+                torrent.to_string_lossy().into_owned()
+            ))
+        );
+    } else {
+        assert_eq!(committed.kind, ServedKind::Archive);
+        assert_eq!(committed.location, Some(ServedLocation::Local(torrent)));
+    }
+
+    let archive = root.join("a.tar");
+    tar(&archive);
+    let url = PathBuf::from(format!("file://{}", archive.display()));
+    let mounted = served_of(std::slice::from_ref(&url), &mut options());
+    let committed = served_without_indexing(&url, &[]).unwrap();
+    assert_eq!(committed.kind, ServedKind::Archive);
+    assert_eq!(committed.kind, mounted.kind);
+    assert_eq!(committed.location, mounted.location);
+    assert_eq!(committed.location, Some(ServedLocation::Local(archive)));
 }
