@@ -776,6 +776,38 @@ mod tests {
         ));
     }
 
+    /// Regression (R5 record, no `base_location` row): a strong archive record
+    /// without a place compares content as before when the base is local, and
+    /// needs the matching strong digest when the base is remote.
+    #[test]
+    fn regression_r5_absent_location_remote_needs_digest() {
+        let place = Place::new();
+        let r5 = meta_with(&[
+            ("format_version", "2"),
+            ("base_url", "x"),
+            ("base_kind", "archive"),
+            ("base_digest_kind", "strong"),
+            ("base_digest", D1),
+        ]);
+        let probe = |supplied| BaseProbe {
+            supplied,
+            extra_excludes: &[],
+        };
+        let local = place.token(Shape::ArchL);
+        assert_eq!(
+            shape_verdict(Some(&r5), local.actual(), &probe(None)),
+            Verdict::Content
+        );
+        let remote = place.token(Shape::ArchR);
+        for (supplied, same) in [(None, false), (Some(D2), false), (Some(D1), true)] {
+            let got = shape_verdict(Some(&r5), remote.actual(), &probe(supplied));
+            assert_eq!(got == Verdict::Same, same, "supplied {supplied:?}: {got:?}");
+            if !same {
+                assert!(matches!(got, Verdict::Refuse(_)), "{got:?}");
+            }
+        }
+    }
+
     /// Regression: a forced change with nothing supplied drops a directory or
     /// archive to kind-only (`none`) with no weak digest, no stamp and no
     /// "cannot measure base" error; a supplied digest records strong/supplied.

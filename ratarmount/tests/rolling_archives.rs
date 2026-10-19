@@ -155,11 +155,17 @@ fn fuse_rolling_one_cycle() {
     }
 }
 
-/// Regression: a rolling commit recorded the old generation's baseline and
-/// refused the next mount of the same series (no kernel mount required).
-#[test]
-fn regression_rolling_commit_baseline_allows_cli_remount() {
-    use ratarmount_compositing::{CommitMode, OverlayMeta, RollingMountSource, WriteOverlay};
+/// A rolled series with an overlay over it: two commits rolled the active
+/// generation to `traces.000002.tar.zst`, and each commit passed the commit
+/// check against the rows the previous commit/refresh wrote (the pre-roll
+/// rows for the first, the re-pointed ones for the second).
+fn rolled_overlay() -> (
+    tempfile::TempDir,
+    PathBuf,
+    PathBuf,
+    std::sync::Arc<ratarmount_compositing::RollingMountSource>,
+) {
+    use ratarmount_compositing::{CommitMode, RollingMountSource, WriteOverlay};
     use ratarmount_core::{MountSource, OpenOptions};
     use std::sync::Arc;
 
@@ -204,10 +210,11 @@ fn regression_rolling_commit_baseline_allows_cli_remount() {
     }
     assert!(series.active_path().ends_with("traces.000002.tar.zst"));
     drop(ov);
-    let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
-    assert!(meta.get("base_committed_at").is_some());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
-    command
+    (dir, base, overlay, series)
+}
+
+fn rolling_remount(base: &Path, overlay: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ratarmount"))
         .args([
             "--no-mount",
             "--index-file",
@@ -216,9 +223,22 @@ fn regression_rolling_commit_baseline_allows_cli_remount() {
             "1B",
             "-w",
         ])
-        .arg(&overlay)
-        .arg(&base);
-    let out = command.output().unwrap();
+        .arg(overlay)
+        .arg(base)
+        .output()
+        .unwrap()
+}
+
+/// Regression: a rolling commit recorded the old generation's baseline and
+/// refused the next mount of the same series (no kernel mount required).
+#[test]
+fn regression_rolling_commit_baseline_allows_cli_remount() {
+    use ratarmount_compositing::OverlayMeta;
+
+    let (_dir, base, overlay, series) = rolled_overlay();
+    let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
+    assert!(meta.get("base_committed_at").is_some());
+    let out = rolling_remount(&base, &overlay);
     assert!(
         out.status.success(),
         "{}",
@@ -230,7 +250,52 @@ fn regression_rolling_commit_baseline_allows_cli_remount() {
         .unwrap()
         .set_modified(modified + Duration::from_secs(1))
         .unwrap();
-    let out = command.output().unwrap();
+    let out = rolling_remount(&base, &overlay);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("base mismatch"));
+}
+
+/// After a roll the active generation is a different path than the one the
+/// overlay was created over. The roll's commits passed the commit check, the
+/// refresh re-pointed the recorded place (`base_location`) at the new
+/// generation, a remount over the series is not refused, and replacing the
+/// NEW active generation's bytes is (the check compares the generation that is
+/// active now, not the stale creation path).
+#[test]
+fn regression_rolling_roll_then_remount_not_refused() {
+    use ratarmount_compositing::OverlayMeta;
+
+    let (_dir, base, overlay, series) = rolled_overlay();
+    let active = series.active_path();
+    let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
+    assert_eq!(
+        meta.get("base_location"),
+        Some(format!("local:{}", active.canonicalize().unwrap().display()).as_str()),
+        "the refresh followed the roll"
+    );
+    let out = rolling_remount(&base, &overlay);
+    assert!(
+        out.status.success(),
+        "a remount after a roll was refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Same mtime, different size: only the content gate can notice it.
+    let modified = fs::metadata(&active).unwrap().modified().unwrap();
+    let mut bytes = fs::read(&active).unwrap();
+    // An empty zstd skippable frame: still a valid archive, one size larger.
+    bytes.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0]);
+    fs::write(&active, bytes).unwrap();
+    File::options()
+        .write(true)
+        .open(&active)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let out = rolling_remount(&base, &overlay);
+    assert!(
+        !out.status.success(),
+        "a replaced active generation was accepted"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("base mismatch"), "{stderr}");
 }
