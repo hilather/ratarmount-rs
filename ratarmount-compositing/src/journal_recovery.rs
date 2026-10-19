@@ -49,7 +49,7 @@ impl Rows<'_> {
             Rows::Shared(db) => f(&db.lock().unwrap_or_else(|e| e.into_inner())),
             Rows::Owned(conn) => f(conn),
             Rows::Path(db) => {
-                if !db.exists() {
+                if !db.is_file() {
                     return Ok(());
                 }
                 let conn = Connection::open_with_flags(
@@ -233,6 +233,10 @@ pub(crate) fn recover_journal(
     authorize: Authorize<'_>,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
     commit_journal::recover_with(archive, authorize, &mut |applied| {
+        // A rollback restores the recorded state: nothing to restamp.
+        if !applied.rolled_forward {
+            return Ok(());
+        }
         rows.with(|conn| restamp_rows(conn, archive, applied, Restamp::Recovery))
     })
 }
@@ -246,24 +250,8 @@ pub fn recover_journal_at(
     overlay_db: Option<&Path>,
     authorize: Authorize<'_>,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
-    let conn = match overlay_db.filter(|db| db.exists()) {
-        Some(db) => {
-            let conn = Connection::open_with_flags(
-                db,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .and_then(|conn| conn.busy_timeout(Duration::from_secs(5)).map(|()| conn))
-            .map_err(|e| {
-                RecoverError::Journal(io::Error::other(format!(
-                    "cannot open the overlay database {} to restamp the recovered base: {e}",
-                    db.display()
-                )))
-            })?;
-            Some(conn)
-        }
-        None => None,
-    };
-    let rows = conn.as_ref().map_or(Rows::None, Rows::Owned);
+    // Opened only when a roll-forward needs to restamp: a mount with no pending
+    // journal never touches the overlay database here.
+    let rows = overlay_db.map_or(Rows::None, Rows::Path);
     recover_journal(archive, rows, authorize)
 }
