@@ -3370,17 +3370,8 @@ fn resolve_color_style(force_color: bool, force_no_color: bool) -> env_logger::W
 }
 
 fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::WriteStyle) {
-    let level = match debug {
-        0 => log::LevelFilter::Error,
-        1 => log::LevelFilter::Warn,
-        2 => log::LevelFilter::Info,
-        _ => log::LevelFilter::Debug,
-    };
-    // RUST_LOG still wins if set (env_logger convention via filter_or).
-    let mut builder =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level.as_str()));
-    builder.filter_level(level);
-    configure_http_logging(&mut builder);
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let mut builder = logger_filter_builder(debug, rust_log.as_deref());
     builder.write_style(write_style);
     if let Some(path) = log_file {
         match std::fs::OpenOptions::new()
@@ -3398,6 +3389,24 @@ fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::Writ
         }
     }
     let _ = builder.try_init();
+}
+
+/// Log filters: `-d` sets the global baseline, then a non-empty `RUST_LOG`
+/// (global and module directives) overrides it (#138).
+fn logger_filter_builder(debug: u8, rust_log: Option<&str>) -> env_logger::Builder {
+    let level = match debug {
+        0 => log::LevelFilter::Error,
+        1 => log::LevelFilter::Warn,
+        2 => log::LevelFilter::Info,
+        _ => log::LevelFilter::Debug,
+    };
+    let mut builder = env_logger::Builder::new();
+    builder.filter_level(level);
+    if let Some(spec) = rust_log.filter(|s| !s.is_empty()) {
+        builder.parse_filters(spec);
+    }
+    configure_http_logging(&mut builder);
+    builder
 }
 
 fn configure_http_logging(builder: &mut env_logger::Builder) {
@@ -3429,6 +3438,48 @@ fn regression_http_debug_logging_hides_signed_request_urls() {
         .args(format_args!("safe HTTP diagnostic"))
         .build();
     assert!(logger.matches(&record));
+}
+
+#[cfg(test)]
+fn logger_enabled(debug: u8, rust_log: Option<&str>, target: &str, level: log::Level) -> bool {
+    let logger = logger_filter_builder(debug, rust_log).build();
+    let record = log::Record::builder()
+        .target(target)
+        .level(level)
+        .args(format_args!("x"))
+        .build();
+    logger.matches(&record)
+}
+
+/// Regression: `RUST_LOG=debug` printed no DEBUG lines because `-d`'s
+/// `filter_level` replaced RUST_LOG's global directive (#138).
+#[test]
+fn regression_rust_log_global_level_wins_over_debug_flag() {
+    use log::Level::{Debug, Error, Info, Trace, Warn};
+    assert!(logger_enabled(0, Some("debug"), "ratarmount", Debug));
+    assert!(logger_enabled(1, Some("debug"), "ratarmount_fuse", Debug));
+    // RUST_LOG=error beats -d 3.
+    assert!(logger_enabled(3, Some("error"), "ratarmount", Error));
+    assert!(!logger_enabled(3, Some("error"), "ratarmount", Warn));
+    assert!(!logger_enabled(3, Some("error"), "ratarmount", Debug));
+    // Empty RUST_LOG falls back to -d.
+    assert!(logger_enabled(3, Some(""), "ratarmount", Debug));
+    // Unset: -d applies.
+    assert!(logger_enabled(3, None, "ratarmount", Debug));
+    assert!(!logger_enabled(2, None, "ratarmount", Debug));
+    assert!(logger_enabled(2, None, "ratarmount", Info));
+    assert!(!logger_enabled(1, None, "ratarmount", Info));
+    // Module-scoped directive keeps working on top of the -d baseline.
+    let spec = Some("ratarmount_fuse=debug");
+    assert!(logger_enabled(2, spec, "ratarmount_fuse", Debug));
+    assert!(logger_enabled(2, spec, "ratarmount_fuse::sub", Debug));
+    assert!(!logger_enabled(2, spec, "ratarmount", Debug));
+    assert!(logger_enabled(2, spec, "ratarmount", Info));
+    // Signed-URL redaction survives a global RUST_LOG.
+    let spec = Some("debug,ureq::unit=trace");
+    assert!(!logger_enabled(0, spec, "ureq::unit", Debug));
+    assert!(!logger_enabled(0, spec, "ureq::unit", Trace));
+    assert!(logger_enabled(0, spec, "ureq::unit", Warn));
 }
 
 /// Adapter so env_logger can write through a Mutex-guarded File.
