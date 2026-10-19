@@ -9,9 +9,7 @@
 //! first conflict. It runs before the overlay database/marker, any fork and the mount.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::ffi::OsString;
 use std::io;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -127,6 +125,7 @@ const STX_MNT_ID: usize = 144;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn mount_id_statx(p: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
     let cpath = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is the 256-byte statx buffer and `cpath` is NUL-terminated.
@@ -161,6 +160,7 @@ struct FileHandle {
 /// Kernels before 5.8: `name_to_handle_at` reports the mount id of the path.
 #[cfg(target_os = "linux")]
 pub(crate) fn mount_id_handle(p: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
     let cpath = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
     let mut fh = FileHandle {
         handle_bytes: 128,
@@ -329,6 +329,8 @@ pub(crate) struct MountEntry {
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_mountinfo(bytes: &[u8]) -> Vec<MountEntry> {
     use crate::sandbox::process::unescape_mountinfo_field;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
     fn num<T: std::str::FromStr>(f: &[u8]) -> Option<T> {
         std::str::from_utf8(f).ok()?.parse().ok()
     }
@@ -461,6 +463,7 @@ fn compare_rel(a: &Path, b: &Path) -> Option<Relation> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 /// Compare a generated view with a base: lexically, then through the inode of the
 /// directory above the view's mount point (case/Unicode aliases of the base spelling).
 fn relation_view<F: FsIdentity>(

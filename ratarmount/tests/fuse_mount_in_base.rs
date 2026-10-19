@@ -16,7 +16,7 @@ use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -340,6 +340,7 @@ fn scan_marker_pids(token: &str, root: &Path) -> Vec<i32> {
     let mut out = Vec::new();
     #[cfg(target_os = "linux")]
     {
+        use std::os::unix::fs::MetadataExt;
         let me = unsafe { libc::getuid() };
         let Ok(rd) = fs::read_dir("/proc") else {
             return out;
@@ -1178,7 +1179,7 @@ fn regression_mount_in_base_guard_finds_and_kills_detached_grandchild() {
     let token = env.token.clone();
     // Double fork: the parent exits, the grandchild is a session leader whose command
     // line carries the token but not the root path.
-    let script = format!("setsid sh -c 'sleep 300; true' {token} >/dev/null 2>&1 &");
+    let script = format!("setsid sh -c 'while :; do sleep 1; done' {token} >/dev/null 2>&1 &");
     let run = env.run_raw("detach", &["sh", "-c", &script], WATCHDOG);
     assert_eq!(run.code(), Some(0));
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1885,12 +1886,24 @@ fn mount_and_check_with(
     }
     env.guard.connections.extend(owned_connections(&env.root));
     // Bounded listing in a disposable subprocess, never in the test process.
-    let (st, out) = run_bounded(
-        Command::new("ls").arg("-1A").arg(&mp),
-        Duration::from_secs(10),
-    )
-    .expect("ls finished");
-    assert!(st.success(), "ls failed");
+    // The mount can be listed in mountinfo a moment before the daemon serves it.
+    let out = loop {
+        let (st, out) = run_bounded(
+            Command::new("ls").arg("-1A").arg(&mp),
+            Duration::from_secs(10),
+        )
+        .expect("ls finished");
+        if st.success() {
+            break out;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ls of {} kept failing\n{}",
+            mp.display(),
+            run.stderr_text()
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
     if let Some(entry) = expected_entry {
         let text = String::from_utf8_lossy(&out);
         assert!(

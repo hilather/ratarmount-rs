@@ -4,6 +4,10 @@
 use super::*;
 use clap::Parser;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 
 // ---------------------------------------------------------------------------
 // FakeFs
@@ -32,6 +36,8 @@ struct FakeFs {
     linux: bool,
     mnt_ids: bool,
     panic_cwd: bool,
+    /// Paths whose `mount_id` is unavailable (statx and handle both fail).
+    no_mnt: Vec<PathBuf>,
     next: u64,
 }
 
@@ -51,6 +57,7 @@ impl FakeFs {
             linux: true,
             mnt_ids: true,
             panic_cwd: false,
+            no_mnt: Vec::new(),
             next: 100,
         };
         f.nodes.insert(
@@ -204,7 +211,7 @@ impl FsIdentity for FakeFs {
         }
     }
     fn mount_id(&self, p: &Path) -> Option<u64> {
-        if !self.linux || !self.mnt_ids {
+        if !self.linux || !self.mnt_ids || self.no_mnt.iter().any(|n| n == p) {
             return None;
         }
         self.nodes.get(&self.key(p)).map(|n| n.mnt)
@@ -896,6 +903,40 @@ fn regression_mount_in_base_views_different_device_ok() {
 }
 
 #[test]
+fn regression_mount_in_base_views_hidden_under_overmount_in_base_is_conservative() {
+    // /C at /P/B/sub, then /D over it: the hidden bind is still a view (documented).
+    let mut fs = FakeFs::std();
+    fs.dir("/C");
+    fs.dir("/D");
+    fs.bind("/C", "/P/B/sub", 101);
+    fs.bind("/D", "/P/B/sub", 102);
+    fs.mountinfo = mi_lines(&[
+        "101 1 8:1 /C /P/B/sub rw - ext4 /dev/sda1 rw",
+        "102 1 8:1 /D /P/B/sub rw - ext4 /dev/sda1 rw",
+    ]);
+    refused(
+        run(&fs, "/C/mnt", &["/P/B"]),
+        &["also visible at /P/B/sub/mnt"],
+    );
+}
+
+#[test]
+fn regression_mount_in_base_plan_git_inline_ref_stripped() {
+    let (_td, root) = real_dir();
+    std::fs::create_dir_all(root.join("B/.git")).unwrap();
+    let fs = RealFs::with_cwd(root);
+    let args = Args::try_parse_from(["ratarmount", "B@HEAD", "B/mnt"]).unwrap();
+    let msg = plan_mount_point(
+        &fs,
+        &args,
+        Some(PathBuf::from("B/mnt")),
+        &[PathBuf::from("B@HEAD")],
+    )
+    .unwrap_err();
+    assert!(msg.contains("inside the folder being mounted B;"), "{msg}");
+}
+
+#[test]
 fn regression_mount_in_base_views_mount_id_unknown_skips_check() {
     let mut fs = FakeFs::std();
     fs.mnt_ids = false;
@@ -1083,14 +1124,33 @@ fn regression_mount_in_base_inode_overmount_view_not_projected_c3() {
     let mut fs = c3_fs();
     fs.mnt_ids = false;
     fs.mountinfo = None;
-    // Same device everywhere: the alias chain is projected.
-    let _ = run(&fs, "/alias/B/mnt", &["/P/B"]);
+    // Same device everywhere: the alias chain is projected (documented over-refusal).
+    refused(run(&fs, "/alias/B/mnt", &["/P/B"]), &["inside the folder"]);
 }
 
 #[test]
 fn regression_mount_in_base_inode_mixed_view_kinds_not_projected() {
-    // `Mount` on one anchor and `Dev` on the other never compare equal.
-    assert_ne!(View::Mount(1), View::Dev(1));
+    // /B2 is a bind of /P/B; /B2/x is a directory in it. When the ancestor /B2 has no
+    // mount id its view is `Dev`, the anchor's is `Mount`: the pair is skipped.
+    let mut fs = FakeFs::std();
+    fs.bind("/P/B", "/B2", 101);
+    fs.dir("/B2/x");
+    fs.mountinfo = None;
+    refused(
+        run(&fs, "/B2/x/mnt", &["/P/B"]),
+        &["inside the folder", "same directory"],
+    );
+    fs.no_mnt.push(PathBuf::from("/B2"));
+    run(&fs, "/B2/x/mnt", &["/P/B"]).unwrap();
+}
+
+#[test]
+fn regression_mount_in_base_inode_chain_crosses_mount_not_projected() {
+    // C3 without mountinfo: the (/alias, /P) pair has equal inodes, but /alias is in
+    // another mount than the mount point's anchor, so it is not projected.
+    let mut fs = c3_fs();
+    fs.mountinfo = None;
+    run(&fs, "/alias/B/mnt", &["/P/B"]).unwrap();
 }
 
 #[test]
