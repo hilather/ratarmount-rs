@@ -1924,11 +1924,22 @@ fn main() {
         }
         // A `file://` URL names a local archive: everything below (recovery,
         // the gate, the splice) works on the path it resolves to.
-        let resolved_archive =
-            match &ratarmount_remote::resolve_to_local(&archive.to_string_lossy()) {
+        // Only `file://` is resolved; any other remote scheme is refused
+        // before anything could fetch it.
+        let typed = archive.to_string_lossy();
+        let resolved_archive = match ratarmount_remote::remote_url_scheme(&typed).as_deref() {
+            Some("file") => match &ratarmount_remote::resolve_to_local(&typed) {
                 Ok(ratarmount_remote::RemoteLocal::Local(path)) => path.clone(),
                 _ => archive.clone(),
-            };
+            },
+            _ if ratarmount_remote::is_remote_url(&typed) => {
+                eprintln!(
+                    "error: offline --commit-overlay takes only a local path or file:// URL, not '{typed}'"
+                );
+                std::process::exit(2);
+            }
+            _ => archive.clone(),
+        };
         let archive = &resolved_archive;
         // A database overlay recovers a pending commit journal only after its
         // base identity gate (inside the commit): recovery rewrites the archive,

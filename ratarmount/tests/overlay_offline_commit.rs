@@ -523,3 +523,54 @@ fn regression_offline_commit_accepts_file_url() {
         "{listing}"
     );
 }
+
+/// Regression (R6-L1, r12 skeptic 5): R6-K8 resolved EVERY remote input to a
+/// local file before the commit, so `--commit-overlay http://...` downloaded
+/// the archive (and ssh/sftp/ftp/webdav would connect). Only `file://` is
+/// resolved; every other remote scheme is refused with no network contact.
+#[cfg(unix)]
+#[test]
+fn regression_offline_commit_makes_no_network_fetch() {
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let env = Env::new();
+    let overlay = env.path("overlay");
+    fs::create_dir_all(&overlay).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicUsize::new(0));
+    let (h, st) = (hits.clone(), stop.clone());
+    let server = std::thread::spawn(move || {
+        while st.load(Ordering::SeqCst) == 0 {
+            if listener.accept().is_ok() {
+                h.fetch_add(1, Ordering::SeqCst);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    });
+    for url in [
+        format!("http://127.0.0.1:{port}/a.tar"),
+        format!("https://127.0.0.1:{port}/a.tar"),
+        format!("ssh://127.0.0.1:{port}/a.tar"),
+        format!("sftp://127.0.0.1:{port}/a.tar"),
+        format!("ftp://127.0.0.1:{port}/a.tar"),
+        format!("webdav://127.0.0.1:{port}/a.tar"),
+    ] {
+        let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), &url]);
+        assert!(!out.status.success(), "{url}: must refuse: {}", text(&out));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("only a local path or file:// URL"),
+            "{url}: unclear refusal: {err}"
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    stop.store(1, Ordering::SeqCst);
+    server.join().unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "network contacted");
+}
