@@ -191,6 +191,110 @@ fn regression_base_replaced_by_symlink_refused() {
     }
 }
 
+fn sha(path: &Path) -> String {
+    format!(
+        "sha256:{}",
+        ratarmount_index::sha256_hex(&fs::read(path).unwrap())
+    )
+}
+
+/// Regression (R6-F3): reopen used the old stamp verifier, so a byte-identical
+/// local copy of a strong-digest archive (another path, another mtime) failed
+/// even though the supplied SHA-256 matched. Every gate shares one comparator.
+#[test]
+fn regression_reopen_byte_identical_copy_with_other_mtime_accepted_by_digest() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    let digest = sha(&fx.archive);
+    drop(
+        open_with(
+            &archive_token(&fx.archive),
+            &fx.overlay,
+            BaseDigestRequest::Supplied(digest.clone()),
+            false,
+        )
+        .unwrap(),
+    );
+    let copy = fx.archive.with_file_name("copy.tar");
+    fs::copy(&fx.archive, &copy).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+        .unwrap();
+    open_with(
+        &archive_token(&copy),
+        &fx.overlay,
+        BaseDigestRequest::Supplied(digest.clone()),
+        false,
+    )
+    .expect("a byte-identical copy confirmed by the supplied digest reopens");
+    // A wrong supplied digest still refuses.
+    let wrong = format!("sha256:{}", "2".repeat(64));
+    assert!(open_with(
+        &archive_token(&copy),
+        &fx.overlay,
+        BaseDigestRequest::Supplied(wrong),
+        false
+    )
+    .is_err());
+}
+
+/// Regression (R6-F3): an accepted local -> remote relocation kept the local
+/// stamp rows, so the NEXT remote reopen compared a stamp that cannot be read
+/// and failed with "unavailable (local archive missing)".
+#[test]
+fn regression_accepted_remote_relocation_drops_local_stamp() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    let digest = sha(&fx.archive);
+    drop(
+        open_with(
+            &archive_token(&fx.archive),
+            &fx.overlay,
+            BaseDigestRequest::Supplied(digest.clone()),
+            false,
+        )
+        .unwrap(),
+    );
+    let remote = || {
+        ClassifiedBase::for_tests(
+            open_tar(&fx.archive),
+            ServedKind::Archive,
+            Some(ServedLocation::Remote("https://h.example/base.tar".into())),
+        )
+    };
+    drop(
+        open_with(
+            &remote(),
+            &fx.overlay,
+            BaseDigestRequest::Supplied(digest.clone()),
+            false,
+        )
+        .expect("accepted by the strong digest"),
+    );
+    drop(
+        open_with(
+            &remote(),
+            &fx.overlay,
+            BaseDigestRequest::Supplied(digest.clone()),
+            false,
+        )
+        .expect("the next remote reopen agrees"),
+    );
+    let meta = crate::OverlayMeta::read(&fx.overlay).unwrap().unwrap();
+    for key in ["base_size", "base_mtime_ns", "base_local_path"] {
+        assert_eq!(meta.get(key), None, "{key}");
+    }
+}
+
 /// A directory swapped in at the archive path is refused under every digest
 /// kind, `none` included (the token's kind is static, so only a fresh file
 /// type check can see it); a different valid tar under `none` is accepted

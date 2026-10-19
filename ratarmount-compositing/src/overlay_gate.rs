@@ -273,6 +273,20 @@ pub(crate) fn write_accepted_identity(
     } else {
         identity
     };
+    if moved {
+        // The stamp, path and manifest of the place left behind describe a
+        // base that is no longer read; the next reopen would compare them.
+        for key in [
+            "base_size",
+            "base_mtime_ns",
+            "base_local_path",
+            "base_weak_digest",
+        ] {
+            if !rows.contains_key(key) {
+                OverlayMeta::remove(conn, key)?;
+            }
+        }
+    }
     OverlayMeta::set_many(
         conn,
         &rows

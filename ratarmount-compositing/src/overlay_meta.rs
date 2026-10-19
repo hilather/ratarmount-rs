@@ -1642,7 +1642,18 @@ fn reopen_classified(
             // run overrides this open only (`base_mismatch_forced_at`); the
             // recorded digest stays, so a later offline verb still refuses.
             if !meta.legacy() {
-                verify(conn, meta, info, plan)?;
+                // A strong archive record is confirmed by the same comparator
+                // every other gate uses (supplied or cached SHA-256), so a
+                // byte-identical copy with another mtime reopens. Anything the
+                // comparator does not accept falls to the stamp/manifest/
+                // exclusion checks of `verify`, which name the mismatch.
+                let confirmed = base.actual().kind() == crate::BaseKind::Archive
+                    && meta.base_digest_kind() == Some("strong")
+                    && crate::overlay_gate::compare_base_identity(Some(meta), base, &probe)
+                        .is_ok_and(|cmp| cmp.mismatch.is_none());
+                if !confirmed {
+                    verify(conn, meta, info, plan)?;
+                }
             }
         }
     }
