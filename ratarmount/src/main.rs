@@ -1931,6 +1931,7 @@ fn main() {
             debug: args.debug,
             encoding: args.encoding.clone(),
             ignore_zeros: args.ignore_zeros,
+            force_base_mismatch: args.force_base_mismatch,
         };
         match commit_overlay(overlay, archive, &opts) {
             Ok(_) => return,

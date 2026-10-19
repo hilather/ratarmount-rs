@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use ratarmount_core::MountSource;
 
-use crate::overlay_meta::OverlayMeta;
+use crate::overlay_meta::{OverlayCreateInfo, OverlayMeta};
 use crate::write_overlay::Result;
 use crate::BaseDigestRequest;
 use crate::LowerLayerRecord;
@@ -112,6 +112,26 @@ pub enum BaseLocation {
     Remote(String),
 }
 
+impl BaseLocation {
+    /// The value stored in the `base_location` row.
+    pub(crate) fn row(&self) -> String {
+        match self {
+            BaseLocation::Local(path) => format!("local:{}", path.display()),
+            BaseLocation::Remote(url) => format!("remote:{url}"),
+        }
+    }
+
+    /// Inverse of [`Self::row`]; `None` for an absent or unknown form.
+    pub(crate) fn from_row(row: &str) -> Option<Self> {
+        if let Some(path) = row.strip_prefix("local:") {
+            Some(BaseLocation::Local(PathBuf::from(path)))
+        } else {
+            row.strip_prefix("remote:")
+                .map(|url| BaseLocation::Remote(url.to_owned()))
+        }
+    }
+}
+
 /// **Experimental.** What the opener served, canonicalized and redacted.
 #[derive(Clone)]
 pub struct ActualBase {
@@ -122,6 +142,8 @@ pub struct ActualBase {
     pub(crate) git_tree: Option<String>,
     pub(crate) remote_token: Option<String>,
     pub(crate) index_for_peek: Option<PathBuf>,
+    /// The index the opener selected (never a credentialed one).
+    pub(crate) index_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ActualBase {
@@ -160,6 +182,38 @@ impl ActualBase {
     }
     pub fn index_for_peek(&self) -> Option<&Path> {
         self.index_for_peek.as_deref()
+    }
+
+    /// The creation input the overlay database is initialized from. The only
+    /// way to build an [`OverlayCreateInfo`]: nothing here names a base the
+    /// opener did not report.
+    pub(crate) fn create_info(&self, options: &CreateOptions) -> OverlayCreateInfo {
+        let composite = self.remote_token.is_some();
+        let local_path = match (&self.location, self.kind) {
+            // A composite has no single content identity, and a remote or Git
+            // base is identified by other means.
+            (Some(BaseLocation::Local(path)), BaseKind::Archive | BaseKind::Dir) if !composite => {
+                Some(path.clone())
+            }
+            _ => None,
+        };
+        OverlayCreateInfo {
+            base_url: self.base_url.clone(),
+            base_digest: options.base_digest.clone(),
+            lower_layers: options.lower_layers.clone(),
+            force_base_mismatch: options.force_base_mismatch,
+            local_path,
+            index_path: self
+                .index_path
+                .clone()
+                .filter(|_| options.index_writable && !self.credentialed),
+            git_tree: self.git_tree.clone(),
+            remote_token: self
+                .remote_token
+                .clone()
+                .or_else(|| options.remote_token.clone()),
+            weak_exclude: options.weak_exclude.clone(),
+        }
     }
 }
 
@@ -318,6 +372,7 @@ pub(crate) struct Inner {
 ///     git_tree: None,
 ///     remote_token: None,
 ///     index_for_peek: None,
+///     index_path: None,
 /// };
 /// ```
 ///
@@ -346,6 +401,179 @@ pub(crate) struct Inner {
 /// // control: ActualBase literal
 /// let cb = ClassifiedBase::open(&mut Fixture)?;
 /// let _ = (cb.actual().kind(), cb.actual().base_url());
+/// # Ok::<(), String>(())
+/// ```
+///
+/// A sealed overlay's own record cannot start a seal (it is not a token), but
+/// the token can:
+///
+/// ```compile_fail
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // compile_fail: seal_with_base(&sealed_record)
+/// let record = SealedRecord::read("/nonexistent")?.unwrap();
+/// let _ = overlay_seal::seal_with_base("/nonexistent".as_ref(), &record, Arc::new(FolderMountSource::new("/tmp").unwrap()));
+/// # Ok::<(), OverlayError>(())
+/// ```
+///
+/// ```no_run
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // control: seal_with_base(&classified)
+/// let cb = ClassifiedBase::open(&mut Fixture)?;
+/// let _ = overlay_seal::seal_with_base("/nonexistent".as_ref(), &cb, cb.source());
+/// # Ok::<(), String>(())
+/// ```
+///
+/// ```compile_fail
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // compile_fail: reseal(&classified)
+/// let cb = ClassifiedBase::open(&mut Fixture)?;
+/// let _ = overlay_seal::reseal(&cb);
+/// # Ok::<(), String>(())
+/// ```
+///
+/// ```no_run
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // control: reseal(&sealed_record)
+/// let record = SealedRecord::read("/nonexistent")?.unwrap();
+/// let _ = overlay_seal::reseal(&record);
+/// # Ok::<(), OverlayError>(())
+/// ```
+///
+/// ```compile_fail
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // compile_fail: check_commit_base (pub(crate))
+/// let cb = ClassifiedBase::open(&mut Fixture)?;
+/// let conn = rusqlite::Connection::open_in_memory().unwrap();
+/// let _ = overlay_gate::check_commit_base(&conn, &cb, "/tmp".as_ref());
+/// # Ok::<(), String>(())
+/// ```
+///
+/// ```no_run
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // control: commit through the public WriteOverlay entry
+/// let cb = ClassifiedBase::open(&mut Fixture)?;
+/// let overlay = WriteOverlay::open(&cb, cb.source(), "/nonexistent", &CreateOptions::default()).unwrap();
+/// let _ = overlay.commit_atomic("/tmp/a.tar".as_ref());
 /// # Ok::<(), String>(())
 /// ```
 #[derive(Clone)]
@@ -407,6 +635,14 @@ impl ClassifiedBase {
             let items: Vec<String> = inputs.iter().map(|raw| redacted(raw)).collect();
             serde_json::to_string(&items).expect("input paths serialize")
         });
+        let index_path = match &index {
+            IndexProvenance::Local(path) | IndexProvenance::Discovered { path, .. }
+                if !credentialed =>
+            {
+                Some(path.clone())
+            }
+            _ => None,
+        };
         let index_for_peek = match (&base_kind, &location) {
             (BaseKind::Archive, Some(BaseLocation::Local(_))) if !credentialed => match index {
                 IndexProvenance::Local(path) | IndexProvenance::Discovered { path, .. } => {
@@ -424,6 +660,7 @@ impl ClassifiedBase {
             git_tree,
             remote_token,
             index_for_peek,
+            index_path,
         };
         Ok(Self {
             inner: Arc::new(Inner {
@@ -596,6 +833,10 @@ pub struct CreateOptions {
     pub weak_exclude: Vec<PathBuf>,
     /// The index sidecar may be updated (a cached digest written back).
     pub index_writable: bool,
+    /// Cheap remote identity (ETag, or Content-Length + Last-Modified) the
+    /// caller read when it created a single remote base; a composite's token
+    /// comes from the opener's inputs.
+    pub remote_token: Option<String>,
 }
 
 #[cfg(test)]

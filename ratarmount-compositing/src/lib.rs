@@ -16,6 +16,7 @@ mod oci_whiteout;
 pub mod overlay_changes;
 #[cfg(unix)]
 pub mod overlay_fsck;
+pub mod overlay_gate;
 pub mod overlay_identity;
 pub mod overlay_layer;
 pub mod overlay_meta;
@@ -31,6 +32,8 @@ mod union;
 mod versioning;
 mod write_overlay;
 
+#[cfg(test)]
+mod overlay_identity_tests;
 #[cfg(test)]
 mod search_cheap;
 
@@ -77,10 +80,11 @@ pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};
 pub use versioning::FileVersionLayer;
 pub use write_overlay::{
-    commit_overlay, is_control_reserved_path, is_overlay_internal_path, live_commit_is_supported,
-    name_suggests_tar_zst, overlay_atime, overlay_only_names, patch_sidecar_if_present,
-    sidecar_path_for_patch, CommitKind, CommitMode, CommitOutcome, CommitOverlayOptions,
-    IndexPatchWindow, OverlayError, OverlayMetadata, OverlayMutation, OverlayPolicy, Parked,
-    RemoteDownload, RemoteObjectHead, RemotePublishError, RemotePublishRequest, WriteOverlay,
-    HIDDEN_DB, LEGACY_OVERLAY_MARKER, OVERLAY_MARKER,
+    commit_overlay, commit_overlay_checked, commit_overlay_raw_dir, is_control_reserved_path,
+    is_overlay_internal_path, live_commit_is_supported, name_suggests_tar_zst, overlay_atime,
+    overlay_only_names, patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitMode,
+    CommitOutcome, CommitOverlayOptions, IndexPatchWindow, OverlayError, OverlayMetadata,
+    OverlayMutation, OverlayPolicy, Parked, RawDirCommit, RemoteDownload, RemoteObjectHead,
+    RemotePublishError, RemotePublishRequest, WriteOverlay, HIDDEN_DB, LEGACY_OVERLAY_MARKER,
+    OVERLAY_MARKER,
 };

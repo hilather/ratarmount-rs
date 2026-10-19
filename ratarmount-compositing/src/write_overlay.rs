@@ -672,6 +672,11 @@ pub struct WriteOverlay {
     #[cfg(test)]
     cow_before_persist_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     base: Arc<dyn MountSource>,
+    /// The classified base this overlay was opened with (`None` for the
+    /// legacy constructors). A commit re-points it at the archive it wrote.
+    identity: Mutex<Option<crate::ClassifiedBase>>,
+    /// `--force-base-mismatch`: a commit over a changed base proceeds.
+    force_base_mismatch: bool,
     rolling: Option<Arc<crate::RollingMountSource>>,
     /// After a live TAR commit, the reopened archive.
     replacement: RwLock<Option<Arc<dyn MountSource>>>,
@@ -997,7 +1002,20 @@ impl WriteOverlay {
     }
 
     pub fn new(base: Arc<dyn MountSource>, overlay: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_create_info(base, overlay.as_ref(), None)
+        Self::open_with_create_info(base, overlay.as_ref(), None, None)
+    }
+
+    /// Open (or create) the overlay over a classified base. `composed` is the
+    /// view that is served (lower layers over `base.source()`); the token is
+    /// what was opened and is compared with what the overlay recorded.
+    pub fn open(
+        base: &crate::ClassifiedBase,
+        composed: Arc<dyn MountSource>,
+        overlay: impl AsRef<Path>,
+        options: &crate::CreateOptions,
+    ) -> Result<Self> {
+        let info = base.actual().create_info(options);
+        Self::open_with_create_info(composed, overlay.as_ref(), Some(&info), Some(base))
     }
 
     /// Open with the original base identity. Existing overlays are verified
@@ -1007,13 +1025,14 @@ impl WriteOverlay {
         overlay: impl AsRef<Path>,
         info: &crate::OverlayCreateInfo,
     ) -> Result<Self> {
-        Self::open_with_create_info(base, overlay.as_ref(), Some(info))
+        Self::open_with_create_info(base, overlay.as_ref(), Some(info), None)
     }
 
     fn open_with_create_info(
         base: Arc<dyn MountSource>,
         overlay: &Path,
         info: Option<&crate::OverlayCreateInfo>,
+        identity: Option<&crate::ClassifiedBase>,
     ) -> Result<Self> {
         // Before the directory is created: the topmost-new exclusion rule
         // depends on which parents of the overlay exist right now.
@@ -1146,7 +1165,13 @@ impl WriteOverlay {
                     "overlay is sealed; mount it with --lower, or `overlay unseal`".into(),
                 ));
             }
-            crate::overlay_meta::initialize(&transaction, had_files, info, exclude_plan.as_ref())?;
+            crate::overlay_meta::initialize(
+                &transaction,
+                had_files,
+                info,
+                exclude_plan.as_ref(),
+                identity,
+            )?;
             let tombstones = tombstone_set_from_conn(&transaction)?;
             transaction.commit()?;
             Ok(tombstones)
@@ -1227,6 +1252,8 @@ impl WriteOverlay {
             #[cfg(test)]
             cow_before_persist_hook: Mutex::new(None),
             base,
+            identity: Mutex::new(identity.cloned()),
+            force_base_mismatch: info.is_some_and(|info| info.force_base_mismatch),
             rolling: None,
             replacement: RwLock::new(None),
             root,
@@ -3364,6 +3391,7 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
+        self.check_commit_identity(archive)?;
         let target = self.rolling_commit_target(archive, &plan)?;
         let archive = target.as_path();
         let persist_plan = self.rolling_persist_plan(&plan);
@@ -4016,6 +4044,7 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
+        self.check_commit_identity(archive)?;
         let target = self.rolling_commit_target(archive, &plan)?;
         let archive = target.as_path();
         let persist_plan = self.rolling_persist_plan(&plan);
@@ -4224,14 +4253,21 @@ impl WriteOverlay {
             }
         };
         if !self.remote_enabled() {
-            if let Err(error) = crate::overlay_meta::refresh_committed_base(
+            let identity = self.identity.lock().expect("overlay identity").clone();
+            match crate::overlay_meta::refresh_committed_base(
                 &self.db.lock().expect("overlay db"),
+                identity.as_ref(),
                 archive,
             ) {
-                self.refuse_base_after_commit_failure();
-                return Err(OverlayError::Msg(format!(
-                    "archive committed; baseline refresh failed (remount required): {error}"
-                )));
+                // The next commit starts from the re-pointed token.
+                Ok(Some(moved)) => *self.identity.lock().expect("overlay identity") = Some(moved),
+                Ok(None) => {}
+                Err(error) => {
+                    self.refuse_base_after_commit_failure();
+                    return Err(OverlayError::Msg(format!(
+                        "archive committed; baseline refresh failed (remount required): {error}"
+                    )));
+                }
             }
             if let Some(hashes) = &self.manifest_hashes {
                 if let Err(e) = write_commit_manifest(
@@ -4251,6 +4287,45 @@ impl WriteOverlay {
             prefix_compressed_bytes: prefix,
         });
         Ok(window)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn meta_for_tests(&self) -> crate::OverlayMeta {
+        crate::OverlayMeta::from_connection(&self.db.lock().expect("overlay db"))
+            .expect("read meta")
+            .expect("meta table")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity_for_tests(&self) -> Option<crate::ClassifiedBase> {
+        self.identity.lock().expect("overlay identity").clone()
+    }
+
+    /// Refuse THIS commit, before it writes anything, when the archive is no
+    /// longer the base the last create, commit or refresh recorded (under the
+    /// commit gate). The mount keeps serving and the interval stays on: unlike
+    /// a failed commit, nothing was written. `--force-base-mismatch` commits
+    /// anyway (the refresh after the write records the new baseline).
+    fn check_commit_identity(&self, archive: &Path) -> Result<()> {
+        if self.remote_enabled() {
+            return Ok(());
+        }
+        let Some(base) = self.identity.lock().expect("overlay identity").clone() else {
+            return Ok(());
+        };
+        let checked = crate::overlay_gate::check_commit_base(
+            &self.db.lock().expect("overlay db"),
+            &base,
+            archive,
+        );
+        match checked {
+            Ok(()) => Ok(()),
+            Err(refusal) if self.force_base_mismatch => {
+                log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
+                Ok(())
+            }
+            Err(refusal) => Err(OverlayError::Msg(refusal.0)),
+        }
     }
 
     fn refuse_base_after_commit_failure(&self) {
@@ -6370,6 +6445,9 @@ pub struct CommitOverlayOptions {
     /// classification, and sidecar patch always walk past per-frame TAR EOF
     /// so later concatenated members survive even when this is false.
     pub ignore_zeros: bool,
+    /// `--force-base-mismatch`: commit although the archive is no longer the
+    /// base the overlay recorded.
+    pub force_base_mismatch: bool,
 }
 
 impl Default for CommitOverlayOptions {
@@ -6381,6 +6459,7 @@ impl Default for CommitOverlayOptions {
             debug: 1,
             encoding: "utf-8".into(),
             ignore_zeros: false,
+            force_base_mismatch: false,
         }
     }
 }
@@ -6412,9 +6491,80 @@ pub fn commit_overlay(
     archive_file: impl AsRef<Path>,
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
+    commit_overlay_inner(write_overlay.as_ref(), archive_file.as_ref(), None, opts)
+}
+
+/// [`commit_overlay`] for an overlay with a database: the archive about to be
+/// rewritten must still be the base the last create, commit or refresh
+/// recorded (checked with `stat` only, before anything is written; the
+/// classified base is the opener's report for `archive_file`). The refresh
+/// afterwards re-points the recorded location at the committed archive.
+/// `--force-base-mismatch` (`opts`) commits anyway.
+pub fn commit_overlay_checked(
+    write_overlay: impl AsRef<Path>,
+    archive_file: impl AsRef<Path>,
+    base: &crate::ClassifiedBase,
+    opts: &CommitOverlayOptions,
+) -> Result<bool> {
     let write_overlay = write_overlay.as_ref();
     let archive_file = archive_file.as_ref();
+    if !write_overlay.join(HIDDEN_DB).exists() {
+        return Err(OverlayError::Msg(format!(
+            "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
+            write_overlay.display()
+        )));
+    }
+    if let Err(refusal) =
+        crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
+    {
+        if !opts.force_base_mismatch {
+            return Err(OverlayError::Msg(refusal.0));
+        }
+        log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
+    }
+    commit_overlay_inner(write_overlay, archive_file, Some(base), opts)
+}
 
+/// What [`commit_overlay_raw_dir`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawDirCommit {
+    pub committed: bool,
+    /// Always `false`: a raw overlay directory records no base identity, so
+    /// none was checked. The CLI says so.
+    pub identity_checked: bool,
+}
+
+/// Commit a raw overlay DIRECTORY of files (no database) to an archive. It
+/// takes no token and checks no identity; it refuses once the directory has
+/// an overlay database, because then the base identity must be checked
+/// through [`commit_overlay_checked`].
+pub fn commit_overlay_raw_dir(
+    write_overlay: impl AsRef<Path>,
+    archive_file: impl AsRef<Path>,
+    opts: &CommitOverlayOptions,
+) -> Result<RawDirCommit> {
+    let write_overlay = write_overlay.as_ref();
+    let db = write_overlay.join(HIDDEN_DB);
+    if db.exists() {
+        return Err(OverlayError::Msg(format!(
+            "overlay database {} exists; its base identity must be checked, so commit it \
+             with a classified base (commit_overlay_checked), not as a raw directory",
+            db.display()
+        )));
+    }
+    let committed = commit_overlay_inner(write_overlay, archive_file.as_ref(), None, opts)?;
+    Ok(RawDirCommit {
+        committed,
+        identity_checked: false,
+    })
+}
+
+fn commit_overlay_inner(
+    write_overlay: &Path,
+    archive_file: &Path,
+    identity: Option<&crate::ClassifiedBase>,
+    opts: &CommitOverlayOptions,
+) -> Result<bool> {
     if !write_overlay.is_dir() {
         return Err(OverlayError::Msg(
             "Need an existing write overlay folder for committing changes.".into(),
@@ -6456,7 +6606,7 @@ pub fn commit_overlay(
             opts.mode,
             hash_payloads.then_some(&mut written_hashes),
         )?;
-        crate::overlay_meta::refresh_committed_base_offline(write_overlay, archive_file)?;
+        crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
         plan.written_hashes = written_hashes;
         let patch_opts = OpenOptions {
             encoding: opts.encoding.clone(),
@@ -6476,7 +6626,7 @@ pub fn commit_overlay(
         commit_overlay_tar(write_overlay, archive_file, opts)?
     };
     if committed {
-        crate::overlay_meta::refresh_committed_base_offline(write_overlay, archive_file)?;
+        crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
         if let Some(hashes) = &opts.manifest_hashes {
             write_commit_manifest(archive_file, &plan, &opts.encoding, hashes)?;
         }

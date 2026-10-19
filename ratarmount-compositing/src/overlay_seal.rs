@@ -187,6 +187,56 @@ fn digest_rows(
 /// metadata; callers must supply their base explicitly when none is recorded.
 /// A writer reservation covers fsck, hashing, and the atomic metadata update.
 pub fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutcome> {
+    seal_impl(dir, None, lower_view)
+}
+
+/// Seal an overlay that is not sealed yet, over the base the opener served
+/// (`composed` is that base under the `--lower` layers: what the rows hash
+/// against). An overlay that recorded no kind (made by a released build)
+/// gets the kind and place of this base recorded with the seal. An overlay
+/// that is already sealed is [`reseal`]ed, never sealed again.
+pub fn seal_with_base(
+    dir: &Path,
+    base: &crate::ClassifiedBase,
+    composed: Arc<dyn MountSource>,
+) -> io::Result<SealOutcome> {
+    seal_impl(dir, Some(base), composed)
+}
+
+/// Finish an interrupted seal of an already sealed overlay, from the record
+/// read off the overlay itself. It opens no base and writes no row: it
+/// re-checks that the overlay is still sealed with the same digest, then
+/// restores the sentinel and the read-only modes. It cannot start a seal.
+pub fn reseal(record: &crate::SealedRecord) -> io::Result<SealOutcome> {
+    let dir = record.dir();
+    let root = root(dir)?;
+    let meta = OverlayMeta::read(dir)
+        .map_err(overlay_error)?
+        .filter(OverlayMeta::layer_sealed)
+        .ok_or_else(|| io::Error::other("overlay is no longer sealed"))?;
+    check_hash_format(|key| meta.get(key))?;
+    let layer_digest: String = meta
+        .get("layer_digest")
+        .ok_or_else(|| io::Error::other("sealed overlay has no layer_digest"))?
+        .into();
+    if layer_digest != record.layer_digest() {
+        return Err(io::Error::other(
+            "overlay was sealed again since it was read; retry",
+        ));
+    }
+    finish_sealed(dir, &root, &layer_digest)?;
+    Ok(SealOutcome {
+        layer_digest,
+        sealed_at: meta.get("sealed_at").unwrap_or_default().into(),
+        already_sealed: true,
+    })
+}
+
+fn seal_impl(
+    dir: &Path,
+    identity: Option<&crate::ClassifiedBase>,
+    lower_view: Arc<dyn MountSource>,
+) -> io::Result<SealOutcome> {
     let root = root(dir)?;
     let meta = OverlayMeta::read(dir).map_err(overlay_error)?;
     if let Some(meta) = meta.filter(OverlayMeta::layer_sealed) {
@@ -231,6 +281,17 @@ pub fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutc
     let mut modes = BTreeMap::new();
     walk_modes(&root, "", &mut modes)?;
     let (layer_digest, rows) = digest_rows(dir, lower_view, false)?;
+    if let Some(base) = identity {
+        // A released overlay recorded no kind; the seal writes it now (no digest).
+        let meta = OverlayMeta::from_connection(&conn).map_err(overlay_error)?;
+        if matches!(
+            crate::overlay_gate::Recorded::from_meta(meta.as_ref()),
+            crate::overlay_gate::Recorded::Unrecorded
+        ) {
+            crate::overlay_gate::write_accepted_identity(&conn, meta.as_ref(), base)
+                .map_err(overlay_error)?;
+        }
+    }
     let sealed_at = chrono::Utc::now().to_rfc3339();
     conn.execute_batch(SEAL_SCHEMA).map_err(sql_error)?;
     for (path, mode) in &modes {
@@ -371,6 +432,16 @@ pub fn check_hash_format<'a>(get: impl Fn(&str) -> Option<&'a str>) -> io::Resul
             changes::CANONICAL_HASH_FORMAT
         ),
     ))
+}
+
+/// [`verify`] over a classified base: the caller has classified and gated the
+/// base the layer is checked against.
+pub fn verify_with_base(
+    dir: &Path,
+    _base: &crate::ClassifiedBase,
+    composed: Arc<dyn MountSource>,
+) -> io::Result<VerifyReport> {
+    verify(dir, composed)
 }
 
 pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<VerifyReport> {

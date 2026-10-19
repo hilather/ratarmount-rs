@@ -914,7 +914,7 @@ pub fn resolve_pending_base_digest(conn: &Connection) -> Result<bool> {
     record_base_digest(conn, &pending, &digest)
 }
 
-fn timestamp() -> String {
+pub(crate) fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -1019,10 +1019,14 @@ pub(crate) fn initialize(
     had_files: bool,
     info: Option<&OverlayCreateInfo>,
     plan: Option<&ExcludePlan>,
+    identity: Option<&crate::ClassifiedBase>,
 ) -> Result<()> {
     let previous = OverlayMeta::from_connection(conn)?;
     if had_files {
         if let Some(meta) = previous.filter(|m| !m.values.is_empty()) {
+            if let (Some(base), Some(info)) = (identity, info) {
+                return reopen_classified(conn, &meta, info, plan, base);
+            }
             if !meta.legacy() {
                 if let Some(info) = info {
                     verify(conn, &meta, info, plan)?;
@@ -1031,7 +1035,13 @@ pub(crate) fn initialize(
             return Ok(());
         }
         // A schema-only migration must never claim to know a legacy base.
-        return OverlayMeta::set(conn, "format_version", "1");
+        OverlayMeta::set(conn, "format_version", "1")?;
+        // The first `-w` open of an overlay made by a released build records
+        // what the opener served (kind, place), and no digest.
+        if let Some(base) = identity {
+            crate::overlay_gate::write_accepted_identity(conn, None, base)?;
+        }
+        return Ok(());
     }
     let default = OverlayCreateInfo {
         base_digest: BaseDigestRequest::None,
@@ -1108,7 +1118,12 @@ pub(crate) fn initialize(
     }
     // An overlay created without naming its base records no kind; the
     // comparison rows then identify it.
-    if info.git_tree.is_some() || info.path().is_some() || !info.base_url.is_empty() {
+    if let Some(base) = identity {
+        values.insert("base_kind", base.actual().kind().as_str().to_owned());
+        if let Some(location) = base.actual().location() {
+            values.insert("base_location", location.row());
+        }
+    } else if info.git_tree.is_some() || info.path().is_some() || !info.base_url.is_empty() {
         let kind = if info.git_tree.is_some() {
             BaseKind::Git
         } else if info.path().is_some_and(Path::is_dir) {
@@ -1134,10 +1149,27 @@ pub(crate) fn initialize(
 
 /// Advance the baseline only after archive persistence succeeds. Legacy overlays
 /// retain their unknown identity. The caller holds the commit gate / DB lock.
-pub(crate) fn refresh_committed_base(conn: &Connection, archive: &Path) -> Result<()> {
-    let Some(meta) = OverlayMeta::from_connection(conn)?.filter(|meta| !meta.legacy()) else {
-        return Ok(());
+///
+/// With the mount's token, the token is re-pointed at the committed archive
+/// (the caller stores it so the next commit starts from it); a token that is
+/// not an archive writes no base rows at all (the commit target of a union
+/// is not the overlay's base). Without a token (the legacy constructors) the
+/// previous behaviour is kept.
+pub(crate) fn refresh_committed_base(
+    conn: &Connection,
+    base: Option<&crate::ClassifiedBase>,
+    archive: &Path,
+) -> Result<Option<crate::ClassifiedBase>> {
+    let Some(meta) = OverlayMeta::from_connection(conn)? else {
+        return Ok(None);
     };
+    // A released overlay is refreshed only once it has gained a kind row.
+    if meta.legacy() && (base.is_none() || meta.get("base_kind").is_none()) {
+        return Ok(None);
+    }
+    if base.is_some_and(|b| b.actual().kind() != crate::overlay_identity::BaseKind::Archive) {
+        return Ok(None);
+    }
     let archive = archive.canonicalize()?;
     let stamp = ArchiveDigestStamp::read(&archive)?;
     let sibling = PathBuf::from(format!("{}.index.sqlite", archive.display()));
@@ -1177,7 +1209,7 @@ pub(crate) fn refresh_committed_base(conn: &Connection, archive: &Path) -> Resul
     } else {
         meta.base_digest_kind().unwrap_or("none")
     };
-    let values = [
+    let mut values = vec![
         ("base_size", stamp.size.to_string()),
         ("base_mtime_ns", stamp.mtime_ns.to_string()),
         ("base_digest", digest),
@@ -1188,16 +1220,31 @@ pub(crate) fn refresh_committed_base(conn: &Connection, archive: &Path) -> Resul
         ("base_index_path", index.to_string_lossy().into_owned()),
         ("base_kind", BaseKind::Archive.as_str().to_owned()),
     ];
+    let moved = base.map(|b| b.repointed(&archive));
+    if let Some(moved) = &moved {
+        let actual = moved.actual();
+        if let Some(location) = actual.location() {
+            values.push(("base_location", location.row()));
+        }
+        if !actual.base_url().is_empty() && meta.base_url() != Some(actual.base_url()) {
+            values.push(("base_url", actual.base_url().to_owned()));
+        }
+    }
     OverlayMeta::set_many(
         conn,
         &values
             .iter()
             .map(|(k, v)| (*k, v.as_str()))
             .collect::<Vec<_>>(),
-    )
+    )?;
+    Ok(moved)
 }
 
-pub(crate) fn refresh_committed_base_offline(overlay: &Path, archive: &Path) -> Result<()> {
+pub(crate) fn refresh_committed_base_offline(
+    overlay: &Path,
+    base: Option<&crate::ClassifiedBase>,
+    archive: &Path,
+) -> Result<()> {
     let db = overlay.join(HIDDEN_DB);
     // Some offline callers commit a directory of files without an overlay DB.
     if !db.exists() {
@@ -1205,7 +1252,7 @@ pub(crate) fn refresh_committed_base_offline(overlay: &Path, archive: &Path) -> 
     }
     let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.busy_timeout(std::time::Duration::ZERO)?;
-    refresh_committed_base(&conn, archive)
+    refresh_committed_base(&conn, base, archive).map(|_| ())
 }
 
 /// How strong a [`BaseCheck`] comparison is.
@@ -1462,6 +1509,17 @@ pub fn compare_base_identity(
     meta: Option<&OverlayMeta>,
     probe: &BaseProbe,
 ) -> std::result::Result<BaseComparison, String> {
+    compare_content(meta, probe, true)
+}
+
+/// The content half of the comparison. `check_kind` runs the legacy kind rule
+/// that guesses the actual kind from the probe; the token-based gate has
+/// already compared the kind the opener reported and passes `false`.
+pub(crate) fn compare_content(
+    meta: Option<&OverlayMeta>,
+    probe: &BaseProbe,
+    check_kind: bool,
+) -> std::result::Result<BaseComparison, String> {
     let get = |key: &str| meta.and_then(|m| m.get(key));
     let decidable = meta.is_some_and(|m| m.base_digest_kind().is_some_and(|k| k != "none"));
     let strong = meta.is_some_and(|m| m.base_digest_kind() == Some("strong"));
@@ -1563,7 +1621,7 @@ pub fn compare_base_identity(
     // The one kind rule: a base of another kind than the recorded one is a
     // different base, whatever else agrees. Compared with `==`, so a new kind
     // cannot be skipped.
-    if mismatch.is_none() {
+    if mismatch.is_none() && check_kind {
         let actual = BaseKind::of_probe(probe);
         if let Some(recorded) = meta.and_then(BaseKind::recorded).filter(|r| *r != actual) {
             mismatch = Some(format!(
@@ -1659,8 +1717,10 @@ pub fn forced_base_record(
 /// seal or pack replaces the record wholesale: rows of the previous base kind
 /// (an archive's stamp, a directory's walk, a Git tree, the old paths) must not
 /// survive to match the old base later.
-pub const BASE_COMPARISON_KEYS: [&str; 7] = [
+pub const BASE_COMPARISON_KEYS: [&str; 9] = [
     "base_kind",
+    "base_location",
+    "base_digest_source",
     "base_size",
     "base_mtime_ns",
     "base_local_path",
@@ -1692,18 +1752,7 @@ pub fn record_base_rows_offline(overlay: &Path, rows: &BTreeMap<String, String>)
     )?;
     conn.busy_timeout(std::time::Duration::ZERO)?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| -> Result<()> {
-        for key in BASE_COMPARISON_KEYS {
-            OverlayMeta::remove(&conn, key)?;
-        }
-        OverlayMeta::set_many(
-            &conn,
-            &rows
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect::<Vec<_>>(),
-        )
-    })();
+    let result = apply_comparison_rows(&conn, rows);
     match result {
         Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
         Err(e) => {
@@ -1713,14 +1762,80 @@ pub fn record_base_rows_offline(overlay: &Path, rows: &BTreeMap<String, String>)
     }
 }
 
+/// Reopen over a classified base: the kind-and-place verdict first (for every
+/// record that names a kind, legacy or not), then the digest check on the
+/// records that have one, then the rows for an accepted change of place. A
+/// forced override records the base now in use.
+fn reopen_classified(
+    conn: &Connection,
+    meta: &OverlayMeta,
+    info: &OverlayCreateInfo,
+    plan: Option<&ExcludePlan>,
+    base: &crate::ClassifiedBase,
+) -> Result<()> {
+    use crate::overlay_gate::{forced_base_record, shape_verdict, BaseProbe, Verdict};
+    let probe = BaseProbe {
+        supplied: match &info.base_digest {
+            BaseDigestRequest::Supplied(digest) => Some(digest.as_str()),
+            _ => None,
+        },
+        extra_excludes: &[],
+    };
+    let forced_rows = |conn: &Connection| -> Result<()> {
+        let rows = forced_base_record(meta, base, &probe).map_err(OverlayError::Msg)?;
+        apply_comparison_rows(conn, &rows)
+    };
+    match shape_verdict(Some(meta), base.actual(), &probe) {
+        Verdict::Refuse(reason) => {
+            if !info.force_base_mismatch {
+                return Err(OverlayError::Msg(format!(
+                    "base mismatch: {reason}; use --force-base-mismatch to override"
+                )));
+            }
+            return forced_rows(conn);
+        }
+        Verdict::Same => {}
+        Verdict::Content => {
+            if !meta.legacy() && verify(conn, meta, info, plan)? {
+                return forced_rows(conn);
+            }
+        }
+    }
+    if !matches!(
+        crate::overlay_gate::Recorded::from_meta(Some(meta)),
+        crate::overlay_gate::Recorded::Nothing
+    ) {
+        crate::overlay_gate::write_accepted_identity(conn, Some(meta), base)?;
+    }
+    Ok(())
+}
+
+/// Replace every comparison row with `rows` through the caller's connection.
+pub(crate) fn apply_comparison_rows(
+    conn: &Connection,
+    rows: &BTreeMap<String, String>,
+) -> Result<()> {
+    for key in BASE_COMPARISON_KEYS {
+        OverlayMeta::remove(conn, key)?;
+    }
+    OverlayMeta::set_many(
+        conn,
+        &rows
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Returns `true` when a mismatch was overridden by `--force-base-mismatch`.
 fn verify(
     conn: &Connection,
     meta: &OverlayMeta,
     info: &OverlayCreateInfo,
     plan: Option<&ExcludePlan>,
-) -> Result<()> {
+) -> Result<bool> {
     if meta.base_digest_kind() == Some("none") {
-        return Ok(());
+        return Ok(false);
     }
     let old = match meta.base_digest_kind() {
         Some("pending") => "pending",
@@ -1776,10 +1891,11 @@ fn verify(
             return Err(OverlayError::Msg(format!("base mismatch: recorded digest {old}; current digest {current}; use --force-base-mismatch to override")));
         }
         OverlayMeta::set(conn, "base_mismatch_forced_at", &timestamp())?;
+        return Ok(true);
     } else if !to_append.is_empty() {
         append_base_excludes(conn, &to_append)?;
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -2172,7 +2288,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            refresh_committed_base(&conn, &archive).unwrap();
+            refresh_committed_base(&conn, None, &archive).unwrap();
             let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
             assert_eq!(meta.base_digest_kind(), Some(kind));
             assert_eq!(meta.get("base_size"), Some("12"));
@@ -2184,11 +2300,11 @@ mod tests {
             }
         }
         let conn = Connection::open_in_memory().unwrap();
-        refresh_committed_base(&conn, &archive).unwrap();
+        refresh_committed_base(&conn, None, &archive).unwrap();
         assert!(OverlayMeta::from_connection(&conn).unwrap().is_none());
         conn.execute_batch(META_SCHEMA).unwrap();
         OverlayMeta::set(&conn, "format_version", "1").unwrap();
-        refresh_committed_base(&conn, &archive).unwrap();
+        refresh_committed_base(&conn, None, &archive).unwrap();
         let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
         assert_eq!(meta.values().len(), 1);
         assert!(meta.legacy());
