@@ -829,7 +829,7 @@ fn reap(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
 }
 
 /// How long a graceful unmount keeps retrying a busy mount (desktop watchers such as
-/// gvfsd-trash probe each new mount). Separate from the per-attempt `UNMOUNT_DEADLINE`.
+/// gvfsd-trash and gvfs-udisks2-volume-monitor probe each new mount). Separate from the per-attempt `UNMOUNT_DEADLINE`.
 const BUSY_RETRY: Duration = Duration::from_secs(1);
 
 /// EBUSY from fusermount: stderr ends with the strerror (`failed to unmount <path>: <strerror>`),

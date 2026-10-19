@@ -73,10 +73,17 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[command(group(clap::ArgGroup::new("overlay_target").args(["write_overlay", "overlay_tmpfs", "sandbox"]).multiple(true)))]
 struct Args {
     /// Unmount the given mountpoint(s)
+    ///
+    /// On Linux this runs `fusermount3 -u` and retries about 1 s while the mount is busy
+    /// (desktop watchers such as gvfsd-trash probe a new mount).
     #[arg(short = 'u', long = "unmount", action = ArgAction::SetTrue)]
     unmount: bool,
 
     /// Stay in foreground (default: daemonize after mount is ready)
+    ///
+    /// SIGINT (Ctrl-C) unmounts with the same ~1 s retry and never detaches lazily; send it
+    /// again to retry. SIGTERM retries for about 1 s, then detaches lazily (`fusermount3 -u -z`)
+    /// and the process exits once open files close. macOS has no lazy detach.
     #[arg(short = 'f', long = "foreground", action = ArgAction::SetTrue)]
     foreground: bool,
 

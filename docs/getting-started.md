@@ -182,6 +182,17 @@ For mounts that other users or containers must see, enable `user_allow_other`
 in `/etc/fuse.conf` and mount with `-o allow_other`. `-o uid=,gid=,umask=`
 present the tree with different ownership without changing the archive.
 
+## Stopping a mount
+
+`ratarmount -u mnt/` retries `fusermount3 -u` for about a second while the mount
+is busy; desktop watchers (gvfsd-trash, gvfs-udisks2-volume-monitor) probe every
+new mount and briefly hold it. A foreground or daemonized FUSE mount also
+unmounts on a signal. SIGINT (Ctrl-C) retries the same way and never detaches
+lazily; if the mount is still busy it warns and keeps serving, and pressing it
+again retries. SIGTERM retries for about a second, then detaches lazily
+(`fusermount3 -u -z`) and the process exits once open files close; with a file
+held open that takes the full retry window. macOS has no lazy unmount.
+
 ## When something looks wrong
 
 ```bash

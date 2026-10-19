@@ -1,5 +1,5 @@
-//! A briefly busy FUSE mount (desktop watchers such as gvfsd-trash probing a new
-//! mount) must not turn a one-shot EBUSY into a failed unmount.
+//! A briefly busy FUSE mount (desktop watchers such as gvfsd-trash and
+//! gvfs-udisks2-volume-monitor probing a new mount) must not turn a one-shot EBUSY into a failed unmount.
 //!
 //! Each test holds a file open inside the mount, triggers an unmount, waits
 //! until the first unmount attempt has hit EBUSY, releases the file 200 ms later
