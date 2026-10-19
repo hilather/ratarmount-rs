@@ -3698,21 +3698,25 @@ fn unmount_linux_with(
                 mp.display()
             )));
         }
-        note(&format!(
-            "fusermount3 -u {}: busy (attempt {attempts}), retrying",
-            mp.display()
-        ));
         if start.elapsed() + retry.interval > retry.deadline {
+            let why = if attempts == 1 {
+                "busy".to_string()
+            } else {
+                format!(
+                    "still busy after {attempts} attempts over ~{}ms",
+                    start.elapsed().as_millis()
+                )
+            };
             return Err(std::io::Error::new(
                 ErrorKind::ResourceBusy,
-                format!(
-                    "fusermount failed for {}: {detail} (still busy after {attempts} attempts \
-                     over ~{}ms)",
-                    mp.display(),
-                    start.elapsed().as_millis()
-                ),
+                format!("fusermount failed for {}: {detail} ({why})", mp.display()),
             ));
         }
+        note(&format!(
+            "fusermount3 {} {}: busy (attempt {attempts}), retrying",
+            flags.join(" "),
+            mp.display()
+        ));
         std::thread::sleep(retry.interval);
     }
 }
