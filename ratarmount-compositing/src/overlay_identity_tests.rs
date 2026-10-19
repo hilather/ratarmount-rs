@@ -1445,3 +1445,68 @@ fn regression_raw_dir_commit_refuses_foreign_journal() {
     assert!(done.committed);
     assert!(!ratarmount_compress::commit_journal::journal_path(&fx.archive).exists());
 }
+
+/// Regression (R6-J7, audit C9): a FORCED reopen over an edited copy at another
+/// local place overrides that open only ("the recorded digest stays"), but the
+/// accepted-move writer then re-measured the stamp (archive) or weak manifest
+/// (directory) FROM THE EDITED COPY, silently re-pointing the baseline, so a
+/// later unforced open or gate accepted the edit. The record is left as it was:
+/// the next unforced reopen over the copy is still refused.
+#[test]
+fn regression_forced_reopen_at_other_place_does_not_rebaseline() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let keys = [
+        "base_location",
+        "base_size",
+        "base_mtime_ns",
+        "base_local_path",
+        "base_weak_digest",
+        "base_digest",
+    ];
+    // Archive, strong.
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let before = read_rows(&fx.overlay, &keys);
+    let copy = fx.archive.with_file_name("copy.tar");
+    write_tar(&copy, &[("other", b"a different base"), ("more", b"x")]);
+    let edited = archive_token(&copy);
+    drop(open_with(&edited, &fx.overlay, BaseDigestRequest::Compute, true).unwrap());
+    assert_eq!(read_rows(&fx.overlay, &keys), before, "archive: re-pointed");
+    assert!(
+        open_with(&edited, &fx.overlay, BaseDigestRequest::Compute, false).is_err(),
+        "archive: the edited copy was accepted after one forced open"
+    );
+    // Directory, weak.
+    let fx = Fixture::new();
+    let dir = fx.overlay.parent().unwrap().join("basedir");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("f"), b"base").unwrap();
+    drop(
+        open_with(
+            &folder_token(&dir),
+            &fx.overlay,
+            BaseDigestRequest::Compute,
+            false,
+        )
+        .unwrap(),
+    );
+    let before = read_rows(&fx.overlay, &keys);
+    assert!(before[4].is_some(), "a directory record has a weak digest");
+    let copy = fx.overlay.parent().unwrap().join("copydir");
+    fs::create_dir(&copy).unwrap();
+    fs::write(copy.join("f"), b"edited").unwrap();
+    let edited = folder_token(&copy);
+    drop(open_with(&edited, &fx.overlay, BaseDigestRequest::Compute, true).unwrap());
+    assert_eq!(
+        read_rows(&fx.overlay, &keys),
+        before,
+        "directory: re-pointed"
+    );
+    assert!(
+        open_with(&edited, &fx.overlay, BaseDigestRequest::Compute, false).is_err(),
+        "directory: the edited copy was accepted after one forced open"
+    );
+}

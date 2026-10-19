@@ -1036,7 +1036,7 @@ pub(crate) fn initialize(
             }
             if !meta.legacy() {
                 if let Some(info) = info {
-                    verify(conn, &meta, info, plan)?;
+                    let _ = verify(conn, &meta, info, plan)?;
                 }
             }
             return Ok(());
@@ -1642,6 +1642,7 @@ fn reopen_classified(
         }
         Verdict::Same | Verdict::Confirmed(_) => {}
         Verdict::Content => {
+            let mut overridden = false;
             // Same kind at the same place with a changed content: a forced
             // run overrides this open only (`base_mismatch_forced_at`); the
             // recorded digest stays, so a later offline verb still refuses.
@@ -1656,8 +1657,14 @@ fn reopen_classified(
                     && crate::overlay_gate::compare_base_identity(Some(meta), base, &probe)
                         .is_ok_and(|cmp| cmp.mismatch.is_none());
                 if !confirmed {
-                    verify(conn, meta, info, plan)?;
+                    overridden = verify(conn, meta, info, plan)?;
                 }
+            }
+            if overridden {
+                // A forced open over content that differs from the record
+                // overrides this open only: the stamp / manifest stay, so the
+                // next unforced open or gate still compares the recorded base.
+                return Ok(());
             }
         }
     }
@@ -1687,14 +1694,18 @@ pub(crate) fn apply_comparison_rows(
     )
 }
 
+/// Compare the base with the record by stamp, manifest, tree or digest.
+/// `Ok(true)` when a mismatch was overridden by `--force-base-mismatch` (the
+/// record is then left as it was: the open is forced, the baseline is not
+/// moved to a base nothing confirmed).
 fn verify(
     conn: &Connection,
     meta: &OverlayMeta,
     info: &OverlayCreateInfo,
     plan: Option<&ExcludePlan>,
-) -> Result<()> {
+) -> Result<bool> {
     if meta.base_digest_kind() == Some("none") {
-        return Ok(());
+        return Ok(false);
     }
     let old = match meta.base_digest_kind() {
         Some("pending") => "pending",
@@ -1750,10 +1761,11 @@ fn verify(
             return Err(OverlayError::Msg(format!("base mismatch: recorded digest {old}; current digest {current}; use --force-base-mismatch to override")));
         }
         OverlayMeta::set(conn, "base_mismatch_forced_at", &timestamp())?;
+        return Ok(true);
     } else if !to_append.is_empty() {
         append_base_excludes(conn, &to_append)?;
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
