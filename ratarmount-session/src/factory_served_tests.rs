@@ -404,3 +404,47 @@ fn regression_served_kind_table_fetched_and_torrent() {
         assert_eq!(served.location, Some(expected), "{input}");
     }
 }
+
+/// Regression (R6-H5, B5): the offline `--commit-overlay` classifier took its
+/// kind from `stat` alone, so a bare repository was a Folder although the
+/// factory serves Git. `served_without_indexing` sniffs what the factory would
+/// serve: a bare repository is Git (with its tree id), a file is an Archive, a
+/// directory a Folder, and nothing is created beside any of them (no index,
+/// sidecar or journal).
+#[test]
+fn regression_served_without_indexing_sniffs_git_and_builds_no_index() {
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = walkdir_names(dir);
+        names.sort();
+        names
+    }
+    fn walkdir_names(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            out.push(entry.path().to_string_lossy().into_owned());
+            if entry.file_type().unwrap().is_dir() {
+                out.extend(walkdir_names(&entry.path()));
+            }
+        }
+        out
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bare = dir.path().join("repo.git");
+    let (tree, _) = commit_repo(&bare, true);
+    let archive = dir.path().join("a.tar");
+    tar(&archive);
+    let folder = dir.path().join("plain");
+    std::fs::create_dir(&folder).unwrap();
+    let before = listing(dir.path());
+
+    let served = served_without_indexing(&bare, &[]).unwrap();
+    assert_eq!(served.kind, ServedKind::Git { tree }, "bare repo is Git");
+    assert!(matches!(served.index, IndexProvenance::None));
+    let served = served_without_indexing(&archive, &[]).unwrap();
+    assert_eq!(served.kind, ServedKind::Archive);
+    assert!(matches!(served.index, IndexProvenance::None));
+    let served = served_without_indexing(&folder, &[]).unwrap();
+    assert_eq!(served.kind, ServedKind::Folder);
+    assert_eq!(listing(dir.path()), before, "something was created");
+}

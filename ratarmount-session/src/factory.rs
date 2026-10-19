@@ -4096,6 +4096,29 @@ fn open_tar_body(
         .map_err(|e| e.to_string())
 }
 
+/// The Git kind the factory serves for a directory without any flag: a bare
+/// repository (or any repository under `RATARMOUNT_FORCE_GIT`), with the tree
+/// id of `HEAD`. Reads the repository's refs and one tree object; no index.
+#[cfg(feature = "git")]
+fn git_served_kind(path: &Path) -> Result<Option<ServedKind>, String> {
+    let is_bare = path.join("HEAD").is_file()
+        && path.join("objects").is_dir()
+        && path.join("refs").is_dir()
+        && !path.join(".git").exists();
+    if !(is_bare || (looks_like_git(path) && std::env::var_os("RATARMOUNT_FORCE_GIT").is_some())) {
+        return Ok(None);
+    }
+    let git = GitMountSource::open(path, None).map_err(|e| e.to_string())?;
+    Ok(Some(ServedKind::Git {
+        tree: git.tree_id(),
+    }))
+}
+
+#[cfg(not(feature = "git"))]
+fn git_served_kind(_path: &Path) -> Result<Option<ServedKind>, String> {
+    Ok(None)
+}
+
 /// What the first factory-opened source served: the kind and location the
 /// base-identity token records. `None` location only for a declared source
 /// with no location (a corpus).
@@ -4110,8 +4133,9 @@ pub struct Served {
     pub fetched: bool,
 }
 
-/// What the factory would serve for a local `path`, decided WITHOUT opening it:
-/// no index is built or loaded, no commit journal is recovered, nothing is
+/// written. A file is an archive, a bare Git repository is Git, any other
+/// directory a folder; anything else (a remote URL, a Git reference, a
+/// missing path) is not answered here.
 /// written. A file is an archive, a directory a folder; anything else (a
 /// remote URL, a Git reference, a missing path) is not answered here.
 ///
@@ -4122,7 +4146,7 @@ pub struct Served {
 pub fn served_without_indexing(path: &Path, index_folders: &[PathBuf]) -> Result<Served, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let kind = if meta.is_dir() {
-        ServedKind::Folder
+        git_served_kind(path)?.unwrap_or(ServedKind::Folder)
     } else if meta.is_file() {
         ServedKind::Archive
     } else {
