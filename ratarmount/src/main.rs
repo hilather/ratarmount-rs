@@ -1947,7 +1947,7 @@ fn main() {
         // splice. A raw directory of files has no identity to check; it
         // commits through its own entry and says so.
         let result = if overlay.join(HIDDEN_DB).exists() {
-            base_identity::classify_offline(
+            base_identity::classify_offline_reusing_sidecar(
                 archive,
                 base_identity::GitIntent::Replay(None),
                 &overlay_run_context(args.index_folders.as_deref()),

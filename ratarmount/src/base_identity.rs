@@ -127,15 +127,41 @@ pub fn classify_offline(
     git: GitIntent,
     context: &OverlayRunContext,
 ) -> Result<ClassifiedBase, String> {
+    classify_offline_with(base, git, context, false)
+}
+
+/// [`classify_offline`] for a verb that must not pay for a full index build of
+/// a large archive (`--commit-overlay`): an existing sidecar is loaded
+/// read-only (never written, never replaced); with none, the index stays in
+/// memory as before.
+pub fn classify_offline_reusing_sidecar(
+    base: &Path,
+    git: GitIntent,
+    context: &OverlayRunContext,
+) -> Result<ClassifiedBase, String> {
+    classify_offline_with(base, git, context, true)
+}
+
+fn classify_offline_with(
+    base: &Path,
+    git: GitIntent,
+    context: &OverlayRunContext,
+    reuse_sidecar: bool,
+) -> Result<ClassifiedBase, String> {
     let git_tree = match git {
         GitIntent::Auto => base.join(".git").exists(),
         GitIntent::Replay(kind) => {
             kind == Some(BaseKind::Git) && ratarmount_formats_git::looks_like_git(base)
         }
     };
+    let sidecar = reuse_sidecar
+        && ratarmount_index::possible_index_paths(base, &context.index_folders)
+            .iter()
+            .any(|p| p.is_file());
     let mut options = OpenOptions {
         write_index: false,
-        index_in_memory: true,
+        index_in_memory: !sidecar,
+        read_only_index: sidecar,
         index_folders: context.index_folders.clone(),
         git: git_tree,
         ..Default::default()
@@ -362,5 +388,60 @@ mod tests {
         );
         // No sidecar was created next to the archive, either.
         assert!(!root.join("a.tar.index.sqlite").exists());
+    }
+
+    /// Regression (R6 review, Guardrail 2): offline `--commit-overlay`
+    /// classified the archive with a forced in-memory index, so a multi-GB
+    /// `.tar.zst` with a valid sidecar was fully re-indexed before the splice.
+    /// The commit's classifier loads the existing sidecar (read-only) instead;
+    /// every other offline verb keeps the in-memory open.
+    #[test]
+    fn regression_offline_commit_classification_loads_existing_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let archive = root.join("a.tar");
+        let members = [ratarmount_formats_tar::UstarMember {
+            path: "f",
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            xattrs: &[],
+        }];
+        let mut file = std::fs::File::create(&archive).unwrap();
+        ratarmount_formats_tar::write_ustar_members(&mut file, &members).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut file).unwrap();
+        drop(file);
+        let sidecar = root.join("a.tar.index.sqlite");
+        let opts = ratarmount_core::OpenOptions::default();
+        drop(
+            ratarmount_formats_tar::SqliteIndexedTar::create_index(
+                &archive,
+                &archive,
+                Some(&sidecar),
+                &opts,
+                "test",
+                &mut None,
+            )
+            .unwrap(),
+        );
+        // Mark the sidecar: a rescan of the archive can never produce "ghost".
+        rusqlite::Connection::open(&sidecar)
+            .unwrap()
+            .execute("UPDATE files SET name='ghost' WHERE name='f'", [])
+            .unwrap();
+        let before = std::fs::read(&sidecar).unwrap();
+        let context = OverlayRunContext::default();
+        let reused =
+            classify_offline_reusing_sidecar(&archive, GitIntent::Replay(None), &context).unwrap();
+        assert!(
+            reused.source().lookup("/ghost", 0).is_some(),
+            "the existing sidecar must be loaded, not rebuilt in memory"
+        );
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before, "never written");
+        let fresh = classify_offline(&archive, GitIntent::Replay(None), &context).unwrap();
+        assert!(fresh.source().lookup("/ghost", 0).is_none());
+        assert!(fresh.source().lookup("/f", 0).is_some());
     }
 }
