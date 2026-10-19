@@ -272,7 +272,7 @@ pub fn pack(
         ..Default::default()
     };
     let changes = overlay_changes::change_set(directory, lower_view, &opts)?;
-    if options.base_rows.is_some() && overlay_changes::canonical_hash(&changes, &opts)? != digest {
+    if overlay_changes::canonical_hash(&changes, &opts)? != digest {
         // The sealed digest covers the change set on the base the layer was
         // sealed on. Replacing only the base rows would make a bundle whose
         // unpack / verify fails against the base it names; recomputing the

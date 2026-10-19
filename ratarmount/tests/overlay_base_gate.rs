@@ -1023,15 +1023,39 @@ fn regression_forced_seal_git_to_dir_and_archive_to_git_clear_stale_rows() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
 }
 
-/// Regression (R6-G1, reverts R6-F4): an ACCEPTED `none` pack against another
-/// archive rewrote the bundle's base rows and dropped `base_git_tree` and
-/// `base_weak_digest`, so a layer that MODIFIED `/x.txt` of A became an ADDED
-/// `/x.txt` over B (which has none) while the old seal survived, and the
-/// bundle failed unpack / verify. An accepted pack leaves the rows untouched.
-#[test]
-fn regression_accepted_pack_leaves_rows_and_change_set_untouched() {
-    let env = Env::new();
-    let (base, _) = fixture(&env, Kind::Archive, false);
+/// A tar of the given members, built the same way for every caller.
+fn tar_with_members(env: &Env, name: &str, files: &[(&str, &[u8])]) -> PathBuf {
+    let dir = env.path(&format!("{name}.dir"));
+    fs::create_dir(&dir).unwrap();
+    let mut args = vec!["cf".to_owned(), s(&env.path(name)).to_owned()];
+    args.extend(["-C".to_owned(), s(&dir).to_owned()]);
+    for (file, bytes) in files {
+        fs::write(dir.join(file), bytes).unwrap();
+        args.push((*file).to_owned());
+    }
+    assert!(Command::new("tar").args(&args).status().unwrap().success());
+    env.path(name)
+}
+
+/// The member listing of a bundle's `manifest.jsonl`, whole.
+fn bundle_manifest(bundle: &Path) -> String {
+    use std::io::Read;
+    let decoder = zstd::stream::read::Decoder::new(fs::File::open(bundle).unwrap()).unwrap();
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap().ends_with("manifest.jsonl") {
+            let mut text = String::new();
+            entry.read_to_string(&mut text).unwrap();
+            return text;
+        }
+    }
+    panic!("no manifest.jsonl in {bundle:?}");
+}
+
+/// A sealed `none` overlay over `base.tar` whose layer modifies `x.txt`.
+fn sealed_none_overlay(env: &Env) -> (PathBuf, PathBuf) {
+    let (base, _) = fixture(env, Kind::Archive, false);
     fs::remove_dir_all(env.path("overlay")).unwrap();
     let overlay = env.path("overlay");
     env.ok(&[
@@ -1046,37 +1070,122 @@ fn regression_accepted_pack_leaves_rows_and_change_set_untouched() {
     ]);
     fs::write(overlay.join("x.txt"), b"new\n").unwrap();
     env.ok(&["overlay", "seal", s(&overlay)]);
+    (base, overlay)
+}
+
+/// Regression (R6-H4, B4; supersedes R6-G1's accepted `none` pack): a `none`
+/// pack against another archive was ACCEPTED without any content confirmation
+/// and exported `manifest.jsonl` measured against that archive (`/x.txt` Added)
+/// next to A's seal (Modified) and A's rows. It is refused without
+/// `--force-base-mismatch`, names the flag and writes no bundle. A forced pack
+/// re-checks the seal against the base it is given: a byte-identical copy
+/// packs and its manifest agrees; an archive that makes the layer an add is
+/// refused even forced, because it is not the base the layer was sealed on.
+#[test]
+fn regression_none_pack_against_other_archive_needs_force_and_agrees() {
+    let env = Env::new();
+    let (base, overlay) = sealed_none_overlay(&env);
     let recorded = meta_of(&overlay);
-    // B has no x.txt, so the layer would be an add over it.
-    let other_dir = env.path("otherdir");
-    fs::create_dir(&other_dir).unwrap();
-    fs::write(other_dir.join("z.txt"), b"z\n").unwrap();
-    let other = env.path("other.tar");
-    assert!(Command::new("tar")
-        .args(["cf", s(&other), "-C", s(&other_dir), "z.txt"])
-        .status()
-        .unwrap()
-        .success());
+    let bundle = env.path("bundle.tar.zst");
+    // B has no x.txt: the layer would be an add over it.
+    let other = tar_with_members(&env, "other.tar", &[("z.txt", b"z\n")]);
     let out = verb(&env, Verb::Pack, &overlay, &other, &[]);
+    refused(&out);
+    assert!(!bundle.exists(), "wrote a bundle");
+    let out = verb(
+        &env,
+        Verb::Pack,
+        &overlay,
+        &other,
+        &["--force-base-mismatch"],
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        !bundle.exists(),
+        "wrote a bundle for a different change set"
+    );
+    // A byte-identical copy at another path: refused unforced (nothing
+    // confirms it), packs forced, and the manifest agrees with the seal.
+    let copy = env.path("copy.tar");
+    fs::copy(&base, &copy).unwrap();
+    let out = verb(&env, Verb::Pack, &overlay, &copy, &[]);
+    refused(&out);
+    assert!(!bundle.exists(), "wrote a bundle");
+    let out = verb(
+        &env,
+        Verb::Pack,
+        &overlay,
+        &copy,
+        &["--force-base-mismatch"],
+    );
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let manifest = bundle_manifest(&bundle);
+    assert!(
+        manifest.contains("x.txt") && !manifest.contains("\"added\""),
+        "{manifest}"
+    );
     let restored = env.path("restored");
+    env.ok(&["overlay", "unpack", s(&bundle), s(&restored)]);
+    env.ok(&["overlay", "verify", s(&restored), s(&copy)]);
+    // The sealed source layer keeps its own record.
+    assert_eq!(
+        meta_of(&overlay).get("base_location"),
+        recorded.get("base_location")
+    );
+}
+
+/// Regression (R6-H4, B4 carve-out): a copy confirmed by the recorded STRONG
+/// digest (supplied) packs without force, keeps the recorded rows, and its
+/// manifest agrees with the seal.
+#[test]
+fn regression_strong_confirmed_copy_packs_and_manifest_agrees() {
+    let env = Env::new();
+    let (base, _) = fixture(&env, Kind::Archive, false);
+    fs::remove_dir_all(env.path("overlay")).unwrap();
+    let digest = env
+        .ok(&["overlay", "digest-base", s(&base)])
+        .trim()
+        .to_owned();
+    let overlay = env.path("overlay");
     env.ok(&[
-        "overlay",
-        "unpack",
-        s(&env.path("bundle.tar.zst")),
-        s(&restored),
+        "--no-mount",
+        "--index-file",
+        ":memory:",
+        "-w",
+        s(&overlay),
+        "--base-digest",
+        &digest,
+        s(&base),
     ]);
+    fs::write(overlay.join("x.txt"), b"new\n").unwrap();
+    env.ok(&["overlay", "seal", s(&overlay)]);
+    let recorded = meta_of(&overlay);
+    let copy = env.path("copy.tar");
+    fs::copy(&base, &copy).unwrap();
+    // Without the digest nothing confirms the copy.
+    let out = verb(&env, Verb::Pack, &overlay, &copy, &[]);
+    refused(&out);
+    let out = verb(
+        &env,
+        Verb::Pack,
+        &overlay,
+        &copy,
+        &["--base-digest", &digest],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let bundle = env.path("bundle.tar.zst");
+    let manifest = bundle_manifest(&bundle);
+    assert!(
+        manifest.contains("x.txt") && !manifest.contains("\"added\""),
+        "{manifest}"
+    );
+    let restored = env.path("restored");
+    env.ok(&["overlay", "unpack", s(&bundle), s(&restored)]);
     let meta = meta_of(&restored);
-    for key in [
-        "base_url",
-        "base_location",
-        "base_git_tree",
-        "base_weak_digest",
-    ] {
+    for key in ["base_location", "base_digest", "base_size", "base_mtime_ns"] {
         assert_eq!(meta.get(key), recorded.get(key), "{key}");
     }
-    // The layer still modifies A's x.txt: verify against A passes.
-    env.ok(&["overlay", "verify", s(&restored), s(&base)]);
+    env.ok(&["overlay", "verify", s(&restored), s(&copy)]);
 }
 
 /// A repository whose branches `main` and `stable` both point at one commit.
@@ -1160,20 +1269,17 @@ fn regression_repo_stable_over_main_updates_base_url_in_seal_and_forced_pack() {
     assert_eq!(meta_of(&overlay).base_url(), Some(stable.as_str()));
 }
 
-/// Regression (R6-G1, directory copy case): packing a sealed WEAK directory
-/// overlay against a byte-identical copy of the base (another path, same
-/// manifest) is accepted; the accepted relocation rewrote `base_url` and
-/// dropped `base_weak_digest`, so later `diff` / `--lower` gates stopped
-/// comparing that copy. The bundle keeps every recorded comparison row.
+/// Regression (R6-G1, directory copy case; R6-H4 decision): packing a sealed
+/// WEAK directory overlay against a copy of the base at another path matched
+/// only the weak manifest. That is no content confirmation, so the pack is
+/// refused without `--force-base-mismatch` (it used to be accepted and then
+/// rewrote the rows and dropped `base_weak_digest`). Forced, the manifest is
+/// re-checked against the seal and agrees for an identical copy.
 #[test]
 fn regression_accepted_pack_against_directory_copy_keeps_weak_digest() {
     let env = Env::new();
     let (base, overlay) = fixture(&env, Kind::Dir, true);
     let recorded = meta_of(&overlay);
-    let weak = recorded
-        .get("base_weak_digest")
-        .expect("weak digest")
-        .to_owned();
     let copy = env.path("copy");
     assert!(Command::new("cp")
         .args(["-a", s(&base), s(&copy)])
@@ -1181,17 +1287,19 @@ fn regression_accepted_pack_against_directory_copy_keeps_weak_digest() {
         .unwrap()
         .success());
     let out = verb(&env, Verb::Pack, &overlay, &copy, &[]);
+    refused(&out);
+    assert!(!env.path("bundle.tar.zst").exists(), "wrote a bundle");
+    let out = verb(
+        &env,
+        Verb::Pack,
+        &overlay,
+        &copy,
+        &["--force-base-mismatch"],
+    );
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    let restored = env.path("restored");
-    env.ok(&[
-        "overlay",
-        "unpack",
-        s(&env.path("bundle.tar.zst")),
-        s(&restored),
-    ]);
-    let meta = meta_of(&restored);
-    assert_eq!(meta.get("base_weak_digest"), Some(weak.as_str()));
-    for key in ["base_url", "base_location", "base_kind"] {
-        assert_eq!(meta.get(key), recorded.get(key), "{key}");
+    // The sealed source layer keeps its own record.
+    let after = meta_of(&overlay);
+    for key in ["base_weak_digest", "base_url", "base_location", "base_kind"] {
+        assert_eq!(after.get(key), recorded.get(key), "{key}");
     }
 }

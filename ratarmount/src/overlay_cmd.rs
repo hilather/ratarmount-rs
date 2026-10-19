@@ -384,6 +384,10 @@ pub(super) struct GateOutcome {
     /// digest confirmed the base. False for a base with nothing cheap to
     /// compare (remote): the recorded identity is then unconfirmed.
     pub confirmed: bool,
+    /// The base is at another place than the one the overlay recorded and
+    /// nothing confirmed its content with a strong digest (the recorded one,
+    /// supplied or cached): accepted only because the record cannot tell.
+    pub unconfirmed_move: bool,
 }
 
 /// Compare the classified base with the identity the overlay recorded, with
@@ -412,10 +416,22 @@ pub(super) fn gate_base(
                 m.base_digest_kind() == Some("strong")
                     && identity.base_digest.as_deref() == m.base_digest()
             });
+        let moved = meta.is_some_and(|m| {
+            ratarmount_compositing::overlay_gate::identity_rows(Some(m), base)
+                .and_then(|rows| rows.get("base_location").cloned())
+                .zip(m.get("base_location"))
+                .is_some_and(|(now, then)| now != then)
+        });
+        let strong = meta.is_some_and(|m| {
+            m.base_digest_kind() == Some("strong")
+                && (identity.base_digest.as_deref() == m.base_digest()
+                    || comparison.cached_digest.as_deref() == m.base_digest())
+        });
         return Ok(Some(GateOutcome {
             recorded,
             forced: None,
             confirmed,
+            unconfirmed_move: moved && !strong,
         }));
     };
     let meta = meta.expect("a mismatch is measured against recorded metadata");
@@ -440,6 +456,7 @@ pub(super) fn gate_base(
         recorded,
         forced: Some(forced),
         confirmed: false,
+        unconfirmed_move: false,
     }))
 }
 
@@ -450,8 +467,22 @@ pub fn pack(args: &PackArgs, context: &OverlayRunContext) -> Result<(String, i32
     }
     let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
     let base = classify_base(args.base.as_ref(), meta.as_ref(), None, context)?;
-    let forced = gate_base(&args.directory, meta.as_ref(), &base, &args.identity)?
-        .and_then(|outcome| outcome.forced);
+    let outcome = gate_base(&args.directory, meta.as_ref(), &base, &args.identity)?;
+    // The bundle carries the sealed record. A base at another place whose
+    // content nothing confirmed would be measured for the manifest but never
+    // be the base the seal describes: refuse it unless forced.
+    if outcome
+        .as_ref()
+        .is_some_and(|o| o.unconfirmed_move && o.forced.is_none())
+        && !args.identity.force_base_mismatch
+    {
+        return Err(format!(
+            "base mismatch: {} is not the place overlay {} recorded and nothing confirms its content (pass the recorded strong digest with --base-digest, or use --force-base-mismatch to pack against the base as it is now)",
+            base.actual().base_url(),
+            args.directory.display()
+        ));
+    }
+    let forced = outcome.and_then(|outcome| outcome.forced);
     let lower = lower_view(&base, &args.lower, meta.as_ref())?;
     let options = super::overlay_pack::PackOptions {
         include_journal: args.include_journal.clone(),
