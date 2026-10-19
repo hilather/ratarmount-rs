@@ -38,6 +38,7 @@ mod corpus;
 mod diff;
 mod export_index;
 mod find;
+mod mount_guard;
 mod overlay_commit;
 mod overlay_stats;
 mod publish_index;
@@ -494,7 +495,8 @@ struct Args {
     #[arg(long = "oss-attributions", action = ArgAction::SetTrue)]
     oss_attributions: bool,
 
-    /// Write overlay folder (`:temp:` for a temporary directory).
+    /// Write overlay folder (`:temp:` for a temporary directory). The mountpoint may not
+    /// be, lie inside, or contain it (refused, exit 2).
     /// A missing uncompressed `.tar` or `.tar.zst` is created as an empty archive.
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
@@ -634,7 +636,9 @@ struct Args {
     #[arg(long = "print-features", action = ArgAction::SetTrue)]
     print_features: bool,
 
-    /// Input archives/folders/URLs and optional mountpoint
+    /// Input archives/folders/URLs and optional mountpoint. A mountpoint may not be, lie
+    /// inside, or contain a folder being mounted (refused, exit 2); a folder defaults to
+    /// `<folder>.mounted`.
     #[arg(required = false)]
     paths: Vec<PathBuf>,
 
@@ -1408,6 +1412,22 @@ fn main() {
         }
     }
 
+    // Refuse a mount point equal to, inside, or aliasing a folder the daemon reads by
+    // path (the single-threaded daemon deadlocks on its own mount point). Early check:
+    // creates nothing, before any fork. See `mount_guard`.
+    let guard = if mount_guard::skip_guard(&args, mountpoint.as_deref(), publishing) {
+        None
+    } else {
+        let fs = mount_guard::RealFs::new();
+        match mount_guard::plan_mount_point(&fs, &args, mountpoint.clone(), &inputs) {
+            Ok(plan) => Some((fs, plan)),
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                std::process::exit(2);
+            }
+        }
+    };
+
     {
         for input in &inputs {
             if !ratarmount_remote::is_remote_url(&input.to_string_lossy()) {
@@ -1600,6 +1620,15 @@ fn main() {
         match overlay_commit::open_rolling_series(&inputs[0], policy.clone(), &open_opts) {
             Ok(series) => {
                 inputs[0] = series.active_path();
+                if let Some((_, plan)) = &guard {
+                    if let Some(derived) = &plan.derived_rolling_input {
+                        if let Some(msg) =
+                            mount_guard::rolling_derivation_notice(derived, &inputs[0], &plan.mp)
+                        {
+                            eprintln!("warning: {msg}");
+                        }
+                    }
+                }
                 Some(series)
             }
             Err(e) => {
@@ -1681,6 +1710,30 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Decisive check: inputs are opened (index folders exist), the `-w` directory is
+    // created here exactly as `WriteOverlay::new` did, and nothing has forked, no
+    // overlay database, marker or inspection socket exists and nothing is published.
+    // Only guard-active runs (a FUSE mount point is coming) take this path; export-only,
+    // `--no-mount`, `find` and publish-only keep HEAD's order.
+    let mut prepared_overlay_path: Option<PathBuf> = None;
+    if let Some((fs, plan)) = &guard {
+        if let Some(w) = &args.write_overlay {
+            let p = overlay_dir_for(&args, w);
+            // The `-w` directory is created before the check so the resolver sees the
+            // real directory; no database, marker or socket exists yet.
+            if let Err(e) = mount_guard::prepare_overlay_dir(&p) {
+                eprintln!("{}", overlay_open_error(&p, &OverlayError::Io(e)));
+                std::process::exit(1);
+            }
+            prepared_overlay_path = Some(p);
+        }
+        if let Err(msg) = mount_guard::decisive_check(fs, plan, prepared_overlay_path.as_deref()) {
+            eprintln!("error: {msg}");
+            // A `:temp:` overlay directory is removed by the atexit handler.
+            std::process::exit(2);
+        }
+    }
 
     // Content-hash xattrs foundation: after a successful mount build, for each
     // path-backed local archive with an on-disk index, open the index writable and
@@ -1786,22 +1839,9 @@ fn main() {
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
     if let Some(w) = &args.write_overlay {
-        let overlay_path = if w.as_os_str() == ":temp:" {
-            let td = if args.overlay_tmpfs.is_some() {
-                create_tmpfs_overlay()
-            } else {
-                tempfile::TempDir::with_prefix("ratarmount-write-overlay.")
-            }
-            .unwrap_or_else(|error| {
-                eprintln!("error creating temporary overlay: {error}");
-                std::process::exit(1)
-            });
-            let p = td.path().to_path_buf();
-            eprintln!("Created temporary overlay directory: {}", p.display());
-            register_temp_overlay(td);
-            p
-        } else {
-            w.clone()
+        let overlay_path = match prepared_overlay_path.take() {
+            Some(p) => p,
+            None => overlay_dir_for(&args, w),
         };
         match WriteOverlay::new(Arc::clone(&bundle.source), &overlay_path) {
             Ok(mut ov) => {
@@ -1995,21 +2035,15 @@ fn main() {
     }
 
     // Export-only (NFS/HTTP/…): do not invent a FUSE mountpoint / stem directory.
-    let fuse_mp = if any_export(&args) && mountpoint.is_none() {
-        None
-    } else {
-        Some(match mountpoint {
-            Some(mp) => mp,
-            None => {
-                let mp = default_mountpoint(&inputs[0]);
-                std::fs::create_dir_all(&mp).ok();
-                mp
-            }
-        })
+    let fuse_mp = match &guard {
+        // Export-only without a mount point, as on HEAD.
+        None => None,
+        Some((_, plan)) => {
+            // First durable creation of the accepted mount point.
+            std::fs::create_dir_all(&plan.mp).ok();
+            Some(plan.mp.clone())
+        }
     };
-    if let Some(mp) = &fuse_mp {
-        std::fs::create_dir_all(mp).ok();
-    }
     if args.sftp_subsystem && fuse_mp.is_some() && !args.foreground {
         eprintln!(
             "warning: --sftp-subsystem with a FUSE mountpoint daemonizes and redirects stdin; \
@@ -2214,6 +2248,28 @@ fn main() {
         open_opts,
         control,
     );
+}
+
+/// The overlay directory for `-w`: the path itself, or a fresh temporary directory
+/// (disk-backed or tmpfs) for `:temp:`.
+fn overlay_dir_for(args: &Args, w: &Path) -> PathBuf {
+    if w.as_os_str() == ":temp:" {
+        let td = if args.overlay_tmpfs.is_some() {
+            create_tmpfs_overlay()
+        } else {
+            tempfile::TempDir::with_prefix("ratarmount-write-overlay.")
+        }
+        .unwrap_or_else(|error| {
+            eprintln!("error creating temporary overlay: {error}");
+            std::process::exit(1)
+        });
+        let p = td.path().to_path_buf();
+        eprintln!("Created temporary overlay directory: {}", p.display());
+        register_temp_overlay(td);
+        p
+    } else {
+        w.to_path_buf()
+    }
 }
 
 fn any_export(args: &Args) -> bool {
@@ -3982,21 +4038,27 @@ fn split_inputs_mountpoint(paths: &[PathBuf], no_mount: bool) -> (Vec<PathBuf>, 
     (paths[..paths.len() - 1].to_vec(), Some(last.clone()))
 }
 
+/// Default mount point stem for a string `url::Url` can parse (never touches the filesystem).
+fn default_mountpoint_url(s: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(s).ok()?;
+    if let Some(seg) = url.path_segments().and_then(|mut p| p.next_back()) {
+        if !seg.is_empty() {
+            let stripped = strip_compression_suffix(seg);
+            let stem = Path::new(&stripped)
+                .file_stem()
+                .and_then(|x| x.to_str())
+                .unwrap_or(&stripped);
+            return Some(PathBuf::from(stem));
+        }
+    }
+    // fall through if URL parse had no usable last segment
+    Some(PathBuf::from("remote"))
+}
+
 fn default_mountpoint(archive: &Path) -> PathBuf {
     let s = archive.to_string_lossy();
-    if let Ok(url) = url::Url::parse(&s) {
-        if let Some(seg) = url.path_segments().and_then(|mut p| p.next_back()) {
-            if !seg.is_empty() {
-                let stripped = strip_compression_suffix(seg);
-                let stem = Path::new(&stripped)
-                    .file_stem()
-                    .and_then(|x| x.to_str())
-                    .unwrap_or(&stripped);
-                return PathBuf::from(stem);
-            }
-        }
-        // fall through if URL parse had no usable last segment
-        return PathBuf::from("remote");
+    if let Some(d) = default_mountpoint_url(&s) {
+        return d;
     }
     let name = archive
         .file_name()

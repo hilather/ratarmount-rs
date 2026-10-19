@@ -246,6 +246,10 @@ The complete status against the Python original is in the
    [Writing into archives](write-overlay.md#known-limits).
 5. **Platforms.** Linux and macOS on Apple silicon. No Intel macOS package (no
    CI runner), no Windows CLI. The library crates compile on Windows.
+6. **Mount point inside its own folder.** The refusal (exit 2) is a point-in-time
+   check: a bind created later, mount propagation from another namespace or an ancestor
+   rename after mounting are not caught, mount propagation flags are not read (a private
+   bind is refused too), and `--corpus` members are not checked.
 
 Remote, export and platform limits are listed with their own guides:
 [Remote inputs](phase10-remote.md#not-yet) · [NFS](nfs-export.md) · [other exports](export.md) · [macOS](macos.md).
