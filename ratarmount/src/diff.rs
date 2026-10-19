@@ -26,6 +26,9 @@ pub(crate) mod tests;
     group(ArgGroup::new("mode").args(["patch", "git", "manifest", "hash", "stat", "name_only", "name_status"])))]
 pub struct DiffArgs {
     pub directory: PathBuf,
+    /// Index sidecar folders read when opening the base (as for a mount).
+    #[arg(long, value_name = "FOLDERS")]
+    pub index_folders: Option<String>,
     /// Archive, committed Git repository, folder or URL; defaults to meta.base_url.
     #[arg(value_name = "BASE")]
     pub base_source: Option<PathBuf>,

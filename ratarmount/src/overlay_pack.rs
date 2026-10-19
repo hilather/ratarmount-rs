@@ -2458,10 +2458,14 @@ mod tests {
             sweep_pack_temps_in(&dir);
             sweep_stale_stages_in(&dir, true);
             FORCE_NO_REPLACE_FALLBACK.with(|f| f.set(false));
+            // The control run removes the stale temps only where an atomic
+            // no-replace rename exists; on a platform without one (BSD) the
+            // unforced sweep skips quarantine too, so everything stays.
+            let left_in_place = forced || !no_replace_rename_available();
             for name in &names {
                 assert_eq!(
                     tmp.path().join(name).exists(),
-                    forced,
+                    left_in_place,
                     "forced={forced}: {name}"
                 );
             }

@@ -138,10 +138,15 @@ pub fn cached_archive_digest(path: &Path, index: Option<&Path>) -> Result<String
 /// The cached SHA-256 of `path`, or `None` on a miss. Never hashes the archive
 /// and never waits: it takes neither the in-process entry nor the cross-process
 /// lock, so a mount that only peeks is ready while another mount is hashing.
+///
+/// The index is opened read-only (`SQLITE_OPEN_READ_ONLY`, zero busy wait) and
+/// is never created, written, recreated or locked, so an index the caller may
+/// not write (`chmod 444`, `--no-recreate-index`, an index folder it only reads)
+/// still answers. A missing, unreadable, busy or table-less index is a miss.
 pub fn peek_archive_digest(path: &Path, index: Option<&Path>) -> Result<Option<String>> {
     let path = path.canonicalize()?;
     let stamp = ArchiveDigestStamp::read(&path)?;
-    let Some(cache) = open_cache(index, false) else {
+    let Some(cache) = open_cache_read_only(index) else {
         return Ok(None);
     };
     Ok(lookup(&cache, path.as_os_str().as_encoded_bytes(), &stamp))
@@ -222,6 +227,36 @@ fn cache_target(index: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
     Some(index)
+}
+
+/// The index a read-only peek may read: an existing regular file. Unlike
+/// [`cache_target`] (write eligibility), permissions and publication do not
+/// matter, because nothing is written.
+fn cache_read_target(index: Option<&Path>) -> Option<PathBuf> {
+    let index = index?;
+    if !fs::metadata(index).ok()?.is_file() {
+        return None;
+    }
+    index.canonicalize().ok()
+}
+
+fn open_cache_read_only(index: Option<&Path>) -> Option<Cache> {
+    let index = cache_read_target(index)?;
+    let conn = Connection::open_with_flags(
+        &index,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.busy_timeout(Duration::ZERO).ok()?;
+    let has_cache: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='overlay_base_digests')
+             AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='files')",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    has_cache.then_some(Cache { conn, index })
 }
 
 /// `create_table`: false for a read-only peek, which must not wait out another
@@ -780,6 +815,54 @@ mod tests {
         // The cancelled wait left no in-process entry behind.
         drop(other_process);
         cached_archive_digest(&archive, Some(&index)).unwrap();
+    }
+
+    /// Regression: the peek went through the write-eligibility check, so a
+    /// `chmod 444` index (or one under `--no-recreate-index`) never answered and
+    /// a byte-identical copy of a strong base was refused. The peek opens the
+    /// index read-only, writes and creates nothing, and a missing, table-less
+    /// or non-file index is a plain miss.
+    #[cfg(unix)]
+    #[test]
+    fn regression_digest_peek_reads_readonly_index() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, vec![9u8; 4096]).unwrap();
+        let index = index_with_files(dir.path());
+        let digest = cached_archive_digest(&archive, Some(&index)).unwrap();
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o444)).unwrap();
+        // Not a cache the digest could be stored into any more ...
+        assert!(cache_target(Some(&index)).is_none());
+        // ... but a peek still reads it.
+        assert_eq!(
+            peek_archive_digest(&archive, Some(&index)).unwrap(),
+            Some(digest)
+        );
+        // Nothing is created for a missing index, and a non-file is a miss.
+        let missing = dir.path().join("missing.sqlite");
+        assert_eq!(peek_archive_digest(&archive, Some(&missing)).unwrap(), None);
+        assert!(!missing.exists());
+        assert_eq!(
+            peek_archive_digest(&archive, Some(dir.path())).unwrap(),
+            None
+        );
+        // A table-less database is a miss and stays table-less.
+        let bare = dir.path().join("bare.sqlite");
+        Connection::open(&bare)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT);")
+            .unwrap();
+        assert_eq!(peek_archive_digest(&archive, Some(&bare)).unwrap(), None);
+        let tables: i64 = Connection::open(&bare)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='overlay_base_digests'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "the peek must not create the cache table");
     }
 
     /// Regression: a mount's cache peek waited on the lock another mount held

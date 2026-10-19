@@ -278,11 +278,14 @@ pub(crate) fn seal_impl(
     walk_modes(&root, "", &mut modes)?;
     let (layer_digest, rows) = digest_rows(dir, lower_view, false)?;
     if let Some(base) = identity {
-        // A released overlay recorded no kind; the seal writes it now (no digest).
+        // The caller's gate already accepted (or forced) this base. A released
+        // overlay recorded no kind: the seal writes it now (no digest). An
+        // accepted move to another place (a local copy of a remote archive)
+        // is recorded too, so the sealed layer names the base it was sealed on.
         let meta = OverlayMeta::from_connection(&conn).map_err(overlay_error)?;
-        if matches!(
+        if !matches!(
             crate::overlay_gate::Recorded::from_meta(meta.as_ref()),
-            crate::overlay_gate::Recorded::Unrecorded
+            crate::overlay_gate::Recorded::Nothing | crate::overlay_gate::Recorded::Unknown
         ) {
             crate::overlay_gate::write_accepted_identity(&conn, meta.as_ref(), base)
                 .map_err(overlay_error)?;

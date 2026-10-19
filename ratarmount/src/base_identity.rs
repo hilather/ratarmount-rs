@@ -315,3 +315,52 @@ pub(crate) mod fixtures {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: classification is the factory open a verb already needs and
+    /// nothing else: no directory walk, no digest, and (for an archive) no
+    /// hashing or stamp comparison. A big directory and a plain archive are
+    /// classified without any content work.
+    #[test]
+    fn regression_classifier_does_no_content_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let folder = root.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        for i in 0..50 {
+            std::fs::write(folder.join(format!("f{i}")), vec![b'x'; 1024]).unwrap();
+        }
+        let archive = root.join("a.tar");
+        let members = [ratarmount_formats_tar::UstarMember {
+            path: "f",
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            xattrs: &[],
+        }];
+        let mut file = std::fs::File::create(&archive).unwrap();
+        ratarmount_formats_tar::write_ustar_members(&mut file, &members).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut file).unwrap();
+        drop(file);
+        let walks = ratarmount_compositing::directory_weak_walks_this_thread();
+        let digests = ratarmount_compositing::directory_digest_calls_this_thread();
+        for base in [&folder, &archive] {
+            classify_offline(base, GitIntent::Replay(None), &OverlayRunContext::default()).unwrap();
+        }
+        assert_eq!(
+            ratarmount_compositing::directory_weak_walks_this_thread(),
+            walks
+        );
+        assert_eq!(
+            ratarmount_compositing::directory_digest_calls_this_thread(),
+            digests
+        );
+        // No sidecar was created next to the archive, either.
+        assert!(!root.join("a.tar.index.sqlite").exists());
+    }
+}

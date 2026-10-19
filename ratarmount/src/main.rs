@@ -530,8 +530,8 @@ struct Args {
     )]
     base_digest: Option<ratarmount_compositing::BaseDigestRequest>,
 
-    /// Allow a changed base on remount and record the override in overlay metadata.
-    #[arg(long, requires = "overlay_target", conflicts_with = "commit_overlay")]
+    /// Allow a changed base on remount (or `--commit-overlay`) and record the override in overlay metadata.
+    #[arg(long, requires = "overlay_target")]
     force_base_mismatch: bool,
 
     /// Container-friendly ownership, allow_other/noatime, and a throwaway RAM overlay.
@@ -1752,7 +1752,10 @@ fn main() {
         }
     }
     if let Some(diff) = &args.diff {
-        std::process::exit(diff::run(diff, &overlay_run_context(&args)));
+        std::process::exit(diff::run(
+            diff,
+            &overlay_run_context(diff.index_folders.as_deref()),
+        ));
     }
     if args.shard.is_some() || args.export_index.is_some() {
         let result = export_index::cli_stdout()
@@ -1782,7 +1785,10 @@ fn main() {
         return;
     }
     if let Some(overlay) = &args.overlay {
-        match overlay_cmd::run(overlay, &overlay_run_context(&args)) {
+        match overlay_cmd::run(
+            overlay,
+            &overlay_run_context(overlay.index_folders.as_deref()),
+        ) {
             Ok((output, code)) => {
                 println!("{}", output.trim_end());
                 if code != 0 {
@@ -1944,7 +1950,7 @@ fn main() {
             base_identity::classify_offline(
                 archive,
                 base_identity::GitIntent::Replay(None),
-                &overlay_run_context(&args),
+                &overlay_run_context(args.index_folders.as_deref()),
             )
             .map_err(OverlayError::Msg)
             .and_then(|base| ratarmount_compositing::commit_overlay(overlay, archive, &base, &opts))
@@ -3051,16 +3057,22 @@ fn warn_export_non_loopback(name: &str, bind: std::net::SocketAddr) {
 
 /// The index folders the invocation names (`--index-folders`), else the defaults.
 fn index_folders_of(args: &Args) -> Vec<PathBuf> {
-    match &args.index_folders {
+    parse_folders_or_default(args.index_folders.as_deref())
+}
+
+fn parse_folders_or_default(spec: Option<&str>) -> Vec<PathBuf> {
+    match spec {
         Some(s) => parse_index_folders(s),
         None => default_index_folders(),
     }
 }
 
-/// What the offline verbs need from the parent invocation.
-fn overlay_run_context(args: &Args) -> base_identity::OverlayRunContext {
+/// What the offline verbs need from their invocation: the `--index-folders`
+/// they were given (`overlay ... --index-folders`, `diff --index-folders`,
+/// `--commit-overlay --index-folders`), else the defaults a mount uses.
+fn overlay_run_context(spec: Option<&str>) -> base_identity::OverlayRunContext {
     base_identity::OverlayRunContext {
-        index_folders: index_folders_of(args),
+        index_folders: parse_folders_or_default(spec),
     }
 }
 
@@ -5210,21 +5222,61 @@ mod base_flag_cli_tests {
 
     /// Regression: the offline verbs (`overlay seal|pack|verify|import`, `diff`)
     /// dropped the parent invocation's `--index-folders`, so the sidecar a
-    /// mount used was not the one they read. The context carries the parsed
-    /// folders (and the defaults when none are given).
+    /// mount used was not the one they read. Each verb takes the flag, and the
+    /// context carries the parsed folders (the defaults when none are given).
     #[test]
     fn regression_index_folders_reaches_offline_verbs() {
-        let args = parse(&["--index-folders", "/idx/a,/idx/b", "base.tar", "mnt"]).unwrap();
-        assert_eq!(
-            super::overlay_run_context(&args).index_folders,
+        let want = vec![
+            std::path::PathBuf::from("/idx/a"),
+            std::path::PathBuf::from("/idx/b"),
+        ];
+        for argv in [
+            vec!["overlay", "seal", "ov", "--index-folders", "/idx/a,/idx/b"],
             vec![
-                std::path::PathBuf::from("/idx/a"),
-                std::path::PathBuf::from("/idx/b")
-            ]
-        );
-        let args = parse(&["base.tar", "mnt"]).unwrap();
+                "overlay",
+                "pack",
+                "ov",
+                "out.tar.zst",
+                "--index-folders",
+                "/idx/a,/idx/b",
+            ],
+            vec![
+                "overlay",
+                "verify",
+                "ov",
+                "--index-folders",
+                "/idx/a,/idx/b",
+            ],
+        ] {
+            let args = parse(&argv).unwrap();
+            let overlay = args.overlay.expect("overlay verb");
+            assert_eq!(
+                super::overlay_run_context(overlay.index_folders.as_deref()).index_folders,
+                want,
+                "{argv:?}"
+            );
+        }
+        let args = parse(&["diff", "ov", "--index-folders", "/idx/a,/idx/b"]).unwrap();
+        let diff = args.diff.expect("diff");
         assert_eq!(
-            super::overlay_run_context(&args).index_folders,
+            super::overlay_run_context(diff.index_folders.as_deref()).index_folders,
+            want
+        );
+        let args = parse(&[
+            "--index-folders",
+            "/idx/a,/idx/b",
+            "--commit-overlay",
+            "-w",
+            "ov",
+            "a.tar",
+        ])
+        .unwrap();
+        assert_eq!(
+            super::overlay_run_context(args.index_folders.as_deref()).index_folders,
+            want
+        );
+        assert_eq!(
+            super::overlay_run_context(None).index_folders,
             ratarmount_index::default_index_folders()
         );
     }

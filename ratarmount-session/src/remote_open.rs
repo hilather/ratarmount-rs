@@ -36,6 +36,33 @@ fn apply_remote_index_discovery(
         &ratarmount_remote::OciLayer,
     )>,
 ) -> Result<(), String> {
+    let before = opts.index_file_path.clone();
+    let result = apply_remote_index_discovery_inner(input, opts, recreate, archive_size, oci);
+    // A sidecar installed by discovery changes the index this open uses; the
+    // base-identity token records where it was fetched from (redacted when the
+    // token is minted).
+    if result.is_ok() && opts.index_file_path.is_some() && opts.index_file_path != before {
+        DISCOVERED_INDEX.with(|cell| *cell.borrow_mut() = Some(input.to_owned()));
+    }
+    result
+}
+
+thread_local! {
+    /// The URL a sidecar was discovered from during the current remote open.
+    static DISCOVERED_INDEX: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn apply_remote_index_discovery_inner(
+    input: &str,
+    opts: &mut OpenOptions,
+    recreate: bool,
+    archive_size: u64,
+    oci: Option<(
+        &ratarmount_remote::OciLocation,
+        &ratarmount_remote::OciLayer,
+    )>,
+) -> Result<(), String> {
     if recreate || opts.clear_index_cache || opts.index_in_memory {
         return Ok(());
     }
@@ -1157,6 +1184,25 @@ pub(super) fn open_remote_input_with_nested(
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
     nested: &mut Option<ratarmount_compositing::OpenNestedReaderFn>,
 ) -> Result<RemoteOpened, String> {
+    DISCOVERED_INDEX.with(|cell| *cell.borrow_mut() = None);
+    let mut opened = open_remote_input_inner(input, opts, recreate, remotes, nested)?;
+    // The index this open selected (a local cache or a discovered sidecar).
+    if !opts.index_in_memory && opened.index.location.is_memory() {
+        if let Some(path) = opts.index_file_path.clone() {
+            opened.index.location = ratarmount_index::IndexLocation::Path(path);
+            opened.index.discovered_from = DISCOVERED_INDEX.with(|cell| cell.borrow_mut().take());
+        }
+    }
+    Ok(opened)
+}
+
+fn open_remote_input_inner(
+    input: &str,
+    opts: &mut OpenOptions,
+    recreate: bool,
+    remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
+    nested: &mut Option<ratarmount_compositing::OpenNestedReaderFn>,
+) -> Result<RemoteOpened, String> {
     use ratarmount_remote::{
         open_azure_range, open_ftp_range, open_gcs_range, open_ipfs, open_rclone, open_s3_range,
         resolve_access, RemoteAccess, RemoteHttp,
@@ -2240,6 +2286,115 @@ mod tests {
         let file_url = url::Url::from_file_path(&tar_path).unwrap().to_string();
         let opened = materialize_remote_input(&file_url, &opts, true, &mut remotes).unwrap();
         assert!(opened.local && !opened.fetched);
+    }
+
+    fn small_tar(path: &Path, member: &str) -> Vec<u8> {
+        let members = [ratarmount_formats_tar::UstarMember {
+            path: member,
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            xattrs: &[],
+        }];
+        let mut file = fs::File::create(path).unwrap();
+        ratarmount_formats_tar::write_ustar_members(&mut file, &members).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut file).unwrap();
+        drop(file);
+        fs::read(path).unwrap()
+    }
+
+    /// R6-6: a sidecar discovered from the archive's `Link: describedby` is
+    /// reported with the URL it came from (redacted when the token is minted);
+    /// the open's selected index is the installed file.
+    #[test]
+    fn regression_discovered_index_from_is_reported() {
+        let _env = EnvGuard::acquire(&[]);
+        use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.tar");
+        let bytes = small_tar(&archive, "f");
+        let index_bytes = make_sidecar_for(&archive);
+        let folders = empty_index_folders(dir.path());
+        let link = format!(
+            "</archive.tar.index.sqlite>; rel=\"{INDEX_LINK_REL}\"; type=\"{INDEX_MEDIA_TYPE}\""
+        );
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("/archive.tar.index.sqlite".into(), index_bytes);
+        let http = spawn_index_http("/archive.tar", bytes, objects, Some(link), None);
+        let url = format!("http://{}/archive.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        let mut remotes = Vec::new();
+        let opened =
+            open_remote_input_with_nested(&url, &mut opts, false, &mut remotes, &mut None).unwrap();
+        assert_eq!(opened.index.discovered_from.as_deref(), Some(url.as_str()));
+        assert_eq!(
+            opened.index.location.as_path(),
+            opts.index_file_path.as_deref()
+        );
+        assert!(opened.index.location.as_path().is_some_and(Path::is_file));
+        // A second open of something that discovers nothing reports nothing.
+        let local = dir.path().join("plain.tar");
+        small_tar(&local, "g");
+        let mut opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let opened = open_remote_input_with_nested(
+            url::Url::from_file_path(&local).unwrap().as_str(),
+            &mut opts,
+            false,
+            &mut remotes,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(opened.index.discovered_from, None);
+    }
+
+    /// R6-6: the index reported for a composite is the FIRST element's own,
+    /// never one a later source installed (`options.index_file_path` is copied
+    /// back for interval commits only).
+    #[test]
+    fn regression_composite_second_source_index_not_inherited() {
+        let _env = EnvGuard::acquire(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let first = root.join("first.tar");
+        small_tar(&first, "f");
+        let second = root.join("second.tar");
+        let second_bytes = small_tar(&second, "g");
+        let folder = root.join("idx");
+        fs::create_dir(&folder).unwrap();
+        let http = spawn_index_http("/second.tar", second_bytes, Default::default(), None, None);
+        let url = format!("http://{}/second.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_folders: vec![folder.clone()],
+            write_index: true,
+            index_minimum_file_count: 0,
+            ..OpenOptions::default()
+        };
+        let bundle = super::super::build_mount_source(
+            &[first.clone(), PathBuf::from(&url)],
+            &mut opts,
+            false,
+            false,
+        )
+        .unwrap();
+        let expected = ratarmount_index::possible_index_paths(&first, &[folder])[0].clone();
+        let served = bundle.served.expect("first element");
+        assert_eq!(
+            served.index,
+            ratarmount_compositing::IndexProvenance::Local(expected)
+        );
+        assert_eq!(
+            served.location,
+            Some(ratarmount_compositing::ServedLocation::Local(first))
+        );
     }
 
     /// Regression: repo mounts scanned shards and ignored published sibling indexes.

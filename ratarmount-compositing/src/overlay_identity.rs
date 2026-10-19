@@ -1183,6 +1183,49 @@ mod tests {
         );
     }
 
+    /// Regression: the default index name embeds the whole URL, so an index
+    /// selected for a credentialed input is never recorded as `base_index_path`
+    /// (the old check compared a URL with itself and was always false). It is
+    /// also never a peek target. Without a credential it is recorded when the
+    /// caller may write the index.
+    #[test]
+    fn regression_credentialed_url_index_path_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let options = CreateOptions {
+            index_writable: true,
+            ..Default::default()
+        };
+        for (typed, credentialed) in [
+            ("https://u:s3cr3t@h.example/a.tar", true),
+            ("https://h.example/a.tar?sig=abc", true),
+            ("https://h.example/a.tar", false),
+        ] {
+            let mut o = opened(&root, ServedKind::Archive, &[typed]);
+            o.location = Some(ServedLocation::Remote(typed.into()));
+            o.index = IndexProvenance::Local(root.join("idx.sqlite"));
+            let cb = ClassifiedBase::mint(o).unwrap();
+            assert_eq!(cb.actual().credentialed(), credentialed, "{typed}");
+            let info = cb.actual().create_info(&options);
+            assert_eq!(
+                info.index_path.is_some(),
+                !credentialed,
+                "{typed}: index_path {:?}",
+                info.index_path
+            );
+        }
+        // A caller that may not write the index records none either.
+        let mut o = opened(&root, ServedKind::Archive, &["a.tar"]);
+        o.location = Some(ServedLocation::Local(root.clone()));
+        o.index = IndexProvenance::Local(root.join("idx.sqlite"));
+        let cb = ClassifiedBase::mint(o).unwrap();
+        assert!(cb
+            .actual()
+            .create_info(&CreateOptions::default())
+            .index_path
+            .is_none());
+    }
+
     /// `repointed` moves the token to the committed archive and keeps the
     /// source; `for_tests` builds the same token a test needs.
     #[test]

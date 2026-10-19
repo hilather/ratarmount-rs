@@ -642,6 +642,51 @@ fn regression_import_reject_type_change_and_repeated_file_sections() {
     assert_eq!(rejects, b"diff a/type b/type\t(rejected hunks)\n@@ -1 +0,0 @@\n-wrong preimage\n@@ -1 +1 @@\n-also wrong\n+new\n");
 }
 
+/// Regression: import sealed its rows against the RAW base instead of the
+/// composed view (base under the `--lower` layers). A file a lower layer added
+/// and the imported patch modifies was recorded `Added`; the seal hashes
+/// against the composed view, so it is `Modified`, and the sealed layer
+/// verifies against that same view.
+#[test]
+fn regression_import_lower_added_then_modified_seals_modified() {
+    use ratarmount_compositing::overlay_changes::Status;
+    let f = Fixture::new();
+    let lower = f.temp.path().join("lower");
+    let ov = crate::base_identity::fixtures::overlay_over(
+        f.source.clone(),
+        &lower,
+        f.base.to_str().unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
+    put(&ov, "/added", b"from lower\n", 0o644);
+    drop(ov);
+    crate::base_identity::fixtures::seal(&lower, f.source.clone()).unwrap();
+    let mut args = f.args("top");
+    args.lower = vec![lower.clone()];
+    args.no_seal = false;
+    let patch = b"--- a/added\n+++ b/added\n@@ -1 +1 @@\n-from lower\n+from top\n";
+    let parsed = parse::parse(patch, args.max_patch_bytes).unwrap();
+    let stack = ImportStack::open(&args, &Default::default()).unwrap();
+    import(&args, &parsed, stack, 1.0).unwrap();
+    let view = ratarmount_compositing::compose_stack(
+        f.source.clone(),
+        &[(lower, Immutability::Immutable)],
+    )
+    .unwrap();
+    let changes = change_set(&args.directory, view.clone(), &ChangeOptions::default()).unwrap();
+    let row = changes
+        .iter()
+        .find(|c| c.path == b"added")
+        .expect("a row for /added");
+    assert_eq!(row.status, Status::Modified, "{row:?}");
+    assert!(
+        ratarmount_compositing::overlay_seal::verify(&args.directory, view)
+            .unwrap()
+            .ok
+    );
+}
+
 /// Stand-in for SIGKILL during the write phase: same create/open path and
 /// marker as `import`, writes the first `n` entries, then returns without
 /// clearing the marker and without the error cleanup (`import` removes the

@@ -221,6 +221,31 @@ fn regression_served_kind_table_git() {
     assert_eq!(served.kind, ServedKind::Git { tree: work_tree });
     assert_eq!(served.location, Some(ServedLocation::Local(work.clone())));
 
+    // Composite and bind selectors report the resolved repository too.
+    let archive = root.join("a.tar");
+    tar(&archive);
+    let typed = PathBuf::from(format!("{}@{work_commit}", work.display()));
+    let served = served_of(&[typed.clone(), archive.clone()], &mut options());
+    assert_eq!(served.location, Some(ServedLocation::Local(work.clone())));
+    assert!(matches!(served.kind, ServedKind::Git { .. }), "{served:?}");
+    let bundle = build_mount_source_with_bindings(
+        &[],
+        &mut options(),
+        false,
+        CompositingOptions::default(),
+        SourceBindings {
+            binds: vec![SourceBind {
+                mount_path: "/repo".into(),
+                source: typed.to_string_lossy().into_owned(),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let served = bundle.served.expect("bind-only git");
+    assert_eq!(served.location, Some(ServedLocation::Local(work.clone())));
+    assert!(matches!(served.kind, ServedKind::Git { .. }), "{served:?}");
+
     // A working tree without a flag is a plain folder.
     let served = served_of(std::slice::from_ref(&work), &mut options());
     assert_eq!(served.kind, ServedKind::Folder);
@@ -230,4 +255,77 @@ fn regression_served_kind_table_git() {
     let served = served_of(&[url], &mut options());
     assert!(matches!(served.kind, ServedKind::Git { .. }), "{served:?}");
     assert_eq!(served.location, Some(ServedLocation::Local(bare)));
+}
+
+/// R6-6: an in-memory open (every offline verb) selects no index, so the
+/// token would have nothing to peek a cached digest in. The factory names the
+/// sidecar the open WOULD have used (sibling, a custom `--index-folders`
+/// entry, or an explicit `--index-file`), as a pure path computation: nothing
+/// is created, fetched or written, and a name with no existing file is none.
+#[test]
+fn regression_served_sidecar_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let archive = root.join("a.tar");
+    tar(&archive);
+    let in_memory = || OpenOptions {
+        index_in_memory: true,
+        write_index: false,
+        ..Default::default()
+    };
+    // No sidecar anywhere: no candidate, and the open created none.
+    let served = served_of(std::slice::from_ref(&archive), &mut in_memory());
+    assert_eq!(served.sidecar_candidate, None);
+    assert!(!root.join("a.tar.index.sqlite").exists());
+    // The sibling sidecar.
+    let sibling = root.join("a.tar.index.sqlite");
+    drop(
+        build_mount_source_ex(
+            std::slice::from_ref(&archive),
+            &mut OpenOptions {
+                write_index: true,
+                index_minimum_file_count: 0,
+                ..Default::default()
+            },
+            true,
+            CompositingOptions::default(),
+        )
+        .unwrap(),
+    );
+    assert!(
+        sibling.is_file(),
+        "the writing open made the sibling sidecar"
+    );
+    let served = served_of(std::slice::from_ref(&archive), &mut in_memory());
+    assert_eq!(served.sidecar_candidate, Some(sibling.clone()));
+    assert_eq!(
+        served.index,
+        IndexProvenance::None,
+        "the index itself stays in memory"
+    );
+    // A custom folder wins over a missing sibling (named like the index).
+    std::fs::remove_file(&sibling).unwrap();
+    let folder = root.join("idx");
+    std::fs::create_dir(&folder).unwrap();
+    let named = folder.join(format!("{}.index.sqlite", archive.display()).replace('/', "_"));
+    std::fs::write(&named, b"not empty").unwrap();
+    let mut options = in_memory();
+    options.index_folders = vec![folder.clone()];
+    assert_eq!(
+        served_of(std::slice::from_ref(&archive), &mut options).sidecar_candidate,
+        Some(named.clone())
+    );
+    // An explicit existing `--index-file` is the candidate; `:memory:` is none.
+    let mut options = in_memory();
+    options.index_file_path = Some(named.clone());
+    assert_eq!(
+        served_of(std::slice::from_ref(&archive), &mut options).sidecar_candidate,
+        Some(named)
+    );
+    let mut options = in_memory();
+    options.index_file_path = Some(PathBuf::from(ratarmount_index::MEMORY_INDEX));
+    assert_eq!(
+        served_of(std::slice::from_ref(&archive), &mut options).sidecar_candidate,
+        None
+    );
 }

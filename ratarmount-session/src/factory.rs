@@ -2358,6 +2358,8 @@ fn open_path_impl(
 
     let compression = detect_compression(path).map_err(|e| e.to_string())?;
     let index_loc = resolved_index(path, options, recreate);
+    // Before the clone below drops an explicit index in the in-memory case.
+    let candidate = sidecar_candidate(path, options, &index_loc);
     // Propagate memory flag so format open() does not fall back to a disk path.
     let mut options = options.clone();
     if index_loc.is_memory() {
@@ -2430,11 +2432,40 @@ fn open_path_impl(
         source,
         path,
         IndexUsed {
+            sidecar_candidate: candidate,
             location: index_loc,
             discovered_from: None,
-            sidecar_candidate: None,
         },
     ))
+}
+
+/// The sidecar an in-memory open would have used, for a read-only peek at a
+/// cached digest. A pure path computation: no index is created, written,
+/// fetched or materialized. `None` when the open selected an on-disk index
+/// itself (that path is the answer) or no existing sidecar is named.
+fn sidecar_candidate(
+    path: &Path,
+    options: &OpenOptions,
+    selected: &IndexLocation,
+) -> Option<PathBuf> {
+    if !selected.is_memory() {
+        return None;
+    }
+    if let Some(explicit) = options.index_file_path.as_ref() {
+        let text = explicit.to_string_lossy();
+        if text == ratarmount_index::MEMORY_INDEX || ratarmount_index::is_index_url(&text) {
+            return None;
+        }
+        return ratarmount_index::path_is_usable_existing_index(explicit).then(|| explicit.clone());
+    }
+    let folders = if options.index_folders.is_empty() {
+        ratarmount_index::default_index_folders()
+    } else {
+        options.index_folders.clone()
+    };
+    ratarmount_index::possible_index_paths(path, &folders)
+        .into_iter()
+        .find(|candidate| ratarmount_index::path_is_usable_existing_index(candidate))
 }
 
 /// Open lrzip: prefer external `lrzip`/`lrunzip` materialize (then format probe);

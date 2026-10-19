@@ -16,6 +16,12 @@ mod upperdir;
     about = "Inspect and manage write overlays offline"
 )]
 pub struct OverlayArgs {
+    /// Index sidecar folders the verbs read when they open the base (as for a mount).
+    ///
+    /// A custom folder is where a cached digest of a local copy is found; the
+    /// index is only ever read.
+    #[arg(long, global = true, value_name = "FOLDERS")]
+    pub index_folders: Option<String>,
     #[command(subcommand)]
     pub command: OverlayCommand,
 }
@@ -144,8 +150,11 @@ pub struct PackArgs {
 pub struct BaseIdentityArgs {
     /// Proceed although the base differs from the one the overlay recorded (experimental).
     ///
-    /// Seal and pack record the base actually used (and the override time);
-    /// diff reports it. Without this flag a changed base is refused.
+    /// Seal and pack record the base actually used (its kind, place and the
+    /// override time); diff reports it. With --base-digest that digest is
+    /// recorded as strong; without one the base is recorded kind-only (`none`):
+    /// later runs compare the kind, not the content. Without this flag a
+    /// changed base (or one of another kind) is refused.
     #[arg(long)]
     pub force_base_mismatch: bool,
     /// Strong digest of the base (from `overlay digest-base`), confirming a copy without hashing (experimental).

@@ -253,3 +253,83 @@ fn regression_seal_of_unrecorded_overlay_records_kind() {
         "no digest for a released overlay"
     );
 }
+
+fn have_gnu_tar() -> bool {
+    Command::new("tar")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("GNU tar"))
+}
+
+/// Offline `--commit-overlay` of an overlay with a database checks the archive
+/// against the recorded base BEFORE the splice: a swapped base is refused
+/// naming the flag (nothing written), `--force-base-mismatch` commits; a raw
+/// directory of files has no identity and says so.
+#[test]
+fn regression_offline_commit_overlay_gates_the_base() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let env = Env::new();
+    let archive = tar_of(&env, "a.tar");
+    let overlay = env.path("ov");
+    env.ok(&[
+        "--no-mount",
+        "--index-file",
+        ":memory:",
+        "-w",
+        s(&overlay),
+        s(&archive),
+    ]);
+    fs::write(overlay.join("new.txt"), b"new").unwrap();
+    // The base is swapped for a different valid tar.
+    let other = tar_of(&env, "swap.tar");
+    fs::write(&other, {
+        let mut bytes = fs::read(&other).unwrap();
+        bytes.extend_from_slice(&[0u8; 1024]);
+        bytes
+    })
+    .unwrap();
+    fs::copy(&other, &archive).unwrap();
+    let before = fs::read(&archive).unwrap();
+    let refused = env.run(&["--commit-overlay", "-w", s(&overlay), s(&archive), "--yes"]);
+    refused_with(&refused, "--force-base-mismatch");
+    assert_eq!(fs::read(&archive).unwrap(), before, "nothing was written");
+    let forced = env.run(&[
+        "--commit-overlay",
+        "-w",
+        s(&overlay),
+        s(&archive),
+        "--yes",
+        "--force-base-mismatch",
+    ]);
+    assert_eq!(forced.status.code(), Some(0), "{}", text(&forced));
+    assert_ne!(
+        fs::read(&archive).unwrap(),
+        before,
+        "the forced commit wrote"
+    );
+
+    // A raw directory (no overlay database): committed, with the note.
+    let raw = env.path("raw");
+    fs::create_dir(&raw).unwrap();
+    fs::write(raw.join("added"), b"raw").unwrap();
+    let target = tar_of(&env, "raw-target.tar");
+    let out = env.run(&["--commit-overlay", "-w", s(&raw), s(&target), "--yes"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no base identity was checked"),
+        "{}",
+        text(&out)
+    );
+}
+
+fn refused_with(out: &Output, flag: &str) {
+    assert_ne!(out.status.code(), Some(0), "{}", text(out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(flag),
+        "{}",
+        text(out)
+    );
+}
