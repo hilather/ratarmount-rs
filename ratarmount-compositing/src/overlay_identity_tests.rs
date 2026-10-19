@@ -165,6 +165,32 @@ fn regression_base_swapped_between_commits_refused_by_next_gate() {
     }
 }
 
+/// Regression (R6-F2): the mounted `base.tar` replaced by a SYMLINK to another
+/// valid tar made the canonical path differ from the token's, so the commit
+/// guard passed and committed against the replacement. Refused on the live and
+/// on-exit paths, with the archive untouched.
+#[cfg(unix)]
+#[test]
+fn regression_base_replaced_by_symlink_refused() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        let fx = Fixture::new();
+        let ov = fx.open(BaseDigestRequest::Compute, false);
+        fs::write(ov.root().join("one"), b"one").unwrap();
+        let other = fx.archive.with_file_name("other.tar");
+        write_tar(&other, &[("other", b"a different base"), ("more", b"x")]);
+        fs::remove_file(&fx.archive).unwrap();
+        std::os::unix::fs::symlink(&other, &fx.archive).unwrap();
+        let before = fs::read(&other).unwrap();
+        let err = commit(&ov, &fx.archive, path).unwrap_err().to_string();
+        assert!(err.contains("--force-base-mismatch"), "{path:?}: {err}");
+        assert_eq!(fs::read(&other).unwrap(), before, "{path:?}: untouched");
+    }
+}
+
 /// A directory swapped in at the archive path is refused under every digest
 /// kind, `none` included (the token's kind is static, so only a fresh file
 /// type check can see it); a different valid tar under `none` is accepted

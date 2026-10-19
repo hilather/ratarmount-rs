@@ -443,6 +443,24 @@ pub(crate) fn check_commit_base(
         .canonicalize()
         .map_err(|e| refuse(format!("cannot resolve {}: {e}", archive.display())))?;
     if &canonical != path {
+        // The path the commit names, with only its parent resolved, is the
+        // mounted base when it equals the token's path: the file there was
+        // replaced (by a symlink to another archive). Any other path is an
+        // archive the token does not describe.
+        let named = archive
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(std::env::current_dir, |p| p.canonicalize())
+            .ok()
+            .zip(archive.file_name())
+            .map(|(dir, name)| dir.join(name));
+        if named.as_deref() == Some(path.as_path()) {
+            return Err(refuse(format!(
+                "{} no longer is the archive that was recorded (it now resolves to {})",
+                archive.display(),
+                canonical.display()
+            )));
+        }
         return Ok(());
     }
     let metadata = std::fs::metadata(&canonical)
