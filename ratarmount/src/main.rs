@@ -2835,10 +2835,8 @@ fn run_exports(
             finish_overlay_serve(overlay_arc, Some(source), interval, commit_exit);
         }
         Some(mp) => {
-            if live_archive.is_some() || has_temp_overlay() {
-                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-            }
             if foreground {
+                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
                 let interval = spawn_interval_if(
                     &overlay_arc,
                     &live_archive,
@@ -2920,9 +2918,7 @@ fn run_exports(
                     if !has_log_file {
                         let _ = redirect_stdio_to_null();
                     }
-                    if live_archive.is_some() || has_temp_overlay() {
-                        overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-                    }
+                    overlay_commit::spawn_signal_fuse_unmount(mp.clone());
                     let interval = spawn_interval_if(
                         &overlay_arc,
                         &live_archive,
@@ -3081,9 +3077,7 @@ fn run_fuse_and_nfs(
         let stop = ratarmount_nfs::NfsStop::new();
         nfs_opts.stop = Some(stop.clone());
         overlay_commit::spawn_signal_nfs_stop(stop.clone());
-        if live_archive.is_some() || has_temp_overlay() {
-            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-        }
+        overlay_commit::spawn_signal_fuse_unmount(mp.clone());
         let interval = spawn_interval_if(
             &overlay_arc,
             &live_archive,
@@ -3154,9 +3148,7 @@ fn run_fuse_and_nfs(
             let stop = ratarmount_nfs::NfsStop::new();
             nfs_opts.stop = Some(stop.clone());
             overlay_commit::spawn_signal_nfs_stop(stop.clone());
-            if live_archive.is_some() || has_temp_overlay() {
-                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-            }
+            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
             let interval = spawn_interval_if(
                 &overlay_arc,
                 &live_archive,
@@ -3222,7 +3214,7 @@ fn run_fuse_only(
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
 ) {
-    if foreground && (live_archive.is_some() || has_temp_overlay()) {
+    if foreground {
         overlay_commit::spawn_signal_fuse_unmount(mp.clone());
     }
     let commit_exit = |ov: Option<&WriteOverlay>| {
@@ -3283,9 +3275,7 @@ fn run_fuse_only(
             if !has_log_file {
                 let _ = redirect_stdio_to_null();
             }
-            if live_archive.is_some() || has_temp_overlay() {
-                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-            }
+            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
             let interval = spawn_interval_if(
                 &overlay_arc,
                 &live_archive,

@@ -131,7 +131,11 @@ pub fn spawn_signal_export_stops(stops: Vec<Arc<dyn Fn() + Send + Sync>>) {
 ///
 /// The unmount retries while the mount is briefly busy. SIGTERM, and only
 /// SIGTERM, falls back to a logged lazy unmount if it is still busy after that.
+///
+/// Installs the term handler itself (idempotent), so it exists exactly in the process that
+/// serves the mount: a daemon parent that only waits for the mount keeps default signals.
 pub fn spawn_signal_fuse_unmount(mp: PathBuf) {
+    install_term_signal_flag();
     thread::Builder::new()
         .name("ratarmount-fuse-signal".into())
         .spawn(move || {
