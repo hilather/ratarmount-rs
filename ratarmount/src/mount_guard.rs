@@ -593,12 +593,27 @@ fn relation<F: FsIdentity>(fs: &F, mp: &MpCtx<'_>, base: &Target) -> Option<(Rel
             continue;
         }
         for b in base.anchor.ancestors() {
-            if a == b || fs.dir_id(b) != Some(ida) || view_of(fs, b).as_ref() != Some(&vb) {
+            if a == b || fs.dir_id(b) != Some(ida) {
+                continue;
+            }
+            // Mirror of `crossing`: an ancestor above a mount boundary on the base side
+            // (the covering direction) matches when it is in the mount point's own view
+            // and the mount point's name walk by the base's names reaches the anchor.
+            let vbb = view_of(fs, b);
+            let base_crossing = vbb.as_ref() != Some(&vb);
+            if base_crossing && vbb.as_ref() != Some(&vm) {
                 continue;
             }
             let (Ok(ma), Ok(bb)) = (mp.t.full.strip_prefix(a), base.full.strip_prefix(b)) else {
                 continue;
             };
+            if base_crossing {
+                let rest = base.anchor.strip_prefix(b).unwrap_or(Path::new(""));
+                let walked = fs.dir_id(&a.join(rest));
+                if walked.is_none() || walked != fs.dir_id(&base.anchor) {
+                    continue;
+                }
+            }
             if crossing {
                 let rest = mp.t.anchor.strip_prefix(a).unwrap_or(Path::new(""));
                 let walked = fs.dir_id(&b.join(rest));

@@ -1155,6 +1155,46 @@ fn regression_mount_in_base_case_alias_across_intervening_mount() {
     refused(run(&fs, "/FS/P/B/mnt", &["/FS/p"]), &["inside the folder"]);
 }
 
+/// Regression: a filesystem mounted at `/FS/P/B` serving base `/FS/P/B`; mount point
+/// `/FS/P` is refused (it covers the base) but its case alias `/FS/p` was accepted
+/// (check 3 dropped the base-side ancestors above the mount boundary).
+#[test]
+fn regression_mount_in_base_case_alias_across_mount_covering() {
+    let mut fs = FakeFs::new();
+    fs.tmpfs("/FS/P/B", 102, 40);
+    fs.alias("/FS/p", "/FS/P");
+    fs.mountinfo = mi_lines(&["102 1 0:40 / /FS/P/B rw - tmpfs tmpfs rw"]);
+    for mp in ["/FS/P", "/FS/p"] {
+        refused(run(&fs, mp, &["/FS/P/B"]), &["would cover"]);
+    }
+    run(&fs, "/FS/Q", &["/FS/P/B"]).unwrap();
+    // macOS-style fallback (no mount ids): same-dev view comparison.
+    fs.mnt_ids = false;
+    for mp in ["/FS/P", "/FS/p"] {
+        refused(run(&fs, mp, &["/FS/P/B"]), &["would cover"]);
+    }
+}
+
+/// Covering direction, descendant-bind variant: `/C` is bound at `/FS/P/B/sub` (below
+/// an intervening mount); a mount point `/FS/P/B/sub` or its case alias covers base `/C`.
+#[test]
+fn regression_mount_in_base_case_alias_descendant_bind_covering() {
+    let mut fs = FakeFs::new();
+    fs.tmpfs("/FS/P/B", 102, 40);
+    fs.tmpfs("/C", 103, 41);
+    fs.bind("/C", "/FS/P/B/sub", 104);
+    fs.alias("/FS/p", "/FS/P");
+    fs.mountinfo = mi_lines(&[
+        "102 1 0:40 / /FS/P/B rw - tmpfs tmpfs rw",
+        "103 1 0:41 / /C rw - tmpfs tmpfs rw",
+        "104 102 0:41 / /FS/P/B/sub rw - tmpfs tmpfs rw",
+    ]);
+    let a = run(&fs, "/FS/P/B/sub", &["/C"]).is_err();
+    let b = run(&fs, "/FS/p/B/sub", &["/C"]).is_err();
+    assert_eq!(a, b, "alias must be refused whenever the original is");
+    assert!(a, "bind root covering its source is refused");
+}
+
 /// Regression (descendant-bind variant): the bind of the mount-point filesystem sits
 /// below an intervening mount (`/FS/P/B`), so the view's parent and the base anchor
 /// are on different mounts; the base `/FS/p` still walks into the copy.
