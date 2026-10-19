@@ -127,26 +127,62 @@ pub fn classify_offline(
     git: GitIntent,
     context: &OverlayRunContext,
 ) -> Result<ClassifiedBase, String> {
-    classify_offline_with(base, git, context, false)
+    classify_offline_in_memory(base, git, context)
 }
 
-/// [`classify_offline`] for a verb that must not pay for a full index build of
-/// a large archive (`--commit-overlay`): an existing sidecar is loaded
-/// read-only (never written, never replaced); with none, the index stays in
-/// memory as before.
-pub fn classify_offline_reusing_sidecar(
+/// Classify the archive an offline `--commit-overlay` is about to rewrite.
+///
+/// Unlike [`classify_offline`] this never opens the archive: no index is built
+/// or loaded (a large archive's index build was the whole cost), no sidecar is
+/// read or written and no commit journal is recovered (the identity gate must
+/// judge the file BEFORE recovery touches it). What the commit gate compares is
+/// the kind, the place and the file's stamp, all of which come from `stat`; the
+/// factory decides the kind ([`factory::served_without_indexing`]). The token's
+/// source is an unread placeholder: the commit path reads only its identity.
+pub fn classify_offline_commit(
     base: &Path,
-    git: GitIntent,
     context: &OverlayRunContext,
 ) -> Result<ClassifiedBase, String> {
-    classify_offline_with(base, git, context, true)
+    let mut opener = CommitOpener {
+        base,
+        index_folders: &context.index_folders,
+    };
+    ClassifiedBase::open(&mut opener)
 }
 
-fn classify_offline_with(
+struct CommitOpener<'a> {
+    base: &'a Path,
+    index_folders: &'a [PathBuf],
+}
+
+impl OpenBase for CommitOpener<'_> {
+    fn open_base(&mut self) -> Result<Opened, String> {
+        let served = factory::served_without_indexing(self.base, self.index_folders)?;
+        // Never read: `commit_overlay` takes the token's identity only.
+        let parent = self
+            .base
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let placeholder = ratarmount_compositing::FolderMountSource::new(parent)
+            .map_err(|error| error.to_string())?;
+        Ok(Opened {
+            source: std::sync::Arc::new(placeholder),
+            kind: served.kind,
+            inputs: vec![self.base.to_string_lossy().into_owned()],
+            location: served.location,
+            index: served.index,
+            sidecar_candidate: served.sidecar_candidate,
+            fetched: false,
+            keep_alive: Box::new(()),
+        })
+    }
+}
+
+fn classify_offline_in_memory(
     base: &Path,
     git: GitIntent,
     context: &OverlayRunContext,
-    reuse_sidecar: bool,
 ) -> Result<ClassifiedBase, String> {
     let git_tree = match git {
         GitIntent::Auto => base.join(".git").exists(),
@@ -154,14 +190,9 @@ fn classify_offline_with(
             kind == Some(BaseKind::Git) && ratarmount_formats_git::looks_like_git(base)
         }
     };
-    let sidecar = reuse_sidecar
-        && ratarmount_index::possible_index_paths(base, &context.index_folders)
-            .iter()
-            .any(|p| p.is_file());
     let mut options = OpenOptions {
         write_index: false,
-        index_in_memory: !sidecar,
-        read_only_index: sidecar,
+        index_in_memory: true,
         index_folders: context.index_folders.clone(),
         git: git_tree,
         ..Default::default()
@@ -390,13 +421,15 @@ mod tests {
         assert!(!root.join("a.tar.index.sqlite").exists());
     }
 
-    /// Regression (R6 review, Guardrail 2): offline `--commit-overlay`
-    /// classified the archive with a forced in-memory index, so a multi-GB
-    /// `.tar.zst` with a valid sidecar was fully re-indexed before the splice.
-    /// The commit's classifier loads the existing sidecar (read-only) instead;
-    /// every other offline verb keeps the in-memory open.
+    /// Regression (R6-G4, offline-commit cost): offline `--commit-overlay`
+    /// classified the archive with an in-memory index (R6 review), then by
+    /// loading its sidecar (R6-F7), so a multi-GB archive paid an index
+    /// build or load just to learn it is an archive. The commit's classifier
+    /// opens nothing: the token's source holds no member of the archive, no
+    /// file appears beside it and its sidecar is untouched; the sidecar is
+    /// still the peek target for a cached digest.
     #[test]
-    fn regression_offline_commit_classification_loads_existing_sidecar() {
+    fn regression_offline_commit_classification_builds_no_index() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let archive = root.join("a.tar");
@@ -414,34 +447,41 @@ mod tests {
         ratarmount_formats_tar::write_tar_eof(&mut file).unwrap();
         drop(file);
         let sidecar = root.join("a.tar.index.sqlite");
-        let opts = ratarmount_core::OpenOptions::default();
         drop(
             ratarmount_formats_tar::SqliteIndexedTar::create_index(
                 &archive,
                 &archive,
                 Some(&sidecar),
-                &opts,
+                &ratarmount_core::OpenOptions::default(),
                 "test",
                 &mut None,
             )
             .unwrap(),
         );
-        // Mark the sidecar: a rescan of the archive can never produce "ghost".
-        rusqlite::Connection::open(&sidecar)
-            .unwrap()
-            .execute("UPDATE files SET name='ghost' WHERE name='f'", [])
-            .unwrap();
-        let before = std::fs::read(&sidecar).unwrap();
+        let names = |dir: &Path| {
+            let mut all: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, before) = (names(&root), std::fs::read(&sidecar).unwrap());
         let context = OverlayRunContext::default();
-        let reused =
-            classify_offline_reusing_sidecar(&archive, GitIntent::Replay(None), &context).unwrap();
+        let token = classify_offline_commit(&archive, &context).unwrap();
+        assert_eq!(token.actual().kind(), BaseKind::Archive);
         assert!(
-            reused.source().lookup("/ghost", 0).is_some(),
-            "the existing sidecar must be loaded, not rebuilt in memory"
+            token.source().lookup("/f", 0).is_none(),
+            "no index of the archive may be built or loaded"
         );
-        assert_eq!(std::fs::read(&sidecar).unwrap(), before, "never written");
+        assert_eq!(token.actual().index_for_peek(), Some(sidecar.as_path()));
+        assert_eq!(names(&root), listing, "nothing created beside the archive");
+        assert!(
+            std::fs::read(&sidecar).unwrap() == before,
+            "sidecar written"
+        );
+        // The other offline verbs keep the factory's in-memory open.
         let fresh = classify_offline(&archive, GitIntent::Replay(None), &context).unwrap();
-        assert!(fresh.source().lookup("/ghost", 0).is_none());
         assert!(fresh.source().lookup("/f", 0).is_some());
     }
 }

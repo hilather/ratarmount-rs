@@ -1922,9 +1922,14 @@ fn main() {
             eprintln!("error: {msg}");
             std::process::exit(2);
         }
-        if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
-            eprintln!("error: commit recovery for {}: {e}", archive.display());
-            std::process::exit(2);
+        // A database overlay recovers a pending commit journal only after its
+        // base identity gate (inside the commit): recovery rewrites the archive,
+        // and it must not do that to an archive the overlay does not describe.
+        if !overlay.join(HIDDEN_DB).exists() {
+            if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
+                eprintln!("error: commit recovery for {}: {e}", archive.display());
+                std::process::exit(2);
+            }
         }
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
             archive,
@@ -1947,9 +1952,8 @@ fn main() {
         // splice. A raw directory of files has no identity to check; it
         // commits through its own entry and says so.
         let result = if overlay.join(HIDDEN_DB).exists() {
-            base_identity::classify_offline_reusing_sidecar(
+            base_identity::classify_offline_commit(
                 archive,
-                base_identity::GitIntent::Replay(None),
                 &overlay_run_context(args.index_folders.as_deref()),
             )
             .map_err(OverlayError::Msg)

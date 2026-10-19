@@ -4106,6 +4106,43 @@ pub struct Served {
     pub fetched: bool,
 }
 
+/// What the factory would serve for a local `path`, decided WITHOUT opening it:
+/// no index is built or loaded, no commit journal is recovered, nothing is
+/// written. A file is an archive, a directory a folder; anything else (a
+/// remote URL, a Git reference, a missing path) is not answered here.
+///
+/// For a verb that only needs to know what it is about to rewrite
+/// (`--commit-overlay`): indexing a large archive to learn that it is an
+/// archive is the cost this avoids. `sidecar_candidate` is the existing sidecar
+/// a cold open would have used, for a read-only digest peek.
+pub fn served_without_indexing(path: &Path, index_folders: &[PathBuf]) -> Result<Served, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let kind = if meta.is_dir() {
+        ServedKind::Folder
+    } else if meta.is_file() {
+        ServedKind::Archive
+    } else {
+        return Err(format!(
+            "{} is neither a file nor a directory",
+            path.display()
+        ));
+    };
+    let sidecar_candidate = (kind == ServedKind::Archive)
+        .then(|| {
+            ratarmount_index::possible_index_paths(path, index_folders)
+                .into_iter()
+                .find(|p| p.is_file())
+        })
+        .flatten();
+    Ok(Served {
+        kind,
+        location: Some(ServedLocation::Local(path.to_path_buf())),
+        index: IndexProvenance::None,
+        sidecar_candidate,
+        fetched: false,
+    })
+}
+
 /// Holds remote downloads for process lifetime (deleted on drop).
 pub struct MountBundle {
     pub source: Arc<dyn MountSource>,

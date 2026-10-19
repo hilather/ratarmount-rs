@@ -455,6 +455,28 @@ pub(crate) fn check_commit_base(
         ))
     };
     let actual = base.actual();
+    // The recorded kind and the Unknown gate come first, under every digest
+    // kind: a `none` directory overlay must not commit into an unrelated
+    // archive, and a record with no usable kind never commits without force.
+    let meta = OverlayMeta::from_connection(conn)
+        .map_err(|e| refuse(format!("cannot read overlay metadata: {e}")))?;
+    match Recorded::from_meta(meta.as_ref()) {
+        Recorded::Unknown => {
+            return Err(refuse(
+                "the overlay recorded no usable base kind (it was written by a pre-release \
+                 build)"
+                    .to_owned(),
+            ))
+        }
+        Recorded::Kind { kind, .. } if kind != actual.kind() => {
+            return Err(refuse(format!(
+                "the commit target is of kind {} (the overlay recorded kind {})",
+                actual.kind().as_str(),
+                kind.as_str()
+            )))
+        }
+        _ => {}
+    }
     let (BaseKind::Archive, Some(BaseLocation::Local(path))) = (actual.kind(), actual.location())
     else {
         return Ok(());
@@ -493,8 +515,6 @@ pub(crate) fn check_commit_base(
             canonical.display()
         )));
     }
-    let meta = OverlayMeta::from_connection(conn)
-        .map_err(|e| refuse(format!("cannot read overlay metadata: {e}")))?;
     let Some(meta) = meta else {
         return Ok(());
     };
@@ -1020,7 +1040,44 @@ mod tests {
         let err = check_commit_base(&conn, &token, &place.archive).unwrap_err();
         assert!(err.0.contains("no longer a regular file"), "{err}");
         assert!(err.0.contains("--force-base-mismatch"), "{err}");
-        // A non-archive token has nothing to compare.
-        check_commit_base(&conn, &place.token(Shape::DirL), &place.archive).unwrap();
+        // A token of another kind than the record is the kind gate's to refuse
+        // (R6-G4); with a matching record a non-archive token has no stamp.
+        let err = check_commit_base(&conn, &place.token(Shape::DirL), &place.archive).unwrap_err();
+        assert!(err.0.contains("kind"), "{err}");
+    }
+
+    /// Regression (R6-G4, #2): the commit gate compares the recorded KIND under
+    /// every digest kind (a `none` directory overlay does not commit into an
+    /// archive) and refuses an Unknown record; a recorded archive passes.
+    #[test]
+    fn check_commit_base_kind_and_unknown_gate() {
+        let place = Place::new();
+        let token = place.token(Shape::ArchL);
+        let conn_with = |rows: &[(&str, &str)]| {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(crate::overlay_meta::META_SCHEMA)
+                .unwrap();
+            OverlayMeta::set_many(&conn, rows).unwrap();
+            conn
+        };
+        for kind in ["directory", "git"] {
+            let conn = conn_with(&[
+                ("format_version", "2"),
+                ("base_digest_kind", "none"),
+                ("base_kind", kind),
+            ]);
+            let err = check_commit_base(&conn, &token, &place.archive).unwrap_err();
+            assert!(err.0.contains(kind) && err.0.contains("archive"), "{err}");
+            assert!(err.0.contains("--force-base-mismatch"), "{err}");
+        }
+        let unknown = conn_with(&[("format_version", "2"), ("base_url", "/x.tar")]);
+        let err = check_commit_base(&unknown, &token, &place.archive).unwrap_err();
+        assert!(err.0.contains("no usable base kind"), "{err}");
+        let archive = conn_with(&[
+            ("format_version", "2"),
+            ("base_digest_kind", "none"),
+            ("base_kind", "archive"),
+        ]);
+        check_commit_base(&archive, &token, &place.archive).unwrap();
     }
 }
