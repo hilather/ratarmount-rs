@@ -27,7 +27,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | GPT/MBR partitioned disks | guestfish | factory `Block` after FAT/exFAT/NTFS; `/p1/`… via FAT/EXT4 offset; LVM residual | `[x]` / `~` LVM/RAID/Btrfs |
 | Apple UDIF `.dmg` | no | factory `Dmg`: `koly` + inner FAT/ISO/exFAT/NTFS; **HFS+/APFS/encrypted residual** | `[x]` / `~` HFS+/APFS |
 | QCOW2 | guestfish / qemu-nbd | factory `Qcow2`: v2/v3 zlib + local backing then block `pN/`; zstd/HTTP residual | `[x]` / `~` zstd/HTTP |
-| VHD / VHDX | guestfish | factory `Vhd`: fixed+dynamic VHD, VHDX fixed; wraps block `pN/`; differencing residual | `[x]` / `~` differencing |
+| VHD / VHDX | guestfish | factory `Vhd`: fixed+dynamic VHD, VHDX fixed + dynamic (sparse); wraps block `pN/`; differencing residual | `[x]` / `~` differencing |
 | VMDK | guestfish | factory `Vmdk`: KDMV sparse → Block/FAT/EXT4; compressed/ESXi residual | `[x]` / `~` compressed/ESXi |
 | exFAT / NTFS / UDF | guestfish | factory `Exfat`/`Ntfs`/`Udf` (Udf immediately before Iso); NTFS LZNT1/EFS residual | `[x]` / `~` LZNT1/EFS, UDF metadata partition |
 | SQLAR | yes | unencrypted + encrypt detect; sqlcipher feature optional | `~` feature-gated decrypt |

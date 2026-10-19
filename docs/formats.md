@@ -68,7 +68,7 @@ sample in its own frame. See [Zstd random access](zstd-random-access.md).
 | **DMG** (UDIF) | Direct through the chunk table | Yes | Inner FAT, ISO, exFAT, NTFS, EXT4 or partitioned images. HFS+, APFS, encrypted, LZFSE and LZMA chunks are not supported |
 | **WIM** | Direct, uncompressed and XPRESS | Yes | First image only. LZX and LZMS resources, WIMBoot and delta images are not supported |
 | **QCOW2** (v2, v3) | Cluster map | Yes | zlib-compressed clusters and local backing files; zstd clusters and network backing are not supported |
-| **VHD / VHDX** | Block allocation table | Yes | Fixed and dynamic VHD, fixed VHDX. Differencing disks and VHDX log replay are not supported |
+| **VHD / VHDX** | Block allocation table | Yes | Fixed and dynamic VHD, fixed and dynamic (sparse) VHDX. Differencing disks and VHDX log replay are not supported |
 | **VMDK** | Grain map | Yes | Hosted sparse (KDMV) images. Compressed `streamOptimized` and ESXi formats are not supported |
 
 Disk images are read-only. A partitioned image inside a TAR inside a ZIP still
