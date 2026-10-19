@@ -12,6 +12,12 @@ use ratarmount_core::MountSource;
 /// what is served (lower layers over the classified base); `options` carries
 /// the digest request, lower records and exclusions. What the base IS comes
 /// from `base`, never from the options.
+/// `--base-digest none` is kind-only: the base's kind (and a remote's place)
+/// is still checked; its content is not.
+pub(crate) const NONE_DIGEST_WARNING: &str = "warning: --base-digest none checks only the kind of \
+     the base for new overlays, not its content; an edited or swapped base of the same kind is \
+     accepted";
+
 pub fn create_overlay(
     base: &ClassifiedBase,
     composed: Arc<dyn MountSource>,
@@ -22,9 +28,7 @@ pub fn create_overlay(
 ) -> Result<WriteOverlay, OverlayError> {
     use ratarmount_compositing::BaseDigestRequest;
     if options.base_digest == BaseDigestRequest::None {
-        eprintln!(
-            "warning: --base-digest none disables base identity verification for new overlays"
-        );
+        eprintln!("{NONE_DIGEST_WARNING}");
     }
     // A single remote base also records a cheap remote token (ETag, size);
     // a composite's token comes from the classified inputs.
@@ -49,6 +53,15 @@ mod tests {
     use super::*;
     use ratarmount_compositing::HIDDEN_DB;
     use ratarmount_core::MountSource;
+
+    /// Regression (R6-G8): the warning said `none` disables identity
+    /// verification, but the kind is still checked (a directory overlay is
+    /// refused over an archive).
+    #[test]
+    fn regression_none_digest_warning_says_kind_is_checked() {
+        assert!(NONE_DIGEST_WARNING.contains("only the kind"));
+        assert!(!NONE_DIGEST_WARNING.contains("disables"));
+    }
 
     fn token_for(inputs: &[&str], binds: bool) -> Option<String> {
         let dir = tempfile::tempdir().unwrap();

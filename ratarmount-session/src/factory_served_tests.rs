@@ -52,7 +52,8 @@ fn commit_repo(path: &Path, bare: bool) -> (String, String) {
 
 /// R6-1: every LOCAL arm of the factory names the kind and the path it opened.
 /// Remote arms are in `remote_open::tests::regression_served_kind_table_remote`;
-/// arms with no offline server (smb, ftp, ipfs, rclone, gs, az, torrent, oci,
+/// ssh/webdav/torrent rows are in `regression_served_kind_table_fetched_and_torrent`;
+/// arms with no offline server (smb, ftp, ipfs, rclone, gs, az, oci,
 /// restic, hf) are enforced by the type: `RemoteOpened` has no `Default`, so
 /// every `return Ok` in `open_remote_input_with_nested` must name its kind.
 #[test]
@@ -328,4 +329,78 @@ fn regression_served_sidecar_candidate() {
         served_of(std::slice::from_ref(&archive), &mut options).sidecar_candidate,
         None
     );
+}
+
+/// R6-1 (guardrail 4): the arms with no offline server still get a row. A
+/// body fetched over ssh/scp/sftp or webdav(s), and a torrent (whose "path" is
+/// `torrent:<infohash>`), are `Remote` at the TYPED location - never the
+/// temporary copy or the torrent pseudo-path; only a `file://` body is Local.
+#[test]
+fn regression_served_kind_table_fetched_and_torrent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let source: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&root).unwrap());
+    let opened =
+        |path: &str, kind: ServedKind, local: bool, fetched: bool| remote_open::RemoteOpened {
+            path: PathBuf::from(path),
+            source: source.clone(),
+            kind,
+            local,
+            fetched,
+            index: IndexUsed::none(),
+        };
+    let rows = [
+        // (typed input, what the arm returned, expected location is remote)
+        (
+            "ssh://user@host.example/data/a.tar",
+            opened("/tmp/fetched-ssh.tar", ServedKind::Archive, false, true),
+            true,
+        ),
+        (
+            "sftp://host.example/data/a.tar",
+            opened("/tmp/fetched-sftp.tar", ServedKind::Archive, false, true),
+            true,
+        ),
+        (
+            "scp://host.example/data/a.tar",
+            opened("/tmp/fetched-scp.tar", ServedKind::Archive, false, true),
+            true,
+        ),
+        (
+            "webdav://host.example/files/a.tar",
+            opened("/tmp/fetched-dav.tar", ServedKind::Archive, false, true),
+            true,
+        ),
+        (
+            "webdavs://host.example/files/a.tar",
+            opened("/tmp/fetched-davs.tar", ServedKind::Archive, false, true),
+            true,
+        ),
+        (
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            opened(
+                "torrent:0123456789abcdef0123456789abcdef01234567",
+                ServedKind::Folder,
+                false,
+                false,
+            ),
+            true,
+        ),
+        (
+            "file:///data/a.tar",
+            opened("/data/a.tar", ServedKind::Archive, true, false),
+            false,
+        ),
+    ];
+    for (input, opened, remote) in rows {
+        let served = served_from_remote(input, &opened);
+        assert_eq!(served.kind, opened.kind, "{input}");
+        assert_eq!(served.fetched, opened.fetched, "{input}");
+        let expected = if remote {
+            ServedLocation::Remote(input.to_owned())
+        } else {
+            ServedLocation::Local(opened.path.clone())
+        };
+        assert_eq!(served.location, Some(expected), "{input}");
+    }
 }

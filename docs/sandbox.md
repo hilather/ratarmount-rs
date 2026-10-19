@@ -343,6 +343,19 @@ already-strong base compares the stamp and does not rehash).
 `--commit-overlay` on a raw directory of files (no overlay database) has no
 identity to check and says so.
 
+The commit check also compares the recorded KIND under every digest kind, `none`
+included (a directory overlay does not commit into an archive), and refuses an
+Unknown record (written by an unreleased build) without
+`--force-base-mismatch`. A mounted base reached through a symlink is the same
+file only while the name and its inode still match: a link retargeted to another
+archive is refused. `--commit-overlay` learns what it is rewriting from a `stat`
+of the archive: it builds no index, reads and writes no sidecar, and recovers a
+pending commit journal only after this check. A journal is rolled back only
+when it belongs to the recorded base (the size and mtime it restores equal the
+recorded stamp; a live mount also requires the mounted inode); another
+archive's interrupted-append journal is refused with the archive and journal
+left untouched.
+
 Remote bases use a `weak` digest of the URL and cheaply available validators:
 HTTP HEAD ETag/Content-Length/Last-Modified or S3 ETag/size. Failed HEADs,
 redirects, and other schemes fall back to the known URL. This fallback does

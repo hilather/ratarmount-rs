@@ -10,6 +10,20 @@
 # only READ the committed fixture; FUSE is needed to regenerate it, not to run them.
 set -euo pipefail
 
+# Replace the generated files in OUT (an overlay and its base) and nothing else:
+# the committed README.md beside them is documentation, not output.
+publish() { # WORK OUT
+  mkdir -p "$2"
+  rm -rf "$2/overlay" "$2/base.tar"
+  cp -a "$1/overlay" "$2/overlay"
+  cp "$1/base.tar" "$2/base.tar"
+}
+# test-harness/test-make-overlay-v0.1.35.sh exercises this step without FUSE.
+if [ "${1:-}" = "--publish-only" ]; then
+  publish "${2:?WORK}" "${3:?OUT}"
+  exit 0
+fi
+
 BIN=${1:?usage: make-overlay-v0.1.35.sh PATH-TO-RATARMOUNT-0.1.35-BINARY}
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT="$HERE/fixtures/overlay-v0.1.35"
@@ -51,8 +65,5 @@ if sqlite3 "$WORK/overlay/.ratarmount.overlay.sqlite" '.tables' | grep -qw meta;
   exit 1
 fi
 
-rm -rf "$OUT"
-mkdir -p "$OUT"
-cp -a "$WORK/overlay" "$OUT/overlay"
-cp "$WORK/base.tar" "$OUT/base.tar"
+publish "$WORK" "$OUT"
 echo "wrote $OUT"

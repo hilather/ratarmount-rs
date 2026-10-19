@@ -4941,18 +4941,7 @@ pub fn build_mount_source_with_bindings(
                 &mut remotes,
                 &mut folder_opener,
             )?;
-            let location = if opened.local {
-                ServedLocation::Local(opened.path.clone())
-            } else {
-                ServedLocation::Remote(input.to_string())
-            };
-            let served = Served {
-                kind: opened.kind,
-                location: Some(location),
-                index: index_provenance(&opened.index),
-                sidecar_candidate: opened.index.sidecar_candidate.clone(),
-                fetched: opened.fetched,
-            };
+            let served = served_from_remote(&input, &opened);
             (opened.path, opened.source, served)
         } else {
             let local_path = p.clone();
@@ -5030,6 +5019,25 @@ pub fn build_mount_source_with_bindings(
 }
 
 /// The index an open selected, as the token records it.
+/// What a remote open served, for the base-identity token. A body that is a
+/// plain local path (`file://`) is `Local`; everything else, including a body
+/// downloaded to a temporary copy (ssh, webdav, smb, ftp, ...) and a torrent
+/// whose "path" is `torrent:<infohash>`, is `Remote` at the typed location.
+fn served_from_remote(input: &str, opened: &remote_open::RemoteOpened) -> Served {
+    let location = if opened.local {
+        ServedLocation::Local(opened.path.clone())
+    } else {
+        ServedLocation::Remote(input.to_string())
+    };
+    Served {
+        kind: opened.kind.clone(),
+        location: Some(location),
+        index: index_provenance(&opened.index),
+        sidecar_candidate: opened.index.sidecar_candidate.clone(),
+        fetched: opened.fetched,
+    }
+}
+
 fn index_provenance(used: &IndexUsed) -> IndexProvenance {
     match (used.location.as_path(), &used.discovered_from) {
         (Some(path), Some(from)) => IndexProvenance::Discovered {
