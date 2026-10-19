@@ -633,9 +633,13 @@ impl CleanupOps for RealOps<'_> {
             .all(|c| matches!(c.try_wait(), Ok(Some(_))))
     }
     fn connection_dir_exists(&mut self, minor: u32) -> bool {
-        Path::new("/sys/fs/fuse/connections")
-            .join(minor.to_string())
-            .exists()
+        // A number a mount outside the root now carries is not ours to wait for.
+        let reused = fs::read("/proc/self/mountinfo")
+            .is_ok_and(|b| connection_reused_elsewhere(&b, self.root, minor));
+        !reused
+            && Path::new("/sys/fs/fuse/connections")
+                .join(minor.to_string())
+                .exists()
     }
     fn sleep(&mut self, d: Duration) {
         thread::sleep(d);
