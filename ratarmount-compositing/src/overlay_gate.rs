@@ -287,6 +287,17 @@ fn relocation_rows(
                 "base_local_path".into(),
                 path.to_string_lossy().into_owned(),
             );
+            // A recorded `base_index_path` means the index was writable at
+            // creation; it follows the move to the new place's index, and is
+            // dropped (by the caller) when that place has none.
+            if meta.is_some_and(|m| m.get("base_index_path").is_some()) {
+                if let Some(index) = actual.index_path.as_ref() {
+                    rows.insert(
+                        "base_index_path".into(),
+                        std::path::absolute(index)?.to_string_lossy().into_owned(),
+                    );
+                }
+            }
         }
     }
     Ok(rows)
@@ -337,6 +348,7 @@ pub(crate) fn write_accepted_identity(
             "base_mtime_ns",
             "base_local_path",
             "base_weak_digest",
+            "base_index_path",
         ] {
             if !rows.contains_key(key) {
                 OverlayMeta::remove(conn, key)?;

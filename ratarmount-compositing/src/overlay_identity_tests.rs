@@ -1510,3 +1510,73 @@ fn regression_forced_reopen_at_other_place_does_not_rebaseline() {
         "directory: the edited copy was accepted after one forced open"
     );
 }
+
+/// Regression (R6-J8, audit C1): an accepted move of an archive base to another
+/// local place rewrote the stamp and path rows but left `base_index_path`
+/// naming the OLD place's sidecar, which a commit refresh and a pending-digest
+/// resolution read as the index of the base. The row follows the move: the new
+/// place's sidecar when one exists, else it is dropped.
+#[test]
+fn regression_accepted_archive_move_repoints_base_index_path() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for copy_has_sidecar in [true, false] {
+        let fx = Fixture::new();
+        let digest = sha(&fx.archive);
+        let token_at = |archive: &Path, index: Option<&Path>| {
+            ClassifiedBase::mint(crate::Opened {
+                source: open_tar(archive),
+                kind: ServedKind::Archive,
+                inputs: Vec::new(),
+                location: Some(ServedLocation::Local(archive.to_path_buf())),
+                index: index.map_or(crate::IndexProvenance::None, |path| {
+                    crate::IndexProvenance::Local(path.to_path_buf())
+                }),
+                sidecar_candidate: None,
+                fetched: false,
+                keep_alive: Box::new(()),
+            })
+            .unwrap()
+        };
+        let old_index = fx.archive.with_file_name("base.tar.index.sqlite");
+        fs::write(&old_index, b"sidecar").unwrap();
+        let open_writable = |token: &ClassifiedBase| {
+            WriteOverlay::open(
+                token,
+                token.source(),
+                &fx.overlay,
+                &CreateOptions {
+                    base_digest: BaseDigestRequest::Supplied(digest.clone()),
+                    index_writable: true,
+                    ..Default::default()
+                },
+            )
+        };
+        drop(open_writable(&token_at(&fx.archive, Some(&old_index))).unwrap());
+        assert_eq!(
+            read_rows(&fx.overlay, &["base_index_path"])[0].as_deref(),
+            Some(old_index.to_str().unwrap())
+        );
+        let copy = fx.archive.with_file_name("copy.tar");
+        fs::copy(&fx.archive, &copy).unwrap();
+        let new_index = fx.archive.with_file_name("copy.tar.index.sqlite");
+        if copy_has_sidecar {
+            fs::write(&new_index, b"sidecar").unwrap();
+        }
+        drop(
+            open_writable(&token_at(
+                &copy,
+                copy_has_sidecar.then_some(new_index.as_path()),
+            ))
+            .expect("a byte-identical copy confirmed by the digest reopens"),
+        );
+        let row = read_rows(&fx.overlay, &["base_index_path"])[0].clone();
+        if copy_has_sidecar {
+            assert_eq!(row.as_deref(), Some(new_index.to_str().unwrap()));
+        } else {
+            assert_eq!(row, None, "the old place's sidecar is still named");
+        }
+    }
+}
