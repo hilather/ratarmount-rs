@@ -345,3 +345,49 @@ fn regression_offline_commit_recovers_only_its_own_journal() {
     );
     assert!(!ratarmount_compress::commit_journal::journal_path(&archive).exists());
 }
+
+/// Regression (R6-H1, B1): after a crash the interrupted archive was replaced
+/// by a new-inode copy of the same bytes (same mtime), and the commit ran as a
+/// fresh process. The fresh token matched the copy, and recovery, which checks
+/// only content, rolled the copy back and committed into it. The journal
+/// records the inode it was started for; a successor with another inode is
+/// refused with archive and journal untouched.
+#[cfg(unix)]
+#[test]
+fn regression_new_inode_copy_of_interrupted_archive_is_refused() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let env = Env::new();
+    let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+    interrupt_append(&archive);
+    let crashed = fs::read(&archive).unwrap();
+    let journal = ratarmount_compress::commit_journal::journal_path(&archive);
+    let journal_bytes = fs::read(&journal).unwrap();
+    let copy = env.path("copy.tar");
+    fs::write(&copy, &crashed).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(fs::metadata(&archive).unwrap().modified().unwrap())
+        .unwrap();
+    fs::rename(&copy, &archive).unwrap();
+    let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
+    assert!(
+        !out.status.success(),
+        "must refuse a new-inode successor: {}",
+        text(&out)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--force-base-mismatch"), "{err}");
+    assert!(fs::read(&archive).unwrap() == crashed, "archive modified");
+    assert!(
+        fs::read(&journal).unwrap() == journal_bytes,
+        "journal modified"
+    );
+}

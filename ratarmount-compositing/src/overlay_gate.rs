@@ -531,6 +531,24 @@ pub(crate) fn check_commit_base(
     match ratarmount_compress::commit_journal::pending(&canonical) {
         Ok(None) => {}
         Ok(Some(journal)) => {
+            // The journal was started for one inode. A successor (a copy of
+            // the interrupted bytes, a restored backup) has another, and
+            // recovery would roll it back on content alone: refuse it.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if journal.ino != metadata.ino() || journal.dev != metadata.dev() {
+                    return Err(refuse(format!(
+                        "{} carries a commit journal that was started for another file \
+                         (journal inode {}:{}, archive inode {}:{}); the journal was not applied",
+                        canonical.display(),
+                        journal.dev,
+                        journal.ino,
+                        metadata.dev(),
+                        metadata.ino()
+                    )));
+                }
+            }
             return if journal.len.to_string() == size && journal.mtime_ns.to_string() == mtime {
                 Ok(())
             } else {
