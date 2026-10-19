@@ -326,7 +326,12 @@ mod tests {
                 ..Default::default()
             },
             ratarmount_session::factory::SourceBindings {
-                sources: vec![source],
+                sources: vec![ratarmount_session::factory::DeclaredSource {
+                    src: source,
+                    kind: ratarmount_compositing::ServedKind::Folder,
+                    location: None,
+                    label: "corpus".to_owned(),
+                }],
                 ..Default::default()
             },
         )

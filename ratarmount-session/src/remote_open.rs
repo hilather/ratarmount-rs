@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ratarmount_compositing::OciImageMountSource;
+use ratarmount_compositing::{OciImageMountSource, ServedKind};
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_index::{
     cache_identity, check_tarstats_matches_remote, hash_hex, invalidate_meta_cache_file,
@@ -18,7 +18,9 @@ use ratarmount_index::{
     TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
 };
 
-use super::{open_from_live_range, open_path};
+use super::{
+    open_from_live_range, open_path, open_path_impl, IndexUsed, LiveRangeOpened, PathOpened,
+};
 
 /// K12: explicit `--index-file` / local folder candidates (including `oci:{digest}`
 /// cache) then GET `{url}.index.ptr` + immutable blob, HTTP `Link` on archive HEAD,
@@ -887,18 +889,68 @@ fn smb_unsupported_range_error(input: &str) -> String {
     )
 }
 
+/// What a remote open served, for the base-identity token. Every `return Ok`
+/// in this file builds one, so each arm names the kind it served.
+pub(super) struct RemoteOpened {
+    pub path: PathBuf,
+    pub source: Arc<dyn MountSource>,
+    pub kind: ServedKind,
+    /// The source is a plain local path (`file://`), not a fetched copy or a
+    /// remote object.
+    pub local: bool,
+    /// The body was downloaded to a temporary local copy.
+    pub fetched: bool,
+    pub index: IndexUsed,
+}
+
+impl RemoteOpened {
+    fn folder(path: PathBuf, source: Arc<dyn MountSource>) -> Self {
+        Self {
+            path,
+            source,
+            kind: ServedKind::Folder,
+            local: false,
+            fetched: false,
+            index: IndexUsed {
+                location: ratarmount_index::IndexLocation::Memory,
+                discovered_from: None,
+                sidecar_candidate: None,
+            },
+        }
+    }
+
+    fn archive((path, source): LiveRangeOpened) -> Self {
+        Self {
+            kind: ServedKind::Archive,
+            ..Self::folder(path, source)
+        }
+    }
+
+    fn from_path(path: PathBuf, opened: PathOpened, local: bool) -> Self {
+        Self {
+            path,
+            source: opened.source,
+            kind: opened.kind,
+            local,
+            fetched: !local,
+            index: opened.index,
+        }
+    }
+}
+
 /// Materialize a remote URL to a local path and open it.
 pub(super) fn materialize_remote_input(
     input: &str,
     opts: &OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+) -> Result<RemoteOpened, String> {
     let remote = ratarmount_remote::resolve_to_local(input).map_err(|e| e.to_string())?;
     let path = remote.path().to_path_buf();
+    let local = matches!(remote, ratarmount_remote::RemoteLocal::Local(_));
     remotes.push(remote);
-    let src = open_path(&path, opts, recreate)?;
-    Ok((path, src))
+    let opened = open_path_impl(&path, opts, recreate, true, &mut false)?;
+    Ok(RemoteOpened::from_path(path, opened, local))
 }
 
 /// Resolve once before probing folder/file shape. All subsequent URLs include the SHA.
@@ -908,7 +960,7 @@ fn open_hf_input(
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
     nested: &mut Option<ratarmount_compositing::OpenNestedReaderFn>,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+) -> Result<RemoteOpened, String> {
     let repo = ratarmount_remote::HfRepo::resolve(input).map_err(|e| e.to_string())?;
     eprintln!(
         "hf: {} commit {}",
@@ -922,7 +974,7 @@ fn open_hf_input(
             opts.clone(),
             recreate,
         ));
-        return Ok((PathBuf::from(label), source));
+        return Ok(RemoteOpened::folder(PathBuf::from(label), source));
     }
     open_hf_file(&repo, opts, recreate, remotes)
 }
@@ -932,7 +984,7 @@ fn open_hf_file(
     opts: &mut OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+) -> Result<RemoteOpened, String> {
     let label = repo.resolve_url(&repo.location.path);
     let range = repo
         .open_file(&repo.location.path)
@@ -992,13 +1044,13 @@ fn open_hf_file(
             opts.index_file_path = Some(path);
         }
     }
-    Ok((
+    Ok(RemoteOpened::archive((
         path,
         Arc::new(ratarmount_remote::HfMountSource::new(
             source,
             repo.commit.clone(),
         )),
-    ))
+    )))
 }
 
 /// Reuse the HTTP sibling convention and index validation with Hub-only credentials.
@@ -1095,6 +1147,7 @@ pub(super) fn open_remote_input(
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
     open_remote_input_with_nested(input, opts, recreate, remotes, &mut None)
+        .map(|opened| (opened.path, opened.source))
 }
 
 pub(super) fn open_remote_input_with_nested(
@@ -1103,7 +1156,7 @@ pub(super) fn open_remote_input_with_nested(
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
     nested: &mut Option<ratarmount_compositing::OpenNestedReaderFn>,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+) -> Result<RemoteOpened, String> {
     use ratarmount_remote::{
         open_azure_range, open_ftp_range, open_gcs_range, open_ipfs, open_rclone, open_s3_range,
         resolve_access, RemoteAccess, RemoteHttp,
@@ -1134,7 +1187,7 @@ pub(super) fn open_remote_input_with_nested(
                 },
             )
             .map_err(|e| e.to_string())?;
-            return Ok((
+            return Ok(RemoteOpened::folder(
                 PathBuf::from(format!("torrent:{}", source.infohash())),
                 Arc::new(source),
             ));
@@ -1146,7 +1199,7 @@ pub(super) fn open_remote_input_with_nested(
     if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf-cache") {
         let source =
             ratarmount_remote::HfCacheMountSource::open(input).map_err(|e| e.to_string())?;
-        return Ok((PathBuf::from(input), Arc::new(source)));
+        return Ok(RemoteOpened::folder(PathBuf::from(input), Arc::new(source)));
     }
 
     if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf") {
@@ -1168,7 +1221,7 @@ pub(super) fn open_remote_input_with_nested(
                 recreate,
             ));
         }
-        return Ok((PathBuf::from(input), ms));
+        return Ok(RemoteOpened::folder(PathBuf::from(input), ms));
     }
 
     if is_oci_scheme(input) {
@@ -1247,7 +1300,7 @@ pub(super) fn open_remote_input_with_nested(
         if let Some(ms) =
             ratarmount_remote::try_open_smb_folder(input).map_err(|e| e.to_string())?
         {
-            return Ok((PathBuf::from(input), ms));
+            return Ok(RemoteOpened::folder(PathBuf::from(input), ms));
         }
         let mut range = ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())?;
         if !range.uses_ranges() {
@@ -1269,6 +1322,7 @@ pub(super) fn open_remote_input_with_nested(
         return open_from_live_range(range, len, input, opts, recreate, "SMB Range", || {
             ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())
         })?
+        .map(RemoteOpened::archive)
         .ok_or_else(|| smb_unsupported_range_error(input));
     }
 
@@ -1290,7 +1344,7 @@ pub(super) fn open_remote_input_with_nested(
                     "rclone",
                     move || open_rclone(&input_owned).map_err(|e| e.to_string()),
                 )? {
-                    Some(opened) => return Ok(opened),
+                    Some(opened) => return Ok(RemoteOpened::archive(opened)),
                     None => {
                         eprintln!(
                             "info: rclone format unsupported for {}; materializing",
@@ -1320,7 +1374,7 @@ pub(super) fn open_remote_input_with_nested(
                 // Buffered fallback is still Read+Seek-usable for rebuild.
                 ratarmount_remote::open_http_range(&input_owned).map_err(|e| e.to_string())
             })? {
-                Some(opened) => Ok(opened),
+                Some(opened) => Ok(RemoteOpened::archive(opened)),
                 None => materialize_remote_input(input, opts, recreate, remotes),
             }
         }
@@ -1329,14 +1383,15 @@ pub(super) fn open_remote_input_with_nested(
             let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             apply_remote_index_discovery(input, opts, recreate, len, None)?;
             remotes.push(remote);
-            let src = open_path(&path, opts, recreate)?;
-            Ok((path, src))
+            let opened = open_path_impl(&path, opts, recreate, true, &mut false)?;
+            Ok(RemoteOpened::from_path(path, opened, false))
         }
         RemoteAccess::Path(remote) => {
             let path = remote.path().to_path_buf();
+            let local = matches!(remote, ratarmount_remote::RemoteLocal::Local(_));
             remotes.push(remote);
-            let src = open_path(&path, opts, recreate)?;
-            Ok((path, src))
+            let opened = open_path_impl(&path, opts, recreate, true, &mut false)?;
+            Ok(RemoteOpened::from_path(path, opened, local))
         }
     }
 }
@@ -1350,7 +1405,7 @@ fn open_s3_like<R, Reopen>(
     transport: &str,
     opened: ratarmount_remote::Result<R>,
     reopen: Reopen,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String>
+) -> Result<RemoteOpened, String>
 where
     R: Read + Seek + Send + 'static + LiveRange,
     Reopen: FnOnce() -> ratarmount_remote::Result<R>,
@@ -1366,7 +1421,7 @@ where
             match open_from_live_range(range, len, input, opts, recreate, transport, || {
                 reopen().map_err(|e| e.to_string())
             })? {
-                Some(opened) => Ok(opened),
+                Some(opened) => Ok(RemoteOpened::archive(opened)),
                 None => {
                     eprintln!(
                         "info: {transport} format unsupported for {}; materializing",
@@ -1421,11 +1476,11 @@ impl_live_range!(ratarmount_remote::FtpRangeFile);
 impl_live_range!(ratarmount_remote::IpfsHandle);
 impl_live_range!(ratarmount_remote::SmbRangeFile);
 
-fn open_restic_repo(input: &str) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+fn open_restic_repo(input: &str) -> Result<RemoteOpened, String> {
     let path = ratarmount_formats_restic::parse_restic_url(input).map_err(|e| e.to_string())?;
     let src =
         ratarmount_formats_restic::ResticMountSource::open(&path).map_err(|e| e.to_string())?;
-    Ok((path, Arc::new(src)))
+    Ok(RemoteOpened::folder(path, Arc::new(src)))
 }
 
 fn is_oci_scheme(input: &str) -> bool {
@@ -1436,11 +1491,7 @@ fn is_oci_scheme(input: &str) -> bool {
 }
 
 /// Fetch OCI manifests and open each layer via live Range + overlayfs union.
-fn open_oci_image(
-    input: &str,
-    opts: &OpenOptions,
-    recreate: bool,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+fn open_oci_image(input: &str, opts: &OpenOptions, recreate: bool) -> Result<RemoteOpened, String> {
     let image = ratarmount_remote::fetch_oci_image(input).map_err(|e| e.to_string())?;
     if image.layers.is_empty() {
         return Err(format!(
@@ -1484,7 +1535,7 @@ fn open_oci_image(
         }
     }
     let src = OciImageMountSource::new(layers);
-    Ok((PathBuf::from(input), Arc::new(src)))
+    Ok(RemoteOpened::folder(PathBuf::from(input), Arc::new(src)))
 }
 
 /// F-1 (`s3` / `ssh` / `webdav` / `http`) plus later-scheme folder openers
@@ -1585,7 +1636,7 @@ fn folder_nested_reader_fn(
             }
         };
         match opened {
-            Ok((_, source)) if remotes.is_empty() => Ok(source),
+            Ok(opened) if remotes.is_empty() => Ok(opened.source),
             // Formats requiring materialization retain the normal AutoMount
             // spool owner, whose lifetime is tied to the nested mount.
             Ok(_) => fallback(reader, label, ctx),
@@ -2135,6 +2186,60 @@ mod tests {
                 "{requests} requests for {size} bytes"
             );
         }
+    }
+
+    /// R6-1: the HTTP arms report an `Archive` at the typed remote location;
+    /// a body downloaded to a temporary copy is still `Remote` (never the
+    /// temp path) and is flagged as fetched.
+    #[test]
+    fn regression_served_kind_table_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("a.tar");
+        {
+            let members = [ratarmount_formats_tar::UstarMember {
+                path: "f",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: &[],
+            }];
+            ratarmount_formats_tar::write_ustar_members(
+                &mut fs::File::create(&tar_path).unwrap(),
+                &members,
+            )
+            .unwrap();
+        }
+        let bytes = fs::read(&tar_path).unwrap();
+        let http = spawn_index_http("/a.tar", bytes.clone(), Default::default(), None, None);
+        let url = format!("http://{}/a.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_in_memory: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let bundle =
+            super::super::build_mount_source(&[PathBuf::from(&url)], &mut opts, true, false)
+                .unwrap();
+        let served = bundle.served.expect("live Range");
+        assert_eq!(served.kind, ServedKind::Archive);
+        assert_eq!(
+            served.location,
+            Some(ratarmount_compositing::ServedLocation::Remote(url.clone()))
+        );
+        assert!(!served.fetched, "a live Range open fetches no copy");
+
+        // A downloaded body is `Remote(typed)`, never the temp path.
+        let mut remotes = Vec::new();
+        let opened = materialize_remote_input(&url, &opts, true, &mut remotes).unwrap();
+        assert_eq!(opened.kind, ServedKind::Archive);
+        assert!(!opened.local && opened.fetched);
+        assert_eq!(remotes.len(), 1);
+        // `file://` is a plain local path: not fetched.
+        let file_url = url::Url::from_file_path(&tar_path).unwrap().to_string();
+        let opened = materialize_remote_input(&file_url, &opts, true, &mut remotes).unwrap();
+        assert!(opened.local && !opened.fetched);
     }
 
     /// Regression: repo mounts scanned shards and ignored published sibling indexes.

@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use ratarmount_compositing::{
     parse_recursive_extensions, AutoMountLayer, AutoMountOptions, FileVersionLayer,
-    FolderMountSource, NestedOpenContext, OpenNestedFn, OpenNestedReaderFn, PrefixMountSource,
-    RecursiveExtSet, SourceBind, TransformMountSource, UnionMountOptions, UnionMountSource,
+    FolderMountSource, IndexProvenance, NestedOpenContext, OpenNestedFn, OpenNestedReaderFn,
+    PrefixMountSource, RecursiveExtSet, ServedKind, ServedLocation, SourceBind,
+    TransformMountSource, UnionMountOptions, UnionMountSource,
 };
 use ratarmount_compress::{
     body_looks_like_tar, check_for_split_file_in_folder, detect_compression, export_bzip2_blocks,
@@ -2153,7 +2154,7 @@ fn open_split_set(
     }
 
     // Archive/compressed stream: open without re-running split detection; keep temp alive.
-    let inner = open_path_impl(&tmp_path, &opts, recreate, false, &mut false)?;
+    let inner = open_path_impl(&tmp_path, &opts, recreate, false, &mut false)?.source;
     Ok(Arc::new(KeepAliveMount { inner, _tmp: tmp }))
 }
 
@@ -2210,7 +2211,49 @@ pub fn open_path(
     options: &OpenOptions,
     recreate: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
-    open_path_impl(path, options, recreate, true, &mut false)
+    open_path_impl(path, options, recreate, true, &mut false).map(|opened| opened.source)
+}
+
+/// The index an open selected, for the base-identity peek. The selected
+/// location is always filled; `discovered_from` (the URL a remote index was
+/// fetched from) and `sidecar_candidate` (the sidecar path an in-memory open
+/// would have used) are filled by the callers that know them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IndexUsed {
+    pub location: IndexLocation,
+    pub discovered_from: Option<String>,
+    pub sidecar_candidate: Option<PathBuf>,
+}
+
+impl IndexUsed {
+    fn none() -> Self {
+        Self {
+            location: IndexLocation::Memory,
+            discovered_from: None,
+            sidecar_candidate: None,
+        }
+    }
+}
+
+/// What [`open_path_impl`] opened: the source and, for the base-identity
+/// token, what kind of source it is and where it was opened.
+pub(crate) struct PathOpened {
+    pub source: Arc<dyn MountSource>,
+    pub kind: ServedKind,
+    /// The path actually opened (the repository path for Git).
+    pub location: PathBuf,
+    pub index: IndexUsed,
+}
+
+impl PathOpened {
+    fn archive(source: Arc<dyn MountSource>, location: &Path, index: IndexUsed) -> Self {
+        Self {
+            source,
+            kind: ServedKind::Archive,
+            location: location.to_path_buf(),
+            index,
+        }
+    }
 }
 
 fn open_path_impl(
@@ -2219,7 +2262,7 @@ fn open_path_impl(
     recreate: bool,
     allow_split: bool,
     plain_tar: &mut bool,
-) -> Result<Arc<dyn MountSource>, String> {
+) -> Result<PathOpened, String> {
     // Resolve inline refs before the normal filesystem existence check.
     #[cfg(feature = "git")]
     {
@@ -2271,7 +2314,14 @@ fn open_path_impl(
                 let cache = cache.join("git-synthetic-v1");
                 git = git.with_synthetic_head(&cache).map_err(|e| e.to_string())?;
             }
-            return Ok(Arc::new(git));
+            // The tree after any subtree selection: what is actually served.
+            let tree = git.tree_id();
+            return Ok(PathOpened {
+                source: Arc::new(git),
+                kind: ServedKind::Git { tree },
+                location: git_path.to_path_buf(),
+                index: IndexUsed::none(),
+            });
         }
     }
     if !ratarmount_index::looks_like_url_archive(path) {
@@ -2286,7 +2336,12 @@ fn open_path_impl(
     }
     if path.is_dir() {
         return FolderMountSource::new(path)
-            .map(|f| Arc::new(f) as Arc<dyn MountSource>)
+            .map(|f| PathOpened {
+                source: Arc::new(f) as Arc<dyn MountSource>,
+                kind: ServedKind::Folder,
+                location: path.to_path_buf(),
+                index: IndexUsed::none(),
+            })
             .map_err(|e| e.to_string());
     }
     if !path.exists() {
@@ -2296,7 +2351,8 @@ fn open_path_impl(
     // Multi-volume split files (Python check_for_split_file_in_folder + JoinedFile).
     if allow_split {
         if let Some(split) = check_for_split_file_in_folder(path) {
-            return open_split_set(&split.paths, options, recreate);
+            return open_split_set(&split.paths, options, recreate)
+                .map(|source| PathOpened::archive(source, path, IndexUsed::none()));
         }
     }
 
@@ -2370,7 +2426,15 @@ fn open_path_impl(
     // After create + optional compression side-table writes: drop small indexes (B-119).
     maybe_discard_index_below_minimum(index_path, &options);
 
-    Ok(source)
+    Ok(PathOpened::archive(
+        source,
+        path,
+        IndexUsed {
+            location: index_loc,
+            discovered_from: None,
+            sidecar_candidate: None,
+        },
+    ))
 }
 
 /// Open lrzip: prefer external `lrzip`/`lrunzip` materialize (then format probe);
@@ -3997,14 +4061,39 @@ fn open_tar_body(
         .map_err(|e| e.to_string())
 }
 
+/// What the first factory-opened source served: the kind and location the
+/// base-identity token records. `None` location only for a declared source
+/// with no location (a corpus).
+#[derive(Clone, Debug)]
+pub struct Served {
+    pub kind: ServedKind,
+    pub location: Option<ServedLocation>,
+    pub index: IndexProvenance,
+    /// Sidecar path an in-memory open would have used (read-only peek target).
+    pub sidecar_candidate: Option<PathBuf>,
+    /// The first source was fetched to a temporary local copy.
+    pub fetched: bool,
+}
+
 /// Holds remote downloads for process lifetime (deleted on drop).
 pub struct MountBundle {
     pub source: Arc<dyn MountSource>,
+    /// What the first element in factory order served (`inputs[0]`, else the
+    /// first declared source). `None` only when nothing was opened.
+    pub served: Option<Served>,
     /// Provenance from the successful local TAR probe, before compositing.
     /// No remote, split, compressed, recursive, or path-transforming source.
     pub(crate) plain_tar_file: Option<PathBuf>,
     /// Fetched HTTP bodies etc. must outlive `source`.
     _remotes: Vec<ratarmount_remote::RemoteLocal>,
+}
+
+impl MountBundle {
+    /// The private downloads that must outlive the source, and nothing else:
+    /// never the bundle itself, whose source a live commit replaces.
+    pub fn into_keep_alive(self) -> Box<dyn std::any::Any + Send + Sync> {
+        Box::new(self._remotes)
+    }
 }
 
 /// Extra compositing options beyond [`OpenOptions`].
@@ -4131,7 +4220,7 @@ fn remote_index_setup(
 }
 
 /// Result of a successful live-Range open (label path + mount source).
-type LiveRangeOpened = (PathBuf, Arc<dyn MountSource>);
+pub(crate) type LiveRangeOpened = (PathBuf, Arc<dyn MountSource>);
 
 /// Open TAR/ZIP/gzip/bzip2/xz/zstd from a live Range-capable `Read+Seek` body.
 ///
@@ -4596,7 +4685,19 @@ pub struct SourceBindings {
     /// Applied after positional inputs, in this order (later sources win).
     pub binds: Vec<SourceBind>,
     /// Already opened root sources, e.g. a lazy corpus. They precede positional inputs.
-    pub sources: Vec<Arc<dyn MountSource>>,
+    pub sources: Vec<DeclaredSource>,
+}
+
+/// An already opened root source and what its caller says it is. A declared
+/// source has no opener to ask: the caller built it and names what it built
+/// (a small, stated exception to "the factory reports the kind").
+pub struct DeclaredSource {
+    pub src: Arc<dyn MountSource>,
+    pub kind: ServedKind,
+    /// `None` for a corpus, which has no single location.
+    pub location: Option<ServedLocation>,
+    /// Human label (the rolling series' active generation).
+    pub label: String,
 }
 
 /// Build a union with per-source mount paths. Explicit binds take precedence
@@ -4675,7 +4776,20 @@ pub fn build_mount_source_with_bindings(
         ext_set
     };
     let mut sources = Vec::new();
-    for src in bindings.sources {
+    // `inputs[0]` wins over a declared source when both exist.
+    let mut served: Option<Served> = if inputs.is_empty() {
+        bindings.sources.first().map(|declared| Served {
+            kind: declared.kind.clone(),
+            location: declared.location.clone(),
+            index: IndexProvenance::None,
+            sidecar_candidate: None,
+            fetched: false,
+        })
+    } else {
+        None
+    };
+    for declared in bindings.sources {
+        let src = declared.src;
         sources.push(apply_compositing(
             src,
             options,
@@ -4694,7 +4808,7 @@ pub fn build_mount_source_with_bindings(
     // onto `options` (the value `spawn_interval_commits` clones). Do not inject
     // one input's sidecar into the next input's clone.
     let cli_opts = options.clone();
-    for ((p, mount_path), is_git) in inputs.iter().zip(git_inputs) {
+    for (position, ((p, mount_path), is_git)) in inputs.iter().zip(git_inputs).enumerate() {
         let input = p.to_string_lossy();
         // Do not force a default index path here — `open_path` resolves via folders / :memory:.
         let mut opts = cli_opts.clone();
@@ -4717,6 +4831,15 @@ pub fn build_mount_source_with_bindings(
 
         // Dropbox folders: browse via API (list + download-on-open). Files fall through.
         if let Some(ms) = remote_open::try_open_dropbox_folder(input.as_ref())? {
+            if position == 0 {
+                served = Some(Served {
+                    kind: ServedKind::Folder,
+                    location: Some(ServedLocation::Remote(input.to_string())),
+                    index: IndexProvenance::None,
+                    sidecar_candidate: None,
+                    fetched: false,
+                });
+            }
             let src = apply_compositing(
                 ms,
                 &opts,
@@ -4738,18 +4861,39 @@ pub fn build_mount_source_with_bindings(
 
         let remote = ratarmount_remote::is_remote_url(&input);
         let mut folder_opener = None;
-        let (local_path, mut src) = if remote {
-            remote_open::open_remote_input_with_nested(
+        let (local_path, mut src, input_served) = if remote {
+            let opened = remote_open::open_remote_input_with_nested(
                 input.as_ref(),
                 &mut opts,
                 recreate_src,
                 &mut remotes,
                 &mut folder_opener,
-            )?
+            )?;
+            let location = if opened.local {
+                ServedLocation::Local(opened.path.clone())
+            } else {
+                ServedLocation::Remote(input.to_string())
+            };
+            let served = Served {
+                kind: opened.kind,
+                location: Some(location),
+                index: index_provenance(&opened.index),
+                sidecar_candidate: opened.index.sidecar_candidate.clone(),
+                fetched: opened.fetched,
+            };
+            (opened.path, opened.source, served)
         } else {
             let local_path = p.clone();
             let mut plain_tar = false;
-            let src = open_path_impl(&local_path, &opts, recreate_src, true, &mut plain_tar)?;
+            let opened = open_path_impl(&local_path, &opts, recreate_src, true, &mut plain_tar)?;
+            let input_served = Served {
+                kind: opened.kind,
+                location: Some(ServedLocation::Local(opened.location)),
+                index: index_provenance(&opened.index),
+                sidecar_candidate: opened.index.sidecar_candidate.clone(),
+                fetched: false,
+            };
+            let src = opened.source;
             if plain_tar
                 && source_count == 1
                 && mount_path.is_none()
@@ -4759,8 +4903,11 @@ pub fn build_mount_source_with_bindings(
             {
                 plain_tar_file = std::fs::canonicalize(&local_path).ok();
             }
-            (local_path, src)
+            (local_path, src, input_served)
         };
+        if position == 0 {
+            served = Some(input_served);
+        }
         if remote && options.index_file_path.is_none() {
             if let Some(path) = opts.index_file_path.clone() {
                 options.index_file_path = Some(path);
@@ -4804,9 +4951,22 @@ pub fn build_mount_source_with_bindings(
     }
     Ok(MountBundle {
         source,
+        served,
         plain_tar_file,
         _remotes: remotes,
     })
+}
+
+/// The index an open selected, as the token records it.
+fn index_provenance(used: &IndexUsed) -> IndexProvenance {
+    match (used.location.as_path(), &used.discovered_from) {
+        (Some(path), Some(from)) => IndexProvenance::Discovered {
+            path: path.to_path_buf(),
+            from: from.clone(),
+        },
+        (Some(path), None) => IndexProvenance::Local(path.to_path_buf()),
+        (None, _) => IndexProvenance::None,
+    }
 }
 
 fn strip_source_name(name: &str) -> String {
@@ -8686,6 +8846,10 @@ mod tests {
 #[path = "factory_tensors_tests.rs"]
 mod tensors_tests;
 
+#[cfg(test)]
+#[path = "factory_served_tests.rs"]
+mod served_tests;
+
 #[cfg(all(test, feature = "git", unix))]
 mod git_tests {
     use super::*;
@@ -9043,13 +9207,14 @@ mod git_tests {
         });
         assert!(session.is_ok(), "{}", session.err().unwrap());
         let mut remotes = Vec::new();
-        let (_, source) = remote_open::materialize_remote_input(
+        let source = remote_open::materialize_remote_input(
             url::Url::from_file_path(tar).unwrap().as_str(),
             &options,
             false,
             &mut remotes,
         )
-        .unwrap();
+        .unwrap()
+        .source;
         assert!(source.lookup("/before", 0).is_some());
     }
 
@@ -9360,7 +9525,12 @@ mod source_bind_tests {
             false,
             CompositingOptions::default(),
             SourceBindings {
-                sources: vec![image],
+                sources: vec![DeclaredSource {
+                    src: image,
+                    kind: ServedKind::Folder,
+                    location: None,
+                    label: "image".into(),
+                }],
                 binds: vec![SourceBind {
                     mount_path: "/repo".into(),
                     source: repo.to_string_lossy().into(),

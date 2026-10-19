@@ -16,6 +16,7 @@ mod oci_whiteout;
 pub mod overlay_changes;
 #[cfg(unix)]
 pub mod overlay_fsck;
+pub mod overlay_identity;
 pub mod overlay_layer;
 pub mod overlay_meta;
 mod overlay_policy;
@@ -49,6 +50,10 @@ pub use empty_archive::{
 };
 pub use folder::FolderMountSource;
 pub use oci_whiteout::OciImageMountSource;
+pub use overlay_identity::{
+    ActualBase, ClassifiedBase, CreateOptions, IndexProvenance, OpenBase, Opened, SealedRecord,
+    ServedKind, ServedLocation,
+};
 pub use overlay_layer::{
     compose_stack, serving_layer, Immutability, LayerIndex, ReadOnlyOverlayLayer,
 };

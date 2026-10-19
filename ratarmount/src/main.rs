@@ -2204,13 +2204,25 @@ fn main() {
         ..Default::default()
     };
     if let Some(series) = &rolling {
-        bindings
-            .sources
-            .push(series.clone() as Arc<dyn MountSource>);
+        // Declared: the series is built here, so this caller names what it is.
+        let active = series.active_path();
+        bindings.sources.push(factory::DeclaredSource {
+            src: series.clone() as Arc<dyn MountSource>,
+            kind: ratarmount_compositing::ServedKind::Archive,
+            location: Some(ratarmount_compositing::ServedLocation::Local(
+                active.clone(),
+            )),
+            label: active.display().to_string(),
+        });
     }
     if let Some(list) = &args.corpus_list {
         match corpus::open(list, args.corpus_cache_size as usize) {
-            Ok(source) => bindings.sources.push(source),
+            Ok(source) => bindings.sources.push(factory::DeclaredSource {
+                src: source,
+                kind: ratarmount_compositing::ServedKind::Folder,
+                location: None,
+                label: "corpus".to_owned(),
+            }),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(2);
