@@ -7072,11 +7072,11 @@ fn rebuild_zip_with_overlay(
         OverlayError::Msg(format!("Failed to read ZIP '{}': {e}", zip_file.display()))
     })?;
 
-    let parent = zip_file.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp = match parent {
-        Some(dir) => tempfile::NamedTempFile::new_in(dir)?,
-        None => tempfile::NamedTempFile::new()?,
-    };
+    let parent = zip_file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
 
     {
         let mut writer = ZipWriter::new(tmp.as_file_mut());
@@ -7558,11 +7558,11 @@ fn commit_overlay_tar_zst(
 
 /// Compress `plain` with `format` and atomically replace `dest`.
 fn recompress_replace(plain: &Path, dest: &Path, format: CompressionFormat) -> Result<()> {
-    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp = match parent {
-        Some(dir) => tempfile::NamedTempFile::new_in(dir)?,
-        None => tempfile::NamedTempFile::new()?,
-    };
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
 
     {
         let mut src = BufReader::new(File::open(plain)?);
@@ -9334,6 +9334,110 @@ mod tests {
             zw.write_all(data).unwrap();
         }
         zw.finish().unwrap();
+    }
+
+    /// Re-run test `name` in a child whose cwd is `cwd` and whose `TMPDIR` does
+    /// not exist, so any scratch allocation in `$TMPDIR` fails (or, on a real
+    /// host, would land on another filesystem). `vars` carry absolute inputs.
+    #[cfg(unix)]
+    fn run_bare_name_child(name: &str, cwd: &Path, vars: &[(&str, &Path)]) {
+        let mut cmd = StdCommand::new(std::env::current_exe().unwrap());
+        cmd.env("RATARMOUNT_BARE_NAME_CHILD", "1")
+            .env("TMPDIR", cwd.join("does-not-exist"))
+            .current_dir(cwd)
+            .args([name, "--exact", "--nocapture"]);
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "child stdout: {}\nchild stderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("running 1 test"),
+            "child must have run the test"
+        );
+    }
+
+    #[cfg(unix)]
+    fn in_bare_name_child() -> bool {
+        std::env::var_os("RATARMOUNT_BARE_NAME_CHILD").is_some()
+    }
+
+    /// Regression: #134 `recompress_replace` on a bare relative `dest` staged
+    /// its temp file in `$TMPDIR`; `persist` then failed with EXDEV when
+    /// `$TMPDIR` was on another filesystem.
+    #[cfg(unix)]
+    #[test]
+    fn regression_134_recompress_replace_bare_name_stages_beside_dest() {
+        if in_bare_name_child() {
+            let plain = PathBuf::from(std::env::var_os("RM134_PLAIN").unwrap());
+            for (dest, fmt) in [
+                ("t.tar.gz", CompressionFormat::Gzip),
+                ("t.tar.bz2", CompressionFormat::Bzip2),
+            ] {
+                recompress_replace(&plain, Path::new(dest), fmt)
+                    .unwrap_or_else(|e| panic!("{dest}: {e}"));
+                assert!(fs::metadata(dest).unwrap().len() > 0);
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.tar");
+        fs::write(&plain, vec![0u8; 10240]).unwrap();
+        run_bare_name_child(
+            "write_overlay::tests::regression_134_recompress_replace_bare_name_stages_beside_dest",
+            dir.path(),
+            &[("RM134_PLAIN", &plain)],
+        );
+        assert!(dir.path().join("t.tar.gz").is_file());
+        assert!(dir.path().join("t.tar.bz2").is_file());
+    }
+
+    /// Regression: #134 ZIP `--commit-overlay` of a bare relative `t.zip`
+    /// staged the rebuilt ZIP in `$TMPDIR` (EXDEV on `persist`).
+    #[cfg(unix)]
+    #[test]
+    fn regression_134_commit_overlay_zip_bare_name_stages_beside_dest() {
+        if in_bare_name_child() {
+            let overlay = PathBuf::from(std::env::var_os("RM134_OVERLAY").unwrap());
+            let opts = CommitOverlayOptions {
+                yes: true,
+                debug: 0,
+                ..Default::default()
+            };
+            commit_overlay(&overlay, Path::new("t.zip"), &opts).expect("commit_overlay bare zip");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("t.zip");
+        write_sample_zip(
+            &zip_path,
+            &[("old.txt", b"old zip\n", CompressionMethod::Stored)],
+        );
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        {
+            let base = Arc::new(NullBase) as Arc<dyn MountSource>;
+            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            fs::write(overlay.join("new.txt"), b"hello bare zip\n").unwrap();
+        }
+        run_bare_name_child(
+            "write_overlay::tests::regression_134_commit_overlay_zip_bare_name_stages_beside_dest",
+            dir.path(),
+            &[("RM134_OVERLAY", &overlay)],
+        );
+        let mut archive = ZipArchive::new(File::open(&zip_path).unwrap()).unwrap();
+        let mut body = String::new();
+        archive
+            .by_name("new.txt")
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        assert_eq!(body, "hello bare zip\n");
     }
 
     /// Regression: ZIP --commit-overlay add file (full rebuild) → reopen list/read.
