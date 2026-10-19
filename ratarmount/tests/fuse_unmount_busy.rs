@@ -47,14 +47,24 @@ impl Log {
         thread::spawn(move || {
             let _eof_tx = eof_tx;
             let mut fired = false;
-            for line in BufReader::new(reader).lines() {
-                let Ok(line) = line else { break };
-                if !fired && is_busy_trigger(&line) {
+            // Raw bytes, lossy: a non-UTF-8 line must not stop the drain (the child would block
+            // on a full pipe). Stops only at EOF or an I/O error.
+            let mut reader = BufReader::new(reader);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let line = String::from_utf8_lossy(&buf);
+                let line = line.trim_end_matches(['\n', '\r']);
+                if !fired && is_busy_trigger(line) {
                     fired = true;
                     let _ = tx.send(());
                 }
                 let mut t = sink.lock().unwrap();
-                t.push_str(&line);
+                t.push_str(line);
                 t.push('\n');
             }
         });
