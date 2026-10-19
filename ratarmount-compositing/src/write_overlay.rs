@@ -3397,6 +3397,9 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
+        // After `recover` on purpose: recovery only rolls a torn earlier append
+        // back to the archive the rows describe, and the identity check then
+        // judges that restored file; nothing of this commit is written before it.
         self.check_commit_identity(archive)?;
         let target = self.rolling_commit_target(archive, &plan)?;
         let archive = target.as_path();
@@ -4050,6 +4053,9 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
+        // After `recover` on purpose: recovery only rolls a torn earlier append
+        // back to the archive the rows describe, and the identity check then
+        // judges that restored file; nothing of this commit is written before it.
         self.check_commit_identity(archive)?;
         let target = self.rolling_commit_target(archive, &plan)?;
         let archive = target.as_path();

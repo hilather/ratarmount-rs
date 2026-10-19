@@ -338,7 +338,8 @@ create, commit or refresh recorded (a `stat` of its size and mtime; the mount's
 `none`). A refused commit refuses that commit only: nothing is written, the
 mount keeps serving, and `--force-base-mismatch` accepts the new base. A swap of
 the base with the same size and mtime cannot be caught without hashing; only
-`overlay seal` or `overlay verify` with a strong digest catches it.
+`overlay verify` with a strong digest catches it (it rehashes; `overlay seal` of
+an already-strong base compares the stamp and does not).
 `--commit-overlay` on a raw directory of files (no overlay database) has no
 identity to check and says so.
 
