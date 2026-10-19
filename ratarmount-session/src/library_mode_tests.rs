@@ -225,8 +225,7 @@ fn member_extent_overlay_modified_file_returns_none() {
         false,
     )
     .unwrap();
-    let overlay =
-        ratarmount_compositing::WriteOverlay::new(base, dir.path().join("writes")).unwrap();
+    let overlay = crate::test_overlay::new_overlay(base, dir.path().join("writes")).unwrap();
     let fd = overlay.create_file("/file", 0o644).unwrap();
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     file.write_all(b"modified").unwrap();

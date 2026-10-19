@@ -2,6 +2,8 @@
 
 #[cfg(test)]
 mod fuser_tests;
+#[cfg(test)]
+mod test_overlay;
 
 pub mod oplog;
 mod passthrough;
@@ -4177,7 +4179,7 @@ mod tests {
         }
         let td = tempfile::tempdir().unwrap();
         let quota = Arc::new(Quota(AtomicU64::new(0)));
-        let mut ov = WriteOverlay::new(Arc::new(EmptyBase), td.path()).unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(EmptyBase), td.path()).unwrap();
         ov.set_policy(Some(quota.clone()));
         ov.close_overlay_fd(ov.create_file("/file", 0o644).unwrap());
         let ov = Arc::new(ov);
@@ -4208,7 +4210,8 @@ mod tests {
     #[test]
     fn regression_write_handle_keeps_legacy_eio() {
         let td = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(Arc::new(EmptyBase), td.path()).unwrap());
+        let ov =
+            Arc::new(crate::test_overlay::new_overlay(Arc::new(EmptyBase), td.path()).unwrap());
         ov.close_overlay_fd(ov.create_file("/file", 0o644).unwrap());
         let fs = RatarmountFs::new(ov.clone(), Some(ov));
         let ino = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("file")).unwrap().0;
@@ -4246,7 +4249,7 @@ mod tests {
         }
         let td = tempfile::tempdir().unwrap();
         let probe = Arc::new(Probe(Mutex::new(std::sync::Weak::new())));
-        let mut ov = WriteOverlay::new(Arc::new(EmptyBase), td.path()).unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(EmptyBase), td.path()).unwrap();
         ov.close_overlay_fd(ov.create_file("/file", 0o644).unwrap());
         ov.set_policy(Some(probe.clone()));
         let ov = Arc::new(ov);
@@ -4323,7 +4326,8 @@ mod tests {
     #[test]
     fn passthrough_overlay_policy_keeps_writable_mount_on_daemon() {
         let dir = tempfile::tempdir().unwrap();
-        let mut overlay = WriteOverlay::new(Arc::new(EmptyBase), dir.path()).unwrap();
+        let mut overlay =
+            crate::test_overlay::new_overlay(Arc::new(EmptyBase), dir.path()).unwrap();
         let fd = overlay.create_file("/file", 0o644).unwrap();
         overlay.close_overlay_fd(fd);
         std::fs::write(dir.path().join("file"), b"payload").unwrap();
@@ -4365,7 +4369,7 @@ mod tests {
     #[test]
     fn regression_overlay_policy_denials() {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(EmptyBase), td.path()).unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(EmptyBase), td.path()).unwrap();
         ov.mkdir("/locked", 0o755).unwrap();
         ov.mkdir("/locked/empty", 0o755).unwrap();
         for path in ["/locked/file", "/outside", "/quota"] {
@@ -4667,13 +4671,12 @@ mod tests {
     /// from the inode cache (write-then-cat / stat returned empty size).
     #[test]
     fn overlay_file_info_for_ino_refreshes_size_after_write() {
-        use ratarmount_compositing::WriteOverlay;
         use std::io::Write;
         use std::os::unix::io::FromRawFd;
 
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         // Create empty file (size 0) then write payload — same sequence as FUSE create+write.
         let fd = ov.create_file("/new.txt", 0o644).expect("create");
         let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -4738,13 +4741,12 @@ mod tests {
     /// skips `has_file` and goes `file_info_for_open` + `open_source_backend`.
     #[test]
     fn overlay_open_after_create_write() {
-        use ratarmount_compositing::WriteOverlay;
         use std::io::Write;
         use std::os::unix::io::FromRawFd;
 
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fd = ov.create_file("/new.txt", 0o644).expect("create");
         let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
         f.write_all(b"hello-overlay-payload").unwrap();
@@ -4777,12 +4779,11 @@ mod tests {
     /// production open/read must return "".
     #[test]
     fn overlay_open_after_create_reads_empty() {
-        use ratarmount_compositing::WriteOverlay;
         use std::os::unix::io::FromRawFd;
 
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fd = ov.create_file("/empty.txt", 0o644).expect("create");
         drop(unsafe { std::fs::File::from_raw_fd(fd) });
 
@@ -4805,13 +4806,12 @@ mod tests {
     /// FileInfo (and never both `Some`).
     #[test]
     fn overlay_store_cookie_without_file_info() {
-        use ratarmount_compositing::WriteOverlay;
         use std::io::Write;
         use std::os::unix::io::FromRawFd;
 
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fd = ov.create_file("/cookie.txt", 0o644).expect("create");
         let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
         f.write_all(b"payload").unwrap();
@@ -4846,7 +4846,6 @@ mod tests {
     /// write still drops that cache so the next stat sees the overlay size.
     #[test]
     fn overlay_archive_member_stat_skips_repeat_lookup() {
-        use ratarmount_compositing::WriteOverlay;
         use std::sync::atomic::{AtomicU64, Ordering};
 
         struct CountingTar {
@@ -4917,7 +4916,7 @@ mod tests {
             lookups: Arc::clone(&lookups),
             opens: Arc::clone(&opens),
         }) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -5220,7 +5219,7 @@ mod tests {
     fn regression_direct_io_member_flags_leave_overlay_cached() {
         let source = OffsetShiftSource::two_members(b"archive", b"other");
         let dir = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(source, dir.path()).unwrap());
+        let ov = Arc::new(crate::test_overlay::new_overlay(source, dir.path()).unwrap());
         let fs = RatarmountFs::new(ov.clone(), Some(ov.clone())).with_direct_io(true);
         let ino = fs.ino_for_path("/a.txt");
         let (fh, flags) = fs.open_inode(ino, libc::O_RDONLY).unwrap();
@@ -5365,7 +5364,7 @@ mod tests {
     fn overlay_fs_for_rename() -> (tempfile::TempDir, Arc<WriteOverlay>, RatarmountFs) {
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -5610,11 +5609,9 @@ mod tests {
     /// Symptom: create file under parent, then ls misses the new name until TTL expires.
     #[test]
     fn overlay_create_invalidates_dir_cache_so_list_shows_new_name() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -6011,11 +6008,9 @@ mod tests {
     /// Regression: unlink must drop parent dir_cache so readdir does not ghost-delete.
     #[test]
     fn overlay_unlink_invalidates_dir_cache_so_list_drops_name() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -6932,11 +6927,9 @@ mod tests {
     /// so the batch is exactly `Inode(root)`.
     #[test]
     fn entry_advertised_create_unseen_name_sends_root_inode_not_entry() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -6980,14 +6973,12 @@ mod tests {
     /// unlink or create of that name sends no Entry: the pair was consumed.
     #[test]
     fn entry_advertised_lookup_inserts_pair_and_unlink_sends_entry() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(NamedMember {
             name: "m".into(),
             fi: stable_tar_fi(4),
         }) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -7116,11 +7107,9 @@ mod tests {
     }
 
     fn readable_tree_fs(entries: Vec<(String, FileInfo)>) -> (tempfile::TempDir, RatarmountFs) {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(ReadableMembers(entries)) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -7394,8 +7383,6 @@ mod tests {
 
     /// Write-overlay fs over `GenMembers`: stable file `m`, stable dir `sub`.
     fn gen_members_fs() -> (tempfile::TempDir, RatarmountFs, Arc<AtomicU64>) {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let mut sub = stable_tar_fi(0);
         sub.mode = ratarmount_core::S_IFDIR | 0o755;
@@ -7404,7 +7391,7 @@ mod tests {
             ReadableMembers(vec![("m".into(), stable_tar_fi(4)), ("sub".into(), sub)]),
             Arc::clone(&gen),
         )) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -7535,11 +7522,9 @@ mod tests {
     /// Unlink sends no Entry and no Inode(child).
     #[test]
     fn entry_advertised_overlay_unlink_sends_no_entry_or_child_inode() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -7592,11 +7577,9 @@ mod tests {
     /// non-zero-size file. It must not insert into `entry_advertised`.
     #[test]
     fn entry_advertised_readdirplus_entry_ttl_is_zero_with_overlay() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -7719,8 +7702,6 @@ mod tests {
     fn byte_members_fs(
         entries: &[(&str, &str)],
     ) -> (tempfile::TempDir, RatarmountFs, Arc<ByteMembers>) {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let mut files = BTreeMap::new();
         for (name, body) in entries {
@@ -7732,7 +7713,7 @@ mod tests {
             opens: Arc::new(AtomicUsize::new(0)),
         });
         let base = Arc::clone(&bytes) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(Arc::clone(&ov) as Arc<dyn MountSource>, Some(ov));
         (dir, fs, bytes)
     }
@@ -7796,11 +7777,9 @@ mod tests {
     }
 
     fn xattr_members_fs(files: BTreeMap<String, FileInfo>) -> (tempfile::TempDir, RatarmountFs) {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(XattrMembers { files }) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(Arc::clone(&ov) as Arc<dyn MountSource>, Some(ov));
         (dir, fs)
     }
@@ -8640,7 +8619,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base: Arc<dyn MountSource> = Arc::new(EmptyBase);
         let lower_path = dir.path().join("lower");
-        let lower = WriteOverlay::new(base.clone(), &lower_path).unwrap();
+        let lower = crate::test_overlay::new_overlay(base.clone(), &lower_path).unwrap();
         overlay_write_new(&lower, "/lower-file", b"lower");
         drop(lower);
         let stack = ratarmount_compositing::compose_stack(
@@ -8648,7 +8627,8 @@ mod tests {
             &[(lower_path, ratarmount_compositing::Immutability::Shared)],
         )
         .unwrap();
-        let overlay = Arc::new(WriteOverlay::new(stack, dir.path().join("top")).unwrap());
+        let overlay =
+            Arc::new(crate::test_overlay::new_overlay(stack, dir.path().join("top")).unwrap());
         overlay.set_meta("base_digest", "sha256:base").unwrap();
         overlay.set_meta("stack_digest", "sha256:stack").unwrap();
         overlay.set_meta("lower_layers", "[]").unwrap();
@@ -8773,7 +8753,7 @@ mod sandbox_attr_tests {
         let base = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
-        let overlay = Arc::new(WriteOverlay::new(source, directory.path()).unwrap());
+        let overlay = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
         let fs = RatarmountFs::new(overlay.clone(), Some(overlay.clone())).with_attribute_mapping(
             AttributeMapping::parse("uid=12345,gid=23456,umask=027").unwrap(),
         );

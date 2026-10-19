@@ -1,8 +1,9 @@
 //! Regression: layered mount startup and offline fsck, without /dev/fuse.
 
-use ratarmount_compositing::{
-    stack_digest, FolderMountSource, OverlayMeta, WriteOverlay, HIDDEN_DB,
-};
+#[path = "support/token.rs"]
+mod token;
+
+use ratarmount_compositing::{stack_digest, FolderMountSource, OverlayMeta, HIDDEN_DB};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -173,7 +174,7 @@ fn regression_cow_lower_fsck_cli_json_exit_codes_and_lock() {
     assert_eq!(fsck(&dir, false).status.code(), Some(2));
     success(open(&base, Some(&dir), &[], &[]));
     fs::write(base.join("cow"), b"base").unwrap();
-    let ov = WriteOverlay::new(Arc::new(FolderMountSource::new(&base).unwrap()), &dir).unwrap();
+    let ov = token::new_overlay(Arc::new(FolderMountSource::new(&base).unwrap()), &dir).unwrap();
     cow::cow_write(&ov, "/cow", b"changed");
     drop(ov);
     let output = fsck(&dir, true);
@@ -210,7 +211,8 @@ fn regression_cow_lower_fsck_cli_json_exit_codes_and_lock() {
     assert!(text.contains("missing_content: 1") && text.contains("result: errors:1"));
     success(fsck(&dir, true));
     success(fsck(&dir, false));
-    let mounted = WriteOverlay::new(Arc::new(FolderMountSource::new(base).unwrap()), &dir).unwrap();
+    let mounted =
+        token::new_overlay(Arc::new(FolderMountSource::new(base).unwrap()), &dir).unwrap();
     let busy = fsck(&dir, true);
     assert_eq!(busy.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&busy.stderr).contains("in use"));

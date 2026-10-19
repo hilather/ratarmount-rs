@@ -234,8 +234,6 @@ fn overlay_write_via_sftp_client_skip_without() {
 }
 
 fn run_sftp_overlay_put() {
-    use ratarmount_compositing::WriteOverlay;
-
     let td = tempfile::tempdir().unwrap();
     let (ident, pubk) = ssh_keygen_ed25519(td.path()).expect("ssh-keygen");
     let auth = td.path().join("authorized_keys");
@@ -244,7 +242,7 @@ fn run_sftp_overlay_put() {
     let ovdir = td.path().join("ov");
     std::fs::create_dir(&ovdir).unwrap();
     let inner: Arc<dyn MountSource> = Arc::new(EmptyFs);
-    let ov = Arc::new(WriteOverlay::new(inner.clone(), &ovdir).expect("overlay"));
+    let ov = Arc::new(crate::test_overlay::new_overlay(inner.clone(), &ovdir).expect("overlay"));
     let source: Arc<dyn MountSource> = ov.clone();
 
     let stop = ExportStop::new();

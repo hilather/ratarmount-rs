@@ -250,7 +250,7 @@ mod protocol {
     #[test]
     fn regression_non_utf8_name_write_callbacks_wire() {
         let dir = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(Arc::new(Source), dir.path()).unwrap());
+        let ov = Arc::new(crate::test_overlay::new_overlay(Arc::new(Source), dir.path()).unwrap());
         let fs = RatarmountFs::new(ov.clone(), Some(ov.clone()));
         let mut h = Harness::with_fs(mount_config(true, ""), 1024, fs);
         let invalid = b"caf\xe9\0";
@@ -311,7 +311,7 @@ mod protocol {
     #[test]
     fn regression_provenance_fuser_xattr_wire() {
         let dir = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(Arc::new(Source), dir.path()).unwrap());
+        let ov = Arc::new(crate::test_overlay::new_overlay(Arc::new(Source), dir.path()).unwrap());
         let fs = RatarmountFs::new(ov.clone(), Some(ov));
         let mut h = Harness::with_capabilities(
             mount_config(true, ""),
@@ -688,7 +688,7 @@ mod protocol {
     #[test]
     fn fuser_detached_inode_survives_until_final_forget() {
         let dir = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(Arc::new(Source), dir.path()).unwrap());
+        let ov = Arc::new(crate::test_overlay::new_overlay(Arc::new(Source), dir.path()).unwrap());
         let fs = RatarmountFs::new(ov.clone(), Some(ov));
         let mut harness = Harness::with_fs(mount_config(true, ""), 4096, fs);
         let create = [

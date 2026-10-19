@@ -195,76 +195,124 @@ fn regression_edited_base_is_refused_by_seal_pack_and_diff() {
 #[test]
 fn regression_forced_seal_records_actual_base_and_verifies() {
     for kind in [Kind::Dir, Kind::Archive] {
-        let env = Env::new();
-        let (base, overlay) = fixture(&env, kind, false);
-        let old = meta_of(&overlay).base_digest().unwrap().to_owned();
-        edit(&base, kind);
-        let out = verb(
-            &env,
-            Verb::Seal,
-            &overlay,
-            &base,
-            &["--force-base-mismatch"],
-        );
-        assert_eq!(out.status.code(), Some(0), "{kind:?}: {}", text(&out));
-        let meta = meta_of(&overlay);
-        assert!(meta.layer_sealed());
-        assert!(meta.get("base_mismatch_forced_at").is_some());
-        assert_ne!(
-            meta.base_digest().unwrap(),
-            old,
-            "{kind:?} kept the stale identity"
-        );
-        match kind {
-            Kind::Dir => assert_eq!(meta.get("base_weak_digest"), Some(weak_now(&base).as_str())),
-            Kind::Archive => assert_eq!(meta.get("base_mtime_ns"), Some(mtime_ns(&base).as_str())),
+        // Nothing supplied: the forced base drops to kind-only (`none`) with no
+        // weak digest and no stamp. With the digest of the base as it is now
+        // supplied, it is recorded strong with the measured rows.
+        for supplied in [false, true] {
+            let env = Env::new();
+            let (base, overlay) = fixture(&env, kind, false);
+            let old = meta_of(&overlay).base_digest().unwrap().to_owned();
+            edit(&base, kind);
+            let digest = env.ok(&["overlay", "digest-base", s(&base)]);
+            let digest = digest.trim().to_owned();
+            let mut extra = vec!["--force-base-mismatch"];
+            if supplied {
+                extra.extend(["--base-digest", digest.as_str()]);
+            }
+            let out = verb(&env, Verb::Seal, &overlay, &base, &extra);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{kind:?} supplied={supplied}: {}",
+                text(&out)
+            );
+            let meta = meta_of(&overlay);
+            assert!(meta.layer_sealed());
+            assert!(meta.get("base_mismatch_forced_at").is_some());
+            assert_ne!(
+                meta.base_digest().unwrap(),
+                old,
+                "{kind:?} kept the stale identity"
+            );
+            if supplied {
+                assert_eq!(meta.base_digest_kind(), Some("strong"));
+                assert_eq!(meta.base_digest(), Some(digest.as_str()));
+                assert_eq!(meta.get("base_digest_source"), Some("supplied"));
+                match kind {
+                    Kind::Dir => {
+                        assert_eq!(meta.get("base_weak_digest"), Some(weak_now(&base).as_str()))
+                    }
+                    Kind::Archive => {
+                        assert_eq!(meta.get("base_mtime_ns"), Some(mtime_ns(&base).as_str()))
+                    }
+                }
+            } else {
+                assert_eq!(meta.base_digest_kind(), Some("none"), "{kind:?}");
+                assert_eq!(meta.base_digest(), Some("none"));
+                for key in [
+                    "base_weak_digest",
+                    "base_size",
+                    "base_mtime_ns",
+                    "base_digest_source",
+                ] {
+                    assert!(meta.get(key).is_none(), "{kind:?}: {key} recorded");
+                }
+            }
+            // The stack digest follows the recorded base.
+            assert_eq!(
+                meta.stack_digest().unwrap(),
+                ratarmount_compositing::stack_digest(meta.base_digest().unwrap(), &[])
+            );
+            let json = env.ok(&["overlay", "verify", s(&overlay), s(&base), "--json"]);
+            let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(json["ok"], true, "{kind:?}: {json}");
+            assert_ne!(json["base_ok"], false, "{kind:?}: {json}");
         }
-        // The stack digest follows the recorded base.
-        assert_eq!(
-            meta.stack_digest().unwrap(),
-            ratarmount_compositing::stack_digest(meta.base_digest().unwrap(), &[])
-        );
-        let json = env.ok(&["overlay", "verify", s(&overlay), s(&base), "--json"]);
-        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(json["ok"], true, "{kind:?}: {json}");
-        assert_ne!(json["base_ok"], false, "{kind:?}: {json}");
     }
 }
 
 #[test]
 fn regression_forced_pack_records_actual_base_in_bundle() {
     for kind in [Kind::Dir, Kind::Archive] {
-        let env = Env::new();
-        let (base, overlay) = fixture(&env, kind, true);
-        let old = meta_of(&overlay).base_digest().unwrap().to_owned();
-        edit(&base, kind);
-        let out = verb(
-            &env,
-            Verb::Pack,
-            &overlay,
-            &base,
-            &["--force-base-mismatch"],
-        );
-        assert_eq!(out.status.code(), Some(0), "{kind:?}: {}", text(&out));
-        // The sealed source layer is never modified.
-        assert_eq!(meta_of(&overlay).base_digest().unwrap(), old);
-        assert!(meta_of(&overlay).get("base_mismatch_forced_at").is_none());
-        let restored = env.path("restored");
-        env.ok(&[
-            "overlay",
-            "unpack",
-            s(&env.path("bundle.tar.zst")),
-            s(&restored),
-        ]);
-        let meta = meta_of(&restored);
-        assert!(meta.get("base_mismatch_forced_at").is_some());
-        assert_ne!(meta.base_digest().unwrap(), old);
-        match kind {
-            Kind::Dir => assert_eq!(meta.get("base_weak_digest"), Some(weak_now(&base).as_str())),
-            Kind::Archive => assert_eq!(meta.get("base_mtime_ns"), Some(mtime_ns(&base).as_str())),
+        for supplied in [false, true] {
+            let env = Env::new();
+            let (base, overlay) = fixture(&env, kind, true);
+            let old = meta_of(&overlay).base_digest().unwrap().to_owned();
+            edit(&base, kind);
+            let digest = env.ok(&["overlay", "digest-base", s(&base)]);
+            let digest = digest.trim().to_owned();
+            let mut extra = vec!["--force-base-mismatch"];
+            if supplied {
+                extra.extend(["--base-digest", digest.as_str()]);
+            }
+            let out = verb(&env, Verb::Pack, &overlay, &base, &extra);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{kind:?} supplied={supplied}: {}",
+                text(&out)
+            );
+            // The sealed source layer is never modified.
+            assert_eq!(meta_of(&overlay).base_digest().unwrap(), old);
+            assert!(meta_of(&overlay).get("base_mismatch_forced_at").is_none());
+            let restored = env.path("restored");
+            env.ok(&[
+                "overlay",
+                "unpack",
+                s(&env.path("bundle.tar.zst")),
+                s(&restored),
+            ]);
+            let meta = meta_of(&restored);
+            assert!(meta.get("base_mismatch_forced_at").is_some());
+            assert_ne!(meta.base_digest().unwrap(), old);
+            if supplied {
+                assert_eq!(meta.base_digest(), Some(digest.as_str()));
+                match kind {
+                    Kind::Dir => {
+                        assert_eq!(meta.get("base_weak_digest"), Some(weak_now(&base).as_str()))
+                    }
+                    Kind::Archive => {
+                        assert_eq!(meta.get("base_mtime_ns"), Some(mtime_ns(&base).as_str()))
+                    }
+                }
+            } else {
+                assert_eq!(meta.base_digest_kind(), Some("none"), "{kind:?}");
+                assert!(meta.get("base_weak_digest").is_none());
+                assert!(meta.get("base_mtime_ns").is_none());
+            }
+            // The restored layer verifies against the base it was packed on.
+            env.ok(&["overlay", "verify", s(&restored), s(&base)]);
         }
-        // The restored layer verifies against the base it was packed on.
-        env.ok(&["overlay", "verify", s(&restored), s(&base)]);
     }
 }
 
@@ -292,9 +340,8 @@ fn regression_forced_diff_reports_the_base_actually_diffed() {
             "stale recorded base reported: {json}"
         );
         assert!(json["base"].is_string(), "{json}");
-        if kind == Kind::Dir {
-            assert_eq!(json["base"], weak_now(&base).as_str());
-        }
+        // Nothing supplied: the base actually diffed is kind-only.
+        assert_eq!(json["base"], "none", "{json}");
     }
 }
 
@@ -481,7 +528,8 @@ fn regression_forced_seal_clears_obsolete_identity_rows() {
             meta.get(key)
         );
     }
-    assert!(meta.get("base_weak_digest").is_some());
+    assert!(meta.get("base_weak_digest").is_none(), "kind-only: no walk");
+    assert_eq!(meta.get("base_kind"), Some("directory"));
     let out = env.run(&["--no-mount", "--lower", s(&overlay), s(&archive)]);
     assert!(
         !out.status.success(),
@@ -505,7 +553,8 @@ fn regression_forced_seal_clears_obsolete_identity_rows() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let meta = meta_of(&overlay);
     assert!(meta.get("base_weak_digest").is_none());
-    assert!(meta.get("base_mtime_ns").is_some());
+    assert!(meta.get("base_mtime_ns").is_none(), "kind-only: no stamp");
+    assert_eq!(meta.get("base_kind"), Some("archive"));
     let out = env.run(&["--no-mount", "--lower", s(&overlay), s(&dir)]);
     assert!(
         !out.status.success(),
@@ -808,7 +857,8 @@ fn regression_forced_pack_across_kinds_records_actual_base_in_bundle_and_db() {
             let overlay = env.path("overlay");
             env.ok(&["--no-mount", "-w", s(&overlay), &url]);
             env.ok(&["overlay", "seal", s(&overlay)]);
-            (overlay, dir.clone(), "directory", weak_now(&dir))
+            // A directory with nothing supplied is kind-only.
+            (overlay, dir.clone(), "directory", "none".to_owned())
         };
         let old = meta_of(&overlay);
         let out = verb(
@@ -863,7 +913,8 @@ fn regression_forced_pack_across_kinds_records_actual_base_in_bundle_and_db() {
             assert_eq!(json["base_git_tree"], tree.as_str(), "{json}");
             assert_eq!(meta.get("base_git_tree"), Some(tree.as_str()));
         } else {
-            assert_eq!(meta.get("base_weak_digest"), Some(weak_now(&dir).as_str()));
+            assert!(meta.get("base_weak_digest").is_none());
+            assert_eq!(meta.base_digest_kind(), Some("none"));
         }
     }
 }
@@ -907,7 +958,7 @@ fn regression_forced_diff_across_kinds_reports_actual_base() {
     assert_eq!(json["base_forced"], true, "{json}");
     assert_eq!(json["base_identity"], "forced", "{json}");
     assert_eq!(json["base_recorded"], old.as_str(), "{json}");
-    assert_eq!(json["base"], weak_now(&dir).as_str(), "{json}");
+    assert_eq!(json["base"], "none", "{json}");
 }
 
 /// Review nit (R5-4): forced Git -> directory and forced archive -> Git seals
@@ -928,7 +979,8 @@ fn regression_forced_seal_git_to_dir_and_archive_to_git_clear_stale_rows() {
     let meta = meta_of(&overlay);
     assert_eq!(meta.get("base_kind"), Some("directory"));
     assert!(meta.get("base_git_tree").is_none(), "git tree survived");
-    assert_eq!(meta.get("base_weak_digest"), Some(weak_now(&dir).as_str()));
+    assert_eq!(meta.base_digest_kind(), Some("none"));
+    assert!(meta.get("base_weak_digest").is_none());
     let out = env.run(&["--no-mount", "--lower", s(&overlay), &git]);
     assert!(
         !out.status.success(),

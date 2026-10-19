@@ -55,8 +55,11 @@ pub struct LowerLayerRecord {
 /// Identity supplied by a caller that knows the original base positional.
 /// `local_path` may differ from `base_url` (for example a pinned remote download).
 /// Set `index_path` only for an existing index whose cache may be updated.
+///
+/// Not public: it is built only from a classified base
+/// (`ActualBase::create_info`), or by the in-crate tests.
 #[derive(Clone, Debug, Default)]
-pub struct OverlayCreateInfo {
+pub(crate) struct OverlayCreateInfo {
     pub base_url: String,
     pub base_digest: BaseDigestRequest,
     pub lower_layers: Vec<LowerLayerRecord>,
@@ -1124,16 +1127,18 @@ pub(crate) fn initialize(
             values.insert("base_location", location.row());
         }
     } else if info.git_tree.is_some() || info.path().is_some() || !info.base_url.is_empty() {
+        // Only the in-crate test constructors reach this: a real base is
+        // always classified by its opener.
         let kind = if info.git_tree.is_some() {
-            BaseKind::Git
+            "git"
         } else if info.path().is_some_and(Path::is_dir) {
-            BaseKind::Directory
+            "directory"
         } else if info.path().is_some_and(Path::is_file) {
-            BaseKind::Archive
+            "archive"
         } else {
-            BaseKind::Remote
+            "remote"
         };
-        values.insert("base_kind", kind.as_str().to_owned());
+        values.insert("base_kind", kind.to_owned());
     }
     if let Some(token) = &info.remote_token {
         values.insert("base_remote_token", token.clone());
@@ -1218,7 +1223,12 @@ pub(crate) fn refresh_committed_base(
         ("base_committed_at", timestamp()),
         ("base_local_path", archive.to_string_lossy().into_owned()),
         ("base_index_path", index.to_string_lossy().into_owned()),
-        ("base_kind", BaseKind::Archive.as_str().to_owned()),
+        (
+            "base_kind",
+            crate::overlay_identity::BaseKind::Archive
+                .as_str()
+                .to_owned(),
+        ),
     ];
     let moved = base.map(|b| b.repointed(&archive));
     if let Some(moved) = &moved {
@@ -1299,7 +1309,7 @@ pub enum BaseCheck {
 /// recomputed from the bytes; a weak directory digest is recomputed from the
 /// lstat manifest with the *recorded* exclusions. Git trees, remote bases,
 /// `none`, `pending` and unreadable bases are `Skipped`.
-pub fn verify_base(dir: &Path, base: &Path) -> BaseCheck {
+pub(crate) fn verify_base_path(dir: &Path, base: &Path) -> BaseCheck {
     let skipped = |reason: &str| BaseCheck::Skipped {
         reason: reason.to_owned(),
     };
@@ -1379,8 +1389,9 @@ pub fn verify_base(dir: &Path, base: &Path) -> BaseCheck {
     }
 }
 
-/// What a caller knows about a base without reading any of its content.
-pub struct BaseProbe<'a> {
+/// What the content comparison measures: the local path of the base the
+/// opener served (never guessed), its Git tree, and the caller's own paths.
+pub(crate) struct ContentProbe<'a> {
     /// Local path of a directory or archive base; `None` for remote bases.
     pub path: Option<&'a Path>,
     /// Tree id of a pinned Git base.
@@ -1394,94 +1405,7 @@ pub struct BaseProbe<'a> {
     pub extra_excludes: &'a [PathBuf],
 }
 
-/// What a base is, for the one rule every base check shares: a change of kind
-/// is a different base (and is refused without `--force-base-mismatch`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BaseKind {
-    /// A local directory (weak manifest walk).
-    Directory,
-    /// A local archive file (size/mtime stamp).
-    Archive,
-    /// A pinned Git tree.
-    Git,
-    /// Anything else: an HTTP/S3/... URL or a composite of inputs.
-    Remote,
-}
-
-impl BaseKind {
-    /// Every kind. Exhaustiveness is checked where kinds are compared
-    /// (see `kind_name`) and by the table test over all pairs.
-    pub const ALL: [BaseKind; 4] = [
-        BaseKind::Directory,
-        BaseKind::Archive,
-        BaseKind::Git,
-        BaseKind::Remote,
-    ];
-
-    /// The value stored in the `base_kind` row.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            BaseKind::Directory => "directory",
-            BaseKind::Archive => "archive",
-            BaseKind::Git => "git",
-            BaseKind::Remote => "remote",
-        }
-    }
-
-    fn parse(text: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|k| k.as_str() == text)
-    }
-
-    /// The kind of the base `probe` describes.
-    pub fn of_probe(probe: &BaseProbe) -> Self {
-        if probe.git_tree.is_some() {
-            BaseKind::Git
-        } else if probe.path.is_some_and(Path::is_dir) {
-            BaseKind::Directory
-        } else if probe.path.is_some_and(Path::is_file) {
-            BaseKind::Archive
-        } else {
-            BaseKind::Remote
-        }
-    }
-
-    /// The kind an overlay recorded: the `base_kind` row, else (overlays made
-    /// before it existed) the comparison rows that identify it (a named base
-    /// with none of them is remote). `None` for a
-    /// recorded kind of `none` (or none at all): no identity to compare.
-    pub fn recorded(meta: &OverlayMeta) -> Option<Self> {
-        if meta.base_digest_kind().is_none_or(|k| k == "none") {
-            return None;
-        }
-        // Transitional (R6-3 .. R6-4): an overlay created over a remote base
-        // records its kind as served (an HTTP archive is an `archive`) and
-        // the place `remote:`. The untokened verbs still tell remote bases
-        // from local ones by the probe, so they see this record as remote.
-        if meta
-            .get("base_location")
-            .is_some_and(|row| row.starts_with("remote:"))
-        {
-            return Some(BaseKind::Remote);
-        }
-        if let Some(kind) = meta.get("base_kind").and_then(Self::parse) {
-            return Some(kind);
-        }
-        if meta.get("base_git_tree").is_some() {
-            Some(BaseKind::Git)
-        } else if meta.get("base_weak_digest").is_some() {
-            Some(BaseKind::Directory)
-        } else if meta.get("base_size").is_some() || meta.get("base_local_path").is_some() {
-            Some(BaseKind::Archive)
-        } else if meta.base_url().is_some_and(|url| !url.is_empty()) {
-            Some(BaseKind::Remote)
-        } else {
-            // Nothing names the base: nothing to compare a kind with.
-            None
-        }
-    }
-}
-
-/// Result of [`compare_base_identity`].
+/// Result of [`crate::overlay_gate::compare_base_identity`].
 #[derive(Debug, Default)]
 pub struct BaseComparison {
     /// The base's own identity: the supplied digest, the weak manifest, the
@@ -1515,20 +1439,12 @@ pub struct BaseComparison {
 ///   contradicts a strong record is a mismatch even if the walk agrees.
 ///
 /// A recorded kind of `none` (or no metadata) recorded no identity to compare.
-pub fn compare_base_identity(
-    meta: Option<&OverlayMeta>,
-    probe: &BaseProbe,
-) -> std::result::Result<BaseComparison, String> {
-    compare_content(meta, probe, true)
-}
-
-/// The content half of the comparison. `check_kind` runs the legacy kind rule
-/// that guesses the actual kind from the probe; the token-based gate has
-/// already compared the kind the opener reported and passes `false`.
+///
+/// This is the content half: the kind and place the opener reported are
+/// compared first by [`crate::overlay_gate::shape_verdict`].
 pub(crate) fn compare_content(
     meta: Option<&OverlayMeta>,
-    probe: &BaseProbe,
-    check_kind: bool,
+    probe: &ContentProbe,
 ) -> std::result::Result<BaseComparison, String> {
     let get = |key: &str| meta.and_then(|m| m.get(key));
     let decidable = meta.is_some_and(|m| m.base_digest_kind().is_some_and(|k| k != "none"));
@@ -1628,97 +1544,8 @@ pub(crate) fn compare_content(
             mismatch = Some(supplied.to_owned());
         }
     }
-    // The one kind rule: a base of another kind than the recorded one is a
-    // different base, whatever else agrees. Compared with `==`, so a new kind
-    // cannot be skipped.
-    if mismatch.is_none() && check_kind {
-        let actual = BaseKind::of_probe(probe);
-        if let Some(recorded) = meta.and_then(BaseKind::recorded).filter(|r| *r != actual) {
-            mismatch = Some(format!(
-                "a {} base (the overlay recorded a {} base)",
-                actual.as_str(),
-                recorded.as_str()
-            ));
-        }
-    }
     out.mismatch = mismatch;
     Ok(out)
-}
-
-/// The meta rows that make the overlay describe the base `probe` measured,
-/// for a forced seal or pack (`--force-base-mismatch`): the actual identity
-/// instead of the recorded one, the recomputed `stack_digest`, and the time of
-/// the override. Metadata only: a directory records its weak walk (or the
-/// supplied strong digest), an archive its stamp plus the supplied or cached
-/// digest, else the weak `size`/`mtime_ns` form (nothing is hashed), Git its
-/// tree id.
-pub fn forced_base_record(
-    meta: &OverlayMeta,
-    probe: &BaseProbe,
-    measured: &BaseComparison,
-) -> std::result::Result<BTreeMap<String, String>, String> {
-    let mut rows: BTreeMap<String, String> = BTreeMap::new();
-    let mut set = |key: &str, value: String| {
-        rows.insert(key.to_owned(), value);
-    };
-    let (digest, kind, source) = if let Some(tree) = probe.git_tree {
-        set("base_git_tree", tree.to_owned());
-        (format!("git-tree:{tree}"), "git-tree", "computed")
-    } else if let Some(dir) = probe.path.filter(|p| p.is_dir()) {
-        if let Some(weak) = &measured.weak {
-            set("base_weak_digest", weak.clone());
-        }
-        match (probe.supplied, &measured.weak) {
-            (Some(supplied), _) => (supplied.to_owned(), "strong", "supplied"),
-            (None, Some(weak)) => (weak.clone(), "weak", "computed"),
-            (None, None) => {
-                return Err(format!("cannot measure base {}", dir.display()));
-            }
-        }
-    } else if let Some(file) = probe.path.filter(|p| p.is_file()) {
-        let stamp = measured
-            .stamp
-            .as_ref()
-            .ok_or_else(|| format!("cannot stat base {}", file.display()))?;
-        set("base_size", stamp.size.to_string());
-        set("base_mtime_ns", stamp.mtime_ns.to_string());
-        set(
-            "base_local_path",
-            file.canonicalize()
-                .map_err(|e| format!("cannot resolve base {}: {e}", file.display()))?
-                .to_string_lossy()
-                .into_owned(),
-        );
-        match (probe.supplied, &measured.cached_digest) {
-            (Some(supplied), _) => (supplied.to_owned(), "strong", "supplied"),
-            (None, Some(cached)) => (cached.clone(), "strong", "computed"),
-            (None, None) => (
-                format!("weak:size={},mtime_ns={}", stamp.size, stamp.mtime_ns),
-                "weak",
-                "computed",
-            ),
-        }
-    } else if let Some(supplied) = probe.supplied {
-        // A remote base: nothing is read, the supplied digest is the identity.
-        (supplied.to_owned(), "strong", "supplied")
-    } else {
-        return Err("the base is not a local directory, archive or Git tree; pass --base-digest sha256:<hex> to record its identity".into());
-    };
-    let layers = meta.lower_layers().map_err(|e| e.to_string())?;
-    let stack = stack_digest(
-        &digest,
-        &layers
-            .iter()
-            .map(|l| l.layer_digest.as_str())
-            .collect::<Vec<_>>(),
-    );
-    set("base_kind", BaseKind::of_probe(probe).as_str().to_owned());
-    set("base_digest", digest);
-    set("base_digest_kind", kind.to_owned());
-    set("base_digest_source", source.to_owned());
-    set("stack_digest", stack);
-    set("base_mismatch_forced_at", timestamp());
-    Ok(rows)
 }
 
 /// Every row that compares a base with the overlay's record (not
@@ -1752,8 +1579,13 @@ impl OverlayMeta {
     }
 }
 
-/// Write `rows` into an unsealed overlay's `meta` table (a forced seal).
-pub fn record_base_rows_offline(overlay: &Path, rows: &BTreeMap<String, String>) -> Result<()> {
+/// Write `rows` into an unsealed overlay's `meta` table (a forced seal). Not
+/// public: [`crate::overlay_gate::record_forced_base_rows`] is the entry, and
+/// it demands the classified base the rows describe.
+pub(crate) fn record_base_rows_offline(
+    overlay: &Path,
+    rows: &BTreeMap<String, String>,
+) -> Result<()> {
     // NOFOLLOW rejects a symlink in any component, so resolve the directory
     // first (every macOS temp dir lives under /var -> /private/var).
     let conn = Connection::open_with_flags(
@@ -1945,8 +1777,8 @@ mod tests {
         git_tree: Option<&'a str>,
         supplied: Option<&'a str>,
         index: Option<&'a Path>,
-    ) -> BaseProbe<'a> {
-        BaseProbe {
+    ) -> ContentProbe<'a> {
+        ContentProbe {
             path,
             git_tree,
             supplied,
@@ -1965,121 +1797,19 @@ mod tests {
             ("base_digest", "git-tree:aaa"),
             ("base_git_tree", "aaa"),
         ]);
-        let other =
-            compare_base_identity(Some(&meta), &probe(None, Some("bbb"), None, None)).unwrap();
+        let other = compare_content(Some(&meta), &probe(None, Some("bbb"), None, None)).unwrap();
         assert_eq!(other.mismatch.as_deref(), Some("git-tree:bbb"));
         assert_eq!(other.identity, "git-tree:bbb");
-        let same =
-            compare_base_identity(Some(&meta), &probe(None, Some("aaa"), None, None)).unwrap();
+        let same = compare_content(Some(&meta), &probe(None, Some("aaa"), None, None)).unwrap();
         assert_eq!(same.mismatch, None);
-        // A record taken from a directory or archive is not this tree.
-        let dir_record = meta_with(&[("base_digest_kind", "weak"), ("base_weak_digest", "weak:x")]);
-        assert!(
-            compare_base_identity(Some(&dir_record), &probe(None, Some("aaa"), None, None))
-                .unwrap()
-                .mismatch
-                .is_some()
-        );
         // Kind `none` recorded nothing to compare.
         let none = meta_with(&[("base_digest_kind", "none"), ("base_git_tree", "aaa")]);
         assert_eq!(
-            compare_base_identity(Some(&none), &probe(None, Some("bbb"), None, None))
+            compare_content(Some(&none), &probe(None, Some("bbb"), None, None))
                 .unwrap()
                 .mismatch,
             None
         );
-    }
-
-    /// R5-1: the one kind rule over EVERY (recorded, actual) pair. Same kind is
-    /// no kind mismatch; any other pair is refused (and `forced_base_record`
-    /// then records the actual kind, so the next check agrees).
-    #[test]
-    fn regression_base_kind_table_every_pair() {
-        // Exhaustive: adding a `BaseKind` breaks this match until `ALL` and
-        // the fixtures below cover it.
-        for kind in BaseKind::ALL {
-            match kind {
-                BaseKind::Directory | BaseKind::Archive | BaseKind::Git | BaseKind::Remote => {}
-            }
-        }
-        assert_eq!(BaseKind::ALL.len(), 4);
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("f"), b"x").unwrap();
-        let archive = dir.path().join("a.tar");
-        fs::write(&archive, b"bytes").unwrap();
-        let weak = directory_weak_digest(dir.path(), &BaseExcludes::default()).unwrap();
-        let stamp = ArchiveDigestStamp::read(&archive).unwrap();
-        let (size, mtime) = (stamp.size.to_string(), stamp.mtime_ns.to_string());
-        let probe_of = |kind: BaseKind| match kind {
-            BaseKind::Directory => probe(Some(dir.path()), None, None, None),
-            BaseKind::Archive => probe(Some(archive.as_path()), None, None, None),
-            BaseKind::Git => probe(None, Some("aaa"), None, None),
-            BaseKind::Remote => probe(None, None, None, None),
-        };
-        let record_of = |kind: BaseKind| {
-            let mut rows = vec![("base_kind", kind.as_str())];
-            match kind {
-                BaseKind::Directory => {
-                    rows.extend([
-                        ("base_digest_kind", "weak"),
-                        ("base_weak_digest", weak.as_str()),
-                    ]);
-                }
-                BaseKind::Archive => rows.extend([
-                    ("base_digest_kind", "weak"),
-                    ("base_size", size.as_str()),
-                    ("base_mtime_ns", mtime.as_str()),
-                ]),
-                BaseKind::Git => {
-                    rows.extend([("base_digest_kind", "git-tree"), ("base_git_tree", "aaa")])
-                }
-                BaseKind::Remote => rows.extend([
-                    ("base_digest_kind", "weak"),
-                    ("base_url", "http://example.invalid/b.tar"),
-                ]),
-            }
-            meta_with(&rows)
-        };
-        for recorded in BaseKind::ALL {
-            assert_eq!(BaseKind::recorded(&record_of(recorded)), Some(recorded));
-            for actual in BaseKind::ALL {
-                let meta = record_of(recorded);
-                let probe = probe_of(actual);
-                assert_eq!(BaseKind::of_probe(&probe), actual);
-                let out = compare_base_identity(Some(&meta), &probe).unwrap();
-                assert_eq!(
-                    out.mismatch.is_some(),
-                    recorded != actual,
-                    "recorded {recorded:?} vs actual {actual:?}: {:?}",
-                    out.mismatch
-                );
-                if recorded != actual {
-                    // Forced: the actual kind is recorded, and agrees next time.
-                    let forced = forced_base_record(&meta, &probe, &out);
-                    if let Ok(rows) = forced {
-                        assert_eq!(
-                            rows.get("base_kind").map(String::as_str),
-                            Some(actual.as_str())
-                        );
-                    } else {
-                        // Remote needs a supplied digest to record an identity.
-                        assert_eq!(actual, BaseKind::Remote);
-                    }
-                }
-            }
-        }
-        // Rows without a `base_kind` row (older overlays) derive the same kinds.
-        for kind in BaseKind::ALL {
-            let mut rows: Vec<(String, String)> = record_of(kind)
-                .values
-                .into_iter()
-                .filter(|(k, _)| k != "base_kind")
-                .collect();
-            rows.sort();
-            let refs: Vec<(&str, &str)> =
-                rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            assert_eq!(BaseKind::recorded(&meta_with(&refs)), Some(kind));
-        }
     }
 
     /// Regression (R4-S3): a strong record with no stamp, manifest or tree (an
@@ -2099,14 +1829,6 @@ mod tests {
             ("base_digest", strong.as_str()),
             ("base_kind", "remote"),
         ]);
-        // R5-1: a remote-kind record is never a local base, even if the same
-        // strong digest is supplied (kind change needs --force-base-mismatch).
-        for path in [dir.path(), archive.as_path()] {
-            let ok =
-                compare_base_identity(Some(&record), &probe(Some(path), None, Some(&strong), None))
-                    .unwrap();
-            assert!(ok.mismatch.is_some(), "{path:?} remote record accepted");
-        }
         // The same record taken over a directory / archive (kind row, no
         // manifest or stamp) needs the digest to confirm.
         for (path, kind) in [(dir.path(), "directory"), (archive.as_path(), "archive")] {
@@ -2115,22 +1837,19 @@ mod tests {
                 ("base_digest", strong.as_str()),
                 ("base_kind", kind),
             ]);
-            let bad =
-                compare_base_identity(Some(&record), &probe(Some(path), None, None, None)).unwrap();
+            let bad = compare_content(Some(&record), &probe(Some(path), None, None, None)).unwrap();
             assert!(bad.mismatch.is_some(), "{path:?} accepted unconfirmed");
             let wrong =
-                compare_base_identity(Some(&record), &probe(Some(path), None, Some(&other), None))
+                compare_content(Some(&record), &probe(Some(path), None, Some(&other), None))
                     .unwrap();
             assert!(wrong.mismatch.is_some(), "{path:?} accepted a wrong digest");
-            let ok =
-                compare_base_identity(Some(&record), &probe(Some(path), None, Some(&strong), None))
-                    .unwrap();
+            let ok = compare_content(Some(&record), &probe(Some(path), None, Some(&strong), None))
+                .unwrap();
             assert_eq!(ok.mismatch, None, "{path:?}");
         }
-        let git =
-            compare_base_identity(Some(&record), &probe(None, Some("abc"), None, None)).unwrap();
+        let git = compare_content(Some(&record), &probe(None, Some("abc"), None, None)).unwrap();
         assert!(git.mismatch.is_some(), "git tree accepted unconfirmed");
-        let remote = compare_base_identity(Some(&record), &probe(None, None, None, None)).unwrap();
+        let remote = compare_content(Some(&record), &probe(None, None, None, None)).unwrap();
         assert_eq!(remote.mismatch, None);
     }
 
@@ -2157,7 +1876,7 @@ mod tests {
         // confirmed by the equal supplied digest.
         let with_weak = record(&[("base_weak_digest", weak.as_str())]);
         let walks = directory_weak_walks_this_thread();
-        let ok = compare_base_identity(
+        let ok = compare_content(
             Some(&with_weak),
             &probe(Some(dir.path()), None, Some(&strong), None),
         )
@@ -2169,7 +1888,7 @@ mod tests {
         // A different supplied digest, or none, is a mismatch.
         let other = format!("sha256:{}", "b".repeat(64));
         for supplied in [Some(other.as_str()), None] {
-            let bad = compare_base_identity(
+            let bad = compare_content(
                 Some(&with_weak),
                 &probe(Some(dir.path()), None, supplied, None),
             )
@@ -2179,7 +1898,7 @@ mod tests {
         // No recorded manifest and a supplied digest: nothing to walk.
         let without = record(&[]);
         let walks = directory_weak_walks_this_thread();
-        let ok = compare_base_identity(
+        let ok = compare_content(
             Some(&without),
             &probe(Some(dir.path()), None, Some(&strong), None),
         )
@@ -2192,7 +1911,7 @@ mod tests {
             ("base_weak_digest", weak.as_str()),
         ]);
         let walks = directory_weak_walks_this_thread();
-        let ok = compare_base_identity(
+        let ok = compare_content(
             Some(&none),
             &probe(Some(dir.path()), None, Some(&strong), None),
         )
@@ -2217,7 +1936,7 @@ mod tests {
             ("base_mtime_ns", "1"),
         ]);
         // Nothing cached: not confirmed.
-        let miss = compare_base_identity(
+        let miss = compare_content(
             Some(&record),
             &probe(Some(&archive), None, None, Some(&index)),
         )
@@ -2234,7 +1953,7 @@ mod tests {
             |_| Ok("c".repeat(64)),
         )
         .unwrap();
-        let hit = compare_base_identity(
+        let hit = compare_content(
             Some(&record),
             &probe(Some(&archive), None, None, Some(&index)),
         )
@@ -2250,7 +1969,7 @@ mod tests {
             ("base_size", "999"),
             ("base_mtime_ns", "1"),
         ]);
-        assert!(compare_base_identity(
+        assert!(compare_content(
             Some(&other),
             &probe(Some(&archive), None, None, Some(&index))
         )
@@ -2258,7 +1977,7 @@ mod tests {
         .mismatch
         .is_some());
         // Supplied equals recorded: confirmed even with no cache.
-        let supplied = compare_base_identity(
+        let supplied = compare_content(
             Some(&record),
             &probe(Some(&archive), None, Some(&digest), None),
         )
@@ -2271,7 +1990,7 @@ mod tests {
             ("base_size", "999"),
             ("base_mtime_ns", "1"),
         ]);
-        assert!(compare_base_identity(
+        assert!(compare_content(
             Some(&weak),
             &probe(Some(&archive), None, Some(&digest), Some(&index))
         )
@@ -2338,7 +2057,10 @@ mod tests {
             layer_digest: "sha256:first".into(),
             sealed_at: "2026-10-17T00:00:00Z".into(),
         });
-        drop(WriteOverlay::new_with_create_info(base(root.path()), &overlay, &info).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &overlay, &info)
+                .unwrap(),
+        );
         // An uncached archive is `pending` until something resolves it.
         assert_eq!(meta_of(&overlay).base_digest_kind(), Some("pending"));
         let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
@@ -2432,7 +2154,9 @@ mod tests {
         assert!(OverlayMeta::read(&overlay).unwrap().is_none());
         let mut context = info(Path::new("missing base that must never be hashed"));
         context.force_base_mismatch = false;
-        let ov = WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context).unwrap();
+        let ov =
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &overlay, &context)
+                .unwrap();
         assert!(ov.lookup("/deleted", 0).is_none());
         drop(ov);
         let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
@@ -2469,7 +2193,10 @@ mod tests {
         let mut context = info(&root.path().join("unreadable-base"));
         context.base_digest = BaseDigestRequest::Supplied(format!("sha256:{}", "a".repeat(64)));
         let overlay = root.path().join("overlay");
-        drop(WriteOverlay::new_with_create_info(source.clone(), &overlay, &context).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(source.clone(), &overlay, &context)
+                .unwrap(),
+        );
         assert_eq!(source.0.load(Ordering::SeqCst), 0);
         assert_eq!(
             OverlayMeta::read(&overlay).unwrap().unwrap().base_digest(),
@@ -2485,7 +2212,10 @@ mod tests {
         fs::write(&archive, b"abc").unwrap();
         let overlay = root.path().join("overlay");
         let mut context = info(&archive);
-        drop(WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &overlay, &context)
+                .unwrap(),
+        );
         resolve_pending_base_digest(&Connection::open(overlay.join(HIDDEN_DB)).unwrap()).unwrap();
         let old = OverlayMeta::read(&overlay)
             .unwrap()
@@ -2504,13 +2234,17 @@ mod tests {
             .set_modified(modified)
             .unwrap();
         context.index_path = Some(root.path().join("missing-index"));
-        drop(WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &overlay, &context)
+                .unwrap(),
+        );
         assert!(!context.index_path.as_ref().unwrap().exists());
         fs::write(&archive, b"changed").unwrap();
-        let error = WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context)
-            .err()
-            .unwrap()
-            .to_string();
+        let error =
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &overlay, &context)
+                .err()
+                .unwrap()
+                .to_string();
         assert!(
             error.contains(&old) && error.contains("current digest weak:size=7"),
             "{error}"
@@ -2521,7 +2255,10 @@ mod tests {
             .get("base_mismatch_forced_at")
             .is_none());
         context.force_base_mismatch = true;
-        drop(WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &overlay, &context)
+                .unwrap(),
+        );
         let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
         assert!(meta.get("base_mismatch_forced_at").is_some());
         assert_eq!(meta.base_digest(), Some(old.as_str()));
@@ -2537,7 +2274,10 @@ mod tests {
             ..Default::default()
         };
         let overlay = root.path().join("git");
-        drop(WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &overlay, &context)
+                .unwrap(),
+        );
         assert_eq!(
             OverlayMeta::read(&overlay)
                 .unwrap()
@@ -2546,10 +2286,11 @@ mod tests {
             Some("git-tree")
         );
         context.git_tree = Some("b".repeat(40));
-        let error = WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context)
-            .err()
-            .unwrap()
-            .to_string();
+        let error =
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &overlay, &context)
+                .err()
+                .unwrap()
+                .to_string();
         assert!(
             error.contains(&format!("git-tree:{}", "a".repeat(40)))
                 && error.contains(&format!("git-tree:{}", "b".repeat(40)))
@@ -2569,7 +2310,7 @@ mod tests {
             with_token.digest(None).unwrap().0
         );
         let overlay = root.path().join("no-context");
-        drop(WriteOverlay::new(base(root.path()), &overlay).unwrap());
+        drop(WriteOverlay::new_for_tests(base(root.path()), &overlay).unwrap());
         let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
         assert_eq!(meta.base_digest_kind(), Some("none"));
         assert_eq!(meta.format_version().unwrap(), Some(2));
@@ -2615,7 +2356,7 @@ mod tests {
         overlay: &Path,
         context: &OverlayCreateInfo,
     ) -> Result<WriteOverlay> {
-        WriteOverlay::new_with_create_info(base(base_dir), overlay, context)
+        WriteOverlay::new_with_create_info_for_tests(base(base_dir), overlay, context)
     }
 
     fn set_mtime(path: &Path, secs: u64) {
@@ -2711,7 +2452,7 @@ mod tests {
         let overlay = root.path().join("weak");
         open_dir_base(&basedir, &overlay, &info(&basedir)).unwrap();
         assert!(matches!(
-            verify_base(&overlay, &basedir),
+            verify_base_path(&overlay, &basedir),
             BaseCheck::Matches {
                 strength: BaseStrength::Weak,
                 ..
@@ -2719,7 +2460,7 @@ mod tests {
         ));
         fs::write(basedir.join("f"), b"abcd").unwrap();
         assert!(matches!(
-            verify_base(&overlay, &basedir),
+            verify_base_path(&overlay, &basedir),
             BaseCheck::Mismatch {
                 strength: BaseStrength::Weak,
                 ..
@@ -2732,7 +2473,7 @@ mod tests {
         request.base_digest = BaseDigestRequest::Supplied(directory_digest(&basedir).unwrap());
         open_dir_base(&basedir, &strong, &request).unwrap();
         assert!(matches!(
-            verify_base(&strong, &basedir),
+            verify_base_path(&strong, &basedir),
             BaseCheck::Matches {
                 strength: BaseStrength::Strong,
                 ..
@@ -2744,7 +2485,7 @@ mod tests {
             .unwrap()
             .success());
         assert!(matches!(
-            verify_base(&strong, &basedir),
+            verify_base_path(&strong, &basedir),
             BaseCheck::Skipped { .. }
         ));
         fs::remove_file(basedir.join("pipe")).unwrap();
@@ -2754,11 +2495,11 @@ mod tests {
         request.base_digest = BaseDigestRequest::None;
         open_dir_base(&basedir, &none, &request).unwrap();
         assert!(matches!(
-            verify_base(&none, &basedir),
+            verify_base_path(&none, &basedir),
             BaseCheck::Skipped { .. }
         ));
         assert!(matches!(
-            verify_base(&overlay, &root.path().join("missing")),
+            verify_base_path(&overlay, &root.path().join("missing")),
             BaseCheck::Skipped { .. }
         ));
         // A git-tree base is skipped.
@@ -2766,7 +2507,7 @@ mod tests {
         OverlayMeta::set(&conn, "base_git_tree", "abc").unwrap();
         drop(conn);
         assert!(matches!(
-            verify_base(&overlay, &basedir),
+            verify_base_path(&overlay, &basedir),
             BaseCheck::Skipped { .. }
         ));
     }
@@ -2786,7 +2527,7 @@ mod tests {
         let link = root.path().join("link");
         std::os::unix::fs::symlink(&basedir, &link).unwrap();
         assert!(matches!(
-            verify_base(&overlay, &link),
+            verify_base_path(&overlay, &link),
             BaseCheck::Matches {
                 strength: BaseStrength::Weak,
                 ..
@@ -2794,7 +2535,7 @@ mod tests {
         ));
         fs::write(basedir.join("f"), b"abcd").unwrap();
         assert!(matches!(
-            verify_base(&overlay, &link),
+            verify_base_path(&overlay, &link),
             BaseCheck::Mismatch { .. }
         ));
         // An archive base reached through a symlink is hashed too.
@@ -2808,7 +2549,7 @@ mod tests {
         std::os::unix::fs::symlink(&archive, &alink).unwrap();
         fs::write(&archive, b"abX").unwrap();
         assert!(matches!(
-            verify_base(&strong, &alink),
+            verify_base_path(&strong, &alink),
             BaseCheck::Mismatch { .. }
         ));
     }
@@ -3062,7 +2803,7 @@ mod tests {
         let overlay = root.path().join("overlay");
         assert!(OverlayMeta::read(&overlay).is_err());
         assert!(!overlay.exists());
-        let ov = WriteOverlay::new(base(root.path()), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base(root.path()), &overlay).unwrap();
         let error = OverlayMeta::read(&overlay).unwrap_err().to_string();
         assert!(error.contains("in use"), "{error}");
         drop(ov);
@@ -3107,7 +2848,10 @@ mod tests {
 
     fn pending_overlay(root: &Path, archive: &Path, name: &str) -> (PathBuf, PendingBase) {
         let overlay = root.join(name);
-        drop(WriteOverlay::new_with_create_info(base(root), &overlay, &info(archive)).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(base(root), &overlay, &info(archive))
+                .unwrap(),
+        );
         let meta = meta_of(&overlay);
         let pending = PendingBase::from_meta(&meta).unwrap().expect("pending");
         (overlay, pending)
@@ -3184,16 +2928,23 @@ mod tests {
         fs::write(&archive, b"abc").unwrap();
         let (overlay, _) = pending_overlay(root.path(), &archive, "overlay");
         drop(
-            WriteOverlay::new_with_create_info(base(root.path()), &overlay, &info(&archive))
-                .unwrap(),
+            WriteOverlay::new_with_create_info_for_tests(
+                base(root.path()),
+                &overlay,
+                &info(&archive),
+            )
+            .unwrap(),
         );
         fs::write(&archive, b"changed").unwrap();
         let before = ratarmount_index::sha256_stream_calls_this_thread();
-        let error =
-            WriteOverlay::new_with_create_info(base(root.path()), &overlay, &info(&archive))
-                .err()
-                .unwrap()
-                .to_string();
+        let error = WriteOverlay::new_with_create_info_for_tests(
+            base(root.path()),
+            &overlay,
+            &info(&archive),
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(
             error.contains("base mismatch") && error.contains("recorded digest pending"),
             "{error}"
@@ -3225,14 +2976,20 @@ mod tests {
         let mut context = info(&archive);
         context.index_path = Some(index);
         let first = root.path().join("first");
-        drop(WriteOverlay::new_with_create_info(base(root.path()), &first, &context).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &first, &context)
+                .unwrap(),
+        );
         assert_eq!(meta_of(&first).base_digest_kind(), Some("pending"));
         let conn = Connection::open(first.join(HIDDEN_DB)).unwrap();
         assert!(resolve_pending_base_digest(&conn).unwrap());
         drop(conn);
         let second = root.path().join("second");
         let before = ratarmount_index::sha256_stream_calls_this_thread();
-        drop(WriteOverlay::new_with_create_info(base(root.path()), &second, &context).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &second, &context)
+                .unwrap(),
+        );
         assert_eq!(ratarmount_index::sha256_stream_calls_this_thread(), before);
         assert_eq!(meta_of(&second).base_digest_kind(), Some("strong"));
         assert_eq!(
@@ -3253,7 +3010,10 @@ mod tests {
         context.base_digest = BaseDigestRequest::Supplied(format!("sha256:{}", "c".repeat(64)));
         let before = ratarmount_index::sha256_stream_calls_this_thread();
         let overlay = root.path().join("supplied");
-        drop(WriteOverlay::new_with_create_info(base(root.path()), &overlay, &context).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(base(root.path()), &overlay, &context)
+                .unwrap(),
+        );
         assert_eq!(ratarmount_index::sha256_stream_calls_this_thread(), before);
         assert_eq!(meta_of(&overlay).base_digest_kind(), Some("strong"));
         let (overlay, _) = pending_overlay(root.path(), &archive, "computed");

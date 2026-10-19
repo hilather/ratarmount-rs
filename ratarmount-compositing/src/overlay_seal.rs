@@ -186,16 +186,12 @@ fn digest_rows(
 /// Seal against the supplied composed lower view. Legacy overlays get minimal
 /// metadata; callers must supply their base explicitly when none is recorded.
 /// A writer reservation covers fsck, hashing, and the atomic metadata update.
-pub fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutcome> {
-    seal_impl(dir, None, lower_view)
-}
-
 /// Seal an overlay that is not sealed yet, over the base the opener served
 /// (`composed` is that base under the `--lower` layers: what the rows hash
 /// against). An overlay that recorded no kind (made by a released build)
 /// gets the kind and place of this base recorded with the seal. An overlay
 /// that is already sealed is [`reseal`]ed, never sealed again.
-pub fn seal_with_base(
+pub fn seal(
     dir: &Path,
     base: &crate::ClassifiedBase,
     composed: Arc<dyn MountSource>,
@@ -232,7 +228,7 @@ pub fn reseal(record: &crate::SealedRecord) -> io::Result<SealOutcome> {
     })
 }
 
-fn seal_impl(
+pub(crate) fn seal_impl(
     dir: &Path,
     identity: Option<&crate::ClassifiedBase>,
     lower_view: Arc<dyn MountSource>,
@@ -434,16 +430,8 @@ pub fn check_hash_format<'a>(get: impl Fn(&str) -> Option<&'a str>) -> io::Resul
     ))
 }
 
-/// [`verify`] over a classified base: the caller has classified and gated the
-/// base the layer is checked against.
-pub fn verify_with_base(
-    dir: &Path,
-    _base: &crate::ClassifiedBase,
-    composed: Arc<dyn MountSource>,
-) -> io::Result<VerifyReport> {
-    verify(dir, composed)
-}
-
+/// Verify a layer against the view it sits on. Read-only: it writes nothing
+/// and cannot authorize a seal or a create, so it needs no classified base.
 pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<VerifyReport> {
     let root = root(dir)?;
     let conn = connection(dir, true)?;
@@ -504,6 +492,13 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
 mod tests {
     use super::*;
     use crate::{FolderMountSource, OverlayMetadata, WriteOverlay};
+
+    /// Seal without a classified base: the in-crate fixtures open overlays
+    /// with `new_for_tests`, which record no base.
+    fn seal(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<SealOutcome> {
+        seal_impl(dir, None, lower_view)
+    }
+
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::PathBuf;
 
@@ -520,7 +515,7 @@ mod tests {
             fs::write(base.join("inherited"), b"base bytes").unwrap();
             let base: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base).unwrap());
             let dir = tmp.path().join("overlay");
-            let overlay = WriteOverlay::new(base.clone(), &dir).unwrap();
+            let overlay = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
             overlay.mkdir("/sub", 0o775).unwrap();
             for path in ["/sub/file", "/plain"] {
                 let fd = overlay.create_file(path, 0o664).unwrap();
@@ -584,7 +579,7 @@ mod tests {
         fs::create_dir(&base_dir).unwrap();
         fs::write(base_dir.join("cow"), b"base bytes").unwrap();
         fs::set_permissions(base_dir.join("cow"), fs::Permissions::from_mode(0o751)).unwrap();
-        let writer = WriteOverlay::new(f.base.clone(), &f.dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(f.base.clone(), &f.dir).unwrap();
         changes::cow_write(&writer, "/sub/cow", b"changed\n");
         let before = visible(&writer);
         drop(writer);
@@ -714,7 +709,7 @@ mod tests {
         let source =
             ReadOnlyOverlayLayer::new(f.base.clone(), &f.dir, Immutability::Shared).unwrap();
         let before = visible(&source);
-        let writer = WriteOverlay::new(f.base.clone(), &f.dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(f.base.clone(), &f.dir).unwrap();
         assert_eq!(visible(&writer), before);
         drop(writer);
         let digest = changes::canonical_hash(
@@ -731,7 +726,7 @@ mod tests {
         assert_eq!(visible(source.as_ref()), before);
         assert!(source.lookup("/.ratarmount-sealed", 0).is_none());
         // A fresh writable top over the sealed layer must retain the same modes.
-        let writer = WriteOverlay::new(source, f._tmp.path().join("top")).unwrap();
+        let writer = WriteOverlay::new_for_tests(source, f._tmp.path().join("top")).unwrap();
         assert_eq!(visible(&writer), before);
         drop(writer);
         let mut modes = BTreeMap::new();
@@ -750,7 +745,7 @@ mod tests {
         assert!(seal(&f.dir, f.base.clone()).unwrap().already_sealed);
         assert_eq!(fs::read(f.dir.join(HIDDEN_DB)).unwrap(), db);
         unseal(&f.dir).unwrap();
-        let writer = WriteOverlay::new(f.base.clone(), &f.dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(f.base.clone(), &f.dir).unwrap();
         assert_eq!(visible(&writer), before);
         drop(writer);
         let meta = OverlayMeta::read(&f.dir).unwrap().unwrap();
@@ -798,7 +793,7 @@ mod tests {
     #[test]
     fn regression_seal_refuses_mounted_and_inconsistent_overlay() {
         let f = Fixture::new();
-        let writer = WriteOverlay::new(f.base.clone(), &f.dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(f.base.clone(), &f.dir).unwrap();
         for error in [
             seal(&f.dir, f.base.clone()).unwrap_err(),
             unseal(&f.dir).unwrap_err(),
@@ -821,7 +816,7 @@ mod tests {
         );
         crate::overlay_fsck::fsck(&f.dir, true).unwrap();
         seal(&f.dir, f.base.clone()).unwrap();
-        assert!(WriteOverlay::new(f.base.clone(), &f.dir)
+        assert!(WriteOverlay::new_for_tests(f.base.clone(), &f.dir)
             .err()
             .unwrap()
             .to_string()
@@ -836,7 +831,7 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("keep"), b"safe").unwrap();
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o750)).unwrap();
-        let writer = WriteOverlay::new(f.base.clone(), &f.dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(f.base.clone(), &f.dir).unwrap();
         writer
             .create_symlink("/external", outside.to_str().unwrap())
             .unwrap();
@@ -910,7 +905,7 @@ mod tests {
     #[test]
     fn regression_seal_legacy_metadata_and_git_content() {
         let f = Fixture::new();
-        let writer = WriteOverlay::new(f.base.clone(), &f.dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(f.base.clone(), &f.dir).unwrap();
         writer.mkdir("/.git", 0o755).unwrap();
         let fd = writer.create_file("/.git/config", 0o644).unwrap();
         writer.close_overlay_fd(fd);

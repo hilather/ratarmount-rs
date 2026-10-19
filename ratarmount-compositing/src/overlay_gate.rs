@@ -166,8 +166,11 @@ pub fn shape_verdict(
     }
 }
 
-fn legacy_probe<'a>(actual: &'a ActualBase, probe: &BaseProbe<'a>) -> overlay_meta::BaseProbe<'a> {
-    overlay_meta::BaseProbe {
+fn content_probe<'a>(
+    actual: &'a ActualBase,
+    probe: &BaseProbe<'a>,
+) -> overlay_meta::ContentProbe<'a> {
+    overlay_meta::ContentProbe {
         path: match (actual.kind(), actual.location()) {
             (BaseKind::Archive | BaseKind::Dir, Some(BaseLocation::Local(path))) => {
                 Some(path.as_path())
@@ -200,9 +203,7 @@ pub fn compare_base_identity(
             mismatch: Some(reason),
             ..Default::default()
         }),
-        Verdict::Content => {
-            overlay_meta::compare_content(meta, &legacy_probe(actual, probe), false)
-        }
+        Verdict::Content => overlay_meta::compare_content(meta, &content_probe(actual, probe)),
     }
 }
 
@@ -392,7 +393,7 @@ pub fn verify_base(dir: &Path, base: &ClassifiedBase) -> BaseCheck {
         (BaseKind::Git, _) => BaseCheck::Skipped {
             reason: "git-tree base".to_owned(),
         },
-        (_, Some(BaseLocation::Local(path))) => overlay_meta::verify_base(dir, path),
+        (_, Some(BaseLocation::Local(path))) => overlay_meta::verify_base_path(dir, path),
         _ => BaseCheck::Skipped {
             reason: "base is not a local path".to_owned(),
         },

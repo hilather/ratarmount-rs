@@ -912,7 +912,7 @@ mod tests {
     fn regression_read_only_view_matches_write_overlay() {
         let dir = tempfile::tempdir().unwrap();
         let base: Arc<dyn MountSource> = Arc::new(Base::new());
-        let writer = WriteOverlay::new(base.clone(), dir.path()).unwrap();
+        let writer = WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap();
         let fd = writer.create_file("/new", 0o640).unwrap();
         writer.close_overlay_fd(fd);
         write(&writer, "/new", 0, b"new payload");
@@ -951,7 +951,7 @@ mod tests {
         drop(writer);
         for kind in [Immutability::Shared, Immutability::Immutable] {
             let layer = ReadOnlyOverlayLayer::new(base.clone(), dir.path(), kind).unwrap();
-            let writer = WriteOverlay::new(base.clone(), dir.path()).unwrap();
+            let writer = WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap();
             compare_views(&layer, &writer, "/");
             compare_views(&layer, &writer, "/deleted");
             for source in [&layer as &dyn MountSource, &writer] {
@@ -976,7 +976,7 @@ mod tests {
         let prepared = temp.path().join("prepared");
         let attempt = temp.path().join("attempt");
         let base: Arc<dyn MountSource> = Arc::new(Base::new());
-        let writer = WriteOverlay::new(base.clone(), &prepared).unwrap();
+        let writer = WriteOverlay::new_for_tests(base.clone(), &prepared).unwrap();
         writer.mkdir("/blib", 0o755).unwrap();
         write(&writer, "/blib/x", 0, b"build x");
         write(&writer, "/blib/keep", 0, b"build keep");
@@ -987,7 +987,7 @@ mod tests {
         let lower =
             compose_stack(base.clone(), &[(prepared.clone(), Immutability::Immutable)]).unwrap();
         assert!(lower.lookup("/restore", 0).is_none());
-        let writer = WriteOverlay::new(lower, &attempt).unwrap();
+        let writer = WriteOverlay::new_for_tests(lower, &attempt).unwrap();
         write(&writer, "/lib/Foo.pm", 8, b"Bar");
         writer.unlink("/blib/x").unwrap();
         write(&writer, "/restore", 0, b"recreated");
@@ -1056,13 +1056,13 @@ mod tests {
         let middle = temp.path().join("middle");
         let top = temp.path().join("top");
         let base: Arc<dyn MountSource> = Arc::new(Base::new());
-        let writer = WriteOverlay::new(base.clone(), &lower).unwrap();
+        let writer = WriteOverlay::new_for_tests(base.clone(), &lower).unwrap();
         write(&writer, "/only-lower", 0, b"lower bytes");
         writer
             .set_xattr("/only-lower", "user.build", b"prepared", 0)
             .unwrap();
         drop(writer);
-        drop(WriteOverlay::new(base.clone(), &middle).unwrap());
+        drop(WriteOverlay::new_for_tests(base.clone(), &middle).unwrap());
         let stack = compose_stack(
             base,
             &[
@@ -1075,7 +1075,7 @@ mod tests {
             serving_layer(stack.as_ref(), "/only-lower"),
             Some(LayerIndex::Lower(1))
         );
-        let writer = WriteOverlay::new(stack, &top).unwrap();
+        let writer = WriteOverlay::new_for_tests(stack, &top).unwrap();
         assert_eq!(bytes(&writer, "/only-lower"), b"lower bytes");
         writer.ensure_modifiable("/only-lower").unwrap();
         assert_eq!(fs::read(top.join("only-lower")).unwrap(), b"lower bytes");
@@ -1093,7 +1093,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("overlay");
         let base: Arc<dyn MountSource> = Arc::new(Base::new());
-        let writer = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         crate::overlay_changes::cow_write(&writer, "/lib/Foo.pm", b"changed\n");
         drop(writer);
         let conn = Connection::open(dir.join(HIDDEN_DB)).unwrap();
@@ -1104,7 +1104,7 @@ mod tests {
         );
         drop(conn);
         let layer = ReadOnlyOverlayLayer::new(base.clone(), &dir, Immutability::Shared).unwrap();
-        let writer = WriteOverlay::new(base, &dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(base, &dir).unwrap();
         compare_views(&writer, &layer, "/");
         assert_eq!(bytes(&layer, "/lib/Foo.pm"), b"changed\n");
         assert_eq!(
@@ -1122,7 +1122,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("layer ?#% ü");
         let base: Arc<dyn MountSource> = Arc::new(Base::new());
-        let writer = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         write(&writer, "/resident", 0, b"resident bytes");
         drop(writer);
         let before = fs::read(dir.join(HIDDEN_DB)).unwrap();
@@ -1153,7 +1153,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base: Arc<dyn MountSource> = Arc::new(Base::new());
         let payload = (0..65536).map(|i| (i % 251) as u8).collect::<Vec<_>>();
-        let writer = WriteOverlay::new(base.clone(), dir.path()).unwrap();
+        let writer = WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap();
         write(&writer, "/resident", 0, &payload);
         drop(writer);
         let layers = [(dir.path().to_path_buf(), Immutability::Immutable)];
@@ -1199,7 +1199,7 @@ mod tests {
             base.add_file(&format!("/nested/{name}"), b"nested bookkeeping");
         }
         let base: Arc<dyn MountSource> = Arc::new(base);
-        drop(WriteOverlay::new(base.clone(), dir.path()).unwrap());
+        drop(WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap());
         fs::create_dir(dir.path().join("nested")).unwrap();
         for name in internal {
             fs::write(dir.path().join("nested").join(name), b"host bookkeeping").unwrap();
@@ -1235,7 +1235,7 @@ mod tests {
         let mut base = Base::new();
         base.add_file("/dir-link/secret", b"shadowed base directory");
         let base: Arc<dyn MountSource> = Arc::new(base);
-        let writer = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         writer.unlink("/dir-link/secret").unwrap();
         writer.rmdir("/dir-link").unwrap();
         for (path, target) in [
@@ -1276,7 +1276,7 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("file"), b"secret").unwrap();
         let base: Arc<dyn MountSource> = Arc::new(Base::new());
-        let writer = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let writer = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         writer.mkdir("/parent", 0o755).unwrap();
         write(&writer, "/parent/file", 0, b"layer file");
         drop(writer);
@@ -1330,7 +1330,7 @@ mod tests {
     fn regression_shared_layer_reports_busy_writer() {
         let dir = tempfile::tempdir().unwrap();
         let base: Arc<dyn MountSource> = Arc::new(Base::new());
-        let _writer = WriteOverlay::new(base.clone(), dir.path()).unwrap();
+        let _writer = WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap();
         let error = ReadOnlyOverlayLayer::new(base, dir.path(), Immutability::Shared)
             .err()
             .unwrap();
@@ -1346,7 +1346,7 @@ mod tests {
     fn regression_layer_cached_rows_and_cheap_listing() {
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(Base::new());
-        let writer = WriteOverlay::new(base.clone(), dir.path()).unwrap();
+        let writer = WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap();
         writer.unlink("/deleted").unwrap();
         writer
             .set_metadata(
@@ -1394,7 +1394,7 @@ mod tests {
         let mut base = Base::new();
         base.immutable = false;
         let base: Arc<dyn MountSource> = Arc::new(base);
-        drop(WriteOverlay::new(base.clone(), dir.path()).unwrap());
+        drop(WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap());
         let conn = Connection::open(dir.path().join(HIDDEN_DB)).unwrap();
         conn.execute_batch("DROP TABLE overlay_metadata; DROP TABLE xattrs;")
             .unwrap();

@@ -581,7 +581,7 @@ fn regression_mountinfo_decodes_escaped_mount_paths() {
 /// Regression: API diffs include composed bind paths and stats read the attempt's real overlay.
 #[test]
 fn regression_live_diff_and_stats_do_not_reopen_locked_database() {
-    use ratarmount_compositing::{FolderMountSource, WriteOverlay};
+    use ratarmount_compositing::FolderMountSource;
     let (root, mut supervisor, fake) = setup(8);
     let source = root.path().join("source");
     fs::create_dir(&source).unwrap();
@@ -610,7 +610,7 @@ fn regression_live_diff_and_stats_do_not_reopen_locked_database() {
     let attempt = supervisor.attempts.values().next().unwrap().clone();
     fs::write(empty.join("gone"), "delete me\n").unwrap();
     let overlay = Arc::new(
-        WriteOverlay::new(
+        crate::base_identity::fixtures::new_overlay(
             Arc::new(FolderMountSource::new(&empty).unwrap()),
             &attempt.overlay_dir,
         )

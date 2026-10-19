@@ -300,11 +300,8 @@ pub fn pack(
         let mut tar = tar::Builder::new(BufWriter::new(&mut plain));
         // Top-level members and all layer entries use bytewise sorted paths.
         if options.include_index {
-            let base = options
-                .base
-                .as_deref()
-                .or_else(|| meta.base_url().map(Path::new));
-            if let Some(base) = base.filter(|p| p.is_file()) {
+            // The local archive the classified base is (None for any other kind).
+            if let Some(base) = options.base.as_deref().filter(|p| p.is_file()) {
                 let index = ratarmount_index::default_index_path(base);
                 if index.is_file() {
                     let file = File::from(host::open(&index, regular_flags(), Mode::empty())?);
@@ -1334,6 +1331,29 @@ fn finalize_stage(directory: &Path, recorded: Recorded) -> io::Result<()> {
 }
 
 fn verify_recorded(directory: &Path, meta: &OverlayMeta) -> io::Result<Option<bool>> {
+    verify_recorded_with(directory, meta, &|meta| {
+        crate::overlay_cmd::classify_base(
+            None,
+            Some(meta),
+            None,
+            &crate::base_identity::OverlayRunContext::default(),
+        )
+    })
+}
+
+/// Whether a recorded base URL names a remote object: unpack never opens one
+/// (it would touch the network on a path that only verifies a bundle).
+fn recorded_base_is_remote(base: &str) -> bool {
+    base.contains("://") && !base.starts_with("file://") && !base.starts_with("git://")
+}
+
+/// [`verify_recorded`] with the classifier injected, so a test can prove the
+/// opener is not reached for a recorded remote base.
+fn verify_recorded_with(
+    directory: &Path,
+    meta: &OverlayMeta,
+    classify: &dyn Fn(&OverlayMeta) -> Result<ratarmount_compositing::ClassifiedBase, String>,
+) -> io::Result<Option<bool>> {
     let Some(base) = meta.base_url().filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -1348,16 +1368,17 @@ fn verify_recorded(directory: &Path, meta: &OverlayMeta) -> io::Result<Option<bo
     if base.starts_with("git://") && !local.exists() {
         return Ok(None);
     }
+    // Decided BEFORE the opener is called: catching its error afterwards would
+    // already have made the request.
+    if recorded_base_is_remote(base) {
+        return Ok(None);
+    }
     let lowers = meta.lower_layers().map_err(io::Error::other)?;
     if lowers.iter().any(|l| !l.path.exists()) {
         return Ok(None);
     }
-    let lower = crate::overlay_cmd::lower_view(&crate::overlay_cmd::SealArgs {
-        directory: directory.into(),
-        base: None,
-        lower: Vec::new(),
-        json: false,
-    });
+    let lower =
+        classify(meta).and_then(|base| crate::overlay_cmd::lower_view(&base, &[], Some(meta)));
     let lower = match lower {
         Ok(lower) => lower,
         Err(_) if base.contains("://") && !base.starts_with("git://") => return Ok(None),
@@ -1625,7 +1646,7 @@ pub(crate) fn cached_lower_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratarmount_compositing::{FolderMountSource, OverlayCreateInfo, WriteOverlay};
+    use ratarmount_compositing::FolderMountSource;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     struct Fixture {
@@ -1642,13 +1663,11 @@ mod tests {
             fs::write(tmp.path().join("outside"), b"secret").unwrap();
             let base: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base_dir).unwrap());
             let dir = tmp.path().join("overlay");
-            let ov = WriteOverlay::new_with_create_info(
+            let ov = crate::base_identity::fixtures::overlay_over(
                 base.clone(),
                 &dir,
-                &OverlayCreateInfo {
-                    base_url: base_dir.to_str().unwrap().into(),
-                    ..Default::default()
-                },
+                base_dir.to_str().unwrap(),
+                Vec::new(),
             )
             .unwrap();
             ov.unlink("/deleted").unwrap();
@@ -1671,7 +1690,7 @@ mod tests {
             ov.create_symlink("/link", "../outside").unwrap();
             drop(ov);
             if sealed {
-                ratarmount_compositing::overlay_seal::seal(&dir, base.clone()).unwrap();
+                crate::base_identity::fixtures::seal(&dir, base.clone()).unwrap();
             }
             Self { tmp, base, dir }
         }
@@ -1771,18 +1790,15 @@ mod tests {
         let lower =
             compose_stack(f.base.clone(), &[(f.dir.clone(), Immutability::Immutable)]).unwrap();
         let top = f.tmp.path().join("top");
-        let writer = WriteOverlay::new_with_create_info(
+        let writer = crate::base_identity::fixtures::overlay_over(
             lower.clone(),
             &top,
-            &OverlayCreateInfo {
-                base_url: lower_meta.base_url().unwrap().into(),
-                lower_layers: vec![LowerLayerRecord {
-                    path: f.dir.clone(),
-                    layer_digest: lower_meta.get("layer_digest").unwrap().into(),
-                    sealed_at: lower_meta.get("sealed_at").unwrap().into(),
-                }],
-                ..Default::default()
-            },
+            lower_meta.base_url().unwrap(),
+            vec![LowerLayerRecord {
+                path: f.dir.clone(),
+                layer_digest: lower_meta.get("layer_digest").unwrap().into(),
+                sealed_at: lower_meta.get("sealed_at").unwrap().into(),
+            }],
         )
         .unwrap();
         writer.unlink("/sub/file").unwrap();
@@ -1791,7 +1807,7 @@ mod tests {
         fs::write(top.join("new"), b"new bytes").unwrap();
         drop(writer);
         ratarmount_compositing::overlay_fsck::fsck(&top, true).unwrap();
-        ratarmount_compositing::overlay_seal::seal(&top, lower.clone()).unwrap();
+        crate::base_identity::fixtures::seal(&top, lower.clone()).unwrap();
         let bundle = f.tmp.path().join("stack.tar.zst");
         pack(&top, &bundle, lower.clone(), &PackOptions::default()).unwrap();
         let restored = f.tmp.path().join("stack-restored");
@@ -2009,20 +2025,18 @@ mod tests {
         )
         .unwrap();
         let directory = f.tmp.path().join("indexed-overlay");
-        let writer = WriteOverlay::new_with_create_info(
+        let writer = crate::base_identity::fixtures::overlay_over(
             source.clone(),
             &directory,
-            &OverlayCreateInfo {
-                base_url: base.to_str().unwrap().into(),
-                ..Default::default()
-            },
+            base.to_str().unwrap(),
+            Vec::new(),
         )
         .unwrap();
         let fd = writer.create_file("/added", 0o644).unwrap();
         writer.close_overlay_fd(fd);
         fs::write(directory.join("added"), b"new bytes").unwrap();
         drop(writer);
-        ratarmount_compositing::overlay_seal::seal(&directory, source.clone()).unwrap();
+        crate::base_identity::fixtures::seal(&directory, source.clone()).unwrap();
         let journal = f.tmp.path().join("journal");
         fs::write(
             &journal,
@@ -2047,7 +2061,9 @@ mod tests {
             &PackOptions {
                 include_journal: Some(journal),
                 include_index: true,
-                base: None,
+                // The local archive the classified base is (what `overlay pack`
+                // takes from the token).
+                base: Some(base.clone()),
                 base_rows: None,
             },
         )
@@ -2833,18 +2849,15 @@ mod tests {
         let lower =
             compose_stack(f.base.clone(), &[(f.dir.clone(), Immutability::Immutable)]).unwrap();
         let top = f.tmp.path().join(format!("{name}-top"));
-        let writer = WriteOverlay::new_with_create_info(
+        let writer = crate::base_identity::fixtures::overlay_over(
             lower.clone(),
             &top,
-            &OverlayCreateInfo {
-                base_url: lower_meta.base_url().unwrap().into(),
-                lower_layers: vec![LowerLayerRecord {
-                    path: f.dir.clone(),
-                    layer_digest: lower_meta.get("layer_digest").unwrap().into(),
-                    sealed_at: lower_meta.get("sealed_at").unwrap().into(),
-                }],
-                ..Default::default()
-            },
+            lower_meta.base_url().unwrap(),
+            vec![LowerLayerRecord {
+                path: f.dir.clone(),
+                layer_digest: lower_meta.get("layer_digest").unwrap().into(),
+                sealed_at: lower_meta.get("sealed_at").unwrap().into(),
+            }],
         )
         .unwrap();
         writer.unlink("/sub/file").unwrap();
@@ -2852,7 +2865,7 @@ mod tests {
         writer.close_overlay_fd(fd);
         fs::write(top.join("new"), b"new bytes").unwrap();
         drop(writer);
-        ratarmount_compositing::overlay_seal::seal(&top, lower.clone()).unwrap();
+        crate::base_identity::fixtures::seal(&top, lower.clone()).unwrap();
         let bundle = f.tmp.path().join(name);
         pack(&top, &bundle, lower, &PackOptions::default()).unwrap();
         bundle
@@ -3156,7 +3169,8 @@ mod tests {
         use ratarmount_compositing::{compose_stack, Immutability, LowerLayerRecord};
         let f = Fixture::new(true);
         let unsealed = f.tmp.path().join("unsealed");
-        let writer = WriteOverlay::new(f.base.clone(), &unsealed).unwrap();
+        let writer =
+            crate::base_identity::fixtures::new_overlay(f.base.clone(), &unsealed).unwrap();
         let fd = writer.create_file("/lf", 0o644).unwrap();
         writer.close_overlay_fd(fd);
         drop(writer);
@@ -3164,18 +3178,15 @@ mod tests {
         let lower =
             compose_stack(f.base.clone(), &[(unsealed.clone(), Immutability::Shared)]).unwrap();
         let top = f.tmp.path().join("top");
-        let writer = WriteOverlay::new_with_create_info(
+        let writer = crate::base_identity::fixtures::overlay_over(
             lower.clone(),
             &top,
-            &OverlayCreateInfo {
-                base_url: f.tmp.path().join("base").to_str().unwrap().into(),
-                lower_layers: vec![LowerLayerRecord {
-                    path: unsealed.clone(),
-                    layer_digest: String::new(),
-                    sealed_at: String::new(),
-                }],
-                ..Default::default()
-            },
+            f.tmp.path().join("base").to_str().unwrap(),
+            vec![LowerLayerRecord {
+                path: unsealed.clone(),
+                layer_digest: String::new(),
+                sealed_at: String::new(),
+            }],
         )
         .unwrap();
         // Replace the lower's file: the row depends on the lower still holding
@@ -3185,7 +3196,7 @@ mod tests {
         writer.close_overlay_fd(fd);
         fs::write(top.join("lf"), b"bbbb").unwrap();
         drop(writer);
-        ratarmount_compositing::overlay_seal::seal(&top, lower.clone()).unwrap();
+        crate::base_identity::fixtures::seal(&top, lower.clone()).unwrap();
         let bundle = f.tmp.path().join("top.tar.zst");
         pack(&top, &bundle, lower, &PackOptions::default()).unwrap();
         let cache = f.tmp.path().join("cache");
@@ -3229,13 +3240,11 @@ mod tests {
         let base_dir = f.tmp.path().join("base");
         // Replace the base's `deleted` ("old") with same-length "new" bytes.
         let replace = f.tmp.path().join("replace");
-        let writer = WriteOverlay::new_with_create_info(
+        let writer = crate::base_identity::fixtures::overlay_over(
             f.base.clone(),
             &replace,
-            &OverlayCreateInfo {
-                base_url: base_dir.to_str().unwrap().into(),
-                ..Default::default()
-            },
+            base_dir.to_str().unwrap(),
+            Vec::new(),
         )
         .unwrap();
         writer.unlink("/deleted").unwrap();
@@ -3243,7 +3252,7 @@ mod tests {
         writer.close_overlay_fd(fd);
         fs::write(replace.join("deleted"), b"new").unwrap();
         drop(writer);
-        ratarmount_compositing::overlay_seal::seal(&replace, f.base.clone()).unwrap();
+        crate::base_identity::fixtures::seal(&replace, f.base.clone()).unwrap();
         let bundle = f.tmp.path().join("replace.tar.zst");
         pack(&replace, &bundle, f.base.clone(), &PackOptions::default()).unwrap();
         let key = crate::lower_base_key(
@@ -3646,5 +3655,48 @@ mod tests {
             args.overlay.unwrap().command,
             crate::overlay_cmd::OverlayCommand::Unpack { .. }
         ));
+    }
+
+    /// A `meta` table with the given rows, for the classifier-injection tests.
+    fn meta_of(rows: &[(&str, &str)]) -> OverlayMeta {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(ratarmount_compositing::overlay_meta::META_SCHEMA)
+            .unwrap();
+        OverlayMeta::set_many(&conn, rows).unwrap();
+        OverlayMeta::from_connection(&conn).unwrap().unwrap()
+    }
+
+    /// Regression: `overlay unpack` of a bundle whose recorded base is a remote
+    /// URL opened the base (a network request) before it noticed the error.
+    /// The opener must not be reached for a recorded remote scheme.
+    #[test]
+    fn regression_unpack_recorded_remote_base_opens_no_network() {
+        let dir = tempfile::tempdir().unwrap();
+        for base in [
+            "http://127.0.0.1:9/never.tar",
+            "https://user:s3cr3t@example.invalid/x.tar?sig=1",
+            "s3://bucket/key.tar",
+            "ssh://host/path.tar",
+        ] {
+            let meta = meta_of(&[("format_version", "2"), ("base_url", base)]);
+            let verified = verify_recorded_with(dir.path(), &meta, &|_| {
+                panic!("the opener was called for a recorded remote base: {base}")
+            })
+            .unwrap();
+            assert_eq!(verified, None, "{base}");
+        }
+        // A local recorded base still reaches the classifier.
+        let local = dir.path().join("base");
+        fs::create_dir(&local).unwrap();
+        let meta = meta_of(&[
+            ("format_version", "2"),
+            ("base_url", local.to_str().unwrap()),
+        ]);
+        let reached = std::cell::Cell::new(false);
+        let _ = verify_recorded_with(dir.path(), &meta, &|_| {
+            reached.set(true);
+            Err("stop".into())
+        });
+        assert!(reached.get(), "a local recorded base must be classified");
     }
 }

@@ -8,9 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Args;
-use ratarmount_compositing::{OverlayCreateInfo, OverlayMetadata, WriteOverlay};
-use ratarmount_core::{FileInfo, MountSource, OpenOptions, S_IFLNK, S_IFMT, S_IFREG};
-use ratarmount_session::factory;
+use ratarmount_compositing::{
+    ClassifiedBase, CreateOptions, LowerLayerRecord, OverlayMetadata, WriteOverlay,
+};
+use ratarmount_core::{FileInfo, MountSource, S_IFLNK, S_IFMT, S_IFREG};
+
+use crate::base_identity::{classify_offline, GitIntent, OverlayRunContext};
 
 mod parse;
 #[cfg(test)]
@@ -83,51 +86,39 @@ fn read_bounded(reader: impl Read, limit: u64) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
-/// The open source is retained for sealing, so Git branches are resolved once.
+/// The classified base and the composed view over it, retained for sealing:
+/// rows are hashed against `view` (the base under its `--lower` layers), so a
+/// file a lower layer added and the top modifies seals as Modified, not Added.
 pub(super) struct ImportStack {
-    pub source: Arc<dyn MountSource>,
-    pub info: OverlayCreateInfo,
+    pub base: ClassifiedBase,
+    /// The base under its lower layers: what the overlay is served over.
+    pub view: Arc<dyn MountSource>,
+    pub lower_layers: Vec<LowerLayerRecord>,
     pub inputs: Vec<PathBuf>,
 }
 
 impl ImportStack {
-    fn open(args: &ImportArgs) -> Result<Self, String> {
-        Self::open_base(&args.base, &args.lower, args.allow_unsealed_lower)
+    fn open(args: &ImportArgs, context: &OverlayRunContext) -> Result<Self, String> {
+        Self::open_base(&args.base, &args.lower, args.allow_unsealed_lower, context)
     }
 
-    /// Shared by patch and kernel upperdir imports; retain the pinned stack for sealing.
+    /// Shared by patch and kernel upperdir imports; retain the stack for sealing.
     pub fn open_base(
         base: &str,
         lower: &[PathBuf],
         allow_unsealed_lower: bool,
+        context: &OverlayRunContext,
     ) -> Result<Self, String> {
-        let mut inputs = vec![PathBuf::from(base)];
-        let mut open = OpenOptions {
-            write_index: false,
-            index_in_memory: true,
-            git: inputs[0].join(".git").exists(),
-            ..Default::default()
-        };
-        let git_tree = super::overlay_cmd::pin_git_base(&mut inputs, &mut open)?;
-        let source = factory::build_mount_source_ex(
-            &inputs,
-            &mut open,
-            false,
-            factory::CompositingOptions::default(),
-        )
-        .map_err(|e| e.to_string())?
-        .source;
-        let (lowers, source) =
-            super::MountLowerStack::open(source, None, lower, allow_unsealed_lower)?;
+        // Import opens the base the way the user would mount it: a working
+        // tree with a `.git` entry is Git.
+        let classified = classify_offline(Path::new(base), GitIntent::Auto, context)?;
+        let (lowers, view) =
+            super::MountLowerStack::open(classified.source(), None, lower, allow_unsealed_lower)?;
         Ok(Self {
-            source,
-            info: OverlayCreateInfo {
-                base_url: base.into(),
-                lower_layers: lowers.records,
-                git_tree,
-                ..Default::default()
-            },
-            inputs,
+            base: classified,
+            view,
+            lower_layers: lowers.records,
+            inputs: vec![PathBuf::from(base)],
         })
     }
 }
@@ -158,7 +149,7 @@ pub(super) fn validate_destination(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn run(args: &ImportArgs) -> Result<(String, i32), String> {
+pub fn run(args: &ImportArgs, context: &OverlayRunContext) -> Result<(String, i32), String> {
     validate_destination(&args.directory)?;
     let bytes = if args.patch == Path::new("-") {
         read_bounded(io::stdin().lock(), args.max_patch_bytes)
@@ -173,7 +164,7 @@ pub fn run(args: &ImportArgs) -> Result<(String, i32), String> {
     let time = mtime(&args.mtime)?;
     // Factory and lazy archive progress must not contaminate JSON/digest stdout.
     let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
-    let stack = ImportStack::open(args)?;
+    let stack = ImportStack::open(args, context)?;
     import(args, &patches, stack, time)
 }
 
@@ -191,10 +182,14 @@ fn import(
             .map_err(|e| format!("{}: {e}", args.directory.display()))?;
     }
     let result = (|| {
-        let overlay = super::overlay_create::create_overlay_legacy(
-            stack.source.clone(),
+        let overlay = super::overlay_create::create_overlay(
+            &stack.base,
+            stack.view.clone(),
             &args.directory,
-            stack.info,
+            CreateOptions {
+                lower_layers: stack.lower_layers.clone(),
+                ..Default::default()
+            },
             &stack.inputs,
             false,
         )
@@ -206,7 +201,7 @@ fn import(
         let mut rejects: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for patch in patches {
             for path in patch.old.iter().chain(&patch.new) {
-                check_parents(&overlay, stack.source.as_ref(), path)?;
+                check_parents(&overlay, stack.view.as_ref(), path)?;
             }
             // Type changes can be separate delete/add sections. Once any
             // section fails, keep that whole file at its original lower state.
@@ -234,12 +229,12 @@ fn import(
                 // The lower view is the original even if an earlier section in
                 // this patch stream changed this path.
                 for path in patch.old.iter().chain(&patch.new).collect::<BTreeSet<_>>() {
-                    restore(&overlay, stack.source.as_ref(), path, args.max_patch_bytes)?;
+                    restore(&overlay, stack.view.as_ref(), path, args.max_patch_bytes)?;
                     written.remove(path);
                     rejected.insert(path.clone());
                 }
                 let name = format!("{}.rej", patch.path());
-                check_parents(&overlay, stack.source.as_ref(), &name)?;
+                check_parents(&overlay, stack.view.as_ref(), &name)?;
                 let reject = rejects.entry(name).or_insert_with(|| {
                     format!(
                         "diff a/{} b/{}\t(rejected hunks)\n",
@@ -297,7 +292,7 @@ fn import(
             }
         }
         for (name, reject) in rejects {
-            check_parents(&overlay, stack.source.as_ref(), &name)?;
+            check_parents(&overlay, stack.view.as_ref(), &name)?;
             write_entry(&overlay, &name, &reject, S_IFREG | 0o644, time)?;
         }
         finish_import(&overlay)?;
@@ -306,9 +301,13 @@ fn import(
             None
         } else {
             Some(
-                ratarmount_compositing::overlay_seal::seal(&args.directory, stack.source)
-                    .map_err(|e| e.to_string())?
-                    .layer_digest,
+                ratarmount_compositing::overlay_seal::seal(
+                    &args.directory,
+                    &stack.base,
+                    stack.view,
+                )
+                .map_err(|e| e.to_string())?
+                .layer_digest,
             )
         };
         let output = if args.json {

@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn regression_overlay_chmod_sftp_setstat() {
         let td = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap());
+        let ov = Arc::new(crate::test_overlay::new_overlay(Arc::new(EmptyFs), td.path()).unwrap());
         let fd = ov.create_file("/built", 0o644).unwrap();
         ov.close_overlay_fd(fd);
         let fs = RatarmountSftp::with_overlay(ov.clone(), 0, 8, Some(ov.clone()));
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn regression_overlay_policy_denials() {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(EmptyFs), td.path()).unwrap();
         ov.mkdir("/locked", 0o755).unwrap();
         ov.mkdir("/locked/empty", 0o755).unwrap();
         for path in ["/locked/file", "/outside", "/quota"] {
@@ -706,7 +706,7 @@ mod tests {
     fn overlay_write_roundtrip() {
         let td = tempfile::tempdir().unwrap();
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(EmptyFs) as Arc<dyn MountSource>, td.path())
+            crate::test_overlay::new_overlay(Arc::new(EmptyFs) as Arc<dyn MountSource>, td.path())
                 .expect("overlay"),
         );
         let fs = RatarmountSftp::with_overlay(ov.clone(), 0, 8, Some(ov));

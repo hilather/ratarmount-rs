@@ -1,9 +1,10 @@
 //! Regression: composed lower layers through the kernel FUSE client.
 #![cfg(target_os = "linux")]
 
-use ratarmount_compositing::{
-    compose_stack, FolderMountSource, Immutability, OverlayMeta, WriteOverlay,
-};
+#[path = "support/token.rs"]
+mod token;
+
+use ratarmount_compositing::{compose_stack, FolderMountSource, Immutability, OverlayMeta};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -89,7 +90,7 @@ fn fixture(root: &Path) -> (PathBuf, PathBuf) {
     fs::write(base.join("recreated"), b"base file").unwrap();
     let prepared = root.join("prepared");
     let overlay =
-        WriteOverlay::new(Arc::new(FolderMountSource::new(&base).unwrap()), &prepared).unwrap();
+        token::new_overlay(Arc::new(FolderMountSource::new(&base).unwrap()), &prepared).unwrap();
     overlay.unlink("/recreated").unwrap();
     drop(overlay);
     fs::create_dir(prepared.join("blib")).unwrap();
@@ -97,11 +98,7 @@ fn fixture(root: &Path) -> (PathBuf, PathBuf) {
     fs::write(prepared.join("blib/copy"), b"prepared bytes").unwrap();
     fs::write(prepared.join("Makefile"), b"prepared makefile").unwrap();
     ratarmount_compositing::overlay_fsck::fsck(&prepared, true).unwrap();
-    ratarmount_compositing::overlay_seal::seal(
-        &prepared,
-        Arc::new(FolderMountSource::new(&base).unwrap()),
-    )
-    .unwrap();
+    token::seal(&prepared, Arc::new(FolderMountSource::new(&base).unwrap())).unwrap();
     (base, prepared)
 }
 

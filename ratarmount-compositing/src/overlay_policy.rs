@@ -962,9 +962,11 @@ mod tests {
     #[test]
     fn regression_readonly_allow_overlay_mutations() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay =
-            crate::WriteOverlay::new(archive_with_paths(&["t/file", "t/agent/base"]), root.path())
-                .unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(
+            archive_with_paths(&["t/file", "t/agent/base"]),
+            root.path(),
+        )
+        .unwrap();
         let protected = new_file(&overlay, "/t/host");
         let rules = Arc::new(
             ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"])
@@ -1084,7 +1086,7 @@ mod tests {
     #[test]
     fn regression_readonly_mutations_and_parent_rename() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         overlay.mkdir("/t/empty", 0o755).unwrap();
         let protected = new_file(&overlay, "/t/host");
         let outside = new_file(&overlay, "/allowed");
@@ -1150,7 +1152,7 @@ mod tests {
     #[test]
     fn regression_quota_growth_unlink_and_startup_scan() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         fs::write(root.path().join("preexisting"), b"abc").unwrap();
         let quota = Arc::new(OverlayQuota::new(root.path(), Some(10), Some(3)).unwrap());
         assert_eq!((quota.usage().bytes, quota.usage().files), (3, 1));
@@ -1207,7 +1209,7 @@ mod tests {
     #[test]
     fn regression_quota_concurrent_writers_never_exceed_cap() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         let quota = Arc::new(OverlayQuota::new(root.path(), Some(101), Some(8)).unwrap());
         overlay.set_policy(Some(quota.clone()));
         let overlay = Arc::new(overlay);
@@ -1240,7 +1242,7 @@ mod tests {
     #[test]
     fn regression_overlay_stats_exact_counts_and_readonly_db() {
         let root = tempfile::tempdir().unwrap();
-        let overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         let file = new_file(&overlay, "/added");
         overlay.write_at(&file, "/added", 0, b"hello").unwrap();
         overlay.finish_owned_write_fd(file);
@@ -1299,7 +1301,7 @@ mod tests {
     #[test]
     fn regression_control_status_live_quota_usage() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         let rules = Arc::new(ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"]).unwrap());
         let quota = Arc::new(
             OverlayQuota::new(root.path(), Some(10), Some(2))
@@ -1382,7 +1384,7 @@ mod tests {
                     release: release.clone(),
                     fail,
                 });
-                let mut overlay = crate::WriteOverlay::new(base, root.path()).unwrap();
+                let mut overlay = crate::WriteOverlay::new_for_tests(base, root.path()).unwrap();
                 let quota = Arc::new(OverlayQuota::new(root.path(), Some(4), Some(1)).unwrap());
                 overlay.set_policy(Some(quota.clone()));
                 let overlay = Arc::new(overlay);
@@ -1410,7 +1412,7 @@ mod tests {
     #[test]
     fn regression_quota_unlinked_fd_does_not_leak_file_slot() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         let quota = Arc::new(OverlayQuota::new(root.path(), Some(10), Some(1)).unwrap());
         overlay.set_policy(Some(quota.clone()));
         let overlay = Arc::new(overlay);
@@ -1449,7 +1451,7 @@ mod tests {
             external.path().as_os_str().len() as u64 + 7
         );
         let empty = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), empty.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), empty.path()).unwrap();
         overlay.set_policy(Some(Arc::new(
             OverlayQuota::new(empty.path(), Some(0), Some(0)).unwrap(),
         )));
@@ -1468,7 +1470,7 @@ mod tests {
     #[test]
     fn regression_readonly_parent_symlink_cannot_bypass_rules() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         overlay.ensure_modifiable("/t/file").unwrap();
         overlay.set_policy(Some(Arc::new(
             ReadOnlyGlobs::new(["t/**"])
@@ -1510,7 +1512,7 @@ mod tests {
                     release: release.clone(),
                     fail,
                 });
-                let mut overlay = crate::WriteOverlay::new(base, root.path()).unwrap();
+                let mut overlay = crate::WriteOverlay::new_for_tests(base, root.path()).unwrap();
                 overlay.mkdir("/protected", 0o755).unwrap();
                 if symlinked {
                     overlay.mkdir("/physical/child", 0o755).unwrap();

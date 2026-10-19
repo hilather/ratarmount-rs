@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ratarmount_compositing::{
-    ClassifiedBase, CreateOptions, OverlayCreateInfo, OverlayError, WriteOverlay, HIDDEN_DB,
+    ClassifiedBase, CreateOptions, OverlayError, WriteOverlay, HIDDEN_DB,
 };
 use ratarmount_core::MountSource;
 
@@ -42,48 +42,6 @@ pub fn create_overlay(
         }
     }
     WriteOverlay::open(base, composed, dir, &options)
-}
-
-/// Untokened create for `overlay import` and `import-upperdir` until R6-4
-/// moves them to the classifier. Create on an already opened, pinned and composed source. `info` carries the
-/// original positional, digest request, lower records, index path and Git tree.
-pub fn create_overlay_legacy(
-    stack: Arc<dyn MountSource>,
-    dir: &Path,
-    mut info: OverlayCreateInfo,
-    inputs: &[PathBuf],
-    has_source_binds: bool,
-) -> Result<WriteOverlay, OverlayError> {
-    use ratarmount_compositing::BaseDigestRequest;
-    if info.base_digest == BaseDigestRequest::None {
-        eprintln!(
-            "warning: --base-digest none disables base identity verification for new overlays"
-        );
-    }
-    if inputs.len() > 1 || has_source_binds {
-        let redacted: Vec<String> = inputs
-            .iter()
-            .map(|p| ratarmount_core::redact_base_url(&p.to_string_lossy()))
-            .collect();
-        info.remote_token = Some(serde_json::to_string(&redacted).expect("input paths"));
-    } else if info.base_digest == BaseDigestRequest::Compute
-        && !dir.join(HIDDEN_DB).exists()
-        && ratarmount_remote::is_remote_url(&info.base_url)
-    {
-        info.remote_token = Some(
-            super::overlay_cmd::remote_base_token(&info.base_url).unwrap_or_else(|| {
-                format!("url:{}", ratarmount_core::redact_base_url(&info.base_url))
-            }),
-        );
-    }
-    if inputs.len() == 1
-        && !has_source_binds
-        && info.git_tree.is_none()
-        && !ratarmount_remote::is_remote_url(&info.base_url)
-    {
-        info.local_path = Some(inputs[0].clone());
-    }
-    WriteOverlay::new_with_create_info(stack, dir, &info)
 }
 
 #[cfg(test)]

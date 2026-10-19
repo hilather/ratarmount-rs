@@ -383,7 +383,7 @@ mod tests {
         host::create_dir(&base).unwrap();
         let source = Arc::new(FolderMountSource::new(&base).unwrap());
         let overlay = tmp.path().join("overlay");
-        drop(WriteOverlay::new(source.clone(), &overlay).unwrap());
+        drop(WriteOverlay::new_for_tests(source.clone(), &overlay).unwrap());
         (tmp, overlay, source)
     }
 
@@ -397,7 +397,7 @@ mod tests {
         let (tmp, dir, source) = fixture();
         host::create_dir(tmp.path().join("base/lib")).unwrap();
         host::write(tmp.path().join("base/lib/f"), b"base").unwrap();
-        let ov = WriteOverlay::new(source.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(source.clone(), &dir).unwrap();
         crate::overlay_changes::cow_write(&ov, "/lib/f", b"changed");
         drop(ov);
         for repair in [false, true] {
@@ -417,7 +417,7 @@ mod tests {
         }
         host::write(dir.join("lib/.ratarmount.overlay.cow-killed"), b"partial").unwrap();
         assert!(fsck(&dir, true).unwrap().is_clean());
-        drop(WriteOverlay::new(source, &dir).unwrap());
+        drop(WriteOverlay::new_for_tests(source, &dir).unwrap());
         assert!(!dir.join("lib/.ratarmount.overlay.cow-killed").exists());
         assert_eq!(host::read(dir.join("lib/f")).unwrap(), b"changed");
     }
@@ -427,7 +427,7 @@ mod tests {
     fn regression_fsck_killed_writer_reports_and_repairs_each_category() {
         let (tmp, dir, source) = fixture();
         host::write(tmp.path().join("base/cow"), b"base").unwrap();
-        let ov = WriteOverlay::new(source, &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(source, &dir).unwrap();
         crate::overlay_changes::cow_write(&ov, "/cow", b"changed");
         drop(ov);
         let conn = db(&dir);
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn regression_fsck_locked_or_sealed_overlay_is_not_repaired() {
         let (_tmp, dir, source) = fixture();
-        let mounted = WriteOverlay::new(source.clone(), &dir).unwrap();
+        let mounted = WriteOverlay::new_for_tests(source.clone(), &dir).unwrap();
         assert_eq!(
             fsck(&dir, true).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
@@ -492,7 +492,7 @@ mod tests {
         OverlayMeta::set(&db(&dir), "sealed_at", "2026-10-17T00:00:00Z").unwrap();
         host::write(dir.join(".ratarmount-sealed"), b"digest").unwrap();
         let before = host::read(dir.join(HIDDEN_DB)).unwrap();
-        assert!(WriteOverlay::new(source, &dir)
+        assert!(WriteOverlay::new_for_tests(source, &dir)
             .err()
             .unwrap()
             .to_string()
@@ -589,7 +589,7 @@ mod tests {
             host::write(base.join(file), b"base").unwrap();
         }
         let source: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base).unwrap());
-        let overlay = WriteOverlay::new(source.clone(), &dir).unwrap();
+        let overlay = WriteOverlay::new_for_tests(source.clone(), &dir).unwrap();
         overlay.unlink("/a/b/c").unwrap();
         for (file, sub, top) in [("/d/sub/old", "/d/sub", "/d"), ("/l/x/k", "/l/x", "/l")] {
             overlay.unlink(file).unwrap();
@@ -607,7 +607,7 @@ mod tests {
         let report = fsck(&dir, false).unwrap();
         assert!(report.is_clean(), "{}", report.result());
         assert!(!dir.join("a").exists(), "fsck must not create host parents");
-        crate::overlay_seal::seal(&dir, source).unwrap();
+        crate::overlay_seal::seal_impl(&dir, None, source).unwrap();
     }
 
     /// Regression: tombstoned directories leave descendants and missing parents inconsistent.
@@ -638,7 +638,7 @@ mod tests {
         let (tmp, dir, source) = fixture();
         host::create_dir(tmp.path().join("base/sub")).unwrap();
         host::write(tmp.path().join("base/sub/file"), b"base").unwrap();
-        let overlay = WriteOverlay::new(source, &dir).unwrap();
+        let overlay = WriteOverlay::new_for_tests(source, &dir).unwrap();
         for path in ["/", "/sub/file"] {
             overlay
                 .set_metadata(
@@ -711,7 +711,7 @@ mod tests {
         let dir = std::env::var_os("RATARMOUNT_TEST_CHILD_OVERLAY").expect("child overlay dir");
         let base = std::path::PathBuf::from(dir.clone()).with_file_name("base");
         let source = Arc::new(FolderMountSource::new(&base).unwrap());
-        let overlay = WriteOverlay::new(source, std::path::Path::new(&dir)).unwrap();
+        let overlay = WriteOverlay::new_for_tests(source, std::path::Path::new(&dir)).unwrap();
         overlay
             .set_meta("import_in_progress", "123:2026-10-18T00:00:00Z")
             .unwrap();
@@ -763,7 +763,7 @@ mod tests {
             Some("123:2026-10-18T00:00:00Z")
         );
         // Seal refuses, naming the import rather than suggesting fsck --repair.
-        let err = crate::overlay_seal::seal(&dir, source)
+        let err = crate::overlay_seal::seal_impl(&dir, None, source)
             .unwrap_err()
             .to_string();
         assert!(err.contains("import"), "{err}");

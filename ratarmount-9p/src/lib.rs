@@ -18,6 +18,8 @@
 
 mod proto;
 mod serve;
+#[cfg(test)]
+mod test_overlay;
 mod vfs;
 
 pub use ratarmount_compositing::WriteOverlay;

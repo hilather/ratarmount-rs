@@ -53,21 +53,23 @@ pub use empty_archive::{
 };
 pub use folder::FolderMountSource;
 pub use oci_whiteout::OciImageMountSource;
+pub use overlay_gate::{
+    compare_base_identity, forced_base_record, identity_rows, record_forced_base_rows,
+    shape_verdict, verify_base, BaseProbe, Recorded, Verdict,
+};
 pub use overlay_identity::{
-    ActualBase, ClassifiedBase, CreateOptions, IndexProvenance, OpenBase, Opened, SealedRecord,
-    ServedKind, ServedLocation,
+    ActualBase, BaseKind, BaseLocation, ClassifiedBase, CreateOptions, IndexProvenance, OpenBase,
+    Opened, SealedRecord, ServedKind, ServedLocation,
 };
 pub use overlay_layer::{
     compose_stack, serving_layer, Immutability, LayerIndex, ReadOnlyOverlayLayer,
 };
 pub use overlay_meta::{
-    append_base_excludes, base_digest_state, compare_base_identity, directory_digest,
-    directory_digest_calls_this_thread, directory_digest_excluding, directory_weak_digest,
-    directory_weak_walks_this_thread, forced_base_record, record_base_digest,
-    record_base_rows_offline, redact_meta_values, resolve_base_excludes,
-    resolve_pending_base_digest, stack_digest, verify_base, BaseCheck, BaseComparison,
-    BaseDigestRequest, BaseExcludes, BaseKind, BaseProbe, BaseStrength, LowerLayerRecord,
-    OverlayCreateInfo, OverlayMeta, PendingBase, BASE_COMPARISON_KEYS,
+    append_base_excludes, base_digest_state, directory_digest, directory_digest_calls_this_thread,
+    directory_digest_excluding, directory_weak_digest, directory_weak_walks_this_thread,
+    record_base_digest, redact_meta_values, resolve_base_excludes, resolve_pending_base_digest,
+    stack_digest, BaseCheck, BaseComparison, BaseDigestRequest, BaseExcludes, BaseStrength,
+    LowerLayerRecord, OverlayMeta, PendingBase, BASE_COMPARISON_KEYS,
 };
 pub use overlay_policy::{
     parse_overlay_size, CompositeOverlayPolicy, OverlayQuota, OverlayStats, OverlayUsage,
@@ -80,11 +82,10 @@ pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};
 pub use versioning::FileVersionLayer;
 pub use write_overlay::{
-    commit_overlay, commit_overlay_checked, commit_overlay_raw_dir, is_control_reserved_path,
-    is_overlay_internal_path, live_commit_is_supported, name_suggests_tar_zst, overlay_atime,
-    overlay_only_names, patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitMode,
-    CommitOutcome, CommitOverlayOptions, IndexPatchWindow, OverlayError, OverlayMetadata,
-    OverlayMutation, OverlayPolicy, Parked, RawDirCommit, RemoteDownload, RemoteObjectHead,
-    RemotePublishError, RemotePublishRequest, WriteOverlay, HIDDEN_DB, LEGACY_OVERLAY_MARKER,
-    OVERLAY_MARKER,
+    commit_overlay, commit_overlay_raw_dir, is_control_reserved_path, is_overlay_internal_path,
+    live_commit_is_supported, name_suggests_tar_zst, overlay_atime, overlay_only_names,
+    patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitMode, CommitOutcome,
+    CommitOverlayOptions, IndexPatchWindow, OverlayError, OverlayMetadata, OverlayMutation,
+    OverlayPolicy, Parked, RawDirCommit, RemoteDownload, RemoteObjectHead, RemotePublishError,
+    RemotePublishRequest, WriteOverlay, HIDDEN_DB, LEGACY_OVERLAY_MARKER, OVERLAY_MARKER,
 };

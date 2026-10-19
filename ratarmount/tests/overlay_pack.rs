@@ -1,5 +1,8 @@
 //! Regression: portable layers through the CLI and the kernel FUSE client.
 
+#[path = "support/token.rs"]
+mod token;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -11,7 +14,7 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
-use ratarmount_compositing::{FolderMountSource, OverlayCreateInfo, WriteOverlay};
+use ratarmount_compositing::FolderMountSource;
 
 #[path = "diff/cow.rs"]
 mod cow;
@@ -52,19 +55,13 @@ impl Fixture {
         fs::set_permissions(base.join("payload"), fs::Permissions::from_mode(0o751)).unwrap();
         let overlay = tmp.path().join("overlay");
         let source = Arc::new(FolderMountSource::new(&base).unwrap());
-        let writer = WriteOverlay::new_with_create_info(
-            source.clone(),
-            &overlay,
-            &OverlayCreateInfo {
-                base_url: base.to_str().unwrap().into(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let writer =
+            token::overlay_over(source.clone(), &overlay, base.to_str().unwrap(), Vec::new())
+                .unwrap();
         writer.unlink("/deleted").unwrap();
         cow::cow_write(&writer, "/payload", b"bundle bytes\n");
         drop(writer);
-        ratarmount_compositing::overlay_seal::seal(&overlay, source).unwrap();
+        token::seal(&overlay, source).unwrap();
         let bundle = tmp.path().join("bundle.tar.zst");
         let cache = tmp.path().join("cache");
         expect(
@@ -420,15 +417,8 @@ fn regression_pack_redacts_credentialed_base_in_meta_and_db() {
     fs::write(base.join("f"), b"x").unwrap();
     let overlay = tmp.path().join("overlay");
     let source = Arc::new(FolderMountSource::new(&base).unwrap());
-    let writer = WriteOverlay::new_with_create_info(
-        source.clone(),
-        &overlay,
-        &OverlayCreateInfo {
-            base_url: base.to_str().unwrap().into(),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let writer =
+        token::overlay_over(source.clone(), &overlay, base.to_str().unwrap(), Vec::new()).unwrap();
     cow::cow_write(&writer, "/f", b"changed\n");
     drop(writer);
     // Earlier-build shape: raw URL and a JSON array of raw inputs.
@@ -443,7 +433,7 @@ fn regression_pack_redacts_credentialed_base_in_meta_and_db() {
         )
         .unwrap();
     }
-    ratarmount_compositing::overlay_seal::seal(&overlay, source).unwrap();
+    token::seal(&overlay, source).unwrap();
     let before = fs::read(overlay.join(".ratarmount.overlay.sqlite")).unwrap();
     let bundle = tmp.path().join("bundle.tar.zst");
     let cache = tmp.path().join("cache");

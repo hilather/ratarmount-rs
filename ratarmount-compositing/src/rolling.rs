@@ -534,7 +534,7 @@ mod tests {
     }
 
     fn overlay(dir: &Path, series: &Arc<RollingMountSource>, mode: CommitMode) -> WriteOverlay {
-        let mut overlay = WriteOverlay::new(
+        let mut overlay = WriteOverlay::new_for_tests(
             Arc::new(crate::FileVersionLayer::new(series.clone())),
             dir.join("overlay"),
         )

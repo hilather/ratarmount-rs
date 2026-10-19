@@ -42,7 +42,10 @@ enum Kind {
     Whiteout,
 }
 
-pub fn run(args: &ImportUpperdirArgs) -> Result<(String, i32), String> {
+pub fn run(
+    args: &ImportUpperdirArgs,
+    context: &crate::base_identity::OverlayRunContext,
+) -> Result<(String, i32), String> {
     use crate::overlay_import::{validate_destination, ImportStack};
 
     validate_destination(&args.directory)?;
@@ -66,26 +69,30 @@ pub fn run(args: &ImportUpperdirArgs) -> Result<(String, i32), String> {
         return Err("UPPERDIR and NEW_OVERLAY_DIR must not contain one another".into());
     }
     let _progress = crate::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
-    let stack = ImportStack::open_base(&args.base, &args.lower, false)?;
+    let stack = ImportStack::open_base(&args.base, &args.lower, false, context)?;
     validate_destination(&args.directory)?;
     if !args.directory.exists() {
         fs::create_dir(&args.directory).map_err(|e| e.to_string())?;
     }
     let result = (|| {
-        let overlay = crate::overlay_create::create_overlay_legacy(
-            stack.source.clone(),
+        let overlay = crate::overlay_create::create_overlay(
+            &stack.base,
+            stack.view.clone(),
             &args.directory,
-            stack.info,
+            ratarmount_compositing::CreateOptions {
+                lower_layers: stack.lower_layers.clone(),
+                ..Default::default()
+            },
             &stack.inputs,
             false,
         )
         .map_err(|e| e.to_string())?;
-        apply(&upper, "/", false, &overlay, stack.source.as_ref())?;
+        apply(&upper, "/", false, &overlay, stack.view.as_ref())?;
         drop(overlay);
         let output = if args.no_seal {
             format!("imported upperdir into {}", args.directory.display())
         } else {
-            ratarmount_compositing::overlay_seal::seal(&args.directory, stack.source)
+            ratarmount_compositing::overlay_seal::seal(&args.directory, &stack.base, stack.view)
                 .map_err(|e| e.to_string())?
                 .layer_digest
         };
@@ -409,7 +416,7 @@ mod tests {
         }
 
         fn import(&self) -> ReadOnlyOverlayLayer {
-            run(&self.args()).unwrap();
+            run(&self.args(), &Default::default()).unwrap();
             ReadOnlyOverlayLayer::new(self.source(), &self.dest, Immutability::Shared).unwrap()
         }
     }
@@ -581,16 +588,16 @@ mod tests {
     fn regression_upperdir_seals_and_records_lower_stack_identity() {
         let f = Fixture::new();
         let lower = f.root.path().join("lower");
-        let writer = WriteOverlay::new(f.source(), &lower).unwrap();
+        let writer = crate::base_identity::fixtures::new_overlay(f.source(), &lower).unwrap();
         drop(writer);
         fs::write(lower.join("lower-only"), b"prepared").unwrap();
         ratarmount_compositing::overlay_fsck::fsck(&lower, true).unwrap();
-        let seal = ratarmount_compositing::overlay_seal::seal(&lower, f.source()).unwrap();
+        let seal = crate::base_identity::fixtures::seal(&lower, f.source()).unwrap();
         fs::write(f.upper.join(".wh.lower-only"), b"").unwrap();
         let mut args = f.args();
         args.lower = vec![lower.clone()];
         args.no_seal = false;
-        run(&args).unwrap();
+        run(&args, &Default::default()).unwrap();
         let meta = OverlayMeta::read(&f.dest).unwrap().unwrap();
         assert!(meta.layer_sealed());
         assert_eq!(
@@ -612,22 +619,24 @@ mod tests {
         for marker in [".wh.", ".wh..", ".wh...", ".wh..ratarmount.overlay.sqlite"] {
             let f = Fixture::new();
             fs::write(f.upper.join(marker), b"").unwrap();
-            assert!(run(&f.args()).is_err(), "{marker}");
+            assert!(run(&f.args(), &Default::default()).is_err(), "{marker}");
             assert!(!f.dest.exists());
         }
         let f = Fixture::new();
         let mut args = f.args();
         args.directory = f.upper.join("output");
-        assert!(run(&args).unwrap_err().contains("contain one another"));
+        assert!(run(&args, &Default::default())
+            .unwrap_err()
+            .contains("contain one another"));
         fs::write(f.dest.clone(), b"keep").unwrap();
-        assert!(run(&f.args()).is_err());
+        assert!(run(&f.args(), &Default::default()).is_err());
         assert_eq!(fs::read(&f.dest).unwrap(), b"keep");
         fs::remove_file(&f.dest).unwrap();
         args = f.args();
         let link = f.root.path().join("link");
         symlink(&f.upper, &link).unwrap();
         args.upperdir = link;
-        assert!(run(&args)
+        assert!(run(&args, &Default::default())
             .unwrap_err()
             .contains("UPPERDIR must be a directory"));
     }
@@ -641,14 +650,16 @@ mod tests {
         let fifo = f.upper.join("fifo");
         let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        assert!(run(&f.args())
+        assert!(run(&f.args(), &Default::default())
             .unwrap_err()
             .contains("unsupported upperdir file type"));
         fs::remove_file(fifo).unwrap();
         let path = f.upper.join(OsString::from_vec(b"bad\xff".to_vec()));
         match fs::write(&path, b"data") {
             Ok(()) => {
-                assert!(run(&f.args()).unwrap_err().contains("EILSEQ"));
+                assert!(run(&f.args(), &Default::default())
+                    .unwrap_err()
+                    .contains("EILSEQ"));
                 fs::remove_file(path).unwrap();
             }
             // APFS refuses non-UTF-8 names itself; symlink targets still work.
@@ -662,7 +673,9 @@ mod tests {
             f.upper.join("link"),
         )
         .unwrap();
-        assert!(run(&f.args()).unwrap_err().contains("EILSEQ"));
+        assert!(run(&f.args(), &Default::default())
+            .unwrap_err()
+            .contains("EILSEQ"));
         assert!(!f.dest.exists());
     }
 
@@ -714,7 +727,7 @@ mod tests {
             if !set_xattr(&f.upper.join("file"), attr, b"") {
                 return;
             }
-            let error = run(&f.args()).unwrap_err();
+            let error = run(&f.args(), &Default::default()).unwrap_err();
             assert!(
                 error.contains("redirect_dir and metacopy must be off"),
                 "{error}"

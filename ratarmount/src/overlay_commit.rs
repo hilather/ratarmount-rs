@@ -1530,7 +1530,7 @@ mod tests {
             ..Default::default()
         };
         let base = reopen_hf_mount(&repo, &opts).unwrap();
-        let overlay = WriteOverlay::new(base, root).unwrap();
+        let overlay = crate::base_identity::fixtures::new_overlay(base, root).unwrap();
         install_object_store_live_commit(&overlay, Path::new(url), &opts, create_pr).unwrap();
         overlay
     }
@@ -1743,7 +1743,9 @@ mod tests {
                     ..Default::default()
                 };
                 let base = reopen_hf_mount(&repo, &opts).unwrap();
-                let overlay = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+                let overlay =
+                    crate::base_identity::fixtures::new_overlay(base, dir.path().join("ov"))
+                        .unwrap();
                 server.state.lock().unwrap().head = "f".repeat(40);
                 install_object_store_live_commit(&overlay, Path::new(url), &opts, false).unwrap();
                 overlay
@@ -2117,7 +2119,11 @@ mod tests {
             OpenOptions::default(),
         )
         .expect("warm base");
-        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay_dir).unwrap();
+        let ov = crate::base_identity::fixtures::new_overlay(
+            Arc::new(base) as Arc<dyn MountSource>,
+            &overlay_dir,
+        )
+        .unwrap();
         std::fs::write(overlay_dir.join("new.bin"), extra).unwrap();
 
         let opts = OpenOptions {
@@ -2182,7 +2188,11 @@ mod tests {
         )
         .expect("index");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay_dir).unwrap(),
+            crate::base_identity::fixtures::new_overlay(
+                Arc::new(base) as Arc<dyn MountSource>,
+                &overlay_dir,
+            )
+            .unwrap(),
         );
         std::fs::write(overlay_dir.join("new.bin"), extra).unwrap();
         // Backdate so the interval idle filter includes the new file.
@@ -2758,8 +2768,11 @@ mod rolling_tests {
             let series =
                 open_rolling_series(&base, "1B".parse::<RollPolicy>().unwrap(), &opts).unwrap();
             let original = series.active_path();
-            let mut overlay =
-                WriteOverlay::new(series.clone(), dir.path().join("overlay")).unwrap();
+            let mut overlay = crate::base_identity::fixtures::new_overlay(
+                series.clone(),
+                dir.path().join("overlay"),
+            )
+            .unwrap();
             overlay.set_rolling(series.clone());
             overlay.set_commit_mode(CommitMode::Append);
             overlay.set_manifest_hashes(Some("new".into()));

@@ -10,6 +10,8 @@ mod inode;
 mod overlay;
 mod reader;
 mod stop;
+#[cfg(test)]
+mod test_overlay;
 
 pub use bind::{
     default_export_bind, export_bind_string, parse_export_bind, BindError, DEFAULT_HTTP_PORT,

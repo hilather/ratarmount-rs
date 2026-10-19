@@ -12,8 +12,7 @@ use ratarmount_compositing::overlay_changes::{
     self as core, Algorithm, ChangeOptions, Entry, Normalize,
 };
 use ratarmount_compositing::{compose_stack, Immutability, OverlayMeta};
-use ratarmount_core::{MountSource, OpenOptions, S_IFDIR, S_IFMT};
-use ratarmount_session::factory;
+use ratarmount_core::{MountSource, S_IFDIR, S_IFMT};
 
 mod live;
 mod patch;
@@ -271,7 +270,10 @@ struct Prepared {
     base_confirmed: bool,
 }
 
-fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
+fn prepare(
+    args: &DiffArgs,
+    context: &crate::base_identity::OverlayRunContext,
+) -> io::Result<Prepared> {
     if args.json && !(args.hash || args.stat) {
         return Err(io::Error::other("--json requires --hash or --stat"));
     }
@@ -293,7 +295,7 @@ fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
             eprintln!("diff: using base from overlay metadata: {}", base.display());
         }
     }
-    let Some(base) = base else {
+    let Some(_) = base else {
         if args.is_patch() || args.stat || args.between.is_some() || !args.lower.is_empty() {
             return Err(io::Error::other("BASE (or --base SOURCE / meta.base_url) is required for patches, --stat, --lower and --between"));
         }
@@ -344,10 +346,17 @@ fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
             }
         }
     }
+    // Open the base through the factory (a `.git` working tree is Git only
+    // when the overlay recorded Git), keeping lazy lookup/open progress off
+    // stdout as well as factory progress.
+    let _progress = ProgressToStderr::new()?;
+    let classified = crate::overlay_cmd::classify_base(explicit_base, meta.as_ref(), None, context)
+        .map_err(io::Error::other)?;
     // Same cheap identity check as reopen and `--lower`: a base that is not the
     // one the overlay recorded must not be diffed silently.
-    let gate = crate::overlay_cmd::gate_base(&args.directory, meta.as_ref(), base, &args.identity)
-        .map_err(io::Error::other)?;
+    let gate =
+        crate::overlay_cmd::gate_base(&args.directory, meta.as_ref(), &classified, &args.identity)
+            .map_err(io::Error::other)?;
     let base_confirmed = gate.as_ref().is_some_and(|outcome| outcome.confirmed);
     let forced_base = gate.and_then(|outcome| {
         outcome.forced.map(|rows| {
@@ -357,22 +366,7 @@ fn prepare(args: &DiffArgs) -> io::Result<Prepared> {
             )
         })
     });
-    let mut open = OpenOptions {
-        write_index: false,
-        index_in_memory: true,
-        git: base.join(".git").exists(),
-        ..OpenOptions::default()
-    };
-    // Keep lazy lookup/open progress off stdout as well as factory progress.
-    let _progress = ProgressToStderr::new()?;
-    let source = factory::build_mount_source_ex(
-        std::slice::from_ref(base),
-        &mut open,
-        false,
-        factory::CompositingOptions::default(),
-    )
-    .map_err(io::Error::other)?
-    .source;
+    let source = classified.source();
     let stack = compose_stack(source, &layers)?;
     let changes = if let Some(other) = &args.between {
         core::between(&args.directory, other, stack, &options)?
@@ -515,8 +509,8 @@ pub(crate) fn render_source(
     result().map_err(|e| e.to_string())
 }
 
-fn execute(args: &DiffArgs) -> io::Result<i32> {
-    let prepared = prepare(args)?;
+fn execute(args: &DiffArgs, context: &crate::base_identity::OverlayRunContext) -> io::Result<i32> {
+    let prepared = prepare(args, context)?;
     // Withhold partial output on a limit/error. The spool holds rendered bytes,
     // not all source payloads, and is removed automatically on every error.
     let mut spool = tempfile::tempfile()?;
@@ -536,8 +530,8 @@ fn execute(args: &DiffArgs) -> io::Result<i32> {
     })
 }
 
-pub fn run(args: &DiffArgs) -> i32 {
-    match execute(args) {
+pub fn run(args: &DiffArgs, context: &crate::base_identity::OverlayRunContext) -> i32 {
+    match execute(args, context) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("diff: {error}");

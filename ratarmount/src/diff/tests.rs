@@ -1,6 +1,8 @@
 use super::*;
 use ratarmount_compositing::{is_overlay_internal_path, HIDDEN_DB};
+use ratarmount_core::OpenOptions;
 use ratarmount_core::S_IFLNK;
+use ratarmount_session::factory;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -115,7 +117,11 @@ fn regression_diff_unified_golden() {
             ("mode", b"same\n", 0o100644),
         ],
     );
-    let overlay = WriteOverlay::new(Arc::clone(&base.source), tmp.path().join("overlay")).unwrap();
+    let overlay = crate::base_identity::fixtures::new_overlay(
+        Arc::clone(&base.source),
+        tmp.path().join("overlay"),
+    )
+    .unwrap();
     put(&overlay, "/a", b"one\nTWO\nthree\n");
     overlay.unlink("/delete").unwrap();
     put(&overlay, "/empty", b"");
@@ -213,7 +219,11 @@ fn regression_diff_git_apply_matches_overlay_view() {
             ("to-file-dir/child", b"child\n", 0o100644),
         ],
     );
-    let overlay = WriteOverlay::new(Arc::clone(&base.source), tmp.path().join("overlay")).unwrap();
+    let overlay = crate::base_identity::fixtures::new_overlay(
+        Arc::clone(&base.source),
+        tmp.path().join("overlay"),
+    )
+    .unwrap();
     put(&overlay, "/a", b"one\nTWO\nthree\n");
     overlay.ensure_modifiable("/executable").unwrap();
     put(&overlay, "/executable", b"after\n");
@@ -351,7 +361,11 @@ fn regression_diff_renames_summaries_and_internal_paths() {
         tmp.path(),
         &[("a", b"same\n", 0o100644), ("b", b"same\n", 0o100644)],
     );
-    let overlay = WriteOverlay::new(Arc::clone(&base.source), tmp.path().join("overlay")).unwrap();
+    let overlay = crate::base_identity::fixtures::new_overlay(
+        Arc::clone(&base.source),
+        tmp.path().join("overlay"),
+    )
+    .unwrap();
     overlay.unlink("/a").unwrap();
     overlay.unlink("/b").unwrap();
     put(&overlay, "/y", b"same\n");
@@ -442,7 +456,9 @@ fn regression_diff_database_errors_never_create_or_repair() {
 fn regression_diff_active_overlay_is_locked() {
     let tmp = tempfile::tempdir().unwrap();
     let base = ratarmount_compositing::FolderMountSource::new(tmp.path()).unwrap();
-    let overlay = WriteOverlay::new(Arc::new(base), tmp.path().join("overlay")).unwrap();
+    let overlay =
+        crate::base_identity::fixtures::new_overlay(Arc::new(base), tmp.path().join("overlay"))
+            .unwrap();
     let root = overlay.root().to_path_buf();
     assert!(tombstones(&root, false).unwrap_err().contains("locked"));
     drop(overlay);
@@ -460,7 +476,11 @@ fn regression_diff_binary_summary_and_symlink_text() {
             ("link", b"missing-before", 0o120000),
         ],
     );
-    let overlay = WriteOverlay::new(Arc::clone(&base.source), tmp.path().join("overlay")).unwrap();
+    let overlay = crate::base_identity::fixtures::new_overlay(
+        Arc::clone(&base.source),
+        tmp.path().join("overlay"),
+    )
+    .unwrap();
     put(&overlay, "/bin", b"\0after");
     overlay.unlink("/link").unwrap();
     overlay.create_symlink("/link", "missing-after").unwrap();
@@ -477,7 +497,11 @@ fn regression_diff_binary_summary_and_symlink_text() {
 fn regression_diff_git_ignores_unrepresentable_permissions() {
     let tmp = tempfile::tempdir().unwrap();
     let base = base_tar(tmp.path(), &[("mode", b"same\n", 0o100644)]);
-    let overlay = WriteOverlay::new(Arc::clone(&base.source), tmp.path().join("overlay")).unwrap();
+    let overlay = crate::base_identity::fixtures::new_overlay(
+        Arc::clone(&base.source),
+        tmp.path().join("overlay"),
+    )
+    .unwrap();
     overlay.ensure_modifiable("/mode").unwrap();
     overlay
         .set_metadata(
@@ -522,7 +546,7 @@ fn git_roundtrip_case(case: &str) {
     };
     let base = base_tar(tmp.path(), baseline);
     let dir = tmp.path().join("overlay");
-    let overlay = WriteOverlay::new(base.source.clone(), &dir).unwrap();
+    let overlay = crate::base_identity::fixtures::new_overlay(base.source.clone(), &dir).unwrap();
     match case {
         "added" => put(&overlay, "/file", b"added\n"),
         "modified" => cow::cow_write(&overlay, "/file", b"modified\n"),
@@ -649,7 +673,7 @@ fn command_fixture() -> (tempfile::TempDir, DiffArgs) {
     fs::write(base.join("a"), b"old\n").unwrap();
     let dir = tmp.path().join("overlay");
     let source = Arc::new(ratarmount_compositing::FolderMountSource::new(&base).unwrap());
-    let overlay = WriteOverlay::new(source, &dir).unwrap();
+    let overlay = crate::base_identity::fixtures::new_overlay(source, &dir).unwrap();
     put(&overlay, "/a", b"new\n");
     drop(overlay);
     let args = DiffArgs {
@@ -673,34 +697,34 @@ fn output(args: &DiffArgs) -> Vec<u8> {
 fn regression_diff_base_omitted_modes_and_metadata_default() {
     let (_tmp, mut args) = command_fixture();
     let base = args.base_source.take().unwrap();
-    assert_eq!(run(&args), 2);
+    assert_eq!(run(&args, &Default::default()), 2);
     args.stat = true;
-    assert_eq!(run(&args), 2);
+    assert_eq!(run(&args, &Default::default()), 2);
     args.stat = false;
     args.manifest = true;
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
     assert_eq!(row["status"], "written");
     assert!(row.get("base_hash").is_none());
     args.manifest = false;
     args.hash = true;
     args.json = true;
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
     assert_eq!(row["files"], 1);
     assert_eq!(row["base"], "none");
     args.hash = false;
     args.json = false;
     args.name_only = true;
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     assert_eq!(output(&args), b"a\n");
     args.name_only = false;
     args.name_status = true;
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     assert_eq!(output(&args), b"written\ta\n");
     args.name_status = false;
     meta_set(&args.directory, &[("base_url", base.to_str().unwrap())]);
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     assert!(String::from_utf8(output(&args))
         .unwrap()
         .contains("-old\n+new\n"));
@@ -711,9 +735,9 @@ fn regression_diff_base_omitted_modes_and_metadata_default() {
 fn regression_diff_positional_alias_and_mode_conflicts() {
     let (_tmp, mut args) = command_fixture();
     args.base = Some("missing-alias-base".into());
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     args.base = args.base_source.take();
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     for modes in [
         ["--git", "--manifest"],
         ["--patch", "--hash"],
@@ -737,7 +761,7 @@ fn regression_diff_seals_lowers_and_hash_json() {
     args.hash = true;
     args.json = true;
     args.strict = true;
-    assert_eq!(run(&args), 2);
+    assert_eq!(run(&args, &Default::default()), 2);
     meta_set(
         &args.directory,
         &[
@@ -746,7 +770,7 @@ fn regression_diff_seals_lowers_and_hash_json() {
             ("stack_digest", "sha256:stack"),
         ],
     );
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
     assert_eq!(row["base"], "sha256:base");
     assert_eq!(row["stack"], "sha256:stack");
@@ -755,7 +779,7 @@ fn regression_diff_seals_lowers_and_hash_json() {
     assert_eq!(row["algo"], "sha256");
     let lower = tmp.path().join("lower");
     drop(
-        WriteOverlay::new(
+        crate::base_identity::fixtures::new_overlay(
             Arc::new(
                 ratarmount_compositing::FolderMountSource::new(args.base_source.as_ref().unwrap())
                     .unwrap(),
@@ -765,14 +789,14 @@ fn regression_diff_seals_lowers_and_hash_json() {
         .unwrap(),
     );
     args.lower.push(lower.clone());
-    assert_eq!(run(&args), 2);
+    assert_eq!(run(&args, &Default::default()), 2);
     meta_set(&lower, &[("sealed_at", "now")]);
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     let conn = Connection::open(args.directory.join(HIDDEN_DB)).unwrap();
     conn.execute("DELETE FROM meta WHERE key='stack_digest'", [])
         .unwrap();
     drop(conn);
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
     assert_eq!(
         row["stack"],
@@ -782,7 +806,7 @@ fn regression_diff_seals_lowers_and_hash_json() {
     let conn = Connection::open(args.directory.join(HIDDEN_DB)).unwrap();
     conn.execute("DROP TABLE meta", []).unwrap();
     drop(conn);
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
 }
 
 /// Regression: a pending archive base (digest recorded as "") made
@@ -801,7 +825,7 @@ fn regression_diff_hash_json_pending_base_has_no_stack() {
     conn.execute("DELETE FROM meta WHERE key='stack_digest'", [])
         .unwrap();
     drop(conn);
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
     assert!(row["base"].is_null(), "{row}");
     assert!(row["stack"].is_null(), "{row}");
@@ -827,7 +851,7 @@ fn regression_diff_hash_json_base_digest_state_present_and_none() {
             &args.directory,
             &[("base_digest_kind", kind), ("base_digest", digest)],
         );
-        assert_eq!(run(&args), 0);
+        assert_eq!(run(&args, &Default::default()), 0);
         let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
         assert_eq!(row["base_digest_state"], state, "{kind}: {row}");
         assert_eq!(row["base_pending"], false, "{kind}: {row}");
@@ -842,27 +866,27 @@ fn regression_diff_between_stack_checks_and_apply() {
         ratarmount_compositing::FolderMountSource::new(args.base_source.as_ref().unwrap()).unwrap(),
     );
     let other = tmp.path().join("other");
-    let ov = WriteOverlay::new(base.clone(), &other).unwrap();
+    let ov = crate::base_identity::fixtures::new_overlay(base.clone(), &other).unwrap();
     put(&ov, "/a", b"new\n");
     drop(ov);
     meta_set(&args.directory, &[("stack_digest", "same")]);
     meta_set(&other, &[("stack_digest", "different")]);
     args.between = Some(other.clone());
     args.hash = true;
-    assert_eq!(run(&args), 2);
+    assert_eq!(run(&args, &Default::default()), 2);
     meta_set(&other, &[("stack_digest", "same")]);
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     assert_eq!(
         output(&args),
         format!("{}\n", core::EMPTY_SHA256).as_bytes()
     );
-    let ov = WriteOverlay::new(base.clone(), &args.directory).unwrap();
+    let ov = crate::base_identity::fixtures::new_overlay(base.clone(), &args.directory).unwrap();
     put(&ov, "/a", b"second\n");
     put(&ov, "/extra", b"extra\n");
     drop(ov);
     args.hash = false;
     args.git = true;
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     let checkout = tmp.path().join("checkout");
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a"), b"new\n").unwrap();
@@ -889,11 +913,11 @@ fn regression_diff_between_stack_checks_and_apply() {
             .execute("DROP TABLE meta", [])
             .unwrap();
     }
-    assert_eq!(run(&args), 2);
+    assert_eq!(run(&args, &Default::default()), 2);
     let lower = tmp.path().join("lower");
-    drop(WriteOverlay::new(base, &lower).unwrap());
+    drop(crate::base_identity::fixtures::new_overlay(base, &lower).unwrap());
     args.lower.push(lower);
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
 }
 
 /// Regression: output and work bounds exit 3 without publishing partial patches; manifests ignore patch limits.
@@ -902,10 +926,10 @@ fn regression_diff_limits_and_sparse_file_exit_three() {
     let (_tmp, mut args) = command_fixture();
     args.max_patch_bytes = Some(1);
     fs::write(args.output.as_ref().unwrap(), b"keep").unwrap();
-    assert_eq!(run(&args), 3);
+    assert_eq!(run(&args, &Default::default()), 3);
     assert_eq!(output(&args), b"keep");
     args.max_patch_bytes = Some(8);
-    assert_eq!(run(&args), 3); // Fits input, not headers.
+    assert_eq!(run(&args, &Default::default()), 3); // Fits input, not headers.
     fs::OpenOptions::new()
         .write(true)
         .open(args.directory.join("a"))
@@ -914,7 +938,7 @@ fn regression_diff_limits_and_sparse_file_exit_three() {
         .unwrap();
     args.max_patch_bytes = Some(1024);
     let start = std::time::Instant::now();
-    assert_eq!(run(&args), 3);
+    assert_eq!(run(&args, &Default::default()), 3);
     assert!(start.elapsed() < std::time::Duration::from_secs(10));
     // The streaming hasher is tested independently with bounded reader chunks;
     // keep the routine CLI test small rather than hashing 10 GiB in debug mode.
@@ -925,15 +949,15 @@ fn regression_diff_limits_and_sparse_file_exit_three() {
         .set_len(1024 * 1024)
         .unwrap();
     args.manifest = true;
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     args.max_files = Some(0);
-    assert_eq!(run(&args), 3);
+    assert_eq!(run(&args, &Default::default()), 3);
     args.max_files = None;
     args.manifest = false;
     args.max_patch_bytes = None;
     args.stat = true;
     args.json = true;
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
     assert_eq!(row["bytes_written"], 1024 * 1024);
 }
@@ -943,30 +967,30 @@ fn regression_diff_limits_and_sparse_file_exit_three() {
 fn regression_diff_normalize_does_not_rewrite_patch_and_renames_opt_in() {
     let (_tmp, mut args) = command_fixture();
     args.git = true;
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     let exact = output(&args);
     args.normalize = "loose".into();
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     assert_eq!(output(&args), exact);
     args.git = false;
     args.hash = true;
     args.normalize = "exact".into();
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     let hash = output(&args);
     args.detect_renames = true;
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     assert_eq!(output(&args), hash);
     args.hash = false;
     args.manifest = true;
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     let manifest = output(&args);
     args.detect_renames = false;
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     assert_eq!(output(&args), manifest);
     args.manifest = false;
     args.hash = true;
     args.algo = "blake3".into();
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     assert!(output(&args).starts_with(b"blake3:"));
 }
 
@@ -976,7 +1000,7 @@ fn regression_diff_large_text_binary_fallback() {
     let (_tmp, mut args) = command_fixture();
     args.git = true;
     args.max_diff_bytes = 1;
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     let patch = output(&args);
     assert!(String::from_utf8(patch)
         .unwrap()
@@ -989,7 +1013,7 @@ fn regression_diff_live_latin1_socket_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let base = base_tar(tmp.path(), &[("a", b"before\xff\n", 0o100644)]);
     let dir = tmp.path().join("overlay");
-    let overlay = WriteOverlay::new(base.source.clone(), &dir).unwrap();
+    let overlay = crate::base_identity::fixtures::new_overlay(base.source.clone(), &dir).unwrap();
     put(&overlay, "/a", b"after\xfe\n");
     let args = DiffArgs {
         directory: dir,
@@ -1019,7 +1043,7 @@ fn regression_diff_sparse_manifest_streams_ten_gib() {
         .unwrap();
     args.manifest = true;
     args.max_patch_bytes = Some(1024);
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
     assert_eq!(row["size"], 10u64 * 1024 * 1024 * 1024);
     assert!(row["hash"].as_str().unwrap().starts_with("sha256:"));
@@ -1033,7 +1057,7 @@ fn regression_diff_recorded_lowers_default_and_copy_up() {
         ratarmount_compositing::FolderMountSource::new(args.base_source.as_ref().unwrap()).unwrap(),
     );
     let lower_dir = tmp.path().join("prepared");
-    let prepared = WriteOverlay::new(base.clone(), &lower_dir).unwrap();
+    let prepared = crate::base_identity::fixtures::new_overlay(base.clone(), &lower_dir).unwrap();
     put(&prepared, "/a", b"prepared\n");
     put(&prepared, "/blib/x", b"build\n");
     drop(prepared);
@@ -1046,24 +1070,24 @@ fn regression_diff_recorded_lowers_default_and_copy_up() {
     meta_set(&lower_dir, &[("sealed_at", "now")]);
     meta_set(&args.directory, &[("lower_layers", &records)]);
     args.manifest = true;
-    assert_eq!(run(&args), 0);
+    assert_eq!(run(&args, &Default::default()), 0);
     let row: serde_json::Value = serde_json::from_slice(&output(&args)).unwrap();
     assert_eq!(row["path"], "a");
     assert_eq!(row["status"], "modified");
     assert_eq!(row["base_layer"], "lower:1");
     args.manifest = false;
     args.git = true;
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     assert!(String::from_utf8(output(&args))
         .unwrap()
         .contains("-prepared\n+new\n"));
     let lower = compose_stack(base, &[(lower_dir, Immutability::Immutable)]).unwrap();
-    let attempt = WriteOverlay::new(lower, &args.directory).unwrap();
+    let attempt = crate::base_identity::fixtures::new_overlay(lower, &args.directory).unwrap();
     put(&attempt, "/a", b"prepared\n");
     attempt.unlink("/blib/x").unwrap();
     drop(attempt);
     args.git = false;
     args.name_status = true;
-    assert_eq!(run(&args), 1);
+    assert_eq!(run(&args, &Default::default()), 1);
     assert_eq!(output(&args), b"D\tblib/x\n");
 }

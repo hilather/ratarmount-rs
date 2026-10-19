@@ -13,6 +13,8 @@ mod inode;
 mod names;
 mod reader;
 mod serve;
+#[cfg(test)]
+mod test_overlay;
 mod vfs;
 
 #[cfg(feature = "nfsv4")]

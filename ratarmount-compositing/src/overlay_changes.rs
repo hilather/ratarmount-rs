@@ -1269,7 +1269,7 @@ mod tests {
         opts: &ChangeOptions,
     ) -> Vec<Change> {
         let dir = tmp.join(name);
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         cow_write(&ov, "/a", content);
         drop(ov);
         change_set(&dir, base, opts).unwrap()
@@ -1284,7 +1284,7 @@ mod tests {
         let (tmp, base) = fixture();
         for operation in ["open", "truncate"] {
             let dir = tmp.path().join(operation);
-            let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+            let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
             if operation == "open" {
                 cow_write(&ov, "/a", b"changed\n");
             } else {
@@ -1315,7 +1315,7 @@ mod tests {
         let (tmp, base) = fixture();
         let opts = ChangeOptions::default();
         let dir = tmp.path().join("cow");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         cow_write(&ov, "/a", b"new\n");
         drop(ov);
         let changes = change_set(&dir, base.clone(), &opts).unwrap();
@@ -1328,7 +1328,7 @@ mod tests {
         let digest = canonical_hash(&changes, &opts).unwrap();
         assert_ne!(digest, EMPTY_SHA256);
         let rowed_dir = tmp.path().join("rowed");
-        let ov = WriteOverlay::new(base.clone(), &rowed_dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &rowed_dir).unwrap();
         put(&ov, "/a", b"new\n");
         drop(ov);
         let rowed = change_set(&rowed_dir, base, &opts).unwrap();
@@ -1343,7 +1343,7 @@ mod tests {
         let a = tmp.path().join("one");
         let b = tmp.path().join("two");
         for (dir, path) in [(&a, "/a"), (&b, "/b")] {
-            let ov = WriteOverlay::new(base.clone(), dir).unwrap();
+            let ov = WriteOverlay::new_for_tests(base.clone(), dir).unwrap();
             cow_write(&ov, path, b"changed");
             drop(ov);
         }
@@ -1382,7 +1382,7 @@ mod tests {
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(parent.join("f"), b"base").unwrap();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         cow_write(&ov, "/lib/f", b"changed");
         drop(ov);
         fs::set_permissions(dir.join("lib"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -1390,7 +1390,7 @@ mod tests {
         let changes = change_set(&dir, base.clone(), &opts).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, b"lib/f");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         cow_write(&ov, "/lib/f", b"base");
         drop(ov);
         assert!(change_set(&dir, base.clone(), &opts).unwrap().is_empty());
@@ -1418,7 +1418,7 @@ mod tests {
     fn regression_cow_host_walk_skips_internal_entries_and_symlink_targets() {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         cow_write(&ov, "/a", b"changed");
         drop(ov);
         let outside = tmp.path().join("outside");
@@ -1514,7 +1514,7 @@ mod tests {
     fn regression_hash_mode_only_and_ignore_mode() {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         ov.set_metadata(
             "/a",
             &OverlayMetadata {
@@ -1542,7 +1542,7 @@ mod tests {
         };
         let a = edits(tmp.path(), "one", base.clone(), b"new\n", &opts);
         let dir = tmp.path().join("two");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         put(&ov, "/a", b"new\n");
         put(&ov, "/ignored", b"different");
         drop(ov);
@@ -1773,7 +1773,7 @@ mod tests {
     fn regression_changes_revert_and_tombstone_of_nothing() {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         cow_write(&ov, "/a", b"new");
         cow_write(&ov, "/a", b"old\n");
         put(&ov, "/transient", b"x");
@@ -1788,7 +1788,7 @@ mod tests {
     fn regression_changes_manifest_types_and_metadata() {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         ov.mkdir("/empty", 0o755).unwrap();
         ov.unlink("/a").unwrap();
         ov.create_symlink("/a", "/outside/never-open").unwrap();
@@ -1842,7 +1842,7 @@ mod tests {
     fn regression_changes_determinism() {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         for p in ["/z", "/a", "/é", "/a!", "/A"] {
             put(&ov, p, b"new");
         }
@@ -1901,7 +1901,7 @@ mod tests {
             cached: false,
         });
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         for i in 0..1000 {
             fs::write(tmp.path().join(format!("base/blib/{i}")), b"old").unwrap();
             cow_write(&ov, &format!("/blib/{i}"), b"new");
@@ -1928,7 +1928,7 @@ mod tests {
             cached: true,
         });
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         put(&ov, "/a", b"new");
         drop(ov);
         count.store(0, Ordering::Relaxed);
@@ -2008,13 +2008,13 @@ mod tests {
         fs::create_dir(tmp.path().join("base/lib")).unwrap();
         fs::write(tmp.path().join("base/lib/Foo.pm"), b"source").unwrap();
         let prepared = tmp.path().join("prepared");
-        let ov = WriteOverlay::new(base.clone(), &prepared).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &prepared).unwrap();
         put(&ov, "/blib/x", b"build");
         put(&ov, "/Makefile", b"prepared");
         drop(ov);
         let lower = crate::compose_stack(base, &[(prepared, Immutability::Shared)]).unwrap();
         let attempt = tmp.path().join("attempt");
-        let ov = WriteOverlay::new(lower.clone(), &attempt).unwrap();
+        let ov = WriteOverlay::new_for_tests(lower.clone(), &attempt).unwrap();
         cow_write(&ov, "/lib/Foo.pm", b"attempt");
         ov.unlink("/blib/x").unwrap();
         drop(ov);
@@ -2037,13 +2037,13 @@ mod tests {
         fs::create_dir(tmp.path().join("base/lib")).unwrap();
         fs::write(tmp.path().join("base/lib/Foo.pm"), b"source\n").unwrap();
         let prepared = tmp.path().join("prepared");
-        let ov = WriteOverlay::new(base.clone(), &prepared).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &prepared).unwrap();
         ov.mkdir("/blib", 0o755).unwrap();
         put(&ov, "/blib/x", b"build\n");
         drop(ov);
         let lower = crate::compose_stack(base, &[(prepared, Immutability::Shared)]).unwrap();
         let attempt = tmp.path().join("attempt");
-        let ov = WriteOverlay::new(lower.clone(), &attempt).unwrap();
+        let ov = WriteOverlay::new_for_tests(lower.clone(), &attempt).unwrap();
         cow_write(&ov, "/lib/Foo.pm", b"edited\n");
         cow_write(&ov, "/blib/x", b"rebuilt\n");
         drop(ov);
@@ -2087,7 +2087,7 @@ mod tests {
             EMPTY_SHA256
         );
         let dir = tmp.path().join("two");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         put(&ov, "/extra", b"extra");
         drop(ov);
         let changes = between(&tmp.path().join("one"), &dir, base, &opts).unwrap();
@@ -2100,7 +2100,7 @@ mod tests {
     fn regression_changes_without_base_written() {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base, &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &dir).unwrap();
         put(&ov, "/new", b"new");
         ov.unlink("/a").unwrap();
         drop(ov);
@@ -2114,7 +2114,7 @@ mod tests {
     fn regression_changes_sparse_limit_before_open_and_max_files() {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         put(&ov, "/giant", b"");
         drop(ov);
         fs::OpenOptions::new()
@@ -2165,7 +2165,7 @@ mod tests {
     fn regression_changes_symlinks_are_data() {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         ov.create_symlink("/outside", tmp.path().join("base").to_str().unwrap())
             .unwrap();
         drop(ov);
@@ -2186,7 +2186,7 @@ mod tests {
     fn regression_changes_baseless_metadata_is_written() {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base, &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &dir).unwrap();
         ov.set_metadata(
             "/a",
             &OverlayMetadata {
@@ -2224,12 +2224,12 @@ mod tests {
             cached: true,
         });
         let lower_dir = tmp.path().join("lower");
-        let ov = WriteOverlay::new(base.clone(), &lower_dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &lower_dir).unwrap();
         put(&ov, "/a", b"prepared");
         drop(ov);
         let lower = crate::compose_stack(base, &[(lower_dir, Immutability::Shared)]).unwrap();
         let top = tmp.path().join("top");
-        let ov = WriteOverlay::new(lower.clone(), &top).unwrap();
+        let ov = WriteOverlay::new_for_tests(lower.clone(), &top).unwrap();
         put(&ov, "/a", b"old\n");
         drop(ov);
         let changes = change_set(&top, lower, &ChangeOptions::default()).unwrap();
@@ -2244,7 +2244,7 @@ mod tests {
     fn regression_changes_root_mode_row_is_valid() {
         let (tmp, base) = fixture();
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         ov.set_metadata(
             "/",
             &OverlayMetadata {
@@ -2269,7 +2269,7 @@ mod tests {
         let (tmp, base) = fixture();
         fs::create_dir(tmp.path().join("base/dir")).unwrap();
         let top = tmp.path().join("top");
-        let ov = WriteOverlay::new(base, &top).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &top).unwrap();
         ov.set_metadata(
             "/dir",
             &OverlayMetadata {
@@ -2335,7 +2335,7 @@ mod tests {
         }
         let base: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base_dir).unwrap());
         let dir = tmp.path().join("overlay");
-        let ov = WriteOverlay::new(base.clone(), &dir).unwrap();
+        let ov = WriteOverlay::new_for_tests(base.clone(), &dir).unwrap();
         cow_write(&ov, "/a", b"new\n");
         put(&ov, "/added.txt", b"one  \r\ntwo\t\n\n");
         ov.unlink("/keep/gone.txt").unwrap();

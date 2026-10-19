@@ -3,12 +3,15 @@
 //! The panic is forced with `RATARMOUNT_TEST_STAT_PANIC=<path suffix>`, which
 //! only exists when `ratarmount-compositing/test-hooks` is on (dev-dependency).
 
+#[path = "support/token.rs"]
+mod token;
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use ratarmount_compositing::{FolderMountSource, OverlayCreateInfo, WriteOverlay};
+use ratarmount_compositing::FolderMountSource;
 
 #[path = "diff/cow.rs"]
 mod cow;
@@ -20,13 +23,11 @@ fn fixture(root: &Path) -> (String, String) {
     fs::create_dir(&base).unwrap();
     fs::write(base.join(POISON), b"base\n").unwrap();
     let dir = root.join("overlay");
-    let writer = WriteOverlay::new_with_create_info(
+    let writer = token::overlay_over(
         Arc::new(FolderMountSource::new(&base).unwrap()),
         &dir,
-        &OverlayCreateInfo {
-            base_url: base.to_str().unwrap().into(),
-            ..Default::default()
-        },
+        base.to_str().unwrap(),
+        Vec::new(),
     )
     .unwrap();
     cow::cow_write(&writer, &format!("/{POISON}"), b"change\n");

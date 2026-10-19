@@ -1,6 +1,9 @@
 //! One complete roll through the Linux kernel FUSE client.
 #![cfg(target_os = "linux")]
 
+#[path = "support/token.rs"]
+mod token;
+
 use std::fs::{self, File};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -156,9 +159,7 @@ fn fuse_rolling_one_cycle() {
 /// refused the next mount of the same series (no kernel mount required).
 #[test]
 fn regression_rolling_commit_baseline_allows_cli_remount() {
-    use ratarmount_compositing::{
-        CommitMode, OverlayCreateInfo, OverlayMeta, RollingMountSource, WriteOverlay,
-    };
+    use ratarmount_compositing::{CommitMode, OverlayMeta, RollingMountSource, WriteOverlay};
     use ratarmount_core::{MountSource, OpenOptions};
     use std::sync::Arc;
 
@@ -177,14 +178,24 @@ fn regression_rolling_commit_baseline_allows_cli_remount() {
         .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))
     };
     let series = Arc::new(RollingMountSource::open(&base, "1B".parse().unwrap(), opener).unwrap());
-    let info = OverlayCreateInfo {
-        base_url: base.to_str().unwrap().to_owned(),
-        local_path: Some(series.active_path()),
-        ..Default::default()
-    };
-    let mut ov =
-        WriteOverlay::new_with_create_info(series.clone() as Arc<dyn MountSource>, &overlay, &info)
-            .unwrap();
+    // The series is built here, so the test names what it is: an archive at
+    // its active generation, typed as the series base.
+    let token = ratarmount_compositing::ClassifiedBase::open(&mut token::FixtureOpener {
+        source: series.clone() as Arc<dyn MountSource>,
+        kind: ratarmount_compositing::ServedKind::Archive,
+        inputs: vec![base.to_str().unwrap().to_owned()],
+        location: Some(ratarmount_compositing::ServedLocation::Local(
+            series.active_path(),
+        )),
+    })
+    .unwrap();
+    let mut ov = WriteOverlay::open(
+        &token,
+        series.clone() as Arc<dyn MountSource>,
+        &overlay,
+        &ratarmount_compositing::CreateOptions::default(),
+    )
+    .unwrap();
     ov.set_rolling(series.clone());
     ov.set_commit_mode(CommitMode::Append);
     for name in ["one", "two"] {

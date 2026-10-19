@@ -1,6 +1,9 @@
 //! Kernel overlayfs probe is opt-in; synthetic CLI coverage always runs without FUSE.
 #![cfg(target_os = "linux")]
 
+#[path = "support/token.rs"]
+mod token;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -10,9 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ratarmount_compositing::{
-    compose_stack, FolderMountSource, Immutability, OverlayCreateInfo, WriteOverlay,
-};
+use ratarmount_compositing::{compose_stack, FolderMountSource, Immutability};
 use ratarmount_core::{MountSource, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -268,21 +269,14 @@ fn regression_overlayfs_read_only_lower_and_imported_upper_match_kernel() {
     fs::write(base.join("Makefile"), b"all:\n\tmkdir -p build\n\tcat input > build/result\n\ttest \"$$(cat build/result)\" = prepared\n").unwrap();
     let lower = root.path().join("prepared");
     let source: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base).unwrap());
-    let writer = WriteOverlay::new_with_create_info(
-        source.clone(),
-        &lower,
-        &OverlayCreateInfo {
-            base_url: base.to_str().unwrap().into(),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let writer =
+        token::overlay_over(source.clone(), &lower, base.to_str().unwrap(), Vec::new()).unwrap();
     use std::os::fd::FromRawFd;
     let mut file = unsafe { fs::File::from_raw_fd(writer.create_file("/input", 0o644).unwrap()) };
     file.write_all(b"prepared\n").unwrap();
     writer.finish_owned_write_fd(file);
     drop(writer);
-    ratarmount_compositing::overlay_seal::seal(&lower, source.clone()).unwrap();
+    token::seal(&lower, source.clone()).unwrap();
     let mount = Mount::start(&base, &lower, &root.path().join("lower-mnt"));
     let script =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../test-harness/overlayfs-interop/run.sh");

@@ -379,7 +379,8 @@ mod tests {
 
         let ovdir = dir.path().join("ov");
         std::fs::create_dir_all(&ovdir).unwrap();
-        let ov = WriteOverlay::new(Arc::clone(&inner) as Arc<dyn MountSource>, &ovdir).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&inner) as Arc<dyn MountSource>, &ovdir)
+            .unwrap();
         overlay_write_bytes(&ov, "/f.txt", b"NEW-OVERLAY-BYTES");
         let hashed = AlwaysHashXattr {
             inner: Arc::new(ov) as Arc<dyn MountSource>,

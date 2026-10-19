@@ -434,7 +434,7 @@ fn regression_offline_commit_checks_the_recorded_base() {
         yes: true,
         ..Default::default()
     };
-    let err = crate::commit_overlay_checked(&fx.overlay, &fx.archive, &token, &opts)
+    let err = crate::commit_overlay(&fx.overlay, &fx.archive, &token, &opts)
         .unwrap_err()
         .to_string();
     assert!(err.contains("--force-base-mismatch"), "{err}");
@@ -443,7 +443,7 @@ fn regression_offline_commit_checks_the_recorded_base() {
         force_base_mismatch: true,
         ..opts
     };
-    assert!(crate::commit_overlay_checked(&fx.overlay, &fx.archive, &token, &forced).unwrap());
+    assert!(crate::commit_overlay(&fx.overlay, &fx.archive, &token, &forced).unwrap());
 }
 
 /// A raw overlay DIRECTORY (no database) commits through its own entry, which
@@ -484,10 +484,7 @@ fn regression_raw_dir_commit_succeeds_and_reports_no_identity_check() {
     );
     // And the checked entry refuses a raw directory.
     let token = archive_token(&fx.archive);
-    assert!(
-        crate::commit_overlay_checked(&fx.overlay, &fx.archive, &token, &Default::default())
-            .is_err()
-    );
+    assert!(crate::commit_overlay(&fx.overlay, &fx.archive, &token, &Default::default()).is_err());
 }
 
 fn folder_token(dir: &Path) -> ClassifiedBase {
@@ -560,7 +557,7 @@ fn regression_none_overlay_refuses_kind_swap_in_reopen() {
 #[test]
 fn released_overlay_gains_kind_on_first_open_then_refuses_swap() {
     let fx = Fixture::new();
-    drop(WriteOverlay::new(open_tar(&fx.archive), &fx.overlay).unwrap());
+    drop(WriteOverlay::new_for_tests(open_tar(&fx.archive), &fx.overlay).unwrap());
     {
         let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
         conn.execute_batch("DROP TABLE meta").unwrap();

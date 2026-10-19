@@ -1,12 +1,16 @@
 //! Regression: real sealed overlays through the offline CLI, without /dev/fuse.
 
+#[path = "support/token.rs"]
+mod token;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use ratarmount_compositing::{FolderMountSource, OverlayCreateInfo, WriteOverlay, HIDDEN_DB};
+use ratarmount_compositing::{FolderMountSource, WriteOverlay, HIDDEN_DB};
+use ratarmount_core::MountSource;
 
 #[path = "diff/cow.rs"]
 mod cow;
@@ -32,13 +36,11 @@ fn fixture(root: &Path) -> (String, String) {
     fs::create_dir(&base).unwrap();
     fs::write(base.join("file"), b"base\n").unwrap();
     let dir = root.join("overlay");
-    let writer = WriteOverlay::new_with_create_info(
+    let writer = token::overlay_over(
         Arc::new(FolderMountSource::new(&base).unwrap()),
         &dir,
-        &OverlayCreateInfo {
-            base_url: base.to_str().unwrap().into(),
-            ..Default::default()
-        },
+        base.to_str().unwrap(),
+        Vec::new(),
     )
     .unwrap();
     cow::cow_write(&writer, "/file", b"change\n");
@@ -184,13 +186,11 @@ fn regression_seal_of_pending_overlay_computes_and_records_digest() {
         .unwrap()
         .success());
     let dir = tmp.path().join("overlay");
-    let writer = WriteOverlay::new_with_create_info(
+    let writer = token::overlay_over(
         Arc::new(FolderMountSource::new(&base).unwrap()),
         &dir,
-        &OverlayCreateInfo {
-            base_url: archive.to_str().unwrap().into(),
-            ..Default::default()
-        },
+        archive.to_str().unwrap(),
+        Vec::new(),
     )
     .unwrap();
     cow::cow_write(&writer, "/file", b"change\n");
@@ -244,11 +244,13 @@ fn dir_base_fixture(root: &Path, strong: bool) -> (std::path::PathBuf, String, S
     } else {
         Default::default()
     };
-    let writer = WriteOverlay::new_with_create_info(
-        Arc::new(FolderMountSource::new(&base).unwrap()),
+    let source: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base).unwrap());
+    let token = token::ClassifiedBaseOver::folder(source.clone(), &base);
+    let writer = WriteOverlay::open(
+        &token,
+        source,
         &dir,
-        &OverlayCreateInfo {
-            base_url: base.to_str().unwrap().into(),
+        &ratarmount_compositing::CreateOptions {
             base_digest,
             ..Default::default()
         },

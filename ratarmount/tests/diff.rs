@@ -1,11 +1,15 @@
 //! Offline diff exit codes and clean patch output, without /dev/fuse.
 
+#[path = "support/token.rs"]
+mod token;
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use ratarmount_compositing::{FolderMountSource, WriteOverlay, HIDDEN_DB};
+use ratarmount_compositing::{FolderMountSource, HIDDEN_DB};
+use ratarmount_core::MountSource;
 use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
 
 #[path = "diff/cow.rs"]
@@ -29,7 +33,7 @@ fn regression_cow_diff_name_manifest_hash_and_between() {
     fs::write(base.join("f"), b"base\n").unwrap();
     let source = Arc::new(FolderMountSource::new(&base).unwrap());
     let dir = tmp.path().join("cow");
-    let ov = WriteOverlay::new(source.clone(), &dir).unwrap();
+    let ov = token::new_overlay(source.clone(), &dir).unwrap();
     cow::cow_write(&ov, "/f", b"changed\n");
     drop(ov);
     let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
@@ -55,7 +59,7 @@ fn regression_cow_diff_name_manifest_hash_and_between() {
         ratarmount_compositing::overlay_changes::EMPTY_SHA256
     );
     let rowed = tmp.path().join("rowed");
-    let ov = WriteOverlay::new(source, &rowed).unwrap();
+    let ov = token::new_overlay(source, &rowed).unwrap();
     use std::io::Write;
     use std::os::fd::FromRawFd;
     let mut file = unsafe { fs::File::from_raw_fd(ov.create_file("/f", 0o644).unwrap()) };
@@ -92,7 +96,7 @@ fn regression_diff_exit_codes_and_clean_stdout() {
     fs::create_dir(&base).unwrap();
     fs::write(base.join("a"), b"before\n").unwrap();
     let overlay_dir = tmp.path().join("overlay");
-    let overlay = WriteOverlay::new(
+    let overlay = token::new_overlay(
         Arc::new(FolderMountSource::new(&base).unwrap()),
         &overlay_dir,
     )
@@ -106,7 +110,7 @@ fn regression_diff_exit_codes_and_clean_stdout() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(result.stdout.is_empty());
-    let overlay = WriteOverlay::new(
+    let overlay = token::new_overlay(
         Arc::new(FolderMountSource::new(&base).unwrap()),
         &overlay_dir,
     )
@@ -160,7 +164,13 @@ fn regression_diff_exit_codes_and_clean_stdout() {
     .unwrap();
     write_tar_eof(&mut tar).unwrap();
     drop(tar);
-    let result = run(&overlay_dir, Some(&archive), &["--git"]);
+    // The overlay recorded a directory; this test is about the git-format
+    // output over an archive, so the base change is forced.
+    let result = run(
+        &overlay_dir,
+        Some(&archive),
+        &["--git", "--force-base-mismatch"],
+    );
     assert_eq!(
         result.status.code(),
         Some(1),
@@ -192,9 +202,14 @@ fn regression_diff_git_base_uses_committed_tree() {
         .unwrap();
     fs::write(repo_dir.join("a"), b"dirty\n").unwrap();
     let overlay_dir = tmp.path().join("overlay");
-    let overlay = WriteOverlay::new(
-        Arc::new(FolderMountSource::new(&repo_dir).unwrap()),
+    // The overlay was made over the repository's committed tree (Git).
+    let source: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&repo_dir).unwrap());
+    let git_token = token::ClassifiedBaseOver::git(source.clone(), &repo_dir, &tree_id.to_string());
+    let overlay = ratarmount_compositing::WriteOverlay::open(
+        &git_token,
+        source,
         &overlay_dir,
+        &ratarmount_compositing::CreateOptions::default(),
     )
     .unwrap();
     overlay.ensure_modifiable("/a").unwrap();
@@ -229,7 +244,7 @@ fn regression_diff_warnings_hash_and_limits() {
     fs::create_dir(&base).unwrap();
     let dir = tmp.path().join("overlay");
     let overlay =
-        WriteOverlay::new(Arc::new(FolderMountSource::new(&base).unwrap()), &dir).unwrap();
+        token::new_overlay(Arc::new(FolderMountSource::new(&base).unwrap()), &dir).unwrap();
     use std::io::Write;
     use std::os::fd::FromRawFd;
     let mut file = unsafe { fs::File::from_raw_fd(overlay.create_file("/a", 0o644).unwrap()) };

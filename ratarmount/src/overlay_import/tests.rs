@@ -1,7 +1,9 @@
 use super::*;
 use ratarmount_compositing::overlay_changes::{canonical_hash, change_set, ChangeOptions};
 use ratarmount_compositing::{Immutability, OverlayMeta, ReadOnlyOverlayLayer};
+use ratarmount_core::OpenOptions;
 use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
+use ratarmount_session::factory;
 use std::io::Write;
 
 use crate::diff::tests::cow;
@@ -86,11 +88,9 @@ impl Fixture {
             args,
             &parsed,
             ImportStack {
-                source: self.source.clone(),
-                info: OverlayCreateInfo {
-                    base_url: args.base.clone(),
-                    ..Default::default()
-                },
+                base: crate::base_identity::fixtures::classify(&self.base),
+                view: self.source.clone(),
+                lower_layers: Vec::new(),
                 inputs: vec![self.base.clone()],
             },
             mtime(&args.mtime)?,
@@ -126,7 +126,13 @@ fn put(overlay: &WriteOverlay, path: &str, data: &[u8], mode: u32) {
 fn roundtrip(case: &str) {
     let f = Fixture::new();
     let a = f.temp.path().join("a-overlay");
-    let ov = WriteOverlay::new(f.source.clone(), &a).unwrap();
+    let ov = crate::base_identity::fixtures::overlay_over(
+        f.source.clone(),
+        &a,
+        f.base.to_str().unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
     match case {
         "added" => put(&ov, "/new", b"added\n", 0o644),
         "modified" => cow::cow_write(&ov, "/a", b"one\nchanged\nthree\n"),
@@ -178,7 +184,7 @@ fn roundtrip(case: &str) {
         output: Some(args.patch.clone()),
         ..Default::default()
     };
-    assert_eq!(crate::diff::run(&diff), 1);
+    assert_eq!(crate::diff::run(&diff, &Default::default()), 1);
     let patch = fs::read(&args.patch).unwrap();
     let (_, code) = f
         .apply(&args, &patch)
@@ -524,7 +530,15 @@ fn git_binary_roundtrip(external: bool) {
     let base = PathBuf::from(format!("{}@{commit}", repo_dir.display()));
     let f = Fixture { temp, base, source };
     let a = f.temp.path().join("expected");
-    let ov = WriteOverlay::new(f.source.clone(), &a).unwrap();
+    // The base is a Git commit: the real factory classifies `repo@commit`.
+    let token = crate::base_identity::fixtures::classify(&f.base);
+    let ov = WriteOverlay::open(
+        &token,
+        f.source.clone(),
+        &a,
+        &ratarmount_compositing::CreateOptions::default(),
+    )
+    .unwrap();
     for (name, data) in [
         ("text", b"caf\xe9\n".as_slice()),
         ("bin", b"\x00new binary\xfe"),
@@ -572,8 +586,11 @@ fn git_binary_roundtrip(external: bool) {
         .any(|s| s == b"GIT binary patch"));
     let args = f.args("actual");
     let patches = parse::parse(&bytes, args.max_patch_bytes).unwrap();
-    let stack = ImportStack::open(&args).unwrap();
-    assert_eq!(stack.info.git_tree, Some(tree_id.to_string()));
+    let stack = ImportStack::open(&args, &Default::default()).unwrap();
+    assert_eq!(
+        stack.base.actual().git_tree(),
+        Some(tree_id.to_string().as_str())
+    );
     import(&args, &patches, stack, 123.0).unwrap();
     assert_eq!(f.hash(&a), f.hash(&args.directory));
     let meta = OverlayMeta::read(&args.directory).unwrap().unwrap();
@@ -631,13 +648,11 @@ fn regression_import_reject_type_change_and_repeated_file_sections() {
 /// whole directory on any error, which would hide the marker).
 fn simulate_killed_import(f: &Fixture, args: &ImportArgs, files: &[(&str, &[u8])], n: usize) {
     fs::create_dir(&args.directory).unwrap();
-    let overlay = super::super::overlay_create::create_overlay_legacy(
+    let overlay = super::super::overlay_create::create_overlay(
+        &crate::base_identity::fixtures::classify(&f.base),
         f.source.clone(),
         &args.directory,
-        OverlayCreateInfo {
-            base_url: args.base.clone(),
-            ..Default::default()
-        },
+        ratarmount_compositing::CreateOptions::default(),
         std::slice::from_ref(&f.base),
         false,
     )
@@ -660,7 +675,7 @@ fn regression_import_killed_midway_leaves_marker() {
     let report = ratarmount_compositing::overlay_fsck::fsck(&args.directory, false).unwrap();
     assert!(!report.is_clean());
     assert_eq!(report.import_incomplete, 1);
-    let err = ratarmount_compositing::overlay_seal::seal(&args.directory, f.source.clone())
+    let err = crate::base_identity::fixtures::seal(&args.directory, f.source.clone())
         .unwrap_err()
         .to_string();
     assert!(err.contains("import"), "{err}");

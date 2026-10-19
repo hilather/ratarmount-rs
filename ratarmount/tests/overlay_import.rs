@@ -1,12 +1,15 @@
 //! Import CLI contracts, stdin, lower metadata and exit codes without FUSE.
 
+#[path = "support/token.rs"]
+mod token;
+
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
-use ratarmount_compositing::{FolderMountSource, OverlayCreateInfo, OverlayMeta, WriteOverlay};
+use ratarmount_compositing::{FolderMountSource, OverlayMeta};
 
 #[path = "diff/cow.rs"]
 mod cow;
@@ -40,7 +43,7 @@ fn regression_cow_git_import_hash_roundtrip_base_and_lower() {
         let source: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base).unwrap());
         let prepared = root.path().join("prepared");
         let lower = if layered {
-            let ov = WriteOverlay::new(source.clone(), &prepared).unwrap();
+            let ov = token::new_overlay(source.clone(), &prepared).unwrap();
             ov.mkdir("/blib", 0o755).unwrap();
             use std::os::fd::FromRawFd;
             let mut file =
@@ -48,7 +51,7 @@ fn regression_cow_git_import_hash_roundtrip_base_and_lower() {
             file.write_all(b"built\n").unwrap();
             ov.finish_owned_write_fd(file);
             drop(ov);
-            ratarmount_compositing::overlay_seal::seal(&prepared, source.clone()).unwrap();
+            token::seal(&prepared, source.clone()).unwrap();
             compose_stack(
                 source.clone(),
                 &[(prepared.clone(), Immutability::Immutable)],
@@ -58,7 +61,7 @@ fn regression_cow_git_import_hash_roundtrip_base_and_lower() {
             source
         };
         let attempt = root.path().join("attempt");
-        let ov = WriteOverlay::new(lower, &attempt).unwrap();
+        let ov = token::new_overlay(lower, &attempt).unwrap();
         cow::cow_write(&ov, "/lib/Foo.pm", b"edited\n");
         if layered {
             cow::cow_write(&ov, "/blib/x", b"rebuilt\n");
@@ -210,15 +213,8 @@ fn regression_import_lower_stack_identity_and_unsealed_opt_in() {
     fs::write(base.join("a"), b"base\n").unwrap();
     let source = Arc::new(FolderMountSource::new(&base).unwrap());
     let lower = root.path().join("lower");
-    let ov = WriteOverlay::new_with_create_info(
-        source.clone(),
-        &lower,
-        &OverlayCreateInfo {
-            base_url: base.to_str().unwrap().into(),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let ov =
+        token::overlay_over(source.clone(), &lower, base.to_str().unwrap(), Vec::new()).unwrap();
     cow::cow_write(&ov, "/a", b"prepared\n");
     drop(ov);
     let patch = b"--- a/a\n+++ b/a\n@@ -1 +1 @@\n-prepared\n+attempt\n";
@@ -248,7 +244,7 @@ fn regression_import_lower_stack_identity_and_unsealed_opt_in() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    let seal = ratarmount_compositing::overlay_seal::seal(&lower, source).unwrap();
+    let seal = token::seal(&lower, source).unwrap();
     let dest = root.path().join("sealed-lower");
     let result = import(&base, &dest, patch, &["--lower", lower.to_str().unwrap()]);
     assert_eq!(

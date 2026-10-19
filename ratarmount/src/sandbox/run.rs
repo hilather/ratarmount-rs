@@ -1009,22 +1009,35 @@ fn finish(args: &RunArgs, top: &Path, journal: &Path, execution: Execution) -> i
     }
     // Factory and lazy source progress must never contaminate the JSON report.
     let _progress = crate::diff::ProgressToStderr::new()?;
-    let mut options = ratarmount_core::OpenOptions {
-        write_index: false,
-        index_in_memory: true,
-        ..Default::default()
-    };
-    let base = ratarmount_session::factory::build_mount_source_ex(
-        std::slice::from_ref(&args.base),
-        &mut options,
-        false,
-        ratarmount_session::factory::CompositingOptions::default(),
+    // The base is classified through the factory and gated against what the
+    // overlay recorded BEFORE anything is sealed or packed: a base edited
+    // during the run fails closed instead of being sealed as if unchanged.
+    let recorded = OverlayMeta::read(top).map_err(io::Error::other)?;
+    let base = crate::overlay_cmd::classify_base(
+        Some(&args.base),
+        recorded.as_ref(),
+        None,
+        &crate::base_identity::OverlayRunContext::default(),
     )
-    .map_err(io::Error::other)?
-    .source;
-    let lower = crate::MountLowerStack::compose(base, &args.lower)?;
+    .map_err(io::Error::other)?;
+    crate::overlay_cmd::gate_base(
+        top,
+        recorded.as_ref(),
+        &base,
+        &crate::overlay_cmd::BaseIdentityArgs {
+            force_base_mismatch: false,
+            base_digest: match &args.base_digest {
+                Some(ratarmount_compositing::BaseDigestRequest::Supplied(digest)) => {
+                    Some(digest.clone())
+                }
+                _ => None,
+            },
+        },
+    )
+    .map_err(io::Error::other)?;
+    let lower = crate::MountLowerStack::compose(base.source(), &args.lower)?;
     if args.seal || args.pack.is_some() {
-        overlay_seal::seal(top, lower.clone())?;
+        overlay_seal::seal(top, &base, lower.clone())?;
     }
     let bundle = args.pack.as_ref().map(std::path::absolute).transpose()?;
     if let Some(bundle) = &bundle {
@@ -1634,20 +1647,20 @@ mod tests {
     /// Regression: offline run finalization must fsck, seal, pack, and emit the diff hash object.
     #[test]
     fn regression_run_report_hash_manifest_seal_pack() {
-        use ratarmount_compositing::{
-            BaseDigestRequest, FolderMountSource, OverlayCreateInfo, WriteOverlay,
-        };
+        use ratarmount_compositing::{BaseDigestRequest, FolderMountSource};
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().join("base");
         let top = temp.path().join("top");
         fs::create_dir(&base).unwrap();
         let source = Arc::new(FolderMountSource::new(&base).unwrap());
-        let info = OverlayCreateInfo {
-            base_url: base.to_string_lossy().into_owned(),
-            base_digest: BaseDigestRequest::None,
-            ..Default::default()
-        };
-        let overlay = WriteOverlay::new_with_create_info(source, &top, &info).unwrap();
+        let overlay = crate::base_identity::fixtures::overlay_over_with(
+            source,
+            &top,
+            &base.to_string_lossy(),
+            Vec::new(),
+            BaseDigestRequest::None,
+        )
+        .unwrap();
         overlay.create_symlink("/link", "/target").unwrap();
         drop(overlay);
         let mut args = args(&[]);
@@ -1697,6 +1710,55 @@ mod tests {
         assert_eq!(
             report["patch_hash"]["patch"],
             overlay_changes::canonical_hash(&changes, &options).unwrap()
+        );
+    }
+
+    /// Regression: `sandbox run` finish compared nothing against what the
+    /// overlay recorded, so a base edited during the run was sealed (and
+    /// packed) as if unchanged. The finish now classifies the base and gates
+    /// it before sealing: it fails closed, seals nothing and names the flag.
+    #[test]
+    fn regression_sandbox_run_finish_gates_base() {
+        use ratarmount_compositing::FolderMountSource;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let top = temp.path().join("top");
+        fs::create_dir(&base).unwrap();
+        fs::write(base.join("f"), b"original").unwrap();
+        let source = Arc::new(FolderMountSource::new(&base).unwrap());
+        let overlay = crate::base_identity::fixtures::overlay_over(
+            source,
+            &top,
+            &base.to_string_lossy(),
+            Vec::new(),
+        )
+        .unwrap();
+        overlay.create_symlink("/link", "/target").unwrap();
+        drop(overlay);
+        // The base is edited while the container ran.
+        fs::write(base.join("f"), b"edited during the run, longer").unwrap();
+        let mut args = args(&[]);
+        args.base = base;
+        args.top = top.clone();
+        args.seal = true;
+        let error = finish(
+            &args,
+            &top,
+            &sidecar(&top, ".journal.jsonl"),
+            Execution {
+                exit_code: 0,
+                timed_out: false,
+                erofs_denied: 0,
+                bytes_written: 0,
+                start: Instant::now(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--force-base-mismatch"), "{error}");
+        assert!(
+            !OverlayMeta::read(&top).unwrap().unwrap().layer_sealed(),
+            "nothing may be sealed over a changed base"
         );
     }
 

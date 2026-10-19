@@ -429,9 +429,9 @@ pub(crate) struct Inner {
 /// #         })
 /// #     }
 /// # }
-/// // compile_fail: seal_with_base(&sealed_record)
+/// // compile_fail: seal(&sealed_record)
 /// let record = SealedRecord::read("/nonexistent")?.unwrap();
-/// let _ = overlay_seal::seal_with_base("/nonexistent".as_ref(), &record, Arc::new(FolderMountSource::new("/tmp").unwrap()));
+/// let _ = overlay_seal::seal("/nonexistent".as_ref(), &record, Arc::new(FolderMountSource::new("/tmp").unwrap()));
 /// # Ok::<(), OverlayError>(())
 /// ```
 ///
@@ -457,9 +457,9 @@ pub(crate) struct Inner {
 /// #         })
 /// #     }
 /// # }
-/// // control: seal_with_base(&classified)
+/// // control: seal(&classified)
 /// let cb = ClassifiedBase::open(&mut Fixture)?;
-/// let _ = overlay_seal::seal_with_base("/nonexistent".as_ref(), &cb, cb.source());
+/// let _ = overlay_seal::seal("/nonexistent".as_ref(), &cb, cb.source());
 /// # Ok::<(), String>(())
 /// ```
 ///
@@ -575,6 +575,240 @@ pub(crate) struct Inner {
 /// let overlay = WriteOverlay::open(&cb, cb.source(), "/nonexistent", &CreateOptions::default()).unwrap();
 /// let _ = overlay.commit_atomic("/tmp/a.tar".as_ref());
 /// # Ok::<(), String>(())
+/// ```
+///
+/// The deleted token-free entries stay deleted, and their replacements take the
+/// token:
+///
+/// ```compile_fail
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // compile_fail: WriteOverlay::new (deleted)
+/// let source: Arc<dyn MountSource> = Arc::new(FolderMountSource::new("/tmp").unwrap());
+/// let _ = WriteOverlay::new(source, "/nonexistent");
+/// ```
+///
+/// ```no_run
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // control: WriteOverlay::open
+/// let cb = ClassifiedBase::open(&mut Fixture)?;
+/// let _ = WriteOverlay::open(
+///     &cb,
+///     cb.source(),
+///     "/nonexistent",
+///     &CreateOptions {
+///         base_digest: BaseDigestRequest::None,
+///         force_base_mismatch: false,
+///         lower_layers: vec![],
+///         weak_exclude: vec![],
+///         index_writable: false,
+///         remote_token: None,
+///     },
+/// );
+/// # Ok::<(), String>(())
+/// ```
+///
+/// ```compile_fail
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // compile_fail: record_base_rows_offline (pub(crate))
+/// let rows = std::collections::BTreeMap::new();
+/// let _ = overlay_meta::record_base_rows_offline("/nonexistent".as_ref(), &rows);
+/// ```
+///
+/// ```no_run
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // control: record_forced_base_rows
+/// let cb = ClassifiedBase::open(&mut Fixture)?;
+/// let rows = std::collections::BTreeMap::new();
+/// let _ = record_forced_base_rows("/nonexistent".as_ref(), &cb, &rows);
+/// # Ok::<(), String>(())
+/// ```
+///
+/// ```compile_fail
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // compile_fail: commit_overlay without a token
+/// let _ = commit_overlay("/nonexistent", "/tmp/a.tar", &CommitOverlayOptions::default());
+/// ```
+///
+/// ```no_run
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // control: commit_overlay over a classified base, and the raw directory entry
+/// let cb = ClassifiedBase::open(&mut Fixture)?;
+/// let opts = CommitOverlayOptions::default();
+/// let _ = commit_overlay("/nonexistent", "/tmp/a.tar", &cb, &opts);
+/// let _ = commit_overlay_raw_dir("/nonexistent", "/tmp/a.tar", &opts);
+/// # Ok::<(), String>(())
+/// ```
+///
+/// ```compile_fail
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // compile_fail: OverlayCreateInfo is not public
+/// let _ = OverlayCreateInfo::default();
+/// ```
+///
+/// ```no_run
+/// # use ratarmount_compositing::*;
+/// # use ratarmount_core::MountSource;
+/// # use std::sync::Arc;
+/// # struct Fixture;
+/// # impl OpenBase for Fixture {
+/// #     fn open_base(&mut self) -> Result<Opened, String> {
+/// #         let dir = std::env::temp_dir();
+/// #         let source: Arc<dyn MountSource> =
+/// #             Arc::new(FolderMountSource::new(&dir).map_err(|e| e.to_string())?);
+/// #         Ok(Opened {
+/// #             source,
+/// #             kind: ServedKind::Folder,
+/// #             inputs: vec![],
+/// #             location: Some(ServedLocation::Local(dir)),
+/// #             index: IndexProvenance::None,
+/// #             sidecar_candidate: None,
+/// #             fetched: false,
+/// #             keep_alive: Box::new(()),
+/// #         })
+/// #     }
+/// # }
+/// // control: CreateOptions is the public, identity-free input
+/// let _ = CreateOptions::default();
 /// ```
 #[derive(Clone)]
 pub struct ClassifiedBase {

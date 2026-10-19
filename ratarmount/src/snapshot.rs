@@ -718,7 +718,6 @@ mod tests {
     /// Regression: indexed snapshots must equal the pinned Git view, preserve modes, and open warm.
     #[test]
     fn regression_snapshot_git_equivalent_composed_view_and_warm_index() {
-        use ratarmount_compositing::WriteOverlay;
         use ratarmount_core::{IndexBuildHooks, OpenOptions};
         use ratarmount_session::factory;
         use std::os::unix::fs::MetadataExt;
@@ -787,8 +786,12 @@ mod tests {
         );
         let after = fs::metadata(&index).unwrap();
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
-        let git_overlay = WriteOverlay::new(git, temp.path().join("git-overlay")).unwrap();
-        let tar_overlay = WriteOverlay::new(snapshot, temp.path().join("tar-overlay")).unwrap();
+        let git_overlay =
+            crate::base_identity::fixtures::new_overlay(git, temp.path().join("git-overlay"))
+                .unwrap();
+        let tar_overlay =
+            crate::base_identity::fixtures::new_overlay(snapshot, temp.path().join("tar-overlay"))
+                .unwrap();
         for overlay in [&git_overlay, &tar_overlay] {
             overlay.unlink("/plain").unwrap();
             overlay.mkdir("/added", 0o755).unwrap();

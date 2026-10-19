@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use clap::{ArgAction, Parser};
 use nix::unistd::{fork, setsid, ForkResult};
 use ratarmount_compositing::{
-    commit_overlay, maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource,
-    ControlFolderOptions, OverlayError, WriteOverlay, HIDDEN_DB,
+    maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource, ControlFolderOptions,
+    OverlayError, WriteOverlay, HIDDEN_DB,
 };
 use ratarmount_compress::{
     repack_seekable, strip_compression_suffix, GzipSidecar, RepackAction, RepackOptions,
@@ -1752,7 +1752,7 @@ fn main() {
         }
     }
     if let Some(diff) = &args.diff {
-        std::process::exit(diff::run(diff));
+        std::process::exit(diff::run(diff, &overlay_run_context(&args)));
     }
     if args.shard.is_some() || args.export_index.is_some() {
         let result = export_index::cli_stdout()
@@ -1782,7 +1782,7 @@ fn main() {
         return;
     }
     if let Some(overlay) = &args.overlay {
-        match overlay_cmd::run(overlay) {
+        match overlay_cmd::run(overlay, &overlay_run_context(&args)) {
             Ok((output, code)) => {
                 println!("{}", output.trim_end());
                 if code != 0 {
@@ -1936,7 +1936,29 @@ fn main() {
             ignore_zeros: args.ignore_zeros,
             force_base_mismatch: args.force_base_mismatch,
         };
-        match commit_overlay(overlay, archive, &opts) {
+        // An overlay with a database commits only over the base it recorded:
+        // the archive is classified through the factory and gated before the
+        // splice. A raw directory of files has no identity to check; it
+        // commits through its own entry and says so.
+        let result = if overlay.join(HIDDEN_DB).exists() {
+            base_identity::classify_offline(
+                archive,
+                base_identity::GitIntent::Replay(None),
+                &overlay_run_context(&args),
+            )
+            .map_err(OverlayError::Msg)
+            .and_then(|base| ratarmount_compositing::commit_overlay(overlay, archive, &base, &opts))
+        } else {
+            ratarmount_compositing::commit_overlay_raw_dir(overlay, archive, &opts).map(|done| {
+                if !done.identity_checked {
+                    println!(
+                        "note: no base identity was checked (overlay directory has no database)"
+                    );
+                }
+                done.committed
+            })
+        };
+        match result {
             Ok(_) => return,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -2043,10 +2065,7 @@ fn main() {
         }
     }
 
-    let index_folders = match &args.index_folders {
-        Some(s) => parse_index_folders(s),
-        None => default_index_folders(),
-    };
+    let index_folders = index_folders_of(&args);
 
     let mut passwords = args.passwords.clone();
     if let Some(ref pf) = args.password_file {
@@ -3027,6 +3046,21 @@ fn warn_export_non_loopback(name: &str, bind: std::net::SocketAddr) {
         eprintln!(
             "warning: {name} bound on {bind} (no auth). Prefer 127.0.0.1 unless you trust the LAN."
         );
+    }
+}
+
+/// The index folders the invocation names (`--index-folders`), else the defaults.
+fn index_folders_of(args: &Args) -> Vec<PathBuf> {
+    match &args.index_folders {
+        Some(s) => parse_index_folders(s),
+        None => default_index_folders(),
+    }
+}
+
+/// What the offline verbs need from the parent invocation.
+fn overlay_run_context(args: &Args) -> base_identity::OverlayRunContext {
+    base_identity::OverlayRunContext {
+        index_folders: index_folders_of(args),
     }
 }
 
@@ -5173,6 +5207,27 @@ mod base_flag_cli_tests {
         // --force-base-mismatch still needs an overlay target.
         assert!(parse(&["--lower", "L", "--force-base-mismatch", "base", "mnt"]).is_err());
     }
+
+    /// Regression: the offline verbs (`overlay seal|pack|verify|import`, `diff`)
+    /// dropped the parent invocation's `--index-folders`, so the sidecar a
+    /// mount used was not the one they read. The context carries the parsed
+    /// folders (and the defaults when none are given).
+    #[test]
+    fn regression_index_folders_reaches_offline_verbs() {
+        let args = parse(&["--index-folders", "/idx/a,/idx/b", "base.tar", "mnt"]).unwrap();
+        assert_eq!(
+            super::overlay_run_context(&args).index_folders,
+            vec![
+                std::path::PathBuf::from("/idx/a"),
+                std::path::PathBuf::from("/idx/b")
+            ]
+        );
+        let args = parse(&["base.tar", "mnt"]).unwrap();
+        assert_eq!(
+            super::overlay_run_context(&args).index_folders,
+            ratarmount_index::default_index_folders()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7190,7 +7245,11 @@ mod overlay_unmount_drop_tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            crate::base_identity::fixtures::new_overlay(
+                Arc::new(EmptyBase) as Arc<dyn MountSource>,
+                &overlay,
+            )
+            .unwrap(),
         );
         let weak = Arc::downgrade(&ov);
         let held = Arc::clone(&ov);
@@ -7225,13 +7284,11 @@ mod overlay_unmount_drop_tests {
         std::fs::write(&archive, vec![7u8; 1 << 20]).unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new_with_create_info(
+            crate::base_identity::fixtures::overlay_over(
                 Arc::new(EmptyBase) as Arc<dyn MountSource>,
                 &overlay,
-                &ratarmount_compositing::OverlayCreateInfo {
-                    base_url: archive.to_str().unwrap().into(),
-                    ..Default::default()
-                },
+                archive.to_str().unwrap(),
+                Vec::new(),
             )
             .unwrap(),
         );
@@ -7284,7 +7341,11 @@ mod overlay_unmount_drop_tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            crate::base_identity::fixtures::new_overlay(
+                Arc::new(EmptyBase) as Arc<dyn MountSource>,
+                &overlay,
+            )
+            .unwrap(),
         );
         let weak = Arc::downgrade(&ov);
         let interval = live_interval_thread(&ov, dir.path().join("archive.tar"));
@@ -7316,7 +7377,11 @@ mod overlay_unmount_drop_tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            crate::base_identity::fixtures::new_overlay(
+                Arc::new(EmptyBase) as Arc<dyn MountSource>,
+                &overlay,
+            )
+            .unwrap(),
         );
         let weak = Arc::downgrade(&ov);
         let interval = live_interval_thread(&ov, dir.path().join("archive.tar"));
@@ -7404,7 +7469,11 @@ mod overlay_unmount_drop_tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            crate::base_identity::fixtures::new_overlay(
+                Arc::new(EmptyBase) as Arc<dyn MountSource>,
+                &overlay,
+            )
+            .unwrap(),
         );
         let weak = Arc::downgrade(&ov);
         let cb = crate::find::live_search_callback(
@@ -8363,7 +8432,7 @@ mod lower_stack_tests {
         let dir = root.path().join("lower");
         let view: Arc<dyn ratarmount_core::MountSource> =
             Arc::new(FolderMountSource::new(base).unwrap());
-        drop(WriteOverlay::new(view.clone(), &dir).unwrap());
+        drop(crate::base_identity::fixtures::new_overlay(view.clone(), &dir).unwrap());
         let paths = [dir.clone()];
         let open = |allow| MountLowerStack::open(view.clone(), None, &paths, allow).map(|r| r.0);
         assert!(open(false).err().unwrap().contains("unsealed"));
@@ -8392,7 +8461,7 @@ mod lower_stack_tests {
         let view: Arc<dyn ratarmount_core::MountSource> =
             Arc::new(FolderMountSource::new(base).unwrap());
         let dir = root.join("lower");
-        drop(WriteOverlay::new(view.clone(), &dir).unwrap());
+        drop(crate::base_identity::fixtures::new_overlay(view.clone(), &dir).unwrap());
         let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
         OverlayMeta::set_many(&conn, meta).unwrap();
         // Written by a build that records the base kind (format 2).

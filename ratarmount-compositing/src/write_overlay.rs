@@ -1001,7 +1001,13 @@ impl WriteOverlay {
         Ok(())
     }
 
-    pub fn new(base: Arc<dyn MountSource>, overlay: impl AsRef<Path>) -> Result<Self> {
+    /// In-crate tests only: an overlay that records no base at all. A real
+    /// overlay is opened with [`Self::open`] over a classified base.
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(
+        base: Arc<dyn MountSource>,
+        overlay: impl AsRef<Path>,
+    ) -> Result<Self> {
         Self::open_with_create_info(base, overlay.as_ref(), None, None)
     }
 
@@ -1018,12 +1024,12 @@ impl WriteOverlay {
         Self::open_with_create_info(composed, overlay.as_ref(), Some(&info), Some(base))
     }
 
-    /// Open with the original base identity. Existing overlays are verified
-    /// cheaply; only newly created overlays compute a content digest.
-    pub fn new_with_create_info(
+    /// In-crate tests only: open with a hand-built creation record.
+    #[cfg(test)]
+    pub(crate) fn new_with_create_info_for_tests(
         base: Arc<dyn MountSource>,
         overlay: impl AsRef<Path>,
-        info: &crate::OverlayCreateInfo,
+        info: &crate::overlay_meta::OverlayCreateInfo,
     ) -> Result<Self> {
         Self::open_with_create_info(base, overlay.as_ref(), Some(info), None)
     }
@@ -1031,7 +1037,7 @@ impl WriteOverlay {
     fn open_with_create_info(
         base: Arc<dyn MountSource>,
         overlay: &Path,
-        info: Option<&crate::OverlayCreateInfo>,
+        info: Option<&crate::overlay_meta::OverlayCreateInfo>,
         identity: Option<&crate::ClassifiedBase>,
     ) -> Result<Self> {
         // Before the directory is created: the topmost-new exclusion rule
@@ -6486,21 +6492,14 @@ impl Default for CommitOverlayOptions {
 /// Offline prefix-rewrite escape hatch (including earlier-frame `.tar.zst`
 /// delete). **Not** a V-4 live-queue job — do not route this through
 /// [`WriteOverlay::enqueue_commit`].
-pub fn commit_overlay(
-    write_overlay: impl AsRef<Path>,
-    archive_file: impl AsRef<Path>,
-    opts: &CommitOverlayOptions,
-) -> Result<bool> {
-    commit_overlay_inner(write_overlay.as_ref(), archive_file.as_ref(), None, opts)
-}
-
-/// [`commit_overlay`] for an overlay with a database: the archive about to be
+///
+/// The overlay has a database: the archive about to be
 /// rewritten must still be the base the last create, commit or refresh
 /// recorded (checked with `stat` only, before anything is written; the
 /// classified base is the opener's report for `archive_file`). The refresh
 /// afterwards re-points the recorded location at the committed archive.
 /// `--force-base-mismatch` (`opts`) commits anyway.
-pub fn commit_overlay_checked(
+pub fn commit_overlay(
     write_overlay: impl AsRef<Path>,
     archive_file: impl AsRef<Path>,
     base: &crate::ClassifiedBase,
@@ -6537,7 +6536,7 @@ pub struct RawDirCommit {
 /// Commit a raw overlay DIRECTORY of files (no database) to an archive. It
 /// takes no token and checks no identity; it refuses once the directory has
 /// an overlay database, because then the base identity must be checked
-/// through [`commit_overlay_checked`].
+/// through [`commit_overlay`].
 pub fn commit_overlay_raw_dir(
     write_overlay: impl AsRef<Path>,
     archive_file: impl AsRef<Path>,
@@ -6548,7 +6547,7 @@ pub fn commit_overlay_raw_dir(
     if db.exists() {
         return Err(OverlayError::Msg(format!(
             "overlay database {} exists; its base identity must be checked, so commit it \
-             with a classified base (commit_overlay_checked), not as a raw directory",
+             with a classified base (commit_overlay), not as a raw directory",
             db.display()
         )));
     }
@@ -8547,6 +8546,17 @@ fn walkdir_files_and_empty_dirs(root: &Path) -> Result<Vec<WalkEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Offline commit without a classified base: the in-crate fixtures open
+    /// overlays with `new_for_tests`, which record no base to check.
+    fn commit_overlay(
+        write_overlay: impl AsRef<Path>,
+        archive_file: impl AsRef<Path>,
+        opts: &CommitOverlayOptions,
+    ) -> Result<bool> {
+        commit_overlay_inner(write_overlay.as_ref(), archive_file.as_ref(), None, opts)
+    }
+
     use ratarmount_compress::{open_seekable_bzip2, open_seekable_xz};
     use std::process::Command as StdCommand;
     use zip::write::SimpleFileOptions;
@@ -8569,7 +8579,7 @@ mod tests {
             }
         }
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(MemBase::with(&[])), td.path()).unwrap();
+        let mut ov = WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), td.path()).unwrap();
         ov.set_policy(Some(Arc::new(PanicOnce(AtomicBool::new(true)))));
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             || ov.mkdir("/first", 0o755)
@@ -8887,7 +8897,7 @@ mod tests {
             }
         }
         let td = tempfile::tempdir().unwrap();
-        let ov = WriteOverlay::new(Arc::new(ShortBase), td.path()).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(ShortBase), td.path()).unwrap();
         let host = td.path().join("short");
         let err = ov.ensure_modifiable("/short");
         let bytes = fs::read(&host).ok();
@@ -9035,7 +9045,7 @@ mod tests {
             }
         }
 
-        let ov = WriteOverlay::new(
+        let ov = WriteOverlay::new_for_tests(
             Arc::new(CrashBase {
                 overlay: overlay.clone(),
                 big: original.to_vec(),
@@ -9093,7 +9103,8 @@ mod tests {
         }
 
         let ov =
-            WriteOverlay::new(open_uncompressed_tar_base(&mount_tar, false), &overlay).unwrap();
+            WriteOverlay::new_for_tests(open_uncompressed_tar_base(&mount_tar, false), &overlay)
+                .unwrap();
         assert!(!overlay.join(".ratarmount.overlay.cow-Ab12Cd").exists());
         assert!(!overlay
             .join("sub")
@@ -9125,7 +9136,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        drop(WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).unwrap());
+        drop(WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), &overlay).unwrap());
         let locked = overlay.join("locked");
         fs::create_dir(&locked).unwrap();
         fs::write(
@@ -9149,7 +9160,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         }
-        let err = WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).err();
+        let err = WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), &overlay).err();
         assert!(
             err.is_none(),
             "unreadable dir must not fail reopen: {err:?}"
@@ -9165,11 +9176,11 @@ mod tests {
     fn regression_cow_v3_second_open_keeps_staging() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        drop(WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).unwrap());
-        let first = WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).unwrap();
+        drop(WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), &overlay).unwrap());
+        let first = WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), &overlay).unwrap();
         let staging = overlay.join(format!("{COW_STAGING_PREFIX}Ab12Cd"));
         fs::write(&staging, b"in-progress").unwrap();
-        match WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay) {
+        match WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), &overlay) {
             Ok(_) => panic!("second open must be refused while the first holds the lock"),
             Err(e) => {
                 let msg = e.to_string().to_lowercase();
@@ -9284,7 +9295,7 @@ mod tests {
     #[test]
     fn regression_overlay_policy_read_open_still_allowed() {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(MemBase::with(&[])), td.path()).unwrap();
+        let mut ov = WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), td.path()).unwrap();
         ov.mkdir("/locked", 0o755).unwrap();
         let file = policy_file(&ov, "/locked/file");
         ov.write_at(&file, "/locked/file", 0, b"base").unwrap();
@@ -9379,7 +9390,7 @@ mod tests {
         limit: u64,
     ) -> (tempfile::TempDir, WriteOverlay, Arc<CountingPolicy>) {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(base, td.path()).unwrap();
+        let mut ov = WriteOverlay::new_for_tests(base, td.path()).unwrap();
         let policy = Arc::new(CountingPolicy::new(limit));
         ov.set_policy(Some(policy.clone()));
         (td, ov, policy)
@@ -9655,7 +9666,11 @@ mod tests {
         zw.finish().unwrap();
     }
 
-    fn assert_committed_baseline(overlay: &Path, archive: &Path, info: &crate::OverlayCreateInfo) {
+    fn assert_committed_baseline(
+        overlay: &Path,
+        archive: &Path,
+        info: &crate::overlay_meta::OverlayCreateInfo,
+    ) {
         let meta = crate::OverlayMeta::read(overlay).unwrap().unwrap();
         let stamp = ratarmount_index::ArchiveDigestStamp::read(archive).unwrap();
         let digest = format!(
@@ -9693,14 +9708,17 @@ mod tests {
             )
         );
         // Use the same default creation context as mount startup, with no override.
-        drop(WriteOverlay::new_with_create_info(Arc::new(NullBase), overlay, info).unwrap());
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(Arc::new(NullBase), overlay, info)
+                .unwrap(),
+        );
         fs::OpenOptions::new()
             .append(true)
             .open(archive)
             .unwrap()
             .write_all(b"external change")
             .unwrap();
-        let error = WriteOverlay::new_with_create_info(Arc::new(NullBase), overlay, info)
+        let error = WriteOverlay::new_with_create_info_for_tests(Arc::new(NullBase), overlay, info)
             .err()
             .expect("external archive change must be refused");
         assert!(error.to_string().contains("base mismatch"), "{error}");
@@ -9735,7 +9753,7 @@ mod tests {
             .unwrap()
             .execute_batch("CREATE TABLE files (name TEXT);")
             .unwrap();
-        let info = crate::OverlayCreateInfo {
+        let info = crate::overlay_meta::OverlayCreateInfo {
             base_url: archive.to_str().unwrap().to_owned(),
             index_path: Some(index),
             ..Default::default()
@@ -9745,7 +9763,7 @@ mod tests {
             "tar.zst" => open_tar_zst_base(&archive, false),
             _ => Arc::new(NullBase) as Arc<dyn MountSource>,
         };
-        let mut ov = WriteOverlay::new_with_create_info(base, &overlay, &info).unwrap();
+        let mut ov = WriteOverlay::new_with_create_info_for_tests(base, &overlay, &info).unwrap();
         ov.set_commit_mode(mode);
         fs::write(overlay.join("new"), b"new payload").unwrap();
         if live {
@@ -9828,7 +9846,7 @@ mod tests {
         fs::create_dir_all(&overlay).unwrap();
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
         {
-            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            let _ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             fs::write(overlay.join("new.txt"), b"hello zip commit\n").unwrap();
         }
 
@@ -9911,7 +9929,7 @@ mod tests {
         fs::create_dir_all(&overlay).unwrap();
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
         {
-            let ov = WriteOverlay::new(base, &overlay).unwrap();
+            let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             // Replace mut.txt via overlay file (also marks delete+append on commit walk)
             fs::write(overlay.join("mut.txt"), b"new mut\n").unwrap();
             // Delete gone.txt in overlay DB (base would have had it)
@@ -9998,7 +10016,7 @@ mod tests {
         // Create hidden DB so schema exists (optional for append-only)
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
         {
-            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            let _ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             fs::write(overlay.join("new.txt"), b"hello commit\n").unwrap();
             // Drop overlay so exclusive SQLite lock is released before commit.
         }
@@ -10052,7 +10070,7 @@ mod tests {
         fs::create_dir_all(&overlay).unwrap();
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
         {
-            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            let _ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             fs::write(overlay.join("new.txt"), b"hello gzip commit\n").unwrap();
         }
 
@@ -10173,7 +10191,7 @@ mod tests {
                 open_uncompressed_tar_base(&archive, false)
             };
             let old = base.lookup("/last", 0).unwrap();
-            let mut ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+            let mut ov = WriteOverlay::new_for_tests(base, dir.path().join("ov")).unwrap();
             ov.set_commit_mode(CommitMode::Append);
             fs::write(ov.root().join("new"), b"new").unwrap();
             assert!(ov
@@ -10194,7 +10212,7 @@ mod tests {
         let archive = dir.path().join("a.tar");
         let (_, last) = append_fixture(&archive, false);
         let base = open_uncompressed_tar_base(&archive, false);
-        let ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, dir.path().join("ov")).unwrap();
         let offset = fs::metadata(&archive).unwrap().len() - 1024;
         let mut suffix = tempfile::tempfile().unwrap();
         suffix.write_all(b"partial new member").unwrap();
@@ -10227,7 +10245,7 @@ mod tests {
         append_fixture(&archive, false);
         let base = open_uncompressed_tar_base(&archive, false);
         let old = base.lookup("/last", 0).unwrap();
-        let ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, dir.path().join("ov")).unwrap();
         let mut suffix = tempfile::tempfile().unwrap();
         suffix.write_all(b"new").unwrap();
         assert!(
@@ -10272,7 +10290,7 @@ mod tests {
             let archive = dir.path().join("a.tar");
             append_fixture(&archive, false);
             let before = fs::metadata(&archive).unwrap().ino();
-            let mut ov = WriteOverlay::new(
+            let mut ov = WriteOverlay::new_for_tests(
                 open_uncompressed_tar_base(&archive, false),
                 dir.path().join("ov"),
             )
@@ -10303,7 +10321,7 @@ mod tests {
         let archive = dir.path().join("a.tar");
         append_fixture(&archive, false);
         let good = fs::read(&archive).unwrap();
-        let mut ov = WriteOverlay::new(
+        let mut ov = WriteOverlay::new_for_tests(
             open_uncompressed_tar_base(&archive, false),
             dir.path().join("ov"),
         )
@@ -11535,7 +11553,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(OneFile) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         assert!(!ov.is_deleted("/keep.txt"));
         assert!(ov.lookup("/keep.txt", 0).is_some());
         for _ in 0..64 {
@@ -11551,7 +11569,7 @@ mod tests {
         );
         drop(ov);
 
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert!(
             ov.is_deleted("/keep.txt"),
             "reopen must load tombstones from the overlay database"
@@ -11621,7 +11639,8 @@ mod tests {
     fn overlay_with_keep_tombstone() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(KeepBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(KeepBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         ov.unlink("/keep.txt").unwrap();
         assert!(ov.lookup("/keep.txt", 0).is_none());
         drop(ov);
@@ -11629,7 +11648,7 @@ mod tests {
     }
 
     fn reopen_keep_overlay(overlay: &Path) -> Result<WriteOverlay> {
-        WriteOverlay::new(Arc::new(KeepBase) as Arc<dyn MountSource>, overlay)
+        WriteOverlay::new_for_tests(Arc::new(KeepBase) as Arc<dyn MountSource>, overlay)
     }
 
     /// Remove the overlay database by exact name (plus SQLite sidecars), never
@@ -11890,7 +11909,7 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let ov2 = WriteOverlay::new(Arc::new(DbNamedBase), dir.path().join("o")).unwrap();
+        let ov2 = WriteOverlay::new_for_tests(Arc::new(DbNamedBase), dir.path().join("o")).unwrap();
         // Remove the host DB so only the base member could answer.
         fs::remove_file(dir.path().join("o").join(HIDDEN_DB)).unwrap();
         assert!(ov2.lookup("/.ratarmount.overlay.sqlite", 0).is_none());
@@ -12115,7 +12134,8 @@ mod tests {
             let overlay = dir.path().join(name);
             fs::create_dir(&overlay).unwrap();
             std::os::unix::fs::symlink(target, overlay.join(OVERLAY_MARKER)).unwrap();
-            let r = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay);
+            let r =
+                WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay);
             assert!(r.is_err(), "symlinked marker must be refused");
         }
         assert_eq!(fs::read(&outside).unwrap(), b"secret");
@@ -12218,7 +12238,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
 
         let sub = ov.root.join("sub");
         fs::create_dir_all(sub.join("nested")).unwrap();
@@ -12319,7 +12339,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, overlay.join("outdir")).unwrap();
 
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
 
         // create_file through file symlink must fail and not clobber outside content.
         let err = ov.create_file("/escape", 0o644);
@@ -12447,8 +12467,9 @@ mod tests {
         let (dir, counted, _a, b) = zip_counted_base();
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(Arc::clone(&counted) as Arc<dyn MountSource>, &overlay)
-            .expect("overlay");
+        let ov =
+            WriteOverlay::new_for_tests(Arc::clone(&counted) as Arc<dyn MountSource>, &overlay)
+                .expect("overlay");
 
         ov.unlink("/a.txt").expect("delete base a.txt");
         let fd = ov.create_file("/c.txt", 0o644).expect("overlay create");
@@ -12485,8 +12506,9 @@ mod tests {
         let (dir, counted, a, _b) = zip_counted_base();
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(Arc::clone(&counted) as Arc<dyn MountSource>, &overlay)
-            .expect("overlay");
+        let ov =
+            WriteOverlay::new_for_tests(Arc::clone(&counted) as Arc<dyn MountSource>, &overlay)
+                .expect("overlay");
 
         assert!(
             !a.is_empty(),
@@ -12626,7 +12648,8 @@ mod tests {
         let stacked = crate::FileVersionLayer::new(Arc::new(WithGeneratedReg {
             inner: Arc::new(tar) as Arc<dyn MountSource>,
         }));
-        let ov = WriteOverlay::new(Arc::new(stacked) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(stacked) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         let z_fi = ov.current_base().lookup("/z.txt", 0).expect("z.txt");
         assert!(
             matches!(z_fi.userdata.last(), Some(UserData::Other(s)) if s == "versionlayer:file"),
@@ -12721,7 +12744,8 @@ mod tests {
 
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(Arc::new(tar) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(tar) as Arc<dyn MountSource>, &overlay).unwrap();
         overlay_write_bytes(&ov, "/new.txt", b"overlay-create\n");
         let ov_names = overlay_only_names(&ov);
         assert_eq!(ov_names, vec!["/new.txt".to_string()]);
@@ -12792,7 +12816,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         let fd = ov.create_file("/src.txt", 0o644).unwrap();
         unsafe {
             libc::close(fd);
@@ -12827,7 +12852,8 @@ mod tests {
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
         let base = crate::folder::FolderMountSource::new(&base_dir).unwrap();
-        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
 
         ov.rename("/link", "/link2").expect("rename symlink");
         let meta = fs::symlink_metadata(overlay.join("link2")).expect("overlay link2");
@@ -12861,7 +12887,8 @@ mod tests {
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
         let base = crate::folder::FolderMountSource::new(&base_dir).unwrap();
-        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
 
         let err = ov.rmdir("/full").expect_err("non-empty base dir");
         assert!(
@@ -12930,7 +12957,8 @@ mod tests {
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
         let ov =
-            WriteOverlay::new(Arc::new(FailOpenBase) as Arc<dyn MountSource>, &overlay).unwrap();
+            WriteOverlay::new_for_tests(Arc::new(FailOpenBase) as Arc<dyn MountSource>, &overlay)
+                .unwrap();
         let fd = ov.create_file("/dst", 0o644).unwrap();
         unsafe {
             libc::close(fd);
@@ -12986,7 +13014,8 @@ mod tests {
             &mut materialised,
         )
         .expect("index tar");
-        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
         fs::write(overlay.join("new.txt"), fs::read(&new_payload).unwrap()).unwrap();
         fs::write(overlay.join("keep.txt"), b"replaced-body\n").unwrap();
         ov.unlink("/gone.txt").expect("mark gone deleted");
@@ -13457,7 +13486,8 @@ mod tests {
             &mut materialised,
         )
         .expect("index tar");
-        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
         fs::write(overlay.join("new.txt"), b"appended\n").unwrap();
         match ov.commit_atomic(&tar) {
             Ok(true) => {}
@@ -13534,9 +13564,11 @@ mod tests {
                 .unwrap();
             }
             let root = dir.path().join("ov");
-            let ov =
-                WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-                    .unwrap();
+            let ov = WriteOverlay::new_for_tests(
+                Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+                &root,
+            )
+            .unwrap();
             let fd = ov.create_file("/new", 0o644).unwrap();
             ov.close_overlay_fd(fd);
             fs::write(root.join("new"), b"new payload").unwrap();
@@ -13603,7 +13635,7 @@ mod tests {
                     });
                     append_fixture(&archive, compressed);
                     let root = alias.join("ov");
-                    let ov = WriteOverlay::new(
+                    let ov = WriteOverlay::new_for_tests(
                         Arc::new(provenance_base(&archive, "utf-8").unwrap()),
                         &root,
                     )
@@ -13650,7 +13682,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("base.tar");
         provenance_fixture(&archive, false);
-        let ov = WriteOverlay::new(
+        let ov = WriteOverlay::new_for_tests(
             Arc::new(provenance_base(&archive, "utf-8").unwrap()),
             dir.path().join("ov"),
         )
@@ -13676,8 +13708,11 @@ mod tests {
         let archive = dir.path().join("base.tar");
         fs::write(&archive, pack_tar(&[ustar_file("old", b"old")])).unwrap();
         let root = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-            .unwrap();
+        let ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         put_overlay_bytes(&ov, "/new", b"new payload");
         drop(ov);
         let mut plan = collect_overlay_commit_plan(&root).unwrap();
@@ -13698,9 +13733,11 @@ mod tests {
         write_commit_manifest(&archive, &plan, "utf-8", "new").unwrap();
         let manifest = fs::read_to_string(format!("{}.manifest.jsonl", archive.display())).unwrap();
         assert!(manifest.contains(&expected));
-        let reopened =
-            WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-                .unwrap();
+        let reopened = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         reopened.set_xattr("/new", "user.empty", b"", 1).unwrap();
         assert_eq!(reopened.xattrs_for_path("/new").unwrap()["user.empty"], b"");
     }
@@ -13733,7 +13770,7 @@ mod tests {
             provenance_fixture(&archive, compressed);
             let root = dir.path().join("overlay");
             let base = Arc::new(provenance_base(&archive, "utf-8").unwrap());
-            let ov = WriteOverlay::new(base.clone(), &root).unwrap();
+            let ov = WriteOverlay::new_for_tests(base.clone(), &root).unwrap();
             let fd = ov.create_file("/built", 0o600).unwrap();
             ov.close_overlay_fd(fd);
             let attrs = OverlayMetadata {
@@ -13759,7 +13796,7 @@ mod tests {
                 .collect();
             assert_eq!(modes, [0o751, 0o751]);
             drop(ov);
-            let ov = WriteOverlay::new(base, &root).unwrap();
+            let ov = WriteOverlay::new_for_tests(base, &root).unwrap();
             assert_eq!(ov.lookup("/trace", 0).unwrap().mode & 0o7777, 0o751);
             assert_eq!(overlay_atime(&ov.lookup("/trace", 0).unwrap()), 1234.25);
             // Omitted timestamps are unchanged by a later chmod.
@@ -13792,8 +13829,11 @@ mod tests {
         let archive = dir.path().join("base.tar");
         fs::write(&archive, pack_tar(&[ustar_file("sub/script", b"payload")])).unwrap();
         let root = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-            .unwrap();
+        let ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         ov.set_metadata(
             "/sub/script",
             &OverlayMetadata {
@@ -13854,8 +13894,11 @@ mod tests {
         )
         .unwrap();
         let root = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-            .unwrap();
+        let ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         ov.set_metadata(
             "/archive-link",
             &OverlayMetadata {
@@ -13912,8 +13955,11 @@ mod tests {
         let archive = dir.path().join("base.tar");
         provenance_fixture(&archive, false);
         let root = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-            .unwrap();
+        let ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         ov.set_metadata(
             "/trace",
             &OverlayMetadata {
@@ -13952,9 +13998,11 @@ mod tests {
             let archive = dir.path().join("base.tar");
             provenance_fixture(&archive, false);
             let root = dir.path().join("ov");
-            let mut ov =
-                WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-                    .unwrap();
+            let mut ov = WriteOverlay::new_for_tests(
+                Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+                &root,
+            )
+            .unwrap();
             if policy {
                 ov.set_policy(Some(Arc::new(CountingPolicy::new(u64::MAX))));
             }
@@ -13999,7 +14047,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("base.tar");
         provenance_fixture(&archive, false);
-        let mut ov = WriteOverlay::new(
+        let mut ov = WriteOverlay::new_for_tests(
             Arc::new(provenance_base(&archive, "utf-8").unwrap()),
             dir.path().join("ov"),
         )
@@ -14057,7 +14105,7 @@ mod tests {
         let archive = dir.path().join("base.tar");
         provenance_fixture(&archive, false);
         let base = Arc::new(provenance_base(&archive, "utf-8").unwrap());
-        let mut ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+        let mut ov = WriteOverlay::new_for_tests(base, dir.path().join("ov")).unwrap();
         let error = |r: Result<()>| match r.unwrap_err() {
             OverlayError::Io(e) => e.raw_os_error().unwrap_or_else(|| {
                 assert_eq!(e.kind(), io::ErrorKind::ReadOnlyFilesystem);
@@ -14128,22 +14176,25 @@ mod tests {
         let root = dir.path().join("ov");
         let base = Arc::new(provenance_base(&archive, "utf-8").unwrap());
         {
-            let ov = WriteOverlay::new(base.clone(), &root).unwrap();
+            let ov = WriteOverlay::new_for_tests(base.clone(), &root).unwrap();
             ov.unlink("/trace").unwrap();
         }
         {
             let db = Connection::open(root.join(HIDDEN_DB)).unwrap();
             db.execute("DROP TABLE xattrs", []).unwrap();
         }
-        let ov = WriteOverlay::new(base, &root).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &root).unwrap();
         assert!(ov.lookup("/trace", 0).is_none());
         assert!(root.join(OVERLAY_MARKER).exists());
         let fd = ov.create_file("/new", 0o644).unwrap();
         ov.close_overlay_fd(fd);
         ov.set_xattr("/new", "user.test", b"yes", 0).unwrap();
         drop(ov);
-        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-            .unwrap();
+        let ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         assert_eq!(ov.xattrs_for_path("/new").unwrap()["user.test"], b"yes");
         assert!(ov.is_deleted("/trace"));
     }
@@ -14163,9 +14214,11 @@ mod tests {
                 provenance_fixture(&archive, compressed);
                 let sidecar = append_index(&archive, compressed);
                 let root = dir.path().join("ov");
-                let ov =
-                    WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-                        .unwrap();
+                let ov = WriteOverlay::new_for_tests(
+                    Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+                    &root,
+                )
+                .unwrap();
                 ov.set_xattr("/trace", "user.train_ok", b"false", 0)
                     .unwrap();
                 ov.remove_xattr("/trace", "user.teacher").unwrap();
@@ -14232,9 +14285,11 @@ mod tests {
         let archive = dir.path().join("base.tar.zst");
         provenance_fixture(&archive, true);
         let root = dir.path().join("ov");
-        let mut ov =
-            WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-                .unwrap();
+        let mut ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         ov.set_manifest_hashes(Some("new".into()));
         ov.set_xattr("/trace", "user.train_ok", b"false", 0)
             .unwrap();
@@ -14444,7 +14499,7 @@ mod tests {
 
     fn overlay_with_base(base: Arc<dyn MountSource>, overlay: &Path) -> WriteOverlay {
         fs::create_dir_all(overlay).unwrap();
-        WriteOverlay::new(base, overlay).unwrap()
+        WriteOverlay::new_for_tests(base, overlay).unwrap()
     }
 
     fn seek_table_footer_present(bytes: &[u8]) -> bool {
@@ -16060,7 +16115,8 @@ mod tests {
         let tar = make_tiny_tar(dir.path(), &[("old.txt", b"keep\n")]);
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(open_uncompressed_tar_base(&tar, false), &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(open_uncompressed_tar_base(&tar, false), &overlay).unwrap();
         fs::write(overlay.join("new.txt"), b"appended\n").unwrap();
         match ov.commit_atomic(&tar) {
             Ok(true) => {}
@@ -17009,7 +17065,8 @@ mod tests {
     fn rename_over_overlay_archive_and_tombstone() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/final", b"old-dest");
         put_overlay_bytes(&ov, "/swap", b"new-src");
         let parked = ov
@@ -17048,7 +17105,7 @@ mod tests {
             ("/src", b"archive-src"),
             ("/final", b"archive-final"),
         ])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         assert!(!is_overlay_fi(&ov.lookup("/final", 0).unwrap()));
         let parked = ov.rename_parked("/src", "/final").expect("archive rename");
         assert!(parked.is_none(), "archive-only target has no host inode");
@@ -17063,7 +17120,7 @@ mod tests {
         assert_eq!(deleted_flag(&ov, "/src"), Some(1));
         assert_eq!(deleted_flag(&ov, "/final"), Some(0));
         drop(ov);
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert!(
             ov.is_deleted("/src"),
             "persisted tombstone hides the archive source"
@@ -17074,7 +17131,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/final", b"archived")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.unlink("/final").unwrap();
         assert!(ov.lookup("/final", 0).is_none());
         assert!(ov.is_deleted("/final"));
@@ -17116,7 +17173,8 @@ mod tests {
     fn rename_visible_lookup_never_none() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/final", b"seed");
         let nones = AtomicU64::new(0);
         let samples = AtomicU64::new(0);
@@ -17176,7 +17234,7 @@ mod tests {
     fn rename_tombstone_lookup_none_to_some_once() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(
+        let ov = WriteOverlay::new_for_tests(
             Arc::new(MemBase::with(&[("/final", b"archived")])) as Arc<dyn MountSource>,
             &overlay,
         )
@@ -17251,7 +17309,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/src", b"archive-src")])) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+        let ov = Arc::new(WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap());
         put_overlay_bytes(&ov, "/dst", b"old-dest");
         let probe = Arc::downgrade(&ov);
         let host = overlay.clone();
@@ -17286,7 +17344,7 @@ mod tests {
         );
         assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"archive-src");
         drop(ov);
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         let src = ov
             .lookup("/src", 0)
             .expect("duplicate archive member accepted");
@@ -17298,7 +17356,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+                .unwrap(),
         );
         put_overlay_bytes(&ov, "/dst", b"old-dest");
         put_overlay_bytes(&ov, "/src", b"new-src");
@@ -17322,7 +17381,8 @@ mod tests {
         assert_eq!(deleted_flag(&ov, "/src"), Some(0), "stale present row kept");
         assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new-src");
         drop(ov);
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         assert!(ov.lookup("/src", 0).is_none());
         assert_eq!(deleted_flag(&ov, "/src"), Some(0));
         assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new-src");
@@ -17331,7 +17391,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/dst", b"archived")])) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+        let ov = Arc::new(WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap());
         ov.unlink("/dst").unwrap();
         put_overlay_bytes(&ov, "/src", b"replacement");
         let probe = Arc::downgrade(&ov);
@@ -17352,7 +17412,7 @@ mod tests {
         assert!(is_overlay_fi(&ov.lookup("/dst", 0).unwrap()));
         assert_eq!(deleted_flag(&ov, "/dst"), Some(1), "db row still deleted");
         drop(ov);
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert!(!ov.is_deleted("/dst"), "open clears the tombstone");
         assert_eq!(deleted_flag(&ov, "/dst"), Some(0));
         assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"replacement");
@@ -17370,7 +17430,7 @@ mod tests {
             ("/keep.txt", b"archived-keep"),
             ("/other.txt", b"archived-other"),
         ])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         ov.unlink("/keep.txt").unwrap();
         ov.unlink("/other.txt").unwrap();
         assert!(ov.is_deleted("/keep.txt"));
@@ -17378,7 +17438,7 @@ mod tests {
         fs::write(overlay.join("keep.txt"), b"hidden-but-committed").unwrap();
         drop(ov);
 
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         assert!(!ov.is_deleted("/keep.txt"));
         assert!(is_overlay_fi(&ov.lookup("/keep.txt", 0).expect("visible")));
         assert_eq!(
@@ -17393,7 +17453,7 @@ mod tests {
         assert!(overlay.join(OVERLAY_MARKER).is_file());
         drop(ov);
 
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert!(!ov.is_deleted("/keep.txt"), "clear was persisted");
         assert!(ov.is_deleted("/other.txt"));
         assert_eq!(
@@ -17415,7 +17475,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with_dir("/sub")) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         ov.rmdir("/sub").expect("tombstone the archive directory");
         assert!(ov.is_deleted("/sub"));
         assert_eq!(deleted_flag(&ov, "/sub"), Some(1));
@@ -17423,7 +17483,7 @@ mod tests {
         fs::create_dir(overlay.join("sub")).unwrap();
         drop(ov);
 
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert!(
             overlay.join("sub").is_dir(),
             "open must not delete the host directory"
@@ -17443,7 +17503,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/src", b"archive-src")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.set_rename_tx_failures(1);
         ov.rename_parked("/src", "/dst")
             .expect("a single transient failure is retried");
@@ -17463,7 +17523,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/src", b"archive-src")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/src", "/dst").expect("rename returns success");
         assert_eq!(ov.pending_row_count(), 1);
@@ -17584,7 +17644,7 @@ mod tests {
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
             as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         // First rename's direct attempts, then the second rename's replay.
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
         ov.rename("/a", "/x").expect("a->x returns success");
@@ -17606,7 +17666,7 @@ mod tests {
 
         ov.set_rename_tx_failures(0);
         drop(ov);
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert_eq!(deleted_flag(&ov, "/a"), Some(1));
         assert_eq!(deleted_flag(&ov, "/x"), Some(1), "/x must stay deleted");
         assert_eq!(deleted_flag(&ov, "/y"), Some(0));
@@ -17629,7 +17689,7 @@ mod tests {
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
             as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, &overlay).unwrap());
+        let ov = Arc::new(WriteOverlay::new_for_tests(base, &overlay).unwrap());
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/a", "/x").expect("a->x queued");
         assert_eq!(ov.pending_row_count(), 1);
@@ -17707,7 +17767,7 @@ mod tests {
         let overlay = dir.path().join("ov");
         let base =
             Arc::new(MemBase::with(&[("/a", b"from-a"), ("/z", b"zzz")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/a", "/b").expect("queued");
         assert_eq!(ov.pending_row_count(), 1);
@@ -17733,7 +17793,7 @@ mod tests {
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
             as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
         ov.rename("/a", "/x").expect("queued");
         ov.unlink("/x").expect("unlink returns success");
@@ -17746,7 +17806,7 @@ mod tests {
         assert!(ov.lookup("/x", 0).is_none(), "memory already hides x");
         ov.set_rename_tx_failures(0);
         drop(ov);
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert_eq!(ov.pending_row_count(), 0);
         assert_eq!(deleted_flag(&ov, "/a"), Some(1));
         assert_eq!(deleted_flag(&ov, "/x"), Some(1));
@@ -17768,7 +17828,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/a", "/b").expect("queued");
         assert_eq!(ov.pending_row_count(), 1);
@@ -17909,7 +17969,7 @@ mod tests {
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
             as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         // Direct attempts plus Drop's three replay attempts.
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
         ov.rename("/a", "/x").expect("queued");
@@ -17957,7 +18017,7 @@ mod tests {
             let overlay = dir.path().join("ov");
             let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
                 as Arc<dyn MountSource>;
-            let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+            let ov = Arc::new(WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap());
             let entered = Arc::new(AtomicBool::new(false));
             let sampled = Arc::new(AtomicBool::new(false));
             let lock_was_held = Arc::new(AtomicBool::new(false));
@@ -18026,7 +18086,7 @@ mod tests {
             );
             assert_eq!(deleted_flag(&ov, "/y"), Some(0), "trial {trial}");
             drop(ov);
-            let ov = WriteOverlay::new(base, &overlay).unwrap();
+            let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             assert_eq!(deleted_flag(&ov, "/a"), Some(1), "trial {trial}");
             assert_eq!(
                 deleted_flag(&ov, "/x"),
@@ -18051,7 +18111,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a")])) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+        let ov = Arc::new(WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap());
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/a", "/b").expect("queued");
         assert_eq!(ov.pending_row_count(), 1);
@@ -18080,7 +18140,7 @@ mod tests {
         let ov = Arc::try_unwrap(ov).unwrap_or_else(|_| panic!("only the test holds the overlay"));
         let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(ov)));
         assert!(dropped.is_ok(), "drop panicked on a poisoned overlay lock");
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert_eq!(deleted_flag(&ov, "/a"), Some(1), "drop replay must land");
         assert_eq!(deleted_flag(&ov, "/b"), Some(0));
         assert!(ov.lookup("/a", 0).is_none());
@@ -18093,7 +18153,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"archive-a")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/a", "/b").expect("queued");
         assert_eq!(ov.pending_row_count(), 1);
@@ -18133,7 +18193,7 @@ mod tests {
             ("/still-hidden", b"stay"),
             ("/reexposed", b"old"),
         ])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         put_overlay_bytes(&ov, "/fresh", b"new-bytes");
         ov.set_rename_tx_failures(20);
         ov.unlink("/still-hidden").expect("queue still-hidden");
@@ -18165,7 +18225,7 @@ mod tests {
             ("/already", b"gone"),
             ("/still-hidden", b"stay"),
         ])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.unlink("/already").expect("sql tombstone");
         assert_eq!(deleted_flag(&ov, "/already"), Some(1));
         ov.set_rename_tx_failures(20);
@@ -18189,7 +18249,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/dst", b"old-mode");
         fs::set_permissions(overlay.join("dst"), fs::Permissions::from_mode(0o000)).unwrap();
         let old_ino = host_ino(&overlay.join("dst"));
@@ -18232,7 +18293,8 @@ mod tests {
     fn park_fstat_old_inode() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/dst", b"old-inode");
         put_overlay_bytes(&ov, "/src", b"new-inode");
         let old_ino = host_ino(&overlay.join("dst"));
@@ -18250,7 +18312,8 @@ mod tests {
     fn park_symlink_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         ov.create_symlink("/link", "old-target").unwrap();
         put_overlay_bytes(&ov, "/src", b"file");
         let parked = ov
@@ -18273,7 +18336,8 @@ mod tests {
     fn plain_rename_and_unlink_do_not_park() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/dst", b"old-dst");
         put_overlay_bytes(&ov, "/src", b"new-src");
         let hook_calls = Arc::new(AtomicU64::new(0));
@@ -18306,7 +18370,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let overlay = dir.path().join("ov");
             let ov =
-                WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+                WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+                    .unwrap();
             put_overlay_bytes(&ov, "/dst", b"keep-dst");
             put_overlay_bytes(&ov, "/src", b"keep-src");
             ov.set_park_open_hook(Some(Box::new(move || {
@@ -18348,7 +18413,8 @@ mod tests {
     fn rename_before_tx_hook_is_one_shot() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/dst", b"old");
         put_overlay_bytes(&ov, "/src", b"new");
         let calls = Arc::new(AtomicU64::new(0));
@@ -18406,7 +18472,8 @@ mod tests {
     fn park_open_eacces_is_metadata_only() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/dst", b"old-dst");
         put_overlay_bytes(&ov, "/src", b"new-src");
         let dst_before = ov.lookup("/dst", 0).expect("dst metadata");
@@ -18452,7 +18519,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+                .unwrap(),
         );
         put_overlay_bytes(&ov, "/dst", b"old");
         put_overlay_bytes(&ov, "/src", b"new");
@@ -18483,7 +18551,8 @@ mod tests {
     fn regression_oplog_meta_value_reads_the_exclusively_held_connection() {
         let dir = tempfile::tempdir().unwrap();
         let overlay =
-            WriteOverlay::new(Arc::new(MemBase::with(&[("/base", b"data")])), dir.path()).unwrap();
+            WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[("/base", b"data")])), dir.path())
+                .unwrap();
         assert!(overlay.meta_value("journal_path").unwrap().is_none());
         overlay.set_meta("journal_path", "/trace.jsonl").unwrap();
         assert_eq!(
@@ -18584,7 +18653,7 @@ mod tests {
             ])) as Arc<dyn MountSource>
         };
         let td = tempfile::tempdir().unwrap();
-        let mut on = WriteOverlay::new(base(), td.path()).unwrap();
+        let mut on = WriteOverlay::new_for_tests(base(), td.path()).unwrap();
         on.set_control_reserved(true);
         for (name, op) in &ops {
             for path in spellings {
@@ -18608,7 +18677,7 @@ mod tests {
         assert!(!td.path().join(".ratarmount-control").exists());
         // Off (no --control-interface, or --control-socket-only): ordinary names.
         let td = tempfile::tempdir().unwrap();
-        let off = WriteOverlay::new(base(), td.path()).unwrap();
+        let off = WriteOverlay::new_for_tests(base(), td.path()).unwrap();
         off.create_file("/.ratarmount-control/new", 0o644)
             .map(close_fd)
             .unwrap();

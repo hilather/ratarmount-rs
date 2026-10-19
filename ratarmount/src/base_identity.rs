@@ -6,9 +6,11 @@
 //! overlay over, or compares an overlay with, comes from what the factory
 //! actually served, not from a path or URL guess.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use ratarmount_compositing::{OpenBase, Opened};
+use ratarmount_compositing::overlay_gate::Recorded;
+use ratarmount_compositing::overlay_identity::BaseKind;
+use ratarmount_compositing::{ClassifiedBase, OpenBase, Opened, OverlayMeta};
 use ratarmount_core::OpenOptions;
 use ratarmount_session::factory::{self, CompositingOptions, SourceBindings};
 
@@ -87,6 +89,69 @@ impl OpenBase for FactoryOpener<'_> {
     }
 }
 
+/// What the parent invocation says about how verbs should open a base: the
+/// custom `--index-folders` an offline `seal`, `pack`, `diff`, `verify`,
+/// import or `sandbox run` finish must honour, so the sidecar a mount used is
+/// the one they read (and peek at, for a cached digest).
+#[derive(Clone, Debug, Default)]
+pub struct OverlayRunContext {
+    pub index_folders: Vec<PathBuf>,
+}
+
+/// Whether a plain local path is Git. A path the user typed as `git://`,
+/// `repo@rev` or a bare repository is always Git (the factory sees that);
+/// this decides only the ambiguous case of a working tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitIntent {
+    /// A working tree with a `.git` entry is mounted as Git (the import verbs
+    /// open the base the way the user would mount it).
+    Auto,
+    /// Replay what the overlay recorded: Git only when it recorded Git.
+    Replay(Option<BaseKind>),
+}
+
+impl GitIntent {
+    /// Replay the kind an overlay recorded (none for an unrecorded one).
+    pub fn replay(meta: Option<&OverlayMeta>) -> Self {
+        Self::Replay(match Recorded::from_meta(meta) {
+            Recorded::Kind { kind, .. } => Some(kind),
+            Recorded::Unrecorded | Recorded::Nothing | Recorded::Unknown => None,
+        })
+    }
+}
+
+/// Open and classify a base for an offline verb: through the factory, with an
+/// in-memory index, no index writes and the invocation's index folders.
+pub fn classify_offline(
+    base: &Path,
+    git: GitIntent,
+    context: &OverlayRunContext,
+) -> Result<ClassifiedBase, String> {
+    let git_tree = match git {
+        GitIntent::Auto => base.join(".git").exists(),
+        GitIntent::Replay(kind) => {
+            kind == Some(BaseKind::Git) && ratarmount_formats_git::looks_like_git(base)
+        }
+    };
+    let mut options = OpenOptions {
+        write_index: false,
+        index_in_memory: true,
+        index_folders: context.index_folders.clone(),
+        git: git_tree,
+        ..Default::default()
+    };
+    let mut opener = FactoryOpener::new(
+        vec![base.to_string_lossy().into_owned()],
+        vec![base.to_path_buf()],
+        &mut options,
+        false,
+        Default::default(),
+        Default::default(),
+        git == GitIntent::Auto,
+    );
+    ClassifiedBase::open(&mut opener)
+}
+
 /// The source a mount serves, plus what keeps it alive (downloaded bodies).
 /// When the mount has an overlay or lower, the token owns the keep-alive too.
 pub struct MountedSource {
@@ -121,6 +186,108 @@ pub(crate) mod fixtures {
             false,
         );
         ClassifiedBase::open(&mut opener).expect("classify through the factory")
+    }
+
+    /// A drop-in for `WriteOverlay::new(base, dir)` in tests: opens the
+    /// overlay over a token that reports `base` as a local folder.
+    pub(crate) fn new_overlay(
+        base: Arc<dyn MountSource>,
+        dir: impl AsRef<Path>,
+    ) -> Result<ratarmount_compositing::WriteOverlay, ratarmount_compositing::OverlayError> {
+        let token = ClassifiedBase::open(&mut FixtureOpener {
+            source: base.clone(),
+            kind: ServedKind::Folder,
+            inputs: Vec::new(),
+            location: None,
+        })
+        .map_err(ratarmount_compositing::OverlayError::Msg)?;
+        ratarmount_compositing::WriteOverlay::open(
+            &token,
+            base,
+            dir,
+            &ratarmount_compositing::CreateOptions {
+                base_digest: ratarmount_compositing::BaseDigestRequest::None,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A drop-in for the old untokened `overlay_seal::seal(dir, view)`.
+    pub(crate) fn seal(
+        dir: &Path,
+        view: Arc<dyn MountSource>,
+    ) -> std::io::Result<ratarmount_compositing::overlay_seal::SealOutcome> {
+        let token = ClassifiedBase::open(&mut FixtureOpener {
+            source: view.clone(),
+            kind: ServedKind::Folder,
+            inputs: Vec::new(),
+            location: None,
+        })
+        .map_err(std::io::Error::other)?;
+        ratarmount_compositing::overlay_seal::seal(dir, &token, view)
+    }
+
+    /// A drop-in for the old `WriteOverlay::new_with_create_info(source, dir,
+    /// &info)` in tests: the token reports `base_url` as the typed input
+    /// (a directory is a local folder, a file a local archive, anything else a
+    /// remote archive) and the overlay records the given lower layers.
+    pub(crate) fn overlay_over(
+        source: Arc<dyn MountSource>,
+        dir: impl AsRef<Path>,
+        base_url: &str,
+        lower_layers: Vec<ratarmount_compositing::LowerLayerRecord>,
+    ) -> Result<ratarmount_compositing::WriteOverlay, ratarmount_compositing::OverlayError> {
+        overlay_over_with(
+            source,
+            dir,
+            base_url,
+            lower_layers,
+            ratarmount_compositing::BaseDigestRequest::Compute,
+        )
+    }
+
+    /// [`overlay_over`] with an explicit digest request.
+    pub(crate) fn overlay_over_with(
+        source: Arc<dyn MountSource>,
+        dir: impl AsRef<Path>,
+        base_url: &str,
+        lower_layers: Vec<ratarmount_compositing::LowerLayerRecord>,
+        base_digest: ratarmount_compositing::BaseDigestRequest,
+    ) -> Result<ratarmount_compositing::WriteOverlay, ratarmount_compositing::OverlayError> {
+        let path = Path::new(base_url);
+        let (kind, location) = if path.is_dir() {
+            (
+                ServedKind::Folder,
+                ServedLocation::Local(path.to_path_buf()),
+            )
+        } else if path.is_file() {
+            (
+                ServedKind::Archive,
+                ServedLocation::Local(path.to_path_buf()),
+            )
+        } else {
+            (
+                ServedKind::Archive,
+                ServedLocation::Remote(base_url.to_owned()),
+            )
+        };
+        let token = ClassifiedBase::open(&mut FixtureOpener {
+            source: source.clone(),
+            kind,
+            inputs: vec![base_url.to_owned()],
+            location: Some(location),
+        })
+        .map_err(ratarmount_compositing::OverlayError::Msg)?;
+        ratarmount_compositing::WriteOverlay::open(
+            &token,
+            source,
+            dir,
+            &ratarmount_compositing::CreateOptions {
+                lower_layers,
+                base_digest,
+                ..Default::default()
+            },
+        )
     }
 
     /// An opener that reports exactly what a test says it served (no
