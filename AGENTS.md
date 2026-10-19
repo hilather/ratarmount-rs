@@ -369,6 +369,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Whole-repo hf:// / remote folder mounts scan nested archives instead of using published sibling indexes (AI-FIX-HFREPO) | `cargo test -p ratarmount-session --lib regression_hf_repo_published_index_lazy_zero_scan` · `cargo test -p ratarmount-session --lib regression_http_folder_sibling_index_validated_without_scanning` · `cargo test -p ratarmount-compositing --lib regression_lazy_listing_opens_only_the_accessed_archive` |
 | Remote TAR indexing issues one range request per member header (thousands of GETs; minutes per shard) (AI-FIX-HFREPO) | `cargo test -p ratarmount-session --lib regression_remote_tar_3000_headers_use_chunk_requests` · `cargo test -p ratarmount-remote --lib regression_http_forward_headers_coalesce_and_reuse_redirect` |
 | Standalone safetensors / GGUF mount lists only `__metadata__.json` / `__header__.json`; `ls mnt/layer` is ENOENT (tensor parent directories had no index rows; FUSE walks one component at a time) | `cargo test -p ratarmount-formats-tensors --lib regression_tensor_parent_directories_are_listed_and_looked_up` |
+| `RUST_LOG=debug` prints no DEBUG output because `-d`'s `filter_level` overrode RUST_LOG's global directive (#138); module directives and `ureq::unit` redaction keep working | `cargo test -p ratarmount --bin ratarmount regression_rust_log_global_level_wins_over_debug_flag` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
