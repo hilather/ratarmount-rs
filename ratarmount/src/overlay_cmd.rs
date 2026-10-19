@@ -388,6 +388,8 @@ pub(super) struct GateOutcome {
     /// nothing confirmed its content with a strong digest (the recorded one,
     /// supplied or cached): accepted only because the record cannot tell.
     pub unconfirmed_move: bool,
+    /// The base is at another place than the recorded one.
+    pub moved: bool,
 }
 
 /// Compare the classified base with the identity the overlay recorded, with
@@ -432,6 +434,7 @@ pub(super) fn gate_base(
             forced: None,
             confirmed,
             unconfirmed_move: moved && !strong,
+            moved,
         }));
     };
     let meta = meta.expect("a mismatch is measured against recorded metadata");
@@ -457,6 +460,7 @@ pub(super) fn gate_base(
         forced: Some(forced),
         confirmed: false,
         unconfirmed_move: false,
+        moved: true,
     }))
 }
 
@@ -482,6 +486,7 @@ pub fn pack(args: &PackArgs, context: &OverlayRunContext) -> Result<(String, i32
             args.directory.display()
         ));
     }
+    let moved = outcome.as_ref().is_some_and(|o| o.moved);
     let forced = outcome.and_then(|outcome| outcome.forced);
     let lower = lower_view(&base, &args.lower, meta.as_ref())?;
     let options = super::overlay_pack::PackOptions {
@@ -489,6 +494,7 @@ pub fn pack(args: &PackArgs, context: &OverlayRunContext) -> Result<(String, i32
         include_index: args.include_index,
         base: base_archive(&base),
         base_rows: forced,
+        check_change_set: moved,
     };
     super::overlay_pack::pack(&args.directory, &args.bundle, lower, &options)
         .map(|digest| (digest, 0))

@@ -35,6 +35,10 @@ pub struct PackOptions {
     /// Rows describing the base actually used, written over the bundle's
     /// metadata (`meta.json` and the packed database) by a forced pack.
     pub base_rows: Option<std::collections::BTreeMap<String, String>>,
+    /// The base is not at the place the seal recorded (forced, or confirmed by
+    /// a strong digest): the change set on it must still be the sealed one, or
+    /// the manifest would describe another layer than the seal does.
+    pub check_change_set: bool,
 }
 
 #[derive(Debug)]
@@ -271,8 +275,13 @@ pub fn pack(
         include_git_dir: true,
         ..Default::default()
     };
-    let changes = overlay_changes::change_set(directory, lower_view, &opts)?;
-    if overlay_changes::canonical_hash(&changes, &opts)? != digest {
+    let changes = overlay_changes::change_set(directory, lower_view.clone(), &opts)?;
+    if (options.base_rows.is_some() || options.check_change_set)
+        && ratarmount_compositing::overlay_seal::current_layer_digest(
+            directory,
+            lower_view.clone(),
+        )? != digest
+    {
         // The sealed digest covers the change set on the base the layer was
         // sealed on. Replacing only the base rows would make a bundle whose
         // unpack / verify fails against the base it names; recomputing the
@@ -2068,6 +2077,7 @@ mod tests {
                 // takes from the token).
                 base: Some(base.clone()),
                 base_rows: None,
+                check_change_set: false,
             },
         )
         .unwrap();

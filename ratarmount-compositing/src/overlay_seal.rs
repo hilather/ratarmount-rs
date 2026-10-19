@@ -148,6 +148,13 @@ fn options() -> ChangeOptions {
     }
 }
 
+/// The canonical digest of a SEALED layer over `lower_view`, computed the way
+/// `verify` computes it (immutable view): what the seal recorded, when
+/// `lower_view` is the base it was sealed on.
+pub fn current_layer_digest(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<String> {
+    Ok(digest_rows(dir, lower_view, true)?.0)
+}
+
 fn digest_rows(
     dir: &Path,
     lower: Arc<dyn MountSource>,
