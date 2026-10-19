@@ -2634,12 +2634,10 @@ fn try_load_gzip_index_blob(
     if !meta_ok {
         return None;
     }
-    // Prefer open_writable so we do not emit the RO "Successfully loaded…" banner
-    // (TAR will open RO itself). Fall back to open_read_only if the file is not writable.
-    let idx = match SqliteIndex::open_writable(ip) {
-        Ok(i) => i,
-        Err(_) => SqliteIndex::open_read_only(ip).ok()?,
-    };
+    // Read-only catalog open: no banner (TAR opens the index itself), no file
+    // table in memory, and a sidecar that fails validation is never opened
+    // writable here.
+    let idx = SqliteIndex::open_catalog_read_only(ip).ok()?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: gzip RGZI skipped (index fingerprint: {e})");
@@ -3170,12 +3168,11 @@ fn try_load_zstd_blocks(
     if !meta_ok {
         return None;
     }
-    // Reading only: a sidecar that is merely consulted must not gain WAL
-    // files or schema changes (a writable open does both).
-    let idx = match SqliteIndex::open_read_only(ip) {
-        Ok(i) => i,
-        Err(_) => SqliteIndex::open_writable(ip).ok()?,
-    };
+    // Reading only, and only the catalog (no file table in memory, no
+    // banner): a sidecar that is merely consulted must not gain WAL files or
+    // schema changes, and one that does not validate read-only is refused,
+    // never retried writable.
+    let idx = SqliteIndex::open_catalog_read_only(ip).ok()?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: zstdblocks skipped (index fingerprint: {e})");
@@ -3387,12 +3384,11 @@ fn try_load_bzip2_blocks(
     if !meta_ok {
         return None;
     }
-    // Reading only: a sidecar that is merely consulted must not gain WAL
-    // files or schema changes (a writable open does both).
-    let idx = match SqliteIndex::open_read_only(ip) {
-        Ok(i) => i,
-        Err(_) => SqliteIndex::open_writable(ip).ok()?,
-    };
+    // Reading only, and only the catalog (no file table in memory, no
+    // banner): a sidecar that is merely consulted must not gain WAL files or
+    // schema changes, and one that does not validate read-only is refused,
+    // never retried writable.
+    let idx = SqliteIndex::open_catalog_read_only(ip).ok()?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: bzip2blocks skipped (index fingerprint: {e})");
@@ -6003,6 +5999,45 @@ mod tests {
         let _ = try_load_bzip2_blocks(Some(&index), Some(&archive), false);
         assert_eq!(names(), listing, "a lookup created files");
         assert!(std::fs::read(&index).unwrap() == bytes, "sidecar rewritten");
+    }
+
+    /// Regression (R6-H2, B2): a sidecar that cannot be opened and validated
+    /// read-only (here an incomplete DELETE-journal database with no index
+    /// tables) fell back to a WRITABLE open in the zstd and bzip2 loaders, and
+    /// the gzip RGZI loader opened writable first; the writable open switched
+    /// the journal mode and created tables before anything was validated. A
+    /// lookup that only reads now refuses without touching the file: no bytes
+    /// change and no `-wal` / `-shm` / `-journal` file appears.
+    #[test]
+    fn regression_blocks_loaders_never_write_an_incomplete_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.bin");
+        std::fs::write(&archive, b"archive bytes").unwrap();
+        let index = dir.path().join("a.bin.index.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&index).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=DELETE; CREATE TABLE unrelated(x INTEGER); INSERT INTO unrelated VALUES (1);",
+            )
+            .unwrap();
+        }
+        let names = || {
+            let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, bytes) = (names(), std::fs::read(&index).unwrap());
+        assert!(try_load_zstd_blocks(Some(&index), Some(&archive), false).is_none());
+        assert!(try_load_bzip2_blocks(Some(&index), Some(&archive), false).is_none());
+        assert!(try_load_gzip_index_blob(Some(&index), Some(&archive), false).is_none());
+        assert_eq!(names(), listing, "a lookup created files");
+        assert!(
+            std::fs::read(&index).unwrap() == bytes,
+            "the sidecar was modified"
+        );
     }
 
     /// Regression: FR-9 plain `.zst` also auto-wires `zstdblocks` on open.
