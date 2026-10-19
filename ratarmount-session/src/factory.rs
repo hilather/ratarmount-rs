@@ -2278,18 +2278,13 @@ fn open_path_impl(
             || inline.as_ref().map_or(path, |(p, _)| p.as_path()),
             |(p, _)| p.as_path(),
         );
-        let is_bare = git_path.join("HEAD").is_file()
-            && git_path.join("objects").is_dir()
-            && git_path.join("refs").is_dir()
-            && !git_path.join(".git").exists();
-        let force = options.git
-            || options.git_ref.is_some()
-            || inline.is_some()
-            || url.is_some()
-            || (git_path.is_dir()
-                && looks_like_git(git_path)
-                && std::env::var_os("RATARMOUNT_FORCE_GIT").is_some());
-        if is_bare || force {
+        let explicit =
+            options.git || options.git_ref.is_some() || inline.is_some() || url.is_some();
+        if serves_as_git(
+            git_path,
+            explicit,
+            std::env::var_os("RATARMOUNT_FORCE_GIT").is_some(),
+        ) {
             if !looks_like_git(git_path) {
                 return Err(format!("{} is not a git repository", git_path.display()));
             }
@@ -4093,6 +4088,21 @@ fn open_tar_body(
         .map_err(|e| e.to_string())
 }
 
+/// THE sniff: does the factory serve this local path as Git? Called by the
+/// mount dispatch (`open_path_impl`, with the explicit selectors `--git`,
+/// `--git-ref`, `repo@REV`, `git://`) and by the offline commit classifier
+/// (`served_without_indexing`, with none), so the two cannot drift. A bare
+/// repository is always Git; an explicit selector forces Git; a repository
+/// directory is Git under `RATARMOUNT_FORCE_GIT` (`force_env`).
+#[cfg(feature = "git")]
+fn serves_as_git(path: &Path, explicit: bool, force_env: bool) -> bool {
+    let is_bare = path.join("HEAD").is_file()
+        && path.join("objects").is_dir()
+        && path.join("refs").is_dir()
+        && !path.join(".git").exists();
+    is_bare || explicit || (path.is_dir() && looks_like_git(path) && force_env)
+}
+
 /// The Git kind the factory serves for a directory without any flag: a bare
 /// repository (or any repository under `RATARMOUNT_FORCE_GIT`), with the tree
 /// id of `HEAD`. Reads the repository's refs and one tree object; no index.
@@ -4104,11 +4114,7 @@ fn git_served_kind(path: &Path) -> Result<Option<ServedKind>, String> {
 /// [`git_served_kind`] with `RATARMOUNT_FORCE_GIT` passed in.
 #[cfg(feature = "git")]
 fn git_served_kind_with(path: &Path, force_git: bool) -> Result<Option<ServedKind>, String> {
-    let is_bare = path.join("HEAD").is_file()
-        && path.join("objects").is_dir()
-        && path.join("refs").is_dir()
-        && !path.join(".git").exists();
-    if !(is_bare || (looks_like_git(path) && force_git)) {
+    if !serves_as_git(path, false, force_git) {
         return Ok(None);
     }
     let git = GitMountSource::open(path, None).map_err(|e| e.to_string())?;

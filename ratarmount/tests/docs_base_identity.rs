@@ -63,6 +63,7 @@ fn regression_docs_state_journal_ownership() {
         "Journals exist on Linux and macOS only; elsewhere there is nothing to check.",
         "A journal touches the overlay's recorded rows only when its target is the recorded base",
         "Mounting applies the same ownership check before any recovery",
+        "The Git question is one function (`serves_as_git`) that the mount dispatch and this classifier both call",
         "the roll-forward marks it `pending` (never clears it)",
     ] {
         assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");

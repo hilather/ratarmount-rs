@@ -352,7 +352,10 @@ archive is refused. `--commit-overlay` classifies what it is rewriting with the
 factory's own dispatch questions, without opening it: a local `.torrent` under
 `--features bittorrent` is a remote folder, a `file://` URL is the local path, a
 bare Git repository (or any repository under `RATARMOUNT_FORCE_GIT`) is Git,
-any other directory a folder and a file an archive. It builds no index, reads
+any other directory a folder and a file an archive. The Git question is one
+function (`serves_as_git`) that the mount dispatch and this classifier both call;
+the remote, torrent and `file://` questions are still asked separately and
+pinned by parity tests. It builds no index, reads
 and writes no sidecar, and recovers a pending commit journal only after this
 check. A commit journal is applied only to the file it was started for: before
 EVERY commit, whatever the digest kind (`none` included), whether or not stamp

@@ -472,6 +472,42 @@ fn regression_force_git_repository_is_git_at_commit_too() {
     );
 }
 
+/// Pin (R6-K5, r11 review nit 1): the mount dispatch and the offline commit
+/// classifier ask ONE sniff, `serves_as_git`. Over bare and worktree
+/// repositories and a plain directory, with and without `RATARMOUNT_FORCE_GIT`
+/// (passed explicitly: tests never set the environment), the commit
+/// classifier's answer is the sniff's, and the real mount dispatch (no
+/// selector) agrees wherever the environment is not involved.
+#[cfg(feature = "git")]
+#[test]
+fn regression_one_git_sniff_for_mount_and_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let bare = root.join("bare.git");
+    commit_repo(&bare, true);
+    let work = root.join("work");
+    commit_repo(&work, false);
+    let plain = root.join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    for (path, name) in [(&bare, "bare"), (&work, "worktree"), (&plain, "plain")] {
+        for force_env in [false, true] {
+            let sniffed = serves_as_git(path, false, force_env);
+            let committed = git_served_kind_with(path, force_env).unwrap().is_some();
+            assert_eq!(committed, sniffed, "{name} force_env={force_env}");
+        }
+        let mounted = served_of(std::slice::from_ref(path), &mut options());
+        assert_eq!(
+            matches!(mounted.kind, ServedKind::Git { .. }),
+            serves_as_git(path, false, false),
+            "{name}: mount dispatch vs the sniff"
+        );
+    }
+    // A selector forces Git for any path the sniff is asked about.
+    assert!(serves_as_git(&plain, true, false));
+    assert!(!serves_as_git(&work, false, false));
+    assert!(serves_as_git(&work, false, true));
+}
+
 /// A minimal single-file v1 torrent (`file`, "test"); no trackers, no seeds.
 fn torrent_bytes() -> Vec<u8> {
     let mut out = b"d4:infod6:lengthi4e4:name4:file12:piece lengthi16384e6:pieces20:".to_vec();
