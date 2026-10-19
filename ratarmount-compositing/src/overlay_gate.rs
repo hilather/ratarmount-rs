@@ -438,6 +438,103 @@ pub fn verify_base(dir: &Path, base: &ClassifiedBase) -> BaseCheck {
     }
 }
 
+/// Whether `journal` was started for the file whose inode is `ino`. Only the
+/// inode counts: the device number is a hint that changes across a reboot
+/// (`commit_journal` validates the content on recovery either way).
+#[cfg(unix)]
+pub(crate) fn journal_started_for(
+    journal: &ratarmount_compress::commit_journal::PendingJournal,
+    ino: u64,
+) -> bool {
+    journal.ino == ino
+}
+
+/// The journal pending for `canonical`, when it was started for that very file.
+///
+/// Recovery rolls a journal back (or forward) on content alone, so a journal
+/// left behind by another file (a copy of the interrupted bytes, a restored
+/// backup) must be refused BEFORE recovery runs, whatever the digest kind and
+/// whatever else the gate could compare. Needs no recorded row: only the
+/// journal and the target's metadata. Non-unix hosts have no journals.
+fn owned_journal(
+    canonical: &Path,
+) -> std::result::Result<
+    Option<ratarmount_compress::commit_journal::PendingJournal>,
+    CommitBaseRefusal,
+> {
+    let refuse = |why: String| {
+        CommitBaseRefusal(format!(
+            "base mismatch: {why}; the commit was not written. Restore the archive, \
+             or use --force-base-mismatch to accept the new base"
+        ))
+    };
+    let journal = match ratarmount_compress::commit_journal::pending(canonical) {
+        Ok(None) => return Ok(None),
+        Ok(Some(journal)) => journal,
+        Err(e) => {
+            return Err(refuse(format!(
+                "cannot read the commit journal of {}: {e}",
+                canonical.display()
+            )))
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = std::fs::metadata(canonical) {
+            if !journal_started_for(&journal, metadata.ino()) {
+                return Err(refuse(format!(
+                    "{} carries a commit journal that was started for another file \
+                     (journal inode {}, archive inode {}); the journal was not applied",
+                    canonical.display(),
+                    journal.ino,
+                    metadata.ino()
+                )));
+            }
+        }
+    }
+    Ok(Some(journal))
+}
+
+/// Refuse a commit target that carries another file's commit journal. For
+/// entries with no overlay database (a raw overlay directory), which have no
+/// recorded base to compare but must not roll a foreign journal into the
+/// archive either.
+pub fn ensure_journal_is_for_archive(archive: &Path) -> std::result::Result<(), String> {
+    match archive.canonicalize() {
+        Ok(canonical) => owned_journal(&canonical)
+            .map(|_| ())
+            .map_err(|refusal| refusal.0),
+        Err(_) => Ok(()),
+    }
+}
+
+/// After recovery rolled a consistent COMPLETE journal forward: the archive is
+/// now exactly what the crashed commit wrote, so the recorded stamp is
+/// re-baselined to it (the files that commit appended are still in the
+/// overlay; the retry appends them again and the later member wins).
+pub(crate) fn restamp_rolled_forward(conn: &Connection, archive: &Path) {
+    let Ok(Some(meta)) = OverlayMeta::from_connection(conn) else {
+        return;
+    };
+    if kind_only(&meta) || meta.get("base_size").is_none() || meta.get("base_mtime_ns").is_none() {
+        return;
+    }
+    let Ok(canonical) = archive.canonicalize() else {
+        return;
+    };
+    let Ok(now) = ArchiveDigestStamp::read(&canonical) else {
+        return;
+    };
+    let _ = OverlayMeta::set_many(
+        conn,
+        &[
+            ("base_size", now.size.to_string().as_str()),
+            ("base_mtime_ns", now.mtime_ns.to_string().as_str()),
+        ],
+    );
+}
+
 /// Why a commit was refused before it wrote anything.
 #[derive(Debug)]
 pub(crate) struct CommitBaseRefusal(pub String);
@@ -495,6 +592,14 @@ pub(crate) fn check_commit_base(
         }
         _ => {}
     }
+    // Journal ownership comes before EVERY successful return below: whatever
+    // the token describes and whatever digest the record has, recovery would
+    // roll a journal into the file it finds, so a journal started for another
+    // file is refused here.
+    let journal = match archive.canonicalize() {
+        Ok(resolved) => owned_journal(&resolved)?,
+        Err(_) => None,
+    };
     let (BaseKind::Archive, Some(BaseLocation::Local(path))) = (actual.kind(), actual.location())
     else {
         return Ok(());
@@ -542,50 +647,23 @@ pub(crate) fn check_commit_base(
     let (Some(size), Some(mtime)) = (meta.get("base_size"), meta.get("base_mtime_ns")) else {
         return Ok(());
     };
-    // A commit journal is pending: recovery rolls the archive back to the state
-    // the journal recorded BEFORE this commit writes, so that state is what the
-    // recorded stamp must describe. A journal that describes another state
-    // belongs to another archive; it is left unread by recovery and refused.
-    match ratarmount_compress::commit_journal::pending(&canonical) {
-        Ok(None) => {}
-        Ok(Some(journal)) => {
-            // The journal was started for one inode. A successor (a copy of
-            // the interrupted bytes, a restored backup) has another, and
-            // recovery would roll it back on content alone: refuse it.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if journal.ino != metadata.ino() || journal.dev != metadata.dev() {
-                    return Err(refuse(format!(
-                        "{} carries a commit journal that was started for another file \
-                         (journal inode {}:{}, archive inode {}:{}); the journal was not applied",
-                        canonical.display(),
-                        journal.dev,
-                        journal.ino,
-                        metadata.dev(),
-                        metadata.ino()
-                    )));
-                }
-            }
-            return if journal.len.to_string() == size && journal.mtime_ns.to_string() == mtime {
-                Ok(())
-            } else {
-                Err(refuse(format!(
-                    "{} carries a commit journal that was not started for the recorded base \
-                     (it rolls back to size={},mtime_ns={}, size={size},mtime_ns={mtime} recorded); \
-                     the journal was not applied",
-                    canonical.display(),
-                    journal.len,
-                    journal.mtime_ns
-                )))
-            };
-        }
-        Err(e) => {
-            return Err(refuse(format!(
-                "cannot read the commit journal of {}: {e}",
-                canonical.display()
+    // A commit journal is pending and is this file's own: recovery rolls the
+    // archive back to the state the journal recorded BEFORE this commit
+    // writes, so that state is what the recorded stamp must describe. A
+    // consistent complete journal rolls forward and is re-stamped afterwards.
+    if let Some(journal) = journal {
+        return if journal.len.to_string() == size && journal.mtime_ns.to_string() == mtime {
+            Ok(())
+        } else {
+            Err(refuse(format!(
+                "{} carries a commit journal that was not started for the recorded base \
+                 (it rolls back to size={},mtime_ns={}, size={size},mtime_ns={mtime} recorded); \
+                 the journal was not applied",
+                canonical.display(),
+                journal.len,
+                journal.mtime_ns
             )))
-        }
+        };
     }
     let now = ArchiveDigestStamp::read(&canonical)
         .map_err(|e| refuse(format!("cannot stat {}: {e}", canonical.display())))?;

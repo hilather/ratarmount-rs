@@ -54,8 +54,8 @@ pub use empty_archive::{
 pub use folder::FolderMountSource;
 pub use oci_whiteout::OciImageMountSource;
 pub use overlay_gate::{
-    compare_base_identity, forced_base_record, identity_rows, record_forced_base_rows,
-    shape_verdict, verify_base, BaseProbe, Recorded, Verdict,
+    compare_base_identity, ensure_journal_is_for_archive, forced_base_record, identity_rows,
+    record_forced_base_rows, shape_verdict, verify_base, BaseProbe, Recorded, Verdict,
 };
 pub use overlay_identity::{
     ActualBase, BaseKind, BaseLocation, ClassifiedBase, CreateOptions, IndexProvenance, OpenBase,

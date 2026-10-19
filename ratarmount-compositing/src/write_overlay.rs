@@ -3382,8 +3382,11 @@ impl WriteOverlay {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
-        self.check_pending_journal_is_ours(archive)?;
+        let rolls_forward = self.check_pending_journal_is_ours(archive)?;
         ratarmount_compress::commit_journal::recover(archive)?;
+        if rolls_forward {
+            self.restamp_rolled_forward(archive);
+        }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
         if self.interval_disabled() {
@@ -4024,10 +4027,13 @@ impl WriteOverlay {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
-        self.check_pending_journal_is_ours(archive)?;
+        let rolls_forward = self.check_pending_journal_is_ours(archive)?;
         if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
             self.refuse_base_after_commit_failure();
             return Err(e.into());
+        }
+        if rolls_forward {
+            self.restamp_rolled_forward(archive);
         }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
@@ -4349,11 +4355,30 @@ impl WriteOverlay {
     /// being restored or truncated and only then rejected. Recovery still runs
     /// first for the overlay's own torn append: its journal describes the
     /// recorded state. `--force-base-mismatch` accepts the foreign archive.
-    fn check_pending_journal_is_ours(&self, archive: &Path) -> Result<()> {
+    ///
+    /// Returns whether recovery will roll the journal FORWARD (a complete
+    /// replacement): the caller then re-baselines the recorded stamp.
+    fn check_pending_journal_is_ours(&self, archive: &Path) -> Result<bool> {
         match ratarmount_compress::commit_journal::pending(archive) {
-            Ok(None) => Ok(()),
-            Ok(Some(_)) | Err(_) => self.check_commit_identity(archive),
+            Ok(None) => Ok(false),
+            Ok(Some(journal)) => {
+                self.check_commit_identity(archive)?;
+                Ok(journal.complete)
+            }
+            Err(_) => self.check_commit_identity(archive).map(|()| false),
         }
+    }
+
+    /// After recovery rolled a consistent complete journal forward, the
+    /// archive is what the crashed commit wrote: record that as the base stamp.
+    fn restamp_rolled_forward(&self, archive: &Path) {
+        if self.remote_enabled() {
+            return;
+        }
+        if self.identity.lock().expect("overlay identity").is_none() {
+            return;
+        }
+        crate::overlay_gate::restamp_rolled_forward(&self.db.lock().expect("overlay db"), archive);
     }
 
     fn refuse_base_after_commit_failure(&self) {
@@ -6572,6 +6597,10 @@ pub fn commit_overlay_raw_dir(
              with a classified base (commit_overlay), not as a raw directory",
             db.display()
         )));
+    }
+    if !opts.force_base_mismatch {
+        crate::overlay_gate::ensure_journal_is_for_archive(archive_file.as_ref())
+            .map_err(OverlayError::Msg)?;
     }
     let committed = commit_overlay_inner(write_overlay, archive_file.as_ref(), None, opts)?;
     Ok(RawDirCommit {

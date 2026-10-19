@@ -237,3 +237,60 @@ fn regression_format2_without_base_kind_is_unknown() {
         );
     }
 }
+
+/// Regression (R6-J2, audit A7): a released (v0.1.35) overlay has no `meta`
+/// table, and the gate returned before the journal ownership check. A same-bytes
+/// new-inode copy of a crashed archive is refused by offline `--commit-overlay`
+/// with the archive and its journal byte-identical.
+#[cfg(unix)]
+#[test]
+fn regression_v035_offline_commit_refuses_foreign_journal() {
+    use std::io::Write;
+    let env = Env::new();
+    let len = fs::metadata(&env.base).unwrap().len();
+    let mut suffix = tempfile::tempfile().unwrap();
+    suffix.write_all(&[0u8; 1536]).unwrap();
+    let crashed = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+        &env.base,
+        len - 1024,
+        &mut suffix,
+        &mut |step| {
+            if step == "archive truncate" {
+                Err(std::io::Error::other("crash"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(crashed.is_err());
+    let bytes = fs::read(&env.base).unwrap();
+    let journal = ratarmount_compress::commit_journal::journal_path(&env.base);
+    let journal_bytes = fs::read(&journal).unwrap();
+    let copy = env.root.path().join("copy.tar");
+    fs::write(&copy, &bytes).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(fs::metadata(&env.base).unwrap().modified().unwrap())
+        .unwrap();
+    fs::rename(&copy, &env.base).unwrap();
+    let out = env.run(&[
+        "--commit-overlay",
+        "--yes",
+        "-w",
+        s(&env.overlay),
+        s(&env.base),
+    ]);
+    assert!(!out.status.success(), "must refuse: {}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--force-base-mismatch"),
+        "{}",
+        text(&out)
+    );
+    assert!(fs::read(&env.base).unwrap() == bytes, "archive modified");
+    assert!(
+        fs::read(&journal).unwrap() == journal_bytes,
+        "journal modified"
+    );
+}

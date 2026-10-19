@@ -65,6 +65,9 @@ pub struct PendingJournal {
     /// Where the replaced suffix starts and the length the replacement ends at.
     pub offset: u64,
     pub new_len: u64,
+    /// The replacement finished (the locator says `complete`): recovery rolls
+    /// FORWARD and leaves the new bytes.
+    pub complete: bool,
 }
 
 /// The journal pending for `archive`, found the way [`recover`] finds it (the
@@ -490,7 +493,9 @@ mod unix {
             }
             Err(e) => return Err(e),
         };
-        let path = get_marker(&probe)?
+        let marker = get_marker(&probe)?;
+        let complete = marker.as_ref().is_some_and(|(state, _)| *state == b'C');
+        let path = marker
             .map(|(_, p)| p)
             .unwrap_or_else(|| journal_path(archive));
         let mut journal = match fs::OpenOptions::new()
@@ -516,6 +521,7 @@ mod unix {
             offset: get(32),
             mtime_ns: i128::from(get(40) as i64) * 1_000_000_000 + i128::from(get(48)),
             new_len: get(56),
+            complete,
         }))
     }
 

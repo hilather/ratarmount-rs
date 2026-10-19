@@ -1926,6 +1926,14 @@ fn main() {
         // base identity gate (inside the commit): recovery rewrites the archive,
         // and it must not do that to an archive the overlay does not describe.
         if !overlay.join(HIDDEN_DB).exists() {
+            // No recorded base to compare, but a journal started for another
+            // file (a copy of the interrupted bytes) must not be rolled in.
+            if !args.force_base_mismatch {
+                if let Err(msg) = ratarmount_compositing::ensure_journal_is_for_archive(archive) {
+                    eprintln!("error: {msg}");
+                    std::process::exit(2);
+                }
+            }
             if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
                 eprintln!("error: commit recovery for {}: {e}", archive.display());
                 std::process::exit(2);

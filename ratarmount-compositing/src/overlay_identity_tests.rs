@@ -1035,13 +1035,15 @@ const JOURNAL_STEPS: [&str; 14] = [
     "locator clear",
 ];
 
-/// Regression (R6-G2): the guard now runs BEFORE recovery for a foreign
+/// Regression (R6-G2, R6-J2): the guard runs BEFORE recovery for a foreign
 /// journal, but the overlay's OWN torn append must still recover. A real
 /// SIGKILL at every journal phase: until the replacement is complete the
-/// archive rolls back to the recorded base and the next commit succeeds; once
-/// complete it keeps the new bytes (the recorded stamp no longer matches, so
-/// that commit is refused as a changed base) - never a torn archive, and the
-/// journal is gone after the commit attempt either way.
+/// archive rolls back to the recorded base and the next commit succeeds; at
+/// `locator complete` the journal is still there, consistent with the recorded
+/// base, and recovery rolls FORWARD: the commit is accepted and the stamp rows
+/// re-baselined. Once the journal is gone (`journal unlink` and later) nothing
+/// ties the changed archive to the crash, so that commit is refused as a
+/// changed base - never a torn archive, and no journal is left either way.
 #[cfg(unix)]
 #[test]
 fn regression_real_sigkill_at_every_journal_phase_still_recovers() {
@@ -1067,14 +1069,11 @@ fn regression_real_sigkill_at_every_journal_phase_still_recovers() {
             }
             fs::write(ov.root().join("one"), b"one").unwrap();
             let result = commit(&ov, &fx.archive, path);
-            let complete = JOURNAL_STEPS.iter().position(|s| *s == step).unwrap()
-                >= JOURNAL_STEPS
-                    .iter()
-                    .position(|s| *s == "locator complete")
-                    .unwrap();
             let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
             assert!(!journal.exists(), "{step} {path:?}: journal recovered");
-            if complete {
+            let position = |name: &str| JOURNAL_STEPS.iter().position(|s| *s == name).unwrap();
+            let refused = position(step) > position("locator complete");
+            if refused {
                 let err = result.unwrap_err().to_string();
                 assert!(err.contains("--force-base-mismatch"), "{step}: {err}");
             } else {
@@ -1202,4 +1201,247 @@ fn regression_missing_stamp_rows_on_a_digest_record_skip_only_the_stamp_check() 
         swapped,
         "the commit spliced into the swapped archive"
     );
+}
+
+/// Crash an append into `archive`, then replace it by a copy with the same
+/// bytes and mtime on a new inode: the sibling journal stays behind and now
+/// describes another file. Returns what must stay byte-identical.
+#[cfg(unix)]
+fn crashed_new_inode_copy(archive: &Path) -> (Vec<u8>, PathBuf, Vec<u8>) {
+    interrupt_append(archive);
+    let bytes = fs::read(archive).unwrap();
+    let journal = ratarmount_compress::commit_journal::journal_path(archive);
+    let journal_bytes = fs::read(&journal).unwrap();
+    let mtime = fs::metadata(archive).unwrap().modified().unwrap();
+    let copy = archive.with_file_name("inode-copy.tmp");
+    fs::write(&copy, &bytes).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    fs::rename(&copy, archive).unwrap();
+    (bytes, journal, journal_bytes)
+}
+
+#[cfg(unix)]
+fn assert_refused_untouched(
+    result: crate::write_overlay::Result<bool>,
+    archive: &Path,
+    kept: &(Vec<u8>, PathBuf, Vec<u8>),
+    what: &str,
+) {
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("--force-base-mismatch"), "{what}: {err}");
+    assert!(
+        fs::read(archive).unwrap() == kept.0,
+        "{what}: archive modified"
+    );
+    assert!(
+        fs::read(&kept.1).unwrap() == kept.2,
+        "{what}: journal modified"
+    );
+}
+
+/// Regression (R6-J2, audit A8; Codex r10 #1): a `none` record returned before
+/// the journal ownership check. With a FRESH token (an in-process reopen over
+/// the copy, or offline `--commit-overlay`) recovery rolled the old journal
+/// into a new-inode copy of the crashed archive and committed into it.
+#[cfg(unix)]
+#[test]
+fn regression_none_record_refuses_foreign_journal_with_fresh_token() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        let fx = Fixture::new();
+        let ov = fx.open(BaseDigestRequest::None, false);
+        fs::write(ov.root().join("one"), b"one").unwrap();
+        drop(ov);
+        let kept = crashed_new_inode_copy(&fx.archive);
+        // Reopen over the copy: a fresh token, kind-only record.
+        let ov = fx.open(BaseDigestRequest::None, false);
+        assert_refused_untouched(
+            commit(&ov, &fx.archive, path),
+            &fx.archive,
+            &kept,
+            &format!("{path:?}"),
+        );
+    }
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::None, false);
+    fs::write(ov.root().join("one"), b"one").unwrap();
+    drop(ov);
+    let kept = crashed_new_inode_copy(&fx.archive);
+    let token = archive_token(&fx.archive);
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    let result = crate::commit_overlay(&fx.overlay, &fx.archive, &token, &opts);
+    assert_refused_untouched(result, &fx.archive, &kept, "offline");
+}
+
+/// Regression (R6-J2, audit A9): a digest record that lost its stamp rows
+/// returned before the ownership check too.
+#[cfg(unix)]
+#[test]
+fn regression_missing_stamp_rows_still_refuse_foreign_journal() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    fs::write(ov.root().join("one"), b"one").unwrap();
+    drop(ov);
+    {
+        let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
+        for key in ["base_size", "base_mtime_ns"] {
+            OverlayMeta::remove(&conn, key).unwrap();
+        }
+    }
+    let kept = crashed_new_inode_copy(&fx.archive);
+    let token = archive_token(&fx.archive);
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    let result = crate::commit_overlay(&fx.overlay, &fx.archive, &token, &opts);
+    assert_refused_untouched(result, &fx.archive, &kept, "no stamp rows");
+}
+
+/// Regression (R6-J2, audit A3/A4): a commit target the token does not
+/// describe (a Folder-first union, or another member of the union) returned
+/// before the ownership check, so recovery rolled a foreign journal into it.
+/// The target's OWN journal still recovers.
+#[cfg(unix)]
+#[test]
+fn regression_union_commit_target_with_foreign_journal_refused() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        for folder_first in [true, false] {
+            for foreign in [true, false] {
+                let fx = Fixture::new();
+                let ov = if folder_first {
+                    let folder = fx.overlay.parent().unwrap().join("folder");
+                    fs::create_dir(&folder).unwrap();
+                    open_with(
+                        &folder_token(&folder),
+                        &fx.overlay,
+                        BaseDigestRequest::None,
+                        false,
+                    )
+                    .unwrap()
+                } else {
+                    fx.open(BaseDigestRequest::Compute, false)
+                };
+                let target = fx.archive.with_file_name("member.tar");
+                write_tar(&target, &[("m", b"member")]);
+                fs::write(ov.root().join("one"), b"one").unwrap();
+                let what = format!("{path:?} folder_first={folder_first} foreign={foreign}");
+                if foreign {
+                    let kept = crashed_new_inode_copy(&target);
+                    assert_refused_untouched(commit(&ov, &target, path), &target, &kept, &what);
+                } else {
+                    interrupt_append(&target);
+                    let done = commit(&ov, &target, path);
+                    assert!(done.unwrap_or_else(|e| panic!("{what}: {e}")), "{what}");
+                    assert!(
+                        !ratarmount_compress::commit_journal::journal_path(&target).exists(),
+                        "{what}: own journal recovered"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Regression (R6-J2, audit A10 + #9): the journal check compares the inode
+/// only. `commit_journal` calls the device number a hint (it changes on
+/// reboot), so a device change with the same inode is the overlay's own journal.
+#[cfg(unix)]
+#[test]
+fn regression_journal_dev_change_is_not_a_refusal() {
+    use ratarmount_compress::commit_journal::PendingJournal;
+    let journal = |dev, ino| PendingJournal {
+        dev,
+        ino,
+        len: 1,
+        mtime_ns: 1,
+        offset: 0,
+        new_len: 1,
+        complete: false,
+    };
+    assert!(crate::overlay_gate::journal_started_for(
+        &journal(7, 42),
+        42
+    ));
+    assert!(crate::overlay_gate::journal_started_for(
+        &journal(8, 42),
+        42
+    ));
+    assert!(!crate::overlay_gate::journal_started_for(
+        &journal(7, 42),
+        43
+    ));
+}
+
+/// Pin (R6-J2, audit A13): a journal that cannot be read refuses the commit.
+#[cfg(unix)]
+#[test]
+fn regression_corrupt_journal_locator_refuses_commit() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        let fx = Fixture::new();
+        let ov = fx.open(BaseDigestRequest::Compute, false);
+        fs::write(ov.root().join("one"), b"one").unwrap();
+        interrupt_append(&fx.archive);
+        let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+        let mut bytes = fs::read(&journal).unwrap();
+        bytes[..8].copy_from_slice(b"GARBAGE!");
+        fs::write(&journal, &bytes).unwrap();
+        let archive_bytes = fs::read(&fx.archive).unwrap();
+        let err = commit(&ov, &fx.archive, path).unwrap_err().to_string();
+        assert!(err.contains("journal"), "{path:?}: {err}");
+        assert!(fs::read(&fx.archive).unwrap() == archive_bytes, "{path:?}");
+    }
+}
+
+/// Regression (R6-J2, audit A17): the raw-directory entry recovered whatever
+/// journal the target carried, twice, with no ownership evidence at all.
+#[cfg(unix)]
+#[test]
+fn regression_raw_dir_commit_refuses_foreign_journal() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    fs::create_dir(&fx.overlay).unwrap();
+    fs::write(fx.overlay.join("added"), b"raw").unwrap();
+    let kept = crashed_new_inode_copy(&fx.archive);
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    let result =
+        crate::commit_overlay_raw_dir(&fx.overlay, &fx.archive, &opts).map(|d| d.committed);
+    assert_refused_untouched(result, &fx.archive, &kept, "raw dir");
+    // Its own journal still recovers.
+    let fx = Fixture::new();
+    fs::create_dir(&fx.overlay).unwrap();
+    fs::write(fx.overlay.join("added"), b"raw").unwrap();
+    interrupt_append(&fx.archive);
+    let done = crate::commit_overlay_raw_dir(&fx.overlay, &fx.archive, &opts).unwrap();
+    assert!(done.committed);
+    assert!(!ratarmount_compress::commit_journal::journal_path(&fx.archive).exists());
 }

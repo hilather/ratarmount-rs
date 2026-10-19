@@ -391,3 +391,57 @@ fn regression_new_inode_copy_of_interrupted_archive_is_refused() {
         "journal modified"
     );
 }
+
+/// Regression (R6-J2, audit A17): a RAW overlay directory (no database) has no
+/// recorded base, yet `main.rs` and the commit both recovered whatever journal
+/// the archive carried. A new-inode copy of a crashed archive is refused, and
+/// the archive's own torn append still recovers.
+#[cfg(unix)]
+#[test]
+fn regression_raw_dir_commit_refuses_foreign_journal() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let env = Env::new();
+    let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+    let overlay = env.path("overlay");
+    fs::create_dir(&overlay).unwrap();
+    fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+    interrupt_append(&archive);
+    let crashed = fs::read(&archive).unwrap();
+    let journal = ratarmount_compress::commit_journal::journal_path(&archive);
+    let journal_bytes = fs::read(&journal).unwrap();
+    let copy = env.path("copy.tar");
+    fs::write(&copy, &crashed).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(fs::metadata(&archive).unwrap().modified().unwrap())
+        .unwrap();
+    fs::rename(&copy, &archive).unwrap();
+    let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
+    assert!(!out.status.success(), "must refuse: {}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--force-base-mismatch"),
+        "{}",
+        text(&out)
+    );
+    assert!(fs::read(&archive).unwrap() == crashed, "archive modified");
+    assert!(
+        fs::read(&journal).unwrap() == journal_bytes,
+        "journal modified"
+    );
+
+    // Its own torn append still recovers and commits.
+    let env = Env::new();
+    let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+    let overlay = env.path("overlay");
+    fs::create_dir(&overlay).unwrap();
+    fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+    interrupt_append(&archive);
+    let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(members(&archive).contains("new.txt"));
+}
