@@ -96,9 +96,11 @@ mod linux {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
         let to = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        // musl's libc crate bindings may lack renameat2 (musl 1.2.3); call the syscall directly.
         // SAFETY: both pointers are valid NUL-terminated strings for the call.
         let rc = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 from.as_ptr(),
                 libc::AT_FDCWD,
