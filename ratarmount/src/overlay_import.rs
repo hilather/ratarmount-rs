@@ -191,7 +191,7 @@ fn import(
             .map_err(|e| format!("{}: {e}", args.directory.display()))?;
     }
     let result = (|| {
-        let overlay = super::overlay_create::create_overlay(
+        let overlay = super::overlay_create::create_overlay_legacy(
             stack.source.clone(),
             &args.directory,
             stack.info,

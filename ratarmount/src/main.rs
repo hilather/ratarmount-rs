@@ -35,6 +35,7 @@ use ratarmount_session::factory;
 mod quiet_print;
 
 mod base_digest;
+mod base_identity;
 mod corpus;
 mod diff;
 mod export_index;
@@ -1368,17 +1369,15 @@ fn mounted_view_is_default(args: &Args, rolling: bool) -> bool {
 }
 
 /// The base a mount actually serves, as far as it can be identified without
-/// reading content.
+/// reading content: what the factory reported (the token) plus what the
+/// invocation knows around it.
 #[derive(Default)]
 struct MountedBase {
-    /// Local path of a directory or archive base; `None` for remote bases.
-    path: Option<PathBuf>,
-    /// Tree id of a pinned Git base.
-    git_tree: Option<String>,
+    /// What the opener served. `None` only when nothing was classified (no
+    /// `--lower` and no `-w`), in which case no lower is compared either.
+    classified: Option<ratarmount_compositing::ClassifiedBase>,
     /// A supplied `--base-digest`, reported as the base's identity.
     supplied: Option<String>,
-    /// Index sidecar whose digest cache may already hold the archive's digest.
-    index: Option<PathBuf>,
     /// Base-relative paths of this invocation's own overlay, journal and mount
     /// point (and the existing top's recorded set), left out of the walk in
     /// addition to the bottom lower's recorded set so a top or mount point
@@ -1418,14 +1417,20 @@ fn mounted_base_identity(
     base: &MountedBase,
     force: bool,
 ) -> Result<String, String> {
-    let probe = ratarmount_compositing::BaseProbe {
-        path: base.path.as_deref(),
-        git_tree: base.git_tree.as_deref(),
+    let Some(classified) = base.classified.as_ref() else {
+        return Err("internal error: the mounted base was not classified".into());
+    };
+    let probe = ratarmount_compositing::overlay_gate::BaseProbe {
         supplied: base.supplied.as_deref(),
-        index: base.index.as_deref(),
         extra_excludes: &base.extra_excludes,
     };
-    let comparison = ratarmount_compositing::compare_base_identity(meta, &probe)?;
+    let comparison =
+        ratarmount_compositing::overlay_gate::compare_base_identity(meta, classified, &probe)?;
+    let git_tree = classified.actual().git_tree();
+    let local_path = matches!(
+        classified.actual().location(),
+        Some(ratarmount_compositing::overlay_identity::BaseLocation::Local(_))
+    );
     let get = |key: &str| meta.and_then(|m| m.get(key));
     let mismatch = comparison.mismatch;
     let identity = comparison.identity;
@@ -1433,20 +1438,19 @@ fn mounted_base_identity(
         if !force {
             let recorded = get("base_digest").unwrap_or("unknown");
             let strong = meta.is_some_and(|m| m.base_digest_kind() == Some("strong"));
-            return Err(
-                if strong && base.git_tree.is_none() && base.path.is_some() {
-                    format!(
+            return Err(if strong && git_tree.is_none() && local_path {
+                format!(
                     "lower {} was sealed against a strong base digest ({recorded}) and the mounted base's identity could not be confirmed cheaply (size/mtime or the directory manifest differ, and neither a matching --base-digest nor a matching cached SHA-256 in the base's index was found; the mount never hashes the base). Pass --base-digest {recorded} (from `overlay digest-base` on the source) if the mounted base is a copy of it, run `overlay verify {} BASE`, or pass --force-stack-mismatch as a last resort",
                     lower.display(),
                     lower.display()
                 )
-                } else if base.git_tree.is_some() || base.path.is_none() {
-                    format!(
+            } else if git_tree.is_some() || !local_path {
+                format!(
                     "lower {} was sealed against base {recorded} but the mounted base is {current}; pass --force-stack-mismatch to override",
                     lower.display()
                 )
-                } else {
-                    let journals: String = base
+            } else {
+                let journals: String = base
                     .existing_journals
                     .iter()
                     .map(|p| {
@@ -1456,13 +1460,12 @@ fn mounted_base_identity(
                         )
                     })
                     .collect();
-                    format!(
+                format!(
                     "lower {} was sealed against a different base than the mounted one; run `overlay verify {} BASE` to compare digests, or pass --force-stack-mismatch to mount anyway{journals}",
                     lower.display(),
                     lower.display()
                 )
-                },
-            );
+            });
         }
     }
     Ok(identity)
@@ -1957,7 +1960,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    let (mut source_paths, mountpoint) = split_bound_inputs_mountpoint(&args);
+    let (source_paths, mountpoint) = split_bound_inputs_mountpoint(&args);
     // Metadata labels also include bound sources; factory gets positional paths
     // separately so every explicit bind is opened exactly once.
     let mut inputs = source_paths.clone();
@@ -1966,10 +1969,6 @@ fn main() {
             .iter()
             .map(|bind| PathBuf::from(&bind.source)),
     );
-    let overlay_base_url = inputs
-        .first()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let publishing = args.publish_index || args.publish_index_to.is_some();
     let live_hf_pr = !publishing
         && overlay_commit::live_hf_create_pr(
@@ -2230,65 +2229,94 @@ fn main() {
             }
         }
     }
-    // A read-only `--lower` mount compares the tree too (tree id lookup, no hashing).
-    let overlay_git_tree = if (args.write_overlay.is_some() || !args.lower.is_empty())
-        && args.source_binds.is_empty()
-    {
-        overlay_cmd::pin_git_base(&mut source_paths, &mut open_opts).unwrap_or_else(|error| {
-            eprintln!("error resolving overlay base: {error}");
-            std::process::exit(1);
-        })
+    // A `-w` or `--lower` mount classifies its base: the kind and place the
+    // factory actually served are what the overlay records and compares.
+    let wants_identity = args.write_overlay.is_some() || !args.lower.is_empty();
+    let factory_paths: Vec<PathBuf> = if args.corpus_list.is_some() || rolling.is_some() {
+        Vec::new()
     } else {
-        None
+        source_paths.clone()
     };
-    let mut bundle = match factory::build_mount_source_with_bindings(
-        if args.corpus_list.is_some() || rolling.is_some() {
-            &[]
+    let factory_comp = factory::CompositingOptions {
+        recursive: args.recursive || args.recursion_depth != 0,
+        lazy: args.lazy,
+        file_versions,
+        prefix: if args.prefix.is_empty() {
+            None
         } else {
-            &source_paths
+            Some(args.prefix.clone())
         },
-        &mut open_opts,
-        args.recreate_index && !args.no_recreate_index,
-        factory::CompositingOptions {
-            recursive: args.recursive || args.recursion_depth != 0,
-            lazy: args.lazy,
-            file_versions,
-            prefix: if args.prefix.is_empty() {
-                None
+        strip_recursive_extension: args.strip_recursive_tar_extension,
+        transform_recursive: args.transform_recursive_mount_point.as_ref().and_then(|v| {
+            if v.len() == 2 {
+                Some((v[0].clone(), v[1].clone()))
             } else {
-                Some(args.prefix.clone())
-            },
-            strip_recursive_extension: args.strip_recursive_tar_extension,
-            transform_recursive: args.transform_recursive_mount_point.as_ref().and_then(|v| {
-                if v.len() == 2 {
-                    Some((v[0].clone(), v[1].clone()))
-                } else {
-                    None
-                }
-            }),
-            transform: args.transform.as_ref().and_then(|v| {
-                if v.len() == 2 {
-                    Some((v[0].clone(), v[1].clone()))
-                } else {
-                    None
-                }
-            }),
-            disable_union_mount: args.disable_union_mount,
-            recursive_extensions: Some(args.recursive_extensions.clone()),
-            union_cache: ratarmount_compositing::UnionMountOptions {
-                max_cache_depth: args.union_mount_cache_max_depth,
-                max_cache_entries: args.union_mount_cache_max_entries,
-                max_seconds_to_cache: args.union_mount_cache_timeout,
-                resolve_symlinks: args.union_resolve_symlinks,
-            },
-            parallel_nested_threads: args.parallel_nested,
+                None
+            }
+        }),
+        transform: args.transform.as_ref().and_then(|v| {
+            if v.len() == 2 {
+                Some((v[0].clone(), v[1].clone()))
+            } else {
+                None
+            }
+        }),
+        disable_union_mount: args.disable_union_mount,
+        recursive_extensions: Some(args.recursive_extensions.clone()),
+        union_cache: ratarmount_compositing::UnionMountOptions {
+            max_cache_depth: args.union_mount_cache_max_depth,
+            max_cache_entries: args.union_mount_cache_max_entries,
+            max_seconds_to_cache: args.union_mount_cache_timeout,
+            resolve_symlinks: args.union_resolve_symlinks,
         },
-        bindings,
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+        parallel_nested_threads: args.parallel_nested,
+    };
+    let recreate_index = args.recreate_index && !args.no_recreate_index;
+    let (mut bundle, classified) = if wants_identity {
+        let mut opener = base_identity::FactoryOpener::new(
+            inputs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            factory_paths,
+            &mut open_opts,
+            recreate_index,
+            factory_comp,
+            bindings,
+            args.source_binds.is_empty(),
+        );
+        match ratarmount_compositing::ClassifiedBase::open(&mut opener) {
+            Ok(base) => (
+                base_identity::MountedSource {
+                    source: base.source(),
+                    _keep_alive: Box::new(()),
+                },
+                Some(base),
+            ),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match factory::build_mount_source_with_bindings(
+            &factory_paths,
+            &mut open_opts,
+            recreate_index,
+            factory_comp,
+            bindings,
+        ) {
+            Ok(built) => (
+                base_identity::MountedSource {
+                    source: built.source.clone(),
+                    _keep_alive: built.into_keep_alive(),
+                },
+                None,
+            ),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
@@ -2411,15 +2439,13 @@ fn main() {
                 &args.lower,
                 &args.journal,
             ),
-            path: (inputs.len() == 1).then(|| inputs[0].clone()),
-            git_tree: overlay_git_tree.clone(),
+            classified: classified.clone(),
             supplied: match &args.base_digest {
                 Some(ratarmount_compositing::BaseDigestRequest::Supplied(digest)) => {
                     Some(digest.clone())
                 }
                 _ => None,
             },
-            index: index_sidecar.clone(),
         },
         force: args.force_stack_mismatch,
     };
@@ -2461,15 +2487,11 @@ fn main() {
                 eprintln!("error: {error}");
                 std::process::exit(1);
             });
-        let create_info = ratarmount_compositing::OverlayCreateInfo {
-            base_url: overlay_base_url,
+        let create_options = ratarmount_compositing::CreateOptions {
             base_digest: args.base_digest.clone().unwrap_or_default(),
             force_base_mismatch: args.force_base_mismatch,
             lower_layers: lower_stack.records.clone(),
-            index_path: (!open_opts.read_only_index)
-                .then(|| index_sidecar.clone())
-                .flatten(),
-            git_tree: overlay_git_tree,
+            index_writable: !open_opts.read_only_index,
             // Journal, lower layers and the mount point inside a directory base
             // stay out of its digest (a mount point is created after creation).
             weak_exclude: args
@@ -2479,12 +2501,13 @@ fn main() {
                 .chain(lower_stack.records.iter().map(|r| r.path.clone()))
                 .chain(mount_point_exclusion(&args, mountpoint.as_deref(), &inputs))
                 .collect(),
-            ..Default::default()
+            remote_token: None,
         };
         match overlay_create::create_overlay(
+            classified.as_ref().expect("a -w mount classified its base"),
             Arc::clone(&bundle.source),
             &overlay_path,
-            create_info,
+            create_options,
             &inputs,
             !args.source_binds.is_empty(),
         ) {
@@ -8372,9 +8395,11 @@ mod lower_stack_tests {
         drop(WriteOverlay::new(view.clone(), &dir).unwrap());
         let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
         OverlayMeta::set_many(&conn, meta).unwrap();
+        // Written by a build that records the base kind (format 2).
         OverlayMeta::set_many(
             &conn,
             &[
+                ("format_version", "2"),
                 ("sealed_at", "2026-10-17T00:00:00Z"),
                 ("layer_digest", "sha256:layer"),
             ],
@@ -8386,7 +8411,7 @@ mod lower_stack_tests {
     fn enforce(base: &Path, force: bool) -> BaseIdentity {
         BaseIdentity::Enforce {
             base: MountedBase {
-                path: Some(base.to_path_buf()),
+                classified: Some(base_identity::fixtures::classify(base)),
                 ..Default::default()
             },
             force,
@@ -8410,6 +8435,8 @@ mod lower_stack_tests {
             root.path(),
             &base,
             &[
+                ("base_kind", "directory"),
+                ("base_location", &format!("local:{}", base.display())),
                 ("base_digest", "sha256:forged"),
                 ("base_digest_kind", "strong"),
                 ("base_weak_digest", &weak),
@@ -8456,6 +8483,8 @@ mod lower_stack_tests {
             root.path(),
             &base,
             &[
+                ("base_kind", "directory"),
+                ("base_location", &format!("local:{}", base.display())),
                 ("base_digest", "sha256:strong"),
                 ("base_digest_kind", "strong"),
                 ("base_weak_digest", &weak),
@@ -8493,6 +8522,8 @@ mod lower_stack_tests {
             root.path(),
             &folder,
             &[
+                ("base_kind", "archive"),
+                ("base_location", &format!("local:{}", archive.display())),
                 ("base_digest", ""),
                 ("base_digest_kind", "pending"),
                 ("base_size", &stamp.size.to_string()),

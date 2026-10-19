@@ -3,12 +3,51 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ratarmount_compositing::{OverlayCreateInfo, OverlayError, WriteOverlay, HIDDEN_DB};
+use ratarmount_compositing::{
+    ClassifiedBase, CreateOptions, OverlayCreateInfo, OverlayError, WriteOverlay, HIDDEN_DB,
+};
 use ratarmount_core::MountSource;
 
-/// Create on an already opened, pinned and composed source. `info` carries the
-/// original positional, digest request, lower records, index path and Git tree.
+/// Create on an already opened, classified and composed source. `composed` is
+/// what is served (lower layers over the classified base); `options` carries
+/// the digest request, lower records and exclusions. What the base IS comes
+/// from `base`, never from the options.
 pub fn create_overlay(
+    base: &ClassifiedBase,
+    composed: Arc<dyn MountSource>,
+    dir: &Path,
+    mut options: CreateOptions,
+    inputs: &[PathBuf],
+    has_source_binds: bool,
+) -> Result<WriteOverlay, OverlayError> {
+    use ratarmount_compositing::BaseDigestRequest;
+    if options.base_digest == BaseDigestRequest::None {
+        eprintln!(
+            "warning: --base-digest none disables base identity verification for new overlays"
+        );
+    }
+    // A single remote base also records a cheap remote token (ETag, size);
+    // a composite's token comes from the classified inputs.
+    if inputs.len() == 1
+        && !has_source_binds
+        && options.base_digest == BaseDigestRequest::Compute
+        && !dir.join(HIDDEN_DB).exists()
+    {
+        let typed = inputs[0].to_string_lossy();
+        if ratarmount_remote::is_remote_url(&typed) {
+            options.remote_token = Some(
+                super::overlay_cmd::remote_base_token(&typed)
+                    .unwrap_or_else(|| format!("url:{}", ratarmount_core::redact_base_url(&typed))),
+            );
+        }
+    }
+    WriteOverlay::open(base, composed, dir, &options)
+}
+
+/// Untokened create for `overlay import` and `import-upperdir` until R6-4
+/// moves them to the classifier. Create on an already opened, pinned and composed source. `info` carries the
+/// original positional, digest request, lower records, index path and Git tree.
+pub fn create_overlay_legacy(
     stack: Arc<dyn MountSource>,
     dir: &Path,
     mut info: OverlayCreateInfo,
@@ -58,12 +97,27 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let stack: Arc<dyn MountSource> =
             Arc::new(ratarmount_compositing::FolderMountSource::new(src.path()).unwrap());
-        let info = OverlayCreateInfo {
-            base_url: inputs[0].into(),
-            ..Default::default()
-        };
+        // Remote inputs cannot be opened offline: the fixture opener reports
+        // exactly what the test says was served.
+        let base = ClassifiedBase::open(&mut crate::base_identity::fixtures::FixtureOpener {
+            source: stack.clone(),
+            kind: ratarmount_compositing::ServedKind::Archive,
+            inputs: inputs.iter().map(|s| (*s).to_owned()).collect(),
+            location: Some(ratarmount_compositing::ServedLocation::Remote(
+                inputs[0].to_owned(),
+            )),
+        })
+        .unwrap();
         let paths: Vec<PathBuf> = inputs.iter().map(PathBuf::from).collect();
-        let overlay = create_overlay(stack, &dir.path().join("ov"), info, &paths, binds).unwrap();
+        let overlay = create_overlay(
+            &base,
+            stack,
+            &dir.path().join("ov"),
+            CreateOptions::default(),
+            &paths,
+            binds,
+        )
+        .unwrap();
         drop(overlay);
         let meta = ratarmount_compositing::OverlayMeta::read(dir.path().join("ov"))
             .unwrap()

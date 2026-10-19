@@ -1453,6 +1453,16 @@ impl BaseKind {
         if meta.base_digest_kind().is_none_or(|k| k == "none") {
             return None;
         }
+        // Transitional (R6-3 .. R6-4): an overlay created over a remote base
+        // records its kind as served (an HTTP archive is an `archive`) and
+        // the place `remote:`. The untokened verbs still tell remote bases
+        // from local ones by the probe, so they see this record as remote.
+        if meta
+            .get("base_location")
+            .is_some_and(|row| row.starts_with("remote:"))
+        {
+            return Some(BaseKind::Remote);
+        }
         if let Some(kind) = meta.get("base_kind").and_then(Self::parse) {
             return Some(kind);
         }
@@ -1796,8 +1806,11 @@ fn reopen_classified(
         }
         Verdict::Same => {}
         Verdict::Content => {
-            if !meta.legacy() && verify(conn, meta, info, plan)? {
-                return forced_rows(conn);
+            // Same kind at the same place with a changed content: a forced
+            // run overrides this open only (`base_mismatch_forced_at`); the
+            // recorded digest stays, so a later offline verb still refuses.
+            if !meta.legacy() {
+                verify(conn, meta, info, plan)?;
             }
         }
     }
@@ -1827,15 +1840,14 @@ pub(crate) fn apply_comparison_rows(
     )
 }
 
-/// Returns `true` when a mismatch was overridden by `--force-base-mismatch`.
 fn verify(
     conn: &Connection,
     meta: &OverlayMeta,
     info: &OverlayCreateInfo,
     plan: Option<&ExcludePlan>,
-) -> Result<bool> {
+) -> Result<()> {
     if meta.base_digest_kind() == Some("none") {
-        return Ok(false);
+        return Ok(());
     }
     let old = match meta.base_digest_kind() {
         Some("pending") => "pending",
@@ -1891,11 +1903,10 @@ fn verify(
             return Err(OverlayError::Msg(format!("base mismatch: recorded digest {old}; current digest {current}; use --force-base-mismatch to override")));
         }
         OverlayMeta::set(conn, "base_mismatch_forced_at", &timestamp())?;
-        return Ok(true);
     } else if !to_append.is_empty() {
         append_base_excludes(conn, &to_append)?;
     }
-    Ok(false)
+    Ok(())
 }
 
 #[cfg(test)]

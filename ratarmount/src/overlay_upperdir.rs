@@ -72,7 +72,7 @@ pub fn run(args: &ImportUpperdirArgs) -> Result<(String, i32), String> {
         fs::create_dir(&args.directory).map_err(|e| e.to_string())?;
     }
     let result = (|| {
-        let overlay = crate::overlay_create::create_overlay(
+        let overlay = crate::overlay_create::create_overlay_legacy(
             stack.source.clone(),
             &args.directory,
             stack.info,

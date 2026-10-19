@@ -631,7 +631,7 @@ fn regression_import_reject_type_change_and_repeated_file_sections() {
 /// whole directory on any error, which would hide the marker).
 fn simulate_killed_import(f: &Fixture, args: &ImportArgs, files: &[(&str, &[u8])], n: usize) {
     fs::create_dir(&args.directory).unwrap();
-    let overlay = super::super::overlay_create::create_overlay(
+    let overlay = super::super::overlay_create::create_overlay_legacy(
         f.source.clone(),
         &args.directory,
         OverlayCreateInfo {

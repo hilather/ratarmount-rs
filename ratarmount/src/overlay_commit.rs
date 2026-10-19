@@ -133,6 +133,27 @@ pub fn spawn_signal_fuse_unmount(mp: PathBuf) {
         .expect("fuse signal unmount thread");
 }
 
+/// Logs a failure once per distinct message. A commit refused because the
+/// base changed is retried on every tick; the same refusal every second would
+/// flood the log, while a new observed stamp is new information.
+#[derive(Default)]
+struct RepeatedFailure(Option<String>);
+
+impl RepeatedFailure {
+    /// `true` when `message` differs from the previous failure.
+    fn is_new(&mut self, message: &str) -> bool {
+        let new = self.0.as_deref() != Some(message);
+        if new {
+            self.0 = Some(message.to_owned());
+        }
+        new
+    }
+
+    fn clear(&mut self) {
+        self.0 = None;
+    }
+}
+
 pub fn spawn_interval_commits(
     overlay: Arc<WriteOverlay>,
     archive: PathBuf,
@@ -148,47 +169,60 @@ pub fn spawn_interval_commits(
     let remote_url = archive.to_string_lossy().into_owned();
     thread::Builder::new()
         .name("ratarmount-overlay-commit".into())
-        .spawn(move || loop {
-            let start = Instant::now();
-            while start.elapsed() < poll {
+        .spawn(move || {
+            let mut failures = RepeatedFailure::default();
+            loop {
+                let start = Instant::now();
+                while start.elapsed() < poll {
+                    if term_requested() || stop.as_ref().is_some_and(|s| s.is_stopped()) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
                 if term_requested() || stop.as_ref().is_some_and(|s| s.is_stopped()) {
                     return;
                 }
-                thread::sleep(Duration::from_millis(50));
-            }
-            if term_requested() || stop.as_ref().is_some_and(|s| s.is_stopped()) {
-                return;
-            }
-            let ov = Arc::clone(&overlay);
-            match overlay.enqueue_commit(&archive, CommitKind::IntervalIdle(interval), |p| {
-                match remote_kind {
-                    // Reopen is the URL only. Patch ran inside publish.
-                    LiveRemote::S3 => reopen_s3_mount(&remote_url, &opts),
-                    LiveRemote::Gcs => reopen_gcs_mount(&remote_url, &opts),
-                    LiveRemote::Azure => reopen_azure_mount(&remote_url, &opts),
-                    LiveRemote::Hf => ov.reopen_remote_live_commit(),
-                    LiveRemote::Local => {
-                        if let Some(window) = ov.last_patch_window() {
-                            patch_sidecar_if_present(p, &window, &opts)?;
+                let ov = Arc::clone(&overlay);
+                match overlay.enqueue_commit(&archive, CommitKind::IntervalIdle(interval), |p| {
+                    match remote_kind {
+                        // Reopen is the URL only. Patch ran inside publish.
+                        LiveRemote::S3 => reopen_s3_mount(&remote_url, &opts),
+                        LiveRemote::Gcs => reopen_gcs_mount(&remote_url, &opts),
+                        LiveRemote::Azure => reopen_azure_mount(&remote_url, &opts),
+                        LiveRemote::Hf => ov.reopen_remote_live_commit(),
+                        LiveRemote::Local => {
+                            if let Some(window) = ov.last_patch_window() {
+                                patch_sidecar_if_present(p, &window, &opts)?;
+                            }
+                            reopen_live_archive(p, &opts).map_err(OverlayError::Msg)
                         }
-                        reopen_live_archive(p, &opts).map_err(OverlayError::Msg)
+                    }
+                }) {
+                    Ok(CommitOutcome::DidWork) => {
+                        failures.clear();
+                        log::info!(
+                            "interval overlay commit wrote idle files into {}",
+                            overlay.commit_archive_path(&archive).display()
+                        )
+                    }
+                    Ok(CommitOutcome::Nothing) => {
+                        log::debug!("interval overlay commit: nothing idle to do")
+                    }
+                    Ok(CommitOutcome::Coalesced) => {
+                        log::debug!("interval overlay commit coalesced (persist already in flight)")
+                    }
+                    Ok(CommitOutcome::Disabled) => {
+                        log::debug!("interval overlay commit skipped (remount required)")
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        if failures.is_new(&message) {
+                            log::error!("interval overlay commit failed: {message}");
+                        } else {
+                            log::debug!("interval overlay commit failed again: {message}");
+                        }
                     }
                 }
-            }) {
-                Ok(CommitOutcome::DidWork) => log::info!(
-                    "interval overlay commit wrote idle files into {}",
-                    overlay.commit_archive_path(&archive).display()
-                ),
-                Ok(CommitOutcome::Nothing) => {
-                    log::debug!("interval overlay commit: nothing idle to do")
-                }
-                Ok(CommitOutcome::Coalesced) => {
-                    log::debug!("interval overlay commit coalesced (persist already in flight)")
-                }
-                Ok(CommitOutcome::Disabled) => {
-                    log::debug!("interval overlay commit skipped (remount required)")
-                }
-                Err(e) => log::error!("interval overlay commit failed: {e}"),
             }
         })
         .expect("interval commit thread")
@@ -1450,6 +1484,19 @@ pub(crate) fn term_flag_test_lock() -> &'static std::sync::Mutex<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A refused interval commit is retried every tick; it logs once per
+    /// distinct message (a new observed stamp is new information) and again
+    /// after a success.
+    #[test]
+    fn regression_interval_refusal_logs_once_per_distinct_message() {
+        let mut failures = RepeatedFailure::default();
+        assert!(failures.is_new("base mismatch: size=1"));
+        assert!(!failures.is_new("base mismatch: size=1"));
+        assert!(failures.is_new("base mismatch: size=2"));
+        failures.clear();
+        assert!(failures.is_new("base mismatch: size=2"));
+    }
+
     use super::*;
 
     /// Regression: hf commit URLs must not be stat-ed as local filenames.

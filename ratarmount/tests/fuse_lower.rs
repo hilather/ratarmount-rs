@@ -256,20 +256,14 @@ fn regression_fuse_lower_read_only_root_xattrs_name_the_stack() {
         .get("layer_digest")
         .unwrap()
         .to_owned();
-    // The mounted base's own weak identity (the fixture lower is kind `none`
-    // and records none), never the lower's recorded digest.
-    let base_digest = ratarmount_compositing::overlay_meta::directory_weak_digest(
-        &base,
-        &ratarmount_compositing::overlay_meta::BaseExcludes::default(),
-    )
-    .unwrap();
+    // The fixture lower is kind `none`: the mount compares the kind only and
+    // measures nothing, so the mounted base has no identity to report. What it
+    // must never do is report the lower's recorded digest as the base's.
+    assert_eq!(root_xattr(&path, "user.ratarmount.stack_digest"), "");
+    assert_eq!(root_xattr(&path, "user.ratarmount.base_digest"), "");
     assert_eq!(
-        root_xattr(&path, "user.ratarmount.stack_digest"),
-        ratarmount_compositing::stack_digest(&base_digest, &[&layer_digest])
-    );
-    assert_eq!(
-        root_xattr(&path, "user.ratarmount.base_digest"),
-        base_digest
+        root_xattr(&path, "user.ratarmount.base_digest_state"),
+        "pending"
     );
     assert_eq!(root_xattr(&path, "user.ratarmount.sealed"), "1");
     let layers: serde_json::Value =
