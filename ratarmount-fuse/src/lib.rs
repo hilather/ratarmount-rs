@@ -3611,7 +3611,9 @@ const UNMOUNT_RETRY: RetryPolicy = RetryPolicy {
 /// retried while the kernel reports the mount busy.
 #[cfg(not(target_os = "macos"))]
 fn unmount_linux(mp: &Path) -> std::io::Result<()> {
-    unmount_linux_with(mp, &["-u"], UNMOUNT_RETRY, &mut run_fusermount)
+    unmount_linux_with(mp, &["-u"], UNMOUNT_RETRY, &mut run_fusermount, &mut |m| {
+        debug!("{m}")
+    })
 }
 
 /// Lazy detach (`fusermount3 -u -z`), one attempt. A last resort for callers that
@@ -3627,6 +3629,7 @@ pub fn unmount_lazy(mountpoint: impl AsRef<Path>) -> std::io::Result<()> {
         &["-u", "-z"],
         no_retry,
         &mut run_fusermount,
+        &mut |m| debug!("{m}"),
     )
 }
 
@@ -3665,6 +3668,7 @@ fn unmount_linux_with(
     flags: &[&str],
     retry: RetryPolicy,
     run: &mut dyn FnMut(&[&OsStr]) -> std::io::Result<std::process::Output>,
+    note: &mut dyn FnMut(&str),
 ) -> std::io::Result<()> {
     let mut args: Vec<&OsStr> = flags.iter().map(OsStr::new).collect();
     args.push(mp.as_os_str());
@@ -3693,10 +3697,10 @@ fn unmount_linux_with(
                 mp.display()
             )));
         }
-        debug!(
+        note(&format!(
             "fusermount3 -u {}: busy (attempt {attempts}), retrying",
             mp.display()
-        );
+        ));
         if start.elapsed() + retry.interval > retry.deadline {
             return Err(std::io::Error::new(
                 ErrorKind::ResourceBusy,
@@ -8314,7 +8318,14 @@ mod unmount_retry_tests {
                 fake_fusermount(0, "")
             })
         };
-        unmount_linux_with(Path::new("/m"), &["-u"], fast_retry(), &mut run).unwrap();
+        unmount_linux_with(
+            Path::new("/m"),
+            &["-u"],
+            fast_retry(),
+            &mut run,
+            &mut |_| {},
+        )
+        .unwrap();
         assert_eq!(calls, 3);
     }
 
@@ -8329,7 +8340,14 @@ mod unmount_retry_tests {
                 "fusermount3: entry for /m not found in /etc/mtab\n",
             ))
         };
-        let e = unmount_linux_with(Path::new("/m"), &["-u"], fast_retry(), &mut run).unwrap_err();
+        let e = unmount_linux_with(
+            Path::new("/m"),
+            &["-u"],
+            fast_retry(),
+            &mut run,
+            &mut |_| {},
+        )
+        .unwrap_err();
         assert_eq!(calls, 1);
         assert_eq!(e.kind(), ErrorKind::Other);
         let msg = e.to_string();
@@ -8346,7 +8364,14 @@ mod unmount_retry_tests {
             Ok(fake_fusermount(1, BUSY))
         };
         let started = std::time::Instant::now();
-        let e = unmount_linux_with(Path::new("/m"), &["-u"], fast_retry(), &mut run).unwrap_err();
+        let e = unmount_linux_with(
+            Path::new("/m"),
+            &["-u"],
+            fast_retry(),
+            &mut run,
+            &mut |_| {},
+        )
+        .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(calls > 2, "retried only {calls} times");
         assert_eq!(e.kind(), ErrorKind::ResourceBusy);
@@ -8363,7 +8388,14 @@ mod unmount_retry_tests {
             calls += 1;
             Err(std::io::Error::from(ErrorKind::NotFound))
         };
-        let e = unmount_linux_with(Path::new("/m"), &["-u"], fast_retry(), &mut run).unwrap_err();
+        let e = unmount_linux_with(
+            Path::new("/m"),
+            &["-u"],
+            fast_retry(),
+            &mut run,
+            &mut |_| {},
+        )
+        .unwrap_err();
         assert_eq!((calls, e.kind()), (1, ErrorKind::NotFound));
     }
 
@@ -8380,7 +8412,8 @@ mod unmount_retry_tests {
                 &format!("fusermount3: failed to unmount {mp}: No such file or directory\n"),
             ))
         };
-        let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run).unwrap_err();
+        let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run, &mut |_| {})
+            .unwrap_err();
         assert_eq!((calls, e.kind()), (1, ErrorKind::Other));
     }
 
@@ -8396,7 +8429,8 @@ mod unmount_retry_tests {
                 &format!("fusermount3: failed to unmount {mp}: Device or resource busy\n"),
             ))
         };
-        let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run).unwrap_err();
+        let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run, &mut |_| {})
+            .unwrap_err();
         assert!(calls > 2, "retried only {calls} times");
         assert_eq!(e.kind(), ErrorKind::ResourceBusy);
     }
@@ -8414,7 +8448,8 @@ mod unmount_retry_tests {
                     &format!("fusermount3: failed to unmount {mp}: Device or resource busy\n"),
                 ))
             };
-            let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run).unwrap_err();
+            let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run, &mut |_| {})
+                .unwrap_err();
             assert!(calls > 2, "{mp}: retried only {calls} times");
             assert_eq!(e.kind(), ErrorKind::ResourceBusy, "{mp}");
         }
@@ -8432,7 +8467,8 @@ mod unmount_retry_tests {
                 &format!("fusermount3: failed to unmount {mp}: No such file or directory\n"),
             ))
         };
-        let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run).unwrap_err();
+        let e = unmount_linux_with(Path::new(mp), &["-u"], fast_retry(), &mut run, &mut |_| {})
+            .unwrap_err();
         assert_eq!((calls, e.kind()), (1, ErrorKind::Other));
     }
 }

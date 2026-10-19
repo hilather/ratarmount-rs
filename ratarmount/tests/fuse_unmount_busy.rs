@@ -35,15 +35,18 @@ struct Log {
 
 impl Log {
     fn attach(child: &mut Child) -> Log {
+        Log::attach_reader(child.stderr.take().expect("piped stderr"))
+    }
+
+    fn attach_reader(reader: impl Read + Send + 'static) -> Log {
         let text = Arc::new(Mutex::new(String::new()));
         let (tx, trigger) = mpsc::channel();
         let (eof_tx, eof) = mpsc::channel::<()>();
-        let stderr = child.stderr.take().expect("piped stderr");
         let sink = Arc::clone(&text);
         thread::spawn(move || {
             let _eof_tx = eof_tx;
             let mut fired = false;
-            for line in BufReader::new(stderr).lines() {
+            for line in BufReader::new(reader).lines() {
                 let Ok(line) = line else { break };
                 if !fired && is_busy_trigger(&line) {
                     fired = true;
