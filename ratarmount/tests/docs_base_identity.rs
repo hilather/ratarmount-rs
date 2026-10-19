@@ -61,6 +61,8 @@ fn regression_docs_state_journal_ownership() {
         "the journal's inode must equal the archive's (the device number is only a hint; it changes across reboots)",
         "one in the `complete` phase that is still on disk rolls FORWARD and re-baselines the recorded stamp",
         "Journals exist on Linux and macOS only; elsewhere there is nothing to check.",
+        "A journal touches the overlay's recorded rows only when its target is the recorded base",
+        "Mounting applies the same ownership check before any recovery",
     ] {
         assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
     }

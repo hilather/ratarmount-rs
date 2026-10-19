@@ -49,6 +49,32 @@ pub fn recover(archive: &Path) -> io::Result<bool> {
     }
 }
 
+/// [`recover`] for the mount-time openers, which run before any identity gate:
+/// a journal started for ANOTHER file (a new-inode copy of a crashed archive, a
+/// restored backup) is refused with the archive and the journal untouched,
+/// because recovery checks content only and would roll the copy back. The
+/// archive's own journal recovers as before.
+pub fn recover_owned(archive: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Some(journal) = pending(archive)? {
+            if let Ok(metadata) = fs::metadata(archive) {
+                if journal.ino != metadata.ino() {
+                    return Err(io::Error::other(format!(
+                        "{} carries a commit journal that was started for another file \
+                         (journal inode {}, archive inode {}); the journal was not applied",
+                        archive.display(),
+                        journal.ino,
+                        metadata.ino()
+                    )));
+                }
+            }
+        }
+    }
+    recover(archive)
+}
+
 /// What a pending journal says about the archive it was started for. Read
 /// without a lock and without writing, so a caller can decide whether the
 /// journal is its own BEFORE [`recover`] rolls anything back.
@@ -674,6 +700,44 @@ mod tests {
         assert!(finish_replace(&path, result, false).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"prefix:old contents");
         assert!(!journal_path(&path).exists());
+    }
+
+    /// Regression (R6-K6): `recover_owned` refuses a journal started for another
+    /// file (a new-inode copy) untouched, and recovers the file's own journal.
+    #[cfg(unix)]
+    #[test]
+    fn append_journal_recover_owned_refuses_foreign_journal() {
+        let crash = |path: &Path| {
+            fs::write(path, b"prefix:old contents").unwrap();
+            let mut suffix = tempfile::tempfile().unwrap();
+            suffix.write_all(b"new contents").unwrap();
+            let crashed = replace_suffix_with_hook(path, 7, &mut suffix, &mut |step| {
+                if step == "archive truncate" {
+                    Err(io::Error::other("crash"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(crashed.is_err());
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        crash(&path);
+        let crashed = fs::read(&path).unwrap();
+        let journal = fs::read(journal_path(&path)).unwrap();
+        let copy = dir.path().join("copy");
+        fs::write(&copy, &crashed).unwrap();
+        fs::rename(&copy, &path).unwrap();
+        let err = recover_owned(&path).unwrap_err().to_string();
+        assert!(err.contains("another file"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), crashed);
+        assert_eq!(fs::read(journal_path(&path)).unwrap(), journal);
+
+        let own = dir.path().join("own");
+        crash(&own);
+        assert!(recover_owned(&own).unwrap());
+        assert_eq!(fs::read(&own).unwrap(), b"prefix:old contents");
+        assert!(!journal_path(&own).exists());
     }
 
     /// Regression: a cleanup failure after completion must not append the same plan twice.

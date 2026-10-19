@@ -305,7 +305,7 @@ impl RollingMountSource {
         let members: Vec<_> = found
             .iter()
             .map(|(_, path)| {
-                ratarmount_compress::commit_journal::recover(path)?;
+                ratarmount_compress::commit_journal::recover_owned(path)?;
                 Ok(Arc::new(Member {
                     path: path.clone(),
                     live: AtomicBool::new(true),

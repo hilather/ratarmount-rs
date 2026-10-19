@@ -137,7 +137,7 @@ impl Session {
             matches!(&req.source, SourceSpec::Url(_)) || looks_like_url_archive(&archive_path);
 
         if !remote_archive {
-            ratarmount_compress::commit_journal::recover(&archive_path)
+            ratarmount_compress::commit_journal::recover_owned(&archive_path)
                 .map_err(|e| Error::Internal(e.to_string()))?;
         }
 

@@ -445,3 +445,55 @@ fn regression_raw_dir_commit_refuses_foreign_journal() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(members(&archive).contains("new.txt"));
 }
+
+/// Regression (R6-K6, audit A-ext1): the mount path recovered whatever journal
+/// each input carried BEFORE any gate, so a `-w` remount over a new-inode copy
+/// of a crashed archive rolled the copy back. The journal belongs to the file
+/// it was started for: a foreign one is refused with archive and journal
+/// untouched; the archive's own crash still recovers at mount. (`--no-mount`
+/// runs the same recovery and needs no FUSE.)
+#[cfg(unix)]
+#[test]
+fn regression_mount_recovery_refuses_foreign_journal() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let env = Env::new();
+    let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    interrupt_append(&archive);
+    let crashed = fs::read(&archive).unwrap();
+    let journal = ratarmount_compress::commit_journal::journal_path(&archive);
+    let journal_bytes = fs::read(&journal).unwrap();
+    let copy = env.path("copy.tar");
+    fs::write(&copy, &crashed).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(fs::metadata(&archive).unwrap().modified().unwrap())
+        .unwrap();
+    fs::rename(&copy, &archive).unwrap();
+    let out = env.run(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    assert!(!out.status.success(), "must refuse: {}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("another file"), "{err}");
+    assert!(fs::read(&archive).unwrap() == crashed, "archive modified");
+    assert!(
+        fs::read(&journal).unwrap() == journal_bytes,
+        "journal modified"
+    );
+
+    // Its own crash still recovers at mount.
+    let env = Env::new();
+    let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    let original = fs::read(&archive).unwrap();
+    interrupt_append(&archive);
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    assert!(fs::read(&archive).unwrap() == original, "not rolled back");
+    assert!(!ratarmount_compress::commit_journal::journal_path(&archive).exists());
+}

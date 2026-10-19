@@ -368,6 +368,12 @@ phase that is still on disk rolls FORWARD and re-baselines the recorded stamp
 them again and the later member wins). Once the journal is gone nothing ties a
 changed archive to the crash, and that commit is refused as a changed base.
 Journals exist on Linux and macOS only; elsewhere there is nothing to check.
+A journal touches the overlay's recorded rows only when its target is the
+recorded base: a union member's own journal recovers that member alone and
+leaves the base stamp as it was. Mounting applies the same ownership check
+before any recovery (the plain mount, `-w` remounts, sessions and rolling
+series): a journal started for another file refuses the open with the archive
+and journal untouched, and the archive's own crash still recovers at mount.
 `overlay seal` or `pack` against a directory base at another place measures its
 weak manifest there (one walk of the directory).
 

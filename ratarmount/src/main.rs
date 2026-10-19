@@ -2037,7 +2037,7 @@ fn main() {
     {
         for input in &inputs {
             if !ratarmount_remote::is_remote_url(&input.to_string_lossy()) {
-                if let Err(e) = ratarmount_compress::commit_journal::recover(input) {
+                if let Err(e) = ratarmount_compress::commit_journal::recover_owned(input) {
                     eprintln!("error: commit recovery for {}: {e}", input.display());
                     std::process::exit(2);
                 }
