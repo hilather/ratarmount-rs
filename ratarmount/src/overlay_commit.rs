@@ -209,7 +209,10 @@ fn signal_unmount(
             );
             match lazy(mp) {
                 Ok(()) => {
-                    log::info!("{name}: lazy unmount of {} succeeded", mp.display());
+                    log::warn!(
+                        "{name}: {} lazily detached; waiting for open files to close before exiting",
+                        mp.display()
+                    );
                     SignalUnmountOutcome::LazyFallback
                 }
                 Err(lazy_err) => {
@@ -229,9 +232,9 @@ fn signal_unmount(
 }
 
 /// Run [`signal_unmount`] for each new signal until one ends the attempt
-/// (unmounted or lazy-detached, or both failed). A failed attempt keeps the
-/// watcher alive for the next signal. A programmatic shutdown before any signal
-/// ends it without unmounting.
+/// (unmounted or lazy-detached). A failed attempt, including a failed lazy
+/// fallback, keeps the watcher alive so the next signal retries. A programmatic
+/// shutdown before any signal ends it without unmounting.
 fn signal_unmount_watcher(
     mp: &Path,
     state: &dyn Fn() -> TermState,
@@ -247,10 +250,10 @@ fn signal_unmount_watcher(
         if count != seen {
             seen = count;
             match signal_unmount(mp, st.signal, unmount, lazy) {
-                SignalUnmountOutcome::Unmounted
-                | SignalUnmountOutcome::LazyFallback
-                | SignalUnmountOutcome::LazyFailed(..) => return,
-                SignalUnmountOutcome::Failed(_) | SignalUnmountOutcome::Skipped => {}
+                SignalUnmountOutcome::Unmounted | SignalUnmountOutcome::LazyFallback => return,
+                SignalUnmountOutcome::LazyFailed(..)
+                | SignalUnmountOutcome::Failed(_)
+                | SignalUnmountOutcome::Skipped => {}
             }
         } else if st.flagged && seen == 0 {
             return;
