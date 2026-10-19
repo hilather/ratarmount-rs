@@ -1362,3 +1362,53 @@ fn regression_accepted_seal_against_directory_copy_keeps_a_baseline() {
         refused(&out);
     }
 }
+
+/// Regression (R6-K2, r11 skeptic #2): `overlay seal` resolved a `pending` base
+/// digest from the OLD recorded location before the accepted move was applied.
+/// Rename A -> B and seal against B: A has vanished (hash failed), or A was
+/// recreated with other bytes carrying the recorded size and mtime (the seal
+/// hashed A and recorded A's digest for B). The digest is resolved from the
+/// classified base, so it is B's.
+#[cfg(unix)]
+#[test]
+fn regression_pending_seal_hashes_the_moved_base_not_the_old_place() {
+    use sha2::{Digest, Sha256};
+    for recreate_old in [false, true] {
+        let env = Env::new();
+        let (base, overlay) = fixture(&env, Kind::Archive, false);
+        assert_eq!(
+            meta_of(&overlay).base_digest_kind(),
+            Some("pending"),
+            "fixture must leave the digest pending"
+        );
+        let stamp = fs::metadata(&base).unwrap().modified().unwrap();
+        let moved = env.path("moved.tar");
+        fs::rename(&base, &moved).unwrap();
+        if recreate_old {
+            let mut bytes = fs::read(&moved).unwrap();
+            bytes[512] ^= 1;
+            fs::write(&base, &bytes).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&base)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+        }
+        let out = verb(&env, Verb::Seal, &overlay, &moved, &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "recreate_old={recreate_old}: {}",
+            text(&out)
+        );
+        let expected = format!("sha256:{:x}", Sha256::digest(fs::read(&moved).unwrap()));
+        let meta = meta_of(&overlay);
+        assert_eq!(meta.base_digest_kind(), Some("strong"));
+        assert_eq!(
+            meta.base_digest(),
+            Some(expected.as_str()),
+            "recreate_old={recreate_old}: the seal hashed the old place"
+        );
+    }
+}

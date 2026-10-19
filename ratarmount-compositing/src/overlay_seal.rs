@@ -258,7 +258,7 @@ pub(crate) fn seal_impl(
     let conn = connection(dir, false)?;
     // A sealed layer is never `pending`: hash the base first, outside the
     // write transaction (a cache hit is free).
-    crate::resolve_pending_base_digest(&conn).map_err(overlay_error)?;
+    crate::overlay_meta::resolve_pending_base_digest_for(&conn, identity).map_err(overlay_error)?;
     // Readers can still take snapshots for canonical hashing. Competing writers,
     // including mounts in exclusive locking mode, cannot enter this interval.
     conn.execute_batch("BEGIN IMMEDIATE").map_err(sql_error)?;

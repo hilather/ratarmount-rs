@@ -910,12 +910,36 @@ pub fn record_base_digest(conn: &Connection, pending: &PendingBase, digest: &str
 /// Hash and record a `pending` base digest through `conn`. `false` when the
 /// digest was not pending. Offline verbs that need the digest call this.
 pub fn resolve_pending_base_digest(conn: &Connection) -> Result<bool> {
+    resolve_pending_base_digest_for(conn, None)
+}
+
+/// [`resolve_pending_base_digest`] for a caller whose gate already accepted a
+/// classified base: the digest is of THAT archive, not of the place the
+/// overlay recorded (an accepted move leaves the recorded place stale, and the
+/// old place may be gone or hold other bytes with the recorded stamp).
+pub(crate) fn resolve_pending_base_digest_for(
+    conn: &Connection,
+    base: Option<&crate::ClassifiedBase>,
+) -> Result<bool> {
     let Some(meta) = OverlayMeta::from_connection(conn)? else {
         return Ok(false);
     };
-    let Some(pending) = PendingBase::from_meta(&meta)? else {
+    let Some(mut pending) = PendingBase::from_meta(&meta)? else {
         return Ok(false);
     };
+    if let Some(actual) = base.map(crate::ClassifiedBase::actual) {
+        if let (
+            crate::overlay_identity::BaseKind::Archive,
+            Some(crate::BaseLocation::Local(path)),
+        ) = (actual.kind(), actual.location())
+        {
+            if *path != pending.path {
+                pending.path = path.clone();
+                // The recorded index belongs to the old place.
+                pending.index = None;
+            }
+        }
+    }
     let digest = pending.hash(&|| Ok(()))?;
     record_base_digest(conn, &pending, &digest)
 }

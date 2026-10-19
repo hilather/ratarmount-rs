@@ -472,6 +472,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | A union member's own complete journal re-stamped the overlay's recorded base rows (next commit to the unchanged base refused) (R6-K1) | `cargo test -p ratarmount-compositing --lib regression_union_member_complete_journal_leaves_recorded_stamp` |
 | Mount-time recovery (`main.rs`, `Session::open`, factory, rolling) rolled a foreign journal into a new-inode copy before any gate (R6-K6) | `cargo test -p ratarmount --test overlay_offline_commit regression_mount_recovery_refuses_foreign_journal` · `cargo test -p ratarmount-compress --lib append_journal_recover_owned_refuses_foreign_journal` |
 | Roll-forward re-stamped size/mtime but left the strong digest naming pre-crash bytes (R6-K7) | `cargo test -p ratarmount-compositing --lib regression_roll_forward_marks_base_digest_pending` · `cargo test -p ratarmount --test docs_base_identity` |
+| `overlay seal` of a `pending` digest hashed the OLD recorded place after an accepted move (vanished A, or A recreated with the recorded stamp) (R6-K2) | `cargo test -p ratarmount --test overlay_base_gate regression_pending_seal_hashes_the_moved_base_not_the_old_place` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
