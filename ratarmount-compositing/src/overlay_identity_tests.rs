@@ -1442,6 +1442,45 @@ fn regression_union_member_complete_journal_leaves_recorded_stamp() {
     }
 }
 
+/// Regression (R6-K7, r11 review nit 2): a complete journal rolled forward
+/// moved the stamp rows but left the strong digest naming the PRE-crash bytes,
+/// so a retry that ended before the refresh left stamp and digest disagreeing.
+/// The digest is now marked `pending` (resolved lazily by seal, diff, pack or
+/// grading; mounting stays fast) and resolves to the digest of the archive as
+/// it is now.
+#[cfg(unix)]
+#[test]
+fn regression_roll_forward_marks_base_digest_pending() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        let fx = Fixture::new();
+        let before = sha(&fx.archive);
+        let ov = fx.open(BaseDigestRequest::Supplied(before.clone()), false);
+        let (kind, digest) = ov.recorded_digest_for_tests();
+        assert_eq!(kind.as_deref(), Some("strong"));
+        assert_eq!(digest.as_deref(), Some(before.as_str()));
+        interrupt_complete(&fx.archive);
+        // An empty plan: recovery rolls forward and the commit ends before any refresh.
+        commit(&ov, &fx.archive, path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        let (kind, digest) = ov.recorded_digest_for_tests();
+        assert_eq!(kind.as_deref(), Some("pending"), "{path:?}");
+        assert_eq!(digest.as_deref(), Some(""), "{path:?}");
+        drop(ov);
+        let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
+        assert!(crate::overlay_meta::resolve_pending_base_digest(&conn).unwrap());
+        let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
+        let after = meta.base_digest().unwrap().to_owned();
+        assert_eq!(meta.base_digest_kind(), Some("strong"), "{path:?}");
+        assert_ne!(
+            after, before,
+            "{path:?}: digest still names the pre-crash bytes"
+        );
+    }
+}
+
 /// Regression (R6-J2, audit A10 + #9): the journal check compares the inode
 /// only. `commit_journal` calls the device number a hint (it changes on
 /// reboot), so a device change with the same inode is the overlay's own journal.

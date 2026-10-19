@@ -605,13 +605,32 @@ pub(crate) fn restamp_rolled_forward(conn: &Connection, base: &ClassifiedBase, a
     let Ok(now) = ArchiveDigestStamp::read(&canonical) else {
         return;
     };
+    let size = now.size.to_string();
+    let mtime = now.mtime_ns.to_string();
     let _ = OverlayMeta::set_many(
         conn,
         &[
-            ("base_size", now.size.to_string().as_str()),
-            ("base_mtime_ns", now.mtime_ns.to_string().as_str()),
+            ("base_size", size.as_str()),
+            ("base_mtime_ns", mtime.as_str()),
         ],
     );
+    // The recorded digest names the PRE-crash bytes. A weak one is the stamp
+    // itself; a strong one is marked `pending` (never cleared) and resolved
+    // lazily by seal, diff, pack or grading, so mounting stays fast.
+    match meta.base_digest_kind() {
+        Some("weak") => {
+            let weak = format!("weak:size={size},mtime_ns={mtime}");
+            let _ = OverlayMeta::set_many(conn, &[("base_digest", weak.as_str())]);
+        }
+        Some("strong") => {
+            let _ = OverlayMeta::set_many(
+                conn,
+                &[("base_digest", ""), ("base_digest_kind", "pending")],
+            );
+            let _ = OverlayMeta::remove(conn, "stack_digest");
+        }
+        _ => {}
+    }
 }
 
 /// Why a commit was refused before it wrote anything.

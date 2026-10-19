@@ -4385,6 +4385,20 @@ impl WriteOverlay {
         );
     }
 
+    /// The recorded base digest kind and digest, read through the mount's own
+    /// connection.
+    #[cfg(test)]
+    pub(crate) fn recorded_digest_for_tests(&self) -> (Option<String>, Option<String>) {
+        let conn = self.db.lock().expect("overlay db");
+        let meta = crate::OverlayMeta::from_connection(&conn)
+            .expect("overlay meta")
+            .expect("overlay meta present");
+        (
+            meta.base_digest_kind().map(str::to_owned),
+            meta.base_digest().map(str::to_owned),
+        )
+    }
+
     /// The recorded base stamp rows, read through the mount's own connection.
     #[cfg(test)]
     pub(crate) fn recorded_stamp_for_tests(&self) -> (Option<String>, Option<String>) {

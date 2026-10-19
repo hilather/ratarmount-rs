@@ -365,7 +365,9 @@ restored backup) is refused with the archive and journal left untouched, and
 the size and mtime it restores equal the recorded stamp; one in the `complete`
 phase that is still on disk rolls FORWARD and re-baselines the recorded stamp
 (the files that commit appended are still in the overlay, so the retry appends
-them again and the later member wins). Once the journal is gone nothing ties a
+them again and the later member wins). A recorded strong digest named the
+pre-crash bytes, so the roll-forward marks it `pending` (never clears it);
+seal, diff, pack or grading resolve it lazily and mounting stays fast. Once the journal is gone nothing ties a
 changed archive to the crash, and that commit is refused as a changed base.
 Journals exist on Linux and macOS only; elsewhere there is nothing to check.
 A journal touches the overlay's recorded rows only when its target is the
