@@ -1163,3 +1163,43 @@ fn regression_retargeted_symlink_refused() {
         }
     }
 }
+
+/// Pinning (R6-H7 nit): a record that is not `none` but has lost its stamp rows
+/// (`base_size`, `base_mtime_ns`; a database edited by hand, or written by a
+/// build that did not record them) has nothing to compare the archive's stamp
+/// or a pending journal against. An offline commit then rests on the kind and
+/// place checks alone and goes through, even over a swapped archive at the
+/// same place. This documents that limit so a change to it is deliberate; with
+/// the rows present the same swap is refused (the sibling test above).
+#[test]
+fn regression_missing_stamp_rows_on_a_digest_record_skip_only_the_stamp_check() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    fs::write(ov.root().join("one"), b"one").unwrap();
+    drop(ov);
+    {
+        let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
+        for key in ["base_size", "base_mtime_ns"] {
+            OverlayMeta::remove(&conn, key).unwrap();
+        }
+    }
+    let swapped = fx.swap_for_other_tar();
+    let token = archive_token(&fx.archive);
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    assert!(
+        crate::commit_overlay(&fx.overlay, &fx.archive, &token, &opts).is_ok(),
+        "a record without stamp rows commits on kind and place alone"
+    );
+    assert_ne!(
+        fs::read(&fx.archive).unwrap(),
+        swapped,
+        "the commit spliced into the swapped archive"
+    );
+}
