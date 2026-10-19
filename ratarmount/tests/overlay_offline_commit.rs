@@ -224,6 +224,52 @@ fn regression_refused_offline_commit_writes_no_sidecar_files() {
     );
 }
 
+/// Regression (R6-G6, #7): replacing an indexed TAR left a stale sidecar, and
+/// `--commit-overlay --force-base-mismatch` died loading it before the override
+/// gate. Without force the replacement is refused naming the flag; with force
+/// the commit goes through and never needs the sidecar.
+#[test]
+fn regression_stale_sidecar_does_not_block_force() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let env = Env::new();
+    let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+    env.ok(&["--no-mount", s(&archive)]);
+    assert!(env.path("base.tar.index.sqlite").exists());
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+    // Replace the archive: the sidecar now describes the old one.
+    let replacement = tar_with(
+        &env,
+        "replacement.tar",
+        &[("b.txt", b"bb\n"), ("c.txt", b"c\n")],
+    );
+    fs::rename(&replacement, &archive).unwrap();
+    let before = fs::read(&archive).unwrap();
+    let out = env.run(&["--commit-overlay", "-w", s(&overlay), s(&archive)]);
+    assert!(!out.status.success(), "must refuse: {}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--force-base-mismatch"), "{err}");
+    assert!(fs::read(&archive).unwrap() == before, "archive modified");
+    let out = env.run(&[
+        "--commit-overlay",
+        "-w",
+        s(&overlay),
+        "--force-base-mismatch",
+        "--yes",
+        s(&archive),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let listing = members(&archive);
+    assert!(
+        listing.contains("new.txt") && listing.contains("b.txt"),
+        "{listing}"
+    );
+}
+
 /// Leave `archive` mid-commit the way a crash does (journal and locator on
 /// disk, the archive truncated at the replaced suffix).
 fn interrupt_append(archive: &Path) {
