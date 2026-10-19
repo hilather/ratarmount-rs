@@ -855,8 +855,23 @@ impl ClassifiedBase {
             _ => None,
         };
         let redacted = |raw: &str| ratarmount_core::redact_base_url(raw);
+        // `--index-file` takes a path, but a URL typed there reaches us as one:
+        // it is no index file, and its credentials must not be recorded.
+        let index_text = match &index {
+            IndexProvenance::Local(path) | IndexProvenance::Discovered { path, .. } => {
+                Some(path.to_string_lossy().into_owned())
+            }
+            IndexProvenance::None => None,
+        };
+        let index_is_url = index_text.as_deref().is_some_and(|t| t.contains("://"));
         let credentialed = redacted(raw_first) != raw_first
-            || index_from.is_some_and(|from| redacted(from) != from);
+            || index_from.is_some_and(|from| redacted(from) != from)
+            || index_text.as_deref().is_some_and(|t| redacted(t) != t);
+        let index = if index_is_url {
+            IndexProvenance::None
+        } else {
+            index
+        };
         let (base_kind, git_tree) = match kind {
             ServedKind::Git { tree } => (BaseKind::Git, Some(tree)),
             ServedKind::Folder => (BaseKind::Dir, None),
@@ -1093,6 +1108,41 @@ mod tests {
             sidecar_candidate: None,
             fetched: false,
             keep_alive: Box::new(()),
+        }
+    }
+
+    /// Regression (R6-F1): `--index-file https://user:secret@h/x.sqlite` is a
+    /// path to the factory, so a public archive was minted with that text as
+    /// its "local" index and its credentials reached `base_index_path` and the
+    /// packed metadata. A path that is a URL is no index file: the token
+    /// records none, and a credentialed one marks the base credentialed.
+    #[test]
+    fn regression_url_shaped_index_file_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for raw in [
+            "https://user:s3cr3t@h.example/x.sqlite?sig=abc",
+            "https://h.example/x.sqlite",
+        ] {
+            for index in [
+                IndexProvenance::Local(PathBuf::from(raw)),
+                IndexProvenance::Discovered {
+                    path: PathBuf::from(raw),
+                    from: "https://h.example/a.tar".into(),
+                },
+            ] {
+                let mut o = opened(&root, ServedKind::Archive, &["a.tar"]);
+                o.location = Some(ServedLocation::Local(root.join("a.tar")));
+                o.index = index;
+                let cb = ClassifiedBase::mint(o).unwrap();
+                assert_eq!(cb.actual().index_for_peek(), None, "{raw}");
+                let info = cb.actual().create_info(&CreateOptions {
+                    index_writable: true,
+                    ..Default::default()
+                });
+                assert_eq!(info.index_path, None, "{raw}");
+                assert_eq!(cb.actual().credentialed(), raw.contains("s3cr3t"), "{raw}");
+            }
         }
     }
 
