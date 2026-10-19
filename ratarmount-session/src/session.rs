@@ -530,6 +530,7 @@ fn open_options(req: &OpenRequest, hooks: &IndexBuildHooks) -> OpenOptions {
         write_index,
         read_only_index,
         index_build: hooks.clone(),
+        recover_journals: true,
         ..OpenOptions::default()
     }
 }

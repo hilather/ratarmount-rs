@@ -2066,27 +2066,10 @@ fn main() {
         }
     }
 
-    {
-        for input in &inputs {
-            if !ratarmount_remote::is_remote_url(&input.to_string_lossy()) {
-                // A complete journal rolls forward and restamps the `-w` overlay's
-                // recorded base BEFORE the journal is unlinked, so the identity
-                // gate that follows accepts the archive recovery produced.
-                let top_db = args
-                    .write_overlay
-                    .as_ref()
-                    .map(|dir| dir.join(ratarmount_compositing::HIDDEN_DB));
-                if let Err(e) = ratarmount_compositing::recover_journal_at(
-                    input,
-                    top_db.as_deref(),
-                    &mut ratarmount_compress::commit_journal::authorize_owned,
-                ) {
-                    eprintln!("error: commit recovery for {}: {e}", input.display());
-                    std::process::exit(2);
-                }
-            }
-        }
-    }
+    // Classify every local member's commit journal against the records that
+    // vote on it BEFORE any recovery write; members a record does not own wait
+    // for the identity gates (recovered below, after the overlay opened).
+    let deferred_journals = recover_mount_journals(&args, &inputs);
     if args.roll_every.is_none()
         && args.write_overlay.is_some()
         && inputs.len() == 1
@@ -2228,6 +2211,7 @@ fn main() {
             })
             .unwrap_or_default(),
         index_build: Default::default(),
+        recover_journals: false,
     };
 
     if args.force_folder_index {
@@ -2663,6 +2647,27 @@ fn main() {
                 eprintln!("{}", overlay_open_error(&overlay_path, &e));
                 std::process::exit(1);
             }
+        }
+    }
+
+    // Members whose complete journal waited for the gates: every gate accepted,
+    // so each is recovered now (through the overlay's own connection when there
+    // is one: it holds its database exclusively).
+    for member in &deferred_journals {
+        let recovered = match overlay_arc.as_ref() {
+            Some(ov) => ov.recover_member_journal(member).map_err(|e| e.to_string()),
+            None => ratarmount_compositing::recover_journal_at(
+                member,
+                None,
+                &mut ratarmount_compress::commit_journal::authorize_owned,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        };
+        if let Err(e) = recovered {
+            eprintln!("error: commit recovery for {}: {e}", member.display());
+            drop(overlay_arc);
+            std::process::exit(1);
         }
     }
 
@@ -4840,6 +4845,100 @@ fn lower_extra_excludes(
         out.extend(resolved.paths().iter().cloned());
     }
     out
+}
+
+/// The mount-time journal rule: before any recovery write, compare each
+/// member's journal against every readable overlay record (`-w` top, `--lower`
+/// directories). A journal every record agrees with (or abstains on) is
+/// recovered now and the top's rows restamped; one a record does not own is
+/// left untouched until every gate decided. A torn deferred journal is refused
+/// (nothing can open on a half-written archive); a complete one is returned for
+/// recovery after the gates. The decision is taken again under the archive lock.
+fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
+    use ratarmount_compositing::{
+        authorize_mount_recovery, classify_mount_journal, recover_journal_at, MountJournal,
+        MountRecords,
+    };
+    let mut members: Vec<PathBuf> = Vec::new();
+    for input in inputs {
+        let typed = input.to_string_lossy();
+        match ratarmount_remote::remote_url_scheme(&typed).as_deref() {
+            Some("file") => match &ratarmount_remote::resolve_to_local(&typed) {
+                Ok(ratarmount_remote::RemoteLocal::Local(path)) => members.push(path.clone()),
+                _ => members.push(input.clone()),
+            },
+            _ if ratarmount_remote::is_remote_url(&typed) => {}
+            _ => members.push(input.clone()),
+        }
+    }
+    if args.roll_every.is_some() && members.len() == 1 {
+        if let Ok(name) = ratarmount_compositing::SeriesName::new(&members[0]) {
+            if let Ok(found) = name.discover() {
+                members = found.into_iter().map(|(_, path)| path).collect();
+            }
+        }
+    }
+    for bind in &args.source_binds {
+        if !ratarmount_remote::is_remote_url(&bind.source) {
+            members.push(PathBuf::from(&bind.source));
+        }
+    }
+    let mut records = MountRecords::default();
+    if let Some(top) = args
+        .write_overlay
+        .as_ref()
+        .filter(|w| w.as_os_str() != ":temp:")
+    {
+        records.top = Some(top.clone());
+    }
+    for lower in &args.lower {
+        if lower.is_dir() {
+            records.lowers.push(lower.clone());
+        } else {
+            records.bundles = true;
+        }
+    }
+    let top_db = records
+        .top
+        .as_ref()
+        .map(|dir| dir.join(ratarmount_compositing::HIDDEN_DB));
+    let mut deferred = Vec::new();
+    for member in &members {
+        match classify_mount_journal(&records, member) {
+            Err(e) => {
+                eprintln!("error: commit recovery for {}: {e}", member.display());
+                std::process::exit(2);
+            }
+            Ok(MountJournal::None | MountJournal::Own) => {
+                let mut authorize =
+                    |header: &ratarmount_compress::commit_journal::PendingJournal,
+                     locked: &std::fs::Metadata| {
+                        authorize_mount_recovery(&records, member, header, locked)
+                    };
+                if let Err(e) = recover_journal_at(member, top_db.as_deref(), &mut authorize) {
+                    eprintln!("error: commit recovery for {}: {e}", member.display());
+                    std::process::exit(2);
+                }
+            }
+            Ok(MountJournal::Deferred { complete: true, .. }) => deferred.push(member.clone()),
+            Ok(MountJournal::Deferred {
+                complete: false,
+                why,
+                force_flag,
+            }) => {
+                eprintln!(
+                    "error: {} {why}; the replacement did not complete, so it cannot be opened \
+                     until recovered. Recover it alone first (`ratarmount --no-mount {}` rolls \
+                     the interrupted append back) or restore the recorded base, then retry, \
+                     with {force_flag} if it is meant to replace the recorded base.",
+                    member.display(),
+                    member.display()
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+    deferred
 }
 
 /// `--journal` files that exist already and lie inside a directory base under a

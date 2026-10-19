@@ -19,7 +19,7 @@ use std::time::Duration;
 use ratarmount_compress::commit_journal::{self, Applied, Authorize, PendingJournal, RecoverError};
 use rusqlite::Connection;
 
-use crate::overlay_gate::kind_only;
+use crate::overlay_gate::{kind_only, Recorded};
 use crate::overlay_meta::OverlayMeta;
 
 /// Which restamp rule applies.
@@ -252,4 +252,217 @@ pub fn recover_journal_at(
     // journal never touches the overlay database here.
     let rows = overlay_db.map_or(Rows::None, Rows::Path);
     recover_journal(archive, rows, authorize)
+}
+
+/// `verify`'s journal rule: the archive at `path` carries its OWN pending
+/// journal (started for this very inode) that agrees with the record, which
+/// names `path`. The stamp then differs only because recovery has not run yet.
+/// Never applies to a base at another place: the record must name `path`.
+pub(crate) fn own_pending_journal_agrees(
+    meta: &OverlayMeta,
+    path: &Path,
+    current: (u64, i128),
+) -> bool {
+    let (Ok(canonical), Some(size), Some(mtime)) = (
+        path.canonicalize(),
+        meta.get("base_size").and_then(|v| v.parse::<u64>().ok()),
+        meta.get("base_mtime_ns")
+            .and_then(|v| v.parse::<i128>().ok()),
+    ) else {
+        return false;
+    };
+    if !names(meta, &canonical) {
+        return false;
+    }
+    let Ok(Some(journal)) = commit_journal::pending(&canonical) else {
+        return false;
+    };
+    owns(&journal, &canonical) && journal_agrees((size, mtime), current, &journal)
+}
+
+/// The journal was started for the file `path` resolves to.
+fn owns(journal: &PendingJournal, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).is_ok_and(|m| m.ino() == journal.ino)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (journal, path);
+        false
+    }
+}
+
+// ---- mount-time classification (R7-A1) -------------------------------------
+
+/// What a mount knows about the overlay records that vote on a member's journal.
+#[derive(Clone, Debug, Default)]
+pub struct MountRecords {
+    /// The `-w` overlay directory (its database is the top record).
+    pub top: Option<std::path::PathBuf>,
+    /// Every `--lower` that is a directory (each holds a sealed record).
+    pub lowers: Vec<std::path::PathBuf>,
+    /// A `--lower` is a bundle file: its record is readable only after the
+    /// mount unpacks it, so it cannot vote yet.
+    pub bundles: bool,
+}
+
+/// The decision for one member's pending journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MountJournal {
+    /// No journal is pending (a stale locator may still be cleared).
+    None,
+    /// Every readable record abstains or agrees: recover before any gate.
+    Own,
+    /// Some record does not own it: no write until every gate has decided.
+    Deferred {
+        complete: bool,
+        why: String,
+        force_flag: &'static str,
+    },
+}
+
+fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
+    if !fs::symlink_metadata(dir.join(crate::HIDDEN_DB)).is_ok_and(|m| m.is_file()) {
+        return Ok(None);
+    }
+    OverlayMeta::read_no_recovery(dir).map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// The decision table on the journal header and the file's current identity.
+/// `current` is `(ino, len, mtime_ns)`.
+fn decide(
+    records: &MountRecords,
+    canonical: &Path,
+    journal: &PendingJournal,
+    current: (u64, u64, i128),
+) -> io::Result<MountJournal> {
+    if journal.ino != current.0 {
+        return Err(io::Error::other(format!(
+            "{} carries a commit journal that was started for another file \
+             (journal inode {}, archive inode {}); the journal was not applied",
+            canonical.display(),
+            journal.ino,
+            current.0
+        )));
+    }
+    let defer = |why: String, flag: &'static str| MountJournal::Deferred {
+        complete: journal.complete,
+        why,
+        force_flag: flag,
+    };
+    if records.bundles {
+        return Ok(defer(
+            "a --lower bundle's record is read after unpacking".into(),
+            "--force-stack-mismatch",
+        ));
+    }
+    let voters = records
+        .top
+        .iter()
+        .map(|d| (d, true))
+        .chain(records.lowers.iter().map(|d| (d, false)));
+    for (dir, is_top) in voters {
+        let flag = if is_top {
+            "--force-base-mismatch"
+        } else {
+            "--force-stack-mismatch"
+        };
+        let meta = match read_record(dir) {
+            Ok(meta) => meta,
+            Err(e) => {
+                return Ok(defer(
+                    format!(
+                        "has an overlay record ({}) that cannot be read: {e}",
+                        dir.display()
+                    ),
+                    flag,
+                ))
+            }
+        };
+        let Some(meta) = meta else { continue };
+        if is_top && meta.layer_sealed() {
+            return Ok(defer("is guarded by a sealed overlay".into(), flag));
+        }
+        match Recorded::from_meta(Some(&meta)) {
+            Recorded::Unrecorded | Recorded::Nothing => continue,
+            Recorded::Unknown => {
+                return Ok(defer(
+                    "has an overlay record with no usable base kind".into(),
+                    flag,
+                ))
+            }
+            Recorded::Kind { .. } => {}
+        }
+        if !names(&meta, canonical) {
+            return Ok(defer("is not the base this overlay recorded".into(), flag));
+        }
+        if kind_only(&meta) {
+            continue;
+        }
+        let (Some(size), Some(mtime)) = (
+            meta.get("base_size").and_then(|v| v.parse::<u64>().ok()),
+            meta.get("base_mtime_ns")
+                .and_then(|v| v.parse::<i128>().ok()),
+        ) else {
+            continue;
+        };
+        if !journal_agrees((size, mtime), (current.1, current.2), journal) {
+            return Ok(defer(
+                format!(
+                    "carries a commit journal that was not started for the recorded base \
+                     (it rolls back to size={},mtime_ns={}; size={size},mtime_ns={mtime} recorded)",
+                    journal.len, journal.mtime_ns
+                ),
+                flag,
+            ));
+        }
+    }
+    Ok(MountJournal::Own)
+}
+
+fn current_identity(meta: &fs::Metadata) -> (u64, u64, i128) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            meta.ino(),
+            meta.len(),
+            i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        (0, meta.len(), 0)
+    }
+}
+
+/// Read-only: the pending journal of `member` and every readable record. Never
+/// recovers and never rolls an overlay database's own journal back.
+pub fn classify_mount_journal(records: &MountRecords, member: &Path) -> io::Result<MountJournal> {
+    let Some(journal) = commit_journal::pending(member)? else {
+        return Ok(MountJournal::None);
+    };
+    let canonical = member.canonicalize()?;
+    let metadata = fs::metadata(member)?;
+    decide(records, &canonical, &journal, current_identity(&metadata))
+}
+
+/// The same table on the header read under the archive lock and the locked
+/// descriptor's metadata: `Ok(())` only for [`MountJournal::Own`].
+pub fn authorize_mount_recovery(
+    records: &MountRecords,
+    member: &Path,
+    locked: &PendingJournal,
+    file: &fs::Metadata,
+) -> io::Result<()> {
+    let canonical = member.canonicalize()?;
+    match decide(records, &canonical, locked, current_identity(file))? {
+        MountJournal::None | MountJournal::Own => Ok(()),
+        MountJournal::Deferred { why, .. } => Err(io::Error::other(format!(
+            "{} {why}; its commit journal changed while the mount classified it, retry",
+            member.display()
+        ))),
+    }
 }

@@ -4365,6 +4365,13 @@ impl WriteOverlay {
     /// message), then recovery whose authorizer re-takes the same decision on
     /// the LOCKED file. A complete journal is rolled forward and the rows
     /// restamped (a strong digest `pending`) BEFORE the journal is unlinked.
+    /// Recover `archive`'s pending journal AFTER every gate accepted the mount
+    /// (a member whose journal the mount-time classifier deferred). Runs
+    /// through this overlay's own connection: it holds its database exclusively.
+    pub fn recover_member_journal(&self, archive: &Path) -> Result<()> {
+        self.recover_journal(archive).map(|_| ())
+    }
+
     fn recover_journal(
         &self,
         archive: &Path,

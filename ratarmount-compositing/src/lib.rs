@@ -54,7 +54,10 @@ pub use empty_archive::{
     EmptyCreateOutcome,
 };
 pub use folder::FolderMountSource;
-pub use journal_recovery::{journal_agrees, recover_journal_at};
+pub use journal_recovery::{
+    authorize_mount_recovery, classify_mount_journal, journal_agrees, recover_journal_at,
+    MountJournal, MountRecords,
+};
 pub use oci_whiteout::OciImageMountSource;
 pub use overlay_gate::{
     compare_base_identity, ensure_journal_is_for_archive, forced_base_record,

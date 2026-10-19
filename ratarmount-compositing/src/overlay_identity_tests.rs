@@ -2072,3 +2072,236 @@ fn regression_symlink_retargeted_or_replaced_target_is_refused() {
         }
     }
 }
+
+// ---- R7-A1: mount-time journal -------------------------------------------------
+
+use crate::{authorize_mount_recovery, classify_mount_journal, MountJournal, MountRecords};
+
+fn records_of(fx: &Fixture) -> MountRecords {
+    MountRecords {
+        top: Some(fx.overlay.clone()),
+        ..Default::default()
+    }
+}
+
+/// `foreign.tar` with an interrupted append (torn or complete), renamed over
+/// `fx.archive`: the name now has ANOTHER file's inode and journal.
+#[cfg(unix)]
+fn rename_b_over_a(fx: &Fixture, complete: bool) -> (Vec<u8>, PathBuf, Vec<u8>) {
+    let foreign = fx.archive.with_file_name("foreign.tar");
+    write_tar(&foreign, &[("b", b"bb"), ("c", b"c")]);
+    if complete {
+        interrupt_complete(&foreign);
+    } else {
+        interrupt_append(&foreign);
+    }
+    let journal = ratarmount_compress::commit_journal::journal_path(&foreign);
+    let journal_bytes = fs::read(&journal).unwrap();
+    let bytes = fs::read(&foreign).unwrap();
+    fs::rename(&foreign, &fx.archive).unwrap();
+    (bytes, journal, journal_bytes)
+}
+
+/// Regression (R7-A1, Keystone 1): `mv B A` where B carries its own interrupted
+/// journal. The journal's inode matches the file at A's name, so the unlocked
+/// ownership check passed and recovery rolled B back BEFORE the gate refused
+/// the stamp. The classifier compares the journal's pre-commit stamp with the
+/// recorded base first: Deferred, and the locked authorizer refuses too, with
+/// the archive and the journal byte-identical.
+#[cfg(unix)]
+#[test]
+fn regression_mount_rename_b_over_a_is_deferred_and_untouched() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for complete in [false, true] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let (bytes, journal, journal_bytes) = rename_b_over_a(&fx, complete);
+        let records = records_of(&fx);
+        let decision = classify_mount_journal(&records, &fx.archive).unwrap();
+        match &decision {
+            MountJournal::Deferred {
+                complete: c,
+                force_flag,
+                why,
+            } => {
+                assert_eq!(*c, complete);
+                assert_eq!(*force_flag, "--force-base-mismatch");
+                assert!(why.contains("not started for the recorded base"), "{why}");
+            }
+            other => panic!("complete={complete}: {other:?}"),
+        }
+        let db = fx.overlay.join(HIDDEN_DB);
+        let archive = fx.archive.clone();
+        let mut authorize = |h: &ratarmount_compress::commit_journal::PendingJournal,
+                             m: &fs::Metadata| {
+            authorize_mount_recovery(&records, &archive, h, m)
+        };
+        let refused = crate::recover_journal_at(&fx.archive, Some(&db), &mut authorize);
+        assert!(
+            matches!(
+                refused,
+                Err(ratarmount_compress::commit_journal::RecoverError::Refused(
+                    _
+                ))
+            ),
+            "complete={complete}: {refused:?}"
+        );
+        assert_eq!(fs::read(&fx.archive).unwrap(), bytes, "complete={complete}");
+        assert_eq!(
+            fs::read(&journal).unwrap(),
+            journal_bytes,
+            "complete={complete}"
+        );
+    }
+}
+
+/// Regression (R7-A1): the table's other rows. The overlay's own torn and
+/// complete journals are `Own`; a record naming another file (a union member),
+/// a bundle `--lower`, a sealed or unreadable top and a lower that disagrees
+/// all defer; a journal from another inode is an error; no journal is `None`.
+#[cfg(unix)]
+#[test]
+fn regression_mount_journal_table() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for complete in [false, true] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let records = records_of(&fx);
+        assert_eq!(
+            classify_mount_journal(&records, &fx.archive).unwrap(),
+            MountJournal::None
+        );
+        if complete {
+            interrupt_complete(&fx.archive);
+        } else {
+            interrupt_append(&fx.archive);
+        }
+        assert_eq!(
+            classify_mount_journal(&records, &fx.archive).unwrap(),
+            MountJournal::Own,
+            "complete={complete}"
+        );
+        // No overlay at all: nothing votes.
+        assert_eq!(
+            classify_mount_journal(&MountRecords::default(), &fx.archive).unwrap(),
+            MountJournal::Own
+        );
+        // A bundle lower cannot vote yet: everything waits.
+        let bundles = MountRecords {
+            bundles: true,
+            ..records.clone()
+        };
+        assert!(matches!(
+            classify_mount_journal(&bundles, &fx.archive).unwrap(),
+            MountJournal::Deferred {
+                force_flag: "--force-stack-mismatch",
+                ..
+            }
+        ));
+        // A record that names another file: this member is not the base.
+        let member = fx.archive.with_file_name("member.tar");
+        write_tar(&member, &[("m", b"member")]);
+        if complete {
+            interrupt_complete(&member);
+        } else {
+            interrupt_append(&member);
+        }
+        match classify_mount_journal(&records, &member).unwrap() {
+            MountJournal::Deferred {
+                why, complete: c, ..
+            } => {
+                assert_eq!(c, complete);
+                assert!(why.contains("not the base this overlay recorded"), "{why}");
+            }
+            other => panic!("complete={complete}: {other:?}"),
+        }
+        // A lower record that disagrees votes too.
+        let lower = fx.archive.with_file_name("lower");
+        fs::create_dir(&lower).unwrap();
+        {
+            let conn = rusqlite::Connection::open(lower.join(HIDDEN_DB)).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            let path = fx.archive.canonicalize().unwrap();
+            OverlayMeta::set_many(
+                &conn,
+                &[
+                    ("format_version", "2"),
+                    ("base_kind", "archive"),
+                    ("base_local_path", path.to_str().unwrap()),
+                    ("base_digest_kind", "weak"),
+                    ("base_size", "1"),
+                    ("base_mtime_ns", "1"),
+                ],
+            )
+            .unwrap();
+        }
+        let with_lower = MountRecords {
+            lowers: vec![lower],
+            ..records.clone()
+        };
+        assert!(matches!(
+            classify_mount_journal(&with_lower, &fx.archive).unwrap(),
+            MountJournal::Deferred {
+                force_flag: "--force-stack-mismatch",
+                ..
+            }
+        ));
+        // A journal started for another inode is refused outright.
+        let copy = fx.archive.with_file_name("inode-copy.tmp");
+        fs::write(&copy, fs::read(&fx.archive).unwrap()).unwrap();
+        fs::rename(&copy, &fx.archive).unwrap();
+        assert!(classify_mount_journal(&records, &fx.archive)
+            .unwrap_err()
+            .to_string()
+            .contains("another file"));
+    }
+}
+
+/// Regression (R7-A1): `verify` accepts an archive whose stamp differs from the
+/// record ONLY because its own pending journal is not recovered yet, and never
+/// for a base at another place or a journal that was not started for the rows.
+#[cfg(unix)]
+#[test]
+fn regression_verify_accepts_own_pending_journal() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let meta = || OverlayMeta::read(&fx.overlay).unwrap().unwrap();
+    let now = |p: &Path| {
+        let s = ratarmount_index::ArchiveDigestStamp::read(p).unwrap();
+        (s.size, s.mtime_ns)
+    };
+    interrupt_complete(&fx.archive);
+    assert!(crate::journal_recovery::own_pending_journal_agrees(
+        &meta(),
+        &fx.archive,
+        now(&fx.archive)
+    ));
+    // Another place: the record does not name it.
+    let copy = fx.archive.with_file_name("copy.tar");
+    fs::copy(&fx.archive, &copy).unwrap();
+    assert!(!crate::journal_recovery::own_pending_journal_agrees(
+        &meta(),
+        &copy,
+        now(&copy)
+    ));
+    // A foreign journal under the same name.
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    rename_b_over_a(&fx, true);
+    assert!(!crate::journal_recovery::own_pending_journal_agrees(
+        &OverlayMeta::read(&fx.overlay).unwrap().unwrap(),
+        &fx.archive,
+        now(&fx.archive)
+    ));
+}

@@ -585,6 +585,11 @@ pub struct OpenOptions {
     pub hashes: Vec<String>,
     /// Progress/cancel for a cold SQLite index build. Empty = no-op.
     pub index_build: IndexBuildHooks,
+    /// Recover a pending commit journal of a local archive before opening it
+    /// (default). A mount that already classified and recovered its members
+    /// (`ratarmount`'s mount loop) turns this off so no journal is applied
+    /// before every identity gate has decided.
+    pub recover_journals: bool,
 }
 
 impl Default for OpenOptions {
@@ -625,6 +630,7 @@ impl Default for OpenOptions {
             git_synthetic_head: false,
             hashes: Vec::new(),
             index_build: IndexBuildHooks::default(),
+            recover_journals: true,
         }
     }
 }

@@ -270,9 +270,17 @@ pub fn open_rolling_series(
     opts: &OpenOptions,
 ) -> Result<Arc<ratarmount_compositing::RollingMountSource>, String> {
     let opts = opts.clone();
-    ratarmount_compositing::RollingMountSource::open(base, policy, move |path| {
-        ratarmount_session::factory::open_path(path, &opts, false).map_err(OverlayError::Msg)
-    })
+    // The mount classified and recovered every generation first (see main), so
+    // the opener does not recover them before the identity gates decided.
+    let recover = opts.recover_journals;
+    ratarmount_compositing::RollingMountSource::open_with_recovery(
+        base,
+        policy,
+        move |path| {
+            ratarmount_session::factory::open_path(path, &opts, false).map_err(OverlayError::Msg)
+        },
+        recover,
+    )
     .map(Arc::new)
     .map_err(|e| e.to_string())
 }

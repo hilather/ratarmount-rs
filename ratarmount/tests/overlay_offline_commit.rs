@@ -683,3 +683,135 @@ fn regression_offline_commit_roll_forward_with_empty_plan_restamps() {
     env.ok(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
     assert!(members(&archive).contains("new.txt"));
 }
+
+/// `foreign.tar` carrying an interrupted append (torn or complete), renamed
+/// over `archive`. Returns the archive bytes and the journal path and bytes.
+#[cfg(unix)]
+fn rename_b_over_a(env: &Env, archive: &Path, complete: bool) -> (Vec<u8>, PathBuf, Vec<u8>) {
+    let foreign = tar_with(env, "foreign.tar", &[("b.txt", b"bb\n"), ("c.txt", b"c\n")]);
+    if complete {
+        interrupt_complete(&foreign);
+    } else {
+        interrupt_append(&foreign);
+    }
+    let bytes = fs::read(&foreign).unwrap();
+    let journal = ratarmount_compress::commit_journal::journal_path(&foreign);
+    let journal_bytes = fs::read(&journal).unwrap();
+    fs::rename(&foreign, archive).unwrap();
+    (bytes, journal, journal_bytes)
+}
+
+/// Regression (R7-A1, Keystone 1): `mv B A` where B carries its own interrupted
+/// journal. The journal's inode matches the file at A's name, so mount-time
+/// recovery rolled B back BEFORE the gate refused the stamp. Now the journal's
+/// pre-commit stamp is compared with the recorded base first: exit 2, the
+/// archive and the journal byte-identical (torn and complete).
+#[cfg(unix)]
+#[test]
+fn regression_mount_rename_b_over_a_leaves_b_and_its_journal_untouched() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for complete in [false, true] {
+        let env = Env::new();
+        let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+        let overlay = env.path("overlay");
+        env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+        let (bytes, journal, journal_bytes) = rename_b_over_a(&env, &archive, complete);
+        let out = env.run(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        if complete {
+            // A complete journal waits for the gate, which refuses the stamp.
+            assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+            assert!(err.contains("base mismatch"), "{err}");
+        } else {
+            // A torn one can be neither opened nor applied: refused up front.
+            assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+            assert!(err.contains("not started for the recorded base"), "{err}");
+        }
+        assert!(err.contains("--force-base-mismatch"), "{err}");
+        assert!(
+            fs::read(&archive).unwrap() == bytes,
+            "complete={complete}: archive"
+        );
+        assert!(
+            fs::read(&journal).unwrap() == journal_bytes,
+            "complete={complete}: journal"
+        );
+    }
+}
+
+/// Regression (R7-A1): a COMPLETE foreign journal under `--force-base-mismatch`
+/// is recovered only AFTER the gates accepted, and the overlay keeps A's
+/// baseline: a second unforced open still refuses B.
+#[cfg(unix)]
+#[test]
+fn regression_forced_rename_b_over_a_keeps_a_baseline() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let env = Env::new();
+    let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    let (bytes, journal, _) = rename_b_over_a(&env, &archive, true);
+    let before = info(&env, &overlay);
+    let out = env.run(&[
+        "--no-mount",
+        "--force-base-mismatch",
+        "-w",
+        s(&overlay),
+        s(&archive),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!journal.exists(), "journal recovered after the gate");
+    assert!(
+        fs::read(&archive).unwrap() == bytes,
+        "rolled forward: bytes unchanged"
+    );
+    let after = info(&env, &overlay);
+    assert_eq!(after["base_digest_kind"], before["base_digest_kind"]);
+    let again = env.run(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    assert!(
+        !again.status.success(),
+        "B is still not the recorded base: {}",
+        text(&again)
+    );
+}
+
+/// Regression (R7-A1): a union member (not the recorded base) with a COMPLETE
+/// own journal waits for the gate: the mount of `-w ov A B` is refused or
+/// accepted by the gate first; a torn member journal is refused with the
+/// instruction, untouched.
+#[cfg(unix)]
+#[test]
+fn regression_mount_union_member_journal_waits_for_the_gate() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let env = Env::new();
+    let a = tar_with(&env, "a.tar", &[("a.txt", b"a\n")]);
+    let b = tar_with(&env, "b.tar", &[("b.txt", b"b\n")]);
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&a)]);
+    interrupt_append(&b);
+    let crashed = fs::read(&b).unwrap();
+    let journal = ratarmount_compress::commit_journal::journal_path(&b);
+    let journal_bytes = fs::read(&journal).unwrap();
+    let out = env.run(&["--no-mount", "-w", s(&overlay), s(&a), s(&b)]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not the base this overlay recorded"), "{err}");
+    assert!(err.contains("--no-mount"), "{err}");
+    assert!(fs::read(&b).unwrap() == crashed, "member untouched");
+    assert!(
+        fs::read(&journal).unwrap() == journal_bytes,
+        "journal untouched"
+    );
+    // Recovered alone first, the member opens again.
+    env.ok(&["--no-mount", s(&b)]);
+    assert!(!journal.exists(), "recovered alone");
+}

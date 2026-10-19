@@ -190,7 +190,18 @@ impl OverlayMeta {
     /// Read without creating a directory, database, or table. `None` means an
     /// existing legacy database with no meta table; a missing DB is an error.
     pub fn read(dir: impl AsRef<Path>) -> Result<Option<Self>> {
-        let db = dir.as_ref().join(HIDDEN_DB);
+        Self::read_with(dir.as_ref(), true)
+    }
+
+    /// [`Self::read`] that never rolls an overlay database's hot `-journal`
+    /// back: a hot journal is an error (the caller defers to the open that may
+    /// write). For classification before any recovery writes.
+    pub fn read_no_recovery(dir: impl AsRef<Path>) -> Result<Option<Self>> {
+        Self::read_with(dir.as_ref(), false)
+    }
+
+    fn read_with(dir: &Path, recover_hot: bool) -> Result<Option<Self>> {
+        let db = dir.join(HIDDEN_DB);
         if !fs::symlink_metadata(&db)?.is_file() {
             return Err(OverlayError::Msg(format!(
                 "overlay database {} must be a regular file",
@@ -206,8 +217,8 @@ impl OverlayMeta {
             Self::from_connection(&conn)
         };
         let result = match read() {
-            Err(OverlayError::Sqlite(error)) if is_hot_journal(&error) => {
-                recover_hot_journal(dir.as_ref(), &db).and_then(|()| read())
+            Err(OverlayError::Sqlite(error)) if recover_hot && is_hot_journal(&error) => {
+                recover_hot_journal(dir, &db).and_then(|()| read())
             }
             other => other,
         };
@@ -220,7 +231,7 @@ impl OverlayMeta {
             {
                 OverlayError::Sqlite(rusqlite::Error::SqliteFailure(
                     code,
-                    Some(format!("overlay {} is in use", dir.as_ref().display())),
+                    Some(format!("overlay {} is in use", dir.display())),
                 ))
             }
             error => error,
@@ -1746,6 +1757,21 @@ fn verify(
     } else if let (Some(size), Some(mtime)) = (meta.get("base_size"), meta.get("base_mtime_ns")) {
         match info.stamp()? {
             Some(now) if now.size.to_string() == size && now.mtime_ns.to_string() == mtime => None,
+            // The archive carries its OWN pending commit journal that was
+            // started for the recorded base (or the rows already describe the
+            // committed bytes): recovery after the gates settles it, so the
+            // stamp difference is not a foreign base.
+            Some(now)
+                if info.path().is_some_and(|p| {
+                    crate::journal_recovery::own_pending_journal_agrees(
+                        meta,
+                        p,
+                        (now.size, now.mtime_ns),
+                    )
+                }) =>
+            {
+                None
+            }
             Some(now) => Some(format!(
                 "weak:size={},mtime_ns={} (current SHA-256 not recomputed)",
                 now.size, now.mtime_ns

@@ -2320,7 +2320,7 @@ fn open_path_impl(
             });
         }
     }
-    if !ratarmount_index::looks_like_url_archive(path) {
+    if options.recover_journals && !ratarmount_index::looks_like_url_archive(path) {
         ratarmount_compositing::recover_journal_at(
             path,
             None,
