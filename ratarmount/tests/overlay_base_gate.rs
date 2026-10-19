@@ -1023,11 +1023,13 @@ fn regression_forced_seal_git_to_dir_and_archive_to_git_clear_stale_rows() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
 }
 
-/// Regression (R6-F4): packing a sealed `none` overlay against another archive
-/// is ACCEPTED (kind-only), but the bundle's database still named the previous
-/// base. The accepted relocation rows now travel into the bundle.
+/// Regression (R6-G1, reverts R6-F4): an ACCEPTED `none` pack against another
+/// archive rewrote the bundle's base rows and dropped `base_git_tree` and
+/// `base_weak_digest`, so a layer that MODIFIED `/x.txt` of A became an ADDED
+/// `/x.txt` over B (which has none) while the old seal survived, and the
+/// bundle failed unpack / verify. An accepted pack leaves the rows untouched.
 #[test]
-fn regression_accepted_pack_records_the_base_it_was_packed_against() {
+fn regression_accepted_pack_leaves_rows_and_change_set_untouched() {
     let env = Env::new();
     let (base, _) = fixture(&env, Kind::Archive, false);
     fs::remove_dir_all(env.path("overlay")).unwrap();
@@ -1042,12 +1044,20 @@ fn regression_accepted_pack_records_the_base_it_was_packed_against() {
         "none",
         s(&base),
     ]);
+    fs::write(overlay.join("x.txt"), b"new\n").unwrap();
     env.ok(&["overlay", "seal", s(&overlay)]);
     let recorded = meta_of(&overlay);
-    assert_eq!(recorded.base_digest_kind(), Some("none"));
-    let copy = env.path("elsewhere.tar");
-    fs::copy(&base, &copy).unwrap();
-    let out = verb(&env, Verb::Pack, &overlay, &copy, &[]);
+    // B has no x.txt, so the layer would be an add over it.
+    let other_dir = env.path("otherdir");
+    fs::create_dir(&other_dir).unwrap();
+    fs::write(other_dir.join("z.txt"), b"z\n").unwrap();
+    let other = env.path("other.tar");
+    assert!(Command::new("tar")
+        .args(["cf", s(&other), "-C", s(&other_dir), "z.txt"])
+        .status()
+        .unwrap()
+        .success());
+    let out = verb(&env, Verb::Pack, &overlay, &other, &[]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let restored = env.path("restored");
     env.ok(&[
@@ -1057,9 +1067,14 @@ fn regression_accepted_pack_records_the_base_it_was_packed_against() {
         s(&restored),
     ]);
     let meta = meta_of(&restored);
-    assert_eq!(meta.get("base_url"), Some(s(&copy)), "base_url");
-    let location = meta.get("base_location").unwrap_or_default();
-    assert!(location.ends_with("elsewhere.tar"), "{location}");
-    // The sealed source layer is never modified.
-    assert_eq!(meta_of(&overlay).get("base_url"), recorded.get("base_url"));
+    for key in [
+        "base_url",
+        "base_location",
+        "base_git_tree",
+        "base_weak_digest",
+    ] {
+        assert_eq!(meta.get(key), recorded.get(key), "{key}");
+    }
+    // The layer still modifies A's x.txt: verify against A passes.
+    env.ok(&["overlay", "verify", s(&restored), s(&base)]);
 }

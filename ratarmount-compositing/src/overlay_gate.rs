@@ -296,37 +296,6 @@ pub(crate) fn write_accepted_identity(
     )
 }
 
-/// The rows an ACCEPTED (not forced) comparison would write for a base that
-/// moved to another place, or `None` when the record names this place. `pack` carries
-/// them into the bundle so it names the base it was packed against. The
-/// overlay itself is not touched.
-pub fn accepted_base_rows(
-    meta: Option<&OverlayMeta>,
-    base: &ClassifiedBase,
-) -> Result<Option<BTreeMap<String, String>>> {
-    let Some(identity) = identity_rows(meta, base) else {
-        return Ok(None);
-    };
-    // Only a record that names a kind describes a base to correct; a released
-    // overlay (no kind) keeps its rows, as a plain reopen would first record them.
-    if !matches!(Recorded::from_meta(meta), Recorded::Kind { .. }) {
-        return Ok(None);
-    }
-    let moved = meta
-        .and_then(|m| m.get("base_location"))
-        .is_some_and(|row| Some(row) != identity.get("base_location").map(String::as_str));
-    if !moved {
-        return Ok(None);
-    }
-    let mut rows = relocation_rows(base)?;
-    // A relocation keeps what the record already says about the digest.
-    if let Some(source) = meta.and_then(|m| m.get("base_digest_source")) {
-        rows.entry("base_digest_source".to_owned())
-            .or_insert_with(|| source.to_owned());
-    }
-    Ok(Some(rows))
-}
-
 /// The rows a forced seal, pack, diff or reopen records so the overlay
 /// describes the base actually used. A supplied digest is recorded as strong
 /// (with the directory manifest or archive stamp measured now); with nothing

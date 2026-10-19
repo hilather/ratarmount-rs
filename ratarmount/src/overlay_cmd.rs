@@ -380,9 +380,6 @@ pub(super) struct GateOutcome {
     /// Set when `--force-base-mismatch` overrode a mismatch: the rows that
     /// describe the base actually used (`base_digest`, `stack_digest`, ...).
     pub forced: Option<std::collections::BTreeMap<String, String>>,
-    /// Set when the gate accepted a base at another place than the record
-    /// names: the rows that describe the base actually used.
-    pub accepted: Option<std::collections::BTreeMap<String, String>>,
     /// True when a recorded row (stamp, manifest, tree) or an equal strong
     /// digest confirmed the base. False for a base with nothing cheap to
     /// compare (remote): the recorded identity is then unconfirmed.
@@ -418,8 +415,6 @@ pub(super) fn gate_base(
         return Ok(Some(GateOutcome {
             recorded,
             forced: None,
-            accepted: ratarmount_compositing::overlay_gate::accepted_base_rows(meta, base)
-                .map_err(|e| e.to_string())?,
             confirmed,
         }));
     };
@@ -444,7 +439,6 @@ pub(super) fn gate_base(
     Ok(Some(GateOutcome {
         recorded,
         forced: Some(forced),
-        accepted: None,
         confirmed: false,
     }))
 }
@@ -456,12 +450,10 @@ pub fn pack(args: &PackArgs, context: &OverlayRunContext) -> Result<(String, i32
     }
     let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
     let base = classify_base(args.base.as_ref(), meta.as_ref(), None, context)?;
-    let outcome = gate_base(&args.directory, meta.as_ref(), &base, &args.identity)?;
-    let accepted = outcome.as_ref().and_then(|o| o.accepted.clone());
-    let forced = outcome.and_then(|outcome| outcome.forced);
+    let forced = gate_base(&args.directory, meta.as_ref(), &base, &args.identity)?
+        .and_then(|outcome| outcome.forced);
     let lower = lower_view(&base, &args.lower, meta.as_ref())?;
     let options = super::overlay_pack::PackOptions {
-        accepted_rows: accepted,
         include_journal: args.include_journal.clone(),
         include_index: args.include_index,
         base: base_archive(&base),
