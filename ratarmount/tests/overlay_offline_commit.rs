@@ -867,3 +867,54 @@ fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
         );
     }
 }
+
+/// Regression (R10-B, #150, v4 T6): `--commit-overlay` with the overlay used
+/// (marker kept) and its database either deleted or replaced by a symlink
+/// that cannot be resolved (`plain-file/missing.sqlite`: `ENOTDIR`), with B
+/// (its own torn or complete journal) renamed over A. A deleted database read
+/// as "no database" and the raw-directory branch ran inode-only recovery on B;
+/// the unresolvable one could read as a record. Both exit 2 before any
+/// recovery and B and its journal stay byte-identical.
+#[cfg(unix)]
+#[test]
+fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for unresolved in [false, true] {
+        for complete in [false, true] {
+            let env = Env::new();
+            let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+            let overlay = env.path("overlay");
+            env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+            let db = overlay.join(".ratarmount.overlay.sqlite");
+            fs::rename(&db, env.path("saved.sqlite")).unwrap();
+            if unresolved {
+                let plain = env.path("plain-file");
+                fs::write(&plain, b"plain").unwrap();
+                std::os::unix::fs::symlink(plain.join("missing.sqlite"), &db).unwrap();
+            }
+            let (bytes, journal, journal_bytes) = rename_b_over_a(&env, &archive, complete);
+            let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
+            let row = format!("unresolved={unresolved} complete={complete}");
+            assert_eq!(out.status.code(), Some(2), "{row}: {}", text(&out));
+            let expect = if unresolved {
+                "cannot resolve the overlay database"
+            } else {
+                "was used before but its database"
+            };
+            assert!(text(&out).contains(expect), "{row}: {}", text(&out));
+            assert!(
+                !text(&out).contains("no base identity was checked"),
+                "{row}: {}",
+                text(&out)
+            );
+            assert!(fs::read(&archive).unwrap() == bytes, "{row}: B modified");
+            assert!(
+                fs::read(&journal).is_ok_and(|j| j == journal_bytes),
+                "{row}: journal modified or removed"
+            );
+        }
+    }
+}

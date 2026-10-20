@@ -16,18 +16,19 @@
 //! replacement or copy goes through the wrappers below.
 #![allow(clippy::disallowed_methods)]
 
+use std::cell::Cell;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use ratarmount_compress::commit_journal::{
     self, Applied, PendingJournal, RecoverError, ReplaceError,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
-use crate::write_overlay::OverlayError;
+use crate::write_overlay::{DbEntry, OverlayError};
 
 use crate::overlay_gate::{kind_only, Recorded};
 use crate::overlay_meta::OverlayMeta;
@@ -120,21 +121,175 @@ pub(crate) enum Restamp {
 /// Where the rows live.
 pub(crate) enum Rows<'a> {
     None,
-    Shared(&'a Mutex<Connection>),
+    /// A mount's own connection, on the database file `id` in `dir`.
+    Shared {
+        db: &'a Mutex<Connection>,
+        dir: &'a Path,
+        id: Option<(u64, u64)>,
+    },
     /// An overlay database opened (read-write, never created) when the hook
-    /// runs. A raw overlay directory has none: nothing to restamp.
-    Path(&'a Path),
+    /// runs. A raw overlay directory has none: nothing to restamp. Two
+    /// monotonic flags (R10-B), set from every classification of the
+    /// directory and never cleared: `must_exist` once a database was seen,
+    /// `required_files` once a marker was seen (the record must then have a
+    /// `files` table).
+    Path {
+        db: &'a Path,
+        must_exist: Cell<bool>,
+        required_files: Cell<bool>,
+    },
 }
 
-impl Rows<'_> {
-    pub(crate) fn with(&self, f: impl FnOnce(&Connection) -> io::Result<()>) -> io::Result<()> {
+/// The database `db`'s overlay directory.
+fn db_dir(db: &Path) -> &Path {
+    db.parent().unwrap_or(Path::new("."))
+}
+
+/// A classification of an overlay directory that is not a usable record, as
+/// the `io::Error` recovery refuses with.
+fn unusable(dir: &Path, entry: &io::Result<DbEntry>) -> Option<io::Error> {
+    match entry {
+        Err(e) => Some(io::Error::new(
+            e.kind(),
+            format!(
+                "the overlay record in {} cannot be classified: {e}; no recovery write was \
+                 made",
+                dir.display()
+            ),
+        )),
+        Ok(DbEntry::Lost { markers, .. }) => Some(io::Error::other(
+            crate::write_overlay::lost_record_error(dir, markers).to_string(),
+        )),
+        Ok(_) => None,
+    }
+}
+
+/// [`crate::write_overlay::overlay_db_entry`] as an `io::Result`.
+fn classify(dir: &Path) -> io::Result<DbEntry> {
+    crate::write_overlay::overlay_db_entry(dir).map_err(|e| match e {
+        OverlayError::Io(e) => e,
+        other => io::Error::other(other.to_string()),
+    })
+}
+
+/// A live record (a mount's own database `id` in `dir`) is still that file.
+fn check_live(dir: &Path, id: Option<(u64, u64)>) -> io::Result<()> {
+    let entry = classify(dir);
+    if let Some(e) = unusable(dir, &entry) {
+        return Err(e);
+    }
+    match entry {
+        Ok(DbEntry::Present { metadata, .. }) => {
+            if id.is_some() && crate::overlay_db::file_id(&metadata) != id {
+                return Err(io::Error::other(format!(
+                    "the overlay database in {} was replaced while the overlay is mounted; \
+                     no recovery write was made",
+                    dir.display()
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(io::Error::other(format!(
+            "the overlay database in {} disappeared while the overlay is mounted; no \
+             recovery write was made",
+            dir.display()
+        ))),
+    }
+}
+
+impl<'a> Rows<'a> {
+    /// [`Rows::Path`] for `db`, its flags seeded from a classification now.
+    pub(crate) fn path(db: &'a Path) -> Self {
+        let rows = Rows::Path {
+            db,
+            must_exist: Cell::new(false),
+            required_files: Cell::new(false),
+        };
+        if let Ok(entry) = classify(db_dir(db)) {
+            rows.observe(&entry);
+        }
+        rows
+    }
+
+    /// Raise [`Rows::Path`]'s flags from a classification.
+    fn observe(&self, entry: &DbEntry) {
+        if let Rows::Path {
+            must_exist,
+            required_files,
+            ..
+        } = self
+        {
+            match entry {
+                DbEntry::Present { marked, .. } => {
+                    must_exist.set(true);
+                    if *marked {
+                        required_files.set(true);
+                    }
+                }
+                DbEntry::Lost { .. } => required_files.set(true),
+                DbEntry::Absent => {}
+            }
+        }
+    }
+
+    /// The guard half for the rows (under the archive lock, before any
+    /// recovery write): the rows' directory must not be a lost or
+    /// unclassifiable record, and a mount's own database must still be the
+    /// file it opened.
+    fn guard(&self) -> io::Result<()> {
         match self {
             Rows::None => Ok(()),
-            Rows::Shared(db) => f(&db.lock().unwrap_or_else(|e| e.into_inner())),
-            Rows::Path(db) => {
-                // Only a missing entry is "no database" (R7-E2); anything
-                // else is opened (never created) and fails if unreadable.
-                if crate::write_overlay::db_entry_absent(db) {
+            Rows::Shared { dir, id, .. } => check_live(dir, *id),
+            Rows::Path { db, .. } => {
+                let dir = db_dir(db);
+                let entry = classify(dir);
+                if let Some(e) = unusable(dir, &entry) {
+                    return Err(e);
+                }
+                if let Ok(entry) = &entry {
+                    self.observe(entry);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Run `f` on the rows' connection with whether the record must have a
+    /// `files` table. The rows are re-classified first (R10-B): a record lost,
+    /// replaced or unclassifiable since the guard fails the hook, which keeps
+    /// the journal.
+    pub(crate) fn with(
+        &self,
+        f: impl FnOnce(&Connection, bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match self {
+            Rows::None => Ok(()),
+            Rows::Shared { db, dir, id } => {
+                check_live(dir, *id)?;
+                f(&db.lock().unwrap_or_else(|e| e.into_inner()), true)
+            }
+            Rows::Path {
+                db,
+                must_exist,
+                required_files,
+            } => {
+                let dir = db_dir(db);
+                let entry = classify(dir);
+                if let Some(e) = unusable(dir, &entry) {
+                    return Err(e);
+                }
+                let entry = entry?;
+                self.observe(&entry);
+                if let DbEntry::Absent = entry {
+                    if must_exist.get() || required_files.get() {
+                        return Err(io::Error::other(format!(
+                            "overlay database {} disappeared while a journal was being \
+                             recovered (it existed when recovery was authorized); the rows \
+                             were not restamped and the journal is kept",
+                            db.display()
+                        )));
+                    }
+                    // A raw overlay directory: nothing to restamp.
                     return Ok(());
                 }
                 let conn = crate::open_overlay_db(
@@ -149,7 +304,7 @@ impl Rows<'_> {
                         db.display()
                     ))
                 })?;
-                f(&conn)
+                f(&conn, required_files.get())
             }
         }
     }
@@ -160,7 +315,11 @@ impl Rows<'_> {
         &'h self,
         archive: &'h Path,
     ) -> impl FnMut(&Applied) -> io::Result<()> + 'h {
-        move |applied| self.with(|conn| restamp_rows(conn, archive, applied, Restamp::Commit))
+        move |applied| {
+            self.with(|conn, required| {
+                restamp_rows(conn, archive, applied, Restamp::Commit, required)
+            })
+        }
     }
 }
 
@@ -236,6 +395,7 @@ pub(crate) fn restamp_rows(
     archive: &Path,
     applied: &Applied,
     mode: Restamp,
+    required: bool,
 ) -> io::Result<()> {
     let target = fs::metadata(archive)?;
     #[cfg(unix)]
@@ -256,7 +416,7 @@ pub(crate) fn restamp_rows(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match restamp_once(conn, &canonical, applied, mode) {
+        match restamp_once(conn, &canonical, applied, mode, required) {
             Err(RestampError::Busy(_)) if attempt < 3 => {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -276,6 +436,7 @@ fn restamp_once(
     canonical: &Path,
     applied: &Applied,
     mode: Restamp,
+    required: bool,
 ) -> std::result::Result<(), RestampError> {
     let classify = |e: rusqlite::Error| {
         if busy(&e) {
@@ -286,6 +447,26 @@ fn restamp_once(
     };
     conn.execute_batch("BEGIN IMMEDIATE").map_err(classify)?;
     let result = (|| -> std::result::Result<(), RestampError> {
+        // A used overlay's record must be there (R10-B): an emptied or
+        // replaced database would otherwise read as "unrecorded" and the
+        // journal would be unlinked with the rows never restamped. Plain SQL
+        // inside this transaction: no nested BEGIN.
+        if required {
+            let files = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(classify)?
+                .is_some();
+            if !files {
+                return Err(RestampError::Other(io::Error::other(
+                    "the overlay database has no files table (the record of a used overlay                      is lost); the rows were not restamped and the journal is kept",
+                )));
+            }
+        }
         let meta = OverlayMeta::from_connection(conn)
             .map_err(|e| RestampError::Other(io::Error::other(e.to_string())))?;
         // A journal whose target is not the recorded base (a union member, a
@@ -372,10 +553,36 @@ pub(crate) fn recover_journal(
     rows: Rows<'_>,
     mut owner: Owner<'_>,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
+    // Every overlay record this recovery answers to, captured before the
+    // closures borrow `owner` (R10-B): none may be lost or unclassifiable
+    // when the first recovery write (the stale-`P` clear included) is made.
+    let records: Vec<PathBuf> = match &owner {
+        Owner::Mount { records, .. } => records
+            .top
+            .iter()
+            .chain(records.lowers.iter())
+            .cloned()
+            .collect(),
+        Owner::Recorded {
+            record: Record::Offline(dir),
+            ..
+        } => vec![dir.to_path_buf()],
+        _ => Vec::new(),
+    };
+    let mut before_write = || {
+        for dir in &records {
+            if let Some(e) = unusable(dir, &classify(dir)) {
+                return Err(e);
+            }
+        }
+        rows.guard()
+    };
     let mut authorize =
         |header: &PendingJournal, locked: &fs::Metadata| owner.authorize(header, locked);
-    commit_journal::recover_with(archive, &mut authorize, &mut |applied| {
-        rows.with(|conn| restamp_rows(conn, archive, applied, Restamp::Recovery))
+    commit_journal::recover_guarded(archive, &mut before_write, &mut authorize, &mut |applied| {
+        rows.with(|conn, required| {
+            restamp_rows(conn, archive, applied, Restamp::Recovery, required)
+        })
     })
 }
 
@@ -390,7 +597,7 @@ pub fn recover_journal_at(
 ) -> std::result::Result<Option<Applied>, RecoverError> {
     // Opened only when a roll-forward needs to restamp: a mount with no pending
     // journal never touches the overlay database here.
-    let rows = overlay_db.map_or(Rows::None, Rows::Path);
+    let rows = overlay_db.map_or(Rows::None, Rows::path);
     recover_journal(archive, rows, owner)
 }
 
@@ -469,9 +676,17 @@ pub enum MountJournal {
 }
 
 fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
-    // Only a missing database is "no record". A directory, a symlink or
-    // anything else that is not a regular file, or that cannot be statted, is
-    // an unreadable record: it must defer, never abstain.
+    // Only an absent database is "no record" (R10-B: a lost record, or one
+    // that cannot be classified, defers). A directory, a symlink or anything
+    // else that is not a regular file is an unreadable record: it must defer,
+    // never abstain.
+    let entry = classify(dir);
+    if let Some(e) = unusable(dir, &entry) {
+        return Err(e);
+    }
+    if let Ok(DbEntry::Absent) = entry {
+        return Ok(None);
+    }
     match fs::symlink_metadata(dir.join(crate::HIDDEN_DB)) {
         Ok(m) if m.is_file() => {}
         Ok(_) => {
@@ -479,7 +694,6 @@ fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
                 "the overlay database is not a regular file".to_string(),
             ))
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     }
     OverlayMeta::read_no_recovery(dir).map_err(|e| io::Error::other(e.to_string()))

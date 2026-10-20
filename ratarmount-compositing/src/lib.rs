@@ -60,7 +60,7 @@ pub use journal_recovery::{
     MountJournal, MountRecords, Owner, Record,
 };
 pub use oci_whiteout::OciImageMountSource;
-pub use overlay_db::{open_overlay_db, DbName, OverlayDbError};
+pub use overlay_db::{open_overlay_db, DbName, OverlayDb, OverlayDbError};
 pub use overlay_gate::{
     compare_base_identity, ensure_journal_is_for_archive, forced_base_record,
     forced_relocation_record, identity_rows, record_forced_base_rows, shape_verdict, verify_base,
@@ -93,10 +93,10 @@ pub use unopened::UnopenedSource;
 pub use versioning::FileVersionLayer;
 pub use write_overlay::{
     commit_overlay, commit_overlay_raw_dir, is_control_reserved_path, is_overlay_internal_path,
-    live_commit_is_supported, name_suggests_tar_zst, overlay_atime, overlay_db_absent,
-    overlay_only_names, patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitMode,
-    CommitOutcome, CommitOverlayOptions, IndexPatchWindow, OverlayError, OverlayMetadata,
-    OverlayMutation, OverlayPolicy, Parked, RawDirCommit, RemoteDownload, RemoteObjectHead,
-    RemotePublishError, RemotePublishRequest, WriteOverlay, HIDDEN_DB, LEGACY_OVERLAY_MARKER,
-    OVERLAY_MARKER,
+    live_commit_is_supported, lost_record_error, name_suggests_tar_zst, overlay_atime,
+    overlay_db_absent, overlay_db_entry, overlay_only_names, patch_sidecar_if_present,
+    sidecar_path_for_patch, CommitKind, CommitMode, CommitOutcome, CommitOverlayOptions, DbEntry,
+    IndexPatchWindow, OverlayError, OverlayMetadata, OverlayMutation, OverlayPolicy, Parked,
+    RawDirCommit, RemoteDownload, RemoteObjectHead, RemotePublishError, RemotePublishRequest,
+    WriteOverlay, HIDDEN_DB, LEGACY_OVERLAY_MARKER, OVERLAY_MARKER,
 };

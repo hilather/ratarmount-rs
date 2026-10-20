@@ -145,26 +145,98 @@ fn discard_hint(paths: &[&Path]) -> String {
     )
 }
 
-/// Nothing at all is at `dir`'s overlay database path (R7-E2): only an
-/// `lstat` that reports a missing entry is "no database". A symlink (dangling
-/// or not), a directory, a FIFO, or an entry that cannot be statted is an
-/// existing database, so the caller takes the database path, which opens it
-/// (a symlink to a regular file is followed) and refuses or defers anything
-/// that is not a readable regular file. Never `exists()`, `is_file()` or
-/// `metadata()`: they follow a dangling symlink to "missing".
-pub fn overlay_db_absent(dir: &Path) -> bool {
-    db_entry_absent(&dir.join(HIDDEN_DB))
+/// What is at an overlay directory's database path (R10-B, #150).
+///
+/// One classifier for every caller that must tell "no record" from "a lost
+/// record" from "a record to open". It never opens anything: `lstat` of the
+/// entry, `stat` through it (the way `Connection::open` follows a symlink),
+/// `lstat` of the two marker names.
+#[derive(Debug)]
+pub enum DbEntry {
+    /// Nothing at the database path and no marker: a raw directory, or an
+    /// overlay about to be created. The only "no record".
+    Absent,
+    /// A marker remains (the overlay was used) but the database is gone:
+    /// missing, a dangling symlink, or (`empty`) a 0-byte file. A LOST
+    /// record, never "no record".
+    Lost { markers: Vec<PathBuf>, empty: bool },
+    /// A regular file (directly or through a symlink) that may be a record;
+    /// `metadata` is the followed `stat` (`is_file()` always holds, so its
+    /// `(dev, ino)` is the file SQLite would open). It does not certify the
+    /// contents or that the file is readable: the validated open decides.
+    Present {
+        marked: bool,
+        metadata: fs::Metadata,
+    },
 }
 
-/// [`overlay_db_absent`] for the database path itself.
-pub(crate) fn db_entry_absent(db: &Path) -> bool {
-    matches!(fs::symlink_metadata(db), Err(e) if e.kind() == io::ErrorKind::NotFound)
+/// Classify `dir`'s overlay database entry; see [`DbEntry`]. Errors: a marker
+/// that is not a regular file; a database entry that is a directory, FIFO,
+/// device or socket (directly or through a symlink); an unmarked dangling
+/// symlink; and EVERY other `lstat` or followed-`stat` error (`ENOTDIR`,
+/// `EACCES`, `ELOOP`, `EIO`, ...), which is never read as "present" or
+/// "absent": an unresolved target proves nothing about the record.
+pub fn overlay_db_entry(dir: &Path) -> Result<DbEntry> {
+    let markers = overlay_markers(dir)?;
+    let marked = !markers.is_empty();
+    Ok(match overlay_db_regular(&dir.join(HIDDEN_DB), marked)? {
+        None if marked => DbEntry::Lost {
+            markers,
+            empty: false,
+        },
+        None => DbEntry::Absent,
+        Some(metadata) if marked && metadata.len() == 0 => DbEntry::Lost {
+            markers,
+            empty: true,
+        },
+        Some(metadata) => DbEntry::Present { marked, metadata },
+    })
+}
+
+/// Nothing at all is at `dir`'s overlay database path and no marker says the
+/// overlay was used ([`DbEntry::Absent`]). A symlink (dangling or not), a
+/// directory, a FIFO, an entry that cannot be statted (R7-E2, R10-B) or a lost
+/// record is not absent, so the caller takes the database path, which opens
+/// it or refuses. Never `exists()`, `is_file()` or `metadata()`: they follow a
+/// dangling symlink to "missing".
+pub fn overlay_db_absent(dir: &Path) -> bool {
+    matches!(overlay_db_entry(dir), Ok(DbEntry::Absent))
+}
+
+/// The #96 refusal for a [`DbEntry::Lost`] record in `dir`.
+pub fn lost_record_error(dir: &Path, markers: &[PathBuf]) -> OverlayError {
+    OverlayError::Msg(format!(
+        "write overlay {} was used before but its database {} is missing or empty; \
+         its deletions would be lost (unlinked archive members reappear). \
+         Restore the database, or use a new empty folder{}",
+        dir.display(),
+        dir.join(HIDDEN_DB).display(),
+        discard_hint(&markers.iter().map(|p| p.as_path()).collect::<Vec<_>>())
+    ))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (R10-B): while set, every followed `stat` of an overlay
+    /// database in [`overlay_db_regular`] on this thread fails with this errno.
+    pub(crate) static FOLLOWED_STAT_ERRNO: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The `stat` through the database entry ([`FOLLOWED_STAT_ERRNO`] in tests).
+fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
+    #[cfg(test)]
+    if let Some(errno) = FOLLOWED_STAT_ERRNO.with(|seam| seam.get()) {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    fs::metadata(db_path)
 }
 
 /// The overlay database at `db_path` as `Connection::open` would see it:
-/// `None` when nothing is there ([`db_entry_absent`]), else the metadata of
+/// `None` when nothing is there (an `lstat` NotFound), else the metadata of
 /// the regular file it is (or a symlink points to). A directory, a dangling
-/// symlink or any other non-regular file is refused. `marked`: the overlay
+/// symlink or any other non-regular file is refused; any other error of the
+/// followed `stat` propagates with the path (R10-B). `marked`: the overlay
 /// was used before (#96); a dangling symlink then reads as a missing database,
 /// which the caller refuses with the #96 wording.
 fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadata>> {
@@ -173,7 +245,7 @@ fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadat
         Err(e) => return Err(OverlayError::Io(e)),
         Ok(_) => {}
     }
-    match fs::metadata(db_path) {
+    match followed_db_stat(db_path) {
         Ok(m) if m.is_file() => Ok(Some(m)),
         // A directory or any other non-regular file: the shared open's text.
         Ok(m) => Err(OverlayError::Msg(crate::overlay_db::not_regular_message(
@@ -185,7 +257,14 @@ fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadat
              created through the symlink: restore its target or remove the symlink",
             db_path.display()
         ))),
-        Err(e) => Err(OverlayError::Io(e)),
+        Err(e) => Err(OverlayError::Io(io::Error::new(
+            e.kind(),
+            format!(
+                "cannot resolve the overlay database {} (it is neither proved present nor \
+                 missing): {e}",
+                db_path.display()
+            ),
+        ))),
     }
 }
 
@@ -727,6 +806,10 @@ pub struct WriteOverlay {
     replacement: RwLock<Option<Arc<dyn MountSource>>>,
     root: PathBuf,
     db: Mutex<Connection>,
+    /// `(dev, ino)` of the database file this mount opened (the validated
+    /// open's post-open path stat). Recovery refuses when the database path
+    /// no longer names it (R10-B).
+    db_id: Option<(u64, u64)>,
     /// Mount paths with `deleted = 1` (for example `/dir/file`).
     ///
     /// `is_deleted` checks this set. The `files` table remains the durable
@@ -1109,24 +1192,16 @@ impl WriteOverlay {
         let marker = found_marker.is_some();
         let marker_path = found_marker.unwrap_or_else(|| root.join(OVERLAY_MARKER));
         // Follows a symlinked database exactly like `Connection::open` does,
-        // but never reads a dangling symlink as "no database" (R7-E2).
-        let db_len = overlay_db_regular(&db_path, marker)?.map(|m| m.len());
-        if marker && db_len.unwrap_or(0) == 0 {
-            return Err(OverlayError::Msg(format!(
-                "write overlay {} was used before but its database {} is missing or empty; \
-                 its deletions would be lost (unlinked archive members reappear). \
-                 Restore the database, or use a new empty folder{}",
-                root.display(),
-                db_path.display(),
-                discard_hint(
-                    &overlay_markers(&root)?
-                        .iter()
-                        .map(|p| p.as_path())
-                        .collect::<Vec<_>>()
-                )
-            )));
-        }
-        let mut conn = crate::open_overlay_db(&db_path, OpenFlags::default(), crate::DbName::Path)?;
+        // but never reads a dangling symlink as "no database" (R7-E2), nor an
+        // unresolvable one as anything (R10-B).
+        let db_len = match overlay_db_entry(&root)? {
+            DbEntry::Absent => None,
+            DbEntry::Lost { markers, .. } => return Err(lost_record_error(&root, &markers)),
+            DbEntry::Present { metadata, .. } => Some(metadata.len()),
+        };
+        let opened = crate::open_overlay_db(&db_path, OpenFlags::default(), crate::DbName::Path)?;
+        let db_id = opened.id();
+        let mut conn = opened.into_connection();
         let had_files = conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'",
@@ -1305,6 +1380,7 @@ impl WriteOverlay {
             replacement: RwLock::new(None),
             root,
             db: Mutex::new(conn),
+            db_id,
             tombstones: Mutex::new(tombstones),
             pending_rows: Mutex::new(Vec::new()),
             commit_gate: RwLock::new(()),
@@ -4445,7 +4521,11 @@ impl WriteOverlay {
         if self.remote_enabled() {
             crate::journal_recovery::Rows::None
         } else {
-            crate::journal_recovery::Rows::Shared(&self.db)
+            crate::journal_recovery::Rows::Shared {
+                db: &self.db,
+                dir: &self.root,
+                id: self.db_id,
+            }
         }
     }
 
@@ -6813,11 +6893,15 @@ pub fn commit_overlay(
 ) -> Result<bool> {
     let write_overlay = write_overlay.as_ref();
     let archive_file = archive_file.as_ref();
-    if overlay_db_absent(write_overlay) {
-        return Err(OverlayError::Msg(format!(
-            "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
-            write_overlay.display()
-        )));
+    match overlay_db_entry(write_overlay)? {
+        DbEntry::Absent => {
+            return Err(OverlayError::Msg(format!(
+                "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
+                write_overlay.display()
+            )))
+        }
+        DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
+        DbEntry::Present { .. } => {}
     }
     if let Err(refusal) =
         crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
@@ -6850,7 +6934,10 @@ pub fn commit_overlay_raw_dir(
 ) -> Result<RawDirCommit> {
     let write_overlay = write_overlay.as_ref();
     let db = write_overlay.join(HIDDEN_DB);
-    if !db_entry_absent(&db) {
+    if let DbEntry::Lost { markers, .. } = overlay_db_entry(write_overlay)? {
+        return Err(lost_record_error(write_overlay, &markers));
+    }
+    if !overlay_db_absent(write_overlay) {
         return Err(OverlayError::Msg(format!(
             "overlay database {} exists (or something else is at its path); its base \
              identity must be checked, so commit it with a classified base \
@@ -6951,7 +7038,7 @@ fn commit_overlay_inner(
             &opts.encoding,
             opts.mode,
             hash_payloads.then_some(&mut written_hashes),
-            &crate::journal_recovery::Rows::Path(&db),
+            &crate::journal_recovery::Rows::path(&db),
             &original,
         )?;
         crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
@@ -7067,7 +7154,7 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
     } else {
         None
     };
-    collect_overlay_commit_plan_from_conn(write_overlay, conn.as_ref(), None, &HashSet::new())
+    collect_overlay_commit_plan_from_conn(write_overlay, conn.as_deref(), None, &HashSet::new())
 }
 
 fn collect_overlay_commit_plan_from_conn(
@@ -7899,7 +7986,7 @@ fn commit_overlay_tar(
                 write_overlay,
                 &plan,
                 &opts.encoding,
-                &crate::journal_recovery::Rows::Path(&db),
+                &crate::journal_recovery::Rows::path(&db),
                 original,
             )
         })();
@@ -8215,7 +8302,7 @@ fn commit_overlay_tar_zst(
     invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
     if append {
         let db = write_overlay.join(HIDDEN_DB);
-        let rows = crate::journal_recovery::Rows::Path(&db);
+        let rows = crate::journal_recovery::Rows::path(&db);
         match crate::journal_recovery::splice_append_committing(
             tar_file, from_idx, transform, original, &rows,
         ) {

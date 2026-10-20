@@ -345,7 +345,13 @@ there counts as "no database": a dangling symlink, a directory or any other
 entry that is not a readable regular file is an existing but unreadable
 database, so the commit is refused (and any journal on the archive is left
 alone) instead of committing as a raw directory. A symlink to a regular
-database file keeps working.
+database file keeps working. A database path whose target cannot be resolved
+(`ENOTDIR`, `EACCES`, `ELOOP`, `EIO`: for example a symlink to
+`plain-file/missing.sqlite`) is neither present nor absent: the error is
+reported with the path and nothing is recovered, committed or cleared. An
+overlay that was used (its marker remains) but whose database is missing,
+empty or a dangling symlink is a lost record: the commit exits 2 with the #96
+text before any recovery.
 
 The commit check also compares the recorded KIND under every digest kind, `none`
 included (a directory overlay does not commit into an archive), and refuses an
@@ -401,7 +407,15 @@ file. A journal whose rows already describe the file recovery will leave (the
 committed bytes, or rolled-back bytes whose mtime could not be restored; only
 the unlink is owed) is accepted by every gate. Recovery finds a journal through
 its inode locator or beside the archive's current name (a directory renamed
-with the journal in it). A stale prepare locator without a journal is cleared
+with the journal in it). Before the first recovery write (clearing a stale
+prepare locator included) every overlay record the recovery answers to (the
+mount's top and directory lowers, the offline overlay, the live mount's own
+database, which must still be the file it opened) is classified again under
+the archive lock; a lost record or one whose database path cannot be resolved
+refuses the recovery with the locator, the archive and any journal left as
+they were. The restamp after a roll-forward re-checks the record too, and a
+used overlay's database must still have its `files` table, else the journal is
+kept. A stale prepare locator without a journal is otherwise cleared
 after a directory sync; a complete locator whose journal cannot be found is
 refused, never cleared (the commit's hook may not have run), and the error
 names the manual escape: verify the archive, then remove its
