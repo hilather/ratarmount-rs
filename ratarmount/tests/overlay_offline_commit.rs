@@ -869,8 +869,9 @@ fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
 }
 
 /// Regression (R10-B, #150, v4 T6): `--commit-overlay` with the overlay used
-/// (marker kept) and its database either deleted or replaced by a symlink
-/// that cannot be resolved (`plain-file/missing.sqlite`: `ENOTDIR`), with B
+/// (marker kept) and its database deleted, replaced by a symlink to a 0-byte
+/// file, or by a symlink that cannot be resolved
+/// (`plain-file/missing.sqlite`: `ENOTDIR`), with B
 /// (its own torn or complete journal) renamed over A. A deleted database read
 /// as "no database" and the raw-directory branch ran inode-only recovery on B;
 /// the unresolvable one could read as a record. Both exit 2 before any
@@ -882,8 +883,11 @@ fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
         eprintln!("skip: GNU tar unavailable");
         return;
     }
-    for unresolved in [false, true] {
+    // R10-FIX2 (v4 T6): a symlink to a 0-byte file is as lost as a deleted
+    // database.
+    for shape in ["deleted", "symlink to empty", "unresolved"] {
         for complete in [false, true] {
+            let unresolved = shape == "unresolved";
             let env = Env::new();
             let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
             let overlay = env.path("overlay");
@@ -894,10 +898,14 @@ fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
                 let plain = env.path("plain-file");
                 fs::write(&plain, b"plain").unwrap();
                 std::os::unix::fs::symlink(plain.join("missing.sqlite"), &db).unwrap();
+            } else if shape == "symlink to empty" {
+                let empty = env.path("empty.sqlite");
+                fs::write(&empty, b"").unwrap();
+                std::os::unix::fs::symlink(&empty, &db).unwrap();
             }
             let (bytes, journal, journal_bytes) = rename_b_over_a(&env, &archive, complete);
             let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
-            let row = format!("unresolved={unresolved} complete={complete}");
+            let row = format!("{shape} complete={complete}");
             assert_eq!(out.status.code(), Some(2), "{row}: {}", text(&out));
             let expect = if unresolved {
                 "cannot resolve the overlay database"

@@ -5362,6 +5362,204 @@ fn regression_rows_guard_refuses_a_record_removed_after_it_was_seen() {
     assert!(fs::read(&journal).unwrap() == journal_bytes, "journal kept");
 }
 
+/// The four ways a used overlay's database is lost (its marker kept).
+#[cfg(unix)]
+const LOST_SHAPES: [&str; 4] = [
+    "deleted",
+    "0-byte",
+    "symlink to 0-byte",
+    "symlink to missing",
+];
+
+/// Lose `overlay`'s database in the way `shape` names.
+#[cfg(unix)]
+fn lose_db(overlay: &Path, shape: &str) {
+    let db = overlay.join(HIDDEN_DB);
+    fs::remove_file(&db).unwrap();
+    match shape {
+        "deleted" => {}
+        "0-byte" => fs::write(&db, b"").unwrap(),
+        "symlink to 0-byte" => {
+            let empty = overlay.with_file_name("empty.sqlite");
+            fs::write(&empty, b"").unwrap();
+            std::os::unix::fs::symlink(&empty, &db).unwrap();
+        }
+        _ => std::os::unix::fs::symlink(overlay.with_file_name("nowhere.sqlite"), &db).unwrap(),
+    }
+    assert!(overlay.join(crate::OVERLAY_MARKER).is_file(), "marker kept");
+}
+
+/// Regression (R10-FIX2, r10 review B2, v4 T5): a mount whose top or
+/// `--lower`-only record is lost (database deleted, 0-byte, a symlink to a
+/// 0-byte file or to nothing; marker kept) next to B renamed over A with its
+/// own torn or complete journal, or next to a stale prepare locator.
+/// `read_record` read a deleted or empty database as "no record", so the
+/// journal classified `Own` and was recovered; the stale locator was cleared.
+/// The classifier defers (or reports no journal for the stale locator), the
+/// locked recovery refuses, and B, its journal and the locator stay
+/// byte-identical.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_mount_lost_overlay_db_defers_recovery() {
+    use ratarmount_compress::commit_journal::RecoverError;
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for shape in LOST_SHAPES {
+        for journal in ["torn", "complete", "stale P"] {
+            for top in [true, false] {
+                let what = format!("{shape} / {journal} / top={top}");
+                let fx = Fixture::new();
+                drop(fx.open(BaseDigestRequest::Compute, false));
+                lose_db(&fx.overlay, shape);
+                let kept = if journal == "stale P" {
+                    stale_prepare(&fx.archive);
+                    None
+                } else {
+                    Some(rename_b_over_a(&fx, journal == "complete"))
+                };
+                let bytes = fs::read(&fx.archive).unwrap();
+                let before = locator(&fx.archive);
+                let records = if top {
+                    records_of(&fx)
+                } else {
+                    MountRecords {
+                        lowers: vec![fx.overlay.clone()],
+                        ..Default::default()
+                    }
+                };
+                let flag = if top {
+                    "--force-base-mismatch"
+                } else {
+                    "--force-stack-mismatch"
+                };
+                match classify_mount_journal(&records, &fx.archive).unwrap() {
+                    MountJournal::Deferred {
+                        why, force_flag, ..
+                    } => {
+                        assert_eq!(force_flag, flag, "{what}");
+                        assert!(why.contains("missing or empty"), "{what}: {why}");
+                    }
+                    MountJournal::None if kept.is_none() => {}
+                    other => panic!("{what}: {other:?}"),
+                }
+                let db = fx.overlay.join(HIDDEN_DB);
+                let error = crate::recover_journal_at(
+                    &fx.archive,
+                    top.then_some(db.as_path()),
+                    crate::Owner::Mount {
+                        records: &records,
+                        member: &fx.archive,
+                    },
+                )
+                .map(drop)
+                .expect_err(&what);
+                assert!(
+                    matches!(error, RecoverError::Refused(_)),
+                    "{what}: {error:?}"
+                );
+                assert!(
+                    error.to_string().contains("missing or empty"),
+                    "{what}: {error}"
+                );
+                assert!(fs::read(&fx.archive).unwrap() == bytes, "{what}: archive");
+                assert_eq!(locator(&fx.archive), before, "{what}: locator");
+                if let Some((_, path, journal_bytes)) = &kept {
+                    assert!(fs::read(path).unwrap() == *journal_bytes, "{what}: journal");
+                }
+            }
+        }
+    }
+}
+
+/// Regression (R10-FIX2, r10 review B2, v4 T7): the offline entry points with
+/// a lost record (the four shapes, marker kept). `commit_overlay` said "has no
+/// database" for a deleted one or read an empty one through the symlink;
+/// `commit_overlay_raw_dir` recovered B by inode and then refused;
+/// `recover_journal_at(.., Some(db), Owner::Inode)` rolled A's own torn
+/// journal back or cleared a stale prepare locator. Each refuses before any
+/// recovery write: the archive, its journal and the locator stay
+/// byte-identical.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_lost_record_refuses_before_recovery() {
+    use ratarmount_compress::commit_journal::RecoverError;
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    for shape in LOST_SHAPES {
+        for row in [
+            "commit_overlay",
+            "commit_overlay_raw_dir",
+            "recover torn",
+            "recover stale P",
+        ] {
+            let what = format!("{shape} / {row}");
+            let fx = Fixture::new();
+            drop(fx.open(BaseDigestRequest::Compute, false));
+            lose_db(&fx.overlay, shape);
+            let journal = match row {
+                "recover torn" => {
+                    interrupt_append(&fx.archive);
+                    let path = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+                    let bytes = fs::read(&path).unwrap();
+                    Some((path, bytes))
+                }
+                "recover stale P" => {
+                    stale_prepare(&fx.archive);
+                    None
+                }
+                _ => {
+                    let (_, path, bytes) = rename_b_over_a(&fx, false);
+                    Some((path, bytes))
+                }
+            };
+            let bytes = fs::read(&fx.archive).unwrap();
+            let before = locator(&fx.archive);
+            let db = fx.overlay.join(HIDDEN_DB);
+            let error = match row {
+                "commit_overlay" => crate::commit_overlay(
+                    &fx.overlay,
+                    &fx.archive,
+                    &archive_token(&fx.archive),
+                    &opts,
+                )
+                .expect_err(&what)
+                .to_string(),
+                "commit_overlay_raw_dir" => {
+                    crate::commit_overlay_raw_dir(&fx.overlay, &fx.archive, &opts)
+                        .map(drop)
+                        .expect_err(&what)
+                        .to_string()
+                }
+                _ => {
+                    let error =
+                        crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Inode)
+                            .map(drop)
+                            .expect_err(&what);
+                    assert!(
+                        matches!(error, RecoverError::Refused(_)),
+                        "{what}: {error:?}"
+                    );
+                    error.to_string()
+                }
+            };
+            assert!(error.contains("missing or empty"), "{what}: {error}");
+            assert!(fs::read(&fx.archive).unwrap() == bytes, "{what}: archive");
+            assert_eq!(locator(&fx.archive), before, "{what}: locator");
+            if let Some((path, journal_bytes)) = &journal {
+                assert!(fs::read(path).unwrap() == *journal_bytes, "{what}: journal");
+            }
+        }
+    }
+}
+
 // ---- R10-C (#148): payload opens of another name of an open database ------
 
 /// A hard link of `db` named `name` in the overlay root `dir`.
