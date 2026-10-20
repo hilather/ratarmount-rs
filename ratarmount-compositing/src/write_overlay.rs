@@ -4245,22 +4245,33 @@ impl WriteOverlay {
         let hash_payloads =
             manifest_plan.is_some() && self.manifest_hashes.as_deref() != Some("none");
         let (window, prefix) = if plan.has_metadata_changes() || hash_payloads {
-            (
-                persist_provenance_plan(
-                    archive,
-                    &self.root,
-                    plan,
-                    &self.encoding,
-                    self.commit_mode,
-                    if hash_payloads {
-                        manifest_plan.as_mut().map(|p| &mut p.written_hashes)
-                    } else {
-                        None
-                    },
-                    &self.commit_rows(),
-                )?,
-                0,
-            )
+            let window = persist_provenance_plan(
+                archive,
+                &self.root,
+                plan,
+                &self.encoding,
+                self.commit_mode,
+                if hash_payloads {
+                    manifest_plan.as_mut().map(|p| &mut p.written_hashes)
+                } else {
+                    None
+                },
+                &self.commit_rows(),
+            );
+            // Exactly the ordinary append branches: a splice that landed but
+            // could not finish refuses the stale frame map and stops intervals;
+            // any other error recovers the torn append or refuses if it cannot.
+            match window {
+                Ok(window) => (window, 0),
+                Err(e @ OverlayError::Committed(_)) => {
+                    self.refuse_base_after_commit_failure();
+                    return Err(e);
+                }
+                Err(e) => {
+                    self.recover_failed_append(archive, &e)?;
+                    return Err(e);
+                }
+            }
         } else {
             match format {
                 CompressionFormat::Zstd => {
@@ -10475,6 +10486,36 @@ mod tests {
             assert!(ov.open(&old, 0).is_err());
             assert!(ov.root().join("new").exists());
         }
+    }
+
+    /// Regression (R7-B3): a `--commit-manifest` (provenance) append whose
+    /// baseline restamp fails after the splice returned `Committed` without the
+    /// ordinary append branches' handling: the interval stayed on and the
+    /// mounted source kept serving the pre-splice frame map over the new bytes.
+    #[cfg(unix)]
+    #[test]
+    fn regression_provenance_append_committed_refuses_stale_frame_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.zst");
+        append_fixture(&archive, true);
+        let base = open_tar_zst_base(&archive, false);
+        let old = base.lookup("/last", 0).unwrap();
+        let mut ov = WriteOverlay::new_for_tests(base, dir.path().join("ov")).unwrap();
+        ov.set_commit_mode(CommitMode::Append);
+        ov.set_manifest_hashes(Some("new".into()));
+        fs::write(ov.root().join("new"), b"new").unwrap();
+        // An open transaction on the mount's connection makes the restamp's
+        // BEGIN IMMEDIATE fail after the splice.
+        ov.db.lock().unwrap().execute_batch("BEGIN").unwrap();
+        let err = ov
+            .commit_live(&archive, |_| panic!("a committed splice must not reopen"))
+            .unwrap_err();
+        assert!(matches!(err, OverlayError::Committed(_)), "{err}");
+        assert!(ov.interval_disabled(), "interval commits stay enabled");
+        assert!(
+            ov.open(&old, 0).is_err(),
+            "stale pre-splice frame map still served"
+        );
     }
 
     /// Regression: recovery of a failed append keeps the old live index readable.
