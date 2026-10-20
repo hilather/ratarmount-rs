@@ -1221,9 +1221,13 @@ unchanged and has no journal pending. The copy source must be exactly the
 gate's snapshot (device, inode, length, mtime, ctime): a refusal because the
 archive changed after the gate (or any other writer between the gate and the
 copy) never copies, since the copy would publish a file the gate never
-judged. Only after the attempt's own `RolledBack` is the source checked by
-device and inode (the rollback moved its ctime). `copy` mode and the zstd
-copy splice use the same rule. Crash recovery finds a journal through
+judged. After the attempt's own `RolledBack` the source must be exactly the
+stamp the attempt's locked descriptor had after its cleanup (`RolledBack`
+carries it; the rollback moved the ctime), so another commit that took the
+lock after the rollback refuses the copy too. Every copy publishes with the
+stamp it checked, never with one it took later. `copy` mode, the zstd copy
+splice, the offline gzip/bzip2/xz recompress and the offline ZIP rebuild use
+the same rule and the same copy guard. Crash recovery finds a journal through
 the locator or beside the archive's current name; a `C` locator whose journal
 cannot be found is refused and a `D` locator without a journal is kept (only a
 `P` one is cleared), so a journal that moved with a renamed directory is never

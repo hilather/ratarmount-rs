@@ -3131,9 +3131,9 @@ fn regression_commit_gate_judges_and_returns_one_snapshot() {
     assert_eq!(fs::read(&fx.archive).unwrap(), b_bytes);
     for from in [
         crate::journal_recovery::CopyFrom::Gate,
-        crate::journal_recovery::CopyFrom::AfterRollback,
+        crate::journal_recovery::CopyFrom::AfterRollback(snapshot.clone()),
     ] {
-        assert!(crate::journal_recovery::open_copy_source(&fx.archive, &snapshot, from).is_err());
+        assert!(crate::journal_recovery::open_copy_source(&fx.archive, &snapshot, &from).is_err());
     }
 }
 
@@ -3357,6 +3357,458 @@ thread_local! {
     /// P2, handed back after it committed inside P1's commit.
     static P2_BACK: std::cell::RefCell<Option<WriteOverlay>> =
         const { std::cell::RefCell::new(None) };
+}
+
+// ---- R7-E1: every copy path compares the gate's stamp ----
+
+/// When the other writer changes the archive inside P1's copy fallback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CopyWindow {
+    /// Right after the copy source was opened and compared ("copy source
+    /// opened"): the copy must still publish only the gate's file.
+    Opened,
+    /// P1's in-place append failed (ENOSPC) and rolled back; the writer acts
+    /// right before the copy source is opened ("copy source open"), after P1
+    /// released the lock.
+    AfterRollback,
+    /// Right after the gate's snapshot (offline gzip/bzip2/xz and ZIP, which
+    /// had no copy-source check at all).
+    AfterGate,
+}
+
+/// The archive format of a copy-path row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CopyFmt {
+    Tar,
+    Zst,
+    Gz,
+    Bz2,
+    Xz,
+    Zip,
+}
+
+/// One copy/publish call site (R7-E1 inventory, PROGRESS "R6 fix round 7E").
+struct CopyRow {
+    site: &'static str,
+    fmt: CopyFmt,
+    way: Way,
+    mode: crate::CommitMode,
+    window: CopyWindow,
+    /// P1 also deletes the base member (Auto with deletions takes the copy).
+    delete: bool,
+}
+
+/// Regression (r17 skeptic #1, R7-E1): every copy/publish path carries the
+/// stamp its gate checked and compares against it. Before: the plain-TAR
+/// provenance copy dropped the stamp `open_copy_source` had matched and took a
+/// fresh one, so another writer's in-place append between the open and that
+/// stat was copied and published (Copy mode, Auto with deletions); a copy after
+/// a rollback compared only device and inode, so an append after P1 released
+/// its lock was published; the offline gzip/bzip2/xz recompress and the ZIP
+/// rebuild compared nothing and published without the copy guard. Now P1 is
+/// refused, the archive keeps its inode and the other writer's bytes, and the
+/// other writer's next commit is accepted. Rows marked control already passed.
+#[cfg(unix)]
+#[test]
+fn regression_copy_paths_compare_the_gate_stamp() {
+    use crate::CommitMode::{Auto, Copy};
+    use CopyFmt::*;
+    use CopyWindow::*;
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let row = |site, fmt, way, mode, window, delete| CopyRow {
+        site,
+        fmt,
+        way,
+        mode,
+        window,
+        delete,
+    };
+    let rows = [
+        row(
+            "A1 provenance tar copy",
+            Tar,
+            Way::Provenance,
+            Copy,
+            Opened,
+            false,
+        ),
+        row(
+            "A1 provenance tar auto+delete",
+            Tar,
+            Way::Provenance,
+            Auto,
+            Opened,
+            true,
+        ),
+        row(
+            "A2 provenance tar after rollback",
+            Tar,
+            Way::Provenance,
+            Auto,
+            AfterRollback,
+            false,
+        ),
+        row(
+            "A3 live tar copy (control)",
+            Tar,
+            Way::Live,
+            Copy,
+            Opened,
+            false,
+        ),
+        row(
+            "A3 live tar after rollback",
+            Tar,
+            Way::Live,
+            Auto,
+            AfterRollback,
+            false,
+        ),
+        row(
+            "A4 offline tar copy (control)",
+            Tar,
+            Way::Offline,
+            Copy,
+            Opened,
+            false,
+        ),
+        row(
+            "A4 offline tar after rollback",
+            Tar,
+            Way::Offline,
+            Auto,
+            AfterRollback,
+            false,
+        ),
+        row(
+            "A5 live zst copy (control)",
+            Zst,
+            Way::Live,
+            Copy,
+            Opened,
+            false,
+        ),
+        row(
+            "A5 provenance zst copy (control)",
+            Zst,
+            Way::Provenance,
+            Copy,
+            Opened,
+            false,
+        ),
+        row(
+            "A5 offline zst copy (control)",
+            Zst,
+            Way::Offline,
+            Copy,
+            Opened,
+            false,
+        ),
+        row(
+            "A5 live zst after rollback",
+            Zst,
+            Way::Live,
+            Auto,
+            AfterRollback,
+            false,
+        ),
+        row(
+            "A5 provenance zst after rollback",
+            Zst,
+            Way::Provenance,
+            Auto,
+            AfterRollback,
+            false,
+        ),
+        row(
+            "A5 offline zst after rollback",
+            Zst,
+            Way::Offline,
+            Auto,
+            AfterRollback,
+            false,
+        ),
+        row(
+            "A6 offline tar.gz after gate",
+            Gz,
+            Way::Offline,
+            Auto,
+            AfterGate,
+            false,
+        ),
+        row(
+            "A6 offline tar.gz opened",
+            Gz,
+            Way::Offline,
+            Auto,
+            Opened,
+            false,
+        ),
+        row(
+            "A6 offline tar.bz2 after gate",
+            Bz2,
+            Way::Offline,
+            Auto,
+            AfterGate,
+            false,
+        ),
+        row(
+            "A6 offline tar.bz2 opened",
+            Bz2,
+            Way::Offline,
+            Auto,
+            Opened,
+            false,
+        ),
+        row(
+            "A6 offline tar.xz after gate",
+            Xz,
+            Way::Offline,
+            Auto,
+            AfterGate,
+            false,
+        ),
+        row(
+            "A6 offline tar.xz opened",
+            Xz,
+            Way::Offline,
+            Auto,
+            Opened,
+            false,
+        ),
+        row(
+            "A7 offline zip after gate",
+            Zip,
+            Way::Offline,
+            Auto,
+            AfterGate,
+            false,
+        ),
+        row(
+            "A7 offline zip opened",
+            Zip,
+            Way::Offline,
+            Auto,
+            Opened,
+            false,
+        ),
+    ];
+    let mut failed = Vec::new();
+    for r in &rows {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if matches!(r.fmt, Tar | Zst) {
+                copy_row_with_p2(r)
+            } else {
+                copy_row_in_place(r)
+            }
+        }));
+        fault::clear();
+        crate::overlay_gate::AFTER_SNAPSHOT.with(|hook| *hook.borrow_mut() = None);
+        if run.is_err() {
+            failed.push(r.site);
+        }
+    }
+    assert!(failed.is_empty(), "failed rows: {failed:?}");
+}
+
+/// A `.tar`/`.tar.zst` row: P2 (another `-w` overlay) appends its member in
+/// place inside P1's copy fallback.
+fn copy_row_with_p2(r: &CopyRow) {
+    use std::rc::Rc;
+    let case = r.site;
+    let place = Rc::new(Place::new(r.fmt == CopyFmt::Zst));
+    let mut p1 = place.open(&place.overlay, r.way, r.mode);
+    if r.way == Way::Provenance {
+        p1.set_manifest_hashes(Some("all".into()));
+    }
+    fs::write(p1.root().join("from-p1"), b"p1 member").unwrap();
+    if r.delete {
+        p1.unlink("/first").unwrap();
+    }
+    let p2 = place.open(
+        &place.root.join("overlay2"),
+        Way::Live,
+        crate::CommitMode::Append,
+    );
+    fs::write(p2.root().join("from-p2"), b"p2 member").unwrap();
+    let a_ino = ino(&place.archive);
+    let mut p2_commit = Some({
+        let place = place.clone();
+        move || {
+            let committed = p2.commit_live(&place.archive, |p| Ok(place.source(p)));
+            assert!(committed.unwrap(), "P2 commits");
+            P2_BACK.with(|slot| *slot.borrow_mut() = Some(p2));
+        }
+    });
+    P2_BACK.with(|slot| *slot.borrow_mut() = None);
+    let window = r.window;
+    let mut wrote = false;
+    fault::install(move |step| {
+        match (window, step) {
+            (CopyWindow::AfterRollback, "archive write") if !wrote => {
+                wrote = true;
+                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            (CopyWindow::AfterRollback, "copy source open") if wrote => {
+                if let Some(run) = p2_commit.take() {
+                    run();
+                }
+            }
+            (CopyWindow::Opened, "copy source opened") => {
+                if let Some(run) = p2_commit.take() {
+                    run();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+    let (_p1, result) = place.commit(p1, r.way, r.mode);
+    fault::clear();
+    let p2 = P2_BACK
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_else(|| panic!("{case}: P2 never committed inside P1's commit"));
+    let error = match result {
+        Ok(done) => panic!("{case}: P1 must be refused, got Ok({done})"),
+        Err(e) => e.to_string(),
+    };
+    assert!(error.contains("changed"), "{case}: {error}");
+    assert_eq!(ino(&place.archive), a_ino, "{case}: P1 published a copy");
+    let served = place.source(&place.archive);
+    assert_eq!(
+        read_member(served.as_ref(), "/from-p2"),
+        b"p2 member",
+        "{case}"
+    );
+    assert!(served.lookup("/from-p1", 0).is_none(), "{case}");
+    fs::write(p2.root().join("again-p2"), b"p2 again").unwrap();
+    let next = p2.commit_live(&place.archive, |p| Ok(place.source(p)));
+    assert!(
+        next.unwrap_or_else(|e| panic!("{case}: P2's next commit: {e}")),
+        "{case}"
+    );
+}
+
+/// The bytes of a one-member archive `x` in `fmt`.
+fn copy_row_archive(fmt: CopyFmt, name: &str, payload: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let tar = dir.path().join("x.tar");
+    write_tar(&tar, &[(name, payload)]);
+    let plain = fs::read(&tar).unwrap();
+    match fmt {
+        CopyFmt::Gz => {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&plain).unwrap();
+            enc.finish().unwrap()
+        }
+        CopyFmt::Bz2 => {
+            let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            enc.write_all(&plain).unwrap();
+            enc.finish().unwrap()
+        }
+        CopyFmt::Xz => {
+            let mut enc = xz2::write::XzEncoder::new(Vec::new(), 6);
+            enc.write_all(&plain).unwrap();
+            enc.finish().unwrap()
+        }
+        CopyFmt::Zip => {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(payload).unwrap();
+            zip.finish().unwrap().into_inner()
+        }
+        CopyFmt::Tar | CopyFmt::Zst => unreachable!("in-place rows are gzip/bzip2/xz/zip"),
+    }
+}
+
+/// An offline gzip/bzip2/xz/ZIP row: another writer rewrites the archive in
+/// place (same inode, a valid archive holding `x`) inside P1's commit.
+fn copy_row_in_place(r: &CopyRow) {
+    use std::io::Write;
+    let case = r.site;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let ext = match r.fmt {
+        CopyFmt::Gz => "tar.gz",
+        CopyFmt::Bz2 => "tar.bz2",
+        CopyFmt::Xz => "tar.xz",
+        _ => "zip",
+    };
+    let archive = root.join(format!("base.{ext}"));
+    fs::write(&archive, copy_row_archive(r.fmt, "first", b"first member")).unwrap();
+    let plain = root.join("plain.tar");
+    write_tar(&plain, &[("first", b"first member")]);
+    let token = || {
+        ClassifiedBase::for_tests(
+            open_tar(&plain),
+            ServedKind::Archive,
+            Some(ServedLocation::Local(archive.clone())),
+        )
+    };
+    let overlay = root.join("overlay");
+    let p1 = open_with(&token(), &overlay, BaseDigestRequest::Compute, false).unwrap();
+    fs::write(p1.root().join("from-p1"), b"p1 member").unwrap();
+    drop(p1);
+    let theirs = copy_row_archive(r.fmt, "x", b"the other writer's x");
+    let a_ino = ino(&archive);
+    let rewrite = {
+        let (archive, theirs) = (archive.clone(), theirs.clone());
+        move || {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&archive)
+                .unwrap();
+            f.write_all(&theirs).unwrap();
+            f.sync_all().unwrap();
+        }
+    };
+    match r.window {
+        CopyWindow::AfterGate => {
+            // The offline commit judges the archive twice; rewrite right
+            // after the second (the snapshot every write compares against).
+            let fire: Box<dyn FnOnce()> = Box::new(move || {
+                crate::overlay_gate::AFTER_SNAPSHOT
+                    .with(|hook| *hook.borrow_mut() = Some(Box::new(rewrite)));
+            });
+            crate::overlay_gate::AFTER_SNAPSHOT.with(|hook| *hook.borrow_mut() = Some(fire));
+        }
+        _ => {
+            let mut rewrite = Some(rewrite);
+            fault::install(move |step| {
+                if step == "copy source opened" {
+                    if let Some(run) = rewrite.take() {
+                        run();
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    let opts = CommitOverlayOptions {
+        yes: true,
+        mode: r.mode,
+        ..Default::default()
+    };
+    let result = crate::commit_overlay(&overlay, &archive, &token(), &opts);
+    fault::clear();
+    crate::overlay_gate::AFTER_SNAPSHOT.with(|hook| *hook.borrow_mut() = None);
+    let error = match result {
+        Ok(done) => panic!("{case}: P1 must be refused, got Ok({done})"),
+        Err(e) => e.to_string(),
+    };
+    assert!(error.contains("changed"), "{case}: {error}");
+    assert_eq!(ino(&archive), a_ino, "{case}: P1 published a copy");
+    assert_eq!(
+        fs::read(&archive).unwrap(),
+        theirs,
+        "{case}: the other writer's archive"
+    );
 }
 
 // ---- R7-C5: one target rule, one restamp rule, disjunct 3, idempotent rollback ----

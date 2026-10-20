@@ -119,6 +119,13 @@ pub mod fault {
         }
     }
 
+    /// [`check`] for a step another crate's copy fallback runs ("copy source
+    /// open" before it opens and compares its source, "copy source opened"
+    /// after): every copy path shares the step names.
+    pub fn point(step: &'static str) -> io::Result<()> {
+        check(step)
+    }
+
     /// An instead-of seam: a fault's `Err` replaces `op`.
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     pub(crate) fn instead<T>(
@@ -338,8 +345,11 @@ pub enum ReplaceError {
     /// never touched or were rolled back under the same lock, no journal of
     /// this attempt is on disk, and the hook saw the rollback whenever a
     /// journal was published. A copy fallback may run (behind
-    /// [`guard_copy`]).
-    RolledBack(io::Error),
+    /// [`guard_copy`]). The second field is the locked descriptor's stamp
+    /// after the cleanup, read before the lock was released (`None` when it
+    /// could not be read): the only file a copy fallback may read is one
+    /// still exactly at that stamp.
+    RolledBack(io::Error, Option<Box<fs::Metadata>>),
     /// Started and failed; this attempt's journal (old or torn bytes) is on
     /// disk or no longer where the attempt put it. Recover through the gate.
     /// Never answer with a copy.
@@ -354,7 +364,7 @@ pub enum ReplaceError {
 impl ReplaceError {
     pub fn into_io(self) -> io::Error {
         match self {
-            Self::Refused(e) | Self::RolledBack(e) | Self::Pending(e) | Self::Committed(e) => e,
+            Self::Refused(e) | Self::RolledBack(e, _) | Self::Pending(e) | Self::Committed(e) => e,
         }
     }
 }
@@ -362,7 +372,7 @@ impl ReplaceError {
 impl std::fmt::Display for ReplaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Refused(e) | Self::RolledBack(e) | Self::Pending(e) | Self::Committed(e) => {
+            Self::Refused(e) | Self::RolledBack(e, _) | Self::Pending(e) | Self::Committed(e) => {
                 e.fmt(f)
             }
         }
@@ -741,7 +751,15 @@ mod unix {
         if let Err(x) = fault::check("before cleanup") {
             return Err(unresolved(join(error, x)));
         }
-        finish_failed(&mut file, &path, &attempt, error, before_unlink)
+        match finish_failed(&mut file, &path, &attempt, error, before_unlink) {
+            // The stamp a copy fallback compares against, taken under the
+            // lock after the last write of the cleanup (the locator xattr).
+            Err(ReplaceError::RolledBack(e, _)) => Err(ReplaceError::RolledBack(
+                e,
+                file.metadata().ok().map(Box::new),
+            )),
+            other => other,
+        }
     }
 
     fn join(error: io::Error, other: impl std::fmt::Display) -> io::Error {
@@ -868,7 +886,7 @@ mod unix {
             if let Err(x) = clear_marker(file) {
                 log::warn!("commit: stale prepare locator left: {x}");
             }
-            return Err(ReplaceError::RolledBack(error));
+            return Err(ReplaceError::RolledBack(error, None));
         };
         if attempt.unlinked {
             // The hook ran and THIS attempt removed its journal (`D` is on the
@@ -916,7 +934,7 @@ mod unix {
             before_unlink,
         ) {
             Ok(_) if complete => Ok(()),
-            Ok(_) => Err(ReplaceError::RolledBack(error)),
+            Ok(_) => Err(ReplaceError::RolledBack(error, None)),
             Err(x) => Err(unresolved(join(error, x))),
         }
     }
@@ -1473,7 +1491,7 @@ mod tests {
             replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
         fault::clear();
         assert!(
-            matches!(result, Err(ReplaceError::RolledBack(_))),
+            matches!(result, Err(ReplaceError::RolledBack(..))),
             "{result:?}"
         );
         assert_eq!(fs::read(&path).unwrap(), b"prefix:old contents");
@@ -1766,6 +1784,44 @@ mod tests {
         }
     }
 
+    /// Regression (R7-E1): a rolled-back replacement reports the locked
+    /// descriptor's stamp after its cleanup (the only stamp a copy fallback
+    /// may read), whether its journal was published or not: it equals the
+    /// archive's stamp afterwards, the old bytes are in place, and a write
+    /// after the lock was released no longer matches it.
+    #[test]
+    fn append_journal_rolled_back_reports_the_locked_stamp() {
+        for step in ["journal header", "locator prepare", "archive write"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("archive");
+            fs::write(&path, b"prefix:old contents").unwrap();
+            let original = fs::metadata(&path).unwrap();
+            let mut suffix = tempfile::tempfile().unwrap();
+            suffix.write_all(b"new contents").unwrap();
+            fault::install(move |seen| {
+                if seen == step {
+                    return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+                }
+                Ok(())
+            });
+            let result =
+                replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+            fault::clear();
+            let Err(ReplaceError::RolledBack(_, Some(stamp))) = result else {
+                panic!("{step}: {result:?}");
+            };
+            assert_eq!(fs::read(&path).unwrap(), b"prefix:old contents", "{step}");
+            assert!(same_stamp(&stamp, &fs::metadata(&path).unwrap()), "{step}");
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+            assert!(!same_stamp(&stamp, &fs::metadata(&path).unwrap()), "{step}");
+        }
+    }
+
     /// The fault seam is consulted at every step of a production replacement,
     /// in order, and an instead-of seam's `Err` replaces the step.
     #[test]
@@ -1822,7 +1878,7 @@ mod tests {
             replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
         fault::clear();
         assert!(
-            matches!(error, Err(ReplaceError::RolledBack(_))),
+            matches!(error, Err(ReplaceError::RolledBack(..))),
             "{error:?}"
         );
         assert_eq!(fs::read(&path).unwrap(), b"prefix:old contents");
@@ -2255,7 +2311,7 @@ mod tests {
         });
         fault::clear();
         assert!(
-            matches!(result, Err(ReplaceError::RolledBack(_))),
+            matches!(result, Err(ReplaceError::RolledBack(..))),
             "{result:?}"
         );
         assert_eq!(marker_state(&a), Some(b'C'), "B keeps its complete locator");
@@ -2665,7 +2721,7 @@ mod tests {
             let got = match result {
                 Ok(()) => V::Ok,
                 Err(ReplaceError::Refused(_)) => V::Refused,
-                Err(ReplaceError::RolledBack(_)) => V::RolledBack,
+                Err(ReplaceError::RolledBack(..)) => V::RolledBack,
                 Err(ReplaceError::Pending(_)) => V::Pending,
                 Err(ReplaceError::Committed(_)) => V::Committed,
             };

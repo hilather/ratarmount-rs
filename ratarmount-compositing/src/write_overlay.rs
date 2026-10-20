@@ -16,7 +16,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression as GzCompression;
 use ratarmount_compress::{
     body_looks_like_tar, decode_zstd_frames_to, detect_compression, export_zstd_blocks,
-    materialize, open_seekable_zstd, open_seekable_zstd_with_threads, scan_zstd_frames_path,
+    materialize_open, open_seekable_zstd, open_seekable_zstd_with_threads, scan_zstd_frames_path,
     CompressionFormat, SpliceStats, ZstdFrameMap, DEFAULT_MEMORY_CAP,
 };
 use ratarmount_core::{
@@ -4579,7 +4579,7 @@ impl WriteOverlay {
                 Err(failed) => {
                     let from = self.after_failed_replace(failed)?;
                     crate::journal_recovery::splice_replace_over(
-                        archive, from_idx, transform, original, from,
+                        archive, from_idx, transform, original, &from,
                     )?
                 }
             }
@@ -4589,7 +4589,7 @@ impl WriteOverlay {
                 from_idx,
                 transform,
                 original,
-                crate::journal_recovery::CopyFrom::Gate,
+                &crate::journal_recovery::CopyFrom::Gate,
             )?
         };
         Ok((
@@ -4662,7 +4662,7 @@ impl WriteOverlay {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let (mut src, source) =
-            crate::journal_recovery::open_copy_source(archive, original, copy_from)?;
+            crate::journal_recovery::open_copy_source(archive, original, &copy_from)?;
         let (tmp, method) = ratarmount_compress::fastcopy::copy_to_temp(&mut src, parent)?;
         ratarmount_compress::fastcopy::log_commit_copy(source.len(), method);
         tmp.as_file().sync_all()?;
@@ -5923,7 +5923,7 @@ fn persist_provenance_plan(
                 ) {
                     let copy_from = copy_after_failed_replace(failed, mode)?;
                     crate::journal_recovery::splice_replace_over(
-                        archive, from, transform, original, copy_from,
+                        archive, from, transform, original, &copy_from,
                     )?;
                 }
             } else {
@@ -5932,7 +5932,7 @@ fn persist_provenance_plan(
                     from,
                     transform,
                     original,
-                    crate::journal_recovery::CopyFrom::Gate,
+                    &crate::journal_recovery::CopyFrom::Gate,
                 )?;
             }
             return Ok(IndexPatchWindow {
@@ -5946,10 +5946,12 @@ fn persist_provenance_plan(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-        let (mut src, _) = crate::journal_recovery::open_copy_source(
+        // The stamp checked against the gate is the one the copy publishes
+        // with (R7-E1): another writer's change after this open refuses it.
+        let (mut src, opened) = crate::journal_recovery::open_copy_source(
             archive,
             original,
-            crate::journal_recovery::CopyFrom::Gate,
+            &crate::journal_recovery::CopyFrom::Gate,
         )?;
         let append_offset = if deleted.is_empty() && mode.may_append(archive)? {
             uncompressed_append_offset(archive, plan, encoding)?
@@ -5967,13 +5969,13 @@ fn persist_provenance_plan(
                 rows,
             ) {
                 let copy_from = copy_after_failed_replace(failed, mode)?;
-                // The stamp after the attempt (a rollback may have left a new
-                // mtime), read from the very file the copy reads; it must
-                // still be the gate's file by the rule the failure names.
-                let source = src.metadata()?;
-                if !crate::journal_recovery::copy_source_matches(original, &source, copy_from) {
-                    return Err(crate::journal_recovery::copy_source_changed(archive).into());
-                }
+                // The stamp after the attempt (a rollback left a new ctime),
+                // read from the very file the copy reads; it must still be
+                // exactly the stamp the failure names.
+                ratarmount_compress::commit_journal::fault::point("copy source open")?;
+                let source = crate::journal_recovery::recheck_copy_source(
+                    archive, &src, original, &copy_from,
+                )?;
                 tmp.as_file_mut().set_len(0)?;
                 tmp.as_file_mut().rewind()?;
                 src.rewind()?;
@@ -5995,7 +5997,7 @@ fn persist_provenance_plan(
                 offsets_shifted: false,
             })
         } else {
-            let source = src.metadata()?;
+            let source = opened;
             rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
             tmp.as_file().sync_all()?;
             crate::journal_recovery::publish_over(archive, &source, || {
@@ -6922,7 +6924,7 @@ fn commit_overlay_inner(
         return Ok(true);
     }
     let committed = if is_zip_archive(archive_file)? {
-        commit_overlay_zip(write_overlay, archive_file, opts)?
+        commit_overlay_zip(write_overlay, archive_file, opts, &original)?
     } else {
         commit_overlay_tar(write_overlay, archive_file, opts, &original)?
     };
@@ -7612,6 +7614,7 @@ fn commit_overlay_zip(
     write_overlay: &Path,
     zip_file: &Path,
     opts: &CommitOverlayOptions,
+    original: &fs::Metadata,
 ) -> Result<bool> {
     let plan = collect_overlay_commit_plan(write_overlay)?;
 
@@ -7666,7 +7669,7 @@ fn commit_overlay_zip(
         return Ok(false);
     }
 
-    rebuild_zip_with_overlay(write_overlay, zip_file, &plan)?;
+    rebuild_zip_with_overlay(write_overlay, zip_file, &plan, original)?;
 
     if opts.debug >= 1 {
         println!(
@@ -7681,8 +7684,16 @@ fn rebuild_zip_with_overlay(
     write_overlay: &Path,
     zip_file: &Path,
     plan: &OverlayCommitPlan,
+    original: &fs::Metadata,
 ) -> Result<()> {
-    let src = File::open(zip_file).map_err(|e| {
+    // Read the descriptor checked against the gate; publish only over that
+    // stamp, under the copy guard (R7-E1).
+    let (src, source) = crate::journal_recovery::open_copy_source(
+        zip_file,
+        original,
+        &crate::journal_recovery::CopyFrom::Gate,
+    )
+    .map_err(|e| {
         OverlayError::Msg(format!(
             "Failed to open ZIP '{}' for commit: {e}",
             zip_file.display()
@@ -7768,11 +7779,13 @@ fn rebuild_zip_with_overlay(
     }
     tmp.as_file().sync_all()?;
 
-    tmp.persist(zip_file).map_err(|e| {
+    crate::journal_recovery::publish_over(zip_file, &source, || {
+        tmp.persist(zip_file).map(drop).map_err(|e| e.error)
+    })
+    .map_err(|e| {
         OverlayError::Msg(format!(
-            "Failed to replace '{}' with rebuilt ZIP: {}",
+            "Failed to replace '{}' with rebuilt ZIP: {e}",
             zip_file.display(),
-            e.error
         ))
     })?;
     Ok(())
@@ -7863,7 +7876,8 @@ fn commit_overlay_tar(
 
     // Keep work temp alive through delete/append (and recompress for compressed).
     // Uncompressed offline matches live: sibling copy; replace only on success.
-    let mut copy_source = None;
+    // The stamp checked against the gate; the publish compares exactly it.
+    let copy_source: fs::Metadata;
     let (work_tar, work_holder): (PathBuf, Option<tempfile::NamedTempFile>) = match format {
         CompressionFormat::None => {
             if !is_uncompressed_tar(tar_file)? {
@@ -7878,16 +7892,21 @@ fn commit_overlay_tar(
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
             let (mut src, source) =
-                crate::journal_recovery::open_copy_source(tar_file, original, copy_from)?;
+                crate::journal_recovery::open_copy_source(tar_file, original, &copy_from)?;
             let (tmp, method) = ratarmount_compress::fastcopy::copy_to_temp(&mut src, parent)?;
             ratarmount_compress::fastcopy::log_commit_copy(source.len(), method);
-            copy_source = Some(source);
+            copy_source = source;
             tmp.as_file().sync_all()?;
             let path = tmp.path().to_path_buf();
             (path, Some(tmp))
         }
         CompressionFormat::Gzip | CompressionFormat::Bzip2 | CompressionFormat::Xz => {
-            let (tmp, _) = materialize(tar_file, format).map_err(|e| {
+            // Decompress the descriptor checked against the gate; the
+            // recompressed copy publishes only over that stamp (R7-E1).
+            let (src, source) =
+                crate::journal_recovery::open_copy_source(tar_file, original, &copy_from)?;
+            copy_source = source;
+            let (tmp, _) = materialize_open(src, tar_file, format).map_err(|e| {
                 OverlayError::Msg(format!(
                     "Failed to decompress '{}' for commit: {e}",
                     tar_file.display()
@@ -8017,7 +8036,7 @@ fn commit_overlay_tar(
     }
 
     if format != CompressionFormat::None {
-        recompress_replace(&work_tar, tar_file, format)?;
+        recompress_replace(&work_tar, tar_file, format, &copy_source)?;
         // Keep materialized temp alive until recompress finishes.
         drop(work_holder);
     } else {
@@ -8027,10 +8046,7 @@ fn commit_overlay_tar(
             )
         })?;
         tmp.as_file().sync_all()?;
-        let source = copy_source.ok_or_else(|| {
-            OverlayError::Msg("internal error: missing copy source for offline commit".into())
-        })?;
-        crate::journal_recovery::publish_over(tar_file, &source, || {
+        crate::journal_recovery::publish_over(tar_file, &copy_source, || {
             tmp.persist(tar_file).map(drop).map_err(|e| e.error)
         })
         .map_err(|e| {
@@ -8164,7 +8180,7 @@ fn commit_overlay_tar_zst(
             Err(failed) => {
                 let copy_from = copy_after_failed_replace(failed, opts.mode)?;
                 crate::journal_recovery::splice_replace_over(
-                    tar_file, from_idx, transform, original, copy_from,
+                    tar_file, from_idx, transform, original, &copy_from,
                 )?
             }
         }
@@ -8174,7 +8190,7 @@ fn commit_overlay_tar_zst(
             from_idx,
             transform,
             original,
-            crate::journal_recovery::CopyFrom::Gate,
+            &crate::journal_recovery::CopyFrom::Gate,
         )?
     };
 
@@ -8200,8 +8216,15 @@ fn commit_overlay_tar_zst(
     Ok(true)
 }
 
-/// Compress `plain` with `format` and atomically replace `dest`.
-fn recompress_replace(plain: &Path, dest: &Path, format: CompressionFormat) -> Result<()> {
+/// Compress `plain` with `format` and atomically replace `dest`, only while
+/// `dest` is still exactly `source` (the stamp checked against the gate),
+/// under the copy guard.
+fn recompress_replace(
+    plain: &Path,
+    dest: &Path,
+    format: CompressionFormat,
+    source: &fs::Metadata,
+) -> Result<()> {
     let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = match parent {
         Some(dir) => tempfile::NamedTempFile::new_in(dir)?,
@@ -8238,11 +8261,13 @@ fn recompress_replace(plain: &Path, dest: &Path, format: CompressionFormat) -> R
     tmp.as_file().sync_all()?;
 
     // Atomic replace on the same filesystem (parent chosen to match dest).
-    tmp.persist(dest).map_err(|e| {
+    crate::journal_recovery::publish_over(dest, source, || {
+        tmp.persist(dest).map(drop).map_err(|e| e.error)
+    })
+    .map_err(|e| {
         OverlayError::Msg(format!(
-            "Failed to replace '{}' with recompressed archive: {}",
+            "Failed to replace '{}' with recompressed archive: {e}",
             dest.display(),
-            e.error
         ))
     })?;
     Ok(())

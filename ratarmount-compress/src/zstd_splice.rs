@@ -127,20 +127,18 @@ where
 
 /// Sibling [`NamedTempFile`] in `path.parent()`, splice, sync, persist.
 ///
-/// The copy is read only from the file `original` describes (the caller's
-/// gate snapshot): with `exact`, exactly that snapshot (device, inode, length,
-/// mtime, ctime: nothing wrote the archive since the gate); without it, the
-/// same device and inode (the caller's own journaled attempt wrote and rolled
-/// it back). It is published only while the archive is still exactly the file
-/// the copy read with no journal pending, under its lock
-/// ([`crate::commit_journal::guard_copy`]). On failure before persist the
-/// original inode is untouched.
+/// The copy is read only from the file still exactly at `reference` (device,
+/// inode, length, mtime, ctime): the caller's gate snapshot, or the stamp its
+/// own rolled-back attempt left under the lock
+/// ([`crate::commit_journal::ReplaceError::RolledBack`]). It is published only
+/// while the archive is still exactly that stamp with no journal pending,
+/// under its lock ([`crate::commit_journal::guard_copy`]). On failure before
+/// persist the original inode is untouched.
 pub fn splice_zstd_last_frames_replace<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
-    original: &std::fs::Metadata,
-    exact: bool,
+    reference: &std::fs::Metadata,
 ) -> Result<SpliceStats>
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
@@ -150,20 +148,17 @@ where
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
+    crate::commit_journal::fault::point("copy source open")?;
     let mut src = File::open(path)?;
     let source = src.metadata()?;
-    let matches = if exact {
-        crate::commit_journal::same_stamp(original, &source)
-    } else {
-        same_file(original, &source)
-    };
-    if !matches {
+    if !crate::commit_journal::same_stamp(reference, &source) {
         return Err(CompressError::Msg(format!(
             "{} changed before the copy fallback (it is no longer the file the commit gate \
              accepted); nothing was published, retry",
             path.display()
         )));
     }
+    crate::commit_journal::fault::point("copy source opened")?;
     let map = scan_zstd_frames(&mut src)?;
     let prefix = map
         .frames
@@ -189,20 +184,6 @@ where
         ))
     })?;
     Ok(stats)
-}
-
-/// Same device and inode.
-fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        (a.dev(), a.ino()) == (b.dev(), b.ino())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (a, b);
-        true
-    }
 }
 
 /// Journaled in-place splice. Requires a seek table and stages only the suffix.
@@ -816,7 +797,6 @@ mod tests {
             from_idx,
             append_extra(extra.clone()),
             &std::fs::metadata(&path).unwrap(),
-            true,
         )
         .unwrap();
         assert!(stats.wrote_seek_table);
@@ -846,7 +826,6 @@ mod tests {
             99,
             append_extra(extra),
             &std::fs::metadata(&path).unwrap(),
-            true,
         )
         .unwrap_err();
         assert!(err.to_string().contains("from_idx"), "{err}");
@@ -872,8 +851,7 @@ mod tests {
                 "transform failed after suffix",
             ))
         };
-        let err =
-            splice_zstd_last_frames_replace(&path, 1, transform, &original, true).unwrap_err();
+        let err = splice_zstd_last_frames_replace(&path, 1, transform, &original).unwrap_err();
         assert!(
             err.to_string().contains("transform failed after suffix"),
             "{err}"

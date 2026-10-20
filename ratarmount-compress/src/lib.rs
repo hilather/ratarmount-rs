@@ -324,6 +324,31 @@ pub fn materialize_xz(path: &Path) -> Result<(NamedTempFile, u64)> {
     materialize_from_reader(decoder, "xz", path)
 }
 
+/// [`materialize`] of an already open gzip/bzip2/xz file (`path` only labels
+/// it): a commit decompresses the descriptor its gate checked, never whatever
+/// is at the path later.
+pub fn materialize_open(
+    input: File,
+    path: &Path,
+    format: CompressionFormat,
+) -> Result<(NamedTempFile, u64)> {
+    let input = BufReader::new(input);
+    match format {
+        CompressionFormat::Gzip => {
+            materialize_from_reader(MultiGzDecoder::new(input), "gzip", path)
+        }
+        CompressionFormat::Bzip2 => {
+            materialize_from_reader(MultiBzDecoder::new(input), "bzip2", path)
+        }
+        CompressionFormat::Xz => {
+            materialize_from_reader(XzDecoder::new_multi_decoder(input), "xz", path)
+        }
+        _ => Err(CompressError::Unsupported(
+            "materialize_open supports gzip, bzip2 and xz",
+        )),
+    }
+}
+
 /// Decompress zstd into a persistent temp file.
 pub fn materialize_zstd(path: &Path) -> Result<(NamedTempFile, u64)> {
     let input = File::open(path)?;
