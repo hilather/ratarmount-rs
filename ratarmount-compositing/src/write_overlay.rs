@@ -5706,7 +5706,9 @@ fn write_commit_manifest(
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_micros() as u64;
-    let previous = match File::open(&dest) {
+    // Admitted (R10-FIX3): a manifest name that is a hard link of an open
+    // overlay database is refused without a descriptor of it being closed.
+    let previous = match open_admitted_file(&dest, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
         Ok(file) => {
             use std::io::BufRead;
             let line = BufReader::new(file).lines().next().transpose()?;
