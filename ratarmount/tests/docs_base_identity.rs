@@ -69,3 +69,21 @@ fn regression_docs_state_journal_ownership() {
         assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
     }
 }
+
+/// R7-C: how a failed replacement and crash recovery treat a journal stay
+/// documented: cleanup under the attempt's own lock, no adoption of another
+/// file's journal, a missing complete journal refused (never cleared), the
+/// target never inferred from stamps, and the copy guard.
+#[test]
+fn regression_docs_state_failed_replacement_and_locator_rules() {
+    let docs = read("docs/sandbox.md");
+    for sentence in [
+        "A failed replacement is cleaned up under the archive lock it took, from its own record of what it published, before any other committer can touch the file",
+        "it never adopts a journal another file left at the name",
+        "a complete locator whose journal cannot be found is refused, never cleared",
+        "it is never inferred from matching stamps",
+        "A copy fallback (`--commit-overlay-mode auto`) publishes only over the file the commit gate accepted, unchanged since the copy read it, and only while no journal is pending on it.",
+    ] {
+        assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
+    }
+}

@@ -375,7 +375,12 @@ changed archive to the crash, and that commit is refused as a changed base.
 Journals exist on Linux and macOS only; elsewhere there is nothing to check.
 A journal touches the overlay's recorded rows only when its target is the
 recorded base: a union member's own journal recovers that member alone and
-leaves the base stamp as it was. Mounting applies the same ownership check
+leaves the base stamp as it was. The target is the recorded base when the
+record names the archive's path or when the recorded path is another name of
+the very same file (same device and inode, e.g. a hard link); it is never
+inferred from matching stamps, so a base that left its recorded place (a
+renamed directory, a reused name) is recovered without touching the rows and
+is left to the gate (`--force-base-mismatch`). Mounting applies the same ownership check
 before any recovery (the plain mount, `-w` remounts, sessions and rolling
 series): a journal started for another file refuses the open with the archive
 and journal untouched, and the archive's own crash still recovers at mount.
@@ -388,11 +393,36 @@ after unpacking, a sealed or unreadable top) waits for the gates: a torn one is
 refused with exit 2 and the instruction to recover that file alone first
 (`ratarmount --no-mount FILE`), a complete one is recovered after every gate
 accepted. The decision is taken again under the archive lock, on the locked
-file. A complete journal whose rows already describe the committed bytes (only
-the unlink is owed) is accepted by every gate, and a stale locator without a
-journal is cleared. Recovery restamps the recorded rows from the locked
-descriptor before it unlinks the journal, on every path (mount, offline commit,
-library openers, live and on-exit commits). The lower gate still compares
+file. A journal whose rows already describe the file recovery will leave (the
+committed bytes, or rolled-back bytes whose mtime could not be restored; only
+the unlink is owed) is accepted by every gate. Recovery finds a journal through
+its inode locator or beside the archive's current name (a directory renamed
+with the journal in it). A stale prepare locator without a journal is cleared
+after a directory sync; a complete locator whose journal cannot be found is
+refused, never cleared (the commit's hook may not have run), and the error
+names the manual escape: verify the archive, then remove its
+`user.ratarmount.commit-journal` xattr (`setfattr -x` on Linux, `xattr -d` on
+macOS). A done locator (the commit finished; only the journal's unlink was
+owed) whose journal is not beside the name recovery was given is kept too: the
+journal may sit beside another name of the file (a directory renamed under a
+hard link), and dropping the locator would make it look torn. Recovery
+restamps the recorded rows from the locked descriptor before it unlinks the
+journal, on every path (mount, offline commit, library openers, live and
+on-exit commits).
+
+A failed replacement is cleaned up under the archive lock it took, from its own
+record of what it published, before any other committer can touch the file:
+it never adopts a journal another file left at the name, and it recovers only
+the journal file it published. A rollback that cannot restore the mtime (a
+non-owner gets `EPERM`) moves the recorded stamp to the restored file only when
+the journal was started on the recorded state; a strong digest is kept (the
+bytes are the recorded bytes). A commit whose rows could not be updated, or
+whose journal is no longer where it was written, keeps its journal and stays
+committed but pending (the mount stops committing and needs a remount) until
+that file is recovered; it is never reported as a success. A copy fallback
+(`--commit-overlay-mode auto`) publishes only over the file the commit gate
+accepted, unchanged since the copy read it, and only while no journal is
+pending on it. The lower gate still compares
 content: a lower sealed against the pre-commit stamp refuses the rolled-forward
 archive, and `--force-stack-mismatch` mounts it anyway; a forced lower mismatch
 mounts and is never refused.
