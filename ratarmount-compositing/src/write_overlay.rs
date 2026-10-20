@@ -810,6 +810,9 @@ pub struct WriteOverlay {
     /// open's post-open path stat). Recovery refuses when the database path
     /// no longer names it (R10-B).
     db_id: Option<(u64, u64)>,
+    /// The database inode stays registered as open while the mount lives
+    /// (R10-C). After `db`: dropped once the connection is closed.
+    _db_registration: Option<ratarmount_core::db_inodes::DbInodeRegistration>,
     /// Mount paths with `deleted = 1` (for example `/dir/file`).
     ///
     /// `is_deleted` checks this set. The `files` table remains the durable
@@ -1201,7 +1204,7 @@ impl WriteOverlay {
         };
         let opened = crate::open_overlay_db(&db_path, OpenFlags::default(), crate::DbName::Path)?;
         let db_id = opened.id();
-        let mut conn = opened.into_connection();
+        let (mut conn, db_registration) = opened.into_parts();
         let had_files = conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'",
@@ -1381,6 +1384,7 @@ impl WriteOverlay {
             root,
             db: Mutex::new(conn),
             db_id,
+            _db_registration: db_registration,
             tombstones: Mutex::new(tombstones),
             pending_rows: Mutex::new(Vec::new()),
             commit_gate: RwLock::new(()),
@@ -2241,12 +2245,6 @@ impl WriteOverlay {
                 self.ensure_under_root(parent)?;
                 fs::create_dir_all(parent)?;
             }
-            let mut opts = open_options_nofollow();
-            opts.read(true).write(true).create(true).truncate(true);
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(mode & 0o7777);
-            }
             if let Some(policy) = &self.policy {
                 policy.check_write(
                     &normpath(path),
@@ -2256,7 +2254,13 @@ impl WriteOverlay {
                 )?;
             }
             let _account = self.account_path(path);
-            let f = opts.open(&real)?;
+            // Admitted before `O_TRUNC` and the chmod (R10-C): never a
+            // descriptor of an open overlay database.
+            let f = open_admitted_file(
+                &real,
+                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
+                mode & 0o7777,
+            )?;
             {
                 use std::os::unix::fs::PermissionsExt;
                 f.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
@@ -2339,13 +2343,15 @@ impl WriteOverlay {
             }
             // Keep O_TRUNC on open: Linux permits it with O_RDONLY, and open
             // must perform permission and O_EXCL checks before changing data.
+            // The admitted open applies it only to an inode that is not an
+            // open overlay database (R10-C): another name of one is refused
+            // without closing a descriptor of it.
             let fd = {
+                use std::os::unix::io::IntoRawFd;
                 let _account = self.account_path(path);
-                unsafe { libc::open(c_path(&real)?.as_ptr(), flags, mode & 0o7777) }
+                ratarmount_core::db_inodes::open_admitted(&real, flags, mode & 0o7777)?
+                    .into_raw_fd()
             };
-            if fd < 0 {
-                return Err(OverlayError::Io(io::Error::last_os_error()));
-            }
             // Double-check the opened path still resolves under the overlay root.
             if let Ok(canon) = fs::canonicalize(&real) {
                 if !path_is_under(&self.root, &canon) {
@@ -2500,9 +2506,10 @@ impl WriteOverlay {
         let _policy = self.policy_lock();
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
-        let mut opts = open_options_nofollow();
-        opts.write(true);
-        let f = opts.open(&real)?;
+        #[cfg(unix)]
+        let f = open_admitted_file(&real, libc::O_WRONLY | libc::O_NOFOLLOW, 0)?;
+        #[cfg(not(unix))]
+        let f = open_options_nofollow().write(true).open(&real)?;
         self.truncate_file_inner(&f, path, size)?;
         Ok(())
     }
@@ -5548,9 +5555,11 @@ impl MountSource for WriteOverlay {
             if let Some(path) = s.strip_prefix("overlay:") {
                 let real = self.realpath(path);
                 self.ensure_under_root(&real)?;
-                let mut opts = open_options_nofollow();
-                opts.read(true);
-                match opts.open(&real) {
+                #[cfg(unix)]
+                let opened = open_admitted_file(&real, libc::O_RDONLY | libc::O_NOFOLLOW, 0);
+                #[cfg(not(unix))]
+                let opened = open_options_nofollow().read(true).open(&real);
+                match opened {
                     Ok(f) => return Ok(Box::new(f)),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
                         // Live commit wiped the overlay file; serve from the new base.
@@ -6325,15 +6334,25 @@ fn is_fd_exhaustion(err: &io::Error) -> bool {
 /// `commit_gate`, and that helper would take the lock again.
 #[cfg(unix)]
 fn open_park_fd(host: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
-    use std::os::unix::io::{FromRawFd, OwnedFd};
-    let c = c_path(host)?;
-    // Safety: `c` is NUL-terminated. Flags never include `O_CREAT`.
-    let fd = unsafe { libc::open(c.as_ptr(), park_open_flags(), 0) };
-    if fd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        // Safety: `fd` is a new descriptor owned by this process.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    // Linux parks an `O_PATH` descriptor: closing it releases no fcntl lock.
+    // Elsewhere the parked descriptor is readable, so it is admitted first
+    // (R10-C): another name of an open overlay database is never parked.
+    #[cfg(not(target_os = "linux"))]
+    {
+        ratarmount_core::db_inodes::open_admitted(host, park_open_flags(), 0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::{FromRawFd, OwnedFd};
+        let c = c_path(host)?;
+        // Safety: `c` is NUL-terminated. Flags never include `O_CREAT`.
+        let fd = unsafe { libc::open(c.as_ptr(), park_open_flags(), 0) };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // Safety: `fd` is a new descriptor owned by this process.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
     }
 }
 
@@ -6402,6 +6421,14 @@ fn create_overlay_marker(path: &Path) -> io::Result<bool> {
 }
 
 /// WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no equivalent bit.
+/// `open(2)` of a payload, sentinel or commit source that never returns (and
+/// never closes) a descriptor of an open overlay database (R10-C, see
+/// [`ratarmount_core::db_inodes`]); `O_CLOEXEC` is added.
+#[cfg(unix)]
+pub(crate) fn open_admitted_file(path: &Path, flags: libc::c_int, mode: u32) -> io::Result<File> {
+    ratarmount_core::db_inodes::open_admitted(path, flags | libc::O_CLOEXEC, mode).map(File::from)
+}
+
 pub(crate) fn open_options_nofollow() -> FsOpenOptions {
     let mut opts = FsOpenOptions::new();
     #[cfg(unix)]
@@ -7883,7 +7910,11 @@ fn rebuild_zip_with_overlay(
                 })?;
             } else {
                 let src_path = write_overlay.join(rel);
-                let mut src_file = File::open(&src_path).map_err(|e| {
+                #[cfg(unix)]
+                let opened = open_admitted_file(&src_path, libc::O_RDONLY, 0);
+                #[cfg(not(unix))]
+                let opened = File::open(&src_path);
+                let mut src_file = opened.map_err(|e| {
                     OverlayError::Msg(format!(
                         "Failed to open overlay file '{}': {e}",
                         src_path.display()

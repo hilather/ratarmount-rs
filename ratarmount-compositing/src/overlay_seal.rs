@@ -356,16 +356,23 @@ fn write_sentinel(dir: &Path, layer_digest: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Open the sentinel under `root` for reading, admitted (R10-C): another name
+/// of an open overlay database is refused without closing a descriptor of it.
+fn open_sentinel(root: &OwnedFd) -> io::Result<OwnedFd> {
+    use std::os::fd::AsFd;
+    ratarmount_core::db_inodes::openat_admitted(
+        Some(root.as_fd()),
+        Path::new(SENTINEL),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+}
+
 /// Finish a seal that was interrupted after its metadata commit: write the
 /// missing sentinel (a present one must match exactly and is never replaced)
 /// and re-apply the read-only modes. Writes nothing to the sealed database.
 fn finish_sealed(dir: &Path, root: &OwnedFd, layer_digest: &str) -> io::Result<()> {
-    match host::openat(
-        root,
-        SENTINEL,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
+    match open_sentinel(root) {
         Ok(fd)
             if crate::host_stat::fstat_named(&fd, dir.join(SENTINEL))?.st_mode & libc::S_IFMT
                 == libc::S_IFREG =>
@@ -386,7 +393,7 @@ fn finish_sealed(dir: &Path, root: &OwnedFd, layer_digest: &str) -> io::Result<(
                 "sealed overlay sentinel is not a regular file; refusing to replace it",
             ))
         }
-        Err(rustix::io::Errno::NOENT) => write_sentinel(dir, layer_digest)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => write_sentinel(dir, layer_digest)?,
         Err(e) => {
             return Err(io::Error::other(format!(
                 "sealed overlay sentinel is not a regular file ({e}); refusing to replace it"
@@ -469,12 +476,7 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         .filter(|p| rows.get(*p) != current.get(*p))
         .cloned()
         .collect();
-    let sentinel_ok = match host::openat(
-        &root,
-        SENTINEL,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
+    let sentinel_ok = match open_sentinel(&root) {
         Ok(fd)
             if crate::host_stat::fstat_named(&fd, dir.join(SENTINEL))?.st_mode & libc::S_IFMT
                 == libc::S_IFREG =>
@@ -487,8 +489,10 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
             bytes == recorded.as_bytes() || bytes == format!("{recorded}\n").as_bytes()
         }
         Ok(_) => false,
-        Err(e) if e == rustix::io::Errno::NOENT || e == rustix::io::Errno::LOOP => false,
-        Err(e) => return Err(e.into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) => {
+            false
+        }
+        Err(e) => return Err(e),
     };
     Ok(VerifyReport {
         ok: recorded == computed && sentinel_ok && mismatched.is_empty(),

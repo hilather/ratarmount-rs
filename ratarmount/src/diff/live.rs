@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -75,7 +75,6 @@ impl MountSource for LiveView {
                     .open(&self.root)?;
                 let mut parts = path.trim_start_matches('/').split('/').peekable();
                 while let Some(part) = parts.next() {
-                    let name = std::ffi::CString::new(part).map_err(io::Error::other)?;
                     let flags = libc::O_RDONLY
                         | libc::O_NOFOLLOW
                         | libc::O_CLOEXEC
@@ -87,11 +86,14 @@ impl MountSource for LiveView {
                         };
                     // Pin every host parent; a concurrent directory-to-link swap
                     // cannot redirect an open outside the overlay.
-                    let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
-                    if fd < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    file = unsafe { File::from_raw_fd(fd) };
+                    // Admitted (R10-C): another name of an open overlay
+                    // database is refused without closing a descriptor of it.
+                    file = File::from(ratarmount_core::db_inodes::openat_admitted(
+                        Some(file.as_fd()),
+                        std::path::Path::new(part),
+                        flags,
+                        0,
+                    )?);
                 }
                 return Ok(Box::new(file));
             }

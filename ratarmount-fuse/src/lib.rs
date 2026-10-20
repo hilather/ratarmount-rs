@@ -2890,6 +2890,13 @@ fn install_detached(
 /// entry is a symlink, so no `O_NOFOLLOW` and no `O_PATH`). Other unix dups
 /// the already-readable fd.
 fn reopen_parked_readonly(raw: libc::c_int) -> Result<libc::c_int, i32> {
+    // The parked descriptor pins its inode: refuse another name of an open
+    // overlay database before a readable descriptor of it exists (R10-C). A
+    // refusal closes nothing (the parked descriptor stays with the inode).
+    // Safety: `raw` is the parked descriptor, open for this call.
+    let parked = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+    ratarmount_core::db_inodes::admit_fd(parked, std::path::Path::new("the detached file"))
+        .map_err(|e| io_to_errno(&e))?;
     #[cfg(target_os = "linux")]
     {
         let path = std::ffi::CString::new(format!("/proc/self/fd/{raw}")).map_err(|_| EIO)?;
@@ -7890,6 +7897,92 @@ mod tests {
         let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(Arc::clone(&ov) as Arc<dyn MountSource>, Some(ov));
         (dir, fs)
+    }
+
+    /// Set by [`db_lock_busy_in_child`] for the child it spawns.
+    const DB_PROBE_ENV: &str = "RATARMOUNT_TEST_FUSE_DB_PROBE";
+
+    /// The child half of [`db_lock_busy_in_child`]: `BEGIN IMMEDIATE` alone.
+    #[test]
+    fn fuse_db_lock_probe_child() {
+        let Some(db) = std::env::var_os(DB_PROBE_ENV) else {
+            return;
+        };
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match conn.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => println!("PROBE:acquired"),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                println!("PROBE:busy")
+            }
+            Err(e) => panic!("probe: {e}"),
+        }
+    }
+
+    /// Another process's `BEGIN IMMEDIATE` on `db` is busy (the child must
+    /// exit successfully).
+    fn db_lock_busy_in_child(db: &std::path::Path) -> bool {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::fuse_db_lock_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DB_PROBE_ENV, db)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "probe child: {stdout}");
+        assert!(stdout.contains("PROBE:"), "probe child: {stdout}");
+        stdout.contains("PROBE:busy")
+    }
+
+    /// Regression (R10-C, #148): FUSE duplicates and closes a descriptor on
+    /// every read and write, and reopens a parked descriptor of a detached
+    /// inode. A payload name that is a hard link of the mount's overlay
+    /// database is refused at OPEN (EACCES), a detached inode parked on it is
+    /// refused at its reopen (EACCES), and after an ordinary payload is
+    /// opened and READ (a dup and a close) another process still sees the
+    /// mount's database lock and the mount still writes.
+    #[test]
+    fn regression_payload_db_alias_open_read_and_detached_reopen() {
+        let (dir, ov, fs) = overlay_fs_for_rename();
+        let db = dir.path().join(ratarmount_compositing::HIDDEN_DB);
+        overlay_write_new(&ov, "/plain", b"plain bytes");
+        std::fs::hard_link(&db, dir.path().join("alias")).unwrap();
+        std::fs::hard_link(&db, dir.path().join("parked")).unwrap();
+        overlay_write_new(&ov, "/src", b"src");
+        let (alias, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("alias"))
+            .expect("alias");
+        assert_eq!(fs.open_inode(alias, libc::O_RDONLY).unwrap_err(), EACCES);
+        assert_eq!(fs.open_inode(alias, libc::O_RDWR).unwrap_err(), EACCES);
+        // Detached: rename over `parked` parks a descriptor of the database
+        // inode (`O_PATH` on Linux); its reopen must not hand one out.
+        let (parked, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("parked"))
+            .expect("parked");
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "parked", 0)
+            .expect("rename over");
+        assert_eq!(fs.open_inode(parked, libc::O_RDONLY).unwrap_err(), EACCES);
+        let (plain, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("plain"))
+            .expect("plain");
+        let (fh, _) = fs.open_inode(plain, libc::O_RDONLY).expect("open plain");
+        assert_eq!(fs.test_read(fh, 0, 32).unwrap(), b"plain bytes");
+        assert!(db_lock_busy_in_child(&db), "lock kept after a read");
+        ov.set_meta("r10_probe", "still writes").unwrap();
+        assert!(db_lock_busy_in_child(&db));
+        // The probe itself: without the mount, the child takes the lock.
+        drop(fs);
+        drop(ov);
+        assert!(!db_lock_busy_in_child(&db));
     }
 
     /// Regression (#88): rename-over of an overlay file made the old nodeid
