@@ -621,9 +621,11 @@ fn regression_mount_roll_forward_restamps_then_remount_accepts() {
         let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
         let overlay = env.path("overlay");
         let old = if supplied {
-            let out = Command::new("sha256sum").arg(&archive).output().unwrap();
-            let hex = String::from_utf8_lossy(&out.stdout);
-            Some(format!("sha256:{}", hex.split_whitespace().next().unwrap()))
+            use sha2::{Digest, Sha256};
+            Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(fs::read(&archive).unwrap())
+            ))
         } else {
             None
         };
