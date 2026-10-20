@@ -3374,6 +3374,10 @@ enum CopyWindow {
     /// right before the copy source is opened ("copy source open"), after P1
     /// released the lock.
     AfterRollback,
+    /// P1's in-place append failed and rolled back; the writer acts right
+    /// after the copy source was opened and re-checked ("copy source
+    /// opened"): the publish guard must still refuse.
+    OpenedAfterRollback,
     /// Right after the gate's snapshot (offline gzip/bzip2/xz and ZIP, which
     /// had no copy-source check at all).
     AfterGate,
@@ -3454,6 +3458,14 @@ fn regression_copy_paths_compare_the_gate_stamp() {
             Way::Provenance,
             Auto,
             AfterRollback,
+            false,
+        ),
+        row(
+            "A2 provenance tar opened after rollback",
+            Tar,
+            Way::Provenance,
+            Auto,
+            OpenedAfterRollback,
             false,
         ),
         row(
@@ -3654,7 +3666,9 @@ fn copy_row_with_p2(r: &CopyRow) {
     let mut wrote = false;
     fault::install(move |step| {
         match (window, step) {
-            (CopyWindow::AfterRollback, "archive write") if !wrote => {
+            (CopyWindow::AfterRollback | CopyWindow::OpenedAfterRollback, "archive write")
+                if !wrote =>
+            {
                 wrote = true;
                 return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
             }
@@ -3664,6 +3678,11 @@ fn copy_row_with_p2(r: &CopyRow) {
                 }
             }
             (CopyWindow::Opened, "copy source opened") => {
+                if let Some(run) = p2_commit.take() {
+                    run();
+                }
+            }
+            (CopyWindow::OpenedAfterRollback, "copy source opened") if wrote => {
                 if let Some(run) = p2_commit.take() {
                     run();
                 }

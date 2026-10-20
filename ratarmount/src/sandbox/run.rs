@@ -1093,6 +1093,7 @@ mod tests {
     /// Regression (r17 skeptic #2, R7-E2 B13): `wait_database` read a dangling
     /// symlink at the database path as "no database" and returned at once;
     /// anything at that path that is not a readable regular file is an error.
+    #[cfg(unix)]
     #[test]
     fn regression_wait_database_refuses_a_dangling_db_symlink() {
         let dir = tempfile::tempdir().unwrap();

@@ -434,8 +434,9 @@ pending on it. It reads only the gate's own snapshot: when anything wrote the
 archive after the gate (another mount's commit, `tar -r`, a touch), the
 append is refused and no copy runs; the commit fails and the next one is
 judged afresh. The one exception is the append's own rollback, which moved
-the archive's ctime under its lock: the copy then needs the same device and
-inode. `--commit-overlay-mode copy` reads its source by the same rule. The
+the archive's ctime under its lock: the copy then needs the exact stamp the
+rolled-back file had after that cleanup, read under the lock.
+`--commit-overlay-mode copy` reads its source by the same rule. The
 lower gate still compares
 content: a lower sealed against the pre-commit stamp refuses the rolled-forward
 archive, and `--force-stack-mismatch` mounts it anyway; a forced lower mismatch

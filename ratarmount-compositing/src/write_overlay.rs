@@ -145,7 +145,6 @@ fn discard_hint(paths: &[&Path]) -> String {
     )
 }
 
-/// The database path exists but is a directory (Robo-Ilya, #96 review).
 /// Nothing at all is at `dir`'s overlay database path (R7-E2): only an
 /// `lstat` that reports a missing entry is "no database". A symlink (dangling
 /// or not), a directory, a FIFO, or an entry that cannot be statted is an
@@ -175,11 +174,10 @@ fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadat
         Ok(_) => {}
     }
     match fs::metadata(db_path) {
-        Ok(m) if m.is_dir() => Err(db_is_directory_error(db_path)),
         Ok(m) if m.is_file() => Ok(Some(m)),
-        Ok(_) => Err(OverlayError::Msg(format!(
-            "overlay database {} is not a regular file; move it aside",
-            db_path.display()
+        // A directory or any other non-regular file: the shared open's text.
+        Ok(m) => Err(OverlayError::Msg(crate::overlay_db::not_regular_message(
+            db_path, &m,
         ))),
         Err(e) if e.kind() == io::ErrorKind::NotFound && marked => Ok(None),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Err(OverlayError::Msg(format!(
@@ -189,13 +187,6 @@ fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadat
         ))),
         Err(e) => Err(OverlayError::Io(e)),
     }
-}
-
-fn db_is_directory_error(db_path: &Path) -> OverlayError {
-    OverlayError::Msg(format!(
-        "overlay database path {} is a directory, not a database file; move it aside",
-        db_path.display()
-    ))
 }
 
 /// Overlay-relative names with this prefix are not commit members.
@@ -6017,6 +6008,7 @@ fn persist_provenance_plan(
                 let source = crate::journal_recovery::recheck_copy_source(
                     archive, &src, original, &copy_from,
                 )?;
+                ratarmount_compress::commit_journal::fault::point("copy source opened")?;
                 tmp.as_file_mut().set_len(0)?;
                 tmp.as_file_mut().rewind()?;
                 src.rewind()?;
@@ -6596,12 +6588,12 @@ fn uncompressed_append_offset(
 #[cfg(test)]
 thread_local! {
     static APPEND_PREPARE_TOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// When set, renamed over the archive after the suffix is staged (another
-    /// file takes the name between preparation and the journaled replacement).
     /// Run by an offline commit after the caller's gate, right before it
     /// picks the recovery owner (the overlay or the archive changes there).
     pub(crate) static BEFORE_OFFLINE_RECOVERY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    /// When set, renamed over the archive after the suffix is staged (another
+    /// file takes the name between preparation and the journaled replacement).
     pub(crate) static APPEND_PREPARE_SWAP: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -7030,17 +7022,16 @@ impl OverlayCommitPlan {
 /// see rows that never reached the database. An unsaved queue is logged on
 /// unmount: an offline `--commit-overlay` will publish those archive members.
 fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan> {
-    let db_path = write_overlay.join(HIDDEN_DB);
+    // Canonical paths in every refusal, same as the mount's.
+    let canon = write_overlay
+        .canonicalize()
+        .unwrap_or_else(|_| write_overlay.to_path_buf());
+    let db_path = canon.join(HIDDEN_DB);
     let markers = overlay_markers(write_overlay)?;
     let marker = markers.first().cloned();
-    if fs::metadata(&db_path).is_ok_and(|m| m.is_dir()) {
-        let canon = write_overlay
-            .canonicalize()
-            .unwrap_or_else(|_| write_overlay.to_path_buf());
-        return Err(db_is_directory_error(&canon.join(HIDDEN_DB)));
-    }
     // Only a missing entry is "no database" (R7-E2): a dangling symlink in an
-    // unmarked folder is refused, never planned without its tombstones.
+    // unmarked folder is refused, never planned without its tombstones; a
+    // directory or another non-regular file is refused with the shared text.
     let db_regular = match overlay_db_regular(&db_path, marker.is_some())? {
         // A 0-byte file in a marked folder is as gone as a missing one.
         Some(m) => marker.is_none() || m.len() > 0,
@@ -7050,9 +7041,6 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
         // #96: committing without the tombstones would write the unlinked
         // members back into the archive. Same wording and canonical paths as
         // the mount refusal.
-        let canon = write_overlay
-            .canonicalize()
-            .unwrap_or_else(|_| write_overlay.to_path_buf());
         let canon_markers: Vec<PathBuf> = markers
             .iter()
             .map(|m| canon.join(m.file_name().unwrap_or_default()))
@@ -12561,6 +12549,7 @@ pub(crate) mod tests {
     /// outside the overlay. B7: the offline commit plan was built without the
     /// tombstones. Both refuse; nothing is created at the target. A symlink
     /// to a regular file stays supported (see the test below).
+    #[cfg(unix)]
     #[test]
     fn regression_dangling_db_symlink_is_not_an_absent_database() {
         let dir = tempfile::tempdir().unwrap();
