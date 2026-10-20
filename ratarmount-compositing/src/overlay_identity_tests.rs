@@ -2206,6 +2206,54 @@ fn regression_mount_symlinked_overlay_db_defers_recovery() {
     assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
 }
 
+/// Regression (R7-B2): a journal-bearing file B takes A's name AFTER the
+/// append's suffix was staged and BEFORE the journaled replacement. The
+/// replacement fails ("pending journal") and the fallback cleanup recovered
+/// whatever journal sat at the name with `authorize_any`: B was rolled back and
+/// B's stamp became A's recorded baseline (`Restamp::Commit`). Only the journal
+/// THIS attempt started may be recovered.
+#[cfg(unix)]
+#[test]
+fn regression_replacement_error_fallback_leaves_foreign_journal() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for complete in [false, true] {
+        let fx = Fixture::new();
+        let mut ov = fx.open(BaseDigestRequest::Compute, false);
+        ov.set_commit_mode(crate::CommitMode::Append);
+        let before = ov.recorded_stamp_for_tests();
+        fs::write(ov.root().join("new"), b"new").unwrap();
+        let foreign = fx.archive.with_file_name("foreign.tar");
+        write_tar(&foreign, &[("b", b"bb"), ("c", b"c")]);
+        if complete {
+            interrupt_complete(&foreign);
+        } else {
+            interrupt_append(&foreign);
+        }
+        let journal = ratarmount_compress::commit_journal::journal_path(&foreign);
+        let journal_bytes = fs::read(&journal).unwrap();
+        let bytes = fs::read(&foreign).unwrap();
+        crate::write_overlay::APPEND_PREPARE_SWAP.set(Some(foreign));
+        let result = commit(&ov, &fx.archive, Path_::Live);
+        assert!(result.is_err(), "complete={complete}: {result:?}");
+        assert!(
+            fs::read(&fx.archive).unwrap() == bytes,
+            "complete={complete}: B touched"
+        );
+        assert!(
+            fs::read(&journal).unwrap() == journal_bytes,
+            "complete={complete}: journal"
+        );
+        assert_eq!(
+            ov.recorded_stamp_for_tests(),
+            before,
+            "complete={complete}: baseline moved"
+        );
+    }
+}
+
 /// Regression (R7-A1): the table's other rows. The overlay's own torn and
 /// complete journals are `Own`; a record naming another file (a union member),
 /// a bundle `--lower`, a sealed or unreadable top and a lower that disagrees

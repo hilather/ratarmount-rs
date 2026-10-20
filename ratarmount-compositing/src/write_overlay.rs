@@ -6533,6 +6533,10 @@ fn uncompressed_append_offset(
 #[cfg(test)]
 thread_local! {
     static APPEND_PREPARE_TOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When set, renamed over the archive after the suffix is staged (another
+    /// file takes the name between preparation and the journaled replacement).
+    pub(crate) static APPEND_PREPARE_SWAP: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// A failed journaled replacement: `Committed` keeps its own variant so no
@@ -6589,6 +6593,10 @@ fn append_uncompressed_tar_plan(
         File::options().write(true).open(archive)?.set_times(
             fs::FileTimes::new().set_modified(original.modified()? + Duration::from_secs(2)),
         )?;
+    }
+    #[cfg(test)]
+    if let Some(other) = APPEND_PREPARE_SWAP.take() {
+        fs::rename(other, archive)?;
     }
     ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with(
         archive,

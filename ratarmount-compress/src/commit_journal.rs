@@ -115,6 +115,28 @@ pub fn authorize_owned(journal: &PendingJournal, file: &fs::Metadata) -> io::Res
     Ok(())
 }
 
+/// The journal and the locked file are the one a replacement attempt started
+/// for (`dev`/`ino` of the file it locked): a fallback cleanup after a failed
+/// replacement must never touch another file's journal.
+fn authorize_started(journal: &PendingJournal, file: &fs::Metadata, ino: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if journal.ino != ino || file.ino() != ino {
+            return Err(io::Error::other(format!(
+                "the archive carries a commit journal that this replacement did not start \
+                 (journal inode {}, archive inode {}, attempt inode {}); the journal was not applied",
+                journal.ino,
+                file.ino(),
+                ino
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (journal, file, ino);
+    Ok(())
+}
+
 /// Accept any journal (a forced recovery, or in-crate tests).
 pub fn authorize_any(_: &PendingJournal, _: &fs::Metadata) -> io::Result<()> {
     Ok(())
@@ -239,6 +261,10 @@ fn replace_suffix_if_original(
 ) -> std::result::Result<(), RecoverError> {
     #[allow(unused_mut)]
     let mut committed = false;
+    // The (dev, ino) of the file THIS attempt took the lock on, set once the
+    // staleness check passed and before the first marker or journal is written.
+    #[allow(unused_mut)]
+    let mut started: Option<(u64, u64)> = None;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let result = unix::replace(
         archive,
@@ -246,6 +272,7 @@ fn replace_suffix_if_original(
         suffix,
         original,
         &mut committed,
+        &mut started,
         &mut |_| Ok(()),
         &mut *before_unlink,
     );
@@ -257,17 +284,27 @@ fn replace_suffix_if_original(
             "append requires Linux/macOS inode xattrs",
         ))
     };
-    finish_replace(archive, result, committed, before_unlink)
+    finish_replace(archive, result, committed, started, before_unlink)
 }
 
 fn finish_replace(
     archive: &Path,
     result: io::Result<()>,
     committed: bool,
+    started: Option<(u64, u64)>,
     before_unlink: BeforeUnlink,
 ) -> std::result::Result<(), RecoverError> {
     if let Err(error) = result {
-        match recover_with(archive, &mut authorize_any, before_unlink) {
+        // Only the journal this attempt started may be cleaned up here. A
+        // failure before it was written (another file took the name, a pending
+        // journal of someone else) leaves every journal alone, and the
+        // `before_unlink` hook never restamps for a file this call did not lock.
+        let Some((_dev, ino)) = started else {
+            return Err(RecoverError::Journal(error));
+        };
+        let mut authorize =
+            |journal: &PendingJournal, file: &fs::Metadata| authorize_started(journal, file, ino);
+        match recover_with(archive, &mut authorize, before_unlink) {
             Ok(_) if committed => return Ok(()),
             Ok(_) => return Err(RecoverError::Journal(error)),
             Err(RecoverError::Committed(recovery)) => {
@@ -296,9 +333,16 @@ pub fn replace_suffix_with_hook(
 ) -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        unix::replace(archive, offset, suffix, None, &mut false, hook, &mut |_| {
-            Ok(())
-        })
+        unix::replace(
+            archive,
+            offset,
+            suffix,
+            None,
+            &mut false,
+            &mut None,
+            hook,
+            &mut |_| Ok(()),
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -482,6 +526,7 @@ mod unix {
         suffix: &mut File,
         original: Option<&fs::Metadata>,
         committed: &mut bool,
+        started: &mut Option<(u64, u64)>,
         hook: &mut dyn FnMut(&'static str) -> io::Result<()>,
         before_unlink: BeforeUnlink,
     ) -> io::Result<()> {
@@ -512,6 +557,7 @@ mod unix {
                 "archive changed while preparing append; retry with a fresh plan",
             ));
         }
+        *started = Some((meta.dev(), meta.ino()));
         if offset > meta.len() {
             return Err(io::Error::other("append offset past archive EOF"));
         }
@@ -955,7 +1001,12 @@ mod tests {
                 Ok(())
             }
         });
-        assert!(finish_replace(&path, result, false, &mut |_| Ok(())).is_err());
+        let started = Some({
+            use std::os::unix::fs::MetadataExt;
+            let m = fs::metadata(&path).unwrap();
+            (m.dev(), m.ino())
+        });
+        assert!(finish_replace(&path, result, false, started, &mut |_| Ok(())).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"prefix:old contents");
         assert!(!journal_path(&path).exists());
     }
@@ -1012,12 +1063,18 @@ mod tests {
             let mut suffix = tempfile::tempfile().unwrap();
             suffix.write_all(b"new contents").unwrap();
             let mut committed = false;
+            let started = {
+                use std::os::unix::fs::MetadataExt;
+                let m = fs::metadata(&path).unwrap();
+                Some((m.dev(), m.ino()))
+            };
             let result = unix::replace(
                 &path,
                 7,
                 &mut suffix,
                 None,
                 &mut committed,
+                &mut None,
                 &mut |step| {
                     if step == stop {
                         Err(io::Error::other("cleanup failed"))
@@ -1028,7 +1085,7 @@ mod tests {
                 &mut |_| Ok(()),
             );
             assert!(committed);
-            finish_replace(&path, result, committed, &mut |_| Ok(())).unwrap();
+            finish_replace(&path, result, committed, started, &mut |_| Ok(())).unwrap();
             assert_eq!(fs::read(&path).unwrap(), b"prefix:new contents");
             assert!(!recover(&path).unwrap());
         }
