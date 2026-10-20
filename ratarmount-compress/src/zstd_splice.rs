@@ -189,6 +189,7 @@ pub fn splice_zstd_last_frames_append_with<F>(
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
+    crate::commit_journal::fault::check("before splice scan")?;
     let mut src = File::open(path)?;
     let original = src.metadata()?;
     let map = scan_zstd_frames(&mut src)?;

@@ -8,7 +8,7 @@ description = "Compositing MountSources: union, automount, folder"
 [features]
 # Test seams for CLI tests (host_stat panic injection). Enabled only through
 # the `ratarmount` dev-dependency, never in a normal build.
-test-hooks = []
+test-hooks = ["ratarmount-compress/test-hooks"]
 
 [dependencies]
 ratarmount-core.workspace = true
@@ -40,6 +40,7 @@ zip = { version = "2", default-features = true }
 rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
+ratarmount-compress = { workspace = true, features = ["test-hooks"] }
 ratarmount-formats-sevenzip.workspace = true
 ratarmount-formats-zip.workspace = true
 tempfile.workspace = true

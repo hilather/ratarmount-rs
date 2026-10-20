@@ -12,6 +12,9 @@ default = []
 gzip-rapidgzip = ["dep:rapidgzip-core"]
 # Sequential inflate via Intel ISA-L (requires shared libisal; see ISAL_INSTALL_PREFIX).
 gzip-rapidgzip-isal = ["gzip-rapidgzip", "rapidgzip-core/isal"]
+# Fault seams in the commit journal for other crates' tests (`commit_journal::fault`).
+# Enabled only through dev-dependencies, never in a normal build.
+test-hooks = []
 
 [dependencies]
 ratarmount-core.workspace = true

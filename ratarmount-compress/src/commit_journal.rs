@@ -30,6 +30,69 @@ fn recovery_error(path: &Path, reason: impl std::fmt::Display) -> io::Error {
     ))
 }
 
+/// Test-only fault injection, consulted at every step of a replacement and of
+/// a rollback. A step is either a checkpoint (consulted after the step
+/// succeeded) or an instead-of seam (an `Err` replaces the system call). Without
+/// `cfg(test)` or the `test-hooks` feature every check is `Ok(())`.
+#[doc(hidden)]
+pub mod fault {
+    use std::io;
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    type Fault = Box<dyn FnMut(&'static str) -> io::Result<()>>;
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    thread_local! {
+        static FAULT: std::cell::RefCell<Option<Fault>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Install the fault for this thread (replacing any earlier one).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn install(fault: impl FnMut(&'static str) -> io::Result<()> + 'static) {
+        FAULT.with(|slot| *slot.borrow_mut() = Some(Box::new(fault)));
+    }
+
+    /// Remove this thread's fault.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn clear() {
+        FAULT.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// Consult the fault at `step`. The fault is taken out while it runs, so a
+    /// replacement or recovery it starts itself sees no fault.
+    pub(crate) fn check(step: &'static str) -> io::Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let Some(mut fault) = FAULT.with(|slot| slot.borrow_mut().take()) else {
+                return Ok(());
+            };
+            let result = fault(step);
+            FAULT.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(fault);
+                }
+            });
+            result
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        {
+            let _ = step;
+            Ok(())
+        }
+    }
+
+    /// An instead-of seam: a fault's `Err` replaces `op`.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    pub(crate) fn instead<T>(
+        step: &'static str,
+        op: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        check(step)?;
+        op()
+    }
+}
+
 /// What recovery applied, read from the LOCKED descriptor right before the
 /// journal is unlinked: the only stamp a caller may record for the archive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,6 +365,7 @@ fn finish_replace(
         let Some((_dev, ino)) = started else {
             return Err(RecoverError::Journal(error));
         };
+        fault::check("before cleanup").map_err(RecoverError::Journal)?;
         let mut authorize =
             |journal: &PendingJournal, file: &fs::Metadata| authorize_started(journal, file, ino);
         match recover_with(archive, &mut authorize, before_unlink) {
@@ -531,6 +595,12 @@ mod unix {
         hook: &mut dyn FnMut(&'static str) -> io::Result<()>,
         before_unlink: BeforeUnlink,
     ) -> io::Result<()> {
+        // Every checkpoint consults the death seam, then the fault.
+        let mut hook = |step: &'static str| -> io::Result<()> {
+            hook(step)?;
+            fault::check(step)
+        };
+        fault::check("before replace")?;
         let archive = archive.canonicalize()?;
         let path = journal_path(&archive);
         let mut file = fs::OpenOptions::new()
@@ -626,9 +696,9 @@ mod unix {
             mtime_ns(&meta),
             new_len,
         )?)?;
-        fs::remove_file(&path)?;
+        fault::instead("commit unlink", || fs::remove_file(&path))?;
         hook("journal unlink")?;
-        sync_parent(&path)?;
+        fault::instead("commit directory sync", || sync_parent(&path))?;
         hook("commit directory fsync")?;
         clear_marker(&file)?;
         hook("locator clear")?;
@@ -952,7 +1022,7 @@ mod unix {
             // Persist truncation before rollback writes so another crash leaves
             // a prefix of the old tail, never a mixture of old and new tails.
             let rolled = (|| -> io::Result<()> {
-                file.set_len(offset)?;
+                fault::instead("rollback truncate", || file.set_len(offset))?;
                 file.sync_all()?;
                 file.seek(SeekFrom::Start(offset))?;
                 journal.seek(SeekFrom::Start(HEADER_LEN))?;
@@ -965,7 +1035,9 @@ mod unix {
                         .and_then(|t| t.checked_add(Duration::from_nanos(nanos)))
                 }
                 .ok_or_else(|| io::Error::other("commit journal mtime overflow"))?;
-                restore_mtime(file.set_times(fs::FileTimes::new().set_modified(mtime)))?;
+                restore_mtime(fault::instead("rollback mtime", || {
+                    file.set_times(fs::FileTimes::new().set_modified(mtime))
+                }))?;
                 file.sync_all()
             })();
             rolled.map_err(RecoverError::Journal)?;
@@ -975,8 +1047,8 @@ mod unix {
         marker(file, path, if complete { b'C' } else { b'P' }).map_err(late)?;
         let applied = applied_of(file, complete, len, pre_mtime_ns, new_len).map_err(late)?;
         before_unlink(&applied).map_err(late)?;
-        fs::remove_file(path).map_err(late)?;
-        sync_parent(path).map_err(late)?;
+        fault::instead("rollback unlink", || fs::remove_file(path)).map_err(late)?;
+        fault::instead("rollback directory sync", || sync_parent(path)).map_err(late)?;
         clear_marker(file).map_err(late)?;
         log::info!("commit: recovered journal {}", path.display());
         Ok(applied)
@@ -1259,6 +1331,65 @@ mod tests {
                 assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
             }
         }
+    }
+
+    /// The fault seam is consulted at every step of a production replacement,
+    /// in order, and an instead-of seam's `Err` replaces the step.
+    #[test]
+    fn fault_seam_sees_every_replace_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        fs::write(&path, b"prefix:old contents").unwrap();
+        let original = fs::metadata(&path).unwrap();
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(b"new contents").unwrap();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        fault::install(move |step| {
+            log.borrow_mut().push(step);
+            Ok(())
+        });
+        replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()))
+            .unwrap();
+        fault::clear();
+        assert_eq!(
+            *seen.borrow(),
+            [
+                "before replace",
+                "journal header",
+                "journal tail",
+                "journal fsync",
+                "locator prepare",
+                "journal publish",
+                "journal directory fsync",
+                "locator active",
+                "archive truncate",
+                "archive write",
+                "archive fsync",
+                "locator complete",
+                "commit unlink",
+                "journal unlink",
+                "commit directory sync",
+                "commit directory fsync",
+                "locator clear",
+            ]
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"prefix:new contents");
+
+        // `rollback mtime` replaces `set_times`; EPERM is tolerated as before.
+        fs::write(&path, b"prefix:old contents").unwrap();
+        let original = fs::metadata(&path).unwrap();
+        fault::install(|step| match step {
+            "archive write" => Err(io::Error::from_raw_os_error(libc::ENOSPC)),
+            "rollback mtime" => Err(io::Error::from_raw_os_error(libc::EPERM)),
+            _ => Ok(()),
+        });
+        let error =
+            replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+        fault::clear();
+        assert!(matches!(error, Err(RecoverError::Journal(_))), "{error:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"prefix:old contents");
+        assert!(!journal_path(&path).exists());
     }
 
     /// Regression: a second crash during rollback must leave a reusable journal.
