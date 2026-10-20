@@ -1757,7 +1757,9 @@ Linux the check runs on an `O_PATH` descriptor, whose close releases nothing,
 and the file is then reopened through `/proc/self/fd`; `O_TRUNC` and the
 create mode apply only after the check. Elsewhere (macOS, or Linux without
 `/proc`) the refused descriptor is kept open for the life of the process (one
-descriptor per refused open). Remove the extra link to read the file.
+descriptor per refused open). Remove the extra link to read the file. The
+check never holds its lock across an open, so a FIFO under a payload name
+blocks only the request that opens it, never another overlay-database open.
 
 Not covered: a payload descriptor opened before its inode is first opened as
 a database in this process (no mount path does this: the database is opened

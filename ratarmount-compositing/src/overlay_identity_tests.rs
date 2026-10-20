@@ -5335,3 +5335,60 @@ fn regression_payload_alias_other_overlay() {
     let fd = ov_a.open_overlay_fd("/theirs", libc::O_RDONLY).unwrap();
     ov_a.close_overlay_fd(fd);
 }
+
+// ---- R10-D: the inode registry is never held across an open --------------
+
+/// Regression (R10-D, Fable r10 blocker 2): a FIFO planted under a payload
+/// name blocks its opener in `open(2)` (FUSE has always given that request
+/// thread to the FIFO). The database-inode registry must not be held across
+/// that open: while one thread is blocked opening the FIFO through
+/// `open_overlay_fd`, another thread's overlay-database open (which
+/// registers its inode) and an admitted payload open still return at once.
+#[cfg(unix)]
+#[test]
+fn regression_fifo_payload_does_not_stall_db_opens() {
+    use std::time::{Duration, Instant};
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    let fifo = fx.overlay.join("fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    fs::write(fx.overlay.join("plain"), b"plain").unwrap();
+    let other = Fixture::new();
+    drop(other.open(BaseDigestRequest::Compute, false));
+    let other_db = other.overlay.join(HIDDEN_DB);
+    std::thread::scope(|scope| {
+        let (started, blocked) = std::sync::mpsc::channel();
+        let ov = &ov;
+        let reader = scope.spawn(move || {
+            started.send(()).unwrap();
+            ov.open_overlay_fd("/fifo", libc::O_RDONLY)
+        });
+        blocked.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!reader.is_finished(), "the FIFO open blocks until a writer");
+        let start = Instant::now();
+        let conn = crate::open_overlay_db(
+            &other_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            crate::DbName::Path,
+        )
+        .unwrap();
+        let fd = ov.open_overlay_fd("/plain", libc::O_RDONLY).unwrap();
+        ov.close_overlay_fd(fd);
+        drop(conn);
+        let elapsed = start.elapsed();
+        // Unblock the reader: a writer appears.
+        let writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        let fd = reader
+            .join()
+            .unwrap()
+            .expect("FIFO opened once a writer came");
+        ov.close_overlay_fd(fd);
+        drop(writer);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "database and payload opens waited on the blocked FIFO open: {elapsed:?}"
+        );
+    });
+}
