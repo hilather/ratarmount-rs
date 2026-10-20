@@ -422,7 +422,13 @@ committed but pending (the mount stops committing and needs a remount) until
 that file is recovered; it is never reported as a success. A copy fallback
 (`--commit-overlay-mode auto`) publishes only over the file the commit gate
 accepted, unchanged since the copy read it, and only while no journal is
-pending on it. The lower gate still compares
+pending on it. It reads only the gate's own snapshot: when anything wrote the
+archive after the gate (another mount's commit, `tar -r`, a touch), the
+append is refused and no copy runs; the commit fails and the next one is
+judged afresh. The one exception is the append's own rollback, which moved
+the archive's ctime under its lock: the copy then needs the same device and
+inode. `--commit-overlay-mode copy` reads its source by the same rule. The
+lower gate still compares
 content: a lower sealed against the pre-commit stamp refuses the rolled-forward
 archive, and `--force-stack-mismatch` mounts it anyway; a forced lower mismatch
 mounts and is never refused.

@@ -3128,7 +3128,12 @@ fn regression_commit_gate_judges_and_returns_one_snapshot() {
         "{replaced:?}"
     );
     assert_eq!(fs::read(&fx.archive).unwrap(), b_bytes);
-    assert!(crate::journal_recovery::open_copy_source(&fx.archive, &snapshot).is_err());
+    for from in [
+        crate::journal_recovery::CopyFrom::Gate,
+        crate::journal_recovery::CopyFrom::AfterRollback,
+    ] {
+        assert!(crate::journal_recovery::open_copy_source(&fx.archive, &snapshot, from).is_err());
+    }
 }
 
 /// Regression (Astra v3 #2): a copy fallback publishes only over the file it
@@ -3213,6 +3218,144 @@ fn regression_auto_copy_refuses_an_archive_that_changed_since_it_was_staged() {
             );
         }
     }
+}
+
+// ---- R7-D1: no copy over an archive that changed since the gate ----
+
+/// When P2 commits inside P1's commit, after P1's gate took its snapshot.
+#[derive(Clone, Copy, Debug)]
+enum AfterGate {
+    /// Auto mode: right before the journaled replacement takes the archive
+    /// lock (`before replace`, `before splice scan`); P1's replacement is
+    /// refused because the stamp changed.
+    BeforeLock,
+    /// Copy mode: right after the gate's snapshot; no replacement is tried.
+    Snapshot,
+}
+
+/// Regression (r16 review, R7-D1): a commit whose archive changed between its
+/// gate and its write must not fall back to a copy. P2 (another `-w` overlay
+/// on the same archive) appends its member in place after P1's gate accepted
+/// snapshot S0. Before: P1's replacement was refused ("archive changed while
+/// preparing append"), every refusal allowed the Auto copy fallback, and the
+/// copy (checked against the gate only by device and inode) read P2's file
+/// and published it as a new inode the gate never judged (a `tar --delete` in
+/// that copy would drop P2's member); P2's next commit was then refused. In
+/// Copy mode the same change between the gate and opening the copy was
+/// published too. Now the copy source must be exactly the gate's snapshot
+/// (unless this attempt itself rolled back): P1 is refused, P2's member stays,
+/// the inode is unchanged and P2's next commit is accepted.
+#[cfg(unix)]
+#[test]
+fn regression_no_copy_over_an_archive_changed_after_the_gate() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let mut failed = Vec::new();
+    for when in [AfterGate::BeforeLock, AfterGate::Snapshot] {
+        for (way, zst) in [
+            (Way::Live, false),
+            (Way::Live, true),
+            (Way::Provenance, false),
+            (Way::Provenance, true),
+            (Way::Offline, false),
+            (Way::Offline, true),
+        ] {
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                no_copy_case(when, way, zst)
+            }));
+            fault::clear();
+            crate::overlay_gate::AFTER_SNAPSHOT.with(|hook| *hook.borrow_mut() = None);
+            if run.is_err() {
+                failed.push(format!("{when:?} {way:?} zst={zst}"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "failed cases: {failed:?}");
+}
+
+fn no_copy_case(when: AfterGate, way: Way, zst: bool) {
+    use std::rc::Rc;
+    let case = format!("{when:?} {way:?} zst={zst}");
+    let mode = match when {
+        AfterGate::BeforeLock => crate::CommitMode::Auto,
+        AfterGate::Snapshot => crate::CommitMode::Copy,
+    };
+    let place = Rc::new(Place::new(zst));
+    let mut p1 = place.open(&place.overlay, way, mode);
+    if way == Way::Provenance {
+        p1.set_manifest_hashes(Some("all".into()));
+    }
+    fs::write(p1.root().join("from-p1"), b"p1 member").unwrap();
+    let p2 = place.open(
+        &place.root.join("overlay2"),
+        Way::Live,
+        crate::CommitMode::Append,
+    );
+    fs::write(p2.root().join("from-p2"), b"p2 member").unwrap();
+    let a_ino = ino(&place.archive);
+    let p2_commit = {
+        let place = place.clone();
+        move || {
+            let committed = p2.commit_live(&place.archive, |p| Ok(place.source(p)));
+            assert!(committed.unwrap(), "P2 commits");
+            P2_BACK.with(|slot| *slot.borrow_mut() = Some(p2));
+        }
+    };
+    P2_BACK.with(|slot| *slot.borrow_mut() = None);
+    match when {
+        AfterGate::BeforeLock => {
+            let mut p2_commit = Some(p2_commit);
+            fault::install(move |step| {
+                if matches!(step, "before replace" | "before splice scan") {
+                    if let Some(run) = p2_commit.take() {
+                        run();
+                    }
+                }
+                Ok(())
+            });
+        }
+        AfterGate::Snapshot => {
+            // Every commit judges the archive twice (an early identity check,
+            // then the one snapshot its writes compare against): P2 commits
+            // right after the second.
+            let fire: Box<dyn FnOnce()> = Box::new(move || {
+                crate::overlay_gate::AFTER_SNAPSHOT.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(p2_commit));
+                });
+            });
+            crate::overlay_gate::AFTER_SNAPSHOT.with(|hook| *hook.borrow_mut() = Some(fire));
+        }
+    }
+    let (_p1, result) = place.commit(p1, way, mode);
+    fault::clear();
+    crate::overlay_gate::AFTER_SNAPSHOT.with(|hook| *hook.borrow_mut() = None);
+    let p2 = P2_BACK
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_else(|| panic!("{case}: P2 never committed inside P1's commit"));
+    let error = result.expect_err(&format!("{case}: P1 must be refused"));
+    assert!(error.to_string().contains("changed"), "{case}: {error}");
+    assert_eq!(ino(&place.archive), a_ino, "{case}: P1 published a copy");
+    let served = place.source(&place.archive);
+    assert_eq!(
+        read_member(served.as_ref(), "/from-p2"),
+        b"p2 member",
+        "{case}"
+    );
+    assert!(served.lookup("/from-p1", 0).is_none(), "{case}");
+    fs::write(p2.root().join("again-p2"), b"p2 again").unwrap();
+    let next = p2.commit_live(&place.archive, |p| Ok(place.source(p)));
+    assert!(
+        next.unwrap_or_else(|e| panic!("{case}: P2's next commit: {e}")),
+        "{case}"
+    );
+}
+
+thread_local! {
+    /// P2, handed back after it committed inside P1's commit.
+    static P2_BACK: std::cell::RefCell<Option<WriteOverlay>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 // ---- R7-C5: one target rule, one restamp rule, disjunct 3, idempotent rollback ----

@@ -1211,7 +1211,13 @@ failure after persistence, makes the mount refuse base reads and disables
 intervals until remount. `Refused` and `RolledBack` keep intervals enabled:
 `append` logs and retries next tick; `auto` tries a copy for that commit, read
 from the file the commit gate accepted and published only while that file is
-unchanged and has no journal pending. Crash recovery finds a journal through
+unchanged and has no journal pending. The copy source must be exactly the
+gate's snapshot (device, inode, length, mtime, ctime): a refusal because the
+archive changed after the gate (or any other writer between the gate and the
+copy) never copies, since the copy would publish a file the gate never
+judged. Only after the attempt's own `RolledBack` is the source checked by
+device and inode (the rollback moved its ctime). `copy` mode and the zstd
+copy splice use the same rule. Crash recovery finds a journal through
 the locator or beside the archive's current name; a `C` locator whose journal
 cannot be found is refused and a `D` locator without a journal is kept (only a
 `P` one is cleared), so a journal that moved with a renamed directory is never

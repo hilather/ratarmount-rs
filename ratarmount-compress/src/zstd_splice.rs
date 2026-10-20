@@ -128,8 +128,11 @@ where
 /// Sibling [`NamedTempFile`] in `path.parent()`, splice, sync, persist.
 ///
 /// The copy is read only from the file `original` describes (the caller's
-/// gate snapshot: same device and inode) and is published only while the
-/// archive is still exactly that file with no journal pending, under its lock
+/// gate snapshot): with `exact`, exactly that snapshot (device, inode, length,
+/// mtime, ctime: nothing wrote the archive since the gate); without it, the
+/// same device and inode (the caller's own journaled attempt wrote and rolled
+/// it back). It is published only while the archive is still exactly the file
+/// the copy read with no journal pending, under its lock
 /// ([`crate::commit_journal::guard_copy`]). On failure before persist the
 /// original inode is untouched.
 pub fn splice_zstd_last_frames_replace<F>(
@@ -137,6 +140,7 @@ pub fn splice_zstd_last_frames_replace<F>(
     from_idx: usize,
     transform: F,
     original: &std::fs::Metadata,
+    exact: bool,
 ) -> Result<SpliceStats>
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
@@ -148,7 +152,12 @@ where
     let mut tmp = NamedTempFile::new_in(parent)?;
     let mut src = File::open(path)?;
     let source = src.metadata()?;
-    if !same_file(original, &source) {
+    let matches = if exact {
+        crate::commit_journal::same_stamp(original, &source)
+    } else {
+        same_file(original, &source)
+    };
+    if !matches {
         return Err(CompressError::Msg(format!(
             "{} changed before the copy fallback (it is no longer the file the commit gate \
              accepted); nothing was published, retry",
@@ -807,6 +816,7 @@ mod tests {
             from_idx,
             append_extra(extra.clone()),
             &std::fs::metadata(&path).unwrap(),
+            true,
         )
         .unwrap();
         assert!(stats.wrote_seek_table);
@@ -836,6 +846,7 @@ mod tests {
             99,
             append_extra(extra),
             &std::fs::metadata(&path).unwrap(),
+            true,
         )
         .unwrap_err();
         assert!(err.to_string().contains("from_idx"), "{err}");
@@ -861,7 +872,8 @@ mod tests {
                 "transform failed after suffix",
             ))
         };
-        let err = splice_zstd_last_frames_replace(&path, 1, transform, &original).unwrap_err();
+        let err =
+            splice_zstd_last_frames_replace(&path, 1, transform, &original, true).unwrap_err();
         assert!(
             err.to_string().contains("transform failed after suffix"),
             "{err}"

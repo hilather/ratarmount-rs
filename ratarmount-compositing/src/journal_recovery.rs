@@ -639,6 +639,11 @@ pub(crate) struct FailedReplace {
     /// Nothing of the attempt remains: in `Auto` mode a copy fallback may run
     /// (through [`open_copy_source`] and [`publish_over`]).
     pub(crate) may_copy: bool,
+    /// This attempt itself wrote and rolled back the archive under its lock
+    /// (its ctime, and possibly its mtime, moved): the copy source is then
+    /// checked by device and inode. Otherwise the archive must still be
+    /// exactly the gate's snapshot ([`CopyFrom`]).
+    pub(crate) rolled_back: bool,
     /// The archive holds the new bytes, or this attempt's journal is still on
     /// disk: a live mount stops committing until it is remounted.
     pub(crate) base_unusable: bool,
@@ -651,6 +656,7 @@ impl From<OverlayError> for FailedReplace {
         Self {
             error,
             may_copy: true,
+            rolled_back: false,
             base_unusable: false,
         }
     }
@@ -663,6 +669,11 @@ impl From<io::Error> for FailedReplace {
 }
 
 pub(crate) fn failed_replace(error: ReplaceError) -> FailedReplace {
+    let rolled_back = matches!(error, ReplaceError::RolledBack(_));
+    // A refusal (the archive changed since the gate, its lock was busy, a
+    // journal was pending) may copy only while the archive is still exactly
+    // the gate's snapshot: `rolled_back` is false, so the copy source is
+    // compared with that snapshot ([`CopyFrom::Gate`]).
     let (error, may_copy, base_unusable) = match error {
         ReplaceError::Refused(e) => (OverlayError::Msg(e.to_string()), true, false),
         ReplaceError::RolledBack(e) => (OverlayError::Io(e), true, false),
@@ -685,8 +696,68 @@ pub(crate) fn failed_replace(error: ReplaceError) -> FailedReplace {
     FailedReplace {
         error,
         may_copy,
+        rolled_back,
         base_unusable,
     }
+}
+
+impl FailedReplace {
+    /// What the copy fallback after this failure compares its source with.
+    pub(crate) fn copy_from(&self) -> CopyFrom {
+        if self.rolled_back {
+            CopyFrom::AfterRollback
+        } else {
+            CopyFrom::Gate
+        }
+    }
+}
+
+/// What a copy fallback's source must still be (R7-D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyFrom {
+    /// Nothing of this commit wrote the archive since the gate took its
+    /// snapshot: the source must be exactly that snapshot (device, inode,
+    /// length, mtime, ctime). Any other writer since the gate refuses the
+    /// copy: it would publish a file the gate never judged.
+    Gate,
+    /// This commit's own journaled attempt wrote and rolled back the archive
+    /// under its lock: the same file (device and inode).
+    AfterRollback,
+}
+
+/// The file a copy fallback opened (`source`) is still the one the commit
+/// gate accepted (`original`), by the rule `from` names.
+pub(crate) fn copy_source_matches(
+    original: &fs::Metadata,
+    source: &fs::Metadata,
+    from: CopyFrom,
+) -> bool {
+    match from {
+        CopyFrom::Gate => commit_journal::same_stamp(original, source),
+        CopyFrom::AfterRollback => same_file(original, source),
+    }
+}
+
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        true
+    }
+}
+
+/// The refusal when [`copy_source_matches`] fails.
+pub(crate) fn copy_source_changed(archive: &Path) -> io::Error {
+    io::Error::other(format!(
+        "{} changed before the copy fallback (it is no longer the file the commit \
+         gate accepted); nothing was published, retry",
+        archive.display()
+    ))
 }
 
 /// [`failed_replace`] for the zstd append splice; its other errors (scan,
@@ -739,27 +810,19 @@ where
 }
 
 /// Open the file a copy fallback reads, refusing unless it is the file the
-/// commit gate accepted (`original`'s device and inode). Returns the open
-/// file and its stamp; [`publish_over`] compares that stamp under the lock.
+/// commit gate accepted (`original`, by the rule `from` names). Returns the
+/// open file and its stamp; [`publish_over`] compares that stamp under the
+/// lock.
 pub(crate) fn open_copy_source(
     archive: &Path,
     original: &fs::Metadata,
+    from: CopyFrom,
 ) -> io::Result<(fs::File, fs::Metadata)> {
     let file = fs::File::open(archive)?;
     let source = file.metadata()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if (source.dev(), source.ino()) != (original.dev(), original.ino()) {
-            return Err(io::Error::other(format!(
-                "{} changed before the copy fallback (it is no longer the file the commit \
-                 gate accepted); nothing was published, retry",
-                archive.display()
-            )));
-        }
+    if !copy_source_matches(original, &source, from) {
+        return Err(copy_source_changed(archive));
     }
-    #[cfg(not(unix))]
-    let _ = original;
     Ok((file, source))
 }
 
@@ -782,10 +845,17 @@ pub(crate) fn splice_replace_over<F>(
     from_idx: usize,
     transform: F,
     original: &fs::Metadata,
+    from: CopyFrom,
 ) -> std::result::Result<ratarmount_compress::SpliceStats, OverlayError>
 where
     F: FnOnce(&mut dyn ratarmount_compress::SeekRead, u64, &mut dyn io::Write) -> io::Result<()>,
 {
-    ratarmount_compress::splice_zstd_last_frames_replace(archive, from_idx, transform, original)
-        .map_err(|e| OverlayError::Msg(e.to_string()))
+    ratarmount_compress::splice_zstd_last_frames_replace(
+        archive,
+        from_idx,
+        transform,
+        original,
+        from == CopyFrom::Gate,
+    )
+    .map_err(|e| OverlayError::Msg(e.to_string()))
 }
