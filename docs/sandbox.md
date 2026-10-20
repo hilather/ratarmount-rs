@@ -379,6 +379,23 @@ leaves the base stamp as it was. Mounting applies the same ownership check
 before any recovery (the plain mount, `-w` remounts, sessions and rolling
 series): a journal started for another file refuses the open with the archive
 and journal untouched, and the archive's own crash still recovers at mount.
+Every readable record (the `-w` overlay and each `--lower` directory) votes on a
+member's journal before any recovery write: the journal's pre-commit stamp must
+be the recorded stamp (or the rows already describe the committed bytes). A
+journal a record does not own (another archive renamed over the base, a union
+member, a lower that disagrees, a `--lower` bundle whose record is read only
+after unpacking, a sealed or unreadable top) waits for the gates: a torn one is
+refused with exit 2 and the instruction to recover that file alone first
+(`ratarmount --no-mount FILE`), a complete one is recovered after every gate
+accepted. The decision is taken again under the archive lock, on the locked
+file. A complete journal whose rows already describe the committed bytes (only
+the unlink is owed) is accepted by every gate, and a stale locator without a
+journal is cleared. Recovery restamps the recorded rows from the locked
+descriptor before it unlinks the journal, on every path (mount, offline commit,
+library openers, live and on-exit commits). The lower gate still compares
+content: a lower sealed against the pre-commit stamp refuses the rolled-forward
+archive, and `--force-stack-mismatch` mounts it anyway; a forced lower mismatch
+mounts and is never refused.
 `overlay seal` or `pack` against a directory base at another place measures its
 weak manifest there (one walk of the directory).
 
