@@ -153,7 +153,21 @@ mod unix {
             .push(fd);
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Take the generic (open, check, quarantine) path on Linux too.
+        pub(super) static FORCE_GENERIC: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Make every `fstat` fail with `EIO`.
+        pub(super) static FAIL_FSTAT: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
     fn fstat(fd: RawFd) -> io::Result<libc::stat> {
+        #[cfg(test)]
+        if FAIL_FSTAT.with(|f| f.get()) {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // Safety: `st` is a valid out pointer; `fd` is open.
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
@@ -234,8 +248,12 @@ mod unix {
         flags: libc::c_int,
         mode: u32,
     ) -> io::Result<Option<OwnedFd>> {
+        #[cfg(all(target_os = "linux", test))]
+        let linux = !FORCE_GENERIC.with(|f| f.get());
+        #[cfg(all(target_os = "linux", not(test)))]
+        let linux = true;
         #[cfg(target_os = "linux")]
-        {
+        if linux {
             let create = flags & libc::O_CREAT != 0;
             let exclusive = create && flags & libc::O_EXCL != 0;
             let probe =
@@ -304,7 +322,15 @@ mod unix {
         mode: u32,
     ) -> io::Result<Option<OwnedFd>> {
         let fd = openat_raw(dir, c, flags & !libc::O_TRUNC, mode)?;
-        let st = fstat(fd.as_raw_fd())?;
+        // A descriptor whose identity cannot be established may be the
+        // database's: quarantined, never closed.
+        let st = match fstat(fd.as_raw_fd()) {
+            Ok(st) => st,
+            Err(e) => {
+                quarantine(fd);
+                return Err(e);
+            }
+        };
         if let Some(db) = super::open_db_named(id(&st), name) {
             quarantine(fd);
             return Err(super::refused(name, &db));
@@ -322,7 +348,13 @@ mod unix {
                     libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
                     0,
                 )?;
-                let wst = fstat(writer.as_raw_fd())?;
+                let wst = match fstat(writer.as_raw_fd()) {
+                    Ok(st) => st,
+                    Err(e) => {
+                        quarantine(writer);
+                        return Err(e);
+                    }
+                };
                 if id(&wst) != id(&st) {
                     if let Some(db) = super::open_db_named(id(&wst), name) {
                         quarantine(writer);
@@ -354,6 +386,10 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::MetadataExt;
 
+    /// The quarantine count is process-wide: tests that read it run one at a
+    /// time.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     fn id_of(path: &Path) -> (u64, u64) {
         let m = fs::metadata(path).unwrap();
         (m.dev(), m.ino())
@@ -366,6 +402,7 @@ mod tests {
     /// fresh creations open normally, and the registration counts.
     #[test]
     fn regression_admitted_open_refuses_a_registered_inode() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let db = dir.join("db.sqlite");
@@ -431,5 +468,40 @@ mod tests {
             admit_fd(held.as_fd(), &alias).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    /// Regression (R10-FIX4, r10 skeptic #6): on the generic path (macOS, or
+    /// Linux without `/proc`) a failed `fstat` returned through `?`, which
+    /// closed a descriptor that was never identified and may be an open
+    /// database's (releasing this process's locks on it). It is quarantined
+    /// now, the error is returned, and nothing is truncated; the generic path
+    /// otherwise refuses and admits as the Linux one does.
+    #[test]
+    fn regression_generic_open_quarantines_an_unidentified_descriptor() {
+        use super::unix::{FAIL_FSTAT, FORCE_GENERIC};
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        fs::write(&file, b"bytes").unwrap();
+        FORCE_GENERIC.with(|f| f.set(true));
+        let before = quarantined();
+        FAIL_FSTAT.with(|f| f.set(true));
+        let error = open_admitted(&file, libc::O_RDWR | libc::O_TRUNC, 0).unwrap_err();
+        FAIL_FSTAT.with(|f| f.set(false));
+        assert_eq!(error.raw_os_error(), Some(libc::EIO), "{error}");
+        assert_eq!(quarantined(), before + 1, "the descriptor was closed");
+        assert_eq!(fs::metadata(&file).unwrap().len(), 5, "nothing truncated");
+        // The generic path's ordinary behaviour: a registered inode is
+        // refused (quarantined), another file opens and truncates.
+        let alias = tmp.path().join("alias");
+        fs::hard_link(&file, &alias).unwrap();
+        let registration = register_db_inode(id_of(&file), &file);
+        let error = open_admitted(&alias, libc::O_RDONLY, 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(quarantined(), before + 2);
+        drop(registration);
+        open_admitted(&alias, libc::O_WRONLY | libc::O_TRUNC, 0).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().len(), 0);
+        FORCE_GENERIC.with(|f| f.set(false));
     }
 }
