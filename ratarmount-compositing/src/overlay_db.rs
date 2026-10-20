@@ -134,7 +134,7 @@ impl OverlayDb {
 
     /// The connection and its registration, for a caller that keeps them in
     /// its own structure (drop the connection first).
-    pub fn into_parts(
+    pub(crate) fn into_parts(
         self,
     ) -> (
         Connection,

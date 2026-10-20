@@ -5562,6 +5562,16 @@ fn regression_lost_record_refuses_before_recovery() {
 
 // ---- R10-C (#148): payload opens of another name of an open database ------
 
+/// The overlay call was refused with `PermissionDenied` (an admission
+/// refusal), not some other error.
+#[cfg(unix)]
+fn denied<T: std::fmt::Debug>(result: crate::write_overlay::Result<T>) -> bool {
+    matches!(
+        result,
+        Err(crate::OverlayError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied
+    )
+}
+
 /// A hard link of `db` named `name` in the overlay root `dir`.
 #[cfg(unix)]
 fn link_db(db: &Path, dir: &Path, name: &str) -> PathBuf {
@@ -5629,18 +5639,18 @@ fn regression_payload_db_alias_write_never_truncates() {
     link_db(&db, &fx.overlay, "payload");
     let size = fs::metadata(&db).unwrap().len();
     assert!(size > 0);
-    assert!(ov.create_file("/payload", 0o644).is_err(), "create over");
+    assert!(denied(ov.create_file("/payload", 0o644)), "create over");
     for flags in [
         libc::O_WRONLY | libc::O_TRUNC,
         libc::O_RDWR,
         libc::O_RDONLY | libc::O_TRUNC,
     ] {
         assert!(
-            ov.open_overlay_fd("/payload", flags).is_err(),
+            denied(ov.open_overlay_fd("/payload", flags)),
             "{flags:#x} refused"
         );
     }
-    assert!(ov.truncate("/payload", 0).is_err(), "truncate");
+    assert!(denied(ov.truncate("/payload", 0)), "truncate");
     assert_eq!(fs::metadata(&db).unwrap().len(), size, "database unchanged");
     assert!(crate::overlay_db::lock_probe_is_busy(&db));
     ov.set_meta("r10_probe", "still writes").unwrap();
@@ -5664,7 +5674,10 @@ fn regression_payload_alias_other_overlay() {
         "names B's database: {error}"
     );
     let fi = ov_a.lookup("/theirs", 0).expect("listed");
-    assert!(ov_a.open(&fi, 0).is_err());
+    assert_eq!(
+        ov_a.open(&fi, 0).map(drop).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
     assert!(crate::overlay_db::lock_probe_is_busy(&b_db));
     ov_b.set_meta("r10_probe", "still writes").unwrap();
     // Once B is unmounted, the name is an ordinary file of A.
@@ -5767,17 +5780,25 @@ fn regression_fifo_payload_does_not_stall_db_opens() {
         blocked.recv().unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert!(!reader.is_finished(), "the FIFO open blocks until a writer");
-        let start = Instant::now();
-        let conn = crate::open_overlay_db(
-            &other_db,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            crate::DbName::Path,
-        )
-        .unwrap();
-        let fd = ov.open_overlay_fd("/plain", libc::O_RDONLY).unwrap();
-        ov.close_overlay_fd(fd);
-        drop(conn);
-        let elapsed = start.elapsed();
+        // The opens under test run on a helper thread with a watchdog: a
+        // regression fails the test instead of hanging it (on timeout a
+        // writer releases the FIFO reader first, so the scope can join).
+        let (done, finished) = std::sync::mpsc::channel();
+        let other_db = &other_db;
+        let helper = scope.spawn(move || {
+            let start = Instant::now();
+            let conn = crate::open_overlay_db(
+                other_db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                crate::DbName::Path,
+            )
+            .unwrap();
+            let fd = ov.open_overlay_fd("/plain", libc::O_RDONLY).unwrap();
+            ov.close_overlay_fd(fd);
+            drop(conn);
+            let _ = done.send(start.elapsed());
+        });
+        let waited = finished.recv_timeout(Duration::from_secs(5));
         // Unblock the reader: a writer appears.
         let writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
         let fd = reader
@@ -5786,9 +5807,8 @@ fn regression_fifo_payload_does_not_stall_db_opens() {
             .expect("FIFO opened once a writer came");
         ov.close_overlay_fd(fd);
         drop(writer);
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "database and payload opens waited on the blocked FIFO open: {elapsed:?}"
-        );
+        helper.join().unwrap();
+        let elapsed = waited.expect("database and payload opens waited on the blocked FIFO open");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     });
 }
