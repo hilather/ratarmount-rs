@@ -183,6 +183,10 @@ fn require_files(db: &Path) -> io::Result<()> {
         crate::DbName::Path,
     )
     .map_err(|e| io::Error::other(format!("cannot open {}: {e}", db.display())))?;
+    // Under the archive lock: never wait on another holder of the database
+    // (as `read_with`).
+    conn.busy_timeout(Duration::ZERO)
+        .map_err(|e| io::Error::other(format!("cannot read {}: {e}", db.display())))?;
     match crate::overlay_meta::has_files_table(&conn) {
         Ok(true) => Ok(()),
         Ok(false) => Err(io::Error::other(format!(

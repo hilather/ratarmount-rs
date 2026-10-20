@@ -553,8 +553,11 @@ fn checked_meta(directory: &Path) -> io::Result<OverlayMeta> {
 
 fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
     let root = open_root(directory)?;
-    let db = host::openat(&root, HIDDEN_DB, regular_flags(), Mode::empty())?;
-    if !File::from(db).metadata()?.is_file() {
+    // A stat, never an open: closing a descriptor of the database would
+    // release this process's fcntl locks on it (R7-H1, R10-FIX9).
+    let stat =
+        ratarmount_compositing::host_stat::statat(&root, HIDDEN_DB, AtFlags::SYMLINK_NOFOLLOW)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(invalid("layer database is not a regular file"));
     }
     // URL encoding prevents SQLite URI syntax in a host filename from changing
@@ -2432,10 +2435,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Regression (R4-S5): the pack-temp sweep unlinked through the parent
-    /// pathname after taking the flock; replacing the parent with a symlink
-    /// then deleted a same-named file in another directory. Cleanup is relative
-    /// to the directory opened once.
     /// Set by [`pack_db_lock_busy_in_child`] for the child it spawns.
     const PACK_DB_PROBE_ENV: &str = "RATARMOUNT_TEST_PACK_DB_PROBE";
 
@@ -2494,6 +2493,46 @@ pub(crate) mod tests {
     /// the database (another process's `BEGIN IMMEDIATE` then succeeded
     /// while the holder still wrote). The admitted open skips it: the name
     /// stays, the child is still busy and the holder still commits.
+    /// Regression (R10-FIX9, r10 review N1): `immutable_meta` opened the
+    /// layer database by its own name to check its type and closed that
+    /// descriptor, which released every fcntl lock this process held on the
+    /// database (another process's `BEGIN IMMEDIATE` then succeeded while
+    /// the holder still wrote). It stats the name now.
+    #[test]
+    fn regression_immutable_meta_keeps_the_holders_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let db = dir.join(HIDDEN_DB);
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (x)")
+            .unwrap();
+        let holder = ratarmount_compositing::open_overlay_db(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            ratarmount_compositing::DbName::Path,
+        )
+        .unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(pack_db_lock_busy_in_child(&db), "the holder's lock");
+        let error = immutable_meta(&dir).expect_err("not a sealed layer");
+        assert!(error.to_string().contains("not sealed"), "{error}");
+        assert!(
+            pack_db_lock_busy_in_child(&db),
+            "immutable_meta released the holder's lock"
+        );
+        holder
+            .execute_batch("INSERT INTO files VALUES (1); COMMIT")
+            .unwrap();
+        drop(holder);
+        assert!(!pack_db_lock_busy_in_child(&db), "probe control");
+        // A database entry that is not a regular file is still refused.
+        fs::remove_file(&db).unwrap();
+        fs::create_dir(&db).unwrap();
+        let error = immutable_meta(&dir).expect_err("a directory");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
     #[test]
     fn regression_pack_temp_sweep_skips_a_db_alias() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2533,6 +2572,10 @@ pub(crate) mod tests {
         assert!(!pack_db_lock_busy_in_child(&db), "probe control");
     }
 
+    /// Regression (R4-S5): the pack-temp sweep unlinked through the parent
+    /// pathname after taking the flock; replacing the parent with a symlink
+    /// then deleted a same-named file in another directory. Cleanup is relative
+    /// to the directory opened once.
     #[test]
     fn regression_pack_temp_sweep_is_directory_relative() {
         let tmp = tempfile::tempdir().unwrap();

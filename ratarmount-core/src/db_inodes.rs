@@ -335,7 +335,13 @@ mod unix {
             quarantine(fd);
             return Err(super::refused(name, &db));
         }
-        if flags & libc::O_TRUNC != 0 && st.st_mode & libc::S_IFMT == libc::S_IFREG {
+        // An empty file (a fresh creation included) has nothing to truncate:
+        // no writable reopen, which a new mode-`000` file would refuse
+        // (R10-FIX9).
+        if flags & libc::O_TRUNC != 0
+            && st.st_mode & libc::S_IFMT == libc::S_IFREG
+            && st.st_size != 0
+        {
             if flags & libc::O_ACCMODE != libc::O_RDONLY {
                 truncate(&fd)?;
             } else {
@@ -503,5 +509,29 @@ mod tests {
         open_admitted(&alias, libc::O_WRONLY | libc::O_TRUNC, 0).unwrap();
         assert_eq!(fs::metadata(&file).unwrap().len(), 0);
         FORCE_GENERIC.with(|f| f.set(false));
+    }
+
+    /// Regression (R10-FIX9, r10 skeptic P3): the generic path reopened a
+    /// fresh `O_RDONLY | O_CREAT | O_TRUNC` creation for writing to truncate
+    /// it; with mode `000` that reopen failed (`EACCES`) and the new file was
+    /// left behind. An empty file is not reopened; a non-empty one opened
+    /// `O_RDONLY | O_TRUNC` is still truncated.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_generic_open_creates_read_only_mode_000_file() {
+        use super::unix::FORCE_GENERIC;
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("fresh");
+        FORCE_GENERIC.with(|f| f.set(true));
+        let opened = open_admitted(&fresh, libc::O_RDONLY | libc::O_CREAT | libc::O_TRUNC, 0);
+        let existing = tmp.path().join("existing");
+        fs::write(&existing, b"bytes").unwrap();
+        let truncated = open_admitted(&existing, libc::O_RDONLY | libc::O_TRUNC, 0);
+        FORCE_GENERIC.with(|f| f.set(false));
+        opened.expect("a fresh read-only creation opens");
+        assert_eq!(fs::metadata(&fresh).unwrap().mode() & 0o7777, 0);
+        truncated.unwrap();
+        assert_eq!(fs::metadata(&existing).unwrap().len(), 0);
     }
 }

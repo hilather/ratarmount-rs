@@ -413,7 +413,11 @@ mount's top and directory lowers, the offline overlay, the live mount's own
 database, which must still be the file it opened) is classified again under
 the archive lock; a lost record or one whose database path cannot be resolved
 refuses the recovery with the locator, the archive and any journal left as
-they were. The restamp after a roll-forward re-checks the record too, and a
+they were. The offline overlay's database may be a symlink to a regular file,
+as the offline gate accepts; a mount's records must be regular files. That
+refusal is a refused recovery, also next to a complete journal: a live mount
+is not marked as having a base changed by a failed commit, and the next gate
+still refuses. The restamp after a roll-forward re-checks the record too, and a
 used overlay's database must still have its `files` table, else the journal is
 kept. A stale prepare locator without a journal is otherwise cleared
 after a directory sync; a complete locator whose journal cannot be found is
@@ -1748,9 +1752,12 @@ holds on it, SQLite's included. A payload name that is a hard link of an open
 overlay database (made on the host by the same user, or by a link-preserving
 copy such as `cp -al` or `rsync -H`; FUSE `link` itself is refused) would hand
 out such a descriptor, and closing it after a read would let another process
-write the database under the mount. Every payload, sentinel, pack (including
-the sweep of old pack temp files), commit, commit-journal, provenance-manifest
-and `import-upperdir` input open checks the inode of the descriptor it
+write the database under the mount. The payload opens (FUSE and NFS reads and
+writes, `MountSource::open`, create and truncate, the detached-inode reopen and
+the macOS park), the ZIP and TAR commit readers, the read-only layer and live
+diff, the seal and pack sentinels, the pack lock and member reads and the sweep
+of old pack temp files, the commit-journal reads, the provenance-manifest read
+and the `import-upperdir` inputs each check the inode of the descriptor it
 obtained against the overlay databases open in this process (this mount's,
 and any other overlay mounted or opened by the same process; a `--lower`'s
 database is closed once the layer is loaded) and refuses a match with EACCES
@@ -1770,6 +1777,17 @@ before anything is served), files read by generic folder sources or
 backing extents of non-overlay sources, and an overlay database swapped away
 and back at its path during its own open (the registered inode is the one at
 the path right after SQLite's open, not proved to be SQLite's descriptor).
+Nor are these opens, which do not go through the check: `overlay seal`'s
+permission walk (`chmod_tree`, #149), the removal of a database that a failed
+create just made (#160), the database copy `overlay pack` reads (#156), the
+optional journal and index files `overlay pack --include-journal` /
+`--include-index` reads, and the commit journal's opens of the archive
+itself. The seal walk runs while seal's own connection is open (#149); for the
+others no CLI path keeps another lock-holding connection to that database
+open. Of the checked sites, the ZIP commit reader, the
+read-only layer, live diff, the seal sentinels, the pack member, sentinel and
+lock reads and the macOS park share the tested helper but have no test of
+their own.
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE
