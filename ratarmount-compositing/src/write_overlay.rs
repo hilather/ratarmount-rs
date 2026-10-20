@@ -6903,9 +6903,12 @@ fn commit_overlay_inner(
         use crate::journal_recovery::{Owner, Record};
         // The gate ran before this call (unlocked); the owner re-takes the
         // decision on the LOCKED file, and recovery restamps the rows from it.
+        // A recorded identity stays `Recorded` even if the database vanished
+        // since the gate: the missing record refuses, it never downgrades to
+        // the inode rule (R7-F2).
         let owner = match identity {
             _ if opts.force_base_mismatch => Owner::Forced,
-            Some(base) if !overlay_db_absent(write_overlay) => Owner::Recorded {
+            Some(base) => Owner::Recorded {
                 base,
                 archive: archive_file,
                 record: Record::Offline(write_overlay),
@@ -6917,7 +6920,7 @@ fn commit_overlay_inner(
     // The one snapshot every write of this commit compares against: the file
     // the gate accepts after recovery (one stat when no identity applies).
     let original = match identity {
-        Some(base) if !overlay_db_absent(write_overlay) => {
+        Some(base) => {
             match crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
             {
                 Ok(Some(snapshot)) => snapshot,

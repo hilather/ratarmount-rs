@@ -3975,6 +3975,52 @@ fn regression_overlay_db_entry_not_a_regular_file() {
     assert!(failed.is_empty(), "failed rows: {failed:?}");
 }
 
+/// Regression (r18 skeptic #2, R7-F2): an offline commit whose overlay
+/// database is DELETED after the caller's gate accepted A, with B (another
+/// archive carrying its own journal) renamed over A, downgraded the recovery
+/// owner (and the snapshot gate) to `Owner::Inode` because the database was
+/// now "absent". B's journal matched B's inode, so recovery rewrote B and
+/// removed its journal before the #96 marker refused the commit. A commit
+/// that has a recorded identity keeps `Owner::Recorded`: the vanished record
+/// refuses.
+#[test]
+fn regression_offline_db_deleted_after_gate_keeps_recorded_owner() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    fs::write(ov.root().join("new"), b"new").unwrap();
+    drop(ov);
+    let foreign = fx.archive.with_file_name("foreign.tar");
+    write_tar(&foreign, &[("b", b"bb"), ("c", b"c")]);
+    interrupt_append(&foreign);
+    let journal = ratarmount_compress::commit_journal::journal_path(&foreign);
+    let journal_bytes = fs::read(&journal).unwrap();
+    let bytes = fs::read(&foreign).unwrap();
+    let (overlay, archive) = (fx.overlay.clone(), fx.archive.clone());
+    crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::remove_file(overlay.join(HIDDEN_DB)).unwrap();
+            fs::rename(&foreign, &archive).unwrap();
+        }));
+    });
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    let result =
+        crate::commit_overlay(&fx.overlay, &fx.archive, &archive_token(&fx.archive), &opts);
+    crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| *hook.borrow_mut() = None);
+    assert!(result.is_err(), "refused: {result:?}");
+    assert!(fs::read(&fx.archive).unwrap() == bytes, "B untouched");
+    assert!(
+        fs::read(&journal).is_ok_and(|j| j == journal_bytes),
+        "B's journal kept"
+    );
+}
+
 // ---- R7-C5: one target rule, one restamp rule, disjunct 3, idempotent rollback ----
 
 fn strong_fixture() -> Fixture {
