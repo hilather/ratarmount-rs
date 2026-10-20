@@ -181,6 +181,14 @@ fn path_writable(path: &Path) -> bool {
 /// within version 2.
 pub const MAX_FORMAT_VERSION: u32 = 2;
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once between the `files` check and the `meta` read of
+    /// [`OverlayMeta::from_connection_required`].
+    pub(crate) static BETWEEN_REQUIRED_READS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The refusal of a used overlay's database that has no `files` table.
 pub(crate) const NO_FILES_TABLE: &str =
     "the overlay database has no files table (the record of a used overlay is lost)";
@@ -272,11 +280,30 @@ impl OverlayMeta {
     /// [`Self::from_connection`] of a record that must exist when `required`:
     /// a used (marked) overlay, or a mount's own database, without a `files`
     /// table has lost its record, which must refuse rather than read as an
-    /// unrecorded overlay (R10-B). Opens no transaction (the caller's, if
-    /// any, covers both reads).
+    /// unrecorded overlay (R10-B). The `files` check and the `meta` read are
+    /// one snapshot: outside a transaction this opens a read transaction of
+    /// its own (R10-FIX6: a `DROP TABLE files; DROP TABLE meta` committed
+    /// between two autocommit reads read as "unrecorded"); inside the
+    /// caller's transaction, that one covers both reads.
     pub fn from_connection_required(conn: &Connection, required: bool) -> Result<Option<Self>> {
+        if !conn.is_autocommit() {
+            return Self::from_transaction_required(conn, required);
+        }
+        // Read-only: dropping the transaction rolls it back.
+        let tx = conn.unchecked_transaction()?;
+        Self::from_transaction_required(&tx, required)
+    }
+
+    /// [`Self::from_connection_required`] inside a transaction the caller
+    /// holds (both reads see its snapshot).
+    fn from_transaction_required(conn: &Connection, required: bool) -> Result<Option<Self>> {
+        debug_assert!(!conn.is_autocommit(), "a transaction covers both reads");
         if required && !has_files_table(conn)? {
             return Err(OverlayError::Msg(NO_FILES_TABLE.to_owned()));
+        }
+        #[cfg(test)]
+        if let Some(hook) = BETWEEN_REQUIRED_READS.with(|hook| hook.borrow_mut().take()) {
+            hook();
         }
         Self::from_connection(conn)
     }
