@@ -520,6 +520,7 @@ mod unix {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn replace(
         archive: &Path,
         offset: u64,
