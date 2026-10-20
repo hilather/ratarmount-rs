@@ -832,6 +832,81 @@ fn create_missing_offline_tar_creates_then_commits() {
     assert_eq!(fs::read(extract.join("hello.txt")).unwrap(), expected);
 }
 
+/// Regression: #134 `--commit-overlay` of a bare relative `t.tar.gz` / `t.zip`
+/// staged its temp file in `$TMPDIR`; `rename` then failed with EXDEV when
+/// `$TMPDIR` was on another filesystem than the archive. (Linux only: needs a
+/// second filesystem at `/dev/shm`; the unit tests in `ratarmount-compositing`
+/// cover macOS.)
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_134_commit_overlay_bare_name_cross_filesystem_tmpdir() {
+    use std::os::unix::fs::MetadataExt;
+    if skip_no_gnu_tar() {
+        eprintln!("skip: GNU tar missing");
+        return;
+    }
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        eprintln!("skip: /dev/shm missing");
+        return;
+    }
+    let tmpdir = tempfile::tempdir_in(shm).unwrap();
+    if fs::metadata(tmpdir.path()).unwrap().dev() == fs::metadata(work.path()).unwrap().dev() {
+        eprintln!("skip: /dev/shm is on the same filesystem as the work dir");
+        return;
+    }
+
+    // t.tar.gz: gzip of a one-member tar.
+    let tar = write_tar(work.path(), &[("old.txt", b"old\n")]);
+    let mut enc = flate2::write::GzEncoder::new(
+        fs::File::create(work.path().join("t.tar.gz")).unwrap(),
+        flate2::Compression::default(),
+    );
+    std::io::copy(&mut fs::File::open(&tar).unwrap(), &mut enc).unwrap();
+    enc.finish().unwrap();
+    // t.zip: an empty ZIP (end-of-central-directory record only).
+    let mut eocd = b"PK\x05\x06".to_vec();
+    eocd.extend_from_slice(&[0u8; 18]);
+    fs::write(work.path().join("t.zip"), eocd).unwrap();
+
+    for name in ["t.tar.gz", "t.zip"] {
+        let ov = work.path().join(format!("ov-{name}"));
+        fs::create_dir_all(&ov).unwrap();
+        fs::write(ov.join("new.txt"), b"new\n").unwrap();
+        let out = Command::new(bin())
+            .current_dir(work.path())
+            .env("TMPDIR", tmpdir.path())
+            .args(["--commit-overlay", "--yes", "-w"])
+            .arg(&ov)
+            .arg(name)
+            .output()
+            .expect("run");
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let listing = String::from_utf8_lossy(
+        &Command::new("tar")
+            .arg("-tzf")
+            .arg(work.path().join("t.tar.gz"))
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
+    assert!(listing.contains("new.txt"), "{listing}");
+    let zip = fs::read(work.path().join("t.zip")).unwrap();
+    assert!(zip.starts_with(b"PK"), "t.zip is not a ZIP");
+    assert!(
+        zip.windows(7).any(|w| w == b"new.txt"),
+        "t.zip lacks new.txt"
+    );
+}
+
 /// Refuse existing dir named `*.tar`
 #[test]
 fn create_missing_refuses_dir_named_tar() {

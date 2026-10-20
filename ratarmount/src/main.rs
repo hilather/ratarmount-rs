@@ -41,6 +41,7 @@ mod diff;
 mod export_index;
 mod find;
 mod journal_cmd;
+mod mount_guard;
 mod overlay_cmd;
 mod overlay_commit;
 mod overlay_create;
@@ -80,10 +81,17 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[command(group(clap::ArgGroup::new("overlay_target").args(["write_overlay", "overlay_tmpfs", "sandbox"]).multiple(true)))]
 struct Args {
     /// Unmount the given mountpoint(s)
+    ///
+    /// On Linux this runs `fusermount3 -u` and retries about 1 s while the mount is busy
+    /// (desktop watchers such as gvfsd-trash probe a new mount).
     #[arg(short = 'u', long = "unmount", action = ArgAction::SetTrue)]
     unmount: bool,
 
     /// Stay in foreground (default: daemonize after mount is ready)
+    ///
+    /// SIGINT (Ctrl-C) unmounts with the same ~1 s retry and never detaches lazily; send it
+    /// again to retry. SIGTERM retries for about 1 s, then detaches lazily (`fusermount3 -u -z`)
+    /// and the process exits once open files close. macOS has no lazy detach.
     #[arg(short = 'f', long = "foreground", action = ArgAction::SetTrue)]
     foreground: bool,
 
@@ -505,7 +513,8 @@ struct Args {
     #[arg(long = "oss-attributions", action = ArgAction::SetTrue)]
     oss_attributions: bool,
 
-    /// Write overlay folder (`:temp:` for a temporary directory).
+    /// Write overlay folder (`:temp:` for a temporary directory). The mountpoint may not
+    /// be, lie inside, or contain it (refused, exit 2).
     /// A missing uncompressed `.tar` or `.tar.zst` is created as an empty archive.
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
@@ -695,7 +704,9 @@ struct Args {
     #[arg(long = "print-features", action = ArgAction::SetTrue)]
     print_features: bool,
 
-    /// Input archives/folders/URLs and optional mountpoint
+    /// Input archives/folders/URLs and optional mountpoint. A mountpoint may not be, lie
+    /// inside, or contain a folder being mounted (refused, exit 2); a folder defaults to
+    /// `<folder>.mounted`.
     #[arg(required = false)]
     paths: Vec<PathBuf>,
 
@@ -2062,10 +2073,27 @@ fn main() {
         }
     }
 
+    // Refuse a mount point equal to, inside, or aliasing a folder the daemon reads by
+    // path (the single-threaded daemon deadlocks on its own mount point). Early check:
+    // creates nothing, before any fork. See `mount_guard`.
+    let guard = if mount_guard::skip_guard(&args, mountpoint.as_deref(), publishing) {
+        None
+    } else {
+        let fs = mount_guard::RealFs::new();
+        match mount_guard::plan_mount_point(&fs, &args, mountpoint.clone(), &inputs) {
+            Ok(plan) => Some((fs, plan)),
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                std::process::exit(2);
+            }
+        }
+    };
+
     // Classify every local member's commit journal against the records that
     // vote on it BEFORE any recovery write; members a record does not own wait
     // for the identity gates (recovered below, after the overlay opened).
     let deferred_journals = recover_mount_journals(&args, &inputs);
+
     if args.roll_every.is_none()
         && args.write_overlay.is_some()
         && inputs.len() == 1
@@ -2246,6 +2274,15 @@ fn main() {
         match overlay_commit::open_rolling_series(&inputs[0], policy.clone(), &open_opts) {
             Ok(series) => {
                 inputs[0] = series.active_path();
+                if let Some((_, plan)) = &guard {
+                    if let Some(derived) = &plan.derived_rolling_input {
+                        if let Some(msg) =
+                            mount_guard::rolling_derivation_notice(derived, &inputs[0], &plan.mp)
+                        {
+                            eprintln!("warning: {msg}");
+                        }
+                    }
+                }
                 Some(series)
             }
             Err(e) => {
@@ -2380,6 +2417,30 @@ fn main() {
         }
     };
 
+    // Decisive check: inputs are opened (index folders exist), the `-w` directory is
+    // created here exactly as `WriteOverlay::new` did, and nothing has forked, no
+    // overlay database, marker or inspection socket exists and nothing is published.
+    // Only guard-active runs (a FUSE mount point is coming) take this path; export-only,
+    // `--no-mount`, `find` and publish-only keep HEAD's order.
+    let mut prepared_overlay_path: Option<PathBuf> = None;
+    if let Some((fs, plan)) = &guard {
+        if let Some(w) = &args.write_overlay {
+            let p = overlay_dir_for(&args, w);
+            // The `-w` directory is created before the check so the resolver sees the
+            // real directory; no database, marker or socket exists yet.
+            if let Err(e) = mount_guard::prepare_overlay_dir(&p) {
+                eprintln!("{}", overlay_open_error(&p, &OverlayError::Io(e)));
+                std::process::exit(1);
+            }
+            prepared_overlay_path = Some(p);
+        }
+        if let Err(msg) = mount_guard::decisive_check(fs, plan, prepared_overlay_path.as_deref()) {
+            eprintln!("error: {msg}");
+            // A `:temp:` overlay directory is removed by the atexit handler.
+            std::process::exit(2);
+        }
+    }
+
     // Content-hash xattrs foundation: after a successful mount build, for each
     // path-backed local archive with an on-disk index, open the index writable and
     // fill user.hash.* xattrs. Does not go through factory (TODO: hook during index
@@ -2492,7 +2553,9 @@ fn main() {
                 &args.lower,
                 args.write_overlay.as_deref(),
                 args.journal.iter().cloned().collect(),
-                mount_point_exclusion(&args, mountpoint.as_deref(), &inputs).as_deref(),
+                // A FUSE mount point inside a directory base is refused by
+                // `mount_guard`, so it is never an exclusion.
+                None,
             ),
             existing_journals: existing_journals_inside_base(
                 inputs.first().map(PathBuf::as_path),
@@ -2524,22 +2587,9 @@ fn main() {
     bundle.source = lower_view;
 
     if let Some(w) = &args.write_overlay {
-        let overlay_path = if w.as_os_str() == ":temp:" {
-            let td = if args.overlay_tmpfs.is_some() {
-                create_tmpfs_overlay()
-            } else {
-                tempfile::TempDir::with_prefix("ratarmount-write-overlay.")
-            }
-            .unwrap_or_else(|error| {
-                eprintln!("error creating temporary overlay: {error}");
-                std::process::exit(1)
-            });
-            let p = td.path().to_path_buf();
-            eprintln!("Created temporary overlay directory: {}", p.display());
-            register_temp_overlay(td);
-            p
-        } else {
-            w.clone()
+        let overlay_path = match prepared_overlay_path.take() {
+            Some(p) => p,
+            None => overlay_dir_for(&args, w),
         };
         lower_stack
             .check_top(&overlay_path, args.force_stack_mismatch)
@@ -2552,14 +2602,13 @@ fn main() {
             force_base_mismatch: args.force_base_mismatch,
             lower_layers: lower_stack.records.clone(),
             index_writable: !open_opts.read_only_index,
-            // Journal, lower layers and the mount point inside a directory base
-            // stay out of its digest (a mount point is created after creation).
+            // Journal and lower layers inside a directory base stay out of its
+            // digest. A mount point inside it is refused by `mount_guard`.
             weak_exclude: args
                 .journal
                 .iter()
                 .cloned()
                 .chain(lower_stack.records.iter().map(|r| r.path.clone()))
-                .chain(mount_point_exclusion(&args, mountpoint.as_deref(), &inputs))
                 .collect(),
             remote_token: None,
         };
@@ -2810,21 +2859,15 @@ fn main() {
     }
 
     // Export-only (NFS/HTTP/…): do not invent a FUSE mountpoint / stem directory.
-    let fuse_mp = if any_export(&args) && mountpoint.is_none() {
-        None
-    } else {
-        Some(match mountpoint {
-            Some(mp) => mp,
-            None => {
-                let mp = default_mountpoint(&inputs[0]);
-                std::fs::create_dir_all(&mp).ok();
-                mp
-            }
-        })
+    let fuse_mp = match &guard {
+        // Export-only without a mount point, as on HEAD.
+        None => None,
+        Some((_, plan)) => {
+            // First durable creation of the accepted mount point.
+            std::fs::create_dir_all(&plan.mp).ok();
+            Some(plan.mp.clone())
+        }
     };
-    if let Some(mp) = &fuse_mp {
-        std::fs::create_dir_all(mp).ok();
-    }
     if args.sftp_subsystem && fuse_mp.is_some() && !args.foreground {
         eprintln!(
             "warning: --sftp-subsystem with a FUSE mountpoint daemonizes and redirects stdin; \
@@ -2886,11 +2929,12 @@ fn main() {
 
     // Optional control: Unix socket + in-FS `/.ratarmount-control/` (Python parity).
     let control_stop = Arc::new(AtomicBool::new(false));
-    let _control_sock = if args.control_interface {
+    let control = if args.control_interface {
         let mp = fuse_mp.as_ref().expect("control requires FUSE mp");
         let stop = Arc::clone(&control_stop);
         let mp_ctrl = mp.clone();
         let pre_control = Arc::clone(&bundle.source);
+        let unmount_in_progress = Arc::new(AtomicBool::new(false));
         let on_search = find::live_search_callback(
             Arc::clone(&pre_control),
             overlay_arc.clone(),
@@ -2904,8 +2948,35 @@ fn main() {
                     ControlFolderOptions::enabled()
                         .with_label(mp.display().to_string())
                         .with_on_unmount(Arc::new(move || {
-                            stop.store(true, Ordering::SeqCst);
-                            let _ = unmount(&mp_ctrl);
+                            // The callback fires inside the FUSE request that opens or reads the
+                            // control file, so unmounting here would always find the mount busy
+                            // (and a retry would stall the request thread). Unmount on a short
+                            // thread instead: the opener's request finishes, the opener closes
+                            // the file, and the retrying unmount then succeeds. The guard only
+                            // blocks a concurrent attempt (open and read both fire); `stop` is
+                            // set after success so a failed attempt can be retried by a later read.
+                            if unmount_in_progress.swap(true, Ordering::SeqCst) {
+                                return;
+                            }
+                            let stop = Arc::clone(&stop);
+                            let mp = mp_ctrl.clone();
+                            let in_progress = Arc::clone(&unmount_in_progress);
+                            let spawned = thread::Builder::new()
+                                .name("ratarmount-control-unmount".into())
+                                .spawn(move || match unmount(&mp) {
+                                    Ok(()) => stop.store(true, Ordering::SeqCst),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "control file unmount of {} failed: {e}",
+                                            mp.display()
+                                        );
+                                        in_progress.store(false, Ordering::SeqCst);
+                                    }
+                                });
+                            if let Err(e) = spawned {
+                                log::warn!("control file unmount: cannot start thread: {e}");
+                                unmount_in_progress.store(false, Ordering::SeqCst);
+                            }
                         }))
                         .with_on_search(Arc::clone(&on_search)),
                 )
@@ -2915,7 +2986,7 @@ fn main() {
                 })),
             ) as Arc<dyn MountSource>;
         }
-        start_control_interface(
+        bind_control_interface(
             mp,
             Arc::clone(&control_stop),
             Some(on_search),
@@ -2973,6 +3044,7 @@ fn main() {
                     args.commit_overlay_on_exit,
                     commit_interval,
                     open_opts,
+                    control,
                 ),
             }
             return;
@@ -2995,6 +3067,7 @@ fn main() {
             args.commit_overlay_on_exit,
             commit_interval,
             open_opts,
+            control,
         );
         return;
     }
@@ -3018,6 +3091,7 @@ fn main() {
             args.commit_overlay_on_exit,
             commit_interval,
             open_opts,
+            control,
         );
         return;
     }
@@ -3038,7 +3112,30 @@ fn main() {
         args.commit_overlay_on_exit,
         commit_interval,
         open_opts,
+        control,
     );
+}
+
+/// The overlay directory for `-w`: the path itself, or a fresh temporary directory
+/// (disk-backed or tmpfs) for `:temp:`.
+fn overlay_dir_for(args: &Args, w: &Path) -> PathBuf {
+    if w.as_os_str() == ":temp:" {
+        let td = if args.overlay_tmpfs.is_some() {
+            create_tmpfs_overlay()
+        } else {
+            tempfile::TempDir::with_prefix("ratarmount-write-overlay.")
+        }
+        .unwrap_or_else(|error| {
+            eprintln!("error creating temporary overlay: {error}");
+            std::process::exit(1)
+        });
+        let p = td.path().to_path_buf();
+        eprintln!("Created temporary overlay directory: {}", p.display());
+        register_temp_overlay(td);
+        p
+    } else {
+        w.to_path_buf()
+    }
 }
 
 fn any_export(args: &Args) -> bool {
@@ -3624,6 +3721,7 @@ fn run_exports(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
+    control: Option<ControlListener>,
 ) {
     overlay_commit::install_term_signal_flag();
     let nfs_stop = ratarmount_nfs::NfsStop::new();
@@ -3695,10 +3793,9 @@ fn run_exports(
             finish_overlay_serve(overlay_arc, Some(source), interval, commit_exit);
         }
         Some(mp) => {
-            if live_archive.is_some() || has_temp_overlay() {
-                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-            }
             if foreground {
+                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+                let control = control.map(ControlListener::serve);
                 let interval = spawn_interval_if(
                     &overlay_arc,
                     &live_archive,
@@ -3740,6 +3837,7 @@ fn run_exports(
                     open_opts.direct_io,
                     activity,
                 );
+                wait_control_reply(&control);
                 nfs_stop.request_stop();
                 export_stop.request_stop();
                 join_export_handles(handles);
@@ -3781,9 +3879,8 @@ fn run_exports(
                     if !has_log_file {
                         let _ = redirect_stdio_to_null();
                     }
-                    if live_archive.is_some() || has_temp_overlay() {
-                        overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-                    }
+                    overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+                    let control = control.map(ControlListener::serve);
                     let interval = spawn_interval_if(
                         &overlay_arc,
                         &live_archive,
@@ -3816,6 +3913,7 @@ fn run_exports(
                         open_opts.direct_io,
                         activity,
                     );
+                    wait_control_reply(&control);
                     nfs_stop.request_stop();
                     export_stop.request_stop();
                     join_export_handles(handles);
@@ -3931,6 +4029,7 @@ fn run_fuse_and_nfs(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
+    control: Option<ControlListener>,
 ) {
     let commit_exit = |ov: Option<&WriteOverlay>| {
         overlay_commit::maybe_commit_on_exit(
@@ -3944,9 +4043,8 @@ fn run_fuse_and_nfs(
         let stop = ratarmount_nfs::NfsStop::new();
         nfs_opts.stop = Some(stop.clone());
         overlay_commit::spawn_signal_nfs_stop(stop.clone());
-        if live_archive.is_some() || has_temp_overlay() {
-            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-        }
+        overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+        let control = control.map(ControlListener::serve);
         let interval = spawn_interval_if(
             &overlay_arc,
             &live_archive,
@@ -3977,6 +4075,7 @@ fn run_fuse_and_nfs(
             open_opts.direct_io,
             activity,
         );
+        wait_control_reply(&control);
         stop.request_stop();
         let _ = handle.join();
         finish_overlay_serve(overlay_arc, Some(source), interval, commit_exit);
@@ -4018,9 +4117,8 @@ fn run_fuse_and_nfs(
             let stop = ratarmount_nfs::NfsStop::new();
             nfs_opts.stop = Some(stop.clone());
             overlay_commit::spawn_signal_nfs_stop(stop.clone());
-            if live_archive.is_some() || has_temp_overlay() {
-                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-            }
+            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+            let control = control.map(ControlListener::serve);
             let interval = spawn_interval_if(
                 &overlay_arc,
                 &live_archive,
@@ -4051,6 +4149,7 @@ fn run_fuse_and_nfs(
                 open_opts.direct_io,
                 activity,
             );
+            wait_control_reply(&control);
             stop.request_stop();
             let _ = handle.join();
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
@@ -4087,10 +4186,8 @@ fn run_fuse_only(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
+    control: Option<ControlListener>,
 ) {
-    if foreground && (live_archive.is_some() || has_temp_overlay()) {
-        overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-    }
     let commit_exit = |ov: Option<&WriteOverlay>| {
         overlay_commit::maybe_commit_on_exit(
             ov,
@@ -4100,6 +4197,8 @@ fn run_fuse_only(
         );
     };
     if foreground {
+        overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+        let control = control.map(ControlListener::serve);
         // The interval thread holds an Arc. Join it before the overlay drops,
         // or process exit kills it and the final replay never runs.
         let interval = spawn_interval_if(
@@ -4121,6 +4220,7 @@ fn run_fuse_only(
             open_opts.direct_io,
             activity,
         );
+        wait_control_reply(&control);
         finish_overlay_serve(overlay_arc, None, interval, commit_exit);
         if let Err(e) = mount_err {
             eprintln!("error mounting at {}: {e}", mp.display());
@@ -4150,9 +4250,8 @@ fn run_fuse_only(
             if !has_log_file {
                 let _ = redirect_stdio_to_null();
             }
-            if live_archive.is_some() || has_temp_overlay() {
-                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
-            }
+            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+            let control = control.map(ControlListener::serve);
             let interval = spawn_interval_if(
                 &overlay_arc,
                 &live_archive,
@@ -4172,6 +4271,7 @@ fn run_fuse_only(
                 open_opts.direct_io,
                 activity,
             );
+            wait_control_reply(&control);
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
                 let _ = std::fs::write(
@@ -4224,17 +4324,8 @@ fn resolve_color_style(force_color: bool, force_no_color: bool) -> env_logger::W
 }
 
 fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::WriteStyle) {
-    let level = match debug {
-        0 => log::LevelFilter::Error,
-        1 => log::LevelFilter::Warn,
-        2 => log::LevelFilter::Info,
-        _ => log::LevelFilter::Debug,
-    };
-    // RUST_LOG still wins if set (env_logger convention via filter_or).
-    let mut builder =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level.as_str()));
-    builder.filter_level(level);
-    configure_http_logging(&mut builder);
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let mut builder = logger_filter_builder(debug, rust_log.as_deref());
     builder.write_style(write_style);
     if let Some(path) = log_file {
         match std::fs::OpenOptions::new()
@@ -4252,6 +4343,24 @@ fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::Writ
         }
     }
     let _ = builder.try_init();
+}
+
+/// Log filters: `-d` sets the global baseline, then a non-empty `RUST_LOG`
+/// (global and module directives) overrides it (#138).
+fn logger_filter_builder(debug: u8, rust_log: Option<&str>) -> env_logger::Builder {
+    let level = match debug {
+        0 => log::LevelFilter::Error,
+        1 => log::LevelFilter::Warn,
+        2 => log::LevelFilter::Info,
+        _ => log::LevelFilter::Debug,
+    };
+    let mut builder = env_logger::Builder::new();
+    builder.filter_level(level);
+    if let Some(spec) = rust_log.filter(|s| !s.is_empty()) {
+        builder.parse_filters(spec);
+    }
+    configure_http_logging(&mut builder);
+    builder
 }
 
 fn configure_http_logging(builder: &mut env_logger::Builder) {
@@ -4283,6 +4392,48 @@ fn regression_http_debug_logging_hides_signed_request_urls() {
         .args(format_args!("safe HTTP diagnostic"))
         .build();
     assert!(logger.matches(&record));
+}
+
+#[cfg(test)]
+fn logger_enabled(debug: u8, rust_log: Option<&str>, target: &str, level: log::Level) -> bool {
+    let logger = logger_filter_builder(debug, rust_log).build();
+    let record = log::Record::builder()
+        .target(target)
+        .level(level)
+        .args(format_args!("x"))
+        .build();
+    logger.matches(&record)
+}
+
+/// Regression: `RUST_LOG=debug` printed no DEBUG lines because `-d`'s
+/// `filter_level` replaced RUST_LOG's global directive (#138).
+#[test]
+fn regression_rust_log_global_level_wins_over_debug_flag() {
+    use log::Level::{Debug, Error, Info, Trace, Warn};
+    assert!(logger_enabled(0, Some("debug"), "ratarmount", Debug));
+    assert!(logger_enabled(1, Some("debug"), "ratarmount_fuse", Debug));
+    // RUST_LOG=error beats -d 3.
+    assert!(logger_enabled(3, Some("error"), "ratarmount", Error));
+    assert!(!logger_enabled(3, Some("error"), "ratarmount", Warn));
+    assert!(!logger_enabled(3, Some("error"), "ratarmount", Debug));
+    // Empty RUST_LOG falls back to -d.
+    assert!(logger_enabled(3, Some(""), "ratarmount", Debug));
+    // Unset: -d applies.
+    assert!(logger_enabled(3, None, "ratarmount", Debug));
+    assert!(!logger_enabled(2, None, "ratarmount", Debug));
+    assert!(logger_enabled(2, None, "ratarmount", Info));
+    assert!(!logger_enabled(1, None, "ratarmount", Info));
+    // Module-scoped directive keeps working on top of the -d baseline.
+    let spec = Some("ratarmount_fuse=debug");
+    assert!(logger_enabled(2, spec, "ratarmount_fuse", Debug));
+    assert!(logger_enabled(2, spec, "ratarmount_fuse::sub", Debug));
+    assert!(!logger_enabled(2, spec, "ratarmount", Debug));
+    assert!(logger_enabled(2, spec, "ratarmount", Info));
+    // Signed-URL redaction survives a global RUST_LOG.
+    let spec = Some("debug,ureq::unit=trace");
+    assert!(!logger_enabled(0, spec, "ureq::unit", Debug));
+    assert!(!logger_enabled(0, spec, "ureq::unit", Trace));
+    assert!(logger_enabled(0, spec, "ureq::unit", Warn));
 }
 
 /// Adapter so env_logger can write through a Mutex-guarded File.
@@ -4452,13 +4603,77 @@ fn remove_registered_control_socket() {
     }
 }
 
-/// Listen for line-based control commands on a Unix socket.
-fn start_control_interface(
+/// A bound control socket that is not yet served. Binding (and printing the path) happens
+/// before any fork so errors reach the user; [`ControlListener::serve`] runs in the process
+/// that serves the mount, because a thread started before `fork` does not exist in the child.
+struct ControlListener {
+    listener: UnixListener,
+    sock: PathBuf,
+    mountpoint: PathBuf,
+    stop: Arc<AtomicBool>,
+    on_search: Option<SearchFn>,
+    quota: Option<Arc<ratarmount_compositing::OverlayQuota>>,
+}
+
+/// Counts control requests being answered. A reply that unmounts is in flight before the
+/// unmount starts and stays so until it is written, so the exit path can wait for it.
+/// The copy [`ControlListener::serve`] returns also owns the socket file's
+/// [`ControlSocket`] guard (the accept thread's copy has none), so the file is
+/// removed when the serving path drops it, even after an external `fusermount -u`.
+#[derive(Clone, Default)]
+struct ControlInflight(
+    Arc<std::sync::atomic::AtomicUsize>,
+    Option<Arc<ControlSocket>>,
+);
+
+/// Marks one control request in flight until dropped (also on panic).
+struct ControlInflightGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ControlInflight {
+    fn enter(&self) -> ControlInflightGuard {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ControlInflightGuard(Arc::clone(&self.0))
+    }
+
+    /// Wait up to `bound` for every in-flight request to finish. True when idle.
+    fn wait_idle(&self, bound: Duration) -> bool {
+        let start = Instant::now();
+        while self.0.load(Ordering::SeqCst) != 0 {
+            if start.elapsed() >= bound {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+}
+
+impl Drop for ControlInflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How long the exit path waits for a control reply that is still being written.
+const CONTROL_REPLY_WAIT: Duration = Duration::from_secs(2);
+
+/// Wait (bounded) for an in-flight control reply before the process exits. No-op without
+/// a control socket.
+fn wait_control_reply(control: &Option<ControlInflight>) {
+    if let Some(inflight) = control {
+        if !inflight.wait_idle(CONTROL_REPLY_WAIT) {
+            log::warn!("control reply still being written after {CONTROL_REPLY_WAIT:?}; exiting");
+        }
+    }
+}
+
+/// Bind the control socket and print its path.
+fn bind_control_interface(
     mountpoint: &Path,
     stop: Arc<AtomicBool>,
     on_search: Option<SearchFn>,
     quota: Option<Arc<ratarmount_compositing::OverlayQuota>>,
-) -> Option<ControlSocket> {
+) -> Option<ControlListener> {
     let sock = control_socket_path(&std::env::temp_dir(), std::process::id());
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
@@ -4469,37 +4684,69 @@ fn start_control_interface(
         }
     };
     eprintln!("control interface: {}", sock.display());
-    let mp = mountpoint.to_path_buf();
-    let sock_path = sock.clone();
-    thread::spawn(move || {
-        // Don't block forever if unmount happens
-        let _ = listener.set_nonblocking(false);
-        while !stop.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    use std::io::{BufRead, BufReader};
-                    let mut reader = BufReader::new(&stream);
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).is_ok() {
-                        let reply = control_reply_with_quota(
-                            line.trim(),
-                            &mp,
-                            &stop,
-                            on_search.as_ref(),
-                            quota.as_deref(),
-                        );
-                        let _ = stream.write_all(reply.as_bytes());
+    Some(ControlListener {
+        listener,
+        sock,
+        mountpoint: mountpoint.to_path_buf(),
+        stop,
+        on_search,
+        quota,
+    })
+}
+
+impl ControlListener {
+    /// Start the accept thread. Call in the process that serves the mount.
+    fn serve(self) -> ControlInflight {
+        let mut inflight = ControlInflight::default();
+        // The accept thread's copy carries no socket guard: it blocks in
+        // `accept()` and never returns after an external `fusermount -u`.
+        let tracker = inflight.clone();
+        let ControlListener {
+            listener,
+            sock,
+            mountpoint: mp,
+            stop,
+            on_search,
+            quota,
+        } = self;
+        *CONTROL_SOCKET.lock().unwrap_or_else(|e| e.into_inner()) = Some(sock.clone());
+        inflight.1 = Some(Arc::new(ControlSocket(sock.clone())));
+        thread::spawn(move || {
+            // Don't block forever if unmount happens
+            let _ = listener.set_nonblocking(false);
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        use std::io::{BufRead, BufReader};
+                        let mut reader = BufReader::new(&stream);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_ok() {
+                            // Taken before `control_reply` (which may unmount, after which
+                            // `mount_blocking` returns and the process exits) and released only
+                            // once the reply is written.
+                            let _in_flight = tracker.enter();
+                            let reply = control_reply_with_quota(
+                                line.trim(),
+                                &mp,
+                                &stop,
+                                on_search.as_ref(),
+                                quota.as_deref(),
+                                &|p| unmount(p),
+                            );
+                            let _ = stream.write_all(reply.as_bytes());
+                            let _ = stream.flush();
+                            let _ = stream.shutdown(std::net::Shutdown::Write);
+                        }
+                    }
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(100));
                     }
                 }
-                Err(_) => {
-                    thread::sleep(Duration::from_millis(100));
-                }
             }
-        }
-        let _ = std::fs::remove_file(&sock_path);
-    });
-    *CONTROL_SOCKET.lock().unwrap_or_else(|e| e.into_inner()) = Some(sock.clone());
-    Some(ControlSocket(sock))
+            let _ = std::fs::remove_file(&sock);
+        });
+        inflight
+    }
 }
 
 fn control_reply_with_quota(
@@ -4508,8 +4755,9 @@ fn control_reply_with_quota(
     stop: &AtomicBool,
     on_search: Option<&SearchFn>,
     quota: Option<&ratarmount_compositing::OverlayQuota>,
+    unmount_op: &dyn Fn(&Path) -> std::io::Result<()>,
 ) -> String {
-    let mut reply = control_reply(cmd, mp, stop, on_search);
+    let mut reply = control_reply(cmd, mp, stop, on_search, unmount_op);
     if cmd == "status" {
         if let Some(quota) = quota {
             reply.push_str(&quota.usage().status_text());
@@ -4518,7 +4766,13 @@ fn control_reply_with_quota(
     reply
 }
 
-fn control_reply(cmd: &str, mp: &Path, stop: &AtomicBool, on_search: Option<&SearchFn>) -> String {
+fn control_reply(
+    cmd: &str,
+    mp: &Path,
+    stop: &AtomicBool,
+    on_search: Option<&SearchFn>,
+    unmount_op: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> String {
     match cmd {
         "ping" => "pong\n".to_string(),
         "status" => format!(
@@ -4527,9 +4781,14 @@ fn control_reply(cmd: &str, mp: &Path, stop: &AtomicBool, on_search: Option<&Sea
             ratarmount_core::budget::MemoryBudget::global().status_text()
         ),
         "unmount" | "quit" | "exit" => {
-            let _ = unmount(mp);
-            stop.store(true, Ordering::Relaxed);
-            "ok unmounted\n".to_string()
+            // On failure keep the socket up so the client can retry.
+            match unmount_op(mp) {
+                Ok(()) => {
+                    stop.store(true, Ordering::Relaxed);
+                    "ok unmounted\n".to_string()
+                }
+                Err(e) => format!("error: unmount failed: {e}\n"),
+            }
         }
         "help" => "commands: ping status unmount search help\n".to_string(),
         "search" => "error: search requires a pattern\n".to_string(),
@@ -4560,6 +4819,12 @@ fn control_reply(cmd: &str, mp: &Path, stop: &AtomicBool, on_search: Option<&Sea
         }
         other => format!("error: unknown command {other:?}\n"),
     }
+}
+
+/// Unmount stand-in for control-reply unit tests that never touch a mount.
+#[cfg(test)]
+fn no_unmount(_: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn wait_until_mounted(path: &Path, timeout: Duration) -> bool {
@@ -4794,8 +5059,6 @@ fn split_inputs_mountpoint(paths: &[PathBuf], no_mount: bool) -> (Vec<PathBuf>, 
     (paths[..paths.len() - 1].to_vec(), Some(last.clone()))
 }
 
-/// The FUSE mount point a mount will use, for the weak digest's excluded set.
-/// None for `--no-mount`, export-only runs and unmounts.
 /// Base-relative exclusions for the A2 walk of a directory base: the paths of
 /// this invocation (journal, mount point, a new `-w` overlay) resolved with the
 /// topmost-new rule, plus the set an existing `-w` overlay already recorded.
@@ -4959,36 +5222,27 @@ fn existing_journals_inside_base(
         .collect()
 }
 
-fn mount_point_exclusion(
-    args: &Args,
-    mountpoint: Option<&Path>,
-    inputs: &[PathBuf],
-) -> Option<PathBuf> {
-    if args.no_mount || args.unmount {
-        return None;
+/// Default mount point stem for a string `url::Url` can parse (never touches the filesystem).
+fn default_mountpoint_url(s: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(s).ok()?;
+    if let Some(seg) = url.path_segments().and_then(|mut p| p.next_back()) {
+        if !seg.is_empty() {
+            let stripped = strip_compression_suffix(seg);
+            let stem = Path::new(&stripped)
+                .file_stem()
+                .and_then(|x| x.to_str())
+                .unwrap_or(&stripped);
+            return Some(PathBuf::from(stem));
+        }
     }
-    match mountpoint {
-        Some(mp) => Some(mp.to_path_buf()),
-        None if any_export(args) => None,
-        None => inputs.first().map(|input| default_mountpoint(input)),
-    }
+    // fall through if URL parse had no usable last segment
+    Some(PathBuf::from("remote"))
 }
 
 fn default_mountpoint(archive: &Path) -> PathBuf {
     let s = archive.to_string_lossy();
-    if let Ok(url) = url::Url::parse(&s) {
-        if let Some(seg) = url.path_segments().and_then(|mut p| p.next_back()) {
-            if !seg.is_empty() {
-                let stripped = strip_compression_suffix(seg);
-                let stem = Path::new(&stripped)
-                    .file_stem()
-                    .and_then(|x| x.to_str())
-                    .unwrap_or(&stripped);
-                return PathBuf::from(stem);
-            }
-        }
-        // fall through if URL parse had no usable last segment
-        return PathBuf::from("remote");
+    if let Some(d) = default_mountpoint_url(&s) {
+        return d;
     }
     let name = archive
         .file_name()
@@ -6140,7 +6394,7 @@ mod serve_cli_tests {
 
 #[cfg(test)]
 mod find_cli_tests {
-    use super::{control_reply, find_cli_error, parse_args_from, SearchFn};
+    use super::{control_reply, find_cli_error, no_unmount, parse_args_from, SearchFn};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -6363,21 +6617,40 @@ mod find_cli_tests {
             std::path::Path::new("/mnt"),
             &stop,
             Some(&cb),
+            &no_unmount,
         );
         assert!(reply.contains("/a.fits\t4\t1"), "{reply}");
         assert!(reply.contains("/dir/b.fits\t5\t2"), "{reply}");
         assert!(reply.contains("count 2"), "{reply}");
 
-        let missing = control_reply("search *.fits", std::path::Path::new("/mnt"), &stop, None);
+        let missing = control_reply(
+            "search *.fits",
+            std::path::Path::new("/mnt"),
+            &stop,
+            None,
+            &no_unmount,
+        );
         assert!(
             missing.contains("on-disk index"),
             "socket :memory:/missing: {missing}"
         );
 
-        let no_pat = control_reply("search", std::path::Path::new("/mnt"), &stop, Some(&cb));
+        let no_pat = control_reply(
+            "search",
+            std::path::Path::new("/mnt"),
+            &stop,
+            Some(&cb),
+            &no_unmount,
+        );
         assert!(no_pat.contains("pattern"), "{no_pat}");
 
-        let help = control_reply("help", std::path::Path::new("/mnt"), &stop, Some(&cb));
+        let help = control_reply(
+            "help",
+            std::path::Path::new("/mnt"),
+            &stop,
+            Some(&cb),
+            &no_unmount,
+        );
         assert!(help.contains("search"), "{help}");
 
         let err_cb: SearchFn =
@@ -6387,9 +6660,44 @@ mod find_cli_tests {
             std::path::Path::new("/mnt"),
             &stop,
             Some(&err_cb),
+            &no_unmount,
         );
         assert!(mem.starts_with("error:"), "{mem}");
         assert!(!mem.contains("count "), "{mem}");
+    }
+
+    /// Regression: the control socket answered "ok unmounted" and stopped even when the
+    /// unmount failed (busy), leaving a mount nobody could reach.
+    #[test]
+    fn regression_control_reply_unmount_result() {
+        let mp = std::path::Path::new("/mnt");
+        for cmd in ["unmount", "quit", "exit"] {
+            let stop = AtomicBool::new(false);
+            assert_eq!(
+                control_reply(cmd, mp, &stop, None, &|_| Ok(())),
+                "ok unmounted\n"
+            );
+            assert!(
+                stop.load(std::sync::atomic::Ordering::Relaxed),
+                "{cmd}: stop after success"
+            );
+
+            let stop = AtomicBool::new(false);
+            let busy = |_: &std::path::Path| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    "still busy",
+                ))
+            };
+            let reply = control_reply(cmd, mp, &stop, None, &busy);
+            assert!(reply.starts_with("error:"), "{cmd}: {reply}");
+            assert!(reply.contains("still busy"), "{cmd}: {reply}");
+            assert!(
+                !stop.load(std::sync::atomic::Ordering::Relaxed),
+                "{cmd}: stop after failure"
+            );
+            assert_eq!(control_reply("ping", mp, &stop, None, &busy), "pong\n");
+        }
     }
 }
 
@@ -7011,6 +7319,31 @@ mod create_missing_cli_tests {
             dir.path(),
         );
         assert_eq!(fs::read(&archive).unwrap(), b"secret");
+    }
+
+    /// Regression: the SIGINT (retry only) vs SIGTERM (retry, then lazy) asymmetry was
+    /// undocumented in `--help`.
+    #[test]
+    fn regression_help_documents_signal_unmount() {
+        use clap::CommandFactory;
+        let cmd = Args::command();
+        let find = |long: &str| {
+            cmd.get_arguments()
+                .find(|a| a.get_long() == Some(long))
+                .unwrap_or_else(|| panic!("no --{long}"))
+                .get_long_help()
+                .map(|h| h.to_string())
+                .unwrap_or_default()
+        };
+        let fg = find("foreground");
+        for needle in ["SIGINT", "SIGTERM", "-u -z"] {
+            assert!(
+                fg.contains(needle),
+                "--foreground long help lacks {needle}: {fg}"
+            );
+        }
+        let u = find("unmount");
+        assert!(u.contains("fusermount3 -u"), "--unmount long help: {u}");
     }
 
     #[test]
@@ -7976,6 +8309,53 @@ mod sandbox_cli_tests {
         drop(ControlSocket(path));
     }
 
+    /// Regression (I1): the exit path must wait for an unmount reply that is still being written.
+    #[test]
+    fn regression_control_inflight_idle_returns_immediately() {
+        let inflight = ControlInflight::default();
+        let t = Instant::now();
+        assert!(inflight.wait_idle(Duration::from_secs(5)));
+        assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn regression_control_inflight_waits_for_guard_drop() {
+        let inflight = ControlInflight::default();
+        let guard = inflight.enter();
+        let t = Instant::now();
+        let h = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(guard);
+        });
+        assert!(inflight.wait_idle(Duration::from_secs(5)));
+        assert!(t.elapsed() >= Duration::from_millis(100));
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn regression_control_inflight_never_dropped_returns_at_bound() {
+        let inflight = ControlInflight::default();
+        let _guard = inflight.enter();
+        let t = Instant::now();
+        assert!(!inflight.wait_idle(Duration::from_millis(100)));
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(100), "{took:?}");
+        assert!(took < Duration::from_secs(3), "{took:?}");
+    }
+
+    /// A panic while answering must not leave the exit path waiting for the full bound.
+    #[test]
+    fn regression_control_inflight_guard_dropped_on_panic() {
+        let inflight = ControlInflight::default();
+        let tracker = inflight.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _g = tracker.enter();
+            panic!("handler panic");
+        }));
+        assert!(r.is_err());
+        assert!(inflight.wait_idle(Duration::from_millis(200)));
+    }
+
     /// Regression: socket status includes the same live policy fields as the virtual file.
     #[test]
     fn regression_control_socket_quota_status() {
@@ -7986,25 +8366,50 @@ mod sandbox_cli_tests {
             .unwrap()
             .with_readonly(rules.clone());
         let stop = AtomicBool::new(false);
-        let reply =
-            control_reply_with_quota("status", Path::new("/mnt"), &stop, None, Some(&quota));
+        let reply = control_reply_with_quota(
+            "status",
+            Path::new("/mnt"),
+            &stop,
+            None,
+            Some(&quota),
+            &no_unmount,
+        );
         assert!(reply.starts_with("mounted /mnt\nmemory_budget unlimited\n"));
         assert!(reply.ends_with("overlay_bytes 0\noverlay_quota_bytes 1024\noverlay_files 0\noverlay_quota_files unlimited\nerofs_denied 0\n"));
         assert_eq!(
-            control_reply_with_quota("ping", Path::new("/mnt"), &stop, None, Some(&quota)),
+            control_reply_with_quota(
+                "ping",
+                Path::new("/mnt"),
+                &stop,
+                None,
+                Some(&quota),
+                &no_unmount
+            ),
             "pong\n"
         );
         assert!(rules
             .check_mutation(OverlayMutation::Create, &["/t/blocked"])
             .is_err());
-        let reply =
-            control_reply_with_quota("status", Path::new("/mnt"), &stop, None, Some(&quota));
+        let reply = control_reply_with_quota(
+            "status",
+            Path::new("/mnt"),
+            &stop,
+            None,
+            Some(&quota),
+            &no_unmount,
+        );
         assert!(reply.ends_with("erofs_denied 1\n"));
         let unlimited = OverlayQuota::new(root.path(), None, None)
             .unwrap()
             .with_readonly(rules);
-        let reply =
-            control_reply_with_quota("status", Path::new("/mnt"), &stop, None, Some(&unlimited));
+        let reply = control_reply_with_quota(
+            "status",
+            Path::new("/mnt"),
+            &stop,
+            None,
+            Some(&unlimited),
+            &no_unmount,
+        );
         assert!(reply.contains("overlay_quota_bytes unlimited\n"));
         assert!(reply.ends_with("erofs_denied 1\n"));
     }
@@ -8315,7 +8720,13 @@ mod memory_budget_tests {
             1,
             ratarmount_core::budget::Priority::Cache,
         );
-        let reply = control_reply("status", Path::new("mnt"), &AtomicBool::new(false), None);
+        let reply = control_reply(
+            "status",
+            Path::new("mnt"),
+            &AtomicBool::new(false),
+            None,
+            &|_| Ok(()),
+        );
         assert!(reply.contains("memory_budget unlimited"));
         assert!(reply.contains("memory_pool socket-test"));
     }

@@ -3,7 +3,7 @@
 mod daemon;
 mod inspection;
 pub(crate) use inspection::start as start_inspection;
-mod process;
+pub(crate) mod process;
 mod protocol;
 mod run;
 #[cfg(test)]

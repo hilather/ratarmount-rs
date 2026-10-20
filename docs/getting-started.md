@@ -11,12 +11,33 @@ so. Run `ratarmount --print-features` to see what your binary includes and
 ratarmount archive.tar.gz mnt/     # mount; the process daemonizes once the mount is usable
 ratarmount -f archive.tar mnt/     # stay in the foreground (logs on stderr, Ctrl-C unmounts)
 ratarmount archive.tar             # no mountpoint: mounts at ./archive/
+ratarmount folder                  # a folder mounts at ./folder.mounted/
 ratarmount -u mnt/                 # unmount
 ```
 
 The first mount of an archive scans it and writes a SQLite index next to it
 (`archive.tar.gz.index.sqlite`), or into your user cache when the directory is
 not writable. Later mounts load the index and come up in tens of milliseconds.
+
+A mount point may not be, lie inside, or be an ancestor of a folder being mounted
+(a positional folder or a `--bind` source) or of the `-w` overlay directory. This also
+holds through symlinks, bind mounts (of the whole folder or a subdirectory, a bind hidden
+under a later mount, and a bind mounted *inside* the folder, into which a FUSE mount
+would propagate) and case or Unicode aliases. The single-threaded daemon would `stat` its
+own mount point and hang, so ratarmount refuses with exit code 2 **before the overlay
+database and marker are created, before any daemon is forked and before the FUSE mount**.
+It does not create the mount point itself when it refuses, unless that path lies under a
+directory that indexing creates (for example `--index-folders`). Two layouts are only
+visible to a second check that runs after the archives are opened and the `-w` directory
+is created: a `-w` directory and a mount point that did not exist yet and differ only by
+letter case or Unicode form on a case-insensitive filesystem, and an input directory that
+did not exist until another input's index was written into it (`--index-folders`). As with
+any later failure, index folders and sidecars written while opening the inputs, and an
+empty `-w` directory (no database, no marker), can remain after a refusal.
+`<folder>.mounted` is the default mount point when the usual default would be the folder
+itself (`folder` becomes `folder.mounted`; `folder.d` becomes `folder`; `x.tar.gz` becomes
+`x`). The check is point-in-time and does not read mount propagation flags (a private bind
+is refused too); `--corpus` members are not checked.
 
 ```bash
 ratarmount -c archive.tar mnt/                     # rebuild the index
@@ -230,6 +251,17 @@ source (plain files, stored TAR members, read-only overlays).
 For mounts that other users or containers must see, enable `user_allow_other`
 in `/etc/fuse.conf` and mount with `-o allow_other`. `-o uid=,gid=,umask=`
 present the tree with different ownership without changing the archive.
+
+## Stopping a mount
+
+`ratarmount -u mnt/` retries `fusermount3 -u` for about a second while the mount
+is busy; desktop watchers (gvfsd-trash, gvfs-udisks2-volume-monitor) probe every
+new mount and briefly hold it. A foreground or daemonized FUSE mount also
+unmounts on a signal. SIGINT (Ctrl-C) retries the same way and never detaches
+lazily; if the mount is still busy it warns and keeps serving, and pressing it
+again retries. SIGTERM retries for about a second, then detaches lazily
+(`fusermount3 -u -z`) and the process exits once open files close; with a file
+held open that takes the full retry window. macOS has no lazy unmount.
 
 ## When something looks wrong
 

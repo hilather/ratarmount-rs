@@ -68,7 +68,7 @@ sample in its own frame. See [Zstd random access](zstd-random-access.md).
 | **DMG** (UDIF) | Direct through the chunk table | Yes | Inner FAT, ISO, exFAT, NTFS, EXT4 or partitioned images. HFS+, APFS, encrypted, LZFSE and LZMA chunks are not supported |
 | **WIM** | Direct, uncompressed and XPRESS | Yes | First image only. LZX and LZMS resources, WIMBoot and delta images are not supported |
 | **QCOW2** (v2, v3) | Cluster map | Yes | zlib-compressed clusters and local backing files; zstd clusters and network backing are not supported |
-| **VHD / VHDX** | Block allocation table | Yes | Fixed and dynamic VHD, fixed VHDX. Differencing disks and VHDX log replay are not supported |
+| **VHD / VHDX** | Block allocation table | Yes | Fixed and dynamic VHD, fixed and dynamic (sparse) VHDX. Differencing disks and VHDX log replay are not supported |
 | **VMDK** | Grain map | Yes | Hosted sparse (KDMV) images. Compressed `streamOptimized` and ESXi formats are not supported |
 
 Disk images are read-only. A partitioned image inside a TAR inside a ZIP still
@@ -246,6 +246,10 @@ The complete status against the Python original is in the
    [Writing into archives](write-overlay.md#known-limits).
 5. **Platforms.** Linux and macOS on Apple silicon. No Intel macOS package (no
    CI runner), no Windows CLI. The library crates compile on Windows.
+6. **Mount point inside its own folder.** The refusal (exit 2) is a point-in-time
+   check: a bind created later, mount propagation from another namespace or an ancestor
+   rename after mounting are not caught, mount propagation flags are not read (a private
+   bind is refused too), and `--corpus` members are not checked.
 
 Remote, export and platform limits are listed with their own guides:
 [Remote inputs](phase10-remote.md#not-yet) · [NFS](nfs-export.md) · [other exports](export.md) · [macOS](macos.md).

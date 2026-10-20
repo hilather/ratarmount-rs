@@ -265,24 +265,23 @@ is inside the directory. `ratarmount snapshot` prints an `archive_digest` that
 with its weak companion (`base_weak_digest`), so remounts still check the base
 cheaply. `ratarmount sandbox run --base-digest` passes the value to its mount.
 
-An overlay, `--journal` file, `--lower` layer or FUSE mount point inside (or
-beside) a directory base is left out of the walk: none of them is part of the
-base, and the mount creates its mount point after the digest is taken. The excluded paths are
+An overlay, `--journal` file or `--lower` layer inside (or beside) a
+directory base is left out of the walk: none of them is part of the base. A
+FUSE mount point inside a directory base is refused at startup (exit 2): the
+daemon would stat its own mount point and hang, so mount outside the base. The excluded paths are
 recorded in `base_weak_excludes` (base-relative, append-only). When the
 overlay's parent does not exist yet (`-w BASE/new/ov`) the topmost new
 component (`new`) is recorded, because creating the overlay adds it. A later
 mount may append a journal path that is not in the base yet; one that already
 exists is base content and is refused. The same rule holds for the check of a
 `--lower` stack against its base, with or without `-w`: an invocation path
-(`--journal`, mount point) is left out only if it is not in the base yet, is
-already in a recorded excluded set (the existing top's, or the bottom lower's),
-or is the mount point and an empty directory. Anything else counts as a change
+(`--journal`) is left out only if it is not in the base yet or is already in a
+recorded excluded set (the existing top's, or the bottom lower's). Anything else counts as a change
 to the base (`--force-stack-mismatch` to override). A `-w` remount of the same
 top keeps its journal inside the base (it was recorded when first created). A
 read-only `--lower` mount has nowhere to record anything, so a `--journal` file
 that already exists inside the base is refused on the next mount; keep the
-journal outside the base. Repeated read-only mounts with an empty mount point
-directory inside the base work. Index and sidecar files that ratarmount
+journal outside the base. Index and sidecar files that ratarmount
 itself writes beside an archive (`X.index.sqlite` and its `-wal`/`-shm`,
 `.index.ptr`, pinned `.index.<id>.sqlite`, `.rgzi`, `.gzidx`, commit journals,
 manifests, staging temp names) never count. Archives written, replaced or

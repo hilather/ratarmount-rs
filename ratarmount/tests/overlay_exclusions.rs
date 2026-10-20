@@ -483,15 +483,15 @@ mod mounted {
         move |mnt: &Path| fs::write(mnt.join(name), b"written through the mount").unwrap()
     }
 
-    /// Regression (Matt's rule): a mount point inside the base, created by the
-    /// mount after the digest was taken, must be in the recorded excluded set
-    /// or the next mount reports a false weak mismatch. Overlay beside the base
-    /// and overlay inside it; mount point absent and present beforehand.
+    /// Regression (mount-in-base decision): a FUSE mount point inside a
+    /// directory base is refused at startup with exit 2 (the daemon would stat
+    /// its own mount point and hang). This replaces the earlier rule that
+    /// recorded such a mount point in the weak digest's excluded set. Overlay
+    /// beside the base and inside it; mount point absent and present
+    /// beforehand. Nothing is created: no overlay, no mount point, and the
+    /// base is unchanged.
     #[test]
-    fn regression_mountpoint_inside_directory_base_remounts_without_weak_mismatch() {
-        if !available() {
-            return;
-        }
+    fn regression_mountpoint_inside_directory_base_is_refused_with_exit_two() {
         for (overlay_inside, mnt_preexists) in [(false, false), (true, false), (true, true)] {
             let tmp = tempfile::tempdir().unwrap();
             let base = base_dir(tmp.path());
@@ -505,23 +505,130 @@ mod mounted {
                 fs::create_dir(&mnt).unwrap();
             }
             let label = format!("overlay_inside={overlay_inside} mnt_preexists={mnt_preexists}");
-            cycle(tmp.path(), &overlay, &base, &mnt, &[], &write_through("a"))
-                .unwrap_or_else(|e| panic!("{label}: first mount: {e}"));
-            let recorded = digest(&overlay);
-            assert!(recorded.starts_with("weak:"), "{label}: {recorded}");
-            assert!(
-                excludes(&overlay).contains("\"mnt\""),
-                "{label}: mount point missing from {}",
-                excludes(&overlay)
+            let out = cli(
+                tmp.path(),
+                &[
+                    OsStr::new("--passthrough"),
+                    OsStr::new("off"),
+                    OsStr::new("--index-file"),
+                    OsStr::new(":memory:"),
+                    OsStr::new("-w"),
+                    overlay.as_os_str(),
+                    base.as_os_str(),
+                    mnt.as_os_str(),
+                ],
             );
-            cycle(tmp.path(), &overlay, &base, &mnt, &[], &write_through("b"))
-                .unwrap_or_else(|e| panic!("{label}: remount refused: {e}"));
-            assert_eq!(digest(&overlay), recorded, "{label}");
-            // A real base edit is still caught.
-            fs::write(base.join("f"), b"edited!").unwrap();
-            let error = cycle(tmp.path(), &overlay, &base, &mnt, &[], &|_| {}).unwrap_err();
-            assert!(error.contains("--force-base-mismatch"), "{label}: {error}");
+            if out.status.success() {
+                // A mount that should have been refused: detach it before failing.
+                let _ = Command::new("fusermount3")
+                    .arg("-u")
+                    .arg("-z")
+                    .arg(&mnt)
+                    .status();
+                panic!("{label}: mount inside the base was not refused");
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{label}: {stderr}");
+            assert!(
+                stderr.contains("is inside") && stderr.contains("a mount point outside it"),
+                "{label}: {stderr}"
+            );
+            assert!(
+                !overlay.exists(),
+                "{label}: the early check creates nothing"
+            );
+            assert_eq!(mnt.exists(), mnt_preexists, "{label}");
+            assert_eq!(fs::read(base.join("f")).unwrap(), b"one", "{label}");
         }
+    }
+
+    /// One foreground `-w ov base` mount with no mount point argument, run in
+    /// `root` with relative paths, so the default mount point applies
+    /// (`base.mounted`, since the default would be the folder itself). `Ok`
+    /// once it was ready, written through and unmounted cleanly.
+    fn default_mount_cycle(root: &Path, name: &str) -> Result<(), String> {
+        let mnt = root.join("base.mounted");
+        let stderr_path = root.join("mount.stderr");
+        let stderr = fs::File::create(&stderr_path).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ratarmount"));
+        private_env(&mut cmd, root);
+        let mut child = cmd
+            .current_dir(root)
+            .args(["-f", "--passthrough", "off", "--index-file", ":memory:"])
+            .args(["-w", "ov", "base"])
+            .stdin(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        let root_dev = fs::metadata(root).unwrap().dev();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if fs::metadata(&mnt).is_ok_and(|m| m.dev() != root_dev) && fs::read_dir(&mnt).is_ok() {
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                return Err(refusal_text(
+                    status,
+                    fs::read_to_string(&stderr_path).unwrap(),
+                ));
+            }
+            if Instant::now() > deadline {
+                let _ = unmount_with_retry(&mnt);
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("default mount not ready within 30 s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fs::write(mnt.join(name), b"written through the mount").unwrap();
+        if let Err(message) = unmount_with_retry(&mnt) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{message}");
+        }
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "unmount exit {status}");
+                return Ok(());
+            }
+            if start.elapsed() > Duration::from_secs(30) {
+                let _ = Command::new("fusermount3")
+                    .arg("-u")
+                    .arg("-z")
+                    .arg(&mnt)
+                    .status();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("default mount did not exit after unmount");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Regression (merge of main's mount-point check): `ratarmount -w ov base`
+    /// with no mount point put the default mount point (the folder name
+    /// `base`, i.e. the base itself) into the weak digest's excluded set, so
+    /// creating the overlay failed with "cannot use the base directory itself
+    /// as the overlay" now that main mounts a bare folder at `base.mounted`.
+    /// The mount, a write through it and a remount must succeed.
+    #[test]
+    fn regression_default_mount_point_of_directory_base_with_overlay_mounts_and_remounts() {
+        if !available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = base_dir(tmp.path());
+        default_mount_cycle(tmp.path(), "a").unwrap_or_else(|e| panic!("first mount: {e}"));
+        let overlay = tmp.path().join("ov");
+        assert!(
+            digest(&overlay).starts_with("weak:"),
+            "{}",
+            digest(&overlay)
+        );
+        default_mount_cycle(tmp.path(), "b").unwrap_or_else(|e| panic!("remount: {e}"));
+        assert_eq!(fs::read(base.join("f")).unwrap(), b"one");
+        assert!(!base.join("a").exists(), "writes stay in the overlay");
     }
 
     /// Regression (G5b): a journal added on a later mount is appended to the

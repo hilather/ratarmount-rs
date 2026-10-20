@@ -26,8 +26,6 @@ static MOUNT_LOCK: Mutex<()> = Mutex::new(());
 
 const MOUNT_DEADLINE: Duration = Duration::from_secs(10);
 const UNMOUNT_DEADLINE: Duration = Duration::from_secs(10);
-/// Retry budget for the plain `fusermount3 -u` of a finished test.
-const GRACEFUL_UNMOUNT: Duration = Duration::from_secs(5);
 
 #[path = "../../ratarmount/tests/support/unmount.rs"]
 mod unmount;
@@ -796,10 +794,10 @@ impl MountGuard {
     }
 
     fn graceful_unmount(&mut self) -> Result<(), String> {
-        // Bounded EBUSY retry (an external probe of the new mount, see
-        // support/unmount.rs). If it stays busy the helper logs the holders,
-        // cleans up lazily and this fails; it never passes on the fallback.
-        if let Err(e) = unmount::unmount_within(&self.mnt, GRACEFUL_UNMOUNT, "graceful_unmount") {
+        // Bounded EBUSY retry (desktop probers of the new mount); a mount that
+        // stays busy fails the test with its holders logged.
+        if let Err(e) = graceful_fusermount_u(&self.mnt) {
+            unmount::log_holders(&self.mnt);
             return Err(format!(
                 "{e} (daemon pid {})\n{}",
                 self.daemon_pid,
@@ -833,6 +831,57 @@ fn reap(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             _ => return None,
         }
+    }
+}
+
+/// How long a graceful unmount keeps retrying a busy mount (desktop watchers such as
+/// gvfsd-trash and gvfs-udisks2-volume-monitor probe each new mount). Separate
+/// from the per-attempt `UNMOUNT_DEADLINE`.
+const BUSY_RETRY: Duration = Duration::from_secs(1);
+
+/// EBUSY from fusermount: stderr ends with the strerror (`failed to unmount <path>: <strerror>`),
+/// so the echoed mountpoint is never inspected. glibc and musl spell EBUSY differently.
+fn stderr_is_busy(stderr: &str) -> bool {
+    let end = stderr.trim_end();
+    end.ends_with(": Device or resource busy") || end.ends_with(": Resource busy")
+}
+
+/// `fusermount3 -u` with stderr captured, retried every 50 ms while it reports
+/// "Device or resource busy". Never lazy: a mount that stays busy fails the test.
+fn graceful_fusermount_u(mnt: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + BUSY_RETRY;
+    loop {
+        let mut cmd = Command::new("fusermount3");
+        cmd.arg("-u")
+            .arg(mnt)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("spawn fusermount3: {e}"))?;
+        let Some(st) = reap(&mut child, UNMOUNT_DEADLINE) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "fusermount3 -u {} did not finish within {UNMOUNT_DEADLINE:?}",
+                mnt.display()
+            ));
+        };
+        if st.success() {
+            return Ok(());
+        }
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = io::Read::read_to_string(&mut pipe, &mut stderr);
+        }
+        if !stderr_is_busy(&stderr) || Instant::now() >= deadline {
+            return Err(format!(
+                "fusermount3 -u {} failed ({st}): {}",
+                mnt.display(),
+                stderr.trim()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
