@@ -896,6 +896,7 @@ mod unix {
 
     /// Lock for a copy fallback (see [`super::guard_copy`]).
     pub(super) fn guard_copy(archive: &Path, source: &fs::Metadata) -> io::Result<CopyGuard> {
+        fault::check("copy publish")?;
         let archive = archive.canonicalize()?;
         // Read-only: flock needs no write permission.
         let file = File::open(&archive)?;

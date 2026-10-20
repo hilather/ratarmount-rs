@@ -2481,3 +2481,716 @@ fn regression_verify_accepts_own_pending_journal() {
         now(&fx.archive)
     ));
 }
+
+// ---- R7-C3: a failed replacement's reaction, the gate's snapshot, the copy guard ----
+
+use crate::write_overlay::tests::{reopen_tar_zst, ustar_file, write_split_tar_zst};
+use ratarmount_compress::commit_journal::{fault, journal_path};
+
+/// Incompressible bytes (a zstd frame of them is larger than the data).
+fn noise(tag: u64, len: usize) -> Vec<u8> {
+    let mut x = tag.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Way {
+    Live,
+    Provenance,
+    Offline,
+}
+
+/// A recorded base (`.tar` or a seekable two-frame `.tar.zst`) and its overlay.
+struct Place {
+    _tmp: tempfile::TempDir,
+    root: PathBuf,
+    archive: PathBuf,
+    overlay: PathBuf,
+    zst: bool,
+}
+
+impl Place {
+    fn new(zst: bool) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let archive = root.join(if zst { "base.tar.zst" } else { "base.tar" });
+        Self::write_base(&archive, zst);
+        Self {
+            overlay: root.join("overlay"),
+            archive,
+            root,
+            zst,
+            _tmp: tmp,
+        }
+    }
+
+    fn write_base(archive: &Path, zst: bool) {
+        if zst {
+            write_split_tar_zst(
+                archive,
+                &[ustar_file("prefix.txt", b"prefix member")],
+                &[ustar_file("last.txt", b"last member")],
+                true,
+            );
+        } else {
+            write_tar(archive, &[("first", b"first member")]);
+        }
+    }
+
+    fn source(&self, path: &Path) -> Arc<dyn MountSource> {
+        if self.zst {
+            reopen_tar_zst(path, false).unwrap()
+        } else {
+            open_tar(path)
+        }
+    }
+
+    fn token(&self) -> ClassifiedBase {
+        ClassifiedBase::for_tests(
+            self.source(&self.archive),
+            ServedKind::Archive,
+            Some(ServedLocation::Local(self.archive.clone())),
+        )
+    }
+
+    fn open(&self, overlay: &Path, way: Way, mode: crate::CommitMode) -> WriteOverlay {
+        let mut ov = open_with(&self.token(), overlay, BaseDigestRequest::Compute, false).unwrap();
+        ov.set_commit_mode(mode);
+        if way == Way::Provenance {
+            ov.set_manifest_hashes(Some("sha256".into()));
+        }
+        ov
+    }
+
+    /// Commit `ov` the given way (offline drops it first).
+    fn commit(
+        &self,
+        ov: WriteOverlay,
+        way: Way,
+        mode: crate::CommitMode,
+    ) -> (Option<WriteOverlay>, crate::write_overlay::Result<bool>) {
+        match way {
+            Way::Live | Way::Provenance => {
+                let result = ov.commit_live(&self.archive, |p| Ok(self.source(p)));
+                (Some(ov), result)
+            }
+            Way::Offline => {
+                drop(ov);
+                let opts = CommitOverlayOptions {
+                    yes: true,
+                    mode,
+                    ..Default::default()
+                };
+                let token = self.token();
+                (
+                    None,
+                    crate::commit_overlay(&self.overlay, &self.archive, &token, &opts),
+                )
+            }
+        }
+    }
+}
+
+fn ino(path: &Path) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(&fs::metadata(path).unwrap())
+}
+
+/// Regression (r15 #1): a failed replacement never recovers or copies over
+/// a journal another file left at the name. Journal-bearing B (torn or
+/// complete) is renamed over A right before the replacement locks the name;
+/// the replacement is refused, a copy fallback finds another inode at the
+/// name, and B, its journal and the overlay's rows stay as they were (a live
+/// mount keeps committing). Before: the fallback's `recover_offline(
+/// authorize_any)` recovered B's journal (offline/provenance), or the gated
+/// re-recovery refused it and stopped interval commits (live).
+#[cfg(unix)]
+#[test]
+fn regression_foreign_journal_at_the_name_is_never_recovered_or_overwritten() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for (way, zst) in [
+        (Way::Live, false),
+        (Way::Live, true),
+        (Way::Provenance, false),
+        (Way::Provenance, true),
+        (Way::Offline, false),
+        (Way::Offline, true),
+    ] {
+        for complete in [false, true] {
+            for mode in [crate::CommitMode::Append, crate::CommitMode::Auto] {
+                let case = format!("{way:?} zst={zst} complete={complete} {mode:?}");
+                let place = Place::new(zst);
+                let ov = place.open(&place.overlay, way, mode);
+                fs::write(ov.root().join("new"), b"new member").unwrap();
+                let rows = recorded_rows_live(&ov);
+                let other = place.root.join("other");
+                fs::create_dir(&other).unwrap();
+                let b = other.join(place.archive.file_name().unwrap());
+                write_tar(&b, &[("b", &noise(7, 4096))]);
+                if complete {
+                    interrupt_complete(&b);
+                } else {
+                    interrupt_append(&b);
+                }
+                let (b_bytes, j_bytes) =
+                    (fs::read(&b).unwrap(), fs::read(journal_path(&b)).unwrap());
+                let (from, to) = (b.clone(), place.archive.clone());
+                let (jfrom, jto) = (journal_path(&b), journal_path(&place.archive));
+                fault::install(move |step| {
+                    if step == "before replace" && from.exists() {
+                        fs::rename(&jfrom, &jto)?;
+                        fs::rename(&from, &to)?;
+                    }
+                    Ok(())
+                });
+                let b_ino = ino(&b);
+                let (ov, result) = place.commit(ov, way, mode);
+                fault::clear();
+                assert!(result.is_err(), "{case}: {result:?}");
+                assert!(
+                    fs::read(&place.archive).unwrap() == b_bytes,
+                    "{case}: B touched"
+                );
+                assert!(
+                    fs::read(journal_path(&place.archive)).unwrap() == j_bytes,
+                    "{case}: B's journal touched"
+                );
+                assert_eq!(ino(&place.archive), b_ino, "{case}: B replaced");
+                match ov {
+                    Some(ov) => {
+                        assert!(!ov.interval_disabled(), "{case}: interval stopped");
+                        assert_eq!(recorded_rows_live(&ov), rows, "{case}: rows moved");
+                    }
+                    None => assert_eq!(recorded_rows(&place.overlay), rows, "{case}: rows moved"),
+                }
+            }
+        }
+    }
+}
+
+fn recorded_rows_live(ov: &WriteOverlay) -> Vec<Option<String>> {
+    let meta = ov.meta_for_tests();
+    ["base_size", "base_mtime_ns", "base_digest_kind"]
+        .iter()
+        .map(|k| meta.get(k).map(str::to_owned))
+        .collect()
+}
+
+/// Regression (Astra v2 #3): a file swapped over the name before the append
+/// stages its suffix is never appended into or copied over. zstd B without a
+/// seek table (with a complete journal) and zstd B with a seek table are
+/// swapped in before the splice scans the archive; a TAR B with trailing
+/// garbage before the append offset is computed. Auto mode, live and
+/// offline: an error, B (and its journal) untouched, interval commits on.
+#[cfg(unix)]
+#[test]
+fn regression_swapped_archive_before_staging_is_refused() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for way in [Way::Live, Way::Offline] {
+        for variant in ["zst_no_seek_table", "zst_seek_table", "tar_bad_eof"] {
+            let case = format!("{way:?} {variant}");
+            let zst = variant != "tar_bad_eof";
+            let place = Place::new(zst);
+            let ov = place.open(&place.overlay, way, crate::CommitMode::Auto);
+            fs::write(ov.root().join("new"), b"new member").unwrap();
+            let other = place.root.join("other");
+            fs::create_dir(&other).unwrap();
+            let b = other.join(place.archive.file_name().unwrap());
+            let payload = noise(11, 4096);
+            match variant {
+                "zst_no_seek_table" | "zst_seek_table" => {
+                    write_split_tar_zst(
+                        &b,
+                        &[ustar_file("b1", &payload)],
+                        &[ustar_file("b2", &payload)],
+                        variant == "zst_seek_table",
+                    );
+                }
+                _ => {
+                    write_tar(&b, &[("b", &payload)]);
+                    let mut bytes = fs::read(&b).unwrap();
+                    bytes.extend_from_slice(&noise(12, 700));
+                    fs::write(&b, bytes).unwrap();
+                }
+            }
+            if variant == "zst_no_seek_table" {
+                interrupt_complete(&b);
+            }
+            let b_bytes = fs::read(&b).unwrap();
+            let journal = fs::read(journal_path(&b)).ok();
+            let (from, to) = (b.clone(), place.archive.clone());
+            let (jfrom, jto) = (journal_path(&b), journal_path(&place.archive));
+            if zst {
+                fault::install(move |step| {
+                    if step == "before splice scan" && from.exists() {
+                        if jfrom.exists() {
+                            fs::rename(&jfrom, &jto)?;
+                        }
+                        fs::rename(&from, &to)?;
+                    }
+                    Ok(())
+                });
+            } else {
+                crate::write_overlay::APPEND_PREPARE_SWAP.set(Some(b.clone()));
+            }
+            let (ov, result) = place.commit(ov, way, crate::CommitMode::Auto);
+            fault::clear();
+            crate::write_overlay::APPEND_PREPARE_SWAP.set(None);
+            assert!(result.is_err(), "{case}: {result:?}");
+            assert!(
+                fs::read(&place.archive).unwrap() == b_bytes,
+                "{case}: B touched"
+            );
+            assert_eq!(
+                fs::read(journal_path(&place.archive)).ok(),
+                journal,
+                "{case}: B's journal"
+            );
+            if let Some(ov) = ov {
+                assert!(!ov.interval_disabled(), "{case}: interval stopped");
+            }
+        }
+    }
+}
+
+/// Regression (r15 #1, design test 1c): an attempt that never published its
+/// journal never adopts another file's. B (complete journal J2, `C` on B) is
+/// renamed over A's name after A's prepare locator and before A publishes;
+/// A's attempt fails (EEXIST), rolls nothing back, and the Auto copy finds
+/// another inode at the name: an error, A unchanged (read through an fd
+/// opened before), B and J2 untouched and B still complete, rows unchanged,
+/// interval commits on.
+#[cfg(unix)]
+#[test]
+fn regression_unpublished_attempt_collision_refuses_copy() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    use std::io::{Read, Seek};
+    let place = Place::new(false);
+    let ov = place.open(&place.overlay, Way::Live, crate::CommitMode::Auto);
+    fs::write(ov.root().join("new"), b"new member").unwrap();
+    let rows = recorded_rows_live(&ov);
+    let mut a = fs::File::open(&place.archive).unwrap();
+    let (a_bytes, a_mtime) = (
+        fs::read(&place.archive).unwrap(),
+        a.metadata().unwrap().modified().unwrap(),
+    );
+    let x = place.root.join("x");
+    fs::create_dir(&x).unwrap();
+    let b = x.join("base.tar");
+    write_tar(&b, &[("b", &noise(3, 4096))]);
+    interrupt_complete(&b);
+    let (b_bytes, j2) = (fs::read(&b).unwrap(), fs::read(journal_path(&b)).unwrap());
+    let (from, to) = (b.clone(), place.archive.clone());
+    let (jfrom, jto) = (journal_path(&b), journal_path(&place.archive));
+    fault::install(move |step| {
+        if step == "locator prepare" && from.exists() {
+            fs::rename(&jfrom, &jto)?;
+            fs::rename(&from, &to)?;
+        }
+        Ok(())
+    });
+    let result = ov.commit_live(&place.archive, |p| Ok(open_tar(p)));
+    fault::clear();
+    assert!(result.is_err(), "{result:?}");
+    let mut now = Vec::new();
+    a.rewind().unwrap();
+    a.read_to_end(&mut now).unwrap();
+    assert!(now == a_bytes, "A changed");
+    assert_eq!(a.metadata().unwrap().modified().unwrap(), a_mtime);
+    assert!(fs::read(&place.archive).unwrap() == b_bytes, "B touched");
+    assert!(
+        fs::read(journal_path(&place.archive)).unwrap() == j2,
+        "J2 touched"
+    );
+    assert!(
+        ratarmount_compress::commit_journal::pending(&place.archive)
+            .unwrap()
+            .expect("B's journal")
+            .complete,
+        "B keeps its complete locator"
+    );
+    assert!(!ov.interval_disabled());
+    assert_eq!(recorded_rows_live(&ov), rows);
+}
+
+/// Regression (r15 skeptic #2): the cleanup of a failed attempt runs under
+/// the attempt's own lock. ENOSPC while the archive is written; while the
+/// attempt is about to clean up, another thread tries to recover the archive
+/// and to start its own (complete) replacement: both fail on the lock. The
+/// attempt then rolls back: the archive is the old bytes, no journal, no
+/// locator, rows unchanged, and the next commit succeeds.
+#[cfg(unix)]
+#[test]
+fn regression_failed_attempt_cleanup_holds_the_archive_lock() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let place = Place::new(false);
+    let ov = place.open(&place.overlay, Way::Live, crate::CommitMode::Append);
+    fs::write(ov.root().join("new"), b"new member").unwrap();
+    let rows = recorded_rows_live(&ov);
+    let before = fs::read(&place.archive).unwrap();
+    let archive = place.archive.clone();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    fault::install(move |step| {
+        match step {
+            "archive write" => return Err(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+            "before cleanup" => {
+                let archive = archive.clone();
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    let recovered = crate::recover_journal_at(
+                        &archive,
+                        None,
+                        &mut ratarmount_compress::commit_journal::authorize_owned,
+                    );
+                    log.lock().unwrap().push(format!("recover: {recovered:?}"));
+                    use std::io::Write;
+                    let mut suffix = tempfile::tempfile().unwrap();
+                    suffix.write_all(&[0u8; 1536]).unwrap();
+                    let len = fs::metadata(&archive).unwrap().len();
+                    let started = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+                        &archive,
+                        len.saturating_sub(1024),
+                        &mut suffix,
+                        &mut |step| {
+                            if step == "locator complete" {
+                                Err(std::io::Error::other("crash"))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    );
+                    log.lock().unwrap().push(format!("replace: {started:?}"));
+                })
+                .join()
+                .unwrap();
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+    let result = ov.commit_live(&place.archive, |p| Ok(open_tar(p)));
+    fault::clear();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for line in &seen {
+        assert!(
+            line.contains("Resource temporarily unavailable") || line.contains("WouldBlock"),
+            "the other committer must hit the lock: {line}"
+        );
+    }
+    assert!(result.is_err(), "{result:?}");
+    assert!(fs::read(&place.archive).unwrap() == before, "rolled back");
+    assert!(!journal_path(&place.archive).exists());
+    assert!(ratarmount_compress::commit_journal::pending(&place.archive)
+        .unwrap()
+        .is_none());
+    assert_eq!(recorded_rows_live(&ov), rows);
+    assert!(!ov.interval_disabled());
+    assert!(ov.commit_live(&place.archive, |p| Ok(open_tar(p))).unwrap());
+}
+
+/// Regression (r15 #3): the commit goes through `alias -> A` and, after the
+/// completion marker, `alias` is retargeted to journal-free B. The hook
+/// (resolved name != locked inode) fails, so the commit is NOT a success:
+/// `Committed`, A holds the new bytes with its complete journal, the rows
+/// still describe A's old stamp, the overlay file stays, interval commits
+/// stop. Recovering A then restamps and the gate accepts it. Before: the
+/// cleanup probed `alias` (B: no journal), counted `Ok(None)` as done and
+/// reported success; the refresh then recorded B and the cleanup pruned the
+/// overlay file.
+#[cfg(unix)]
+#[test]
+fn regression_committed_hook_failure_after_link_retarget_stays_committed() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for path in [Path_::Live, Path_::OnExit] {
+        let fx = Fixture::new();
+        let alias = fx.archive.with_file_name("alias.tar");
+        std::os::unix::fs::symlink(&fx.archive, &alias).unwrap();
+        let token = ClassifiedBase::for_tests_typed(
+            open_tar(&fx.archive),
+            ServedKind::Archive,
+            Some(ServedLocation::Local(fx.archive.clone())),
+            &alias,
+        );
+        let mut ov = open_with(&token, &fx.overlay, BaseDigestRequest::Compute, false).unwrap();
+        ov.set_commit_mode(crate::CommitMode::Append);
+        fs::write(ov.root().join("one"), b"one").unwrap();
+        let rows = recorded_rows_live(&ov);
+        let b = fx.archive.with_file_name("b.tar");
+        write_tar(&b, &[("other", b"a different base")]);
+        let b_bytes = fs::read(&b).unwrap();
+        let (link, target) = (alias.clone(), b.clone());
+        fault::install(move |step| {
+            if step == "locator complete" {
+                fs::remove_file(&link)?;
+                std::os::unix::fs::symlink(&target, &link)?;
+            }
+            Ok(())
+        });
+        let result = commit(&ov, &alias, path);
+        fault::clear();
+        let error = result.expect_err("a commit whose hook failed is not a success");
+        assert!(
+            matches!(error, crate::OverlayError::Committed(_)),
+            "{path:?}: {error}"
+        );
+        let journal = ratarmount_compress::commit_journal::pending(&fx.archive)
+            .unwrap()
+            .expect("A keeps its journal");
+        assert!(journal.complete, "{path:?}");
+        assert_eq!(recorded_rows_live(&ov), rows, "{path:?}: rows moved");
+        assert!(ov.root().join("one").exists(), "{path:?}: overlay pruned");
+        assert!(ov.interval_disabled(), "{path:?}");
+        assert_eq!(fs::read(&b).unwrap(), b_bytes);
+        drop(ov);
+        crate::recover_journal_at(
+            &fx.archive,
+            Some(&fx.overlay.join(HIDDEN_DB)),
+            &mut ratarmount_compress::commit_journal::authorize_owned,
+        )
+        .unwrap()
+        .expect("A recovered");
+        let (size, mtime) = stamp_rows(&fx.archive);
+        let now = recorded_rows(&fx.overlay);
+        assert_eq!((now[0].clone(), now[1].clone()), (size, mtime), "{path:?}");
+        crate::overlay_gate::check_commit_base_offline(
+            &fx.overlay,
+            &archive_token(&fx.archive),
+            &fx.archive,
+        )
+        .unwrap_or_else(|e| panic!("{path:?}: {e:?}"));
+    }
+}
+
+/// Regression (r15 #3, renamed directory): the base `/d/a`; after the
+/// completion marker `/d` is renamed to `/saved` and journal-free B is
+/// written at `/d/a`. The hook fails (the name is B): `Committed`; A (now
+/// `/saved/a`) holds the new bytes with its journal byte-identical and `C`;
+/// B untouched; rows unchanged; the overlay file stays; interval commits
+/// stop. With the directory restored, recovery rolls forward, restamps, and
+/// the gate accepts.
+#[cfg(unix)]
+#[test]
+fn regression_committed_hook_failure_after_directory_rename_stays_committed() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (d, saved) = (root.join("d"), root.join("saved"));
+    fs::create_dir(&d).unwrap();
+    let a = d.join("a.tar");
+    write_tar(&a, &[("first", b"first member")]);
+    let overlay = root.join("overlay");
+    let mut ov = open_with(
+        &archive_token(&a),
+        &overlay,
+        BaseDigestRequest::Compute,
+        false,
+    )
+    .unwrap();
+    ov.set_commit_mode(crate::CommitMode::Append);
+    fs::write(ov.root().join("one"), b"one").unwrap();
+    let rows = recorded_rows_live(&ov);
+    let (seam_d, seam_saved) = (d.clone(), saved.clone());
+    fault::install(move |step| {
+        if step == "locator complete" {
+            fs::rename(&seam_d, &seam_saved)?;
+            fs::create_dir(&seam_d)?;
+            write_tar(&seam_d.join("a.tar"), &[("other", b"journal-free B")]);
+        }
+        Ok(())
+    });
+    let result = ov.commit_live(&a, |p| Ok(open_tar(p)));
+    fault::clear();
+    let error = result.expect_err("not a success");
+    assert!(
+        matches!(error, crate::OverlayError::Committed(_)),
+        "{error}"
+    );
+    let moved = saved.join("a.tar");
+    let journal = fs::read(journal_path(&moved)).expect("J1 beside the moved archive");
+    assert!(
+        ratarmount_compress::commit_journal::pending(&moved)
+            .unwrap()
+            .expect("pending through the new name")
+            .complete
+    );
+    let b_bytes = fs::read(&a).unwrap();
+    assert_eq!(recorded_rows_live(&ov), rows);
+    assert!(ov.root().join("one").exists());
+    assert!(ov.interval_disabled());
+    drop(ov);
+    assert_eq!(fs::read(&a).unwrap(), b_bytes, "B untouched");
+    assert_eq!(fs::read(journal_path(&moved)).unwrap(), journal);
+    fs::remove_file(&a).unwrap();
+    fs::remove_dir(&d).unwrap();
+    fs::rename(&saved, &d).unwrap();
+    crate::recover_journal_at(
+        &a,
+        Some(&overlay.join(HIDDEN_DB)),
+        &mut ratarmount_compress::commit_journal::authorize_owned,
+    )
+    .unwrap()
+    .expect("rolled forward");
+    let (size, mtime) = stamp_rows(&a);
+    let now = recorded_rows(&overlay);
+    assert_eq!((now[0].clone(), now[1].clone()), (size, mtime));
+    crate::overlay_gate::check_commit_base_offline(&overlay, &archive_token(&a), &a).unwrap();
+}
+
+/// Regression (Astra v2 #5): the gate resolves and stats the archive once
+/// and returns that snapshot; every later write compares against it. B (same
+/// size, another inode) is swapped over the name right after the snapshot:
+/// the gate still judges and returns A; the replacement and the copy source
+/// then refuse B. Mutation-red: judging the identity by a second stat of the
+/// name (the old `FileId::of(&canonical)`) returns B or a mixed judgement.
+#[cfg(unix)]
+#[test]
+fn regression_commit_gate_judges_and_returns_one_snapshot() {
+    use std::os::unix::fs::MetadataExt;
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let a_ino = ino(&fx.archive);
+    let mut b_bytes = fs::read(&fx.archive).unwrap();
+    b_bytes[600] ^= 1;
+    let b = fx.archive.with_file_name("b.tar");
+    fs::write(&b, &b_bytes).unwrap();
+    let (from, to) = (b.clone(), fx.archive.clone());
+    crate::overlay_gate::AFTER_SNAPSHOT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || fs::rename(&from, &to).unwrap()));
+    });
+    let token = archive_token(&fx.archive);
+    let snapshot = crate::overlay_gate::check_commit_base_offline(&fx.overlay, &token, &fx.archive)
+        .expect("the gate judged A")
+        .expect("an archive snapshot");
+    assert_eq!(snapshot.ino(), a_ino);
+    assert_ne!(ino(&fx.archive), a_ino, "B is at the name");
+    let mut suffix = tempfile::tempfile().unwrap();
+    std::io::Write::write_all(&mut suffix, &[0u8; 1024]).unwrap();
+    let replaced = ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with(
+        &fx.archive,
+        512,
+        &mut suffix,
+        &snapshot,
+        &mut |_| Ok(()),
+    );
+    assert!(
+        matches!(
+            replaced,
+            Err(ratarmount_compress::commit_journal::ReplaceError::Refused(
+                _
+            ))
+        ),
+        "{replaced:?}"
+    );
+    assert_eq!(fs::read(&fx.archive).unwrap(), b_bytes);
+    assert!(crate::journal_recovery::open_copy_source(&fx.archive, &snapshot).is_err());
+}
+
+/// Regression (Astra v3 #2): a copy fallback publishes only over the file it
+/// read, unchanged. P1's append fails (ENOSPC) and rolls back; while P1 is
+/// about to publish its copy, P2 (another overlay on the same archive)
+/// appends its own member to the same inode. P1's copy is refused
+/// ("archive changed during the copy fallback"), P2's member stays readable,
+/// the inode is unchanged, interval commits stay on, and P1's next commit is
+/// refused too (its rows still describe the archive before P2's commit).
+/// Mutation-red: a guard comparing only (dev, ino) publishes P1's copy over
+/// P2's append.
+#[cfg(unix)]
+#[test]
+fn regression_auto_copy_refuses_an_archive_that_changed_since_it_was_staged() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for (way, zst) in [
+        (Way::Live, false),
+        (Way::Live, true),
+        (Way::Provenance, false),
+        (Way::Offline, false),
+        (Way::Offline, true),
+    ] {
+        let case = format!("{way:?} zst={zst}");
+        let place = Place::new(zst);
+        let p1 = place.open(&place.overlay, way, crate::CommitMode::Auto);
+        fs::write(p1.root().join("from-p1"), b"p1 member").unwrap();
+        let p2 = place.open(
+            &place.root.join("overlay2"),
+            Way::Live,
+            crate::CommitMode::Append,
+        );
+        fs::write(p2.root().join("from-p2"), b"p2 member").unwrap();
+        let a_ino = ino(&place.archive);
+        let archive = place.archive.clone();
+        let zst_reopen = zst;
+        let mut p2 = Some(p2);
+        fault::install(move |step| {
+            match step {
+                "archive write" => return Err(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+                "copy publish" => {
+                    if let Some(p2) = p2.take() {
+                        let committed = p2.commit_live(&archive, |p| {
+                            Ok(if zst_reopen {
+                                reopen_tar_zst(p, false).unwrap()
+                            } else {
+                                open_tar(p)
+                            })
+                        });
+                        assert!(committed.unwrap(), "P2 commits");
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+        let (p1, result) = place.commit(p1, way, crate::CommitMode::Auto);
+        fault::clear();
+        let error = result.expect_err(&case).to_string();
+        assert!(
+            error.contains("changed during the copy fallback"),
+            "{case}: {error}"
+        );
+        assert_eq!(ino(&place.archive), a_ino, "{case}: P1 published a copy");
+        let served = place.source(&place.archive);
+        assert_eq!(
+            read_member(served.as_ref(), "/from-p2"),
+            b"p2 member",
+            "{case}"
+        );
+        assert!(served.lookup("/from-p1", 0).is_none(), "{case}");
+        if let Some(p1) = p1 {
+            assert!(!p1.interval_disabled(), "{case}");
+            let next = p1.commit_live(&place.archive, |p| Ok(place.source(p)));
+            assert!(
+                next.unwrap_err()
+                    .to_string()
+                    .contains("--force-base-mismatch"),
+                "{case}: P1's rows describe the archive before P2's commit"
+            );
+        }
+    }
+}

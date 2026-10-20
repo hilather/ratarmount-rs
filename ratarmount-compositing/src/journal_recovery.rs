@@ -16,8 +16,12 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use ratarmount_compress::commit_journal::{self, Applied, Authorize, PendingJournal, RecoverError};
+use ratarmount_compress::commit_journal::{
+    self, Applied, Authorize, PendingJournal, RecoverError, ReplaceError,
+};
 use rusqlite::Connection;
+
+use crate::write_overlay::OverlayError;
 
 use crate::overlay_gate::{kind_only, Recorded};
 use crate::overlay_meta::OverlayMeta;
@@ -480,4 +484,125 @@ pub fn authorize_mount_recovery(
             member.display()
         ))),
     }
+}
+
+// ---- a failed replacement, and the copy fallback (R7-C3) ------------------
+
+/// What a failed journaled replacement leaves its caller to do. Decided once,
+/// here, from the attempt's own [`ReplaceError`]: no caller re-runs recovery.
+#[derive(Debug)]
+pub(crate) struct FailedReplace {
+    pub(crate) error: OverlayError,
+    /// Nothing of the attempt remains: in `Auto` mode a copy fallback may run
+    /// (through [`open_copy_source`] and [`publish_over`]).
+    pub(crate) may_copy: bool,
+    /// The archive holds the new bytes, or this attempt's journal is still on
+    /// disk: a live mount stops committing until it is remounted.
+    pub(crate) base_unusable: bool,
+}
+
+impl From<OverlayError> for FailedReplace {
+    /// An error before the replacement started (staging, scanning): nothing
+    /// was written.
+    fn from(error: OverlayError) -> Self {
+        Self {
+            error,
+            may_copy: true,
+            base_unusable: false,
+        }
+    }
+}
+
+impl From<io::Error> for FailedReplace {
+    fn from(error: io::Error) -> Self {
+        OverlayError::Io(error).into()
+    }
+}
+
+pub(crate) fn failed_replace(error: ReplaceError) -> FailedReplace {
+    let (error, may_copy, base_unusable) = match error {
+        ReplaceError::Refused(e) => (OverlayError::Msg(e.to_string()), true, false),
+        ReplaceError::RolledBack(e) => (OverlayError::Io(e), true, false),
+        ReplaceError::Pending(e) => (
+            OverlayError::JournalPending(format!(
+                "{e}; the archive's commit journal is still pending (remount required)"
+            )),
+            false,
+            true,
+        ),
+        ReplaceError::Committed(e) => (
+            OverlayError::Committed(format!(
+                "{e}; the archive holds the committed bytes but the recorded baseline could \
+                 not be updated (remount required)"
+            )),
+            false,
+            true,
+        ),
+    };
+    FailedReplace {
+        error,
+        may_copy,
+        base_unusable,
+    }
+}
+
+/// [`failed_replace`] for the zstd append splice; its other errors (scan,
+/// staging) happen before anything is written.
+pub(crate) fn failed_splice(error: ratarmount_compress::CompressError) -> FailedReplace {
+    match error {
+        ratarmount_compress::CompressError::Replace(e) => failed_replace(e),
+        other => OverlayError::Msg(other.to_string()).into(),
+    }
+}
+
+/// Open the file a copy fallback reads, refusing unless it is the file the
+/// commit gate accepted (`original`'s device and inode). Returns the open
+/// file and its stamp; [`publish_over`] compares that stamp under the lock.
+pub(crate) fn open_copy_source(
+    archive: &Path,
+    original: &fs::Metadata,
+) -> io::Result<(fs::File, fs::Metadata)> {
+    let file = fs::File::open(archive)?;
+    let source = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (source.dev(), source.ino()) != (original.dev(), original.ino()) {
+            return Err(io::Error::other(format!(
+                "{} changed before the copy fallback (it is no longer the file the commit \
+                 gate accepted); nothing was published, retry",
+                archive.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = original;
+    Ok((file, source))
+}
+
+/// Publish a copy over `archive` only while it is still exactly the file the
+/// copy was read from (`source`) and no journal is pending on it, under its
+/// lock (held until `publish` returned).
+pub(crate) fn publish_over(
+    archive: &Path,
+    source: &fs::Metadata,
+    publish: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let _guard = commit_journal::guard_copy(archive, source)?;
+    publish()
+}
+
+/// The zstd copy splice, read from the gate's file and published under the
+/// same guard.
+pub(crate) fn splice_replace_over<F>(
+    archive: &Path,
+    from_idx: usize,
+    transform: F,
+    original: &fs::Metadata,
+) -> std::result::Result<ratarmount_compress::SpliceStats, OverlayError>
+where
+    F: FnOnce(&mut dyn ratarmount_compress::SeekRead, u64, &mut dyn io::Write) -> io::Result<()>,
+{
+    ratarmount_compress::splice_zstd_last_frames_replace(archive, from_idx, transform, original)
+        .map_err(|e| OverlayError::Msg(e.to_string()))
 }

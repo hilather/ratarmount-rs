@@ -125,11 +125,16 @@ where
 
 /// Sibling [`NamedTempFile`] in `path.parent()`, splice, sync, persist.
 ///
-/// On failure before persist the original inode is untouched.
+/// The copy is read only from the file `original` describes (the caller's
+/// gate snapshot: same device and inode) and is published only while the
+/// archive is still exactly that file with no journal pending, under its lock
+/// ([`crate::commit_journal::guard_copy`]). On failure before persist the
+/// original inode is untouched.
 pub fn splice_zstd_last_frames_replace<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
+    original: &std::fs::Metadata,
 ) -> Result<SpliceStats>
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
@@ -140,6 +145,14 @@ where
         .unwrap_or(Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
     let mut src = File::open(path)?;
+    let source = src.metadata()?;
+    if !same_file(original, &source) {
+        return Err(CompressError::Msg(format!(
+            "{} changed before the copy fallback (it is no longer the file the commit gate \
+             accepted); nothing was published, retry",
+            path.display()
+        )));
+    }
     let map = scan_zstd_frames(&mut src)?;
     let prefix = map
         .frames
@@ -155,6 +168,8 @@ where
     crate::fastcopy::log_commit_copy(prefix, method);
     let stats = write_zstd_splice_suffix(&mut src, &map, from_idx, transform, tmp.as_file_mut())?;
     tmp.as_file().sync_all()?;
+    let _guard = crate::commit_journal::guard_copy(path, &source)
+        .map_err(|e| CompressError::Msg(e.to_string()))?;
     tmp.persist(path).map_err(|e| {
         CompressError::Msg(format!(
             "Failed to replace '{}' after zstd splice: {}",
@@ -163,6 +178,20 @@ where
         ))
     })?;
     Ok(stats)
+}
+
+/// Same device and inode.
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        true
+    }
 }
 
 /// Journaled in-place splice. Requires a seek table and stages only the suffix.
@@ -231,7 +260,8 @@ where
         tmp.as_file().sync_all()?;
         // Published only over the file the copy was read from, unchanged and
         // with no journal pending, under its lock.
-        let _guard = crate::commit_journal::guard_copy(path, &source)?;
+        let _guard = crate::commit_journal::guard_copy(path, &source)
+            .map_err(|e| CompressError::Msg(e.to_string()))?;
         tmp.persist(path).map_err(|e| e.error)?;
         return Ok(stats);
     }
@@ -770,8 +800,13 @@ mod tests {
 
         let map = scan_zstd_frames_path(&path).unwrap();
         let from_idx = 1;
-        let stats =
-            splice_zstd_last_frames_replace(&path, from_idx, append_extra(extra.clone())).unwrap();
+        let stats = splice_zstd_last_frames_replace(
+            &path,
+            from_idx,
+            append_extra(extra.clone()),
+            &std::fs::metadata(&path).unwrap(),
+        )
+        .unwrap();
         assert!(stats.wrote_seek_table);
         assert_eq!(
             stats.prefix_compressed_bytes,
@@ -794,7 +829,13 @@ mod tests {
 
         // Bad from_idx must not touch the inode.
         let before_fail = std::fs::read(&path).unwrap();
-        let err = splice_zstd_last_frames_replace(&path, 99, append_extra(extra)).unwrap_err();
+        let err = splice_zstd_last_frames_replace(
+            &path,
+            99,
+            append_extra(extra),
+            &std::fs::metadata(&path).unwrap(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("from_idx"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), before_fail);
     }
@@ -809,15 +850,16 @@ mod tests {
         let path = dir.path().join("transform-err.zst");
         std::fs::write(&path, &src_bytes).unwrap();
 
-        let err = splice_zstd_last_frames_replace(&path, 1, |suffix, _off, _out| {
+        let original = std::fs::metadata(&path).unwrap();
+        let transform = |suffix: &mut dyn SeekRead, _off: u64, _out: &mut dyn Write| {
             let n = io::copy(suffix, &mut io::sink())?;
             assert!(n > 0, "transform must see a non-empty decoded suffix");
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "transform failed after suffix",
             ))
-        })
-        .unwrap_err();
+        };
+        let err = splice_zstd_last_frames_replace(&path, 1, transform, &original).unwrap_err();
         assert!(
             err.to_string().contains("transform failed after suffix"),
             "{err}"

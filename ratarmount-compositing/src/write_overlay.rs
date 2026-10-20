@@ -17,8 +17,8 @@ use flate2::Compression as GzCompression;
 use ratarmount_compress::{
     body_looks_like_tar, decode_zstd_frames_to, detect_compression, export_zstd_blocks,
     materialize, open_seekable_zstd, open_seekable_zstd_with_threads, scan_zstd_frames_path,
-    splice_zstd_last_frames_append_with, splice_zstd_last_frames_replace, CompressionFormat,
-    SpliceStats, ZstdFrameMap, DEFAULT_MEMORY_CAP,
+    splice_zstd_last_frames_append_with, CompressionFormat, SpliceStats, ZstdFrameMap,
+    DEFAULT_MEMORY_CAP,
 };
 use ratarmount_core::{
     create_root_file_info, metadata_gid, metadata_mode, metadata_mtime_secs, metadata_uid,
@@ -241,6 +241,11 @@ pub enum OverlayError {
     /// a copy fallback: the archive already holds the commit.
     #[error("{0}")]
     Committed(String),
+    /// A journaled append failed and its journal (old or torn bytes) is still
+    /// on disk where recovery must find it. Never answered with a copy: the
+    /// mount must be recovered (remounted) first.
+    #[error("{0}")]
+    JournalPending(String),
 }
 
 pub type Result<T> = std::result::Result<T, OverlayError>;
@@ -3405,7 +3410,7 @@ impl WriteOverlay {
         // After `recover` on purpose: recovery only rolls a torn earlier append
         // back to the archive the rows describe, and the identity check then
         // judges that restored file; nothing of this commit is written before it.
-        self.check_commit_identity(archive)?;
+        self.check_commit_identity(archive, false)?;
         let target = self.rolling_commit_target(archive, &plan)?;
         let archive = target.as_path();
         let persist_plan = self.rolling_persist_plan(&plan);
@@ -4062,7 +4067,7 @@ impl WriteOverlay {
         // After `recover` on purpose: recovery only rolls a torn earlier append
         // back to the archive the rows describe, and the identity check then
         // judges that restored file; nothing of this commit is written before it.
-        self.check_commit_identity(archive)?;
+        self.check_commit_identity(archive, false)?;
         let target = self.rolling_commit_target(archive, &plan)?;
         let archive = target.as_path();
         let persist_plan = self.rolling_persist_plan(&plan);
@@ -4234,6 +4239,9 @@ impl WriteOverlay {
         plan: &OverlayCommitPlan,
     ) -> Result<IndexPatchWindow> {
         self.recover_journal(archive)?;
+        // The one snapshot every write of this commit compares against: the
+        // file the gate accepted (after recovery), never a later stat.
+        let original = self.check_commit_identity(archive, true)?;
         self.persist_count.fetch_add(1, Ordering::SeqCst);
         let mut manifest_plan = if self.manifest_hashes.is_some() && !self.remote_enabled() {
             let mut snapshot = plan.clone();
@@ -4257,29 +4265,30 @@ impl WriteOverlay {
                     None
                 },
                 &self.commit_rows(),
+                &original,
             );
             // Exactly the ordinary append branches: a splice that landed but
-            // could not finish refuses the stale frame map and stops intervals;
-            // any other error recovers the torn append or refuses if it cannot.
+            // could not finish, or left its journal, refuses the stale frame
+            // map and stops intervals; any other error wrote nothing.
             match window {
                 Ok(window) => (window, 0),
-                Err(e @ OverlayError::Committed(_)) => {
+                Err(e @ (OverlayError::Committed(_) | OverlayError::JournalPending(_))) => {
                     self.refuse_base_after_commit_failure();
                     return Err(e);
                 }
-                Err(e) => {
-                    self.recover_failed_append(archive, &e)?;
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         } else {
             match format {
                 CompressionFormat::Zstd => {
-                    let (window, stats) = self.persist_tar_zst_plan(archive, plan)?;
+                    let (window, stats) = self.persist_tar_zst_plan(archive, plan, &original)?;
                     (window, stats.prefix_compressed_bytes)
                 }
                 // Uncompressed TAR stores 0.
-                _ => (self.persist_uncompressed_tar_plan(archive, plan)?, 0),
+                _ => (
+                    self.persist_uncompressed_tar_plan(archive, plan, &original)?,
+                    0,
+                ),
             }
         };
         if !self.remote_enabled() {
@@ -4336,12 +4345,17 @@ impl WriteOverlay {
     /// commit gate). The mount keeps serving and the interval stays on: unlike
     /// a failed commit, nothing was written. `--force-base-mismatch` commits
     /// anyway (the refresh after the write records the new baseline).
-    fn check_commit_identity(&self, archive: &Path) -> Result<()> {
+    ///
+    /// Returns the gate's one snapshot of the archive (or, when the gate judged
+    /// no local archive or was forced, one stat taken right after it): every
+    /// write of the commit compares against it. `quiet`: a repeated check that
+    /// does not log the forced refusal again.
+    fn check_commit_identity(&self, archive: &Path, quiet: bool) -> Result<fs::Metadata> {
         if self.remote_enabled() {
-            return Ok(());
+            return Ok(fs::metadata(archive)?);
         }
         let Some(base) = self.identity.lock().expect("overlay identity").clone() else {
-            return Ok(());
+            return Ok(fs::metadata(archive)?);
         };
         let checked = crate::overlay_gate::check_commit_base(
             &self.db.lock().expect("overlay db"),
@@ -4349,10 +4363,13 @@ impl WriteOverlay {
             archive,
         );
         match checked {
-            Ok(()) => Ok(()),
+            Ok(Some(snapshot)) => Ok(snapshot),
+            Ok(None) => Ok(fs::metadata(archive)?),
             Err(refusal) if self.force_base_mismatch => {
-                log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
-                Ok(())
+                if !quiet {
+                    log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
+                }
+                Ok(fs::metadata(archive)?)
             }
             Err(refusal) => Err(OverlayError::Msg(refusal.0)),
         }
@@ -4368,7 +4385,7 @@ impl WriteOverlay {
     fn gate_pending_journal(&self, archive: &Path) -> Result<()> {
         match ratarmount_compress::commit_journal::pending(archive) {
             Ok(None) => Ok(()),
-            Ok(Some(_)) | Err(_) => self.check_commit_identity(archive),
+            Ok(Some(_)) | Err(_) => self.check_commit_identity(archive, false).map(drop),
         }
     }
 
@@ -4427,6 +4444,7 @@ impl WriteOverlay {
                     archive,
                     Some((header, locked)),
                 )
+                .map(drop)
                 .map_err(|refusal| io::Error::other(refusal.0)),
                 None => cj::authorize_owned(header, locked),
             }
@@ -4486,15 +4504,23 @@ impl WriteOverlay {
         self.commit_generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn recover_failed_append(&self, archive: &Path, error: &dyn std::fmt::Display) -> Result<()> {
-        if let Err(recovery) = self.recover_journal_raw(archive) {
+    /// The one reaction to a failed journaled replacement on a live mount.
+    /// `Ok(())`: nothing of the attempt remains and the mode allows a copy,
+    /// which the caller then publishes through the copy guard. Committed bytes
+    /// or a pending journal stop interval commits until a remount.
+    fn after_failed_replace(&self, failed: crate::journal_recovery::FailedReplace) -> Result<()> {
+        if failed.base_unusable {
             self.refuse_base_after_commit_failure();
-            return Err(OverlayError::Msg(format!(
-                "{error}; {recovery}; remount required"
-            )));
+            return Err(failed.error);
         }
-        log::warn!("commit: append failed: {error}; retrying on the next interval or using copy in auto mode");
-        Ok(())
+        if failed.may_copy && self.commit_mode == CommitMode::Auto {
+            log::warn!(
+                "commit: append failed: {}; falling back to copy",
+                failed.error
+            );
+            return Ok(());
+        }
+        Err(failed.error)
     }
 
     /// Last-N zstd frame rewrite. Never calls GNU tar (K3).
@@ -4505,6 +4531,7 @@ impl WriteOverlay {
         &self,
         archive: &Path,
         plan: &OverlayCommitPlan,
+        original: &fs::Metadata,
     ) -> Result<(IndexPatchWindow, SpliceStats)> {
         let map = scan_zstd_frames_path(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
         let (from_idx, rewrite_window_start_uncomp) =
@@ -4551,31 +4578,19 @@ impl WriteOverlay {
                 archive,
                 from_idx,
                 transform,
-                &fs::metadata(archive)?,
+                original,
                 &mut self.commit_rows().commit_hook(archive),
             ) {
                 Ok(stats) => stats,
-                Err(ratarmount_compress::CompressError::Replace(
-                    ratarmount_compress::commit_journal::ReplaceError::Committed(e),
-                )) => {
-                    self.refuse_base_after_commit_failure();
-                    return Err(recover_error_to_overlay(
-                        ratarmount_compress::commit_journal::RecoverError::Committed(e),
-                    ));
-                }
                 Err(e) => {
-                    self.recover_failed_append(archive, &e)?;
-                    if self.commit_mode == CommitMode::Auto {
-                        splice_zstd_last_frames_replace(archive, from_idx, transform)
-                            .map_err(|e| OverlayError::Msg(e.to_string()))?
-                    } else {
-                        return Err(OverlayError::Msg(e.to_string()));
-                    }
+                    self.after_failed_replace(crate::journal_recovery::failed_splice(e))?;
+                    crate::journal_recovery::splice_replace_over(
+                        archive, from_idx, transform, original,
+                    )?
                 }
             }
         } else {
-            splice_zstd_last_frames_replace(archive, from_idx, transform)
-                .map_err(|e| OverlayError::Msg(e.to_string()))?
+            crate::journal_recovery::splice_replace_over(archive, from_idx, transform, original)?
         };
         Ok((
             IndexPatchWindow {
@@ -4616,6 +4631,7 @@ impl WriteOverlay {
         &self,
         archive: &Path,
         plan: &OverlayCommitPlan,
+        original: &fs::Metadata,
     ) -> Result<IndexPatchWindow> {
         if self.commit_mode.may_append(archive)? {
             match append_uncompressed_tar_plan(
@@ -4624,19 +4640,11 @@ impl WriteOverlay {
                 plan,
                 &self.encoding,
                 &self.commit_rows(),
+                original,
             ) {
                 Ok(Some(window)) => return Ok(window),
                 Ok(None) => {}
-                Err(e @ OverlayError::Committed(_)) => {
-                    self.refuse_base_after_commit_failure();
-                    return Err(e);
-                }
-                Err(e) => {
-                    self.recover_failed_append(archive, &e)?;
-                    if self.commit_mode != CommitMode::Auto {
-                        return Err(e);
-                    }
-                }
+                Err(failed) => self.after_failed_replace(failed)?,
             }
         }
         ensure_gnu_tar()?;
@@ -4652,9 +4660,9 @@ impl WriteOverlay {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let mut src = File::open(archive)?;
+        let (mut src, source) = crate::journal_recovery::open_copy_source(archive, original)?;
         let (tmp, method) = ratarmount_compress::fastcopy::copy_to_temp(&mut src, parent)?;
-        ratarmount_compress::fastcopy::log_commit_copy(src.metadata()?.len(), method);
+        ratarmount_compress::fastcopy::log_commit_copy(source.len(), method);
         tmp.as_file().sync_all()?;
         let work_tar = tmp.path().to_path_buf();
         let list_dir = tempfile::tempdir()?;
@@ -4710,11 +4718,13 @@ impl WriteOverlay {
             }
         }
         tmp.as_file().sync_all()?;
-        tmp.persist(archive).map_err(|e| {
+        crate::journal_recovery::publish_over(archive, &source, || {
+            tmp.persist(archive).map(drop).map_err(|e| e.error)
+        })
+        .map_err(|e| {
             OverlayError::Msg(format!(
-                "Failed to replace '{}' after live TAR commit: {}",
+                "Failed to replace '{}' after live TAR commit: {e}",
                 archive.display(),
-                e.error
             ))
         })?;
         Ok(window)
@@ -5734,6 +5744,7 @@ fn provenance_base(archive: &Path, encoding: &str) -> Result<SqliteIndexedTar> {
 
 /// Shared replacement path for metadata-only changes. Payload copies live only
 /// for the commit, never in the writable overlay. Unchanged TAR records remain raw.
+#[allow(clippy::too_many_arguments)]
 fn persist_provenance_plan(
     archive: &Path,
     root: &Path,
@@ -5742,6 +5753,7 @@ fn persist_provenance_plan(
     mode: CommitMode,
     hash_output: Option<&mut BTreeMap<String, String>>,
     rows: &crate::journal_recovery::Rows<'_>,
+    original: &fs::Metadata,
 ) -> Result<IndexPatchWindow> {
     live_commit_is_supported(archive)?;
     let base = provenance_base(archive, encoding)?;
@@ -5888,6 +5900,8 @@ fn persist_provenance_plan(
         encoding,
     };
     let persist = || -> Result<IndexPatchWindow> {
+        #[cfg(test)]
+        append_prepare_seams(archive, original)?;
         let format = detect_compression(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
         if format == CompressionFormat::Zstd {
             let map =
@@ -5906,36 +5920,16 @@ fn persist_provenance_plan(
                     archive,
                     from,
                     transform,
-                    &fs::metadata(archive)?,
+                    original,
                     &mut rows.commit_hook(archive),
                 ) {
-                    if matches!(
-                        e,
-                        ratarmount_compress::CompressError::Replace(
-                            ratarmount_compress::commit_journal::ReplaceError::Committed(_)
-                        )
-                    ) {
-                        return Err(recover_error_to_overlay(
-                            ratarmount_compress::commit_journal::RecoverError::Committed(
-                                io::Error::other(e.to_string()),
-                            ),
-                        ));
-                    }
-                    recover_offline(
-                        archive,
-                        &root,
-                        &mut ratarmount_compress::commit_journal::authorize_forced,
+                    copy_after_failed_replace(crate::journal_recovery::failed_splice(e), mode)?;
+                    crate::journal_recovery::splice_replace_over(
+                        archive, from, transform, original,
                     )?;
-                    if mode == CommitMode::Auto {
-                        splice_zstd_last_frames_replace(archive, from, transform)
-                            .map_err(|e| OverlayError::Msg(e.to_string()))?;
-                    } else {
-                        return Err(OverlayError::Msg(e.to_string()));
-                    }
                 }
             } else {
-                splice_zstd_last_frames_replace(archive, from, transform)
-                    .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                crate::journal_recovery::splice_replace_over(archive, from, transform, original)?;
             }
             return Ok(IndexPatchWindow {
                 window_start: map.frames[from].uncompressed_offset,
@@ -5948,7 +5942,7 @@ fn persist_provenance_plan(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-        let mut src = File::open(archive)?;
+        let (mut src, _) = crate::journal_recovery::open_copy_source(archive, original)?;
         let append_offset = if deleted.is_empty() && mode.may_append(archive)? {
             uncompressed_append_offset(archive, plan, encoding)?
         } else {
@@ -5957,37 +5951,26 @@ fn persist_provenance_plan(
         if let Some(offset) = append_offset {
             ratarmount_formats_tar::write_ustar_members(tmp.as_file_mut(), &members)?;
             ratarmount_formats_tar::write_tar_eof(tmp.as_file_mut())?;
-            let original = src.metadata()?;
             if let Err(e) = ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with(
                 archive,
                 offset,
                 tmp.as_file_mut(),
-                &original,
+                original,
                 &mut rows.commit_hook(archive),
-            )
-            .map_err(replace_error_shim)
-            {
-                if matches!(
-                    e,
-                    ratarmount_compress::commit_journal::RecoverError::Committed(_)
-                ) {
-                    return Err(recover_error_to_overlay(e));
-                }
-                recover_offline(
-                    archive,
-                    &root,
-                    &mut ratarmount_compress::commit_journal::authorize_forced,
-                )?;
-                if mode != CommitMode::Auto {
-                    return Err(e.into_io().into());
-                }
+            ) {
+                copy_after_failed_replace(crate::journal_recovery::failed_replace(e), mode)?;
+                // The stamp after the attempt (a rollback may have left a new
+                // mtime), read from the very file the copy reads.
+                let source = src.metadata()?;
                 tmp.as_file_mut().set_len(0)?;
                 tmp.as_file_mut().rewind()?;
                 src.rewind()?;
                 rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
                 tmp.as_file().sync_all()?;
-                tmp.persist(archive)
-                    .map_err(|e| OverlayError::Io(e.error))?;
+                crate::journal_recovery::publish_over(archive, &source, || {
+                    tmp.persist(archive).map(drop).map_err(|e| e.error)
+                })
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
                 return Ok(IndexPatchWindow {
                     window_start: 0,
                     from_frame: None,
@@ -6000,10 +5983,13 @@ fn persist_provenance_plan(
                 offsets_shifted: false,
             })
         } else {
+            let source = src.metadata()?;
             rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
             tmp.as_file().sync_all()?;
-            tmp.persist(archive)
-                .map_err(|e| OverlayError::Io(e.error))?;
+            crate::journal_recovery::publish_over(archive, &source, || {
+                tmp.persist(archive).map(drop).map_err(|e| e.error)
+            })
+            .map_err(|e| OverlayError::Msg(e.to_string()))?;
             Ok(IndexPatchWindow {
                 window_start: 0,
                 from_frame: None,
@@ -6561,18 +6547,36 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// R7-C2 shim, removed with the callers' fallbacks in R7-C3: a failed
-/// replacement as the error the callers handled before.
-fn replace_error_shim(
-    error: ratarmount_compress::commit_journal::ReplaceError,
-) -> ratarmount_compress::commit_journal::RecoverError {
-    use ratarmount_compress::commit_journal::{RecoverError, ReplaceError};
-    match error {
-        ReplaceError::Committed(e) => RecoverError::Committed(e),
-        ReplaceError::Refused(e) | ReplaceError::RolledBack(e) | ReplaceError::Pending(e) => {
-            RecoverError::Journal(e)
-        }
+/// The test seams of an append, run before the commit reads the archive: a
+/// touch (the archive is no longer the gate's snapshot) or a swap (another
+/// file takes the name).
+#[cfg(test)]
+fn append_prepare_seams(archive: &Path, original: &fs::Metadata) -> io::Result<()> {
+    if APPEND_PREPARE_TOUCH.replace(false) {
+        File::options().write(true).open(archive)?.set_times(
+            fs::FileTimes::new().set_modified(original.modified()? + Duration::from_secs(2)),
+        )?;
     }
+    if let Some(other) = APPEND_PREPARE_SWAP.take() {
+        fs::rename(other, archive)?;
+    }
+    Ok(())
+}
+
+/// The reaction to a failed journaled replacement without a live mount (and
+/// inside the provenance persist): `Ok(())` when a copy may run.
+fn copy_after_failed_replace(
+    failed: crate::journal_recovery::FailedReplace,
+    mode: CommitMode,
+) -> Result<()> {
+    if failed.may_copy && mode == CommitMode::Auto {
+        log::warn!(
+            "commit: append failed: {}; falling back to copy",
+            failed.error
+        );
+        return Ok(());
+    }
+    Err(failed.error)
 }
 
 /// A failed journaled replacement: `Committed` keeps its own variant so no
@@ -6592,7 +6596,8 @@ fn recover_error_to_overlay(
 
 /// Offline recovery before a commit: restamps the overlay database beside
 /// `root` (when it exists) from the locked descriptor before the journal is
-/// unlinked. `authorize` decides under the archive lock.
+/// unlinked. `authorize` decides under the archive lock. The only offline
+/// recovery: a failed replacement cleans up after itself.
 fn recover_offline(
     archive: &Path,
     root: &Path,
@@ -6609,8 +6614,10 @@ fn append_uncompressed_tar_plan(
     plan: &OverlayCommitPlan,
     encoding: &str,
     rows: &crate::journal_recovery::Rows<'_>,
-) -> Result<Option<IndexPatchWindow>> {
-    let original = fs::metadata(archive)?;
+    original: &fs::Metadata,
+) -> std::result::Result<Option<IndexPatchWindow>, crate::journal_recovery::FailedReplace> {
+    #[cfg(test)]
+    append_prepare_seams(archive, original)?;
     let Some(offset) = uncompressed_append_offset(archive, plan, encoding)? else {
         return Ok(None);
     };
@@ -6624,25 +6631,14 @@ fn append_uncompressed_tar_plan(
     let mut tail = tempfile::NamedTempFile::new_in(parent)?;
     ratarmount_formats_tar::write_ustar_members(tail.as_file_mut(), &members)?;
     ratarmount_formats_tar::write_tar_eof(tail.as_file_mut())?;
-    #[cfg(test)]
-    if APPEND_PREPARE_TOUCH.replace(false) {
-        File::options().write(true).open(archive)?.set_times(
-            fs::FileTimes::new().set_modified(original.modified()? + Duration::from_secs(2)),
-        )?;
-    }
-    #[cfg(test)]
-    if let Some(other) = APPEND_PREPARE_SWAP.take() {
-        fs::rename(other, archive)?;
-    }
     ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with(
         archive,
         offset,
         tail.as_file_mut(),
-        &original,
+        original,
         &mut rows.commit_hook(archive),
     )
-    .map_err(replace_error_shim)
-    .map_err(recover_error_to_overlay)?;
+    .map_err(crate::journal_recovery::failed_replace)?;
     log::info!(
         "commit: prefix {:.1} GiB retained via append",
         offset as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -6855,6 +6851,7 @@ fn commit_overlay_inner(
                         archive_file,
                         Some((header, locked)),
                     )
+                    .map(drop)
                     .map_err(|refusal| io::Error::other(refusal.0))
                 }
                 _ => cj::authorize_owned(header, locked),
@@ -6862,6 +6859,20 @@ fn commit_overlay_inner(
         };
         recover_offline(archive_file, write_overlay, &mut authorize)?;
     }
+    // The one snapshot every write of this commit compares against: the file
+    // the gate accepts after recovery (one stat when no identity applies).
+    let original = match identity {
+        Some(base) if write_overlay.join(HIDDEN_DB).exists() => {
+            match crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
+            {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => fs::metadata(archive_file)?,
+                Err(_) if opts.force_base_mismatch => fs::metadata(archive_file)?,
+                Err(refusal) => return Err(OverlayError::Msg(refusal.0)),
+            }
+        }
+        _ => fs::metadata(archive_file)?,
+    };
     let mut plan = collect_overlay_commit_plan(write_overlay)?;
     if opts.manifest_hashes.is_some() {
         plan.known_hashes = known_manifest_hashes(archive_file)?;
@@ -6891,6 +6902,7 @@ fn commit_overlay_inner(
             opts.mode,
             hash_payloads.then_some(&mut written_hashes),
             &crate::journal_recovery::Rows::Path(&db),
+            &original,
         )?;
         crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
         plan.written_hashes = written_hashes;
@@ -6909,7 +6921,7 @@ fn commit_overlay_inner(
     let committed = if is_zip_archive(archive_file)? {
         commit_overlay_zip(write_overlay, archive_file, opts)?
     } else {
-        commit_overlay_tar(write_overlay, archive_file, opts)?
+        commit_overlay_tar(write_overlay, archive_file, opts, &original)?
     };
     if committed {
         crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
@@ -7768,6 +7780,7 @@ fn commit_overlay_tar(
     write_overlay: &Path,
     tar_file: &Path,
     opts: &CommitOverlayOptions,
+    original: &fs::Metadata,
 ) -> Result<bool> {
     let format = detect_compression(tar_file).map_err(|e| {
         OverlayError::Msg(format!(
@@ -7784,7 +7797,7 @@ fn commit_overlay_tar(
                     .into(),
             ));
         }
-        return commit_overlay_tar_zst(write_overlay, tar_file, opts);
+        return commit_overlay_tar_zst(write_overlay, tar_file, opts, original);
     }
 
     if format == CompressionFormat::None && opts.mode.may_append(tar_file)? {
@@ -7798,7 +7811,10 @@ fn commit_overlay_tar(
             ..OpenOptions::default()
         };
         let mut canceled = false;
-        let attempt = (|| -> Result<Option<IndexPatchWindow>> {
+        let attempt = (|| -> std::result::Result<
+            Option<IndexPatchWindow>,
+            crate::journal_recovery::FailedReplace,
+        > {
             if uncompressed_append_offset(tar_file, &plan, &opts.encoding)?.is_none() {
                 return Ok(None);
             }
@@ -7818,14 +7834,14 @@ fn commit_overlay_tar(
             }
             invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
             let db = write_overlay.join(HIDDEN_DB);
-            let window = append_uncompressed_tar_plan(
+            append_uncompressed_tar_plan(
                 tar_file,
                 write_overlay,
                 &plan,
                 &opts.encoding,
                 &crate::journal_recovery::Rows::Path(&db),
-            )?;
-            Ok(window)
+                original,
+            )
         })();
         if canceled {
             return Ok(false);
@@ -7836,24 +7852,14 @@ fn commit_overlay_tar(
                 return Ok(true);
             }
             Ok(None) => {}
-            Err(e @ OverlayError::Committed(_)) => return Err(e),
-            Err(e) => {
-                recover_offline(
-                    tar_file,
-                    write_overlay,
-                    &mut ratarmount_compress::commit_journal::authorize_forced,
-                )?;
-                if opts.mode != CommitMode::Auto {
-                    return Err(e);
-                }
-                log::warn!("commit: append failed: {e}; falling back to copy");
-            }
+            Err(failed) => copy_after_failed_replace(failed, opts.mode)?,
         }
     }
     ensure_gnu_tar()?;
 
     // Keep work temp alive through delete/append (and recompress for compressed).
     // Uncompressed offline matches live: sibling copy; replace only on success.
+    let mut copy_source = None;
     let (work_tar, work_holder): (PathBuf, Option<tempfile::NamedTempFile>) = match format {
         CompressionFormat::None => {
             if !is_uncompressed_tar(tar_file)? {
@@ -7867,9 +7873,10 @@ fn commit_overlay_tar(
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
-            let mut src = File::open(tar_file)?;
+            let (mut src, source) = crate::journal_recovery::open_copy_source(tar_file, original)?;
             let (tmp, method) = ratarmount_compress::fastcopy::copy_to_temp(&mut src, parent)?;
-            ratarmount_compress::fastcopy::log_commit_copy(src.metadata()?.len(), method);
+            ratarmount_compress::fastcopy::log_commit_copy(source.len(), method);
+            copy_source = Some(source);
             tmp.as_file().sync_all()?;
             let path = tmp.path().to_path_buf();
             (path, Some(tmp))
@@ -8015,11 +8022,16 @@ fn commit_overlay_tar(
             )
         })?;
         tmp.as_file().sync_all()?;
-        tmp.persist(tar_file).map_err(|e| {
+        let source = copy_source.ok_or_else(|| {
+            OverlayError::Msg("internal error: missing copy source for offline commit".into())
+        })?;
+        crate::journal_recovery::publish_over(tar_file, &source, || {
+            tmp.persist(tar_file).map(drop).map_err(|e| e.error)
+        })
+        .map_err(|e| {
             OverlayError::Msg(format!(
-                "Failed to replace '{}' after offline TAR commit: {}",
+                "Failed to replace '{}' after offline TAR commit: {e}",
                 tar_file.display(),
-                e.error
             ))
         })?;
     }
@@ -8039,6 +8051,7 @@ fn commit_overlay_tar_zst(
     write_overlay: &Path,
     tar_file: &Path,
     opts: &CommitOverlayOptions,
+    original: &fs::Metadata,
 ) -> Result<bool> {
     let plan = collect_overlay_commit_plan(write_overlay)?;
     if plan.is_empty() {
@@ -8141,34 +8154,19 @@ fn commit_overlay_tar_zst(
         let rows = crate::journal_recovery::Rows::Path(&db);
         let mut hook = rows.commit_hook(tar_file);
         match splice_zstd_last_frames_append_with(
-            tar_file,
-            from_idx,
-            transform,
-            &fs::metadata(tar_file)?,
-            &mut hook,
+            tar_file, from_idx, transform, original, &mut hook,
         ) {
-            Err(ratarmount_compress::CompressError::Replace(
-                ratarmount_compress::commit_journal::ReplaceError::Committed(e),
-            )) => {
-                return Err(recover_error_to_overlay(
-                    ratarmount_compress::commit_journal::RecoverError::Committed(e),
-                ))
+            Ok(stats) => stats,
+            Err(e) => {
+                copy_after_failed_replace(crate::journal_recovery::failed_splice(e), opts.mode)?;
+                crate::journal_recovery::splice_replace_over(
+                    tar_file, from_idx, transform, original,
+                )?
             }
-            Err(e) if opts.mode == CommitMode::Auto => {
-                recover_offline(
-                    tar_file,
-                    write_overlay,
-                    &mut ratarmount_compress::commit_journal::authorize_forced,
-                )?;
-                log::warn!("commit: append failed: {e}; falling back to copy");
-                splice_zstd_last_frames_replace(tar_file, from_idx, transform)
-            }
-            result => result,
         }
     } else {
-        splice_zstd_last_frames_replace(tar_file, from_idx, transform)
-    }
-    .map_err(|e| OverlayError::Msg(e.to_string()))?;
+        crate::journal_recovery::splice_replace_over(tar_file, from_idx, transform, original)?
+    };
 
     let window = IndexPatchWindow {
         window_start: map.frames[from_idx].uncompressed_offset,
@@ -8862,7 +8860,7 @@ fn walkdir_files_and_empty_dirs(root: &Path) -> Result<Vec<WalkEntry>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Offline commit without a classified base: the in-crate fixtures open
@@ -10579,7 +10577,7 @@ mod tests {
             )
             .is_err()
         );
-        ov.recover_failed_append(&archive, &"ENOSPC").unwrap();
+        ov.recover_member_journal(&archive).unwrap();
         assert!(!ov.interval_disabled());
         assert_eq!(read_member(&ov, "/last"), last);
     }
@@ -13883,7 +13881,7 @@ mod tests {
         );
     }
 
-    fn generated_payload(tag: &str) -> Vec<u8> {
+    pub(crate) fn generated_payload(tag: &str) -> Vec<u8> {
         format!("p-{tag}-{}\n", std::process::id()).into_bytes()
     }
 
@@ -14074,6 +14072,7 @@ mod tests {
             CommitMode::Copy,
             Some(&mut hashes),
             &crate::journal_recovery::Rows::None,
+            &fs::metadata(&archive).unwrap(),
         )
         .unwrap();
         let expected = ratarmount_index::sha256_hex_stream(&mut &b"new payload"[..]).unwrap();
@@ -14668,7 +14667,7 @@ mod tests {
         assert!(ov.xattrs_for_path("/moved").unwrap().is_empty());
     }
 
-    fn ustar_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
+    pub(crate) fn ustar_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
             xattrs: &[],
             path,
@@ -14705,7 +14704,7 @@ mod tests {
         buf
     }
 
-    fn concat_zstd_frames(plains: &[&[u8]], with_seek_table: bool) -> Vec<u8> {
+    pub(crate) fn concat_zstd_frames(plains: &[&[u8]], with_seek_table: bool) -> Vec<u8> {
         let mut out = Vec::new();
         let mut entries = Vec::new();
         for p in plains {
@@ -14720,7 +14719,7 @@ mod tests {
     }
 
     /// One uncompressed TAR split across two zstd frames (EOF only in the last frame).
-    fn write_split_tar_zst(
+    pub(crate) fn write_split_tar_zst(
         path: &Path,
         first: &[UstarMember<'_>],
         last: &[UstarMember<'_>],
@@ -14742,7 +14741,7 @@ mod tests {
         fs::write(path, concat_zstd_frames(&refs, false)).unwrap();
     }
 
-    fn reopen_tar_zst(
+    pub(crate) fn reopen_tar_zst(
         path: &Path,
         ignore_zeros: bool,
     ) -> std::result::Result<Arc<dyn MountSource>, OverlayError> {
