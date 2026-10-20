@@ -2158,6 +2158,54 @@ fn regression_mount_rename_b_over_a_is_deferred_and_untouched() {
     }
 }
 
+/// Regression (R7-B1): the top record's database is a symlink (a supported
+/// layout). `read_record` treated a non-regular file as "no record", so the
+/// record abstained, `mv B A` with B's own torn journal classified `Own` and
+/// recovery rolled B back. A symlinked or unstatable database is an unreadable
+/// record: Deferred in the classifier and refused by the locked authorizer.
+#[cfg(unix)]
+#[test]
+fn regression_mount_symlinked_overlay_db_defers_recovery() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let real = fx.archive.with_file_name("real-overlay.sqlite");
+    let db = fx.overlay.join(HIDDEN_DB);
+    fs::rename(&db, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &db).unwrap();
+    let (bytes, journal, journal_bytes) = rename_b_over_a(&fx, false);
+    let records = records_of(&fx);
+    match classify_mount_journal(&records, &fx.archive).unwrap() {
+        MountJournal::Deferred {
+            force_flag, why, ..
+        } => {
+            assert_eq!(force_flag, "--force-base-mismatch");
+            assert!(why.contains("cannot be read"), "{why}");
+        }
+        other => panic!("symlinked record must defer: {other:?}"),
+    }
+    let archive = fx.archive.clone();
+    let mut authorize = |h: &ratarmount_compress::commit_journal::PendingJournal,
+                         m: &fs::Metadata| {
+        authorize_mount_recovery(&records, &archive, h, m)
+    };
+    let refused = crate::recover_journal_at(&fx.archive, Some(&db), &mut authorize);
+    assert!(
+        matches!(
+            refused,
+            Err(ratarmount_compress::commit_journal::RecoverError::Refused(
+                _
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(fs::read(&fx.archive).unwrap(), bytes);
+    assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+}
+
 /// Regression (R7-A1): the table's other rows. The overlay's own torn and
 /// complete journals are `Own`; a record naming another file (a union member),
 /// a bundle `--lower`, a sealed or unreadable top and a lower that disagrees
