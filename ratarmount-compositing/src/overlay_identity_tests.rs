@@ -5877,3 +5877,69 @@ fn regression_required_record_read_is_one_snapshot() {
         .execute_batch("DROP TABLE files; DROP TABLE meta")
         .unwrap();
 }
+
+/// Regression (R10-FIX7, r10 skeptic #2): offline recovery read its record
+/// with the mount's strict rule, which refuses a database entry that is a
+/// symlink, although the offline gate (and the classifier) accept a symlink
+/// to a regular database file. An offline commit of such an overlay next to a
+/// stale prepare locator was refused. The offline owner now reads the record
+/// through the symlink: the stale locator is cleared and the commit goes on;
+/// a mount's records keep the strict rule (it still defers).
+#[cfg(unix)]
+#[test]
+fn regression_offline_recovery_follows_a_symlinked_database() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let db = fx.overlay.join(HIDDEN_DB);
+    let elsewhere = fx.overlay.parent().unwrap().join("db-elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let target = elsewhere.join("overlay.sqlite");
+    fs::rename(&db, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &db).unwrap();
+    stale_prepare(&fx.archive);
+    assert!(!locator(&fx.archive).is_empty(), "a stale locator");
+    // A mount's records keep the strict rule.
+    let records = records_of(&fx);
+    match classify_mount_journal(&records, &fx.archive).unwrap() {
+        MountJournal::None => {}
+        other => panic!("no journal is pending: {other:?}"),
+    }
+    let rows = || {
+        let conn = rusqlite::Connection::open(&target).unwrap();
+        OverlayMeta::from_connection(&conn)
+            .unwrap()
+            .unwrap()
+            .values()
+            .clone()
+    };
+    let before = rows();
+    crate::commit_overlay(
+        &fx.overlay,
+        &fx.archive,
+        &archive_token(&fx.archive),
+        &CommitOverlayOptions {
+            yes: true,
+            ..Default::default()
+        },
+    )
+    .expect("the offline commit reads its record through the symlink");
+    assert!(
+        locator(&fx.archive).is_empty(),
+        "the stale locator is cleared"
+    );
+    assert!(
+        fs::symlink_metadata(&db).unwrap().file_type().is_symlink(),
+        "the database entry is still the symlink"
+    );
+    assert_eq!(rows(), before, "the record is unchanged");
+    crate::overlay_gate::check_commit_base_offline(
+        &fx.overlay,
+        &archive_token(&fx.archive),
+        &fx.archive,
+    )
+    .unwrap();
+}

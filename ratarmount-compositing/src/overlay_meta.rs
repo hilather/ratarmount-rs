@@ -225,19 +225,41 @@ impl OverlayMeta {
     /// [`Self::read_no_recovery`] of a record that must have a `files` table
     /// when `required` (a marked overlay: its record is the one it used).
     pub(crate) fn read_no_recovery_required(dir: &Path, required: bool) -> Result<Option<Self>> {
-        Self::read_with_required(dir, false, required)
+        Self::read_with_required(dir, false, required, false)
+    }
+
+    /// [`Self::read_no_recovery_required`] that accepts a database entry that
+    /// is a symlink to a regular file, as the offline gate's open does (an
+    /// offline commit's record, R10-FIX7).
+    pub(crate) fn read_no_recovery_required_followed(
+        dir: &Path,
+        required: bool,
+    ) -> Result<Option<Self>> {
+        Self::read_with_required(dir, false, required, true)
     }
 
     fn read_with(dir: &Path, recover_hot: bool) -> Result<Option<Self>> {
         // A marked overlay was used: its database must hold the `files`
         // table, or its record is lost, never "unrecorded" (R10-B).
         let required = !crate::write_overlay::overlay_markers(dir)?.is_empty();
-        Self::read_with_required(dir, recover_hot, required)
+        Self::read_with_required(dir, recover_hot, required, false)
     }
 
-    fn read_with_required(dir: &Path, recover_hot: bool, required: bool) -> Result<Option<Self>> {
+    /// `follow`: the database entry may be a symlink to a regular file (the
+    /// open follows it); otherwise it must itself be a regular file.
+    fn read_with_required(
+        dir: &Path,
+        recover_hot: bool,
+        required: bool,
+        follow: bool,
+    ) -> Result<Option<Self>> {
         let db = dir.join(HIDDEN_DB);
-        if !fs::symlink_metadata(&db)?.is_file() {
+        let entry = if follow {
+            fs::metadata(&db)?
+        } else {
+            fs::symlink_metadata(&db)?
+        };
+        if !entry.is_file() {
             return Err(OverlayError::Msg(format!(
                 "overlay database {} must be a regular file",
                 db.display()

@@ -586,23 +586,26 @@ pub(crate) fn recover_journal(
     // Every overlay record this recovery answers to, captured before the
     // closures borrow `owner` (R10-B): none may be lost or unclassifiable
     // when the first recovery write (the stale-`P` clear included) is made.
-    let records: Vec<PathBuf> = match &owner {
+    // `follow`: an offline commit's record is read as its gate opened it,
+    // through a symlink to a regular file (R10-FIX7); a mount's records keep
+    // the mount's strict rule.
+    let records: Vec<(PathBuf, bool)> = match &owner {
         Owner::Mount { records, .. } => records
             .top
             .iter()
             .chain(records.lowers.iter())
-            .cloned()
+            .map(|dir| (dir.clone(), false))
             .collect(),
         Owner::Recorded {
             record: Record::Offline(dir),
             ..
-        } => vec![dir.to_path_buf()],
+        } => vec![(dir.to_path_buf(), true)],
         _ => Vec::new(),
     };
     let mut before_write = || {
-        for dir in &records {
+        for (dir, follow) in &records {
             // A lost, unclassifiable or `files`-less used record (R10-B).
-            read_record(dir).map_err(|e| {
+            read_record(dir, *follow).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -713,7 +716,10 @@ pub enum MountJournal {
     },
 }
 
-fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
+/// `follow`: a database entry that is a symlink to a regular file is read
+/// through it (an offline commit's record, as its gate opens it); otherwise
+/// it is an unreadable record (a mount's rule).
+fn read_record(dir: &Path, follow: bool) -> io::Result<Option<OverlayMeta>> {
     // Only an absent database is "no record" (R10-B: a lost record, or one
     // that cannot be classified, defers). A directory, a symlink or anything
     // else that is not a regular file is an unreadable record: it must defer,
@@ -727,6 +733,11 @@ fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
         Ok(DbEntry::Present { marked, .. }) => marked,
         _ => true,
     };
+    if follow {
+        // `classify` already followed the entry to a regular file.
+        return OverlayMeta::read_no_recovery_required_followed(dir, marked)
+            .map_err(|e| io::Error::other(e.to_string()));
+    }
     match fs::symlink_metadata(dir.join(crate::HIDDEN_DB)) {
         Ok(m) if m.is_file() => {}
         Ok(_) => {
@@ -779,7 +790,7 @@ fn decide(
         } else {
             "--force-stack-mismatch"
         };
-        let meta = match read_record(dir) {
+        let meta = match read_record(dir, false) {
             Ok(meta) => meta,
             Err(e) => {
                 return Ok(defer(
