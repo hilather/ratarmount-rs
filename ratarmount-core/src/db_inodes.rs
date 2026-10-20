@@ -335,16 +335,13 @@ mod unix {
             quarantine(fd);
             return Err(super::refused(name, &db));
         }
-        // An empty file (a fresh creation included) has nothing to truncate:
-        // no writable reopen, which a new mode-`000` file would refuse
-        // (R10-FIX9).
-        if flags & libc::O_TRUNC != 0
-            && st.st_mode & libc::S_IFMT == libc::S_IFREG
-            && st.st_size != 0
-        {
+        if flags & libc::O_TRUNC != 0 && st.st_mode & libc::S_IFMT == libc::S_IFREG {
             if flags & libc::O_ACCMODE != libc::O_RDONLY {
                 truncate(&fd)?;
-            } else {
+            } else if st.st_size != 0 {
+                // An empty read-only open (a fresh creation included) has
+                // nothing to truncate: no writable reopen, which a new
+                // mode-`000` file would refuse (R10-FIX9).
                 // `O_RDONLY | O_TRUNC`: truncate through a writable handle on
                 // the same, admitted inode (write permission is required, as
                 // for the kernel's own `O_TRUNC`).
@@ -514,8 +511,8 @@ mod tests {
     /// Regression (R10-FIX9, r10 skeptic P3): the generic path reopened a
     /// fresh `O_RDONLY | O_CREAT | O_TRUNC` creation for writing to truncate
     /// it; with mode `000` that reopen failed (`EACCES`) and the new file was
-    /// left behind. An empty file is not reopened; a non-empty one opened
-    /// `O_RDONLY | O_TRUNC` is still truncated.
+    /// left behind. An empty read-only open is not reopened; a non-empty one
+    /// opened `O_RDONLY | O_TRUNC` is still truncated.
     #[cfg(target_os = "linux")]
     #[test]
     fn regression_generic_open_creates_read_only_mode_000_file() {

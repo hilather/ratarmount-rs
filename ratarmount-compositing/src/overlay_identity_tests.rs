@@ -5854,6 +5854,9 @@ fn regression_required_record_read_is_one_snapshot() {
     )
     .expect_err("the gate judged the record it read");
     assert!(refusal.0.contains("base mismatch"), "{}", refusal.0);
+    // The overlay database uses the rollback (DELETE) journal: the reader's
+    // shared lock makes the writer's COMMIT busy. (Under WAL the DROP would
+    // commit and the reader would still see its snapshot.)
     assert_eq!(dropped.get(), Some(false), "the DROP committed mid-read");
     // The reader itself, on an autocommit connection.
     let dropped = Rc::new(Cell::new(None));
