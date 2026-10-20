@@ -97,7 +97,7 @@ pub(crate) fn plan_excludes(
     }
     // `--base-digest none` only applies at creation: it skips the walk for a
     // new overlay, but a reopen compares the recorded identity regardless.
-    if info.base_digest == BaseDigestRequest::None && !overlay.join(HIDDEN_DB).exists() {
+    if info.base_digest == BaseDigestRequest::None && crate::overlay_db_absent(overlay) {
         return Ok(None);
     }
     let Some(path) = info.path().filter(|p| p.is_dir()) else {
@@ -1296,7 +1296,9 @@ pub(crate) fn refresh_committed_base_offline(
 ) -> Result<()> {
     let db = overlay.join(HIDDEN_DB);
     // Some offline callers commit a directory of files without an overlay DB.
-    if !db.exists() {
+    // Only a missing entry is "none" (R7-E2): anything else is opened (never
+    // created) and fails if unreadable.
+    if crate::overlay_db_absent(overlay) {
         return Ok(());
     }
     let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;

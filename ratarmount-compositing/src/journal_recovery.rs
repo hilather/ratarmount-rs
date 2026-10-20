@@ -127,12 +127,14 @@ pub(crate) enum Rows<'a> {
 }
 
 impl Rows<'_> {
-    fn with(&self, f: impl FnOnce(&Connection) -> io::Result<()>) -> io::Result<()> {
+    pub(crate) fn with(&self, f: impl FnOnce(&Connection) -> io::Result<()>) -> io::Result<()> {
         match self {
             Rows::None => Ok(()),
             Rows::Shared(db) => f(&db.lock().unwrap_or_else(|e| e.into_inner())),
             Rows::Path(db) => {
-                if !db.is_file() {
+                // Only a missing entry is "no database" (R7-E2); anything
+                // else is opened (never created) and fails if unreadable.
+                if crate::write_overlay::db_entry_absent(db) {
                     return Ok(());
                 }
                 let conn = Connection::open_with_flags(

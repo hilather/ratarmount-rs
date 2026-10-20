@@ -1944,7 +1944,9 @@ fn main() {
         // A database overlay recovers a pending commit journal only after its
         // base identity gate (inside the commit): recovery rewrites the archive,
         // and it must not do that to an archive the overlay does not describe.
-        if !overlay.join(HIDDEN_DB).exists() {
+        // Only a missing entry is "no database" (R7-E2): a dangling symlink,
+        // a directory or anything else there takes the database path below.
+        if ratarmount_compositing::overlay_db_absent(overlay) {
             // No recorded base to compare, but a journal started for another
             // file (a copy of the interrupted bytes) must not be rolled in.
             if !args.force_base_mismatch {
@@ -1984,7 +1986,7 @@ fn main() {
         // the archive is classified through the factory and gated before the
         // splice. A raw directory of files has no identity to check; it
         // commits through its own entry and says so.
-        let result = if overlay.join(HIDDEN_DB).exists() {
+        let result = if !ratarmount_compositing::overlay_db_absent(overlay) {
             base_identity::classify_offline_commit(
                 archive,
                 &overlay_run_context(args.index_folders.as_deref()),

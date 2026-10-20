@@ -3,7 +3,7 @@
 use crate::control_socket_path;
 use clap::Args;
 use ratarmount_compositing::overlay_changes::{self, ChangeOptions, Normalize};
-use ratarmount_compositing::{overlay_fsck, overlay_seal, OverlayMeta, HIDDEN_DB};
+use ratarmount_compositing::{overlay_fsck, overlay_seal, OverlayMeta};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -423,7 +423,8 @@ fn unmount(path: &Path) -> io::Result<()> {
     )))
 }
 fn wait_database(top: &Path) -> io::Result<()> {
-    if !top.join(HIDDEN_DB).exists() {
+    // Only a missing entry is "no database" (R7-E2).
+    if ratarmount_compositing::overlay_db_absent(top) {
         return Ok(());
     }
     let start = Instant::now();
@@ -1086,7 +1087,20 @@ fn finish(args: &RunArgs, top: &Path, journal: &Path, execution: Execution) -> i
 mod tests {
     use super::*;
     use clap::Parser;
+    use ratarmount_compositing::HIDDEN_DB;
     use std::sync::Arc;
+
+    /// Regression (r17 skeptic #2, R7-E2 B13): `wait_database` read a dangling
+    /// symlink at the database path as "no database" and returned at once;
+    /// anything at that path that is not a readable regular file is an error.
+    #[test]
+    fn regression_wait_database_refuses_a_dangling_db_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nowhere.sqlite");
+        std::os::unix::fs::symlink(&target, dir.path().join(HIDDEN_DB)).unwrap();
+        assert!(wait_database(dir.path()).is_err());
+        assert!(!target.exists());
+    }
 
     /// Regression: an error from `finish()` (a library-rewritten signed URL in
     /// its text) went to `main` and stderr unredacted; only the JSON was clean.

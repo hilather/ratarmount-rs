@@ -2297,7 +2297,7 @@ fn regression_mount_directory_at_overlay_db_defers_recovery() {
         ),
         "{refused:?}"
     );
-    assert_eq!(fs::read(&fx.archive).unwrap(), bytes, "B untouched");
+    assert!(fs::read(&fx.archive).unwrap() == bytes, "B untouched");
     assert_eq!(
         fs::read(&journal).unwrap(),
         journal_bytes,
@@ -3809,6 +3809,162 @@ fn copy_row_in_place(r: &CopyRow) {
         theirs,
         "{case}: the other writer's archive"
     );
+}
+
+// ---- R7-E2: an overlay database path that is not a regular file ----
+
+/// Replace `fx`'s overlay database with a symlink to a file that does not
+/// exist; returns the symlink target.
+#[cfg(unix)]
+fn dangle_db(overlay: &Path) -> PathBuf {
+    let db = overlay.join(HIDDEN_DB);
+    let target = overlay.with_file_name("nowhere.sqlite");
+    fs::rename(&db, overlay.with_file_name("saved.sqlite")).unwrap();
+    std::os::unix::fs::symlink(&target, &db).unwrap();
+    target
+}
+
+/// Regression (r17 skeptic #2, R7-E2): every overlay-database existence check
+/// `lstat`s the path; only a missing entry is "no database". A dangling
+/// symlink (or a directory, a FIFO) was read as absent by `exists()` /
+/// `is_file()` / `metadata()`, so the raw-directory commit and the
+/// unrecorded-recovery owner recovered B (another archive with its own
+/// journal, renamed over A) before any gate, `commit_overlay` advised the
+/// raw-directory API, a restamp or a baseline refresh silently skipped the
+/// rows, and `--base-digest none` treated the overlay as new. Each row is one
+/// call site of the R7-E2 inventory (PROGRESS "R6 fix round 7E").
+#[cfg(unix)]
+#[test]
+fn regression_overlay_db_entry_not_a_regular_file() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    let mut failed = Vec::new();
+    let mut row = |site: &str, run: &dyn Fn()| {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).is_err() {
+            failed.push(site.to_owned());
+        }
+        crate::overlay_gate::AFTER_SNAPSHOT.with(|hook| *hook.borrow_mut() = None);
+        crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| *hook.borrow_mut() = None);
+    };
+    // B3: `commit_overlay` must not call a dangling database "no database"
+    // (and point at the raw-directory API); B is untouched.
+    row("B3 commit_overlay", &|| {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let target = dangle_db(&fx.overlay);
+        let (bytes, journal, journal_bytes) = rename_b_over_a(&fx, false);
+        let error =
+            crate::commit_overlay(&fx.overlay, &fx.archive, &archive_token(&fx.archive), &opts)
+                .expect_err("refused")
+                .to_string();
+        assert!(!error.contains("has no database"), "{error}");
+        assert!(fs::read(&fx.archive).unwrap() == bytes, "B untouched");
+        assert!(
+            fs::read(&journal).is_ok_and(|j| j == journal_bytes),
+            "journal kept"
+        );
+        assert!(!target.exists(), "nothing created through the symlink");
+    });
+    // B4: the raw-directory commit refuses a dangling database instead of
+    // recovering B's journal by inode and committing.
+    row("B4 commit_overlay_raw_dir", &|| {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let target = dangle_db(&fx.overlay);
+        let (bytes, journal, journal_bytes) = rename_b_over_a(&fx, false);
+        let result = crate::commit_overlay_raw_dir(&fx.overlay, &fx.archive, &opts);
+        assert!(
+            result.is_err(),
+            "refused: {:?}",
+            result.map(|r| r.committed)
+        );
+        assert!(fs::read(&fx.archive).unwrap() == bytes, "B untouched");
+        assert!(
+            fs::read(&journal).is_ok_and(|j| j == journal_bytes),
+            "journal kept"
+        );
+        assert!(!target.exists(), "nothing created through the symlink");
+    });
+    // B5/B6: the database becomes a dangling symlink and B is renamed over A
+    // after the caller's gate accepted A, right before the commit picks its
+    // recovery owner: the owner and the snapshot gate inside the commit must
+    // treat the record as unreadable.
+    row("B5/B6 commit_overlay_inner owner + snapshot", &|| {
+        let fx = Fixture::new();
+        let ov = fx.open(BaseDigestRequest::Compute, false);
+        fs::write(ov.root().join("new"), b"new").unwrap();
+        drop(ov);
+        let foreign = fx.archive.with_file_name("foreign.tar");
+        write_tar(&foreign, &[("b", b"bb"), ("c", b"c")]);
+        interrupt_append(&foreign);
+        let journal = ratarmount_compress::commit_journal::journal_path(&foreign);
+        let journal_bytes = fs::read(&journal).unwrap();
+        let bytes = fs::read(&foreign).unwrap();
+        let (overlay, archive) = (fx.overlay.clone(), fx.archive.clone());
+        crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                dangle_db(&overlay);
+                fs::rename(&foreign, &archive).unwrap();
+            }));
+        });
+        let result =
+            crate::commit_overlay(&fx.overlay, &fx.archive, &archive_token(&fx.archive), &opts);
+        assert!(result.is_err(), "refused: {result:?}");
+        assert!(fs::read(&fx.archive).unwrap() == bytes, "B untouched");
+        assert!(
+            fs::read(&journal).is_ok_and(|j| j == journal_bytes),
+            "journal kept"
+        );
+    });
+    // B9: a restamp through a dangling database fails instead of silently
+    // skipping the rows.
+    row("B9 Rows::Path", &|| {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let target = dangle_db(&fx.overlay);
+        let db = fx.overlay.join(HIDDEN_DB);
+        let rows = crate::journal_recovery::Rows::Path(&db);
+        assert!(
+            rows.with(|_| Ok(())).is_err(),
+            "restamp must not be skipped"
+        );
+        assert!(!target.exists(), "nothing created through the symlink");
+    });
+    // B10: `--base-digest none` treats an overlay with a dangling database as
+    // a reopen (the recorded identity is compared), not as a new overlay.
+    row("B10 plan_excludes", &|| {
+        let fx = Fixture::new();
+        let base = fx.archive.with_file_name("basedir");
+        fs::create_dir(&base).unwrap();
+        fs::write(base.join("f"), b"f").unwrap();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        dangle_db(&fx.overlay);
+        let info = crate::overlay_meta::OverlayCreateInfo {
+            base_url: base.to_str().unwrap().to_owned(),
+            base_digest: BaseDigestRequest::None,
+            local_path: Some(base.clone()),
+            ..Default::default()
+        };
+        let plan = crate::overlay_meta::plan_excludes(&info, &fx.overlay).unwrap();
+        assert!(plan.is_some(), "a dangling database is not a new overlay");
+    });
+    // B11: the committed-baseline refresh fails instead of skipping.
+    row("B11 refresh_committed_base_offline", &|| {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let target = dangle_db(&fx.overlay);
+        let refreshed =
+            crate::overlay_meta::refresh_committed_base_offline(&fx.overlay, None, &fx.archive);
+        assert!(refreshed.is_err(), "refresh must not be skipped");
+        assert!(!target.exists(), "nothing created through the symlink");
+    });
+    assert!(failed.is_empty(), "failed rows: {failed:?}");
 }
 
 // ---- R7-C5: one target rule, one restamp rule, disjunct 3, idempotent rollback ----

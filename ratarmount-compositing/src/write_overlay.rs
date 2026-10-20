@@ -146,6 +146,51 @@ fn discard_hint(paths: &[&Path]) -> String {
 }
 
 /// The database path exists but is a directory (Robo-Ilya, #96 review).
+/// Nothing at all is at `dir`'s overlay database path (R7-E2): only an
+/// `lstat` that reports a missing entry is "no database". A symlink (dangling
+/// or not), a directory, a FIFO, or an entry that cannot be statted is an
+/// existing database, so the caller takes the database path, which opens it
+/// (a symlink to a regular file is followed) and refuses or defers anything
+/// that is not a readable regular file. Never `exists()`, `is_file()` or
+/// `metadata()`: they follow a dangling symlink to "missing".
+pub fn overlay_db_absent(dir: &Path) -> bool {
+    db_entry_absent(&dir.join(HIDDEN_DB))
+}
+
+/// [`overlay_db_absent`] for the database path itself.
+pub(crate) fn db_entry_absent(db: &Path) -> bool {
+    matches!(fs::symlink_metadata(db), Err(e) if e.kind() == io::ErrorKind::NotFound)
+}
+
+/// The overlay database at `db_path` as `Connection::open` would see it:
+/// `None` when nothing is there ([`db_entry_absent`]), else the metadata of
+/// the regular file it is (or a symlink points to). A directory, a dangling
+/// symlink or any other non-regular file is refused. `marked`: the overlay
+/// was used before (#96); a dangling symlink then reads as a missing database,
+/// which the caller refuses with the #96 wording.
+fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(db_path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(OverlayError::Io(e)),
+        Ok(_) => {}
+    }
+    match fs::metadata(db_path) {
+        Ok(m) if m.is_dir() => Err(db_is_directory_error(db_path)),
+        Ok(m) if m.is_file() => Ok(Some(m)),
+        Ok(_) => Err(OverlayError::Msg(format!(
+            "overlay database {} is not a regular file; move it aside",
+            db_path.display()
+        ))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound && marked => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(OverlayError::Msg(format!(
+            "overlay database {} is a symlink to a file that does not exist; it is not \
+             created through the symlink: restore its target or remove the symlink",
+            db_path.display()
+        ))),
+        Err(e) => Err(OverlayError::Io(e)),
+    }
+}
+
 fn db_is_directory_error(db_path: &Path) -> OverlayError {
     OverlayError::Msg(format!(
         "overlay database path {} is a directory, not a database file; move it aside",
@@ -1072,13 +1117,9 @@ impl WriteOverlay {
         let found_marker = overlay_marker(&root)?;
         let marker = found_marker.is_some();
         let marker_path = found_marker.unwrap_or_else(|| root.join(OVERLAY_MARKER));
-        // Follows a symlinked database exactly like `Connection::open` does.
-        let db_len = match fs::metadata(&db_path) {
-            Ok(m) if m.is_dir() => return Err(db_is_directory_error(&db_path)),
-            Ok(m) => Some(m.len()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(OverlayError::Io(e)),
-        };
+        // Follows a symlinked database exactly like `Connection::open` does,
+        // but never reads a dangling symlink as "no database" (R7-E2).
+        let db_len = overlay_db_regular(&db_path, marker)?.map(|m| m.len());
         if marker && db_len.unwrap_or(0) == 0 {
             return Err(OverlayError::Msg(format!(
                 "write overlay {} was used before but its database {} is missing or empty; \
@@ -6557,6 +6598,10 @@ thread_local! {
     static APPEND_PREPARE_TOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// When set, renamed over the archive after the suffix is staged (another
     /// file takes the name between preparation and the journaled replacement).
+    /// Run by an offline commit after the caller's gate, right before it
+    /// picks the recovery owner (the overlay or the archive changes there).
+    pub(crate) static BEFORE_OFFLINE_RECOVERY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     pub(crate) static APPEND_PREPARE_SWAP: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -6776,7 +6821,7 @@ pub fn commit_overlay(
 ) -> Result<bool> {
     let write_overlay = write_overlay.as_ref();
     let archive_file = archive_file.as_ref();
-    if !write_overlay.join(HIDDEN_DB).exists() {
+    if overlay_db_absent(write_overlay) {
         return Err(OverlayError::Msg(format!(
             "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
             write_overlay.display()
@@ -6813,10 +6858,11 @@ pub fn commit_overlay_raw_dir(
 ) -> Result<RawDirCommit> {
     let write_overlay = write_overlay.as_ref();
     let db = write_overlay.join(HIDDEN_DB);
-    if db.exists() {
+    if !db_entry_absent(&db) {
         return Err(OverlayError::Msg(format!(
-            "overlay database {} exists; its base identity must be checked, so commit it \
-             with a classified base (commit_overlay), not as a raw directory",
+            "overlay database {} exists (or something else is at its path); its base \
+             identity must be checked, so commit it with a classified base \
+             (commit_overlay), not as a raw directory",
             db.display()
         )));
     }
@@ -6849,13 +6895,17 @@ fn commit_overlay_inner(
         )));
     }
 
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_OFFLINE_RECOVERY.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     {
         use crate::journal_recovery::{Owner, Record};
         // The gate ran before this call (unlocked); the owner re-takes the
         // decision on the LOCKED file, and recovery restamps the rows from it.
         let owner = match identity {
             _ if opts.force_base_mismatch => Owner::Forced,
-            Some(base) if write_overlay.join(HIDDEN_DB).exists() => Owner::Recorded {
+            Some(base) if !overlay_db_absent(write_overlay) => Owner::Recorded {
                 base,
                 archive: archive_file,
                 record: Record::Offline(write_overlay),
@@ -6867,7 +6917,7 @@ fn commit_overlay_inner(
     // The one snapshot every write of this commit compares against: the file
     // the gate accepts after recovery (one stat when no identity applies).
     let original = match identity {
-        Some(base) if write_overlay.join(HIDDEN_DB).exists() => {
+        Some(base) if !overlay_db_absent(write_overlay) => {
             match crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
             {
                 Ok(Some(snapshot)) => snapshot,
@@ -6980,17 +7030,18 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
     let db_path = write_overlay.join(HIDDEN_DB);
     let markers = overlay_markers(write_overlay)?;
     let marker = markers.first().cloned();
-    let db_regular = match fs::metadata(&db_path) {
-        Ok(m) if m.is_dir() => {
-            let canon = write_overlay
-                .canonicalize()
-                .unwrap_or_else(|_| write_overlay.to_path_buf());
-            return Err(db_is_directory_error(&canon.join(HIDDEN_DB)));
-        }
+    if fs::metadata(&db_path).is_ok_and(|m| m.is_dir()) {
+        let canon = write_overlay
+            .canonicalize()
+            .unwrap_or_else(|_| write_overlay.to_path_buf());
+        return Err(db_is_directory_error(&canon.join(HIDDEN_DB)));
+    }
+    // Only a missing entry is "no database" (R7-E2): a dangling symlink in an
+    // unmarked folder is refused, never planned without its tombstones.
+    let db_regular = match overlay_db_regular(&db_path, marker.is_some())? {
         // A 0-byte file in a marked folder is as gone as a missing one.
-        Ok(m) => m.is_file() && (marker.is_none() || m.len() > 0),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        Err(e) => return Err(OverlayError::Io(e)),
+        Some(m) => marker.is_none() || m.len() > 0,
+        None => false,
     };
     if marker.is_some() && !db_regular {
         // #96: committing without the tombstones would write the unlinked
@@ -12498,6 +12549,40 @@ pub(crate) mod tests {
         }
         fs::remove_file(&real).unwrap();
         assert!(msg_of(reopen_keep_overlay(&overlay)).contains("is missing"));
+    }
+
+    /// Regression (r17 skeptic #2, R7-E2): a dangling symlink at the
+    /// database path was read as "no database" by `fs::metadata`. B8: a first
+    /// open (no marker yet) created a fresh database THROUGH the symlink,
+    /// outside the overlay. B7: the offline commit plan was built without the
+    /// tombstones. Both refuse; nothing is created at the target. A symlink
+    /// to a regular file stays supported (see the test below).
+    #[test]
+    fn regression_dangling_db_symlink_is_not_an_absent_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut failed = Vec::new();
+        for site in ["B8 WriteOverlay::open", "B7 collect_overlay_commit_plan"] {
+            let overlay = dir.path().join(site.split(' ').next().unwrap());
+            fs::create_dir(&overlay).unwrap();
+            let target = dir.path().join(format!(
+                "{}-nowhere.sqlite",
+                site.split(' ').next().unwrap()
+            ));
+            std::os::unix::fs::symlink(&target, overlay.join(HIDDEN_DB)).unwrap();
+            let refused = if site.starts_with("B8") {
+                WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+                    .is_err()
+            } else {
+                collect_overlay_commit_plan(&overlay).is_err()
+            };
+            if !refused || target.exists() {
+                failed.push(format!(
+                    "{site}: refused={refused} created={}",
+                    target.exists()
+                ));
+            }
+        }
+        assert!(failed.is_empty(), "failed rows: {failed:?}");
     }
 
     /// Regression: the marker must not be created through a planted symlink.

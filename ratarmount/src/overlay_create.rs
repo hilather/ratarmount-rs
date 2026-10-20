@@ -3,9 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ratarmount_compositing::{
-    ClassifiedBase, CreateOptions, OverlayError, WriteOverlay, HIDDEN_DB,
-};
+use ratarmount_compositing::{ClassifiedBase, CreateOptions, OverlayError, WriteOverlay};
 use ratarmount_core::MountSource;
 
 /// Create on an already opened, classified and composed source. `composed` is
@@ -35,7 +33,7 @@ pub fn create_overlay(
     if inputs.len() == 1
         && !has_source_binds
         && options.base_digest == BaseDigestRequest::Compute
-        && !dir.join(HIDDEN_DB).exists()
+        && ratarmount_compositing::overlay_db_absent(dir)
     {
         let typed = inputs[0].to_string_lossy();
         if ratarmount_remote::is_remote_url(&typed) {
@@ -99,6 +97,58 @@ mod tests {
             assert!(!value.contains("deadbeef"), "{key} leaked: {value}");
         }
         meta.get("base_remote_token").map(str::to_owned)
+    }
+
+    /// Regression (r17 skeptic #2, R7-E2 B12): a dangling symlink at the
+    /// database path was read as a new overlay: a remote base was asked for a
+    /// fresh token (a network HEAD) and the open created a database through
+    /// the symlink. It is an existing, unreadable database: no request is made
+    /// and the open is refused with nothing created at the target.
+    #[cfg(unix)]
+    #[test]
+    fn regression_dangling_db_symlink_is_not_a_new_overlay() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/b.tar");
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dir.path().join("ov");
+        std::fs::create_dir(&ov).unwrap();
+        let target = dir.path().join("nowhere.sqlite");
+        std::os::unix::fs::symlink(&target, ov.join(HIDDEN_DB)).unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let stack: Arc<dyn MountSource> =
+            Arc::new(ratarmount_compositing::FolderMountSource::new(src.path()).unwrap());
+        let base = ClassifiedBase::open(&mut crate::base_identity::fixtures::FixtureOpener {
+            source: stack.clone(),
+            kind: ratarmount_compositing::ServedKind::Archive,
+            inputs: vec![url.clone()],
+            location: Some(ratarmount_compositing::ServedLocation::Remote(url.clone())),
+        })
+        .unwrap();
+        let opened = create_overlay(
+            &base,
+            stack,
+            &ov,
+            CreateOptions::default(),
+            &[PathBuf::from(&url)],
+            false,
+        );
+        assert!(opened.is_err(), "a dangling database must be refused");
+        assert!(!target.exists(), "nothing created through the symlink");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no HEAD for an existing overlay"
+        );
     }
 
     /// Regression: several inputs were stored as a raw JSON array, leaking credentials.

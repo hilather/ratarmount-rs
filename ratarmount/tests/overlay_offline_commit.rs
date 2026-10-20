@@ -818,3 +818,52 @@ fn regression_mount_union_member_journal_waits_for_the_gate() {
     env.ok(&["--no-mount", s(&b)]);
     assert!(!journal.exists(), "recovered alone");
 }
+
+/// Regression (r17 skeptic #2, R7-E2 B1/B2): A's overlay database is replaced
+/// by a dangling symlink, then B with its own journal (torn or complete) is
+/// renamed over A. `overlay.join(DB).exists()` read the dangling symlink as
+/// "no database", so `--commit-overlay -w ov --yes A` ran the inode-only
+/// recovery before any recorded-base gate: B was rolled back (or forward) and
+/// its journal removed. The database path is `lstat`ed: anything there is an
+/// existing database, the commit goes through the database path and is
+/// refused with B, its journal and the symlink target untouched.
+#[cfg(unix)]
+#[test]
+fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for complete in [false, true] {
+        let env = Env::new();
+        let archive = tar_with(&env, "base.tar", &[("a.txt", b"a\n")]);
+        let overlay = env.path("overlay");
+        env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+        fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+        let db = overlay.join(".ratarmount.overlay.sqlite");
+        fs::rename(&db, env.path("saved.sqlite")).unwrap();
+        let target = env.path("nowhere.sqlite");
+        std::os::unix::fs::symlink(&target, &db).unwrap();
+        let (bytes, journal, journal_bytes) = rename_b_over_a(&env, &archive, complete);
+        let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
+        assert!(
+            !out.status.success(),
+            "complete={complete}: must refuse: {}",
+            text(&out)
+        );
+        assert!(
+            fs::read(&archive).unwrap() == bytes,
+            "complete={complete}: B modified: {}",
+            text(&out)
+        );
+        assert!(
+            fs::read(&journal).is_ok_and(|j| j == journal_bytes),
+            "complete={complete}: journal modified or removed: {}",
+            text(&out)
+        );
+        assert!(
+            !target.exists(),
+            "complete={complete}: created through the symlink"
+        );
+    }
+}

@@ -341,7 +341,12 @@ the base with the same size and mtime cannot be caught without hashing; only
 `overlay verify` with a strong digest catches it (`overlay seal` of an
 already-strong base compares the stamp and does not rehash).
 `--commit-overlay` on a raw directory of files (no overlay database) has no
-identity to check and says so.
+identity to check and says so. Only a database path with nothing at all
+there counts as "no database": a dangling symlink, a directory or any other
+entry that is not a readable regular file is an existing but unreadable
+database, so the commit is refused (and any journal on the archive is left
+alone) instead of committing as a raw directory. A symlink to a regular
+database file keeps working.
 
 The commit check also compares the recorded KIND under every digest kind, `none`
 included (a directory overlay does not commit into an archive), and refuses an
