@@ -41,6 +41,32 @@ fn recovery_error(path: &Path, reason: impl std::fmt::Display) -> io::Error {
     ))
 }
 
+// Crash matrix (what a later recovery finds and does; "rows" are the
+// overlay's recorded base stamp, restamped by the `before_unlink` hook):
+// (a) rollback restamped the rows, crash before the unlink: journal + `P`,
+//     rows = the rolled-back stamp -> agrees (disjunct 3); old bytes in place:
+//     nothing written; the hook sees a journal not started on the rows and
+//     leaves them; unlink.
+// (b) rollback with an unrestorable mtime (EPERM) whose hook failed: journal +
+//     `P`, rows = the pre stamp -> agrees (disjunct 1); nothing written; the
+//     hook moves the rows to the current mtime; unlink.
+// (c) `A`, crash before the truncate: agrees; nothing written; exact restore
+//     leaves the rows; unlink.
+// (d) equal-stamp roll-forward, crash before the unlink: rows = final = pre ->
+//     agrees; the hook re-invalidates a strong digest (idempotent); unlink.
+// (e) the attempt unlinked its journal, crash before the directory sync:
+//     `D` kept; a resurrected journal rolls forward (the hook is idempotent);
+//     none: `D` stays until recovered through a name beside its journal or
+//     removed by hand (Astra v4 F1: its absence is ambiguous).
+// (f) crash between `C` and the hook, directory renamed: the journal beside
+//     the archive's new name is found and rolled forward; a base that left its
+//     recorded place is left to the gate (rows unchanged). Recovered through a
+//     hard link in a third directory: `C` is refused, nothing is dropped.
+// (g) `C` whose journal was deleted by hand: refused, the error names the
+//     manual escape.
+// No ordering leaves "journal gone, rows stale" for a journal on the recorded
+// base, "rows moved, bytes not", or "bytes new, digest old".
+
 /// Test-only fault injection, consulted at every step of a replacement and of
 /// a rollback. A step is either a checkpoint (consulted after the step
 /// succeeded) or an instead-of seam (an `Err` replaces the system call). Without
@@ -1222,6 +1248,9 @@ mod unix {
         pending: PendingJournal,
         seconds: i64,
         nanos: u64,
+        /// The archive already holds exactly the old bytes (a rollback that
+        /// finished its writes, or an attempt stopped before it truncated).
+        old_in_place: bool,
     }
 
     /// `expected`: the `(dev, ino)` of the journal file a failed attempt
@@ -1299,11 +1328,13 @@ mod unix {
         if file.metadata()?.dev() != get(8) || file.metadata()?.ino() != get(16) {
             log::info!("commit: journal identity changed; validated archive content instead");
         }
+        let old_in_place = old_matches && file.metadata()?.len() == len;
         Ok((
             Header {
                 pending: parse_pending(&header, complete),
                 seconds,
                 nanos,
+                old_in_place,
             },
             journal,
         ))
@@ -1340,7 +1371,10 @@ mod unix {
             ..
         } = header.pending;
         let (seconds, nanos) = (header.seconds, header.nanos);
-        if !complete {
+        // Idempotent: when the old bytes are already in place nothing is
+        // written (no truncate, copy or mtime), so a second recovery of a
+        // rolled-back file keeps the stamp the first one's hook recorded.
+        if !complete && !header.old_in_place {
             // Persist truncation before rollback writes so another crash leaves
             // a prefix of the old tail, never a mixture of old and new tails.
             let rolled = (|| -> io::Result<()> {
@@ -2430,6 +2464,30 @@ mod tests {
         assert!(!recover(&path).unwrap());
         assert!(marker_state(&path).is_some(), "the completion is kept");
         assert_eq!(fs::read(&path).unwrap(), b"prefix:new contents are longer");
+    }
+
+    /// Regression: a rollback whose old bytes are already in place writes
+    /// nothing (no truncate, copy or mtime), so a second recovery of a
+    /// rolled-back file keeps the stamp the first one's hook recorded.
+    #[test]
+    fn append_journal_rollback_skips_writes_when_old_bytes_are_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        interrupted(&path, "locator active");
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        fault::install(|step| match step {
+            "rollback truncate" | "rollback mtime" => {
+                Err(io::Error::other(format!("{step}: no write expected")))
+            }
+            _ => Ok(()),
+        });
+        let recovered = recover(&path);
+        fault::clear();
+        assert!(recovered.unwrap(), "recovered without writing");
+        assert_eq!(fs::read(&path).unwrap(), b"prefix:old contents");
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        assert!(!journal_path(&path).exists());
+        assert_eq!(marker_state(&path), None);
     }
 
     /// The contract of a failed attempt, one case per stop (design §5 cj

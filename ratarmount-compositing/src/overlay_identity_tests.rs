@@ -2052,39 +2052,6 @@ fn regression_symlink_replaced_target_uses_resolved_identity() {
     assert_eq!((rows[0].clone(), rows[1].clone()), (size, mtime));
 }
 
-/// Regression (R7-B6): `Restamp::Commit` rewrote `base_size`/`base_mtime_ns`
-/// (and marked a strong digest pending) even when the recovery ROLLED BACK, so a
-/// rollback moved the baseline off the bytes it had just restored.
-#[cfg(unix)]
-#[test]
-fn regression_commit_restamp_ignores_a_rollback() {
-    use crate::journal_recovery::{restamp_rows, Restamp};
-    use std::os::unix::fs::MetadataExt;
-    let fx = Fixture::new();
-    let digest = format!("sha256:{}", "0".repeat(64));
-    drop(fx.open(BaseDigestRequest::Supplied(digest), false));
-    let before = recorded_rows(&fx.overlay);
-    let meta = fs::metadata(&fx.archive).unwrap();
-    let applied = ratarmount_compress::commit_journal::Applied {
-        rolled_forward: false,
-        pre_len: meta.len(),
-        pre_mtime_ns: 1,
-        new_len: meta.len() + 1,
-        dev: meta.dev(),
-        ino: meta.ino(),
-        final_len: meta.len() + 7,
-        final_mtime_ns: 99,
-    };
-    let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
-    restamp_rows(&conn, &fx.archive, &applied, Restamp::Commit).unwrap();
-    drop(conn);
-    assert_eq!(
-        recorded_rows(&fx.overlay),
-        before,
-        "a rollback moved the rows"
-    );
-}
-
 /// Regression (R7-A3): a link retargeted to another archive that carries its
 /// own COMPLETE journal, and a target replaced by such an archive, are refused
 /// with the other file, its journal and the rows untouched.
@@ -3182,4 +3149,596 @@ fn regression_auto_copy_refuses_an_archive_that_changed_since_it_was_staged() {
             );
         }
     }
+}
+
+// ---- R7-C5: one target rule, one restamp rule, disjunct 3, idempotent rollback ----
+
+fn strong_fixture() -> Fixture {
+    let fx = Fixture::new();
+    // An old mtime, so any write this test makes moves it.
+    fs::File::options()
+        .write(true)
+        .open(&fx.archive)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+            ),
+        )
+        .unwrap();
+    fx
+}
+
+fn strong_digest() -> BaseDigestRequest {
+    BaseDigestRequest::Supplied(format!("sha256:{}", "0".repeat(64)))
+}
+
+fn digest_rows(overlay: &Path) -> Vec<Option<String>> {
+    read_rows(
+        overlay,
+        &["base_digest_kind", "base_digest", "stack_digest"],
+    )
+}
+
+/// Regression (r15 #4): a rollback that could not restore the mtime (EPERM
+/// for a non-owner) left the rows on the old mtime, so the next commit was
+/// refused as a changed base. The rows follow the restored file (the journal
+/// was started on the recorded state); a strong digest is kept (the bytes are
+/// the recorded bytes); the error is a plain failure and the next commit
+/// succeeds.
+#[cfg(unix)]
+#[test]
+fn regression_rollback_with_unrestored_mtime_restamps_and_the_next_commit_accepts() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = strong_fixture();
+    let mut ov = fx.open(strong_digest(), false);
+    ov.set_commit_mode(crate::CommitMode::Append);
+    fs::write(ov.root().join("one"), b"one").unwrap();
+    let bytes = fs::read(&fx.archive).unwrap();
+    let pre = fs::metadata(&fx.archive).unwrap().modified().unwrap();
+    let digest = ov.recorded_digest_for_tests();
+    ratarmount_compress::commit_journal::fault::install(|step| match step {
+        "archive write" => Err(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+        "rollback mtime" => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+        _ => Ok(()),
+    });
+    let result = commit(&ov, &fx.archive, Path_::Live);
+    ratarmount_compress::commit_journal::fault::clear();
+    let error = result.unwrap_err();
+    assert!(
+        !matches!(
+            error,
+            crate::OverlayError::Committed(_) | crate::OverlayError::JournalPending(_)
+        ),
+        "{error}"
+    );
+    assert!(!ov.interval_disabled());
+    assert_ne!(fs::metadata(&fx.archive).unwrap().modified().unwrap(), pre);
+    assert_eq!(fs::read(&fx.archive).unwrap(), bytes, "rolled back");
+    assert!(!journal_path(&fx.archive).exists());
+    assert_eq!(ov.recorded_stamp_for_tests(), stamp_rows(&fx.archive));
+    assert_eq!(ov.recorded_digest_for_tests(), digest, "strong digest kept");
+    assert!(
+        commit(&ov, &fx.archive, Path_::Live).unwrap(),
+        "next commit"
+    );
+}
+
+/// Regression (r15 #4, crash recovery): a torn append rolled back by recovery
+/// whose mtime cannot be restored restamps the rows (the journal was started
+/// on the recorded state), so a reopen and the commit gate accept the file.
+#[cfg(unix)]
+#[test]
+fn regression_recovery_rollback_with_unrestored_mtime_restamps_and_reopen_accepts() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = strong_fixture();
+    drop(fx.open(strong_digest(), false));
+    let bytes = fs::read(&fx.archive).unwrap();
+    interrupt_append(&fx.archive);
+    ratarmount_compress::commit_journal::fault::install(|step| match step {
+        "rollback mtime" => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+        _ => Ok(()),
+    });
+    let applied = crate::recover_journal_at(
+        &fx.archive,
+        Some(&fx.overlay.join(HIDDEN_DB)),
+        crate::Owner::Inode,
+    );
+    ratarmount_compress::commit_journal::fault::clear();
+    assert!(!applied.unwrap().expect("rolled back").rolled_forward);
+    assert_eq!(fs::read(&fx.archive).unwrap(), bytes);
+    let rows = recorded_rows(&fx.overlay);
+    assert_eq!((rows[0].clone(), rows[1].clone()), stamp_rows(&fx.archive));
+    crate::overlay_gate::check_commit_base_offline(
+        &fx.overlay,
+        &archive_token(&fx.archive),
+        &fx.archive,
+    )
+    .unwrap();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+}
+
+/// Regression (r15 #4 + crash): the rollback restamped the rows (unrestored
+/// mtime) and then its unlink failed: the journal stays (`P`), the rows
+/// describe the rolled-back file. Every gate accepts the file (disjunct 3:
+/// the torn journal's rows already describe the old bytes), and the later
+/// recovery writes nothing (the old bytes are in place) and only unlinks.
+#[cfg(unix)]
+#[test]
+fn regression_rows_rolled_back_then_unlink_failed_is_accepted_by_every_gate() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = strong_fixture();
+    let mut ov = fx.open(strong_digest(), false);
+    ov.set_commit_mode(crate::CommitMode::Append);
+    fs::write(ov.root().join("one"), b"one").unwrap();
+    ratarmount_compress::commit_journal::fault::install(|step| match step {
+        "archive write" => Err(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+        "rollback mtime" => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+        "rollback unlink" => Err(std::io::Error::other("injected unlink failure")),
+        _ => Ok(()),
+    });
+    let result = commit(&ov, &fx.archive, Path_::Live);
+    ratarmount_compress::commit_journal::fault::clear();
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, crate::OverlayError::JournalPending(_)),
+        "{error}"
+    );
+    let journal = ratarmount_compress::commit_journal::pending(&fx.archive)
+        .unwrap()
+        .expect("journal kept");
+    assert!(!journal.complete);
+    assert_eq!(ov.recorded_stamp_for_tests(), stamp_rows(&fx.archive));
+    drop(ov);
+    assert_eq!(
+        classify_mount_journal(&records_of(&fx), &fx.archive).unwrap(),
+        MountJournal::Own
+    );
+    crate::overlay_gate::check_commit_base_offline(
+        &fx.overlay,
+        &archive_token(&fx.archive),
+        &fx.archive,
+    )
+    .unwrap();
+    let (rows, mtime) = (
+        recorded_rows(&fx.overlay),
+        fs::metadata(&fx.archive).unwrap().modified().unwrap(),
+    );
+    crate::recover_journal_at(
+        &fx.archive,
+        Some(&fx.overlay.join(HIDDEN_DB)),
+        crate::Owner::Inode,
+    )
+    .unwrap()
+    .expect("unlinked");
+    assert!(!journal_path(&fx.archive).exists());
+    assert_eq!(
+        fs::metadata(&fx.archive).unwrap().modified().unwrap(),
+        mtime
+    );
+    assert_eq!(recorded_rows(&fx.overlay), rows);
+    drop(fx.open(BaseDigestRequest::Compute, false));
+}
+
+/// Regression: a roll-forward always invalidates a strong digest, also when
+/// the rows already equal the final stamp (an equal-length, equal-mtime
+/// commit, or relocation rows written before a deferred recovery). A
+/// recovery of a journal started on another state still leaves the rows.
+#[cfg(unix)]
+#[test]
+fn regression_equal_stamp_roll_forward_invalidates_the_strong_digest() {
+    use crate::journal_recovery::{restamp_rows, Restamp};
+    use std::os::unix::fs::MetadataExt;
+    for mode in [Restamp::Recovery, Restamp::Commit] {
+        let fx = Fixture::new();
+        drop(fx.open(strong_digest(), false));
+        let rows = recorded_rows(&fx.overlay);
+        let (size, mtime): (u64, i128) = (
+            rows[0].as_ref().unwrap().parse().unwrap(),
+            rows[1].as_ref().unwrap().parse().unwrap(),
+        );
+        let meta = fs::metadata(&fx.archive).unwrap();
+        let applied = |pre: (u64, i128)| ratarmount_compress::commit_journal::Applied {
+            rolled_forward: true,
+            pre_len: pre.0,
+            pre_mtime_ns: pre.1,
+            new_len: size,
+            dev: meta.dev(),
+            ino: meta.ino(),
+            final_len: size,
+            final_mtime_ns: mtime,
+        };
+        let db = fx.overlay.join(HIDDEN_DB);
+        // pre == final == rows.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        restamp_rows(&conn, &fx.archive, &applied((size, mtime)), mode).unwrap();
+        drop(conn);
+        assert_eq!(
+            recorded_rows(&fx.overlay)[2].as_deref(),
+            Some("pending"),
+            "{mode:?}"
+        );
+        assert_eq!(digest_rows(&fx.overlay)[2], None, "{mode:?}: stack digest");
+        if mode == Restamp::Recovery {
+            // pre != final == rows (relocation rows): rows unchanged, digest pending.
+            let fx = Fixture::new();
+            drop(fx.open(strong_digest(), false));
+            let meta = fs::metadata(&fx.archive).unwrap();
+            let rows = recorded_rows(&fx.overlay);
+            let (size, mtime): (u64, i128) = (
+                rows[0].as_ref().unwrap().parse().unwrap(),
+                rows[1].as_ref().unwrap().parse().unwrap(),
+            );
+            let other = ratarmount_compress::commit_journal::Applied {
+                rolled_forward: true,
+                pre_len: size - 512,
+                pre_mtime_ns: 5,
+                new_len: size,
+                dev: meta.dev(),
+                ino: meta.ino(),
+                final_len: size,
+                final_mtime_ns: mtime,
+            };
+            let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
+            restamp_rows(&conn, &fx.archive, &other, mode).unwrap();
+            drop(conn);
+            let now = recorded_rows(&fx.overlay);
+            assert_eq!(
+                (now[0].clone(), now[1].clone()),
+                (rows[0].clone(), rows[1].clone())
+            );
+            assert_eq!(now[2].as_deref(), Some("pending"));
+            // pre != final != rows: nothing.
+            let fx = Fixture::new();
+            drop(fx.open(strong_digest(), false));
+            let before = (recorded_rows(&fx.overlay), digest_rows(&fx.overlay));
+            let meta = fs::metadata(&fx.archive).unwrap();
+            let foreign = ratarmount_compress::commit_journal::Applied {
+                rolled_forward: true,
+                pre_len: 1,
+                pre_mtime_ns: 5,
+                new_len: 9,
+                dev: meta.dev(),
+                ino: meta.ino(),
+                final_len: 9,
+                final_mtime_ns: 7,
+            };
+            let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
+            restamp_rows(&conn, &fx.archive, &foreign, mode).unwrap();
+            drop(conn);
+            assert_eq!(
+                (recorded_rows(&fx.overlay), digest_rows(&fx.overlay)),
+                before
+            );
+        }
+    }
+}
+
+/// Pin (R7-B6): a forced commit over a swapped base whose append rolls back
+/// with an unrestored mtime keeps the record (the journal was started on
+/// another state): the next unforced commit is still refused.
+#[cfg(unix)]
+#[test]
+fn regression_forced_rollback_over_a_swapped_base_keeps_the_record() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = strong_fixture();
+    // Opened (forced) while the base is still the recorded one.
+    let mut ov = fx.open(strong_digest(), true);
+    fx.swap_for_other_tar();
+    fs::File::options()
+        .write(true)
+        .open(&fx.archive)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_500),
+            ),
+        )
+        .unwrap();
+    ov.set_commit_mode(crate::CommitMode::Append);
+    fs::write(ov.root().join("one"), b"one").unwrap();
+    let rows_now = (recorded_rows_live(&ov), ov.recorded_digest_for_tests());
+    ratarmount_compress::commit_journal::fault::install(|step| match step {
+        "archive write" => Err(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+        "rollback mtime" => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+        _ => Ok(()),
+    });
+    let result = commit(&ov, &fx.archive, Path_::Live);
+    ratarmount_compress::commit_journal::fault::clear();
+    assert!(result.is_err());
+    assert_eq!(
+        (recorded_rows_live(&ov), ov.recorded_digest_for_tests()),
+        rows_now,
+        "a forced rollback moved the record"
+    );
+    drop(ov);
+    let refused = open_with(
+        &archive_token(&fx.archive),
+        &fx.overlay,
+        BaseDigestRequest::Compute,
+        false,
+    )
+    .err()
+    .expect("the next unforced open is refused")
+    .to_string();
+    assert!(refused.contains("--force-base-mismatch"), "{refused}");
+}
+
+/// Regression (B6 rewritten): the commit hook after a rollback moves the
+/// rows only when the journal was started on the recorded stamp and the
+/// mtime could not be restored; a strong digest is kept; a rollback that
+/// ended at another length is an error (impossible by construction).
+#[cfg(unix)]
+#[test]
+fn regression_commit_restamp_after_rollback_moves_only_a_started_unrestored_stamp() {
+    use crate::journal_recovery::{restamp_rows, Restamp};
+    use std::os::unix::fs::MetadataExt;
+    for case in ["exact", "started", "not started", "other length"] {
+        let fx = Fixture::new();
+        drop(fx.open(strong_digest(), false));
+        let rows = recorded_rows(&fx.overlay);
+        let digest = digest_rows(&fx.overlay);
+        let (size, mtime): (u64, i128) = (
+            rows[0].as_ref().unwrap().parse().unwrap(),
+            rows[1].as_ref().unwrap().parse().unwrap(),
+        );
+        let meta = fs::metadata(&fx.archive).unwrap();
+        let (pre_mtime, final_len, final_mtime) = match case {
+            "exact" => (mtime, size, mtime),
+            "started" => (mtime, size, mtime + 99),
+            "not started" => (mtime - 5, size, mtime + 99),
+            _ => (mtime, size + 7, mtime + 99),
+        };
+        let applied = ratarmount_compress::commit_journal::Applied {
+            rolled_forward: false,
+            pre_len: size,
+            pre_mtime_ns: pre_mtime,
+            new_len: size + 512,
+            dev: meta.dev(),
+            ino: meta.ino(),
+            final_len,
+            final_mtime_ns: final_mtime,
+        };
+        let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
+        let result = restamp_rows(&conn, &fx.archive, &applied, Restamp::Commit);
+        drop(conn);
+        let now = recorded_rows(&fx.overlay);
+        match case {
+            "started" => {
+                result.unwrap();
+                assert_eq!(
+                    now[1].as_deref(),
+                    Some((mtime + 99).to_string().as_str()),
+                    "{case}"
+                );
+                assert_eq!(now[0], rows[0], "{case}");
+            }
+            "other length" => {
+                assert!(result.is_err(), "{case}");
+                assert_eq!(now, rows, "{case}");
+            }
+            _ => {
+                result.unwrap();
+                assert_eq!(now, rows, "{case}");
+            }
+        }
+        assert_eq!(
+            digest_rows(&fx.overlay),
+            digest,
+            "{case}: strong digest kept"
+        );
+    }
+}
+
+/// Pins (Astra v4 F2): a journal's target is never inferred from matching
+/// stamps. Union member B is a timestamp-preserving copy of the recorded
+/// base A and carries its own complete journal (started on A's recorded
+/// stamp). With A in place, and again with A's name replaced by C carrying
+/// B's final stamp: the mount defers B, recovering B leaves A's rows and
+/// strong digest alone, and a reopen over C is refused.
+#[cfg(unix)]
+#[test]
+fn regression_union_member_journal_is_never_adopted_from_matching_stamps() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for replaced in [false, true] {
+        let fx = strong_fixture();
+        drop(fx.open(strong_digest(), false));
+        let before = (recorded_rows(&fx.overlay), digest_rows(&fx.overlay));
+        let other = fx.archive.parent().unwrap().join("member");
+        fs::create_dir(&other).unwrap();
+        let b = other.join("base.tar");
+        fs::copy(&fx.archive, &b).unwrap();
+        let a_mtime = fs::metadata(&fx.archive).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(a_mtime))
+            .unwrap();
+        interrupt_complete(&b);
+        if replaced {
+            let c = fx.archive.with_file_name("c.tar");
+            fs::copy(&b, &c).unwrap();
+            let b_mtime = fs::metadata(&b).unwrap().modified().unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&c)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(b_mtime))
+                .unwrap();
+            fs::rename(&c, &fx.archive).unwrap();
+        }
+        assert!(
+            matches!(
+                classify_mount_journal(&records_of(&fx), &b).unwrap(),
+                MountJournal::Deferred { .. }
+            ),
+            "replaced={replaced}: the member's journal is not the base's"
+        );
+        crate::recover_journal_at(&b, Some(&fx.overlay.join(HIDDEN_DB)), crate::Owner::Inode)
+            .unwrap()
+            .expect("B rolled forward");
+        assert_eq!(
+            (recorded_rows(&fx.overlay), digest_rows(&fx.overlay)),
+            before,
+            "replaced={replaced}: A's rows moved"
+        );
+        if replaced {
+            let refused = open_with(
+                &archive_token(&fx.archive),
+                &fx.overlay,
+                BaseDigestRequest::Compute,
+                false,
+            )
+            .err()
+            .expect("C at A's name is refused")
+            .to_string();
+            assert!(refused.contains("--force-base-mismatch"), "{refused}");
+        }
+    }
+}
+
+/// Regression (Astra v4 F3): the target rule compares the CURRENT device
+/// and inode of the recorded base with the locked file, never the inode
+/// alone. Another name of the base (a hard link in another directory)
+/// recovers and restamps like the base; the same inode number on another
+/// device is not the base.
+#[cfg(unix)]
+#[test]
+fn regression_journal_target_compares_device_and_inode() {
+    use std::os::unix::fs::MetadataExt;
+    let fx = Fixture::new();
+    drop(fx.open(strong_digest(), false));
+    let meta = OverlayMeta::read(&fx.overlay).unwrap().unwrap();
+    let base = fs::metadata(&fx.archive).unwrap();
+    let elsewhere = fx.archive.with_file_name("elsewhere.tar");
+    assert!(crate::journal_recovery::journal_targets_record(
+        &meta,
+        &elsewhere,
+        (base.dev(), base.ino())
+    ));
+    assert!(!crate::journal_recovery::journal_targets_record(
+        &meta,
+        &elsewhere,
+        (base.dev().wrapping_add(1), base.ino())
+    ));
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    // Recovered through a hard link in another directory: restamped.
+    let other = fx.archive.parent().unwrap().join("links");
+    fs::create_dir(&other).unwrap();
+    let link = other.join("link.tar");
+    fs::hard_link(&fx.archive, &link).unwrap();
+    interrupt_complete(&fx.archive);
+    crate::recover_journal_at(
+        &link,
+        Some(&fx.overlay.join(HIDDEN_DB)),
+        crate::Owner::Inode,
+    )
+    .unwrap()
+    .expect("rolled forward");
+    let rows = recorded_rows(&fx.overlay);
+    assert_eq!((rows[0].clone(), rows[1].clone()), stamp_rows(&fx.archive));
+    assert_eq!(rows[2].as_deref(), Some("pending"));
+}
+
+/// Regression (Astra v3 #1, F2): a complete journal that moved with its
+/// renamed directory is recovered through the archive's new name: rolled
+/// forward (never back), the journal and locator gone. The base left its
+/// recorded place, so ownership is ambiguous: the rows are left for the gate
+/// (the mount defers; a reopen needs --force-base-mismatch).
+#[cfg(unix)]
+#[test]
+fn regression_moved_base_complete_journal_is_recovered_through_its_new_name_and_defers() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (d, saved) = (root.join("d"), root.join("saved"));
+    fs::create_dir(&d).unwrap();
+    let a = d.join("a.tar");
+    write_tar(&a, &[("first", b"first member")]);
+    let overlay = root.join("overlay");
+    drop(open_with(&archive_token(&a), &overlay, strong_digest(), false).unwrap());
+    let before = (recorded_rows(&overlay), digest_rows(&overlay));
+    interrupt_complete(&a);
+    let new = fs::read(&a).unwrap();
+    fs::rename(&d, &saved).unwrap();
+    fs::create_dir(&d).unwrap();
+    write_tar(&d.join("a.tar"), &[("other", b"journal-free B")]);
+    let b_bytes = fs::read(d.join("a.tar")).unwrap();
+    let moved = saved.join("a.tar");
+    let records = MountRecords {
+        top: Some(overlay.clone()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        classify_mount_journal(&records, &moved).unwrap(),
+        MountJournal::Deferred { complete: true, .. }
+    ));
+    let applied =
+        crate::recover_journal_at(&moved, Some(&overlay.join(HIDDEN_DB)), crate::Owner::Inode)
+            .unwrap()
+            .expect("found beside the new name");
+    assert!(applied.rolled_forward);
+    assert_eq!(fs::read(&moved).unwrap(), new, "never rolled back");
+    assert!(ratarmount_compress::commit_journal::pending(&moved)
+        .unwrap()
+        .is_none());
+    assert!(!journal_path(&moved).exists());
+    assert_eq!((recorded_rows(&overlay), digest_rows(&overlay)), before);
+    assert_eq!(fs::read(d.join("a.tar")).unwrap(), b_bytes);
+    let refused = open_with(
+        &archive_token(&moved),
+        &overlay,
+        BaseDigestRequest::Compute,
+        false,
+    )
+    .err()
+    .expect("an ambiguous move is left to the gate")
+    .to_string();
+    assert!(refused.contains("--force-base-mismatch"), "{refused}");
+}
+
+/// Regression: disjunct 3 of `journal_agrees`: a torn journal whose rows
+/// already describe the rolled-back file (only its unlink is owed) agrees;
+/// a complete one, or a file of another length, does not.
+#[test]
+fn regression_journal_agrees_disjunct_three() {
+    let journal = ratarmount_compress::commit_journal::PendingJournal {
+        dev: 1,
+        ino: 2,
+        len: 100,
+        mtime_ns: 5,
+        offset: 50,
+        new_len: 150,
+        complete: false,
+    };
+    assert!(crate::journal_agrees((100, 9), (100, 9), &journal));
+    assert!(!crate::journal_agrees((100, 9), (150, 9), &journal));
+    assert!(!crate::journal_agrees((100, 9), (100, 8), &journal));
+    let complete = ratarmount_compress::commit_journal::PendingJournal {
+        complete: true,
+        ..journal
+    };
+    assert!(!crate::journal_agrees((100, 9), (100, 9), &complete));
 }

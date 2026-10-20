@@ -162,7 +162,9 @@ impl Rows<'_> {
 }
 
 /// The journal's pre-commit stamp is the recorded one, or the rows already
-/// describe the committed bytes and only the unlink is owed.
+/// describe the file recovery will leave and only the unlink is owed: the
+/// committed bytes (a complete journal) or the rolled-back bytes whose mtime
+/// could not be restored (a torn journal whose old bytes are in place).
 pub fn journal_agrees(
     recorded: (u64, i128),
     current: (u64, i128),
@@ -170,6 +172,7 @@ pub fn journal_agrees(
 ) -> bool {
     (journal.len, journal.mtime_ns) == recorded
         || (journal.complete && current.0 == journal.new_len && current == recorded)
+        || (!journal.complete && current.0 == journal.len && current == recorded)
 }
 
 fn busy(error: &rusqlite::Error) -> bool {
@@ -186,6 +189,39 @@ fn names(meta: &OverlayMeta, canonical: &Path) -> bool {
     (local || located) && meta.get("base_kind").is_none_or(|kind| kind == "archive")
 }
 
+/// THE target rule: a journal on the file `file` (its CURRENT `(dev, ino)`:
+/// the locked descriptor's, or a stat of the member) opened through
+/// `canonical` is the recorded base's journal when the record names
+/// `canonical`, or when the recorded base's local path resolves to that very
+/// file (a hard link or another name of it; device AND inode, never the inode
+/// alone). Ownership is never inferred from stamps: a base that left its
+/// recorded place (a renamed directory, a replaced name) is not the target,
+/// and its journal is left to the gate (Astra v4 F2, F3).
+pub(crate) fn journal_targets_record(
+    meta: &OverlayMeta,
+    canonical: &Path,
+    file: (u64, u64),
+) -> bool {
+    if names(meta, canonical) {
+        return true;
+    }
+    if !meta.get("base_kind").is_none_or(|kind| kind == "archive") {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.get("base_local_path")
+            .and_then(|path| fs::metadata(path).ok())
+            .is_some_and(|base| (base.dev(), base.ino()) == file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        false
+    }
+}
+
 /// Write the stamp recovery (or the commit) produced into the overlay's rows.
 ///
 /// The rows are never derived from a path: `applied` carries the LOCKED
@@ -198,11 +234,6 @@ pub(crate) fn restamp_rows(
     applied: &Applied,
     mode: Restamp,
 ) -> io::Result<()> {
-    // A rollback restored the recorded state: the commit's baseline (and a
-    // strong digest) already describe it, so there is nothing to move.
-    if mode == Restamp::Commit && !applied.rolled_forward {
-        return Ok(());
-    }
     let target = fs::metadata(archive)?;
     #[cfg(unix)]
     {
@@ -254,47 +285,65 @@ fn restamp_once(
     let result = (|| -> std::result::Result<(), RestampError> {
         let meta = OverlayMeta::from_connection(conn)
             .map_err(|e| RestampError::Other(io::Error::other(e.to_string())))?;
-        // A union member's journal, a record aimed at another place, a
-        // kind-only record and a record without a stamp leave the rows alone.
+        // A journal whose target is not the recorded base (a union member, a
+        // base that left its recorded place), a kind-only record and a record
+        // without a stamp leave the rows alone.
         let Some(meta) = meta else {
             return Ok(());
         };
-        if !names(&meta, canonical) || kind_only(&meta) {
+        if !journal_targets_record(&meta, canonical, (applied.dev, applied.ino)) || kind_only(&meta)
+        {
             return Ok(());
         }
         let (Some(size), Some(mtime)) = (meta.get("base_size"), meta.get("base_mtime_ns")) else {
             return Ok(());
         };
+        let other = |e: OverlayError| RestampError::Other(io::Error::other(e.to_string()));
         let final_size = applied.final_len.to_string();
         let final_mtime = applied.final_mtime_ns.to_string();
-        if mode == Restamp::Recovery {
-            let started_on_rows =
-                applied.pre_len.to_string() == size && applied.pre_mtime_ns.to_string() == mtime;
-            let already_final = size == final_size && mtime == final_mtime;
-            if already_final {
+        // The journal was started on the recorded state.
+        let started =
+            applied.pre_len.to_string() == size && applied.pre_mtime_ns.to_string() == mtime;
+        let stamp = [
+            ("base_size", final_size.as_str()),
+            ("base_mtime_ns", final_mtime.as_str()),
+        ];
+        let weak = format!("weak:size={final_size},mtime_ns={final_mtime}");
+        if !applied.rolled_forward {
+            // A rollback restored the recorded bytes under a lock never
+            // released; only an mtime it could not restore (EPERM for a
+            // non-owner) can differ. The rows follow it only when the journal
+            // was started on the recorded state (a forced attempt over another
+            // file never moves the baseline); a strong digest still names the
+            // restored bytes.
+            if applied.final_len != applied.pre_len {
+                return Err(RestampError::Other(io::Error::other(format!(
+                    "a rollback ended at {} bytes, not the {} it restores; rows left as they were",
+                    applied.final_len, applied.pre_len
+                ))));
+            }
+            if applied.final_mtime_ns == applied.pre_mtime_ns || !started {
                 return Ok(());
             }
-            if !(applied.rolled_forward && started_on_rows) {
-                return Ok(());
+            OverlayMeta::set_many(conn, &stamp).map_err(other)?;
+            if meta.base_digest_kind() == Some("weak") {
+                OverlayMeta::set_many(conn, &[("base_digest", weak.as_str())]).map_err(other)?;
             }
+            return Ok(());
         }
-        OverlayMeta::set_many(
-            conn,
-            &[
-                ("base_size", final_size.as_str()),
-                ("base_mtime_ns", final_mtime.as_str()),
-            ],
-        )
-        .map_err(|e| RestampError::Other(io::Error::other(e.to_string())))?;
-        // The recorded digest names the PRE-crash bytes. A weak one is the
-        // stamp itself; a strong one is marked `pending` (never cleared) and
-        // resolved lazily by seal, diff, pack or grading, so mounting stays
-        // fast.
+        // A roll-forward. A recovery of a journal started on another state
+        // leaves the rows (unless they already describe the committed bytes).
+        if mode == Restamp::Recovery && !started && (size != final_size || mtime != final_mtime) {
+            return Ok(());
+        }
+        OverlayMeta::set_many(conn, &stamp).map_err(other)?;
+        // The recorded digest names the PRE-commit bytes, also when the stamp
+        // did not change (an equal-length, equal-mtime commit, or relocation
+        // rows written before this recovery). A weak one is the stamp itself;
+        // a strong one is marked `pending` (never cleared) and resolved lazily
+        // by seal, diff, pack or grading, so mounting stays fast.
         let digest = match meta.base_digest_kind() {
-            Some("weak") => {
-                let weak = format!("weak:size={final_size},mtime_ns={final_mtime}");
-                OverlayMeta::set_many(conn, &[("base_digest", weak.as_str())])
-            }
+            Some("weak") => OverlayMeta::set_many(conn, &[("base_digest", weak.as_str())]),
             Some("strong") => OverlayMeta::set_many(
                 conn,
                 &[("base_digest", ""), ("base_digest_kind", "pending")],
@@ -323,10 +372,6 @@ pub(crate) fn recover_journal(
     let mut authorize =
         |header: &PendingJournal, locked: &fs::Metadata| owner.authorize(header, locked);
     commit_journal::recover_with(archive, &mut authorize, &mut |applied| {
-        // A rollback restores the recorded state: nothing to restamp.
-        if !applied.rolled_forward {
-            return Ok(());
-        }
         rows.with(|conn| restamp_rows(conn, archive, applied, Restamp::Recovery))
     })
 }
@@ -363,7 +408,9 @@ pub(crate) fn own_pending_journal_agrees(
     ) else {
         return false;
     };
-    if !names(meta, &canonical) {
+    if !fs::metadata(&canonical)
+        .is_ok_and(|m| journal_targets_record(meta, &canonical, file_id(&m)))
+    {
         return false;
     }
     let Ok(Some(journal)) = commit_journal::pending(&canonical) else {
@@ -433,20 +480,20 @@ fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
 }
 
 /// The decision table on the journal header and the file's current identity.
-/// `current` is `(ino, len, mtime_ns)`.
+/// `current` is `((dev, ino), len, mtime_ns)`.
 fn decide(
     records: &MountRecords,
     canonical: &Path,
     journal: &PendingJournal,
-    current: (u64, u64, i128),
+    current: ((u64, u64), u64, i128),
 ) -> io::Result<MountJournal> {
-    if journal.ino != current.0 {
+    if journal.ino != current.0 .1 {
         return Err(io::Error::other(format!(
             "{} carries a commit journal that was started for another file \
              (journal inode {}, archive inode {}); the journal was not applied",
             canonical.display(),
             journal.ino,
-            current.0
+            current.0 .1
         )));
     }
     let defer = |why: String, flag: &'static str| MountJournal::Deferred {
@@ -497,7 +544,7 @@ fn decide(
             }
             Recorded::Kind { .. } => {}
         }
-        if !names(&meta, canonical) {
+        if !journal_targets_record(&meta, canonical, current.0) {
             return Ok(defer("is not the base this overlay recorded".into(), flag));
         }
         if kind_only(&meta) {
@@ -524,19 +571,32 @@ fn decide(
     Ok(MountJournal::Own)
 }
 
-fn current_identity(meta: &fs::Metadata) -> (u64, u64, i128) {
+fn file_id(meta: &fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        (0, 0)
+    }
+}
+
+fn current_identity(meta: &fs::Metadata) -> ((u64, u64), u64, i128) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         (
-            meta.ino(),
+            file_id(meta),
             meta.len(),
             i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
         )
     }
     #[cfg(not(unix))]
     {
-        (0, meta.len(), 0)
+        (file_id(meta), meta.len(), 0)
     }
 }
 
