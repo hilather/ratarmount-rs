@@ -2250,6 +2250,70 @@ fn regression_mount_symlinked_overlay_db_defers_recovery() {
     assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
 }
 
+/// Regression (r16 skeptic, R7-D2): A's overlay database is replaced by a
+/// directory, then B with its own torn journal is renamed over A.
+/// `read_record` treated a directory at the database path as "no record", so
+/// the top record abstained, the mount classified B's journal `Own` and
+/// recovery rolled B back before `WriteOverlay::open` refused the directory.
+/// Any non-regular file at the database path is an unreadable record: the
+/// classifier defers, the locked authorizer refuses, B and its journal stay
+/// byte-identical and the gate refuses.
+#[cfg(unix)]
+#[test]
+fn regression_mount_directory_at_overlay_db_defers_recovery() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let db = fx.overlay.join(HIDDEN_DB);
+    fs::remove_file(&db).unwrap();
+    fs::create_dir(&db).unwrap();
+    let (bytes, journal, journal_bytes) = rename_b_over_a(&fx, false);
+    let records = records_of(&fx);
+    match classify_mount_journal(&records, &fx.archive).unwrap() {
+        MountJournal::Deferred {
+            force_flag, why, ..
+        } => {
+            assert_eq!(force_flag, "--force-base-mismatch");
+            assert!(why.contains("cannot be read"), "{why}");
+        }
+        other => panic!("a directory at the database path must defer: {other:?}"),
+    }
+    let archive = fx.archive.clone();
+    let mut authorize = |h: &ratarmount_compress::commit_journal::PendingJournal,
+                         m: &fs::Metadata| {
+        authorize_mount_recovery(&records, &archive, h, m)
+    };
+    let refused =
+        crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Test(&mut authorize));
+    assert!(
+        matches!(
+            refused,
+            Err(ratarmount_compress::commit_journal::RecoverError::Refused(
+                _
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(fs::read(&fx.archive).unwrap(), bytes, "B untouched");
+    assert_eq!(
+        fs::read(&journal).unwrap(),
+        journal_bytes,
+        "B's journal kept"
+    );
+    assert!(
+        crate::overlay_gate::check_commit_base_offline(
+            &fx.overlay,
+            &archive_token(&fx.archive),
+            &fx.archive
+        )
+        .is_err(),
+        "the gate refuses"
+    );
+}
+
 /// Regression (R7-B2): a journal-bearing file B takes A's name AFTER the
 /// append's suffix was staged and BEFORE the journaled replacement. The
 /// replacement fails ("pending journal") and the fallback cleanup recovered

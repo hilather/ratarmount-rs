@@ -463,11 +463,11 @@ pub enum MountJournal {
 }
 
 fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
-    // Only a missing database is "no record". A symlink or anything that cannot
-    // be statted is an unreadable record: it must defer, never abstain.
+    // Only a missing database is "no record". A directory, a symlink or
+    // anything else that is not a regular file, or that cannot be statted, is
+    // an unreadable record: it must defer, never abstain.
     match fs::symlink_metadata(dir.join(crate::HIDDEN_DB)) {
         Ok(m) if m.is_file() => {}
-        Ok(m) if m.is_dir() => return Ok(None),
         Ok(_) => {
             return Err(io::Error::other(
                 "the overlay database is not a regular file".to_string(),
