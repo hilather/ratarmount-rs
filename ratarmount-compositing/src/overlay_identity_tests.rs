@@ -5812,3 +5812,68 @@ fn regression_fifo_payload_does_not_stall_db_opens() {
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     });
 }
+
+/// Regression (R10-FIX6, r10 skeptic #1): the required-record reader checked
+/// `files` and read `meta` as two autocommit reads. Another connection that
+/// committed `DROP TABLE files; DROP TABLE meta` between them made a lost
+/// record read as "unrecorded" (`Ok(None)`), so the offline gate passed a
+/// base that no longer matches the record. Both reads are now one read
+/// transaction: the concurrent DROP cannot commit while it is open, and the
+/// gate judges the record it found (the changed base is refused).
+#[test]
+fn regression_required_record_read_is_one_snapshot() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    write_tar(
+        &fx.archive,
+        &[("first", b"first member"), ("second", b"the base changed")],
+    );
+    let db = fx.overlay.join(HIDDEN_DB);
+    let arm = |dropped: Rc<Cell<Option<bool>>>| {
+        let db = db.clone();
+        crate::overlay_meta::BETWEEN_REQUIRED_READS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let other = rusqlite::Connection::open(&db).unwrap();
+                other.busy_timeout(std::time::Duration::ZERO).unwrap();
+                let committed = other
+                    .execute_batch("BEGIN IMMEDIATE; DROP TABLE files; DROP TABLE meta; COMMIT")
+                    .is_ok();
+                dropped.set(Some(committed));
+            }))
+        });
+    };
+    // The offline gate (an autocommit connection of its own).
+    let dropped = Rc::new(Cell::new(None));
+    arm(dropped.clone());
+    let refusal = crate::overlay_gate::check_commit_base_offline(
+        &fx.overlay,
+        &archive_token(&fx.archive),
+        &fx.archive,
+    )
+    .expect_err("the gate judged the record it read");
+    assert!(refusal.0.contains("base mismatch"), "{}", refusal.0);
+    assert_eq!(dropped.get(), Some(false), "the DROP committed mid-read");
+    // The reader itself, on an autocommit connection.
+    let dropped = Rc::new(Cell::new(None));
+    arm(dropped.clone());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let meta = crate::OverlayMeta::from_connection_required(&conn, true)
+        .unwrap()
+        .expect("one snapshot: the record is there");
+    assert!(meta.get("base_size").is_some());
+    assert_eq!(dropped.get(), Some(false), "the DROP committed mid-read");
+    assert!(conn.is_autocommit(), "the reader's transaction ended");
+    // Inside a caller's transaction the reader opens none of its own.
+    let tx = conn.unchecked_transaction().unwrap();
+    assert!(crate::OverlayMeta::from_connection_required(&tx, true)
+        .unwrap()
+        .is_some());
+    drop(tx);
+    // Control: without a reader the DROP commits.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE files; DROP TABLE meta")
+        .unwrap();
+}
