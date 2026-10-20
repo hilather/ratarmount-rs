@@ -26,7 +26,7 @@ use std::time::Duration;
 use ratarmount_compress::commit_journal::{
     self, Applied, PendingJournal, RecoverError, ReplaceError,
 };
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::write_overlay::{DbEntry, OverlayError};
 
@@ -82,6 +82,7 @@ impl Owner<'_> {
                 base,
                 archive,
                 Some((header, locked)),
+                true,
             )
             .map(drop)
             .map_err(refusal),
@@ -164,6 +165,38 @@ fn unusable(dir: &Path, entry: &io::Result<DbEntry>) -> Option<io::Error> {
     }
 }
 
+/// The refusal of a database seen earlier in this recovery and gone now.
+fn vanished(db: &Path) -> io::Error {
+    io::Error::other(format!(
+        "overlay database {} disappeared while a journal was being recovered (it existed \
+         when recovery was authorized); no recovery write was made after that and the \
+         journal is kept",
+        db.display()
+    ))
+}
+
+/// A used overlay's database `db` still has its `files` table (read-only).
+fn require_files(db: &Path) -> io::Result<()> {
+    let conn = crate::open_overlay_db(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        crate::DbName::Path,
+    )
+    .map_err(|e| io::Error::other(format!("cannot open {}: {e}", db.display())))?;
+    match crate::overlay_meta::has_files_table(&conn) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(io::Error::other(format!(
+            "{}: {}; no recovery write was made",
+            db.display(),
+            crate::overlay_meta::NO_FILES_TABLE
+        ))),
+        Err(e) => Err(io::Error::other(format!(
+            "cannot read {}: {e}",
+            db.display()
+        ))),
+    }
+}
+
 /// [`crate::write_overlay::overlay_db_entry`] as an `io::Result`.
 fn classify(dir: &Path) -> io::Result<DbEntry> {
     crate::write_overlay::overlay_db_entry(dir).map_err(|e| match e {
@@ -240,16 +273,28 @@ impl<'a> Rows<'a> {
         match self {
             Rows::None => Ok(()),
             Rows::Shared { dir, id, .. } => check_live(dir, *id),
-            Rows::Path { db, .. } => {
+            Rows::Path {
+                db,
+                must_exist,
+                required_files,
+            } => {
                 let dir = db_dir(db);
                 let entry = classify(dir);
                 if let Some(e) = unusable(dir, &entry) {
                     return Err(e);
                 }
-                if let Ok(entry) = &entry {
-                    self.observe(entry);
+                let entry = entry?;
+                self.observe(&entry);
+                match entry {
+                    // Seen before, gone now (database and marker both
+                    // removed): refuse here, before the first recovery write,
+                    // not only in `with` after it.
+                    DbEntry::Absent if must_exist.get() || required_files.get() => {
+                        Err(vanished(db))
+                    }
+                    DbEntry::Present { .. } if required_files.get() => require_files(db),
+                    _ => Ok(()),
                 }
-                Ok(())
             }
         }
     }
@@ -282,12 +327,7 @@ impl<'a> Rows<'a> {
                 self.observe(&entry);
                 if let DbEntry::Absent = entry {
                     if must_exist.get() || required_files.get() {
-                        return Err(io::Error::other(format!(
-                            "overlay database {} disappeared while a journal was being \
-                             recovered (it existed when recovery was authorized); the rows \
-                             were not restamped and the journal is kept",
-                            db.display()
-                        )));
+                        return Err(vanished(db));
                     }
                     // A raw overlay directory: nothing to restamp.
                     return Ok(());
@@ -451,21 +491,11 @@ fn restamp_once(
         // replaced database would otherwise read as "unrecorded" and the
         // journal would be unlinked with the rows never restamped. Plain SQL
         // inside this transaction: no nested BEGIN.
-        if required {
-            let files = conn
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'",
-                    [],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(classify)?
-                .is_some();
-            if !files {
-                return Err(RestampError::Other(io::Error::other(
-                    "the overlay database has no files table (the record of a used overlay                      is lost); the rows were not restamped and the journal is kept",
-                )));
-            }
+        if required && !crate::overlay_meta::has_files_table(conn).map_err(classify)? {
+            return Err(RestampError::Other(io::Error::other(format!(
+                "{}; the rows were not restamped and the journal is kept",
+                crate::overlay_meta::NO_FILES_TABLE
+            ))));
         }
         let meta = OverlayMeta::from_connection(conn)
             .map_err(|e| RestampError::Other(io::Error::other(e.to_string())))?;
@@ -571,9 +601,17 @@ pub(crate) fn recover_journal(
     };
     let mut before_write = || {
         for dir in &records {
-            if let Some(e) = unusable(dir, &classify(dir)) {
-                return Err(e);
-            }
+            // A lost, unclassifiable or `files`-less used record (R10-B).
+            read_record(dir).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "the overlay record in {} cannot be read: {e}; no recovery write \
+                         was made",
+                        dir.display()
+                    ),
+                )
+            })?;
         }
         rows.guard()
     };
@@ -684,9 +722,11 @@ fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
     if let Some(e) = unusable(dir, &entry) {
         return Err(e);
     }
-    if let Ok(DbEntry::Absent) = entry {
-        return Ok(None);
-    }
+    let marked = match entry {
+        Ok(DbEntry::Absent) => return Ok(None),
+        Ok(DbEntry::Present { marked, .. }) => marked,
+        _ => true,
+    };
     match fs::symlink_metadata(dir.join(crate::HIDDEN_DB)) {
         Ok(m) if m.is_file() => {}
         Ok(_) => {
@@ -696,7 +736,8 @@ fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
         }
         Err(e) => return Err(e),
     }
-    OverlayMeta::read_no_recovery(dir).map_err(|e| io::Error::other(e.to_string()))
+    // A marked record without a `files` table is lost, never unrecorded.
+    OverlayMeta::read_no_recovery_required(dir, marked).map_err(|e| io::Error::other(e.to_string()))
 }
 
 /// The decision table on the journal header and the file's current identity.

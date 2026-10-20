@@ -108,7 +108,7 @@ fn internal_name_refused(path: &str) -> OverlayError {
 
 /// Every regular overlay marker present (current name first, then legacy).
 /// A non-regular entry under either marker name fails closed.
-fn overlay_markers(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn overlay_markers(root: &Path) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut bad: Option<PathBuf> = None;
     for name in [OVERLAY_MARKER, LEGACY_OVERLAY_MARKER] {
@@ -7173,11 +7173,21 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
         )));
     }
     let conn = if db_regular {
-        Some(crate::open_overlay_db(
+        let conn = crate::open_overlay_db(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             crate::DbName::Path,
-        )?)
+        )?;
+        // A used overlay's database without its `files` table is a lost
+        // record (R10-B): refuse with its path, never plan without deletions.
+        if marker.is_some() && !crate::overlay_meta::has_files_table(&conn)? {
+            return Err(OverlayError::Msg(format!(
+                "{}: {}; refusing to commit without its deletions",
+                db_path.display(),
+                crate::overlay_meta::NO_FILES_TABLE
+            )));
+        }
+        Some(conn)
     } else {
         None
     };
