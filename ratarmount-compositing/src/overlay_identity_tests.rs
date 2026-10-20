@@ -5673,6 +5673,69 @@ fn regression_payload_alias_other_overlay() {
     ov_a.close_overlay_fd(fd);
 }
 
+/// Regression (R10-FIX3, r10 skeptic #5): the commit-journal name of a
+/// member is a hard link of the mount's open database. `pending()` (reached
+/// by live recovery before the guard) and the rollback's journal read opened
+/// it, rejected the header and closed the descriptor, releasing the mount's
+/// locks. Both refuse with `PermissionDenied` now; another process is still
+/// busy and the holder still writes.
+#[cfg(unix)]
+#[test]
+fn regression_journal_reads_refuse_a_db_alias() {
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    let db = fx.overlay.join(HIDDEN_DB);
+    let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+    fs::hard_link(&db, &journal).unwrap();
+    let error = ratarmount_compress::commit_journal::pending(&fx.archive).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{error}"
+    );
+    assert!(ov.recover_member_journal(&fx.archive).is_err());
+    assert!(
+        crate::overlay_db::lock_probe_is_busy(&db),
+        "a journal read released the mount's lock"
+    );
+    ov.set_meta("r10_probe", "still writes").unwrap();
+    assert!(crate::overlay_db::lock_probe_is_busy(&db));
+}
+
+/// Regression (R10-FIX3, r10 skeptic #4): a commit writing the provenance
+/// manifest read the previous `<archive>.manifest.jsonl` through a plain
+/// open. When that name is a hard link of another overlay's open database
+/// (B, mounted in this process), the close after the (failed) parse released
+/// B's locks. The read is admitted: refused with `PermissionDenied`, B's
+/// lock survives and B still writes.
+#[cfg(unix)]
+#[test]
+fn regression_manifest_read_refuses_a_db_alias() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    drop(a.open(BaseDigestRequest::Compute, false));
+    fs::write(a.overlay.join("new"), b"new member").unwrap();
+    let ov_b = b.open(BaseDigestRequest::Compute, false);
+    let b_db = b.overlay.join(HIDDEN_DB);
+    let mut manifest = a.archive.as_os_str().to_os_string();
+    manifest.push(crate::base_sidecars::MANIFEST_SIDECAR_SUFFIX);
+    fs::hard_link(&b_db, PathBuf::from(&manifest)).unwrap();
+    let opts = CommitOverlayOptions {
+        yes: true,
+        manifest_hashes: Some("all".into()),
+        ..Default::default()
+    };
+    let error = crate::commit_overlay(&a.overlay, &a.archive, &archive_token(&a.archive), &opts)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("open overlay database"), "{error}");
+    assert!(
+        crate::overlay_db::lock_probe_is_busy(&b_db),
+        "the manifest read released B's lock"
+    );
+    ov_b.set_meta("r10_probe", "still writes").unwrap();
+}
+
 // ---- R10-D: the inode registry is never held across an open --------------
 
 /// Regression (R10-D, Fable r10 blocker 2): a FIFO planted under a payload

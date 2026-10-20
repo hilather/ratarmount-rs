@@ -524,7 +524,7 @@ mod unix {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;
     use std::time::{Duration, UNIX_EPOCH};
 
     const MAGIC: &[u8; 8] = b"RMCJ0002";
@@ -1198,11 +1198,7 @@ mod unix {
         if !present {
             return Ok(None);
         }
-        let mut journal = match fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-        {
+        let mut journal = match open_journal(&path) {
             Ok(f) if f.metadata()?.is_file() => f,
             Ok(_) => return Ok(None),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1243,11 +1239,7 @@ mod unix {
     /// A regular file at `path` whose journal header names inode `ino` (the
     /// device is a hint only, as in [`validate`]).
     fn header_names(path: &Path, ino: u64) -> bool {
-        let Ok(mut journal) = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-        else {
+        let Ok(mut journal) = open_journal(path) else {
             return false;
         };
         if !journal.metadata().is_ok_and(|m| m.is_file()) {
@@ -1258,6 +1250,20 @@ mod unix {
             return false;
         }
         parse_pending(&header, false).ino == ino
+    }
+
+    /// Open a journal for reading through the admitted open (R10-FIX3): a
+    /// journal name that is another name (a hard link) of an open overlay
+    /// database is refused (`PermissionDenied`) without opening, and so
+    /// without closing, a descriptor of the database, which would release
+    /// this process's SQLite locks on it.
+    fn open_journal(path: &Path) -> io::Result<File> {
+        ratarmount_core::db_inodes::open_admitted(
+            path,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0,
+        )
+        .map(File::from)
     }
 
     fn parse_pending(header: &[u8; HEADER_LEN as usize], complete: bool) -> PendingJournal {
@@ -1333,10 +1339,7 @@ mod unix {
         if !fs::symlink_metadata(path)?.is_file() {
             return Err(io::Error::other("commit journal is not a regular file"));
         }
-        let mut journal = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
+        let mut journal = open_journal(path)?;
         if let Some(expected) = expected {
             let opened = journal.metadata()?;
             if (opened.dev(), opened.ino()) != expected {

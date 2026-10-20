@@ -837,7 +837,14 @@ fn sweep_pack_temps_in(dir: &OwnedFd) {
         if !old_enough {
             continue;
         }
-        let Ok(fd) = host::openat(dir, name, regular_flags(), Mode::empty()) else {
+        // Admitted (R10-FIX3): an old temp name that is a hard link of an open
+        // overlay database is skipped without a descriptor of it being
+        // opened and closed (its flock says nothing about SQLite's locks).
+        let Ok(fd) = name
+            .to_str()
+            .map_err(io::Error::other)
+            .and_then(|name| openat_admitted(dir, name, regular_flags()))
+        else {
             continue;
         };
         let file = File::from(fd);
@@ -1665,7 +1672,7 @@ pub(crate) fn cached_lower_in(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ratarmount_compositing::FolderMountSource;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2429,6 +2436,103 @@ mod tests {
     /// pathname after taking the flock; replacing the parent with a symlink
     /// then deleted a same-named file in another directory. Cleanup is relative
     /// to the directory opened once.
+    /// Set by [`pack_db_lock_busy_in_child`] for the child it spawns.
+    const PACK_DB_PROBE_ENV: &str = "RATARMOUNT_TEST_PACK_DB_PROBE";
+
+    /// The child half of [`pack_db_lock_busy_in_child`]: `BEGIN IMMEDIATE`
+    /// alone, busy timeout 0.
+    #[test]
+    fn pack_db_lock_probe_child() {
+        let Some(db) = std::env::var_os(PACK_DB_PROBE_ENV) else {
+            return;
+        };
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match conn.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => println!("PROBE:acquired"),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                println!("PROBE:busy")
+            }
+            Err(e) => panic!("probe: {e}"),
+        }
+    }
+
+    /// Another process's `BEGIN IMMEDIATE` on `db` is busy (the child must
+    /// exit successfully).
+    pub(crate) fn pack_db_lock_busy_in_child(db: &Path) -> bool {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "overlay_pack::tests::pack_db_lock_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PACK_DB_PROBE_ENV, db)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "probe child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if stdout.contains("PROBE:busy") {
+            return true;
+        }
+        assert!(stdout.contains("PROBE:acquired"), "probe child: {stdout}");
+        false
+    }
+
+    /// Regression (R10-FIX3, r10 skeptic #3): an old pack-temp name that is a
+    /// hard link of an open overlay database. The sweeper opened it, took a
+    /// flock and closed it, releasing every fcntl lock this process held on
+    /// the database (another process's `BEGIN IMMEDIATE` then succeeded
+    /// while the holder still wrote). The admitted open skips it: the name
+    /// stays, the child is still busy and the holder still commits.
+    #[test]
+    fn regression_pack_temp_sweep_skips_a_db_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let db = dir.join(".ratarmount.overlay.sqlite");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (x)")
+            .unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        File::options()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let alias = dir.join(".ratarmount-pack-Ab3xY9.tmp");
+        fs::hard_link(&db, &alias).unwrap();
+        let holder = ratarmount_compositing::open_overlay_db(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            ratarmount_compositing::DbName::Path,
+        )
+        .unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(pack_db_lock_busy_in_child(&db), "the holder's lock");
+        sweep_pack_temps_in(&open_root(&dir).unwrap());
+        assert!(alias.exists(), "a database alias is never swept");
+        assert!(
+            pack_db_lock_busy_in_child(&db),
+            "the sweep released the holder's lock"
+        );
+        holder
+            .execute_batch("INSERT INTO files VALUES (1); COMMIT")
+            .unwrap();
+        drop(holder);
+        assert!(!pack_db_lock_busy_in_child(&db), "probe control");
+    }
+
     #[test]
     fn regression_pack_temp_sweep_is_directory_relative() {
         let tmp = tempfile::tempdir().unwrap();
