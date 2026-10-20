@@ -4,6 +4,7 @@
 disallowed-methods = [
     { path = "ratarmount_compress::commit_journal::recover", reason = "test helper; recover through ratarmount_compositing::recover_journal_at with an Owner" },
     { path = "ratarmount_compress::commit_journal::recover_with", reason = "recover through ratarmount_compositing::recover_journal_at with an Owner" },
+    { path = "ratarmount_compress::commit_journal::recover_guarded", reason = "recover through ratarmount_compositing::recover_journal_at with an Owner" },
     { path = "ratarmount_compress::commit_journal::authorize_owned", reason = "use ratarmount_compositing::Owner::Inode" },
     { path = "ratarmount_compress::commit_journal::authorize_forced", reason = "use ratarmount_compositing::Owner::Forced (only behind a --force-* flag)" },
     { path = "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with", reason = "use journal_recovery::replace_committing" },

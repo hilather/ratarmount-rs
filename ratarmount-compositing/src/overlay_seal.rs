@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ratarmount_core::MountSource;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, OpenFlags};
 use rustix::fs::{self as host, AtFlags, Dir, Mode, OFlags};
 
 use crate::overlay_changes::{self as changes, ChangeOptions};
@@ -57,7 +57,7 @@ fn root(dir: &Path) -> io::Result<OwnedFd> {
     Ok(host::open(dir, directory_flags(), Mode::empty())?)
 }
 
-fn connection(dir: &Path, immutable: bool) -> io::Result<Connection> {
+fn connection(dir: &Path, immutable: bool) -> io::Result<crate::OverlayDb> {
     let path = dir.join(HIDDEN_DB);
     if !fs::symlink_metadata(&path)?.is_file() {
         return Err(io::Error::other("overlay database must be a regular file"));

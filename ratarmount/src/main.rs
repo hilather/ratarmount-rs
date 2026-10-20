@@ -1703,9 +1703,26 @@ fn main() {
         // A database overlay recovers a pending commit journal only after its
         // base identity gate (inside the commit): recovery rewrites the archive,
         // and it must not do that to an archive the overlay does not describe.
-        // Only a missing entry is "no database" (R7-E2): a dangling symlink,
-        // a directory or anything else there takes the database path below.
-        if ratarmount_compositing::overlay_db_absent(overlay) {
+        // Only a missing entry without a marker is "no database" (R7-E2,
+        // R10-B): a dangling symlink, a directory or anything else there takes
+        // the database path below; a lost record (marker kept, database gone)
+        // or an entry that cannot be classified refuses before any recovery.
+        let has_db = match ratarmount_compositing::overlay_db_entry(overlay) {
+            Ok(ratarmount_compositing::DbEntry::Absent) => false,
+            Ok(ratarmount_compositing::DbEntry::Present { .. }) => true,
+            Ok(ratarmount_compositing::DbEntry::Lost { markers, .. }) => {
+                eprintln!(
+                    "error: {}",
+                    ratarmount_compositing::lost_record_error(overlay, &markers)
+                );
+                std::process::exit(2);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        };
+        if !has_db {
             // No recorded base to compare, but a journal started for another
             // file (a copy of the interrupted bytes) must not be rolled in.
             if !args.force_base_mismatch {
@@ -1719,7 +1736,14 @@ fn main() {
             } else {
                 ratarmount_compositing::Owner::Inode
             };
-            let recovered = ratarmount_compositing::recover_journal_at(archive, None, owner);
+            // The overlay directory is passed so the guard under the archive
+            // lock re-classifies it (R10-B): nothing is restamped while it
+            // stays a raw directory.
+            let recovered = ratarmount_compositing::recover_journal_at(
+                archive,
+                Some(&overlay.join(ratarmount_compositing::HIDDEN_DB)),
+                owner,
+            );
             if let Err(e) = recovered {
                 eprintln!("error: commit recovery for {}: {e}", archive.display());
                 std::process::exit(2);
@@ -1745,7 +1769,7 @@ fn main() {
         // the archive is classified through the factory and gated before the
         // splice. A raw directory of files has no identity to check; it
         // commits through its own entry and says so.
-        let result = if !ratarmount_compositing::overlay_db_absent(overlay) {
+        let result = if has_db {
             base_identity::classify_offline_commit(
                 archive,
                 &overlay_run_context(args.index_folders.as_deref()),

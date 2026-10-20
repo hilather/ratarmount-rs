@@ -111,6 +111,41 @@ pub enum DbName<'a> {
     Uri(&'a str),
 }
 
+/// A connection [`open_overlay_db`] validated. Dereferences to the
+/// [`Connection`], so callers use it as one.
+#[derive(Debug)]
+pub struct OverlayDb {
+    conn: Connection,
+    id: Option<(u64, u64)>,
+}
+
+impl OverlayDb {
+    /// `(dev, ino)` of the database file, from the post-open path stat (see
+    /// the module docs: the file at the path right after SQLite's open, not
+    /// SQLite's own descriptor). `None` off Unix.
+    pub fn id(&self) -> Option<(u64, u64)> {
+        self.id
+    }
+
+    /// The connection, for a caller that keeps it in its own structure.
+    pub fn into_connection(self) -> Connection {
+        self.conn
+    }
+}
+
+impl std::ops::Deref for OverlayDb {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for OverlayDb {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+}
+
 /// Open the overlay database at `db` with `flags`; see the module docs.
 /// `SQLITE_OPEN_NOFOLLOW` also makes the type checks refuse a symlink at
 /// `db`; SQLite then refuses a symlink in any component, so the directory is
@@ -119,7 +154,7 @@ pub fn open_overlay_db(
     db: &Path,
     flags: OpenFlags,
     name: DbName<'_>,
-) -> Result<Connection, OverlayDbError> {
+) -> Result<OverlayDb, OverlayDbError> {
     let nofollow = flags.contains(OpenFlags::SQLITE_OPEN_NOFOLLOW);
     let resolved;
     let db = if nofollow || name == DbName::Immutable {
@@ -183,19 +218,29 @@ pub fn open_overlay_db(
             db.display()
         )));
     }
-    Ok(conn)
+    Ok(OverlayDb {
+        conn,
+        id: file_id(&opened),
+    })
 }
 
-#[cfg(unix)]
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    (a.dev(), a.ino()) == (b.dev(), b.ino())
+/// `(dev, ino)` of `metadata` (`None` off Unix).
+pub(crate) fn file_id(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 /// Without `(dev, ino)` the type checks are all there is.
-#[cfg(not(unix))]
-fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
-    true
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    file_id(a) == file_id(b)
 }
 
 #[cfg(all(test, unix))]
