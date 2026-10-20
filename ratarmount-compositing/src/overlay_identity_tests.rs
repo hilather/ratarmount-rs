@@ -3224,6 +3224,7 @@ fn regression_auto_copy_refuses_an_archive_that_changed_since_it_was_staged() {
 // ---- R7-D1: no copy over an archive that changed since the gate ----
 
 /// When P2 commits inside P1's commit, after P1's gate took its snapshot.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 enum AfterGate {
     /// Auto mode: right before the journaled replacement takes the archive
@@ -3276,6 +3277,7 @@ fn regression_no_copy_over_an_archive_changed_after_the_gate() {
     assert!(failed.is_empty(), "failed cases: {failed:?}");
 }
 
+#[cfg(unix)]
 fn no_copy_case(when: AfterGate, way: Way, zst: bool) {
     use std::rc::Rc;
     let case = format!("{when:?} {way:?} zst={zst}");
@@ -3362,6 +3364,7 @@ thread_local! {
 // ---- R7-E1: every copy path compares the gate's stamp ----
 
 /// When the other writer changes the archive inside P1's copy fallback.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CopyWindow {
     /// Right after the copy source was opened and compared ("copy source
@@ -3377,6 +3380,7 @@ enum CopyWindow {
 }
 
 /// The archive format of a copy-path row.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CopyFmt {
     Tar,
@@ -3388,6 +3392,7 @@ enum CopyFmt {
 }
 
 /// One copy/publish call site (R7-E1 inventory, PROGRESS "R6 fix round 7E").
+#[cfg(unix)]
 struct CopyRow {
     site: &'static str,
     fmt: CopyFmt,
@@ -3616,6 +3621,7 @@ fn regression_copy_paths_compare_the_gate_stamp() {
 
 /// A `.tar`/`.tar.zst` row: P2 (another `-w` overlay) appends its member in
 /// place inside P1's copy fallback.
+#[cfg(unix)]
 fn copy_row_with_p2(r: &CopyRow) {
     use std::rc::Rc;
     let case = r.site;
@@ -3693,6 +3699,7 @@ fn copy_row_with_p2(r: &CopyRow) {
 }
 
 /// The bytes of a one-member archive `x` in `fmt`.
+#[cfg(unix)]
 fn copy_row_archive(fmt: CopyFmt, name: &str, payload: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let dir = tempfile::tempdir().unwrap();
@@ -3728,6 +3735,7 @@ fn copy_row_archive(fmt: CopyFmt, name: &str, payload: &[u8]) -> Vec<u8> {
 
 /// An offline gzip/bzip2/xz/ZIP row: another writer rewrites the archive in
 /// place (same inode, a valid archive holding `x`) inside P1's commit.
+#[cfg(unix)]
 fn copy_row_in_place(r: &CopyRow) {
     use std::io::Write;
     let case = r.site;
