@@ -10,15 +10,21 @@
 //!    a FIFO, a device or a socket is refused without an `open(2)`, so a FIFO
 //!    never blocks;
 //! 2. SQLite opens the path;
-//! 3. a descriptor of our own is opened on the same path (`O_NONBLOCK`, and
-//!    `O_NOFOLLOW` under the same rule) and `fstat`ed: it must be a regular
+//! 3. the path is classified again under the same rule: it must be a regular
 //!    file with the `(dev, ino)` step 1 saw (or, when step 1 found nothing
 //!    and SQLite created the file, the one the path names now).
+//!
+//! Step 3 is a `stat`, never an `open(2)` (R7-H1): on POSIX, closing ANY
+//! descriptor of an inode releases every fcntl lock this process holds on
+//! it, including SQLite's (this connection's and any other connection's in
+//! the process), so a descriptor of our own would hand another process the
+//! write lock as soon as it was dropped. SQLite's own descriptors are safe:
+//! its unix VFS defers their close while the inode is locked.
 //!
 //! rusqlite does not expose the descriptor SQLite itself opened, so step 3
 //! proves the identity of the file at the path right after SQLite's open, not
 //! of SQLite's descriptor: an entry swapped away and back between steps 2 and
-//! 3 is not detected. Every swap that stays in place is.
+//! 3 is not detected (a known follow-up). Every swap that stays in place is.
 //!
 //! An error is returned before the caller reads or writes anything, so a
 //! caller that authorizes or recovers on the record refuses (or defers)
@@ -161,14 +167,13 @@ pub fn open_overlay_db(
         )?,
         DbName::Uri(uri) => Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI)?,
     };
-    let opened = own_descriptor(db, nofollow)
-        .and_then(|file| file.metadata())
-        .map_err(|e| {
-            OverlayDbError::NotRegular(format!(
-                "overlay database {} changed while it was opened: {e}",
-                db.display()
-            ))
-        })?;
+    // A stat, not an open: see the module docs (R7-H1).
+    let opened = stat(db).map_err(|e| {
+        OverlayDbError::NotRegular(format!(
+            "overlay database {} changed while it was opened: {e}",
+            db.display()
+        ))
+    })?;
     if !opened.is_file() {
         return Err(OverlayDbError::NotRegular(not_regular_message(db, &opened)));
     }
@@ -179,21 +184,6 @@ pub fn open_overlay_db(
         )));
     }
     Ok(conn)
-}
-
-#[cfg(unix)]
-fn own_descriptor(db: &Path, nofollow: bool) -> io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut flags = libc::O_NONBLOCK | libc::O_CLOEXEC;
-    if nofollow {
-        flags |= libc::O_NOFOLLOW;
-    }
-    fs::File::options().read(true).custom_flags(flags).open(db)
-}
-
-#[cfg(not(unix))]
-fn own_descriptor(db: &Path, _nofollow: bool) -> io::Result<fs::File> {
-    fs::File::open(db)
 }
 
 #[cfg(unix)]
@@ -281,5 +271,71 @@ mod tests {
         assert!(!missing.exists());
         open_overlay_db(&missing, OpenFlags::default(), DbName::Path).unwrap();
         assert!(missing.is_file());
+    }
+
+    /// Set by [`regression_open_overlay_db_keeps_other_connections_locks`]
+    /// for the child it spawns.
+    const PROBE_DB_ENV: &str = "RATARMOUNT_TEST_OVERLAY_DB_LOCK_PROBE";
+
+    /// The child half of the lock regression: try to take the write lock
+    /// without waiting and print what happened. A no-op unless spawned.
+    #[test]
+    fn overlay_db_lock_probe_child() {
+        let Some(db) = std::env::var_os(PROBE_DB_ENV) else {
+            return;
+        };
+        let conn = Connection::open(db).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2); COMMIT") {
+            Ok(()) => println!("PROBE:acquired"),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                println!("PROBE:busy")
+            }
+            Err(e) => println!("PROBE:error {e}"),
+        }
+    }
+
+    /// Regression (R7-H1): another connection of this process keeps its
+    /// write lock across an `open_overlay_db` of the same file. POSIX drops
+    /// every fcntl lock a process holds on an inode when ANY descriptor of
+    /// that inode is closed; the validated open used to open (and close) a
+    /// descriptor of its own, so a second process could then write while the
+    /// first still held RESERVED.
+    #[test]
+    fn regression_open_overlay_db_keeps_other_connections_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().canonicalize().unwrap().join("overlay.sqlite");
+        real_db(&db);
+        let holder = Connection::open(&db).unwrap();
+        holder
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (1)")
+            .unwrap();
+        for flags in [
+            RO,
+            OpenFlags::default(),
+            RO | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        ] {
+            drop(open_overlay_db(&db, flags, DbName::Path).unwrap());
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "overlay_db::tests::overlay_db_lock_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE_DB_ENV, &db)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("PROBE:busy"),
+            "a second process must still see the holder's write lock after \
+             open_overlay_db; child stdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        holder.execute_batch("COMMIT").unwrap();
     }
 }
