@@ -4021,6 +4021,142 @@ fn regression_offline_db_deleted_after_gate_keeps_recorded_owner() {
     );
 }
 
+/// What replaces the overlay database in [`regression_offline_gates_refuse_non_regular_db`].
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum NotADb {
+    /// A symlink to `/dev/null` (SQLite reads it as an empty database).
+    DevNull,
+    /// A FIFO (an `O_RDONLY` open blocks until a writer appears).
+    Fifo,
+}
+
+#[cfg(unix)]
+fn replace_db(overlay: &Path, with: NotADb) {
+    let db = overlay.join(HIDDEN_DB);
+    fs::rename(&db, overlay.with_file_name("saved.sqlite")).unwrap();
+    match with {
+        NotADb::DevNull => std::os::unix::fs::symlink("/dev/null", &db).unwrap(),
+        NotADb::Fifo => {
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(db.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+        }
+    }
+}
+
+/// An archive's bytes and its journal's bytes.
+#[cfg(unix)]
+type ArchiveAndJournal = (Vec<u8>, Vec<u8>);
+
+/// Regression (r18 skeptic #1, R7-F1): the offline gates opened the overlay
+/// database without checking what it is. A symlink to `/dev/null` there read
+/// as an empty database (no record), so a gate accepted any journal that was
+/// the file's own; a FIFO there blocked the gate's open forever. Every row
+/// must refuse promptly, with the archive and its journal untouched:
+/// - `entry`: A's database is replaced and B (another archive carrying its own
+///   journal) is renamed over A before `commit_overlay`; its entry gate
+///   accepted and recovery rewrote B before the plan's regular-file check
+///   refused.
+/// - `inside`: after the entry gate accepted A, the database is replaced and A
+///   gets a journal started on a state that is not the recorded one (another
+///   writer appended and crashed); the recovery owner's gate under the archive
+///   lock saw no record and rolled A back.
+#[cfg(unix)]
+#[test]
+fn regression_offline_gates_refuse_non_regular_db() {
+    use std::sync::{Arc, Mutex};
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let mut failed = Vec::new();
+    for with in [NotADb::DevNull, NotADb::Fifo] {
+        for inside in [false, true] {
+            let case = format!("{with:?} {}", if inside { "inside" } else { "entry" });
+            let fx = Fixture::new();
+            let ov = fx.open(BaseDigestRequest::Compute, false);
+            fs::write(ov.root().join("new"), b"new").unwrap();
+            drop(ov);
+            // B's journal keeps the name it was started under.
+            let foreign = fx.archive.with_file_name("foreign.tar");
+            let journal = ratarmount_compress::commit_journal::journal_path(if inside {
+                &fx.archive
+            } else {
+                &foreign
+            });
+            // The archive and journal bytes recovery must leave alone.
+            let expected: Arc<Mutex<Option<ArchiveAndJournal>>> = Arc::default();
+            if !inside {
+                write_tar(&foreign, &[("b", b"bb"), ("c", b"c")]);
+                interrupt_append(&foreign);
+                *expected.lock().unwrap() =
+                    Some((fs::read(&foreign).unwrap(), fs::read(&journal).unwrap()));
+                replace_db(&fx.overlay, with);
+                fs::rename(&foreign, &fx.archive).unwrap();
+            }
+            let (overlay, archive) = (fx.overlay.clone(), fx.archive.clone());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let seen = expected.clone();
+            // The hook is thread-local: install it in the committing thread.
+            std::thread::spawn(move || {
+                let token = archive_token(&archive);
+                if inside {
+                    let (overlay, archive) = (overlay.clone(), archive.clone());
+                    crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            replace_db(&overlay, with);
+                            use std::io::Write;
+                            fs::File::options()
+                                .append(true)
+                                .open(&archive)
+                                .unwrap()
+                                .write_all(&[0u8; 512])
+                                .unwrap();
+                            interrupt_append(&archive);
+                            let journal =
+                                ratarmount_compress::commit_journal::journal_path(&archive);
+                            *seen.lock().unwrap() =
+                                Some((fs::read(&archive).unwrap(), fs::read(journal).unwrap()));
+                        }));
+                    });
+                }
+                let opts = CommitOverlayOptions {
+                    yes: true,
+                    ..Default::default()
+                };
+                let result = crate::commit_overlay(&overlay, &archive, &token, &opts)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            });
+            let outcome = rx.recv_timeout(std::time::Duration::from_secs(20));
+            if outcome.is_err() {
+                // Unblock an open stuck on the FIFO, then let it finish.
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = fs::File::options()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(fx.overlay.join(HIDDEN_DB));
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(20));
+                failed.push(format!("{case}: blocked on the database open"));
+                continue;
+            }
+            let (bytes, journal_bytes) = expected.lock().unwrap().clone().expect("seam ran");
+            match outcome.unwrap() {
+                Ok(done) => failed.push(format!("{case}: committed ({done})")),
+                Err(_) if fs::read(&fx.archive).unwrap() != bytes => {
+                    failed.push(format!("{case}: the archive was rewritten"))
+                }
+                Err(_) if !fs::read(&journal).is_ok_and(|j| j == journal_bytes) => {
+                    failed.push(format!("{case}: the archive's journal was removed"))
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    assert!(failed.is_empty(), "failed rows: {failed:?}");
+}
+
 // ---- R7-C5: one target rule, one restamp rule, disjunct 3, idempotent rollback ----
 
 fn strong_fixture() -> Fixture {

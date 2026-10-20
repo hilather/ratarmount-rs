@@ -10,7 +10,7 @@ use ratarmount_core::{
     create_root_file_info, metadata_mode, normpath, read_exact_or_short, ArchiveRead,
     BackingExtent, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, UserData,
 };
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OpenFlags;
 
 use crate::write_overlay::{file_info_from_overlay_meta, open_options_nofollow, set_info_atime};
 use crate::{is_overlay_internal_path, OverlayMetadata, HIDDEN_DB};
@@ -90,14 +90,12 @@ impl ReadOnlyOverlayLayer {
             ));
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = match immutability {
-            Immutability::Immutable => Connection::open_with_flags(
-                immutable_uri(&db_path),
-                flags | OpenFlags::SQLITE_OPEN_URI,
-            ),
-            Immutability::Shared => Connection::open_with_flags(&db_path, flags),
-        }
-        .map_err(|e| database_error(&root, e))?;
+        let name = match immutability {
+            Immutability::Immutable => crate::DbName::Immutable,
+            Immutability::Shared => crate::DbName::Path,
+        };
+        let conn = crate::open_overlay_db(&db_path, flags, name)
+            .map_err(|e| e.into_io_with(|e| database_error(&root, e)))?;
         conn.busy_timeout(std::time::Duration::ZERO)
             .map_err(|e| database_error(&root, e))?;
         let tx = conn
@@ -670,6 +668,7 @@ mod tests {
     use super::*;
     use crate::{overlay_atime, WriteOverlay, OVERLAY_MARKER};
     use ratarmount_core::{S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
+    use rusqlite::Connection;
     use std::io::{Cursor, Read};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

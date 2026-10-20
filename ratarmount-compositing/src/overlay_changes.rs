@@ -17,7 +17,7 @@ use ratarmount_core::{
     ArchiveRead, FileInfo, ListResult, MountSource, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
 };
 use regex::bytes::Regex;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OpenFlags;
 #[cfg(unix)]
 use rustix::fs::{self as host, AtFlags, Dir, Mode, OFlags, Stat};
 use serde_json::{Map, Value};
@@ -797,14 +797,11 @@ pub(crate) fn mentioned_paths_with_immutability(
         ));
     }
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = match immutability {
-        Immutability::Shared => Connection::open_with_flags(&db, flags),
-        Immutability::Immutable => Connection::open_with_flags(
-            crate::overlay_layer::immutable_uri(&db.canonicalize()?),
-            flags | OpenFlags::SQLITE_OPEN_URI,
-        ),
-    }
-    .map_err(io::Error::other)?;
+    let name = match immutability {
+        Immutability::Shared => crate::DbName::Path,
+        Immutability::Immutable => crate::DbName::Immutable,
+    };
+    let conn = crate::open_overlay_db(&db, flags, name)?;
     conn.busy_timeout(std::time::Duration::ZERO)
         .map_err(io::Error::other)?;
     let mut stmt = conn
@@ -916,9 +913,11 @@ pub fn change_set_without_base(top_dir: &Path, opts: &ChangeOptions) -> io::Resu
     // still a write, never a deletion; expose its known mode without inventing
     // an empty content hash or a size. Time-only mentions are not diff changes.
     if changes.iter().any(|c| c.new.is_none() && c.old.is_none()) {
-        let conn =
-            Connection::open_with_flags(top_dir.join(HIDDEN_DB), OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(io::Error::other)?;
+        let conn = crate::open_overlay_db(
+            &top_dir.join(HIDDEN_DB),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            crate::DbName::Path,
+        )?;
         let has_metadata: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='overlay_metadata' AND type='table')", [], |r| r.get(0)).map_err(io::Error::other)?;
         let mut stmt = conn
             .prepare("SELECT path,name,mode,deleted FROM files")
@@ -1244,6 +1243,7 @@ pub(crate) fn cow_write(overlay: &crate::WriteOverlay, path: &str, bytes: &[u8])
 mod tests {
     use super::*;
     use crate::{FolderMountSource, OverlayMetadata, WriteOverlay};
+    use rusqlite::Connection;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

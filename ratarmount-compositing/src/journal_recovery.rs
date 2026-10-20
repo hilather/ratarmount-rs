@@ -137,10 +137,11 @@ impl Rows<'_> {
                 if crate::write_overlay::db_entry_absent(db) {
                     return Ok(());
                 }
-                let conn = Connection::open_with_flags(
+                let conn = crate::open_overlay_db(
                     db,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    crate::DbName::Path,
                 )
                 .map_err(|e| {
                     io::Error::other(format!(

@@ -1693,9 +1693,10 @@ impl MountLowerStack {
                 dir.display(), serde_json::to_string(&recorded).expect("lower records"),
                 serde_json::to_string(&self.records).expect("lower records")));
         }
-        let mut conn = rusqlite::Connection::open_with_flags(
-            dir.join(HIDDEN_DB),
+        let mut conn = ratarmount_compositing::open_overlay_db(
+            &dir.join(HIDDEN_DB),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            ratarmount_compositing::DbName::Path,
         )
         .map_err(|e| e.to_string())?;
         conn.busy_timeout(Duration::ZERO)

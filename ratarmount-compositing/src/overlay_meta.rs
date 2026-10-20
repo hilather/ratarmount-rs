@@ -148,11 +148,12 @@ fn recover_hot_journal(dir: &Path, db: &Path) -> Result<()> {
     if !path_writable(dir) || !path_writable(db) {
         return Err(refuse("the overlay or its directory is read-only"));
     }
-    let conn = Connection::open_with_flags(
-        dir.canonicalize()?.join(HIDDEN_DB),
+    let conn = crate::open_overlay_db(
+        &dir.join(HIDDEN_DB),
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        crate::DbName::Path,
     )?;
     conn.busy_timeout(std::time::Duration::ZERO)?;
     // Any read takes the shared lock, which plays the journal back.
@@ -209,9 +210,10 @@ impl OverlayMeta {
             )));
         }
         let read = || -> Result<Option<Self>> {
-            let conn = Connection::open_with_flags(
+            let conn = crate::open_overlay_db(
                 &db,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                crate::DbName::Path,
             )?;
             conn.busy_timeout(std::time::Duration::ZERO)?;
             Self::from_connection(&conn)
@@ -1301,7 +1303,7 @@ pub(crate) fn refresh_committed_base_offline(
     if crate::overlay_db_absent(overlay) {
         return Ok(());
     }
-    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let conn = crate::open_overlay_db(&db, OpenFlags::SQLITE_OPEN_READ_WRITE, crate::DbName::Path)?;
     conn.busy_timeout(std::time::Duration::ZERO)?;
     refresh_committed_base(&conn, base, archive).map(|_| ())
 }
@@ -1627,11 +1629,12 @@ pub(crate) fn record_base_rows_offline(
     overlay: &Path,
     rows: &BTreeMap<String, String>,
 ) -> Result<()> {
-    // NOFOLLOW rejects a symlink in any component, so resolve the directory
-    // first (every macOS temp dir lives under /var -> /private/var).
-    let conn = Connection::open_with_flags(
-        overlay.canonicalize()?.join(HIDDEN_DB),
+    // NOFOLLOW rejects a symlink in any component; the shared open resolves
+    // the directory first (every macOS temp dir lives under /var -> /private/var).
+    let conn = crate::open_overlay_db(
+        &overlay.join(HIDDEN_DB),
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        crate::DbName::Path,
     )?;
     conn.busy_timeout(std::time::Duration::ZERO)?;
     conn.execute_batch("BEGIN IMMEDIATE")?;

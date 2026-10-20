@@ -829,9 +829,12 @@ pub(crate) fn check_commit_base_offline_with(
     )>,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
     let db = overlay.join(HIDDEN_DB);
-    let conn = Connection::open_with_flags(
+    // The validated open (R7-F1): a database that is not a regular file
+    // refuses here, before any authorization or recovery reads it.
+    let conn = crate::open_overlay_db(
         &db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        crate::DbName::Path,
     )
     .map_err(|e| CommitBaseRefusal(format!("cannot open {}: {e}", db.display())))?;
     check_commit_base_with(&conn, base, archive, locked)

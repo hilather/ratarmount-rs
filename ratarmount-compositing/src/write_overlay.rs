@@ -1135,7 +1135,7 @@ impl WriteOverlay {
                 )
             )));
         }
-        let mut conn = Connection::open(&db_path)?;
+        let mut conn = crate::open_overlay_db(&db_path, OpenFlags::default(), crate::DbName::Path)?;
         let had_files = conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'",
@@ -7071,9 +7071,10 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
         )));
     }
     let conn = if db_regular {
-        Some(Connection::open_with_flags(
+        Some(crate::open_overlay_db(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            crate::DbName::Path,
         )?)
     } else {
         None

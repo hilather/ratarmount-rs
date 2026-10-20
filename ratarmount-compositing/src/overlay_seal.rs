@@ -62,21 +62,22 @@ fn connection(dir: &Path, immutable: bool) -> io::Result<Connection> {
     if !fs::symlink_metadata(&path)?.is_file() {
         return Err(io::Error::other("overlay database must be a regular file"));
     }
+    // NOFOLLOW rejects a symlink in any component; the shared open resolves
+    // the directory.
     let conn = if immutable {
-        Connection::open_with_flags(
-            crate::overlay_layer::immutable_uri(&path.canonicalize()?),
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        crate::open_overlay_db(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            crate::DbName::Immutable,
         )
     } else {
-        // NOFOLLOW rejects a symlink in any component, so resolve the directory.
-        Connection::open_with_flags(
-            dir.canonicalize()?.join(HIDDEN_DB),
+        crate::open_overlay_db(
+            &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            crate::DbName::Path,
         )
     }
-    .map_err(sql_error)?;
+    .map_err(|e| e.into_io_with(sql_error))?;
     conn.busy_timeout(std::time::Duration::ZERO)
         .map_err(sql_error)?;
     Ok(conn)

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
 
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OpenFlags;
 
 use crate::write_overlay::is_overlay_internal_path;
 use crate::{OverlayError, OverlayMutation, OverlayPolicy, HIDDEN_DB};
@@ -71,9 +71,10 @@ impl OverlayStats {
             )
             .into());
         }
-        let conn = Connection::open_with_flags(
-            db,
+        let conn = crate::open_overlay_db(
+            &db,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            crate::DbName::Path,
         )?;
         let files_deleted =
             conn.query_row("SELECT count(*) FROM files WHERE deleted = 1", [], |row| {
@@ -669,6 +670,7 @@ mod tests {
     use ratarmount_core::{MountSource, OpenOptions};
     use ratarmount_formats_tar::SqliteIndexedTar;
     use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
+    use rusqlite::Connection;
     use std::fs::File;
     use std::io::{Cursor, Read};
 

@@ -168,12 +168,13 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     };
     // NOFOLLOW makes SQLite reject a symlink in any path component (macOS
-    // temp dirs live under /var -> /private/var); only the DB file must not be one.
-    let conn = Connection::open_with_flags(
-        dir.canonicalize()?.join(HIDDEN_DB),
+    // temp dirs live under /var -> /private/var); the shared open resolves the
+    // directory, so only the DB file must not be one.
+    let conn = crate::open_overlay_db(
+        &dir.join(HIDDEN_DB),
         flags | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(io::Error::other)?;
+        crate::DbName::Path,
+    )?;
     conn.busy_timeout(std::time::Duration::ZERO)
         .map_err(io::Error::other)?;
     conn.execute_batch(if sealed { "BEGIN" } else { "BEGIN EXCLUSIVE" })

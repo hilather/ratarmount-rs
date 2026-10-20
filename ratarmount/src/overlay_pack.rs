@@ -146,15 +146,13 @@ fn sanitized_db(
     }
     let source = directory.join(HIDDEN_DB).canonicalize()?;
     let mut uri =
-        url::Url::from_file_path(source).map_err(|()| invalid("invalid database path"))?;
+        url::Url::from_file_path(&source).map_err(|()| invalid("invalid database path"))?;
     uri.set_query(Some("mode=ro&immutable=1"));
-    let conn = rusqlite::Connection::open_with_flags(
-        uri.as_str(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(io::Error::other)?;
+    let conn = ratarmount_compositing::open_overlay_db(
+        &source,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        ratarmount_compositing::DbName::Uri(uri.as_str()),
+    )?;
     // VACUUM INTO opens its target with this connection's flags, so NOFOLLOW
     // rejects a symlink in any component of the staging path (every macOS temp
     // dir lives under /var -> /private/var): hand SQLite the resolved path.
@@ -551,15 +549,13 @@ fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
     // URL encoding prevents SQLite URI syntax in a host filename from changing
     // the immutable/read-only parameters.
     let db = directory.join(HIDDEN_DB).canonicalize()?;
-    let mut uri = url::Url::from_file_path(db).map_err(|()| invalid("invalid database path"))?;
+    let mut uri = url::Url::from_file_path(&db).map_err(|()| invalid("invalid database path"))?;
     uri.set_query(Some("mode=ro&immutable=1"));
-    let conn = rusqlite::Connection::open_with_flags(
-        uri.as_str(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(io::Error::other)?;
+    let conn = ratarmount_compositing::open_overlay_db(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        ratarmount_compositing::DbName::Uri(uri.as_str()),
+    )?;
     let meta = OverlayMeta::from_connection(&conn)
         .map_err(io::Error::other)?
         .filter(OverlayMeta::layer_sealed)
