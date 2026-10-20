@@ -4551,10 +4551,13 @@ impl WriteOverlay {
                 archive,
                 from_idx,
                 transform,
+                &fs::metadata(archive)?,
                 &mut self.commit_rows().commit_hook(archive),
             ) {
                 Ok(stats) => stats,
-                Err(ratarmount_compress::CompressError::Committed(e)) => {
+                Err(ratarmount_compress::CompressError::Replace(
+                    ratarmount_compress::commit_journal::ReplaceError::Committed(e),
+                )) => {
                     self.refuse_base_after_commit_failure();
                     return Err(recover_error_to_overlay(
                         ratarmount_compress::commit_journal::RecoverError::Committed(e),
@@ -5903,9 +5906,15 @@ fn persist_provenance_plan(
                     archive,
                     from,
                     transform,
+                    &fs::metadata(archive)?,
                     &mut rows.commit_hook(archive),
                 ) {
-                    if matches!(e, ratarmount_compress::CompressError::Committed(_)) {
+                    if matches!(
+                        e,
+                        ratarmount_compress::CompressError::Replace(
+                            ratarmount_compress::commit_journal::ReplaceError::Committed(_)
+                        )
+                    ) {
                         return Err(recover_error_to_overlay(
                             ratarmount_compress::commit_journal::RecoverError::Committed(
                                 io::Error::other(e.to_string()),
@@ -5915,7 +5924,7 @@ fn persist_provenance_plan(
                     recover_offline(
                         archive,
                         &root,
-                        &mut ratarmount_compress::commit_journal::authorize_any,
+                        &mut ratarmount_compress::commit_journal::authorize_forced,
                     )?;
                     if mode == CommitMode::Auto {
                         splice_zstd_last_frames_replace(archive, from, transform)
@@ -5955,7 +5964,9 @@ fn persist_provenance_plan(
                 tmp.as_file_mut(),
                 &original,
                 &mut rows.commit_hook(archive),
-            ) {
+            )
+            .map_err(replace_error_shim)
+            {
                 if matches!(
                     e,
                     ratarmount_compress::commit_journal::RecoverError::Committed(_)
@@ -5965,7 +5976,7 @@ fn persist_provenance_plan(
                 recover_offline(
                     archive,
                     &root,
-                    &mut ratarmount_compress::commit_journal::authorize_any,
+                    &mut ratarmount_compress::commit_journal::authorize_forced,
                 )?;
                 if mode != CommitMode::Auto {
                     return Err(e.into_io().into());
@@ -6550,6 +6561,20 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// R7-C2 shim, removed with the callers' fallbacks in R7-C3: a failed
+/// replacement as the error the callers handled before.
+fn replace_error_shim(
+    error: ratarmount_compress::commit_journal::ReplaceError,
+) -> ratarmount_compress::commit_journal::RecoverError {
+    use ratarmount_compress::commit_journal::{RecoverError, ReplaceError};
+    match error {
+        ReplaceError::Committed(e) => RecoverError::Committed(e),
+        ReplaceError::Refused(e) | ReplaceError::RolledBack(e) | ReplaceError::Pending(e) => {
+            RecoverError::Journal(e)
+        }
+    }
+}
+
 /// A failed journaled replacement: `Committed` keeps its own variant so no
 /// caller answers it with a copy fallback.
 fn recover_error_to_overlay(
@@ -6616,6 +6641,7 @@ fn append_uncompressed_tar_plan(
         &original,
         &mut rows.commit_hook(archive),
     )
+    .map_err(replace_error_shim)
     .map_err(recover_error_to_overlay)?;
     log::info!(
         "commit: prefix {:.1} GiB retained via append",
@@ -7815,7 +7841,7 @@ fn commit_overlay_tar(
                 recover_offline(
                     tar_file,
                     write_overlay,
-                    &mut ratarmount_compress::commit_journal::authorize_any,
+                    &mut ratarmount_compress::commit_journal::authorize_forced,
                 )?;
                 if opts.mode != CommitMode::Auto {
                     return Err(e);
@@ -8114,8 +8140,16 @@ fn commit_overlay_tar_zst(
         let db = write_overlay.join(HIDDEN_DB);
         let rows = crate::journal_recovery::Rows::Path(&db);
         let mut hook = rows.commit_hook(tar_file);
-        match splice_zstd_last_frames_append_with(tar_file, from_idx, transform, &mut hook) {
-            Err(ratarmount_compress::CompressError::Committed(e)) => {
+        match splice_zstd_last_frames_append_with(
+            tar_file,
+            from_idx,
+            transform,
+            &fs::metadata(tar_file)?,
+            &mut hook,
+        ) {
+            Err(ratarmount_compress::CompressError::Replace(
+                ratarmount_compress::commit_journal::ReplaceError::Committed(e),
+            )) => {
                 return Err(recover_error_to_overlay(
                     ratarmount_compress::commit_journal::RecoverError::Committed(e),
                 ))
@@ -8124,7 +8158,7 @@ fn commit_overlay_tar_zst(
                 recover_offline(
                     tar_file,
                     write_overlay,
-                    &mut ratarmount_compress::commit_journal::authorize_any,
+                    &mut ratarmount_compress::commit_journal::authorize_forced,
                 )?;
                 log::warn!("commit: append failed: {e}; falling back to copy");
                 splice_zstd_last_frames_replace(tar_file, from_idx, transform)

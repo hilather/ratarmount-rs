@@ -170,20 +170,25 @@ pub fn splice_zstd_last_frames_append<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
+    original: &std::fs::Metadata,
 ) -> Result<SpliceStats>
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
-    splice_zstd_last_frames_append_with(path, from_idx, transform, &mut |_| Ok(()))
+    splice_zstd_last_frames_append_with(path, from_idx, transform, original, &mut |_| Ok(()))
 }
 
 /// [`splice_zstd_last_frames_append`] with a `before_unlink` hook that runs
 /// under the archive lock with the final stamp, before the journal is
-/// unlinked. A hook that keeps failing is [`CompressError::Committed`].
+/// unlinked. `original` is the caller's snapshot of the archive (the file
+/// its gate judged): the source opened here must still be exactly that file,
+/// and the replacement compares it again under the archive lock. A failure
+/// of the journaled replacement is [`CompressError::Replace`].
 pub fn splice_zstd_last_frames_append_with<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
+    original: &std::fs::Metadata,
     before_unlink: crate::commit_journal::BeforeUnlink,
 ) -> Result<SpliceStats>
 where
@@ -191,7 +196,12 @@ where
 {
     crate::commit_journal::fault::check("before splice scan")?;
     let mut src = File::open(path)?;
-    let original = src.metadata()?;
+    let source = src.metadata()?;
+    if !crate::commit_journal::same_stamp(original, &source) {
+        return Err(CompressError::Msg(
+            "archive changed while preparing append; retry with a fresh plan".into(),
+        ));
+    }
     let map = scan_zstd_frames(&mut src)?;
     if map.seek_table.is_none() {
         return Err(CompressError::Msg(
@@ -219,6 +229,9 @@ where
         tail.as_file_mut().rewind()?;
         io::copy(tail.as_file_mut(), tmp.as_file_mut())?;
         tmp.as_file().sync_all()?;
+        // Published only over the file the copy was read from, unchanged and
+        // with no journal pending, under its lock.
+        let _guard = crate::commit_journal::guard_copy(path, &source)?;
         tmp.persist(path).map_err(|e| e.error)?;
         return Ok(stats);
     }
@@ -226,13 +239,10 @@ where
         path,
         stats.prefix_compressed_bytes,
         tail.as_file_mut(),
-        &original,
+        original,
         before_unlink,
     )
-    .map_err(|e| match e {
-        crate::commit_journal::RecoverError::Committed(e) => CompressError::Committed(e),
-        e => CompressError::Io(e.into_io()),
-    })?;
+    .map_err(CompressError::Replace)?;
     log::info!(
         "commit: prefix {:.1} GiB retained via append",
         stats.prefix_compressed_bytes as f64 / (1024.0 * 1024.0 * 1024.0)

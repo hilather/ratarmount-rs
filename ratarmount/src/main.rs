@@ -1957,7 +1957,7 @@ fn main() {
                 ratarmount_compositing::recover_journal_at(
                     archive,
                     None,
-                    &mut ratarmount_compress::commit_journal::authorize_any,
+                    &mut ratarmount_compress::commit_journal::authorize_forced,
                 )
             } else {
                 ratarmount_compositing::recover_journal_at(

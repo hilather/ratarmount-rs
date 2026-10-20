@@ -134,11 +134,11 @@ pub enum CompressError {
     Unsupported(&'static str),
     #[error("{0}")]
     Msg(String),
-    /// An in-place journaled replacement wrote the new bytes but its journal is
-    /// still pending (the before-unlink hook or the cleanup failed). Never
-    /// answer this with a copy fallback.
+    /// A journaled in-place replacement failed after it started (or was
+    /// refused before); the variant says what is on disk and whether a copy
+    /// fallback may run.
     #[error("{0}")]
-    Committed(io::Error),
+    Replace(commit_journal::ReplaceError),
 }
 
 pub type Result<T> = std::result::Result<T, CompressError>;

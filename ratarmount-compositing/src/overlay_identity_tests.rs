@@ -1018,7 +1018,7 @@ fn journal_crash_child() {
     );
 }
 
-const JOURNAL_STEPS: [&str; 14] = [
+const JOURNAL_STEPS: [&str; 15] = [
     "journal header",
     "journal tail",
     "journal fsync",
@@ -1030,6 +1030,7 @@ const JOURNAL_STEPS: [&str; 14] = [
     "archive write",
     "archive fsync",
     "locator complete",
+    "locator done",
     "journal unlink",
     "commit directory fsync",
     "locator clear",
@@ -1039,9 +1040,9 @@ const JOURNAL_STEPS: [&str; 14] = [
 /// journal, but the overlay's OWN torn append must still recover. A real
 /// SIGKILL at every journal phase: until the replacement is complete the
 /// archive rolls back to the recorded base and the next commit succeeds; at
-/// `locator complete` the journal is still there, consistent with the recorded
-/// base, and recovery rolls FORWARD: the commit is accepted and the stamp rows
-/// re-baselined. Once the journal is gone (`journal unlink` and later) nothing
+/// `locator complete` and `locator done` the journal is still there, consistent
+/// with the recorded base, and recovery rolls FORWARD: the commit is accepted and
+/// the stamp rows re-baselined. Once the journal is gone (`journal unlink` and later) nothing
 /// ties the changed archive to the crash, so that commit is refused as a
 /// changed base - never a torn archive, and no journal is left either way.
 #[cfg(unix)]
@@ -1072,7 +1073,7 @@ fn regression_real_sigkill_at_every_journal_phase_still_recovers() {
             let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
             assert!(!journal.exists(), "{step} {path:?}: journal recovered");
             let position = |name: &str| JOURNAL_STEPS.iter().position(|s| *s == name).unwrap();
-            let refused = position(step) > position("locator complete");
+            let refused = position(step) > position("locator done");
             if refused {
                 let err = result.unwrap_err().to_string();
                 assert!(err.contains("--force-base-mismatch"), "{step}: {err}");
@@ -2288,7 +2289,7 @@ fn regression_mount_symlinked_overlay_db_defers_recovery() {
 /// Regression (R7-B2): a journal-bearing file B takes A's name AFTER the
 /// append's suffix was staged and BEFORE the journaled replacement. The
 /// replacement fails ("pending journal") and the fallback cleanup recovered
-/// whatever journal sat at the name with `authorize_any`: B was rolled back and
+/// whatever journal sat at the name with `authorize_forced`: B was rolled back and
 /// B's stamp became A's recorded baseline (`Restamp::Commit`). Only the journal
 /// THIS attempt started may be recovered.
 #[cfg(unix)]
