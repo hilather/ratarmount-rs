@@ -17,8 +17,7 @@ use flate2::Compression as GzCompression;
 use ratarmount_compress::{
     body_looks_like_tar, decode_zstd_frames_to, detect_compression, export_zstd_blocks,
     materialize, open_seekable_zstd, open_seekable_zstd_with_threads, scan_zstd_frames_path,
-    splice_zstd_last_frames_append_with, CompressionFormat, SpliceStats, ZstdFrameMap,
-    DEFAULT_MEMORY_CAP,
+    CompressionFormat, SpliceStats, ZstdFrameMap, DEFAULT_MEMORY_CAP,
 };
 use ratarmount_core::{
     create_root_file_info, metadata_gid, metadata_mode, metadata_mtime_secs, metadata_uid,
@@ -4425,31 +4424,22 @@ impl WriteOverlay {
         Option<ratarmount_compress::commit_journal::Applied>,
         ratarmount_compress::commit_journal::RecoverError,
     > {
-        use ratarmount_compress::commit_journal as cj;
-        let remote = self.remote_enabled();
-        let identity = if remote {
+        use crate::journal_recovery::{Owner, Record};
+        let identity = if self.remote_enabled() {
             None
         } else {
             self.identity.lock().expect("overlay identity").clone()
         };
-        let force = self.force_base_mismatch;
-        let mut authorize = |header: &cj::PendingJournal, locked: &fs::Metadata| {
-            if force {
-                return Ok(());
-            }
-            match &identity {
-                Some(base) => crate::overlay_gate::check_commit_base_with(
-                    &self.db.lock().expect("overlay db"),
-                    base,
-                    archive,
-                    Some((header, locked)),
-                )
-                .map(drop)
-                .map_err(|refusal| io::Error::other(refusal.0)),
-                None => cj::authorize_owned(header, locked),
-            }
+        let owner = match &identity {
+            _ if self.force_base_mismatch => Owner::Forced,
+            Some(base) => Owner::Recorded {
+                base,
+                archive,
+                record: Record::Live(&self.db),
+            },
+            None => Owner::Inode,
         };
-        crate::journal_recovery::recover_journal(archive, self.commit_rows(), &mut authorize)
+        crate::journal_recovery::recover_journal(archive, self.commit_rows(), owner)
     }
 
     fn recover_journal_after_gate(
@@ -4574,16 +4564,16 @@ impl WriteOverlay {
             rewrite_tar_suffix(&mut suffix, stream_offset, &opts, &mut out).map(|_| ())
         };
         let stats = if append && last_window_deletes.is_empty() {
-            match splice_zstd_last_frames_append_with(
+            match crate::journal_recovery::splice_append_committing(
                 archive,
                 from_idx,
                 transform,
                 original,
-                &mut self.commit_rows().commit_hook(archive),
+                &self.commit_rows(),
             ) {
                 Ok(stats) => stats,
-                Err(e) => {
-                    self.after_failed_replace(crate::journal_recovery::failed_splice(e))?;
+                Err(failed) => {
+                    self.after_failed_replace(failed)?;
                     crate::journal_recovery::splice_replace_over(
                         archive, from_idx, transform, original,
                     )?
@@ -5916,14 +5906,10 @@ fn persist_provenance_plan(
                 rewrite_tar_suffix(&mut input, offset, &rewrite, &mut out).map(|_| ())
             };
             if deleted.is_empty() && map.seek_table.is_some() && mode.may_append(archive)? {
-                if let Err(e) = splice_zstd_last_frames_append_with(
-                    archive,
-                    from,
-                    transform,
-                    original,
-                    &mut rows.commit_hook(archive),
+                if let Err(failed) = crate::journal_recovery::splice_append_committing(
+                    archive, from, transform, original, rows,
                 ) {
-                    copy_after_failed_replace(crate::journal_recovery::failed_splice(e), mode)?;
+                    copy_after_failed_replace(failed, mode)?;
                     crate::journal_recovery::splice_replace_over(
                         archive, from, transform, original,
                     )?;
@@ -5951,14 +5937,14 @@ fn persist_provenance_plan(
         if let Some(offset) = append_offset {
             ratarmount_formats_tar::write_ustar_members(tmp.as_file_mut(), &members)?;
             ratarmount_formats_tar::write_tar_eof(tmp.as_file_mut())?;
-            if let Err(e) = ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with(
+            if let Err(failed) = crate::journal_recovery::replace_committing(
                 archive,
                 offset,
                 tmp.as_file_mut(),
                 original,
-                &mut rows.commit_hook(archive),
+                rows,
             ) {
-                copy_after_failed_replace(crate::journal_recovery::failed_replace(e), mode)?;
+                copy_after_failed_replace(failed, mode)?;
                 // The stamp after the attempt (a rollback may have left a new
                 // mtime), read from the very file the copy reads.
                 let source = src.metadata()?;
@@ -6601,9 +6587,9 @@ fn recover_error_to_overlay(
 fn recover_offline(
     archive: &Path,
     root: &Path,
-    authorize: ratarmount_compress::commit_journal::Authorize<'_>,
+    owner: crate::journal_recovery::Owner<'_>,
 ) -> Result<()> {
-    crate::journal_recovery::recover_journal_at(archive, Some(&root.join(HIDDEN_DB)), authorize)
+    crate::journal_recovery::recover_journal_at(archive, Some(&root.join(HIDDEN_DB)), owner)
         .map(|_| ())
         .map_err(recover_error_to_overlay)
 }
@@ -6631,14 +6617,13 @@ fn append_uncompressed_tar_plan(
     let mut tail = tempfile::NamedTempFile::new_in(parent)?;
     ratarmount_formats_tar::write_ustar_members(tail.as_file_mut(), &members)?;
     ratarmount_formats_tar::write_tar_eof(tail.as_file_mut())?;
-    ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with(
+    crate::journal_recovery::replace_committing(
         archive,
         offset,
         tail.as_file_mut(),
         original,
-        &mut rows.commit_hook(archive),
-    )
-    .map_err(crate::journal_recovery::failed_replace)?;
+        rows,
+    )?;
     log::info!(
         "commit: prefix {:.1} GiB retained via append",
         offset as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -6836,28 +6821,19 @@ fn commit_overlay_inner(
     }
 
     {
-        use ratarmount_compress::commit_journal as cj;
-        // The gate ran before this call (unlocked); the authorizer re-takes the
+        use crate::journal_recovery::{Owner, Record};
+        // The gate ran before this call (unlocked); the owner re-takes the
         // decision on the LOCKED file, and recovery restamps the rows from it.
-        let mut authorize = |header: &cj::PendingJournal, locked: &fs::Metadata| {
-            if opts.force_base_mismatch {
-                return Ok(());
-            }
-            match identity {
-                Some(base) if write_overlay.join(HIDDEN_DB).exists() => {
-                    crate::overlay_gate::check_commit_base_offline_with(
-                        write_overlay,
-                        base,
-                        archive_file,
-                        Some((header, locked)),
-                    )
-                    .map(drop)
-                    .map_err(|refusal| io::Error::other(refusal.0))
-                }
-                _ => cj::authorize_owned(header, locked),
-            }
+        let owner = match identity {
+            _ if opts.force_base_mismatch => Owner::Forced,
+            Some(base) if write_overlay.join(HIDDEN_DB).exists() => Owner::Recorded {
+                base,
+                archive: archive_file,
+                record: Record::Offline(write_overlay),
+            },
+            _ => Owner::Inode,
         };
-        recover_offline(archive_file, write_overlay, &mut authorize)?;
+        recover_offline(archive_file, write_overlay, owner)?;
     }
     // The one snapshot every write of this commit compares against: the file
     // the gate accepts after recovery (one stat when no identity applies).
@@ -8152,13 +8128,12 @@ fn commit_overlay_tar_zst(
     if append {
         let db = write_overlay.join(HIDDEN_DB);
         let rows = crate::journal_recovery::Rows::Path(&db);
-        let mut hook = rows.commit_hook(tar_file);
-        match splice_zstd_last_frames_append_with(
-            tar_file, from_idx, transform, original, &mut hook,
+        match crate::journal_recovery::splice_append_committing(
+            tar_file, from_idx, transform, original, &rows,
         ) {
             Ok(stats) => stats,
-            Err(e) => {
-                copy_after_failed_replace(crate::journal_recovery::failed_splice(e), opts.mode)?;
+            Err(failed) => {
+                copy_after_failed_replace(failed, opts.mode)?;
                 crate::journal_recovery::splice_replace_over(
                     tar_file, from_idx, transform, original,
                 )?
@@ -8860,6 +8835,7 @@ fn walkdir_files_and_empty_dirs(root: &Path) -> Result<Vec<WalkEntry>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod tests {
     use super::*;
 

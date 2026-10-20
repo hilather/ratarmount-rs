@@ -2324,7 +2324,7 @@ fn open_path_impl(
         ratarmount_compositing::recover_journal_at(
             path,
             None,
-            &mut ratarmount_compress::commit_journal::authorize_owned,
+            ratarmount_compositing::Owner::Inode,
         )
         .map_err(|e| e.to_string())?;
     }

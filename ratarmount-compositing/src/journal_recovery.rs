@@ -9,6 +9,12 @@
 //! stamp, and marks a strong digest `pending`, BEFORE the journal is unlinked.
 //! A hook that fails keeps the journal, so no ordering leaves "journal gone,
 //! rows stale".
+//!
+//! This is the only module that names the commit journal's recovery,
+//! replacement and copy-guard entry points (`clippy.toml` forbids them
+//! elsewhere): every caller says WHO may apply a journal ([`Owner`]) and a
+//! replacement or copy goes through the wrappers below.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs;
 use std::io;
@@ -17,7 +23,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ratarmount_compress::commit_journal::{
-    self, Applied, Authorize, PendingJournal, RecoverError, ReplaceError,
+    self, Applied, PendingJournal, RecoverError, ReplaceError,
 };
 use rusqlite::Connection;
 
@@ -25,6 +31,81 @@ use crate::write_overlay::OverlayError;
 
 use crate::overlay_gate::{kind_only, Recorded};
 use crate::overlay_meta::OverlayMeta;
+use crate::ClassifiedBase;
+
+/// Who may apply a pending journal. Decided under the archive lock, on the
+/// header read there and the locked descriptor's metadata.
+pub enum Owner<'a> {
+    /// A `-w` overlay committing to (or recovering) the base it recorded: the
+    /// journal must be the locked file's own AND agree with the record (the
+    /// commit gate on the locked file).
+    Recorded {
+        base: &'a ClassifiedBase,
+        archive: &'a Path,
+        record: Record<'a>,
+    },
+    /// A mount: every readable overlay record votes (R7-A1).
+    Mount {
+        records: &'a MountRecords,
+        member: &'a Path,
+    },
+    /// No overlay record applies (a raw overlay directory, the library and
+    /// factory openers, rolling members, `--lower`-only mounts): the journal
+    /// must have been started for the locked inode.
+    Inode,
+    /// The user's explicit `--force-*` flag: any journal.
+    Forced,
+    /// A test authorizer.
+    #[cfg(test)]
+    Test(commit_journal::Authorize<'a>),
+}
+
+/// Where a [`Owner::Recorded`] overlay's record is read.
+pub enum Record<'a> {
+    /// The mount's own connection (it holds its database exclusively).
+    Live(&'a Mutex<Connection>),
+    /// The overlay directory, read-only.
+    Offline(&'a Path),
+}
+
+impl Owner<'_> {
+    fn authorize(&mut self, header: &PendingJournal, locked: &fs::Metadata) -> io::Result<()> {
+        let refusal = |r: crate::overlay_gate::CommitBaseRefusal| io::Error::other(r.0);
+        match self {
+            Owner::Recorded {
+                base,
+                archive,
+                record: Record::Live(db),
+            } => crate::overlay_gate::check_commit_base_with(
+                &db.lock().unwrap_or_else(|e| e.into_inner()),
+                base,
+                archive,
+                Some((header, locked)),
+            )
+            .map(drop)
+            .map_err(refusal),
+            Owner::Recorded {
+                base,
+                archive,
+                record: Record::Offline(dir),
+            } => crate::overlay_gate::check_commit_base_offline_with(
+                dir,
+                base,
+                archive,
+                Some((header, locked)),
+            )
+            .map(drop)
+            .map_err(refusal),
+            Owner::Mount { records, member } => {
+                authorize_mount_recovery(records, member, header, locked)
+            }
+            Owner::Inode => commit_journal::authorize_owned(header, locked),
+            Owner::Forced => commit_journal::authorize_forced(header, locked),
+            #[cfg(test)]
+            Owner::Test(authorize) => authorize(header, locked),
+        }
+    }
+}
 
 /// Which restamp rule applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,9 +318,11 @@ fn restamp_once(
 pub(crate) fn recover_journal(
     archive: &Path,
     rows: Rows<'_>,
-    authorize: Authorize<'_>,
+    mut owner: Owner<'_>,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
-    commit_journal::recover_with(archive, authorize, &mut |applied| {
+    let mut authorize =
+        |header: &PendingJournal, locked: &fs::Metadata| owner.authorize(header, locked);
+    commit_journal::recover_with(archive, &mut authorize, &mut |applied| {
         // A rollback restores the recorded state: nothing to restamp.
         if !applied.rolled_forward {
             return Ok(());
@@ -255,12 +338,12 @@ pub(crate) fn recover_journal(
 pub fn recover_journal_at(
     archive: &Path,
     overlay_db: Option<&Path>,
-    authorize: Authorize<'_>,
+    owner: Owner<'_>,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
     // Opened only when a roll-forward needs to restamp: a mount with no pending
     // journal never touches the overlay database here.
     let rows = overlay_db.map_or(Rows::None, Rows::Path);
-    recover_journal(archive, rows, authorize)
+    recover_journal(archive, rows, owner)
 }
 
 /// `verify`'s journal rule: the archive at `path` carries its OWN pending
@@ -553,6 +636,46 @@ pub(crate) fn failed_splice(error: ratarmount_compress::CompressError) -> Failed
         ratarmount_compress::CompressError::Replace(e) => failed_replace(e),
         other => OverlayError::Msg(other.to_string()).into(),
     }
+}
+
+/// The commit's journaled suffix replacement: the `Restamp::Commit` hook and
+/// the gate's snapshot cannot be forgotten, and a failure is answered once.
+pub(crate) fn replace_committing(
+    archive: &Path,
+    offset: u64,
+    suffix: &mut fs::File,
+    original: &fs::Metadata,
+    rows: &Rows<'_>,
+) -> std::result::Result<(), FailedReplace> {
+    commit_journal::replace_suffix_if_unchanged_with(
+        archive,
+        offset,
+        suffix,
+        original,
+        &mut rows.commit_hook(archive),
+    )
+    .map_err(failed_replace)
+}
+
+/// The commit's journaled zstd append splice (see [`replace_committing`]).
+pub(crate) fn splice_append_committing<F>(
+    archive: &Path,
+    from_idx: usize,
+    transform: F,
+    original: &fs::Metadata,
+    rows: &Rows<'_>,
+) -> std::result::Result<ratarmount_compress::SpliceStats, FailedReplace>
+where
+    F: FnOnce(&mut dyn ratarmount_compress::SeekRead, u64, &mut dyn io::Write) -> io::Result<()>,
+{
+    ratarmount_compress::splice_zstd_last_frames_append_with(
+        archive,
+        from_idx,
+        transform,
+        original,
+        &mut rows.commit_hook(archive),
+    )
+    .map_err(failed_splice)
 }
 
 /// Open the file a copy fallback reads, refusing unless it is the file the

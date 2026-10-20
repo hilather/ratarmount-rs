@@ -1,4 +1,5 @@
 //! Live overlay commit: real `ratarmount --nfs` + SIGTERM / short interval.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

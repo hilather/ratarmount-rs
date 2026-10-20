@@ -4,6 +4,7 @@
 //! stand in the way of `--force-base-mismatch`.
 //!
 //! CLI-level, offline (no FUSE), private HOME / XDG_CACHE_HOME per test.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -140,7 +140,7 @@ impl Session {
             ratarmount_compositing::recover_journal_at(
                 &archive_path,
                 None,
-                &mut ratarmount_compress::commit_journal::authorize_owned,
+                ratarmount_compositing::Owner::Inode,
             )
             .map_err(|e| Error::Internal(e.to_string()))?;
         }
@@ -714,6 +714,7 @@ fn archive_offset_from_info(fi: &FileInfo) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::types::SourceSpec;

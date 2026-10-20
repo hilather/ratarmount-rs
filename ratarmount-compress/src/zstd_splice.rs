@@ -4,6 +4,8 @@
 //! does not depend on `ratarmount-formats-tar`. The decoded last-N is
 //! materialized as [`SeekRead`] so the caller does not recopy the suffix.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;

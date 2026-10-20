@@ -5,6 +5,7 @@
 //! released overlay must keep remounting without a flag; only overlays written
 //! by unreleased builds with a missing or conflicting kind need one force.
 //! CLI-level, offline (no FUSE needed to run these), private HOME / cache.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

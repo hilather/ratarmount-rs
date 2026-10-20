@@ -13,6 +13,8 @@
 //! beside the archive's current name when the directory was renamed; a complete
 //! locator (`C`/`D`) whose journal cannot be found is never cleared.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};

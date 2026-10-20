@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! R6-2: the token-based create/reopen/commit rules, driven through
 //! `WriteOverlay::open` and the commit paths with a real tar on disk.
 
@@ -1737,13 +1738,9 @@ fn regression_recover_journal_at_restamps_and_the_next_gate_accepts() {
         drop(fx.open(digest, false));
         interrupt_complete(&fx.archive);
         let db = fx.overlay.join(HIDDEN_DB);
-        let applied = crate::recover_journal_at(
-            &fx.archive,
-            Some(&db),
-            &mut ratarmount_compress::commit_journal::authorize_owned,
-        )
-        .unwrap()
-        .expect("a journal was applied");
+        let applied = crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Inode)
+            .unwrap()
+            .expect("a journal was applied");
         assert!(applied.rolled_forward);
         assert!(!ratarmount_compress::commit_journal::journal_path(&fx.archive).exists());
         let rows = recorded_rows(&fx.overlay);
@@ -1869,7 +1866,7 @@ fn regression_rows_committed_then_unlink_failed_is_accepted_by_every_gate() {
 #[cfg(unix)]
 #[test]
 fn regression_restamp_writes_the_locked_descriptor_not_the_name() {
-    use ratarmount_compress::commit_journal::{authorize_owned, RecoverError};
+    use ratarmount_compress::commit_journal::RecoverError;
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -1889,7 +1886,8 @@ fn regression_restamp_writes_the_locked_descriptor_not_the_name() {
         fs::rename(&swap_from, &swap_to).unwrap();
         Ok(())
     };
-    let error = crate::recover_journal_at(&fx.archive, Some(&db), &mut swap).unwrap_err();
+    let error = crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Test(&mut swap))
+        .unwrap_err();
     assert!(matches!(error, RecoverError::Committed(_)), "{error:?}");
     assert_eq!(recorded_rows(&fx.overlay), before, "rows moved");
     assert!(
@@ -1897,12 +1895,12 @@ fn regression_restamp_writes_the_locked_descriptor_not_the_name() {
         "journal kept"
     );
     // The name is now an unrelated file: its journal belongs to another inode.
-    let refused = crate::recover_journal_at(&fx.archive, Some(&db), &mut authorize_owned);
+    let refused = crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Inode);
     assert!(refused.is_err());
     assert_eq!(recorded_rows(&fx.overlay), before, "rows moved");
     // Restore A's name: recovery finishes with A's final stamp.
     fs::rename(&keep, &fx.archive).unwrap();
-    crate::recover_journal_at(&fx.archive, Some(&db), &mut authorize_owned)
+    crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Inode)
         .unwrap()
         .expect("finished");
     let rows = recorded_rows(&fx.overlay);
@@ -1999,13 +1997,9 @@ fn regression_symlink_unchanged_complete_recovery_restamps() {
     drop(fx.open(BaseDigestRequest::Compute, false));
     interrupt_complete(&fx.archive);
     let db = fx.overlay.join(HIDDEN_DB);
-    crate::recover_journal_at(
-        &alias,
-        Some(&db),
-        &mut ratarmount_compress::commit_journal::authorize_owned,
-    )
-    .unwrap()
-    .expect("recovered through the link");
+    crate::recover_journal_at(&alias, Some(&db), crate::Owner::Inode)
+        .unwrap()
+        .expect("recovered through the link");
     let rows = recorded_rows(&fx.overlay);
     let (size, mtime) = stamp_rows(&fx.archive);
     assert_eq!((rows[0].clone(), rows[1].clone()), (size, mtime));
@@ -2021,7 +2015,7 @@ fn regression_symlink_unchanged_complete_recovery_restamps() {
 #[cfg(unix)]
 #[test]
 fn regression_symlink_replaced_target_uses_resolved_identity() {
-    use ratarmount_compress::commit_journal::{authorize_owned, RecoverError};
+    use ratarmount_compress::commit_journal::RecoverError;
     if !have_gnu_tar() {
         eprintln!("skip: GNU tar unavailable");
         return;
@@ -2043,13 +2037,14 @@ fn regression_symlink_replaced_target_uses_resolved_identity() {
         fs::rename(&swap_from, &swap_to).unwrap();
         Ok(())
     };
-    let error = crate::recover_journal_at(&alias, Some(&db), &mut swap).unwrap_err();
+    let error =
+        crate::recover_journal_at(&alias, Some(&db), crate::Owner::Test(&mut swap)).unwrap_err();
     assert!(matches!(error, RecoverError::Committed(_)), "{error:?}");
     assert_eq!(recorded_rows(&fx.overlay), before, "rows moved");
     assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
     // The original target is back under the link's target name.
     fs::rename(&keep, &fx.archive).unwrap();
-    crate::recover_journal_at(&alias, Some(&db), &mut authorize_owned)
+    crate::recover_journal_at(&alias, Some(&db), crate::Owner::Inode)
         .unwrap()
         .expect("finished through the link");
     let rows = recorded_rows(&fx.overlay);
@@ -2219,7 +2214,8 @@ fn regression_mount_rename_b_over_a_is_deferred_and_untouched() {
                              m: &fs::Metadata| {
             authorize_mount_recovery(&records, &archive, h, m)
         };
-        let refused = crate::recover_journal_at(&fx.archive, Some(&db), &mut authorize);
+        let refused =
+            crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Test(&mut authorize));
         assert!(
             matches!(
                 refused,
@@ -2272,7 +2268,8 @@ fn regression_mount_symlinked_overlay_db_defers_recovery() {
                          m: &fs::Metadata| {
         authorize_mount_recovery(&records, &archive, h, m)
     };
-    let refused = crate::recover_journal_at(&fx.archive, Some(&db), &mut authorize);
+    let refused =
+        crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Test(&mut authorize));
     assert!(
         matches!(
             refused,
@@ -2856,11 +2853,7 @@ fn regression_failed_attempt_cleanup_holds_the_archive_lock() {
                 let archive = archive.clone();
                 let log = log.clone();
                 std::thread::spawn(move || {
-                    let recovered = crate::recover_journal_at(
-                        &archive,
-                        None,
-                        &mut ratarmount_compress::commit_journal::authorize_owned,
-                    );
+                    let recovered = crate::recover_journal_at(&archive, None, crate::Owner::Inode);
                     log.lock().unwrap().push(format!("recover: {recovered:?}"));
                     use std::io::Write;
                     let mut suffix = tempfile::tempfile().unwrap();
@@ -2968,7 +2961,7 @@ fn regression_committed_hook_failure_after_link_retarget_stays_committed() {
         crate::recover_journal_at(
             &fx.archive,
             Some(&fx.overlay.join(HIDDEN_DB)),
-            &mut ratarmount_compress::commit_journal::authorize_owned,
+            crate::Owner::Inode,
         )
         .unwrap()
         .expect("A recovered");
@@ -3049,13 +3042,9 @@ fn regression_committed_hook_failure_after_directory_rename_stays_committed() {
     fs::remove_file(&a).unwrap();
     fs::remove_dir(&d).unwrap();
     fs::rename(&saved, &d).unwrap();
-    crate::recover_journal_at(
-        &a,
-        Some(&overlay.join(HIDDEN_DB)),
-        &mut ratarmount_compress::commit_journal::authorize_owned,
-    )
-    .unwrap()
-    .expect("rolled forward");
+    crate::recover_journal_at(&a, Some(&overlay.join(HIDDEN_DB)), crate::Owner::Inode)
+        .unwrap()
+        .expect("rolled forward");
     let (size, mtime) = stamp_rows(&a);
     let now = recorded_rows(&overlay);
     assert_eq!((now[0].clone(), now[1].clone()), (size, mtime));

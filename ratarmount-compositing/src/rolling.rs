@@ -321,7 +321,7 @@ impl RollingMountSource {
                     crate::journal_recovery::recover_journal_at(
                         path,
                         None,
-                        &mut ratarmount_compress::commit_journal::authorize_owned,
+                        crate::journal_recovery::Owner::Inode,
                     )
                     .map_err(ratarmount_compress::commit_journal::RecoverError::into_io)?;
                 }

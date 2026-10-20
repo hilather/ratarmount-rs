@@ -1953,19 +1953,12 @@ fn main() {
                     std::process::exit(2);
                 }
             }
-            let recovered = if args.force_base_mismatch {
-                ratarmount_compositing::recover_journal_at(
-                    archive,
-                    None,
-                    &mut ratarmount_compress::commit_journal::authorize_forced,
-                )
+            let owner = if args.force_base_mismatch {
+                ratarmount_compositing::Owner::Forced
             } else {
-                ratarmount_compositing::recover_journal_at(
-                    archive,
-                    None,
-                    &mut ratarmount_compress::commit_journal::authorize_owned,
-                )
+                ratarmount_compositing::Owner::Inode
             };
+            let recovered = ratarmount_compositing::recover_journal_at(archive, None, owner);
             if let Err(e) = recovered {
                 eprintln!("error: commit recovery for {}: {e}", archive.display());
                 std::process::exit(2);
@@ -2659,7 +2652,7 @@ fn main() {
             None => ratarmount_compositing::recover_journal_at(
                 member,
                 None,
-                &mut ratarmount_compress::commit_journal::authorize_owned,
+                ratarmount_compositing::Owner::Inode,
             )
             .map(|_| ())
             .map_err(|e| e.to_string()),
@@ -4856,8 +4849,7 @@ fn lower_extra_excludes(
 /// recovery after the gates. The decision is taken again under the archive lock.
 fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
     use ratarmount_compositing::{
-        authorize_mount_recovery, classify_mount_journal, recover_journal_at, MountJournal,
-        MountRecords,
+        classify_mount_journal, recover_journal_at, MountJournal, MountRecords,
     };
     let mut members: Vec<PathBuf> = Vec::new();
     for input in inputs {
@@ -4910,12 +4902,11 @@ fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
                 std::process::exit(2);
             }
             Ok(MountJournal::None | MountJournal::Own) => {
-                let mut authorize =
-                    |header: &ratarmount_compress::commit_journal::PendingJournal,
-                     locked: &std::fs::Metadata| {
-                        authorize_mount_recovery(&records, member, header, locked)
-                    };
-                if let Err(e) = recover_journal_at(member, top_db.as_deref(), &mut authorize) {
+                let owner = ratarmount_compositing::Owner::Mount {
+                    records: &records,
+                    member,
+                };
+                if let Err(e) = recover_journal_at(member, top_db.as_deref(), owner) {
                     eprintln!("error: commit recovery for {}: {e}", member.display());
                     std::process::exit(2);
                 }
