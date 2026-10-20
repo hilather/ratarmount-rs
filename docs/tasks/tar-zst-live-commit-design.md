@@ -1172,9 +1172,15 @@ writers ignoring the advisory inode lock remain unsupported.
    Run the `before_unlink` hook (it restamps the overlay rows), then set the
    locator to **done** (`D`: only the unlink is owed). Remove the journal, fsync
    its directory, remove the locator, and fsync the archive. A cleanup failure
-   after completion must not retry the append, and is never reported as
-   success: the attempt retries the unlink or the directory sync under its own
-   lock and otherwise returns `Committed` with the journal and locator kept.
+   after completion must not retry the append. A failed unlink or directory
+   sync is never reported as success: the attempt retries it under its own lock
+   and otherwise returns `Committed` with the journal and locator kept. Once
+   the journal is durably unlinked, a failure to remove the locator only warns
+   and the commit returns `Ok`: the archive and the rows already agree, and the
+   stale `D` locator makes later commits refuse with a message that names the
+   manual escape (verify the archive, then `setfattr -x` /
+   `xattr -d` its `user.ratarmount.commit-journal` xattr; see
+   `docs/sandbox.md`).
 6. Patch the existing F-2 sidecar, reopen/swap the mounted source, advance its
    generation, and clean up committed overlay entries. Offline commits validate
    the sidecar against the archive **before** mutation; stale/missing-tarstats

@@ -701,11 +701,10 @@ mod unix {
         // Held until this function returns: the cleanup of a failed attempt
         // runs under the same lock.
         let _lock = lock(&file).map_err(refused)?;
-        if path.try_exists().map_err(refused)? || get_marker(&file).map_err(refused)?.is_some() {
-            return Err(refused(recovery_error(
-                &path,
-                "pending journal; recover before preparing a commit",
-            )));
+        if let Some(e) =
+            pending_refusal(&path, &file, "recover before preparing a commit").map_err(refused)?
+        {
+            return Err(refused(e));
         }
         let meta = file.metadata().map_err(refused)?;
         if original.is_some_and(|old| !same_stamp(old, &meta)) {
@@ -922,6 +921,35 @@ mod unix {
         }
     }
 
+    /// The refusal when a journal or locator is pending on the archive. A done
+    /// (`D`) locator with no journal at `path` is what a process killed after
+    /// the journal unlink leaves: recovery keeps it (the journal may sit beside
+    /// another name of the file), so the refusal names the manual escape.
+    fn pending_refusal(path: &Path, file: &File, what: &str) -> io::Result<Option<io::Error>> {
+        let journal = path.try_exists()?;
+        let marker = get_marker(file)?;
+        if !journal && marker.as_ref().is_some_and(|(state, _)| *state == b'D') {
+            return Ok(Some(recovery_error(
+                path,
+                format!(
+                    "pending journal; {what}: a done (D) commit-journal locator is left on the \
+                     archive with no journal beside this name (the commit finished; only its \
+                     cleanup was interrupted). If the journal moved with a renamed directory, \
+                     recover through the archive's current name; otherwise verify the archive \
+                     and remove its user.ratarmount.commit-journal xattr (setfattr -x on \
+                     Linux, xattr -d on macOS)"
+                ),
+            )));
+        }
+        if journal || marker.is_some() {
+            return Ok(Some(recovery_error(
+                path,
+                format!("pending journal; {what}"),
+            )));
+        }
+        Ok(None)
+    }
+
     /// Lock for a copy fallback (see [`super::guard_copy`]).
     pub(super) fn guard_copy(archive: &Path, source: &fs::Metadata) -> io::Result<CopyGuard> {
         fault::check("copy publish")?;
@@ -937,11 +965,10 @@ mod unix {
                 ),
             )
         })?;
-        if journal_path(&archive).try_exists()? || get_marker(&file)?.is_some() {
-            return Err(recovery_error(
-                &journal_path(&archive),
-                "pending journal; the copy was not published",
-            ));
+        if let Some(e) =
+            pending_refusal(&journal_path(&archive), &file, "the copy was not published")?
+        {
+            return Err(e);
         }
         if !same_stamp(source, &file.metadata()?) {
             return Err(io::Error::other(
@@ -1554,6 +1581,48 @@ mod tests {
             }
         })
         .is_err());
+    }
+
+    /// Regression (r16 nit, R7-D3): a process killed between the journal
+    /// unlink and the locator clear leaves a done (`D`) locator with no
+    /// journal; recovery keeps it (the journal may sit beside another name),
+    /// so every later commit was refused with "pending journal; recover
+    /// before preparing a commit" although recovery had nothing to do. The
+    /// refusal (append and copy guard) names the documented escape; a real
+    /// pending journal does not get that advice.
+    #[test]
+    fn append_journal_done_locator_without_journal_names_the_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        interrupted(&path, "journal unlink");
+        assert!(!journal_path(&path).exists());
+        assert_eq!(marker_state(&path), Some(b'D'));
+        let original = fs::metadata(&path).unwrap();
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(b"more").unwrap();
+        let refused =
+            replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+        let Err(ReplaceError::Refused(e)) = refused else {
+            panic!("{refused:?}");
+        };
+        let text = e.to_string();
+        assert!(text.contains("recover before preparing a commit"), "{text}");
+        assert!(text.contains("setfattr -x"), "{text}");
+        assert!(text.contains("xattr -d"), "{text}");
+        let guarded = guard_copy(&path, &original).map(drop).unwrap_err();
+        assert!(guarded.to_string().contains("setfattr -x"), "{guarded}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        interrupted(&path, "locator active");
+        assert!(journal_path(&path).exists());
+        let original = fs::metadata(&path).unwrap();
+        let refused =
+            replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+        let Err(ReplaceError::Refused(e)) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(!e.to_string().contains("setfattr"), "{e}");
     }
 
     /// Regression: symlinks and hard links must find the same pending journal.

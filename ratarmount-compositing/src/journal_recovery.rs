@@ -419,7 +419,10 @@ pub(crate) fn own_pending_journal_agrees(
     owns(&journal, &canonical) && journal_agrees((size, mtime), current, &journal)
 }
 
-/// The journal was started for the file `path` resolves to.
+/// The journal was started for the file `path` resolves to, by inode only:
+/// the journal's device number is a hint (it changes across reboots, see
+/// `regression_journal_dev_change_is_not_a_refusal`). Read-only; only `verify`
+/// uses it, after its own device and inode check of the recorded target.
 fn owns(journal: &PendingJournal, path: &Path) -> bool {
     #[cfg(unix)]
     {

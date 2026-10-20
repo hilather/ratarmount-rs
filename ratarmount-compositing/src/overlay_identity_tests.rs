@@ -2626,6 +2626,7 @@ impl Place {
     }
 }
 
+#[cfg(unix)]
 fn ino(path: &Path) -> u64 {
     std::os::unix::fs::MetadataExt::ino(&fs::metadata(path).unwrap())
 }

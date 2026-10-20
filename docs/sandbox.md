@@ -405,7 +405,10 @@ names the manual escape: verify the archive, then remove its
 macOS). A done locator (the commit finished; only the journal's unlink was
 owed) whose journal is not beside the name recovery was given is kept too: the
 journal may sit beside another name of the file (a directory renamed under a
-hard link), and dropping the locator would make it look torn. Recovery
+hard link), and dropping the locator would make it look torn. Until it is
+removed, every later commit refuses with "pending journal" and the refusal
+names the same escape (verify the archive, then `setfattr -x` or `xattr -d`
+the xattr). Recovery
 restamps the recorded rows from the locked descriptor before it unlinks the
 journal, on every path (mount, offline commit, library openers, live and
 on-exit commits).
