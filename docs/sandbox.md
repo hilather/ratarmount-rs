@@ -1741,6 +1741,29 @@ unsealed legacy lowers require `--allow-unsealed-lower`. A seal is an integrity
 check, not a security boundary against the layer's owner or root. It covers
 canonical content and modes, not timestamps, ownership or arbitrary xattrs.
 
+### Hard links of the overlay database
+
+On POSIX, closing any descriptor of a file releases every lock the process
+holds on it, SQLite's included. A payload name that is a hard link of an open
+overlay database (made on the host by the same user, or by a link-preserving
+copy such as `cp -al` or `rsync -H`; FUSE `link` itself is refused) would hand
+out such a descriptor, and closing it after a read would let another process
+write the database under the mount. Every payload, sentinel, pack and commit
+open checks the inode of the descriptor it obtained against the overlay
+databases open in this process (this mount's, a `--lower`'s while it is being
+read, and any other overlay mounted by the same process) and refuses a match
+with EACCES and a message naming the database (logged once per inode). On
+Linux the check runs on an `O_PATH` descriptor, whose close releases nothing,
+and the file is then reopened through `/proc/self/fd`; `O_TRUNC` and the
+create mode apply only after the check. Elsewhere (macOS, or Linux without
+`/proc`) the refused descriptor is kept open for the life of the process (one
+descriptor per refused open). Remove the extra link to read the file.
+
+Not covered: a payload descriptor opened before its inode is first opened as
+a database in this process (no mount path does this: the database is opened
+before anything is served), and files read by generic folder sources or
+backing extents of non-overlay sources.
+
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE
 libraries even for offline work. An optional FUSE-free build is not implemented.

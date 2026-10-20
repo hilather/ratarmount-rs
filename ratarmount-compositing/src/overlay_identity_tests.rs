@@ -5222,3 +5222,116 @@ fn regression_restamp_refuses_when_the_record_vanishes_after_authorization() {
         );
     }
 }
+
+// ---- R10-C (#148): payload opens of another name of an open database ------
+
+/// A hard link of `db` named `name` in the overlay root `dir`.
+#[cfg(unix)]
+fn link_db(db: &Path, dir: &Path, name: &str) -> PathBuf {
+    let alias = dir.join(name);
+    fs::hard_link(db, &alias).unwrap();
+    alias
+}
+
+/// Regression (R10-C, #148, r20 skeptic #1): the overlay database hard-linked
+/// under a payload name. FUSE/NFS-style `open_overlay_fd` and
+/// `MountSource::open` opened an unmanaged descriptor of the database inode
+/// and closed it after the read, releasing every fcntl lock this process held
+/// on it while SQLite still believed it held EXCLUSIVE: another process could
+/// then write beneath the mount. Both refuse with EACCES; a child's
+/// `BEGIN IMMEDIATE` is still busy afterwards and the holder still writes.
+#[cfg(unix)]
+#[test]
+fn regression_payload_db_alias_preserves_process_locks() {
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    let db = fx.overlay.join(HIDDEN_DB);
+    link_db(&db, &fx.overlay, "payload");
+    fs::write(fx.overlay.join("plain"), b"plain bytes").unwrap();
+    let error = ov.open_overlay_fd("/payload", libc::O_RDONLY).unwrap_err();
+    assert!(
+        error.to_string().contains("open overlay database"),
+        "{error}"
+    );
+    let fi = ov.lookup("/payload", 0).expect("payload listed");
+    let error = ov.open(&fi, 0).map(drop).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{error}"
+    );
+    // An ordinary payload still opens, reads and closes.
+    let fi = ov.lookup("/plain", 0).expect("plain");
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut ov.open(&fi, 0).unwrap(), &mut bytes).unwrap();
+    assert_eq!(bytes, b"plain bytes");
+    let fd = ov.open_overlay_fd("/plain", libc::O_RDONLY).unwrap();
+    ov.close_overlay_fd(fd);
+    assert!(
+        crate::overlay_db::lock_probe_is_busy(&db),
+        "another process must still see the mount's lock"
+    );
+    ov.set_meta("r10_probe", "still writes").unwrap();
+    assert!(crate::overlay_db::lock_probe_is_busy(&db));
+    // The probe itself: without the mount, the child takes the lock.
+    drop(ov);
+    assert!(!crate::overlay_db::lock_probe_is_busy(&db));
+}
+
+/// Regression (R10-C, #148): no write path truncates or changes the
+/// database through an alias: create over it, a writable `O_TRUNC` open, a
+/// read-only `O_TRUNC` open and an explicit truncate are refused; the
+/// database keeps its size (a `stat`, never a read: a read in this process
+/// would itself close a descriptor) and its lock.
+#[cfg(unix)]
+#[test]
+fn regression_payload_db_alias_write_never_truncates() {
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    let db = fx.overlay.join(HIDDEN_DB);
+    link_db(&db, &fx.overlay, "payload");
+    let size = fs::metadata(&db).unwrap().len();
+    assert!(size > 0);
+    assert!(ov.create_file("/payload", 0o644).is_err(), "create over");
+    for flags in [
+        libc::O_WRONLY | libc::O_TRUNC,
+        libc::O_RDWR,
+        libc::O_RDONLY | libc::O_TRUNC,
+    ] {
+        assert!(
+            ov.open_overlay_fd("/payload", flags).is_err(),
+            "{flags:#x} refused"
+        );
+    }
+    assert!(ov.truncate("/payload", 0).is_err(), "truncate");
+    assert_eq!(fs::metadata(&db).unwrap().len(), size, "database unchanged");
+    assert!(crate::overlay_db::lock_probe_is_busy(&db));
+    ov.set_meta("r10_probe", "still writes").unwrap();
+}
+
+/// Regression (R10-C, #148): a payload of overlay A that is a hard link of
+/// overlay B's database (B mounted in the same process, holding its lock) is
+/// refused through A, naming B's database; B keeps its lock.
+#[cfg(unix)]
+#[test]
+fn regression_payload_alias_other_overlay() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let ov_a = a.open(BaseDigestRequest::Compute, false);
+    let ov_b = b.open(BaseDigestRequest::Compute, false);
+    let b_db = b.overlay.join(HIDDEN_DB);
+    link_db(&b_db, &a.overlay, "theirs");
+    let error = ov_a.open_overlay_fd("/theirs", libc::O_RDONLY).unwrap_err();
+    assert!(
+        error.to_string().contains(&b_db.display().to_string()),
+        "names B's database: {error}"
+    );
+    let fi = ov_a.lookup("/theirs", 0).expect("listed");
+    assert!(ov_a.open(&fi, 0).is_err());
+    assert!(crate::overlay_db::lock_probe_is_busy(&b_db));
+    ov_b.set_meta("r10_probe", "still writes").unwrap();
+    // Once B is unmounted, the name is an ordinary file of A.
+    drop(ov_b);
+    let fd = ov_a.open_overlay_fd("/theirs", libc::O_RDONLY).unwrap();
+    ov_a.close_overlay_fd(fd);
+}

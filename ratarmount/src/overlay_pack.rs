@@ -65,6 +65,18 @@ fn regular_flags() -> OFlags {
     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
 }
 
+/// `openat(dir, name, flags)` that refuses another name of an open overlay
+/// database without closing a descriptor of it (R10-C).
+fn openat_admitted(dir: &OwnedFd, name: &str, flags: OFlags) -> io::Result<OwnedFd> {
+    use std::os::fd::AsFd;
+    ratarmount_core::db_inodes::openat_admitted(
+        Some(dir.as_fd()),
+        Path::new(name),
+        flags.bits() as libc::c_int,
+        0,
+    )
+}
+
 // Each component is opened relative to the previous directory, never via a
 // host path that can traverse a symlink. Used for both packing and extraction.
 fn parent(root: &OwnedFd, path: &str, create: bool) -> io::Result<(OwnedFd, String)> {
@@ -230,10 +242,9 @@ fn append_host<W: Write>(
             )
         }
         0o100000 => {
-            let file = host::openat(&fd, name.as_str(), regular_flags(), Mode::empty())?;
             let mut file = match replacement {
                 Some(copy) => File::open(copy)?,
-                None => File::from(file),
+                None => File::from(openat_admitted(&fd, name.as_str(), regular_flags())?),
             };
             h.set_entry_type(tar::EntryType::Regular);
             h.set_size(file.metadata()?.len());
@@ -570,10 +581,12 @@ fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
 
 fn sentinel_matches(directory: &Path, digest: &str) -> io::Result<bool> {
     let root = open_root(directory)?;
-    let fd = match host::openat(&root, SENTINEL, regular_flags(), Mode::empty()) {
+    let fd = match openat_admitted(&root, SENTINEL, regular_flags()) {
         Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(false),
-        Err(e) => return Err(e.into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) => {
+            return Ok(false)
+        }
+        Err(e) => return Err(e),
     };
     let mut file = File::from(fd);
     if !file.metadata()?.is_file() {
@@ -966,7 +979,7 @@ fn stat_age(stat: &rustix::fs::Stat) -> std::time::Duration {
 /// never following a symlink planted under the name.
 fn open_lock_at(dir: &OwnedFd, name: &str) -> io::Result<File> {
     let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    Ok(File::from(host::openat(dir, name, flags, Mode::empty())?))
+    Ok(File::from(openat_admitted(dir, name, flags)?))
 }
 
 /// Delete everything below `fd` through descriptors only: each child is opened
