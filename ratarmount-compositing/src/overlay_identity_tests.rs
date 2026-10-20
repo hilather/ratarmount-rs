@@ -2056,6 +2056,39 @@ fn regression_symlink_replaced_target_uses_resolved_identity() {
     assert_eq!((rows[0].clone(), rows[1].clone()), (size, mtime));
 }
 
+/// Regression (R7-B6): `Restamp::Commit` rewrote `base_size`/`base_mtime_ns`
+/// (and marked a strong digest pending) even when the recovery ROLLED BACK, so a
+/// rollback moved the baseline off the bytes it had just restored.
+#[cfg(unix)]
+#[test]
+fn regression_commit_restamp_ignores_a_rollback() {
+    use crate::journal_recovery::{restamp_rows, Restamp};
+    use std::os::unix::fs::MetadataExt;
+    let fx = Fixture::new();
+    let digest = format!("sha256:{}", "0".repeat(64));
+    drop(fx.open(BaseDigestRequest::Supplied(digest), false));
+    let before = recorded_rows(&fx.overlay);
+    let meta = fs::metadata(&fx.archive).unwrap();
+    let applied = ratarmount_compress::commit_journal::Applied {
+        rolled_forward: false,
+        pre_len: meta.len(),
+        pre_mtime_ns: 1,
+        new_len: meta.len() + 1,
+        dev: meta.dev(),
+        ino: meta.ino(),
+        final_len: meta.len() + 7,
+        final_mtime_ns: 99,
+    };
+    let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
+    restamp_rows(&conn, &fx.archive, &applied, Restamp::Commit).unwrap();
+    drop(conn);
+    assert_eq!(
+        recorded_rows(&fx.overlay),
+        before,
+        "a rollback moved the rows"
+    );
+}
+
 /// Regression (R7-A3): a link retargeted to another archive that carries its
 /// own COMPLETE journal, and a target replaced by such an archive, are refused
 /// with the other file, its journal and the rows untouched.

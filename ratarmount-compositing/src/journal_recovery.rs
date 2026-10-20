@@ -113,6 +113,11 @@ pub(crate) fn restamp_rows(
     applied: &Applied,
     mode: Restamp,
 ) -> io::Result<()> {
+    // A rollback restored the recorded state: the commit's baseline (and a
+    // strong digest) already describe it, so there is nothing to move.
+    if mode == Restamp::Commit && !applied.rolled_forward {
+        return Ok(());
+    }
     let target = fs::metadata(archive)?;
     #[cfg(unix)]
     {
