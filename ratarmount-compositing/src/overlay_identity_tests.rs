@@ -2010,6 +2010,52 @@ fn regression_symlink_unchanged_complete_recovery_restamps() {
     assert_eq!((rows[0].clone(), rows[1].clone()), (size, mtime));
 }
 
+/// Regression (R7-B5): the base is mounted as `alias.tar -> base.tar` and the
+/// TARGET file is replaced by a different inode while the link itself is
+/// unchanged. The restamp compares the resolved target with the locked
+/// descriptor (a stat of the link would never match and would also refuse the
+/// unchanged case): the replacement leaves the rows alone and keeps the
+/// journal, and once the original target is back recovery finishes through the
+/// link with the target's final stamp.
+#[cfg(unix)]
+#[test]
+fn regression_symlink_replaced_target_uses_resolved_identity() {
+    use ratarmount_compress::commit_journal::{authorize_owned, RecoverError};
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    let alias = fx.archive.with_file_name("alias.tar");
+    std::os::unix::fs::symlink(&fx.archive, &alias).unwrap();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let keep = fx.archive.with_file_name("keep.tar");
+    fs::hard_link(&fx.archive, &keep).unwrap();
+    interrupt_complete(&fx.archive);
+    let other = fx.archive.with_file_name("b.tar");
+    write_tar(&other, &[("other", b"a different base"), ("more", b"x")]);
+    let before = recorded_rows(&fx.overlay);
+    let db = fx.overlay.join(HIDDEN_DB);
+    let (swap_to, swap_from) = (fx.archive.clone(), other.clone());
+    let mut swap = move |_: &ratarmount_compress::commit_journal::PendingJournal,
+                         _: &fs::Metadata| {
+        fs::rename(&swap_from, &swap_to).unwrap();
+        Ok(())
+    };
+    let error = crate::recover_journal_at(&alias, Some(&db), &mut swap).unwrap_err();
+    assert!(matches!(error, RecoverError::Committed(_)), "{error:?}");
+    assert_eq!(recorded_rows(&fx.overlay), before, "rows moved");
+    assert!(fs::symlink_metadata(&alias).unwrap().is_symlink());
+    // The original target is back under the link's target name.
+    fs::rename(&keep, &fx.archive).unwrap();
+    crate::recover_journal_at(&alias, Some(&db), &mut authorize_owned)
+        .unwrap()
+        .expect("finished through the link");
+    let rows = recorded_rows(&fx.overlay);
+    let (size, mtime) = stamp_rows(&fx.archive);
+    assert_eq!((rows[0].clone(), rows[1].clone()), (size, mtime));
+}
+
 /// Regression (R7-A3): a link retargeted to another archive that carries its
 /// own COMPLETE journal, and a target replaced by such an archive, are refused
 /// with the other file, its journal and the rows untouched.
