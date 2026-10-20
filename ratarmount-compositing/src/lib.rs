@@ -11,6 +11,8 @@ pub mod base_sidecars;
 mod control;
 mod empty_archive;
 mod folder;
+// rustix `fstatat`: the overlay verbs that use it are Unix-only.
+#[cfg(unix)]
 pub mod host_stat;
 pub mod journal_recovery;
 mod oci_whiteout;

@@ -2216,7 +2216,7 @@ impl WriteOverlay {
         let guard = self.write_fds.lock().expect("overlay write fds");
         #[cfg(not(unix))]
         {
-            let _ = guard;
+            drop(guard);
             return Some(HashSet::new());
         }
         #[cfg(unix)]
@@ -5716,7 +5716,11 @@ fn write_commit_manifest(
         .as_micros() as u64;
     // Admitted (R10-FIX3): a manifest name that is a hard link of an open
     // overlay database is refused without a descriptor of it being closed.
-    let previous = match open_admitted_file(&dest, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+    #[cfg(unix)]
+    let opened = open_admitted_file(&dest, libc::O_RDONLY | libc::O_NONBLOCK, 0);
+    #[cfg(not(unix))]
+    let opened = File::open(&dest);
+    let previous = match opened {
         Ok(file) => {
             use std::io::BufRead;
             let line = BufReader::new(file).lines().next().transpose()?;
