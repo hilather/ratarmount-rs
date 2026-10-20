@@ -119,7 +119,7 @@ pub(crate) fn overlay_markers(root: &Path) -> Result<Vec<PathBuf>> {
                 bad.get_or_insert(p);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(OverlayError::Io(e)),
+            Err(e) => return Err(io_with_path(e, "cannot stat the overlay marker", &p)),
         }
     }
     if let Some(p) = bad {
@@ -239,10 +239,18 @@ fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
 /// followed `stat` propagates with the path (R10-B). `marked`: the overlay
 /// was used before (#96); a dangling symlink then reads as a missing database,
 /// which the caller refuses with the #96 wording.
+/// `e` (its kind kept) with what failed on which path in its text.
+fn io_with_path(e: io::Error, what: &str, path: &Path) -> OverlayError {
+    OverlayError::Io(io::Error::new(
+        e.kind(),
+        format!("{what} {}: {e}", path.display()),
+    ))
+}
+
 fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(db_path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(OverlayError::Io(e)),
+        Err(e) => return Err(io_with_path(e, "cannot stat the overlay database", db_path)),
         Ok(_) => {}
     }
     match followed_db_stat(db_path) {

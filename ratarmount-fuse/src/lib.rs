@@ -7944,12 +7944,13 @@ mod tests {
     }
 
     /// Regression (R10-C, #148): FUSE duplicates and closes a descriptor on
-    /// every read and write, and reopens a parked descriptor of a detached
-    /// inode. A payload name that is a hard link of the mount's overlay
-    /// database is refused at OPEN (EACCES), a detached inode parked on it is
-    /// refused at its reopen (EACCES), and after an ordinary payload is
-    /// opened and READ (a dup and a close) another process still sees the
-    /// mount's database lock and the mount still writes.
+    /// every WRITE (`write_handle`; a READ is a plain `pread`), and reopens a
+    /// parked descriptor of a detached inode. A payload name that is a hard
+    /// link of the mount's overlay database is refused at OPEN (EACCES), a
+    /// detached inode parked on it is refused at its reopen (EACCES), and
+    /// after an ordinary payload is opened, READ and WRITTEN (a dup and a
+    /// close) another process still sees the mount's database lock and the
+    /// mount still writes.
     #[test]
     fn regression_payload_db_alias_open_read_and_detached_reopen() {
         let (dir, ov, fs) = overlay_fs_for_rename();
@@ -7977,6 +7978,9 @@ mod tests {
         let (fh, _) = fs.open_inode(plain, libc::O_RDONLY).expect("open plain");
         assert_eq!(fs.test_read(fh, 0, 32).unwrap(), b"plain bytes");
         assert!(db_lock_busy_in_child(&db), "lock kept after a read");
+        let (wfh, _) = fs.open_inode(plain, libc::O_RDWR).expect("open plain rw");
+        assert_eq!(fs.write_handle(plain, wfh, 0, b"PLAIN").unwrap(), 5);
+        assert!(db_lock_busy_in_child(&db), "lock kept after a write");
         ov.set_meta("r10_probe", "still writes").unwrap();
         assert!(db_lock_busy_in_child(&db));
         // The probe itself: without the mount, the child takes the lock.

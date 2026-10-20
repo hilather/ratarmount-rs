@@ -1748,23 +1748,28 @@ holds on it, SQLite's included. A payload name that is a hard link of an open
 overlay database (made on the host by the same user, or by a link-preserving
 copy such as `cp -al` or `rsync -H`; FUSE `link` itself is refused) would hand
 out such a descriptor, and closing it after a read would let another process
-write the database under the mount. Every payload, sentinel, pack and commit
-open checks the inode of the descriptor it obtained against the overlay
-databases open in this process (this mount's, a `--lower`'s while it is being
-read, and any other overlay mounted by the same process) and refuses a match
-with EACCES and a message naming the database (logged once per inode). On
+write the database under the mount. Every payload, sentinel, pack (including
+the sweep of old pack temp files), commit, commit-journal, provenance-manifest
+and `import-upperdir` input open checks the inode of the descriptor it
+obtained against the overlay databases open in this process (this mount's,
+and any other overlay mounted or opened by the same process; a `--lower`'s
+database is closed once the layer is loaded) and refuses a match with EACCES
+and a message naming the database (logged once per inode). On
 Linux the check runs on an `O_PATH` descriptor, whose close releases nothing,
 and the file is then reopened through `/proc/self/fd`; `O_TRUNC` and the
 create mode apply only after the check. Elsewhere (macOS, or Linux without
-`/proc`) the refused descriptor is kept open for the life of the process (one
-descriptor per refused open). Remove the extra link to read the file. The
+`/proc`) the refused descriptor, or one whose identity could not be read, is
+kept open for the life of the process (one descriptor per refused open).
+Remove the extra link to read the file. The
 check never holds its lock across an open, so a FIFO under a payload name
 blocks only the request that opens it, never another overlay-database open.
 
 Not covered: a payload descriptor opened before its inode is first opened as
 a database in this process (no mount path does this: the database is opened
-before anything is served), and files read by generic folder sources or
-backing extents of non-overlay sources.
+before anything is served), files read by generic folder sources or
+backing extents of non-overlay sources, and an overlay database swapped away
+and back at its path during its own open (the registered inode is the one at
+the path right after SQLite's open, not proved to be SQLite's descriptor).
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE
