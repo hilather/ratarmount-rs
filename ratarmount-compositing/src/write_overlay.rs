@@ -232,13 +232,6 @@ fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
     fs::metadata(db_path)
 }
 
-/// The overlay database at `db_path` as `Connection::open` would see it:
-/// `None` when nothing is there (an `lstat` NotFound), else the metadata of
-/// the regular file it is (or a symlink points to). A directory, a dangling
-/// symlink or any other non-regular file is refused; any other error of the
-/// followed `stat` propagates with the path (R10-B). `marked`: the overlay
-/// was used before (#96); a dangling symlink then reads as a missing database,
-/// which the caller refuses with the #96 wording.
 /// `e` (its kind kept) with what failed on which path in its text.
 fn io_with_path(e: io::Error, what: &str, path: &Path) -> OverlayError {
     OverlayError::Io(io::Error::new(
@@ -247,6 +240,13 @@ fn io_with_path(e: io::Error, what: &str, path: &Path) -> OverlayError {
     ))
 }
 
+/// The overlay database at `db_path` as `Connection::open` would see it:
+/// `None` when nothing is there (an `lstat` NotFound), else the metadata of
+/// the regular file it is (or a symlink points to). A directory, a dangling
+/// symlink or any other non-regular file is refused; any other error of the
+/// followed `stat` propagates with the path (R10-B). `marked`: the overlay
+/// was used before (#96); a dangling symlink then reads as a missing database,
+/// which the caller refuses with the #96 wording.
 fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(db_path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -6434,7 +6434,6 @@ fn create_overlay_marker(path: &Path) -> io::Result<bool> {
     }
 }
 
-/// WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no equivalent bit.
 /// `open(2)` of a payload, sentinel or commit source that never returns (and
 /// never closes) a descriptor of an open overlay database (R10-C, see
 /// [`ratarmount_core::db_inodes`]); `O_CLOEXEC` is added.
@@ -6443,6 +6442,7 @@ pub(crate) fn open_admitted_file(path: &Path, flags: libc::c_int, mode: u32) -> 
     ratarmount_core::db_inodes::open_admitted(path, flags | libc::O_CLOEXEC, mode).map(File::from)
 }
 
+/// WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no equivalent bit.
 pub(crate) fn open_options_nofollow() -> FsOpenOptions {
     let mut opts = FsOpenOptions::new();
     #[cfg(unix)]
