@@ -20,16 +20,49 @@ use tokio_stream::wrappers::UnixListenerStream;
 // would race these tokio threads.
 static SOCKET_STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
+// The staging name stays short so the staged bind path is only a few bytes
+// longer than the target: `sun_path` holds 107 bytes plus the NUL (#145).
+const STAGING_PREFIX: &str = ".rm";
+const STAGING_RANDOM_LEN: usize = 8;
+const SUN_PATH_MAX: usize = 107;
+/// Bytes the staged bind path adds to the parent: `/.rmXXXXXXXX/s`.
+const STAGING_OVERHEAD: usize = 1 + STAGING_PREFIX.len() + STAGING_RANDOM_LEN + 2;
+/// Longest parent directory whose staged bind path still fits `sun_path`.
+const MAX_SOCKET_DIR_LEN: usize = SUN_PATH_MAX - STAGING_OVERHEAD;
+
+fn staging_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    // RandomState is seeded per process; the inputs keep names distinct within it.
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.write_u64(SOCKET_STAGING_SEQ.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0),
+    );
+    let mut bits = hasher.finish();
+    let mut name = String::from(STAGING_PREFIX);
+    for _ in 0..STAGING_RANDOM_LEN {
+        name.push(ALPHABET[(bits % 36) as usize] as char);
+        bits /= 36;
+    }
+    name
+}
+
 fn stage_dir(parent: &Path) -> io::Result<PathBuf> {
-    let pid = std::process::id();
-    let n = SOCKET_STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    let dir = parent.join(format!(".rmsock-{pid}-{nanos}-{n}"));
-    fs::DirBuilder::new().mode(0o700).create(&dir)?;
-    Ok(dir)
+    let mut last = None;
+    for _ in 0..16 {
+        let dir = parent.join(staging_name());
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => last = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists)))
 }
 
 /// Removes the staging directory, and the staged socket if rename did not run.
@@ -52,14 +85,36 @@ impl Drop for StagingDir {
     }
 }
 
-fn sun_path_fits(path: &Path) -> io::Result<()> {
+fn socket_path_fits(path: &Path, parent: &Path) -> io::Result<()> {
     // `sockaddr_un.sun_path` is 108 bytes, including the trailing NUL.
     // An interior NUL would truncate the path the kernel binds.
     let bytes = path.as_os_str().as_encoded_bytes();
-    if bytes.len() > 107 || bytes.contains(&0) {
+    if bytes.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "path must contain no NUL and be shorter than SUN_LEN",
+            "socket path must contain no NUL",
+        ));
+    }
+    if bytes.len() > SUN_PATH_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path {} is {} bytes, over the {SUN_PATH_MAX}-byte sun_path limit",
+                path.display(),
+                bytes.len()
+            ),
+        ));
+    }
+    let parent_len = parent.as_os_str().as_encoded_bytes().len();
+    if parent_len > MAX_SOCKET_DIR_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path {}: its directory is {parent_len} bytes, but the socket is \
+                 bound in a staging directory first, so the directory may be at most \
+                 {MAX_SOCKET_DIR_LEN} bytes ({SUN_PATH_MAX}-byte sun_path limit)",
+                path.display()
+            ),
         ));
     }
     Ok(())
@@ -106,11 +161,11 @@ fn bind_private(path: &Path) -> io::Result<StdUnixListener> {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
+    socket_path_fits(path, parent)?;
     let staging = StagingDir {
         path: stage_dir(parent)?,
     };
     let staged = staging.path.join("s");
-    sun_path_fits(&staged)?;
     let listener = StdUnixListener::bind(&staged)?;
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
     rename_noreplace(&staged, path)?;
@@ -195,7 +250,7 @@ mod owner_only_socket_tests {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if name.starts_with(".rmsock-") {
+            if name.starts_with(STAGING_PREFIX) {
                 names.push(name.to_string());
             }
         }
@@ -233,7 +288,7 @@ mod owner_only_socket_tests {
         assert!(staging_names(parent).is_empty());
     }
 
-    /// Regression: a leftover `.rmsock-*` directory and its socket must not block the next bind.
+    /// Regression: a leftover `.rm*` staging directory and its socket must not block the next bind.
     #[test]
     fn regression_owner_only_socket_stale_staging_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -316,21 +371,32 @@ mod owner_only_socket_tests {
         }
     }
 
-    /// Regression: a staged path longer than sun_path is rejected and the staging dir is removed.
+    /// Regression: a directory too long to stage in is rejected with the real limit and leaves no staging dir.
     #[test]
     fn regression_owner_only_socket_sun_path_removes_staging() {
         let dir = tempfile::tempdir().unwrap();
-        let mut parent = dir.path().to_path_buf();
-        while parent.as_os_str().as_encoded_bytes().len() <= 100 {
-            parent.push("dddddddddddddddddddddddddddddddd");
-        }
-        fs::create_dir_all(&parent).unwrap();
+        let base_len = dir.path().as_os_str().as_encoded_bytes().len();
+        // One byte over the staging limit; the target itself still fits sun_path.
+        let parent = dir
+            .path()
+            .join("d".repeat(MAX_SOCKET_DIR_LEN + 1 - base_len - 1));
+        fs::create_dir(&parent).unwrap();
+        assert!(
+            parent
+                .join("plugin.sock")
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                <= 107
+        );
         let error = bind_private(&parent.join("csi.sock")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(
-            error.to_string(),
-            "path must contain no NUL and be shorter than SUN_LEN"
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("at most {MAX_SOCKET_DIR_LEN} bytes")),
+            "{message}"
         );
+        assert!(message.contains("107-byte sun_path limit"), "{message}");
         assert!(staging_names(&parent).is_empty());
     }
 
@@ -339,63 +405,82 @@ mod owner_only_socket_tests {
     fn regression_owner_only_socket_sun_path_rejects_interior_nul() {
         use std::os::unix::ffi::OsStrExt;
         let path = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/a\0b"));
-        let error = sun_path_fits(path).unwrap_err();
+        let error = socket_path_fits(path, Path::new("/tmp")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("NUL"));
     }
 
-    /// Regression: a staged path of exactly 107 bytes (sun_path minus the NUL) binds.
+    /// Regression #145: the staging name adds a fixed 14 bytes, so a directory of
+    /// exactly MAX_SOCKET_DIR_LEN bytes stages at 107 bytes and binds; one more is refused.
     #[test]
     fn regression_owner_only_socket_sun_path_exact_107_binds() {
-        // `/tmp` stays short enough that the staging suffix can land on 107 bytes.
-        // Other tests share SOCKET_STAGING_SEQ, so the sequence width can change
-        // between the probe and the bind; retry when the measured length misses.
+        assert_eq!(STAGING_OVERHEAD, 14);
+        assert_eq!(
+            staging_name().len(),
+            STAGING_PREFIX.len() + STAGING_RANDOM_LEN
+        );
         let base = tempfile::tempdir_in("/tmp").unwrap();
-        let mut detail = String::from("no attempt");
-        for _ in 0..8 {
-            let probe = stage_dir(base.path()).unwrap();
-            let name = probe.file_name().unwrap().to_str().unwrap();
-            let seq: u64 = name.rsplit('-').next().unwrap().parse().unwrap();
-            let next_name_len = name.len() + (seq + 1).to_string().len() - seq.to_string().len();
-            let parent_len = 107usize
-                .checked_sub(1 + next_name_len + 2)
-                .expect("staging name longer than sun_path");
-            fs::remove_dir(&probe).unwrap();
-            let base_len = base.path().as_os_str().as_encoded_bytes().len();
-            let leaf_len = parent_len - base_len - 1;
-            assert!(
-                (1..200).contains(&leaf_len),
-                "cannot place a {parent_len}-byte parent under {} ({base_len} bytes)",
-                base.path().display()
-            );
-            let parent = base.path().join("p".repeat(leaf_len));
-            let _ = fs::remove_dir_all(&parent);
-            fs::create_dir(&parent).unwrap();
-            assert_eq!(parent.as_os_str().as_encoded_bytes().len(), parent_len);
-            let sock = parent.join("csi.sock");
-            match bind_private(&sock) {
-                Ok(listener) => {
-                    let bound = listener
-                        .local_addr()
-                        .unwrap()
-                        .as_pathname()
-                        .unwrap()
-                        .to_path_buf();
-                    let len = bound.as_os_str().as_encoded_bytes().len();
-                    if len == 107 {
-                        assert_eq!(bound.file_name(), Some(std::ffi::OsStr::new("s")));
-                        UnixStream::connect(&sock).unwrap();
-                        assert!(staging_names(&parent).is_empty());
-                        return;
-                    }
-                    detail = format!("bound {len} bytes at {}", bound.display());
-                }
-                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
-                    detail = error.to_string();
-                }
-                Err(error) => panic!("bind failed: {error}"),
-            }
-        }
-        panic!("staged path never landed on exactly 107 bytes ({detail})");
+        let base_len = base.path().as_os_str().as_encoded_bytes().len();
+        let parent = base
+            .path()
+            .join("p".repeat(MAX_SOCKET_DIR_LEN - base_len - 1));
+        fs::create_dir(&parent).unwrap();
+        assert_eq!(
+            parent.as_os_str().as_encoded_bytes().len(),
+            MAX_SOCKET_DIR_LEN
+        );
+        let sock = parent.join("csi.sock");
+        let listener = bind_private(&sock).unwrap();
+        let bound = listener
+            .local_addr()
+            .unwrap()
+            .as_pathname()
+            .unwrap()
+            .to_path_buf();
+        assert_eq!(bound.as_os_str().as_encoded_bytes().len(), 107);
+        assert_eq!(bound.file_name(), Some(std::ffi::OsStr::new("s")));
+        UnixStream::connect(&sock).unwrap();
+        assert!(staging_names(&parent).is_empty());
+
+        let longer = base.path().join("p".repeat(MAX_SOCKET_DIR_LEN - base_len));
+        fs::create_dir(&longer).unwrap();
+        let error = bind_private(&longer.join("csi.sock")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(staging_names(&longer).is_empty());
+    }
+
+    /// Regression #145: a target path over 107 bytes is refused even when its
+    /// directory is short enough to stage in (clients could never connect to it).
+    #[test]
+    fn regression_145_target_over_sun_path_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s".repeat(120));
+        let error = bind_private(&sock).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("107-byte sun_path limit"));
+        assert!(staging_names(dir.path()).is_empty());
+    }
+
+    /// Regression #145: a ~90-byte socket path (under sun_path) was refused with the
+    /// SUN_LEN error because the staging path added ~30 bytes.
+    #[test]
+    fn regression_145_ninety_byte_socket_path_binds() {
+        let base = tempfile::tempdir().unwrap();
+        let base_len = base.path().as_os_str().as_encoded_bytes().len();
+        let name = "csi.sock";
+        let leaf_len = 90 - base_len - 2 - name.len();
+        assert!(leaf_len >= 1, "temp dir {} too long", base.path().display());
+        let parent = base.path().join("q".repeat(leaf_len));
+        fs::create_dir(&parent).unwrap();
+        let sock = parent.join(name);
+        assert_eq!(sock.as_os_str().as_encoded_bytes().len(), 90);
+        let listener =
+            bind_private(&sock).unwrap_or_else(|e| panic!("bind {}: {e}", sock.display()));
+        let meta = fs::symlink_metadata(&sock).unwrap();
+        assert!(meta.file_type().is_socket());
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        UnixStream::connect(&sock).unwrap();
+        assert!(staging_names(&parent).is_empty());
+        drop(listener);
     }
 }
