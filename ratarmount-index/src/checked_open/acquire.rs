@@ -865,6 +865,8 @@ pub(crate) mod imp {
             if !a.decided() {
                 a.latch(Mismatch::UnexpectedOpen);
             }
+            #[cfg(any(test, feature = "test-hooks"))]
+            seams::fire(seams::Seam::RefusedOpen);
             set_errno(libc::EACCES);
             return -1;
         }
@@ -1014,6 +1016,9 @@ pub(crate) mod imp {
             AfterLowFdFill,
             /// After SQLite's real database `open` succeeded.
             AfterRealOpen,
+            /// In the `open` wrapper, a second database `open` refused before
+            /// any real `open` (the acquisition is decided or already opened).
+            RefusedOpen,
             /// After the n-th successful armed `stat`. Runs under SQLite's
             /// global unix mutex during `findReusableFd`: filesystem only.
             AfterArmedStat(u32),

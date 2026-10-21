@@ -438,16 +438,36 @@ fn regression_checked_open_reuse_checks_every_stat() {
 /// Regression (R11-S2 review #3, `sqlite3.c` read-write retry): the
 /// read-write open lands on X (swapped in after the first selection `stat`,
 /// A restored right after the real `open`) and is refused with EACCES; SQLite
-/// then retries read-only and reuses a parked read-only descriptor of A with
-/// no `open` call at all, so it returns a connection. The latched mismatch
-/// still refuses it, X's descriptor is retained, and the holder's lock on A
-/// survives (the reused descriptor is re-parked, not closed).
+/// then retries read-only. Every build: the latched mismatch refuses the open,
+/// X's descriptor is retained, and the holder's lock on A survives.
+///
+/// The retry depends on the linked SQLite (R11-S5-FIX1), detected at run time
+/// by `sqlite3_libversion_number()`, never by cargo feature:
+///
+/// - From 3.46.0 (`FIND_REUSABLE_RO_RETRY`) the retry reuses a parked
+///   read-only descriptor of A with no `open` call (a second selection
+///   `stat`), so SQLite returns a connection; the reused descriptor is
+///   re-parked, not closed.
+/// - Before 3.46.0 (SQLCipher's 3.45.3 amalgamation) the retry is a plain
+///   `robust_open` with no selection `stat`; the wrapper refuses that `open`
+///   before any real `open`, so exactly one selection `stat` runs.
 #[test]
 fn regression_checked_open_rw_refusal_then_ro_reuse_refuses() {
-    run_child("rwretry", None);
+    eprintln!("{}", run_child("rwretry", None));
 }
 
+/// The first SQLite whose `unixOpen` read-only retry calls `findReusableFd`.
+/// `libsqlite3-sys-0.30.1/sqlcipher/sqlite3.c` (`SQLITE_VERSION_NUMBER
+/// 3045003`, the SQLCipher amalgamation) retries with a bare
+/// `fd = robust_open(zName, openFlags, openMode);`;
+/// `libsqlite3-sys-0.30.1/sqlite3/sqlite3.c` (3046000) first does
+/// `pReadonly = findReusableFd(zName, flags);` and opens only without one, as
+/// do 3.46.1 (`0.35.0/sqlcipher`) through 3.51.3 (`0.37.0/sqlite3`). No
+/// SQLite release lies between 3.45.3 and 3.46.0.
+const FIND_REUSABLE_RO_RETRY: i32 = 3_046_000;
+
 fn rw_retry_row() -> String {
+    let reuse_retry = rusqlite::version_number() >= FIND_REUSABLE_RO_RETRY;
     let (_t, dir) = tempdir();
     let (a, x) = (dir.join("a.sqlite"), dir.join("x.sqlite"));
     make_db(&a, 1);
@@ -462,8 +482,9 @@ fn rw_retry_row() -> String {
     let saved = dir.join("a.saved");
     let (a2, x2, s2) = (a.clone(), x.clone(), saved.clone());
     let stats = std::rc::Rc::new(std::cell::Cell::new(0));
-    let seen = stats.clone();
-    let mut opened = false;
+    let real_opens = std::rc::Rc::new(std::cell::Cell::new(0));
+    let refused_opens = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (seen, reals, refused) = (stats.clone(), real_opens.clone(), refused_opens.clone());
     // Filesystem only: the stat seam runs under SQLite's unix mutex.
     let seams = Seams::set(move |seam| match seam {
         Seam::AfterArmedStat(n) => {
@@ -473,12 +494,15 @@ fn rw_retry_row() -> String {
                 let _ = std::fs::rename(&x2, &a2);
             }
         }
-        Seam::AfterRealOpen if !opened => {
-            opened = true;
-            let _ = std::fs::rename(&a2, &x2);
-            let _ = std::fs::rename(&s2, &a2);
+        Seam::AfterRealOpen => {
+            reals.set(reals.get() + 1);
+            if reals.get() == 1 {
+                let _ = std::fs::rename(&a2, &x2);
+                let _ = std::fs::rename(&s2, &a2);
+            }
         }
-        _ => {}
+        Seam::RefusedOpen => refused.set(refused.get() + 1),
+        Seam::AfterLowFdFill => {}
     });
     let result = open_checked(&a, RW, NameMode::Path, expect);
     drop(seams);
@@ -491,11 +515,31 @@ fn rw_retry_row() -> String {
     let fd = refusal.retained_fd.expect("X's descriptor is retained");
     assert!(fd >= 3 && fd_is_open(fd));
     assert_eq!(fd_id(fd), id_x);
-    assert!(
-        stats.get() >= 2,
-        "the retry's selection stat ran: {}",
-        stats.get()
-    );
+    assert_eq!(real_opens.get(), 1, "only the read-write open was real");
+    let (version, stats, refused) = (rusqlite::version_number(), stats.get(), refused_opens.get());
+    if reuse_retry {
+        // The read-only retry selected A's parked descriptor: a second
+        // selection `stat`, and no `open` call to refuse.
+        assert!(
+            stats >= 2,
+            "SQLite {version}: the retry's selection stat ran: {stats}"
+        );
+        assert_eq!(
+            refused, 0,
+            "SQLite {version}: the retry reused, it did not open"
+        );
+    } else {
+        // The read-only retry was a plain `robust_open`: no selection `stat`,
+        // and the wrapper refused that `open` before any real `open`.
+        assert_eq!(
+            stats, 1,
+            "SQLite {version}: only the read-write selection stat"
+        );
+        assert_eq!(
+            refused, 1,
+            "SQLite {version}: the read-only retry's open was refused"
+        );
+    }
     assert!(!saved.exists(), "A was restored by the seam");
     assert_eq!(std::fs::read(&a).unwrap(), a_bytes, "A unchanged");
     for side in ["-journal", "-wal", "-shm"] {
@@ -505,7 +549,7 @@ fn rw_retry_row() -> String {
     }
     holder.execute_batch("COMMIT").unwrap();
     assert_eq!(count(&holder), 2);
-    format!("rwretry: {refusal}")
+    format!("rwretry (SQLite {version}, reuse {reuse_retry}): {refusal}")
 }
 
 /// Regression (r9 v3 #3, AFTER_PRESTAT): the marked record's own inode is
@@ -673,7 +717,7 @@ fn reenter_row() -> String {
             let name = match seam {
                 Seam::AfterRealOpen => "open",
                 Seam::AfterArmedStat(_) => "stat",
-                Seam::AfterLowFdFill => return,
+                Seam::AfterLowFdFill | Seam::RefusedOpen => return,
             };
             if name != want_seam || !rec.borrow().is_empty() {
                 return;

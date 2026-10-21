@@ -1826,6 +1826,12 @@ wrappers could be installed:
 | Windows library builds | None | The path is checked to be a regular file (no symlink under `SQLITE_OPEN_NOFOLLOW`) before and after SQLite's open; no file identity, so no swap-back detection. Commit-journal recovery needs Linux or macOS |
 | Any other Unix ABI (musl, 32-bit, big-endian, BSD) | None | Refused (`UnsupportedAbi` / `UnsupportedPlatform`): every `-w` mount and overlay verb that opens an overlay database fails, rather than falling back to pathname checks |
 
+The optional `sqlcipher` feature links SQLCipher's SQLite (3.45.3), which is
+checked the same way. One difference: when its read-write open is refused, its
+read-only retry calls `open` again instead of reusing a parked descriptor
+(SQLite 3.46.0 and later reuse one), and the wrappers refuse that second
+`open` before it reaches the file.
+
 `ratarmount_rs._native._checked_open_status()` reports the installation in a
 Python process. Python's own `sqlite3` module and `_native` may be separate
 SQLite instances; opening one database file through both at once in one
