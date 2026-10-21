@@ -632,11 +632,13 @@ mod imp {
     }
 
     /// The real installer (design §3 steps 1-7). `image`: the private-instance
-    /// proof, whose image must also own the selected VFS's methods.
+    /// proof, whose image must also own the selected VFS's methods (`lookup`:
+    /// [`host_object`], or a test catalog).
     pub(super) fn install_real(
         why: InstallWhy,
         threads: Option<u32>,
         image: Option<ImageIdentity>,
+        lookup: &dyn Fn(usize) -> Lookup,
     ) -> Result<Witness, InstallFailure> {
         // SAFETY: called only under an exclusion proof.
         let rc = unsafe { ffi::sqlite3_initialize() };
@@ -648,7 +650,7 @@ mod imp {
         // The selected VFS's methods are checked before any of them is called.
         if let Some(image) = image {
             // SAFETY: every entry passed `find_vfs`.
-            unsafe { vfs_methods_in_image(&host_object, image, &vfses) }
+            unsafe { vfs_methods_in_image(lookup, image, &vfses) }
                 .map_err(InstallFailure::ForeignVfs)?;
         }
         let table = VfsTable(unix);
@@ -686,7 +688,9 @@ mod imp {
     /// observation; SQLite's own initialization may allocate.
     extern "C" fn constructor() {
         let threads = thread_count();
-        STATE.constructor(threads, |why| install_real(why, threads, None));
+        STATE.constructor(threads, |why| {
+            install_real(why, threads, None, &host_object)
+        });
     }
 
     /// Retained constructor pointer; [`ctor_anchor`] references it so that any
@@ -715,7 +719,14 @@ mod imp {
     pub(super) fn private(anchor: *const std::ffi::c_void) -> Result<Witness, InstallStatus> {
         STATE.private(
             || private_proof(anchor),
-            |image| install_real(InstallWhy::PrivateInstance, thread_count(), Some(image)),
+            |image| {
+                install_real(
+                    InstallWhy::PrivateInstance,
+                    thread_count(),
+                    Some(image),
+                    &host_object,
+                )
+            },
         )
     }
 
@@ -946,6 +957,46 @@ mod imp {
             );
         }
 
+        /// Regression (r11 S1 review 1): no test failed if the real
+        /// installer's VFS-method check was deleted. `install_real` with a
+        /// proof image that owns none of the methods must refuse, naming the
+        /// first method, before any slot is read or set. (Without the check
+        /// it would reach `install_overrides`, which reports `OriginalsDiffer`
+        /// against this binary's installed hooks, or installs.)
+        #[test]
+        fn regression_install_real_refuses_foreign_vfs_before_any_set() {
+            const OTHER: ImageIdentity = ImageIdentity {
+                id: 0x5150,
+                main: false,
+            };
+            let open_before = real_slot(c"open");
+            let stat_before = real_slot(c"stat");
+            let originals_before = ORIGINALS.get().map(|o| (o.open as usize, o.stat as usize));
+            let asked = std::cell::RefCell::new(Vec::new());
+            let lookup = |addr: usize| {
+                asked.borrow_mut().push(addr);
+                Lookup::Found(ImageIdentity {
+                    id: 0x6000,
+                    main: false,
+                })
+            };
+            assert_eq!(
+                install_real(InstallWhy::PrivateInstance, Some(3), Some(OTHER), &lookup),
+                Err(InstallFailure::ForeignVfs(HostFailure::ImageMismatch {
+                    what: "unix xOpen"
+                }))
+            );
+            let unix = find_vfs(c"unix", "unix").unwrap();
+            let x_open = unsafe { (*unix).xOpen }.map_or(0, |f| f as usize);
+            assert_eq!(*asked.borrow(), [x_open], "first anchor: unix xOpen");
+            assert_eq!(real_slot(c"open"), open_before);
+            assert_eq!(real_slot(c"stat"), stat_before);
+            assert_eq!(
+                ORIGINALS.get().map(|o| (o.open as usize, o.stat as usize)),
+                originals_before
+            );
+        }
+
         const CHILD_ENV: &str = "RATARMOUNT_TEST_ABSTAIN_CHILD";
 
         /// Child of `regression_checked_open_never_installs_lazily` (no-op
@@ -1055,7 +1106,9 @@ pub fn constructor_observation() -> Option<CtorObservation> {
 
 /// Install the wrappers into a private SQLite instance whose constructor
 /// abstained. Returns the terminal result if one exists; a failed loader proof
-/// leaves installation possible for a later call.
+/// leaves installation possible for a later call. Once the proof passes, every
+/// result is terminal, a failed VFS-method image check inside the installation
+/// ([`InstallFailure::ForeignVfs`]) included.
 ///
 /// # Safety
 ///
@@ -1113,6 +1166,8 @@ mod tests {
         open: Cell<SyscallPtr>,
         stat: Cell<SyscallPtr>,
         sets: Cell<u32>,
+        /// Every `set` call's slot name, in order.
+        log: std::cell::RefCell<Vec<&'static str>>,
         fail_stat: bool,
         fail_restore_open: bool,
         ignore_open_set: bool,
@@ -1140,6 +1195,11 @@ mod tests {
         }
         fn set(&self, name: &CStr, f: SyscallPtr) -> std::os::raw::c_int {
             self.sets.set(self.sets.get() + 1);
+            self.log.borrow_mut().push(match name.to_bytes() {
+                b"open" => "open",
+                b"stat" => "stat",
+                _ => "?",
+            });
             let Some((cell, default)) = self.slot(name) else {
                 return ffi::SQLITE_NOTFOUND;
             };
@@ -1234,6 +1294,8 @@ mod tests {
         assert_eq!(state.status(), Ok(PRIVATE));
         assert_eq!(addr(fake.open.get()), open_hook as *const () as usize);
         assert_eq!(addr(fake.stat.get()), stat_hook as *const () as usize);
+        // Design step 5: `open` is set before `stat` (r11 S1 review 4).
+        assert_eq!(*fake.log.borrow(), ["open", "stat"]);
         assert_eq!(
             state.observation(),
             Some(CtorObservation::AttemptedSingleThread)
@@ -1300,6 +1362,8 @@ mod tests {
             "not the default, not the hook"
         );
         assert_eq!(addr(fake.stat.get()), custom_stat as *const () as usize);
+        // `open` first, then the failing `stat`, then `open` restored.
+        assert_eq!(*fake.log.borrow(), ["open", "stat", "open"]);
         let o = originals
             .get()
             .expect("originals published before mutation");
@@ -1368,6 +1432,22 @@ mod tests {
             install_overrides(&Empty, &OnceLock::new(), open_hook, stat_hook),
             Err(InstallFailure::OriginalMissing("open"))
         );
+
+        // Originals published earlier differ from the slots now (r11 S1
+        // review 7: unreachable through the terminal cell; defensive):
+        // refused before any mutation.
+        let fake = Fake::new();
+        let seeded = OnceLock::new();
+        let _ = seeded.set(Originals {
+            open: default_open,
+            stat: default_stat,
+        });
+        assert_eq!(
+            install_overrides(&fake, &seeded, open_hook, stat_hook),
+            Err(InstallFailure::OriginalsDiffer)
+        );
+        assert_eq!(fake.sets.get(), 0);
+        assert_eq!(addr(fake.open.get()), custom_open as *const () as usize);
     }
 
     /// Regression: two private initializers that both pass the proof must run

@@ -19,9 +19,11 @@
 //! result or why nothing was installed. The installed wrappers currently
 //! forward every call unchanged.
 //!
-//! The constructor calls `sqlite3_initialize()` in every binary that reaches
-//! `checked_open` ([`installed`] references the constructor, so the linker
-//! keeps it; a binary that never names this module may run no constructor).
+//! The constructor runs in every binary that reaches `checked_open`
+//! ([`installed`] references the constructor, so the linker keeps it; a binary
+//! that never names this module may run no constructor). Only a constructor
+//! that saw exactly one thread calls `sqlite3_initialize()`; an abstaining one
+//! does not touch SQLite (a private-instance installation calls it then).
 //! No code may call `sqlite3_config` (rusqlite's `config_log` included) or
 //! `sqlite3_shutdown` afterwards; a test pins that.
 
