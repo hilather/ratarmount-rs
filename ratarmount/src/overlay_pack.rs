@@ -328,7 +328,10 @@ pub fn pack(
             // The local archive the classified base is (None for any other kind).
             if let Some(base) = options.base.as_deref().filter(|p| p.is_file()) {
                 let index = ratarmount_index::default_index_path(base);
-                if index.is_file() {
+                // `symlink_metadata`: a symlinked (or dangling) index reaches
+                // the snapshot, which refuses it by name, instead of being
+                // followed here or skipped silently.
+                if std::fs::symlink_metadata(&index).is_ok() {
                     // A SQLite copy, never the live file read through a
                     // descriptor of our own: a session of this process may
                     // hold the index open, and that close would release its
@@ -2319,6 +2322,48 @@ pub(crate) mod tests {
             .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
             .unwrap();
         assert_eq!(copied, rows);
+    }
+
+    /// Regression (R11-S5-FIX7): `--include-index` tested the index with
+    /// `is_file()`, which follows a symlink, so a dangling symlinked index was
+    /// skipped without a word. A symlink at the index name (dangling or not)
+    /// now reaches the snapshot, which refuses it by name.
+    #[cfg(unix)]
+    #[test]
+    fn regression_pack_include_index_refuses_symlinked_index() {
+        let f = Fixture::new(true);
+        let base = f.tmp.path().join("base.tar");
+        let mut tar = tar::Builder::new(File::create(&base).unwrap());
+        append_bytes(&mut tar, "hello", b"base").unwrap();
+        tar.finish().unwrap();
+        let index = ratarmount_index::default_index_path(&base);
+        let real = f.tmp.path().join("real.index.sqlite");
+        rusqlite::Connection::open(&real)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x);")
+            .unwrap();
+        for target in [real.clone(), f.tmp.path().join("missing.sqlite")] {
+            let _ = std::fs::remove_file(&index);
+            std::os::unix::fs::symlink(&target, &index).unwrap();
+            let bundle = f.tmp.path().join("symlinked.tar.zst");
+            let err = pack(
+                &f.dir,
+                &bundle,
+                f.base.clone(),
+                &PackOptions {
+                    include_index: true,
+                    base: Some(base.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not a regular file"),
+                "{}: {err:#}",
+                target.display()
+            );
+            assert!(!bundle.exists());
+        }
     }
 
     /// Re-tar `bundle` with the payload of one member replaced (same seal

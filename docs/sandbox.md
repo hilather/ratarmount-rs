@@ -1243,7 +1243,10 @@ of the copy). `--include-index` copies an index only when it has no companion
 files or both `-wal` and `-shm` (a live writer); any other set (a rollback
 `-journal`, a `-wal` without `-shm`), a symlink, a file substituted during the
 open, or an index SQLite cannot read fails the pack instead of being shipped
-raw.
+raw. The companion set is checked by name before the open: an index with none
+is opened `immutable=1`, so a writer in another process that starts a rollback
+journal on it after that check can leave the copy torn (ratarmount's own
+indexes use WAL, and connections in the packing process are not affected).
 
 The ordinary TAR layout is:
 

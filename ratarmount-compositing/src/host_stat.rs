@@ -170,11 +170,24 @@ pub fn chmod_entry_at<Fd: AsFd>(
     expected: &Stat,
     mode: impl FnOnce(rustix::fs::RawMode) -> rustix::fs::RawMode,
 ) -> io::Result<()> {
+    // A directory or symlink the caller was shown is the caller's error, not
+    // a change of the entry; say so instead of "changed".
+    if matches!(
+        expected.st_mode & libc::S_IFMT,
+        libc::S_IFDIR | libc::S_IFLNK
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a directory or a symlink; its permissions are not set here",
+                name.to_string_lossy()
+            ),
+        ));
+    }
     let same = |now: &Stat| {
         now.st_dev == expected.st_dev
             && now.st_ino == expected.st_ino
             && now.st_mode & libc::S_IFMT == expected.st_mode & libc::S_IFMT
-            && !matches!(now.st_mode & libc::S_IFMT, libc::S_IFDIR | libc::S_IFLNK)
     };
     let changed = || {
         io::Error::other(format!(
@@ -242,6 +255,31 @@ mod tests {
     /// is refused and neither file changes; a symlink is refused (never
     /// followed); the expected file is changed. On Linux the check runs on an
     /// `O_PATH` pin, so it also holds between the check and the change.
+    /// Regression (R11-S5-FIX7, review N5): a directory or symlink the
+    /// caller passed as `expected` was reported as "changed while its
+    /// permissions were being set". It is refused as such, and not changed.
+    #[test]
+    fn regression_chmod_entry_at_names_a_directory_or_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::create_dir(dir.join("d")).unwrap();
+        fs::set_permissions(dir.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("d", dir.join("l")).unwrap();
+        let root = fs::File::open(dir).unwrap();
+        for name in [c"d", c"l"] {
+            let st = statat(&root, name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+            let error = chmod_entry_at(&root, name, &st, |_| 0o500).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+            assert!(
+                error.to_string().contains("directory or a symlink"),
+                "{error}"
+            );
+        }
+        let mode = fs::metadata(dir.join("d")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
     #[test]
     fn regression_chmod_entry_at_refuses_a_swapped_name() {
         use std::os::unix::fs::{symlink, PermissionsExt};
