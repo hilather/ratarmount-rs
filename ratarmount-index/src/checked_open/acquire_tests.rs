@@ -162,6 +162,7 @@ fn acquire_child() {
         "closed_stdin" => closed_stdin_row(),
         r if r.starts_with("low:") => low_row(&r["low:".len()..]),
         "reenter" => reenter_row(),
+        "rwretry" => rw_retry_row(),
         other => panic!("unknown row {other}"),
     };
     write_result(&format!("ok {detail}"));
@@ -423,6 +424,79 @@ fn regression_checked_open_reuse_checks_every_stat() {
     );
     assert_eq!(refusal.retained_fd, None, "a reuse opens no descriptor");
     holder.execute_batch("COMMIT").unwrap();
+}
+
+/// Regression (R11-S2 review #3, `sqlite3.c` read-write retry): the
+/// read-write open lands on X (swapped in after the first selection `stat`,
+/// A restored right after the real `open`) and is refused with EACCES; SQLite
+/// then retries read-only and reuses a parked read-only descriptor of A with
+/// no `open` call at all, so it returns a connection. The latched mismatch
+/// still refuses it, X's descriptor is retained, and the holder's lock on A
+/// survives (the reused descriptor is re-parked, not closed).
+#[test]
+fn regression_checked_open_rw_refusal_then_ro_reuse_refuses() {
+    run_child("rwretry", None);
+}
+
+fn rw_retry_row() -> String {
+    let (_t, dir) = tempdir();
+    let (a, x) = (dir.join("a.sqlite"), dir.join("x.sqlite"));
+    make_db(&a, 1);
+    make_db(&x, 2);
+    let (a_bytes, id_x) = (std::fs::read(&a).unwrap(), id_of(&x));
+    let expect = existing(&a, true);
+    let holder = Connection::open(&a).unwrap();
+    holder
+        .execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2)")
+        .unwrap();
+    drop(Connection::open_with_flags(&a, RO).unwrap()); // parks an RO descriptor of A
+    let saved = dir.join("a.saved");
+    let (a2, x2, s2) = (a.clone(), x.clone(), saved.clone());
+    let stats = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = stats.clone();
+    let mut opened = false;
+    // Filesystem only: the stat seam runs under SQLite's unix mutex.
+    let seams = Seams::set(move |seam| match seam {
+        Seam::AfterArmedStat(n) => {
+            seen.set(n);
+            if n == 1 {
+                let _ = std::fs::rename(&a2, &s2);
+                let _ = std::fs::rename(&x2, &a2);
+            }
+        }
+        Seam::AfterRealOpen if !opened => {
+            opened = true;
+            let _ = std::fs::rename(&a2, &x2);
+            let _ = std::fs::rename(&s2, &a2);
+        }
+        _ => {}
+    });
+    let result = open_checked(&a, RW, NameMode::Path, expect);
+    drop(seams);
+    assert!(other_process_sees_lock(&a), "the holder's lock survived");
+    let refusal = result.expect_err("the read-only reuse was accepted");
+    assert!(
+        matches!(refusal.error, AcquireError::OtherFile { actual } if actual == id_x),
+        "{refusal}"
+    );
+    let fd = refusal.retained_fd.expect("X's descriptor is retained");
+    assert!(fd >= 3 && fd_is_open(fd));
+    assert_eq!(fd_id(fd), id_x);
+    assert!(
+        stats.get() >= 2,
+        "the retry's selection stat ran: {}",
+        stats.get()
+    );
+    assert!(!saved.exists(), "A was restored by the seam");
+    assert_eq!(std::fs::read(&a).unwrap(), a_bytes, "A unchanged");
+    for side in ["-journal", "-wal", "-shm"] {
+        let mut p = x.clone().into_os_string();
+        p.push(side);
+        assert!(!Path::new(&p).exists(), "X{side} created");
+    }
+    holder.execute_batch("COMMIT").unwrap();
+    assert_eq!(count(&holder), 2);
+    format!("rwretry: {refusal}")
 }
 
 /// Regression (r9 v3 #3, AFTER_PRESTAT): the marked record's own inode is
