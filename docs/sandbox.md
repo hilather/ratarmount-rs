@@ -104,7 +104,8 @@ JSON-encoded `lower_layers`), plus the numeric `overlay-stats` fields
 `files_dir_writable`, and `db_opens_read_only`. Overlay files live directly in
 the overlay directory, so its permissions determine `files_dir_writable`.
 Success exits 0. Missing or damaged databases fail without being created or
-repaired. A mounted overlay's exclusive database lock is reported as "in use".
+repaired. A mounted overlay's exclusive database lock is reported as "in use"
+(a foreground `-f` mount; a daemonized mount holds no lock, #183).
 
 | Key | Meaning |
 |---|---|
@@ -535,7 +536,8 @@ ratarmount --lower prepared --overlay-tmpfs=2G source.tar scratch/
 
 Lower layers must have `sealed_at` metadata. `--allow-unsealed-lower` also accepts
 unsealed and legacy overlays; these open read-only without SQLite's immutable
-option and may fail with “in use” if another mount holds the database. They use
+option and may fail with “in use” if another mount holds the database
+(a foreground `-f` mount; a daemonized mount holds no lock, #183). They use
 a construction-time row snapshot, so stop writers before using them. Sealed
 lowers use immutable SQLite and can be shared by concurrent mounts.
 
@@ -585,7 +587,8 @@ metadata for such an overlay without inventing a base identity; keep supplying
 BASE to verify it.
 
 Seal refuses a database held by another mount (“in use by another ratarmount
-process”). It runs fsck without repair under a writer reservation and refuses
+process”) (a foreground `-f` mount; a daemonized mount holds no lock, #183).
+It runs fsck without repair under a writer reservation and refuses
 inconsistencies with an `overlay fsck --repair` hint. The digest is the canonical
 SHA-256 change hash against the composed lower view, with exact bytes, modes,
 no excludes, and `.git` included. `--json` prints `layer_digest` and `sealed_at`;
@@ -671,7 +674,8 @@ mount-relative parent, not a host absolute path.
 
 Unsealed checks record `fsck_at` and `fsck_result` (`ok`, `errors:N`, or
 `repaired:N`). Sealed overlays can be checked without modifying any metadata;
-`--repair` is refused. A database locked by a mount returns “in use”. Repairs
+`--repair` is refused. A database locked by a mount returns “in use”
+(a foreground `-f` mount; a daemonized mount holds no lock, #183). Repairs
 hold an exclusive SQLite transaction, but host changes and SQLite are not one
 atomic transaction: stop direct host writers and rerun after an interrupted
 repair. A consistency check does not verify content hashes.
@@ -697,7 +701,8 @@ base and a note goes to stderr. Repeat `--lower DIR` in bottom-to-top order, or
 omit it to use `meta.lower_layers`. Sealed lowers open immutable; other lowers
 open read-only. `--strict` refuses any unsealed top or lower. Without it, unsealed
 and legacy overlays produce warnings. Stop writers before comparing: offline
-diff refuses a database locked by a mount, and files/SQLite are separate stores.
+diff refuses a database locked by a mount (a foreground `-f` mount; a
+daemonized mount holds no lock, #183), and files/SQLite are separate stores.
 
 Choose one output mode (default `--patch`):
 
@@ -1232,7 +1237,13 @@ In-use markers and COW/spool temporary files are excluded. The database member
 and the optional index are copies SQLite writes (`VACUUM INTO`) in a private
 staging directory, never the live files read directly (closing such a read
 would release this process's SQLite locks on them, #156): their rows are the
-layer's and the sidecar's, their bytes need not be.
+layer's and the sidecar's, their bytes need not be, so two packs are
+byte-identical only with the same ratarmount build (the SQLite version is part
+of the copy). `--include-index` copies an index only when it has no companion
+files or both `-wal` and `-shm` (a live writer); any other set (a rollback
+`-journal`, a `-wal` without `-shm`), a symlink, a file substituted during the
+open, or an index SQLite cannot read fails the pack instead of being shipped
+raw.
 
 The ordinary TAR layout is:
 
@@ -1826,11 +1837,11 @@ wrappers could be installed:
 | Windows library builds | None | The path is checked to be a regular file (no symlink under `SQLITE_OPEN_NOFOLLOW`) before and after SQLite's open; no file identity, so no swap-back detection. Commit-journal recovery needs Linux or macOS |
 | Any other Unix ABI (musl, 32-bit, big-endian, BSD) | None | Refused (`UnsupportedAbi` / `UnsupportedPlatform`): every `-w` mount and overlay verb that opens an overlay database fails, rather than falling back to pathname checks |
 
-The optional `sqlcipher` feature links SQLCipher's SQLite (3.45.3), which is
-checked the same way. One difference: when its read-write open is refused, its
-read-only retry calls `open` again instead of reusing a parked descriptor
-(SQLite 3.46.0 and later reuse one), and the wrappers refuse that second
-`open` before it reaches the file.
+The optional `sqlcipher` feature links SQLCipher's SQLite (older than 3.46.0),
+which is checked the same way. One difference: when its read-write open is
+refused, its read-only retry calls `open` again instead of reusing a parked
+descriptor (SQLite 3.46.0 and later reuse one), and the wrappers refuse that
+second `open` before it reaches the file.
 
 `ratarmount_rs._native._checked_open_status()` reports the installation in a
 Python process. Python's own `sqlite3` module and `_native` may be separate
