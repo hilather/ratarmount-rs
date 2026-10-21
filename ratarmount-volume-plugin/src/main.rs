@@ -241,6 +241,7 @@ mod linux {
             }
             return Ok(listener);
         }
+        socket_path_fits(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -605,6 +606,23 @@ mod linux {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert!(error.to_string().contains("107-byte sun_path limit"));
             assert!(staging_names(dir.path()).is_empty());
+        }
+
+        /// Regression #185: an over-long socket path under missing parents is refused
+        /// before any parent directory is created.
+        #[test]
+        fn regression_185_too_long_path_creates_no_parent_dirs() {
+            let dir = tempfile::tempdir().unwrap();
+            let absent = dir.path().join("absent");
+            let sock = absent.join("n1").join("n2").join("s".repeat(120));
+            let error = listener(&sock).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("107-byte sun_path limit"));
+            assert!(
+                !absent.exists(),
+                "parent dirs left behind: {}",
+                absent.display()
+            );
         }
 
         /// Regression #145: a directory over 93 bytes with an exactly-107-byte socket path

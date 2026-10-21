@@ -239,6 +239,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let driver = Driver::open(args.node_id, &args.state_dir, &args.target_root, mounter).await?;
     let path = std::path::Path::new(socket);
+    socket_path_fits(path)?;
     std::fs::create_dir_all(path.parent().ok_or("socket has no parent")?)?;
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if !meta.file_type().is_socket() {
