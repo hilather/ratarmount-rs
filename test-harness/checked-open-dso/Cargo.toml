@@ -19,3 +19,4 @@ rusqlite.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
+tempfile.workspace = true

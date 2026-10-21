@@ -9,7 +9,11 @@ use std::ffi::{c_char, c_int, CStr};
 use ratarmount_index::checked_open;
 
 /// Copy `text` into `buf` (truncated, NUL-terminated); return its full length.
-fn put(text: &str, buf: *mut u8, len: usize) -> usize {
+///
+/// # Safety
+///
+/// `buf` is null or points to `len` writable bytes.
+unsafe fn put(text: &str, buf: *mut u8, len: usize) -> usize {
     if !buf.is_null() && len > 0 {
         let n = text.len().min(len - 1);
         // SAFETY: the caller passes `len` writable bytes.
@@ -23,8 +27,13 @@ fn put(text: &str, buf: *mut u8, len: usize) -> usize {
 
 /// `{:?}` of `install_private_instance`, anchored at `anchor` (0: this
 /// function, the real module anchor).
+///
+/// # Safety
+///
+/// `buf` is null or points to `len` writable bytes. The caller calls this
+/// before anything else in this object uses SQLite, from one thread.
 #[no_mangle]
-pub extern "C" fn fixture_install(anchor: usize, buf: *mut u8, len: usize) -> usize {
+pub unsafe extern "C" fn fixture_install(anchor: usize, buf: *mut u8, len: usize) -> usize {
     let anchor = match anchor {
         0 => fixture_install as *const std::ffi::c_void,
         other => other as *const std::ffi::c_void,
@@ -32,28 +41,39 @@ pub extern "C" fn fixture_install(anchor: usize, buf: *mut u8, len: usize) -> us
     // SAFETY: the test calls this before anything else in this object uses
     // SQLite, from one thread; nothing else replaces the hooks.
     let result = unsafe { checked_open::install_private_instance(anchor) };
-    put(&format!("{result:?}"), buf, len)
+    // SAFETY: the caller's buffer contract.
+    unsafe { put(&format!("{result:?}"), buf, len) }
 }
 
 /// `{:?}` of `(constructor_observation(), installed())`.
+///
+/// # Safety
+///
+/// `buf` is null or points to `len` writable bytes.
 #[no_mangle]
-pub extern "C" fn fixture_status(buf: *mut u8, len: usize) -> usize {
+pub unsafe extern "C" fn fixture_status(buf: *mut u8, len: usize) -> usize {
     let status = (
         checked_open::constructor_observation(),
         checked_open::installed(),
     );
-    put(&format!("{status:?}"), buf, len)
+    // SAFETY: the caller's buffer contract.
+    unsafe { put(&format!("{status:?}"), buf, len) }
 }
 
-/// The current `"open"` slot of this object's `"unix"` VFS.
+/// The current `"open"` slot of this object's `"unix"` VFS (0: none, or the
+/// VFS is older than version 3).
 #[no_mangle]
 pub extern "C" fn fixture_open_slot() -> usize {
-    // SAFETY: SQLite is initialized (the constructor or a database open did
-    // it); the VFS lives for the process and is version 3.
+    // SAFETY: SQLite is initialized here; a registered VFS lives for the
+    // process and is at least the version-1 prefix, so only `iVersion` is
+    // read before the version-3 fields are borrowed.
     unsafe {
         rusqlite::ffi::sqlite3_initialize();
         let vfs = rusqlite::ffi::sqlite3_vfs_find(c"unix".as_ptr());
-        match vfs.as_ref().and_then(|v| v.xGetSystemCall) {
+        if vfs.is_null() || std::ptr::addr_of!((*vfs).iVersion).read() < 3 {
+            return 0;
+        }
+        match (*vfs).xGetSystemCall {
             Some(get) => get(vfs, c"open".as_ptr()).map_or(0, |f| f as usize),
             None => 0,
         }

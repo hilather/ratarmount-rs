@@ -73,8 +73,11 @@ fn regression_dso_private_instance_installs_after_abstention() {
         unsafe { std::mem::transmute(sym(c"fixture_open_slot")) };
     let roundtrip: unsafe extern "C" fn(*const libc::c_char) -> libc::c_int =
         unsafe { std::mem::transmute(sym(c"fixture_db_roundtrip")) };
-    // This executable does not link SQLite: the fixture's is private. (macOS
-    // may have the system libsqlite3 loaded, so Linux only.)
+    // No SQLite in the global scope (a dynamically linked system libsqlite3
+    // would be). This cannot see a SQLite linked statically into this
+    // executable; `install(0)` returning `PrivateInstance` below is what
+    // proves the fixture's SQLite is in the fixture's own image. (macOS may
+    // have the system libsqlite3 loaded, so Linux only.)
     #[cfg(target_os = "linux")]
     assert!(unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"sqlite3_vfs_find".as_ptr()) }.is_null());
 
@@ -89,6 +92,14 @@ fn regression_dso_private_instance_installs_after_abstention() {
         assert_eq!(install(0), "Err(UnsupportedAbi)");
         assert_eq!(open_slot(), slot_before);
         eprintln!("skip: checked opens are unsupported on this target; private-install rows");
+        drop(tx);
+        parked.join().unwrap();
+        return;
+    }
+    if before.contains("AbstainedThreads(None)") {
+        // The constructor could not count threads (masked `/proc`); it still
+        // abstained, but `threads_at_install` below would be `None` too.
+        eprintln!("skip: thread count unreadable (masked /proc?): {before}");
         drop(tx);
         parked.join().unwrap();
         return;
@@ -138,15 +149,19 @@ fn regression_dso_private_instance_installs_after_abstention() {
     let after = status();
     assert!(after.contains(&first), "{after}");
 
-    let dir = std::env::temp_dir().join(format!("ratarmount-dso-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = CString::new(dir.join("t.sqlite").into_os_string().into_encoded_bytes()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = CString::new(
+        dir.path()
+            .join("t.sqlite")
+            .into_os_string()
+            .into_encoded_bytes(),
+    )
+    .unwrap();
     assert_eq!(
         unsafe { roundtrip(db.as_ptr()) },
         0,
         "database work through the wrappers"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 
     drop(tx);
     parked.join().unwrap();
