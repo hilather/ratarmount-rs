@@ -129,7 +129,9 @@ fn is_hot_journal(error: &rusqlite::Error) -> bool {
 /// then names `import_incomplete`). Only an unsealed overlay whose database
 /// and directory are writable is touched; a sealed or read-only one gets an
 /// error naming the interrupted write and its journal stays as it is.
-fn recover_hot_journal(dir: &Path, db: &Path) -> Result<()> {
+/// `required` is the caller's latched requirement; the result is that latch
+/// OR'ed with this open's own (a marker seen here is kept for the retry).
+fn recover_hot_journal(dir: &Path, db: &Path, required: bool) -> Result<bool> {
     let journal = PathBuf::from(format!("{}-journal", db.display()));
     let refuse = |why: &str| {
         OverlayError::Msg(format!(
@@ -148,19 +150,21 @@ fn recover_hot_journal(dir: &Path, db: &Path) -> Result<()> {
     if !path_writable(dir) || !path_writable(db) {
         return Err(refuse("the overlay or its directory is read-only"));
     }
-    let conn = crate::open_overlay_db(
+    let conn = crate::overlay_db::open_overlay_db_required(
         &dir.join(HIDDEN_DB),
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         crate::DbName::Path,
+        required,
     )?;
+    let required = required || conn.required_record();
     conn.busy_timeout(std::time::Duration::ZERO)?;
     // Any read takes the shared lock, which plays the journal back.
     match conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
         r.get::<_, i64>(0)
     }) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(required),
         Err(error) if is_hot_journal(&error) => Err(refuse("it could not be rolled back here")),
         Err(error) => Err(error.into()),
     }
@@ -265,22 +269,29 @@ impl OverlayMeta {
                 db.display()
             )));
         }
+        // The requirement is a latch across the hot-journal recovery and the
+        // retry: a marker any open saw stays required (S3 skeptic #2).
+        let latched = std::cell::Cell::new(required);
         let read = || -> Result<Option<Self>> {
             let conn = crate::overlay_db::open_overlay_db_required(
                 &db,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 crate::DbName::Path,
-                required,
+                latched.get(),
             )?;
+            latched.set(latched.get() || conn.required_record());
             conn.busy_timeout(std::time::Duration::ZERO)?;
             // One read transaction: the `files` check and the `meta` rows
             // describe the same database state.
             let tx = conn.unchecked_transaction()?;
-            Self::from_connection_required(&tx, required || conn.required_record())
+            Self::from_connection_required(&tx, latched.get())
         };
         let result = match read() {
             Err(OverlayError::Sqlite(error)) if recover_hot && is_hot_journal(&error) => {
-                recover_hot_journal(dir, &db).and_then(|()| read())
+                recover_hot_journal(dir, &db, latched.get()).and_then(|required| {
+                    latched.set(required);
+                    read()
+                })
             }
             other => other,
         };
@@ -3535,5 +3546,71 @@ mod tests {
         let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
         assert_eq!(meta.format_version().unwrap(), Some(2));
         assert_eq!(meta.get("import_in_progress"), Some("1:2"));
+    }
+
+    /// Build `dir/HIDDEN_DB` with a hot rollback journal: a table-less
+    /// database (no `files`) copied together with its `-journal` while a
+    /// writer's spilled transaction is open.
+    fn table_less_db_with_hot_journal(dir: &Path) {
+        let scratch = tempfile::tempdir().unwrap();
+        let src = scratch.path().join("src.sqlite");
+        let conn = Connection::open(&src).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE; CREATE TABLE t(x BLOB); \
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 64) \
+             INSERT INTO t SELECT zeroblob(4096) FROM n;",
+        )
+        .unwrap();
+        // A tiny cache spills the open transaction: journal synced, pages
+        // written into the database file.
+        conn.execute_batch(
+            "PRAGMA cache_size=1; BEGIN; UPDATE t SET x = zeroblob(4000); \
+             INSERT INTO t SELECT x FROM t;",
+        )
+        .unwrap();
+        let journal = PathBuf::from(format!("{}-journal", src.display()));
+        assert!(fs::metadata(&journal).unwrap().len() > 0, "spilled journal");
+        let db = dir.join(HIDDEN_DB);
+        fs::copy(&src, &db).unwrap();
+        fs::copy(&journal, format!("{}-journal", db.display())).unwrap();
+        drop(conn);
+    }
+
+    /// Regression (S3 skeptic #2): the required-record latch is kept across
+    /// the hot-journal recovery and the retry. A marker present when the
+    /// first read's open classified the database (after the caller's own
+    /// marker check) and removed after the acquisition made that attempt
+    /// required; the read hit `SQLITE_READONLY_ROLLBACK`, recovery rolled
+    /// the journal back, and the retry used the caller's original `false`,
+    /// so a table-less record read as "unrecorded" (`Ok(None)`).
+    #[test]
+    fn regression_required_latch_survives_hot_journal_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        table_less_db_with_hot_journal(dir.path());
+        let marker = dir.path().join(crate::write_overlay::OVERLAY_MARKER);
+        fs::write(&marker, b"").unwrap();
+        let journal = PathBuf::from(format!("{}-journal", dir.path().join(HIDDEN_DB).display()));
+
+        let opens = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let counted = opens.clone();
+        let removed = marker.clone();
+        crate::overlay_db::AFTER_ACQUIRE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                counted.set(counted.get() + 1);
+                if counted.get() == 1 {
+                    fs::remove_file(&removed).unwrap();
+                }
+            }))
+        });
+        // The caller's own marker check ran before the marker appeared.
+        let result = OverlayMeta::read_with_required(dir.path(), true, false, false);
+        crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
+
+        assert_eq!(opens.get(), 3, "read, recovery, retry");
+        assert!(!journal.exists(), "the hot journal was rolled back");
+        match result {
+            Err(OverlayError::Msg(msg)) => assert_eq!(msg, NO_FILES_TABLE),
+            other => panic!("a required table-less record must refuse: {other:?}"),
+        }
     }
 }
