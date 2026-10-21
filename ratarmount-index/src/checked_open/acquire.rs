@@ -351,29 +351,27 @@ pub(crate) fn decide(
     a: Acquisition,
     result: rusqlite::Result<Connection>,
 ) -> Result<Acquired, Refusal> {
-    let refuse = |error: AcquireError, retained_fd: Option<i32>| Refusal { error, retained_fd };
+    // A refusal reports what stays open: a retained descriptor, else a low
+    // slot that was kept (not re-pointed) after its duplicate was handed on.
+    let kept = a.retained.or(a.low.filter(|l| !l.released).map(|l| l.fd));
+    let refuse = |error: AcquireError| Refusal {
+        error,
+        retained_fd: kept,
+    };
     if let Some(low) = a.low.filter(|l| l.fatal) {
         drop(result);
-        let retained = if low.released {
-            a.retained
-        } else {
-            a.retained.or(Some(low.fd))
-        };
-        return Err(refuse(
-            AcquireError::LowDescriptor {
-                fd: low.fd,
-                locks_may_be_released: low.released,
-            },
-            retained,
-        ));
+        return Err(refuse(AcquireError::LowDescriptor {
+            fd: low.fd,
+            locks_may_be_released: low.released,
+        }));
     }
     if let Some(m) = a.refusal {
         // A returned connection here was validated or reused; its close goes
         // through SQLite's `unixClose`, which re-parks it under any lock.
         drop(result);
-        return Err(refuse(m.into(), a.retained));
+        return Err(refuse(m.into()));
     }
-    let conn = result.map_err(|e| refuse(AcquireError::Sqlite(e), a.retained))?;
+    let conn = result.map_err(|e| refuse(AcquireError::Sqlite(e)))?;
     let retained_low_fd = a.low.map(|l| l.fd);
     match (a.first, a.expect) {
         (Some(id), _) => Ok(Acquired {
@@ -390,7 +388,7 @@ pub(crate) fn decide(
         }),
         _ => {
             drop(conn);
-            Err(refuse(AcquireError::ReusedUnverified, a.retained))
+            Err(refuse(AcquireError::ReusedUnverified))
         }
     }
 }

@@ -583,8 +583,9 @@ fn closed_stdin_row() -> String {
 /// and writable fd 0 are duplicated to a high slot and the low one retained;
 /// a failed duplicate retains it and refuses; writable stdout/stderr is
 /// re-pointed at `/dev/null` and refused as a possible lock release, also for
-/// a mismatching file; a failed `fstat` or a mismatch at a low slot keeps
-/// both descriptors.
+/// a mismatching file or a failed `fstat` (`rw1fstat`); a failed `fstat` or
+/// a mismatch at a read-only low slot keeps both descriptors. An SQLite error
+/// after an accepted low-slot duplicate (`memerr0`) reports the kept slot.
 #[test]
 fn regression_low_fd_window_policy() {
     for row in [
@@ -596,6 +597,8 @@ fn regression_low_fd_window_policy() {
         "rw2mismatch",
         "fstat0",
         "mismatch0",
+        "rw1fstat",
+        "memerr0",
     ] {
         run_child(&format!("low:{row}"), None);
     }
@@ -603,12 +606,23 @@ fn regression_low_fd_window_policy() {
 
 fn low_row(row: &str) -> String {
     let (_t, dir) = tempdir();
-    let a = dir.join("a.sqlite");
-    make_db(&a, 1);
-    let expect = existing(&a, true);
+    // `memerr0`: `/proc/self/mem` is accepted (a regular file), then SQLite's
+    // header read fails with EIO.
+    let mem = row == "memerr0";
+    if mem && !Path::new("/proc/self/mem").exists() {
+        return format!("skip: {row}: /proc is not mounted");
+    }
+    let a = if mem {
+        PathBuf::from("/proc/self/mem")
+    } else {
+        let a = dir.join("a.sqlite");
+        make_db(&a, 1);
+        a
+    };
+    let expect = existing(&a, !mem);
     let slot = match row {
         "ro2" => 2,
-        "rw1" => 1,
+        "rw1" | "rw1fstat" => 1,
         "rw2mismatch" => 2,
         _ => 0,
     };
@@ -616,7 +630,7 @@ fn low_row(row: &str) -> String {
     // A mismatch row has no holder: its open connection would make SQLite's
     // reuse-selection `stat` refuse before the descriptor is opened.
     let mismatch = row.contains("mismatch");
-    let holder = (!mismatch).then(|| {
+    let holder = (!mismatch && !mem).then(|| {
         let holder = Connection::open(&a).unwrap();
         holder
             .execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2)")
@@ -654,7 +668,7 @@ fn low_row(row: &str) -> String {
             unsafe { libc::close(slot) };
         }
     });
-    if row == "fstat0" {
+    if row == "fstat0" || row == "rw1fstat" {
         seams = seams.fail_fstat(libc::EIO);
     }
     let result = open_checked(&a, flags, NameMode::Path, expect);
@@ -696,7 +710,7 @@ fn low_row(row: &str) -> String {
             holder.unwrap().execute_batch("COMMIT").unwrap();
             format!("{row}: {refusal}")
         }
-        ("rw1" | "rw2mismatch", Err(refusal)) => {
+        ("rw1" | "rw2mismatch" | "rw1fstat", Err(refusal)) => {
             assert!(
                 matches!(
                     refusal.error,
@@ -729,6 +743,18 @@ fn low_row(row: &str) -> String {
                 assert!(other_process_sees_lock(&a));
                 holder.unwrap().execute_batch("COMMIT").unwrap();
             }
+            format!("{row}: {refusal}")
+        }
+        ("memerr0", Err(refusal)) => {
+            // The duplicate went to SQLite (and was closed with its failed
+            // connection); the low slot stays open and is reported.
+            assert!(
+                matches!(refusal.error, AcquireError::Sqlite(_)),
+                "{refusal}"
+            );
+            assert_eq!(refusal.retained_fd, Some(0));
+            assert!(fd_is_open(0));
+            assert_eq!(fd_id(0), id_of(&a), "slot 0 still holds the opened file");
             format!("{row}: {refusal}")
         }
         (row, Ok(_)) => panic!("{row}: acquired"),
@@ -856,6 +882,44 @@ fn regression_checked_open_decision_table() {
                     Err(Refusal {
                         error: AcquireError::Sqlite(_),
                         retained_fd: None
+                    })
+                )
+            },
+        ),
+        (
+            "SQLite error after a kept low slot reports that slot",
+            Acquisition {
+                first: Some(id),
+                opened: true,
+                low: low(false, false),
+                ..base
+            },
+            false,
+            |r| {
+                matches!(
+                    r,
+                    Err(Refusal {
+                        error: AcquireError::Sqlite(_),
+                        retained_fd: Some(1)
+                    })
+                )
+            },
+        ),
+        (
+            "a retained descriptor is reported before a kept low slot",
+            Acquisition {
+                refusal: other,
+                low: low(false, false),
+                retained: Some(9),
+                ..base
+            },
+            false,
+            |r| {
+                matches!(
+                    r,
+                    Err(Refusal {
+                        error: AcquireError::OtherFile { .. },
+                        retained_fd: Some(9)
                     })
                 )
             },
