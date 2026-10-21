@@ -1572,3 +1572,148 @@ fn regression_seams_carry_release_marker() {
         "the linked binary keeps the marker"
     );
 }
+
+/// Files beside `db` whose name extends it (`-wal`, `-shm`, `-journal`, ...).
+fn companions(db: &Path) -> Vec<String> {
+    let name = db.file_name().unwrap().to_string_lossy().into_owned();
+    let mut found: Vec<String> = std::fs::read_dir(db.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != &name && n.starts_with(&name))
+        .collect();
+    found.sort();
+    found
+}
+
+/// Regression (#156 fix round): `snapshot_index_into` fell back to the
+/// lookup's raw snapshot (`fs::copy` of the live index and its companions)
+/// for a rollback journal or a partial companion set; closing those copies'
+/// descriptors released this process's locks (a PERSIST-journal holder's
+/// RESERVED lock: another process then wrote under it). Any set other than
+/// none or `-wal` + `-shm` is refused now, nothing is created beside the
+/// index, and the holder keeps its lock.
+#[test]
+fn regression_snapshot_index_refuses_partial_companions_and_keeps_locks() {
+    let (_dir, dir) = tempdir();
+    let db = dir.join("held.index.sqlite");
+    make_db(&db, 1);
+    let holder = Connection::open(&db).unwrap();
+    holder
+        .execute_batch("PRAGMA journal_mode=PERSIST; INSERT INTO t VALUES (2); BEGIN IMMEDIATE;")
+        .unwrap();
+    assert_eq!(companions(&db), ["held.index.sqlite-journal"]);
+    assert!(other_process_sees_lock(&db), "the holder's RESERVED lock");
+    let dest = dir.join("copy.sqlite");
+    let error = crate::snapshot_index_into(&db, &dest).unwrap_err();
+    assert!(error.to_string().contains("incomplete"), "{error}");
+    assert!(
+        other_process_sees_lock(&db),
+        "the refused snapshot released the holder's lock"
+    );
+    holder
+        .execute_batch("INSERT INTO t VALUES (3); COMMIT;")
+        .unwrap();
+    assert_eq!(count(&holder), 3);
+    drop(holder);
+    assert!(!dest.exists());
+
+    for set in [
+        &["-wal"][..],
+        &["-shm"],
+        &["-journal"],
+        &["-wal", "-journal"],
+        &["-wal", "-shm", "-journal"],
+    ] {
+        let db = dir.join(format!("set{}.index.sqlite", set.join("")));
+        make_db(&db, 1);
+        for suffix in set {
+            let mut name = db.clone().into_os_string();
+            name.push(suffix);
+            std::fs::write(PathBuf::from(name), b"").unwrap();
+        }
+        let before = companions(&db);
+        let error = crate::snapshot_index_into(&db, &dest).unwrap_err();
+        assert!(error.to_string().contains("incomplete"), "{set:?}: {error}");
+        assert_eq!(companions(&db), before, "{set:?}: a file was created");
+        assert!(!dest.exists(), "{set:?}");
+    }
+}
+
+/// Regression (#156 fix round): the index was checked for a symlink and then
+/// opened by a canonicalized name, so a symlink (or another database)
+/// substituted in between was copied. The checked acquisition opens the
+/// final component without following it and judges SQLite's own descriptor
+/// against the classified file: both substitutions are refused and nothing
+/// is written.
+#[test]
+fn regression_snapshot_index_refuses_substitution_after_classification() {
+    let (_dir, dir) = tempdir();
+    let other = dir.join("other.sqlite");
+    make_db(&other, 7);
+    for kind in ["symlink", "other"] {
+        let db = dir.join(format!("{kind}.index.sqlite"));
+        make_db(&db, 1);
+        let (hook_db, hook_other) = (db.clone(), other.clone());
+        let kind_owned = kind.to_owned();
+        crate::SNAPSHOT_AFTER_CLASSIFY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&hook_db).unwrap();
+                if kind_owned == "symlink" {
+                    std::os::unix::fs::symlink(&hook_other, &hook_db).unwrap();
+                } else {
+                    std::fs::copy(&hook_other, &hook_db).unwrap();
+                }
+            }))
+        });
+        let dest = dir.join(format!("{kind}-copy.sqlite"));
+        let result = crate::snapshot_index_into(&db, &dest);
+        crate::SNAPSHOT_AFTER_CLASSIFY.with(|hook| *hook.borrow_mut() = None);
+        assert!(result.is_err(), "{kind}: the substitute was copied");
+        assert!(!dest.exists(), "{kind}");
+    }
+}
+
+/// `snapshot_index_into` copies an index with no companions (immutable) and
+/// a live WAL index whose writer holds its write lock (which it keeps), into
+/// a destination whose name is not UTF-8 on Linux (it was converted lossily).
+#[test]
+fn regression_snapshot_index_copies_and_keeps_wal_writer_lock() {
+    let (_dir, dir) = tempdir();
+    #[cfg(target_os = "linux")]
+    let out = {
+        use std::os::unix::ffi::OsStrExt;
+        let out = dir.join(std::ffi::OsStr::from_bytes(b"out-\xff"));
+        std::fs::create_dir(&out).unwrap();
+        out
+    };
+    #[cfg(not(target_os = "linux"))]
+    let out = dir.join("out");
+    #[cfg(not(target_os = "linux"))]
+    std::fs::create_dir(&out).unwrap();
+    let plain = dir.join("plain.index.sqlite");
+    make_db(&plain, 1);
+    crate::snapshot_index_into(&plain, &out.join("plain.sqlite")).unwrap();
+    assert!(companions(&plain).is_empty());
+    assert_eq!(
+        count(&Connection::open(out.join("plain.sqlite")).unwrap()),
+        1
+    );
+
+    let wal = dir.join("wal.index.sqlite");
+    make_db(&wal, 1);
+    let holder = Connection::open(&wal).unwrap();
+    holder
+        .execute_batch("PRAGMA journal_mode=WAL; INSERT INTO t VALUES (2); BEGIN IMMEDIATE;")
+        .unwrap();
+    assert!(other_process_sees_lock(&wal), "the writer's lock");
+    crate::snapshot_index_into(&wal, &out.join("wal.sqlite")).unwrap();
+    assert!(
+        other_process_sees_lock(&wal),
+        "the snapshot released the writer's lock"
+    );
+    holder
+        .execute_batch("INSERT INTO t VALUES (3); COMMIT;")
+        .unwrap();
+    drop(holder);
+    assert_eq!(count(&Connection::open(out.join("wal.sqlite")).unwrap()), 2);
+}

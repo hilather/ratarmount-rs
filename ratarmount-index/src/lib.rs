@@ -762,15 +762,105 @@ pub(crate) fn open_lookup_connection(path: &Path) -> rusqlite::Result<Connection
 }
 
 /// Write a consistent copy of the index at `path` to `dest` (which must not
-/// exist) with `VACUUM INTO`, through the same no-side-file read-only open as
-/// a lookup ([`open_lookup_connection`]). For a caller that ships the index
-/// (`overlay pack --include-index`): reading the live file through a
-/// descriptor of its own would, on close, release every fcntl lock this
-/// process holds on it, a session's included.
-pub fn snapshot_index_into(path: &Path, dest: &Path) -> rusqlite::Result<()> {
-    let conn = open_lookup_connection(path)?;
-    conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
+/// exist) with `VACUUM INTO`. For a caller that ships the index (`overlay pack
+/// --include-index`): reading the live file through a descriptor of its own
+/// would, on close, release every fcntl lock this process holds on it, a
+/// session's included (#156).
+///
+/// Only SQLite opens the index, through the checked acquisition
+/// ([`checked_open::open_checked`]): the final component is never followed
+/// (`SQLITE_OPEN_NOFOLLOW`), and SQLite's own descriptor must be the regular
+/// file classified here, so a symlink or another file substituted between the
+/// classification and the open is refused. Unlike a lookup
+/// ([`open_lookup_connection`]) there is no snapshot fallback, which copies
+/// the live files raw: the index is opened `immutable=1` when it has no
+/// companions, normally when it has both `-wal` and `-shm` (a live writer),
+/// and refused for any other set (a `-wal` without `-shm`, a lone `-shm`, a
+/// `-journal`). `dest` may be any byte string (non-UTF-8 included).
+pub fn snapshot_index_into(path: &Path, dest: &Path) -> std::io::Result<()> {
+    use checked_open::{AcquireError, Expect, NameMode};
+    use std::io;
+    let resolved = match (path.parent(), path.file_name()) {
+        (Some(dir), Some(file)) if !dir.as_os_str().is_empty() => dir.canonicalize()?.join(file),
+        _ => std::path::absolute(path)?,
+    };
+    let metadata = std::fs::symlink_metadata(&resolved)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "index {} is not a regular file (a symlink is never followed)",
+                resolved.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    let id = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    // Off Unix there is no identity (`WindowsPathTypeOnly`).
+    #[cfg(not(unix))]
+    let id = (0, 0);
+    let side = |suffix: &str| {
+        let mut name = resolved.clone().into_os_string();
+        name.push(suffix);
+        std::fs::symlink_metadata(PathBuf::from(name)).is_ok()
+    };
+    let mode = match (side("-wal"), side("-shm"), side("-journal")) {
+        (false, false, false) => NameMode::Immutable,
+        (true, true, false) => NameMode::Path,
+        (wal, shm, journal) => {
+            return Err(io::Error::other(format!(
+                "index {} has an incomplete set of companion files (-wal {wal}, -shm {shm}, \
+                 -journal {journal}); it is not copied: only SQLite may read it, and SQLite \
+                 would create or replay the missing files beside it",
+                resolved.display()
+            )))
+        }
+    };
+    #[cfg(test)]
+    SNAPSHOT_AFTER_CLASSIFY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()
+        }
+    });
+    let acquired = checked_open::open_checked(
+        &resolved,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        mode,
+        Expect::Existing {
+            id,
+            require_nonempty: true,
+        },
+    )
+    .map_err(|refusal| match refusal.error {
+        AcquireError::Sqlite(e) => {
+            io::Error::other(format!("cannot open index {}: {e}", resolved.display()))
+        }
+        _ => io::Error::other(format!("index {}: {refusal}", resolved.display())),
+    })?;
+    vacuum_into(&acquired.conn, dest)
+        .map_err(|e| io::Error::other(format!("cannot copy index {}: {e}", resolved.display())))
+}
+
+/// `VACUUM INTO dest`, with `dest` bound as the bytes of the path (a
+/// non-UTF-8 path is not mangled by a lossy conversion).
+pub fn vacuum_into(conn: &Connection, dest: &Path) -> rusqlite::Result<()> {
+    use rusqlite::types::{ToSqlOutput, ValueRef};
+    let name = ToSqlOutput::Borrowed(ValueRef::Text(dest.as_os_str().as_encoded_bytes()));
+    conn.execute("VACUUM INTO ?1", [name])?;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once in [`snapshot_index_into`], between the classification and
+    /// the open.
+    pub(crate) static SNAPSHOT_AFTER_CLASSIFY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Copy the index and its existing companions into a private temporary

@@ -167,8 +167,7 @@ fn staged_db(
     // rejects a symlink in any component of the staging path (every macOS temp
     // dir lives under /var -> /private/var): hand SQLite the resolved path.
     let copy = staging.canonicalize()?.join(HIDDEN_DB);
-    conn.execute("VACUUM INTO ?1", [copy.to_string_lossy().as_ref()])
-        .map_err(io::Error::other)?;
+    ratarmount_index::vacuum_into(&conn, &copy).map_err(io::Error::other)?;
     drop(conn);
     let clean = packed.redacted_values();
     if &clean == meta.values() {
@@ -330,16 +329,14 @@ pub fn pack(
             if let Some(base) = options.base.as_deref().filter(|p| p.is_file()) {
                 let index = ratarmount_index::default_index_path(base);
                 if index.is_file() {
-                    if !fs::symlink_metadata(&index)?.is_file() {
-                        return Err(io::Error::from_raw_os_error(libc::ELOOP));
-                    }
                     // A SQLite copy, never the live file read through a
                     // descriptor of our own: a session of this process may
                     // hold the index open, and that close would release its
-                    // locks (#156).
+                    // locks (#156). The snapshot refuses a symlink (also one
+                    // substituted after this check) and an index it could
+                    // not copy without a raw read of the live files.
                     let copy = staging.path().canonicalize()?.join("index.sqlite");
-                    ratarmount_index::snapshot_index_into(&index, &copy)
-                        .map_err(io::Error::other)?;
+                    ratarmount_index::snapshot_index_into(&index, &copy)?;
                     let file = File::open(&copy)?;
                     let name = format!(
                         "index/{}",
@@ -2242,6 +2239,8 @@ pub(crate) mod tests {
     fn regression_pack_keeps_in_process_db_lock() {
         let f = Fixture::new(true);
         let db = f.dir.join(HIDDEN_DB);
+        // A sealed layer (database and directory) is read-only, so the holder
+        // only reads; the index test below has a holder that writes after.
         let holder =
             rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .unwrap();
