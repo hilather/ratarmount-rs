@@ -600,7 +600,10 @@ fn regression_low_fd_window_policy() {
         "rw1fstat",
         "memerr0",
     ] {
-        run_child(&format!("low:{row}"), None);
+        let got = run_child(&format!("low:{row}"), None);
+        if got.contains("skip:") {
+            eprintln!("{}", got.trim_start_matches("ok "));
+        }
     }
 }
 
