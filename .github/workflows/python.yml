@@ -92,6 +92,9 @@ jobs:
           sudo apt-get update -o Acquire::Retries=5
           sudo apt-get install -y -o Acquire::Retries=5 pkg-config libarchive-dev zlib1g-dev
       - name: cargo test --features embedding
+        # The test binary links libpython (auto-initialize); point the loader at it.
+        env:
+          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: cargo test -p ratarmount-python --features embedding --lib
 
   sdist:
