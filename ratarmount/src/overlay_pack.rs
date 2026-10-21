@@ -1331,13 +1331,20 @@ fn finalize_stage(directory: &Path, recorded: Recorded) -> io::Result<()> {
     let root = open_root(directory)?;
     for (path, mode) in &recorded.files {
         let (fd, name) = parent(&root, path, false)?;
-        let child = host::openat(
+        let name = std::ffi::CString::new(name).map_err(|_| invalid("NUL in member path"))?;
+        let stat = ratarmount_compositing::host_stat::statat(
             &fd,
-            name.as_str(),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
+            name.as_c_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
         )?;
-        host::fchmod(&child, Mode::from_raw_mode(raw_mode(mode & !0o222)))?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        // Never a data descriptor (#149): its close would release this
+        // process's locks on a database open in it.
+        ratarmount_compositing::host_stat::chmod_entry_at(&fd, &name, &stat, |_| {
+            raw_mode(mode & !0o222)
+        })?;
     }
     // Children first, so sealed parent permissions never obstruct this walk.
     for (path, (mode, mtime)) in recorded.directories.into_iter().rev() {

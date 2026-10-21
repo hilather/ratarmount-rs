@@ -150,11 +150,126 @@ fn statat_raw<Fd: AsFd, P: rustix::path::Arg>(
     Ok(normalized(st))
 }
 
+/// Set the permission bits of the entry `name` of `dir`, which the caller
+/// found by `statat(.., SYMLINK_NOFOLLOW)` as `expected` (never a directory or
+/// a symlink), WITHOUT opening a descriptor that could read or write it.
+/// `mode` maps the entry's current `st_mode` to the new one.
+///
+/// Closing any descriptor of a file releases every fcntl lock the process
+/// holds on it, so opening a file to `fchmod` it released the locks of an
+/// overlay database open in this process (#149). On Linux the entry is
+/// pinned with an `O_PATH | O_NOFOLLOW` descriptor (whose close releases
+/// nothing), checked to be the same file as `expected`, and changed through
+/// `/proc/self/fd`. Elsewhere it is changed by name with
+/// `fchmodat(.., AT_SYMLINK_NOFOLLOW)` after a name check: a symlink is never
+/// followed, but a swap of the name between the check and the change is not
+/// detected (a weaker, pathname-race boundary).
+pub fn chmod_entry_at<Fd: AsFd>(
+    dir: Fd,
+    name: &std::ffi::CStr,
+    expected: &Stat,
+    mode: impl FnOnce(rustix::fs::RawMode) -> rustix::fs::RawMode,
+) -> io::Result<()> {
+    let same = |now: &Stat| {
+        now.st_dev == expected.st_dev
+            && now.st_ino == expected.st_ino
+            && now.st_mode & libc::S_IFMT == expected.st_mode & libc::S_IFMT
+            && !matches!(now.st_mode & libc::S_IFMT, libc::S_IFDIR | libc::S_IFLNK)
+    };
+    let changed = || {
+        io::Error::other(format!(
+            "{} changed while its permissions were being set; nothing was changed",
+            name.to_string_lossy()
+        ))
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::fd::AsRawFd;
+        let pinned = rustix::fs::openat(
+            dir,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let now = fstat_named(&pinned, name.to_string_lossy().as_ref())?;
+        if !same(&now) {
+            return Err(changed());
+        }
+        let proc = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+        rustix::fs::chmod(proc.as_str(), Mode::from_raw_mode(mode(now.st_mode))).map_err(|e| {
+            io::Error::new(
+                io::Error::from(e).kind(),
+                format!(
+                    "cannot set the permissions of {} through {proc} (is /proc mounted?): {e}",
+                    name.to_string_lossy()
+                ),
+            )
+        })?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let dir = dir.as_fd();
+        let now = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if !same(&now) {
+            return Err(changed());
+        }
+        rustix::fs::chmodat(
+            dir,
+            name,
+            rustix::fs::Mode::from_raw_mode(mode(now.st_mode)),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::time::{Duration, UNIX_EPOCH};
+
+    /// Regression (#149): `chmod_entry_at` changes the file it was shown and
+    /// nothing else. A name swapped to another file after the caller's stat
+    /// is refused and neither file changes; a symlink is refused (never
+    /// followed); the expected file is changed. On Linux the check runs on an
+    /// `O_PATH` pin, so it also holds between the check and the change.
+    #[test]
+    fn regression_chmod_entry_at_refuses_a_swapped_name() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("a"), b"a").unwrap();
+        fs::write(dir.join("b"), b"b").unwrap();
+        fs::set_permissions(dir.join("a"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(dir.join("b"), fs::Permissions::from_mode(0o644)).unwrap();
+        let root = fs::File::open(dir).unwrap();
+        let name = c"a";
+        let a = statat(&root, name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        fs::rename(dir.join("b"), dir.join("a")).unwrap();
+        let error = chmod_entry_at(&root, name, &a, |_| 0o400).unwrap_err();
+        assert!(error.to_string().contains("changed"), "{error}");
+        let mode = |p: &str| {
+            fs::symlink_metadata(dir.join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+        };
+        assert_eq!(mode("a") & 0o777, 0o644, "the substitute was changed");
+
+        let now = statat(&root, name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        chmod_entry_at(&root, name, &now, |m| m & !0o222).unwrap();
+        assert_eq!(mode("a") & 0o777, 0o444);
+
+        fs::write(dir.join("target"), b"t").unwrap();
+        fs::set_permissions(dir.join("target"), fs::Permissions::from_mode(0o644)).unwrap();
+        symlink("target", dir.join("link")).unwrap();
+        let link = statat(&root, c"link", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(chmod_entry_at(&root, c"link", &link, |_| 0o400).is_err());
+        assert_eq!(mode("target") & 0o777, 0o644, "a symlink was followed");
+    }
 
     /// Regression: macOS reports mtimes in (-1 s, 0) as {0 s, negative ns};
     /// that is the instant {-1 s, 1e9 - n ns}, not an error or a panic.
