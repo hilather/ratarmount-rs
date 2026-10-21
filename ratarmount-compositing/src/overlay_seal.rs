@@ -792,10 +792,6 @@ mod tests {
             "unseal's permission walk released the holder's lock"
         );
         let error = result.expect_err("busy while the holder reads");
-        eprintln!(
-            "UNSEAL ERROR {error}; writable {:?}",
-            writable_entries(&f.dir)
-        );
         assert!(
             error.to_string().contains("locked") || error.kind() == io::ErrorKind::WouldBlock,
             "{error}"

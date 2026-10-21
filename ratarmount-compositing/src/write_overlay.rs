@@ -240,6 +240,14 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam (#160 fix round): when set, a `-w` open runs it once in its
+    /// schema step and then fails there, taking the failed-open cleanup.
+    pub(crate) static FAIL_SCHEMA_STEP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The `stat` through the database entry ([`FOLLOWED_STAT_ERRNO`] in tests).
 fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
     #[cfg(test)]
@@ -1264,15 +1272,26 @@ impl WriteOverlay {
         // Marker before SCHEMA: a brand-new overlay whose marker cannot be
         // written must not leave a `files` table behind (the next open would
         // take the backfill path and run unmarked).
-        // Remove a database file this call created, so a failed first open
-        // leaves the folder as it was (not "non-empty DB without files").
+        // Remove a database file that was absent before this call (a stat
+        // before SQLite's open; an empty file planted between that stat and
+        // the open is indistinguishable, see `Expect::Fresh`), so a failed
+        // first open leaves the folder as it was (not "non-empty DB without
+        // files"); only while the name still holds the inode SQLite opened.
         // A database that existed (0 bytes included) is left to SQLite's own
         // rollback: truncating it through a descriptor of our own would close
         // that descriptor, which releases every fcntl lock this process holds
-        // on the file, another connection's included (#160).
+        // on the file, another connection's included (#160). If that rollback
+        // itself fails, the database is left non-empty without `files`, and
+        // the next open refuses it (#96) instead of starting over.
         let undo_new_db = |conn: Connection| {
             drop(conn);
-            if db_len.is_none() {
+            let still_ours = || match (db_id, fs::symlink_metadata(&db_path)) {
+                (Some(id), Ok(m)) => crate::overlay_db::file_id(&m) == Some(id),
+                // Off Unix there is no identity to compare.
+                (None, Ok(_)) => true,
+                (_, Err(_)) => false,
+            };
+            if db_len.is_none() && still_ours() {
                 for suf in ["", "-journal", "-shm", "-wal"] {
                     let _ = fs::remove_file(root.join(format!("{HIDDEN_DB}{suf}")));
                 }
@@ -1304,6 +1323,11 @@ impl WriteOverlay {
             }
         }
         let opened = (|| -> Result<HashSet<String>> {
+            #[cfg(test)]
+            if let Some(hook) = FAIL_SCHEMA_STEP.with(|seam| seam.borrow_mut().take()) {
+                hook();
+                return Err(OverlayError::Msg("test: schema step failed".into()));
+            }
             conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
             let transaction = conn.transaction()?;
             transaction.execute_batch(SCHEMA)?;
@@ -12827,6 +12851,41 @@ pub(crate) mod tests {
         holder
             .execute_batch("SELECT count(*) FROM sqlite_master; COMMIT; CREATE TABLE t (x);")
             .unwrap();
+    }
+
+    /// Regression (#160 fix round): the failed first open removed the
+    /// database name whenever a stat before SQLite's open found nothing, even
+    /// when the name held another file by the time of the cleanup. A new
+    /// database the open created is removed; a file put at the name after
+    /// SQLite's open is left alone.
+    #[test]
+    fn regression_failed_first_open_removes_only_the_database_it_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().canonicalize().unwrap().join("fresh");
+        fs::create_dir(&fresh).unwrap();
+        FAIL_SCHEMA_STEP.with(|seam| *seam.borrow_mut() = Some(Box::new(|| {})));
+        let error = msg_of(reopen_keep_overlay(&fresh));
+        assert!(error.contains("schema step failed"), "{error}");
+        assert!(!fresh.join(HIDDEN_DB).exists(), "the new database stayed");
+
+        let swapped = dir.path().canonicalize().unwrap().join("swapped");
+        fs::create_dir(&swapped).unwrap();
+        let db = swapped.join(HIDDEN_DB);
+        let other = dir.path().join("other.sqlite");
+        fs::write(&other, b"another file").unwrap();
+        let (hook_db, hook_other) = (db.clone(), other.clone());
+        FAIL_SCHEMA_STEP.with(|seam| {
+            *seam.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&hook_other, &hook_db).unwrap();
+            }))
+        });
+        let error = msg_of(reopen_keep_overlay(&swapped));
+        assert!(error.contains("schema step failed"), "{error}");
+        assert_eq!(
+            fs::read(&db).unwrap(),
+            b"another file",
+            "the cleanup removed a file it never opened"
+        );
     }
 
     /// Overlays created before the marker existed get it on their next open.

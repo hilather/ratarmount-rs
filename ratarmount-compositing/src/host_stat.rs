@@ -198,10 +198,16 @@ pub fn chmod_entry_at<Fd: AsFd>(
         }
         let proc = format!("/proc/self/fd/{}", pinned.as_raw_fd());
         rustix::fs::chmod(proc.as_str(), Mode::from_raw_mode(mode(now.st_mode))).map_err(|e| {
+            // Only a missing descriptor link points at /proc itself.
+            let hint = if e == rustix::io::Errno::NOENT {
+                " (is /proc mounted?)"
+            } else {
+                ""
+            };
             io::Error::new(
                 io::Error::from(e).kind(),
                 format!(
-                    "cannot set the permissions of {} through {proc} (is /proc mounted?): {e}",
+                    "cannot set the permissions of {} through {proc}{hint}: {e}",
                     name.to_string_lossy()
                 ),
             )
@@ -269,6 +275,45 @@ mod tests {
         let link = statat(&root, c"link", AtFlags::SYMLINK_NOFOLLOW).unwrap();
         assert!(chmod_entry_at(&root, c"link", &link, |_| 0o400).is_err());
         assert_eq!(mode("target") & 0o777, 0o644, "a symlink was followed");
+    }
+
+    /// Regression (#149 fix round): on Linux the name is swapped to another
+    /// file AFTER the pin and its check (inside the mode callback, just
+    /// before the change): only the pinned original changes, never the file
+    /// now at the name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_chmod_entry_at_changes_the_pinned_file_after_a_swap() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("a"), b"a").unwrap();
+        fs::write(dir.join("b"), b"b").unwrap();
+        for p in ["a", "b"] {
+            fs::set_permissions(dir.join(p), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let root = fs::File::open(dir).unwrap();
+        let a = statat(&root, c"a", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        let original = fs::File::open(dir.join("a")).unwrap();
+        chmod_entry_at(&root, c"a", &a, |m| {
+            fs::rename(dir.join("b"), dir.join("a")).unwrap();
+            m & !0o222
+        })
+        .unwrap();
+        assert_eq!(
+            original.metadata().unwrap().permissions().mode() & 0o777,
+            0o444,
+            "the pinned file was not changed"
+        );
+        assert_eq!(
+            fs::symlink_metadata(dir.join("a"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "the file swapped in after the pin was changed"
+        );
     }
 
     /// Regression: macOS reports mtimes in (-1 s, 0) as {0 s, negative ns};
