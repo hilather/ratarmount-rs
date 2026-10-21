@@ -161,6 +161,7 @@ fn acquire_child() {
         "fresh" => fresh_row(),
         "closed_stdin" => closed_stdin_row(),
         r if r.starts_with("low:") => low_row(&r["low:".len()..]),
+        "reenter" => reenter_row(),
         other => panic!("unknown row {other}"),
     };
     write_result(&format!("ok {detail}"));
@@ -366,11 +367,12 @@ fn regression_checked_open_reuse_preserves_locks() {
     assert_eq!(r1.verification, Verification::UnixDescriptor);
     assert_eq!(r1.id, Some(id_of(&a)));
     drop(r1); // parked: the holder keeps a lock on the inode
-    let r2 = open_checked(&a, RO, NameMode::Path, existing(&a, true)).unwrap();
+    let r2 = open_checked(&a, RO, NameMode::Path, existing(&a, true));
+    assert!(other_process_sees_lock(&a), "the holder's lock survived");
+    let r2 = r2.unwrap();
     assert_eq!(r2.verification, Verification::UnixReuse);
     assert_eq!(r2.id, Some(id_of(&a)));
     assert_eq!(count(&r2.conn), 1);
-    assert!(other_process_sees_lock(&a), "the holder's lock survived");
     holder.execute_batch("COMMIT").unwrap();
     assert_eq!(count(&r2.conn), 2);
 }
@@ -409,6 +411,7 @@ fn regression_checked_open_reuse_checks_every_stat() {
     });
     let refusal = open_checked(&a, RO, NameMode::Path, expect).unwrap_err();
     drop(seams);
+    assert!(other_process_sees_lock(&x), "X's holder keeps its lock");
     assert!(
         matches!(refusal.error, AcquireError::OtherFile { actual } if actual == id_x),
         "{refusal}"
@@ -419,7 +422,6 @@ fn regression_checked_open_reuse_checks_every_stat() {
         stats.get()
     );
     assert_eq!(refusal.retained_fd, None, "a reuse opens no descriptor");
-    assert!(other_process_sees_lock(&x), "X's holder keeps its lock");
     holder.execute_batch("COMMIT").unwrap();
 }
 
@@ -472,6 +474,8 @@ fn regression_checked_open_fstat_failure_retains_fd() {
     let seams = Seams::set(|_| {}).fail_fstat(libc::EIO);
     let refusal = open_checked(&a, RO, NameMode::Path, existing(&a, true)).unwrap_err();
     drop(seams);
+    // The behavioral probe first: a diagnostic failure must not hide lock loss.
+    assert!(other_process_sees_lock(&a));
     assert!(
         matches!(refusal.error, AcquireError::Fstat(libc::EIO)),
         "{refusal}"
@@ -479,7 +483,6 @@ fn regression_checked_open_fstat_failure_retains_fd() {
     let fd = refusal.retained_fd.expect("retained");
     assert!(fd_is_open(fd));
     assert_eq!(fd_id(fd), id_of(&a));
-    assert!(other_process_sees_lock(&a));
     holder.execute_batch("COMMIT").unwrap();
 }
 
@@ -549,6 +552,83 @@ fn regression_checked_open_reentrant_arm_refuses() {
     open_checked(&a, RO, NameMode::Path, existing(&a, true)).unwrap();
 }
 
+/// Regression (R11-S2 skeptic #1): the callbacks take the evidence out of
+/// thread-local storage while they run, so a nested `open_checked` from
+/// inside one (another library's `open` wrapper, here a seam) saw the thread
+/// unarmed and succeeded. It must refuse with `Reentrant`, from the `open`
+/// callback (fresh descriptor) and from the `stat` callback (reuse, under
+/// SQLite's unix mutex: before the fix that nested open could hang), and the
+/// outer acquisition still succeeds with its own evidence. In a child: a
+/// hang trips the watchdog.
+#[test]
+fn regression_checked_open_reentry_from_callback_refuses() {
+    run_child("reenter", None);
+}
+
+fn reenter_row() -> String {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let (_t, dir) = tempdir();
+    let (a, b) = (dir.join("a.sqlite"), dir.join("b.sqlite"));
+    make_db(&a, 1);
+    make_db(&b, 1);
+    let expect_b = existing(&b, true);
+    let holder = Connection::open(&a).unwrap();
+    holder
+        .execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2)")
+        .unwrap();
+    let mut out = Vec::new();
+    for (want_seam, want_verification) in [
+        ("open", Verification::UnixDescriptor),
+        ("stat", Verification::UnixReuse),
+    ] {
+        // (seam, active, nested result): no panics inside the callback.
+        type Seen = Vec<(&'static str, bool, String)>;
+        let seen: Rc<RefCell<Seen>> = Rc::default();
+        let (rec, b2) = (seen.clone(), b.clone());
+        let seams = Seams::set(move |seam| {
+            let name = match seam {
+                Seam::AfterRealOpen => "open",
+                Seam::AfterArmedStat(_) => "stat",
+                Seam::AfterLowFdFill => return,
+            };
+            if name != want_seam || !rec.borrow().is_empty() {
+                return;
+            }
+            let active = ArmGuard::active();
+            let nested = match open_checked(&b2, RO, NameMode::Path, expect_b) {
+                Ok(got) => format!("acquired {:?}", got.verification),
+                Err(r) => match r.error {
+                    AcquireError::Reentrant => "reentrant".to_string(),
+                    other => format!("refused {other}"),
+                },
+            };
+            rec.borrow_mut().push((name, active, nested));
+        });
+        let outer = open_checked(&a, RO, NameMode::Path, existing(&a, true));
+        drop(seams);
+        let outer = outer.unwrap_or_else(|r| panic!("{want_seam}: outer refused: {r}"));
+        assert_eq!(outer.verification, want_verification, "{want_seam}");
+        assert_eq!(outer.id, Some(id_of(&a)));
+        assert_eq!(count(&outer.conn), 1);
+        assert_eq!(
+            *seen.borrow(),
+            [(want_seam, true, "reentrant".to_string())],
+            "{want_seam}: the nested open from the callback"
+        );
+        assert!(!ArmGuard::active() && ArmGuard::peek().is_none());
+        // Parks this descriptor (the holder's lock): the next pass reuses it.
+        drop(outer);
+        out.push(want_seam);
+    }
+    assert!(other_process_sees_lock(&a), "the holder's lock survived");
+    holder.execute_batch("COMMIT").unwrap();
+    // Disarmed again: an ordinary checked open of B works.
+    let got = open_checked(&b, RO, NameMode::Path, expect_b).unwrap();
+    assert_eq!(got.id, Some(id_of(&b)));
+    format!("reenter: {}", out.join(" "))
+}
+
 /// Regression (r9 v1 #2): with stdin closed after a holder took its lock,
 /// SQLite's next open would land on descriptor 0 and `robust_open` would
 /// close it, releasing the holder's lock. The fill keeps the lock and the
@@ -568,11 +648,16 @@ fn closed_stdin_row() -> String {
         .execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2)")
         .unwrap();
     unsafe { libc::close(0) };
-    let r = open_checked(&a, RO, NameMode::Path, existing(&a, true)).unwrap();
+    let r = open_checked(&a, RO, NameMode::Path, existing(&a, true));
+    assert!(other_process_sees_lock(&a), "the holder's lock survived");
+    let r = r.unwrap();
     assert_eq!(r.retained_low_fd, None);
     assert!(is_dev_null(0), "stdin was filled with /dev/null");
     drop(r);
-    assert!(other_process_sees_lock(&a), "the holder's lock survived");
+    assert!(
+        other_process_sees_lock(&a),
+        "the holder's lock survived the drop"
+    );
     holder.conn.execute_batch("COMMIT").unwrap();
     assert_eq!(count(&holder.conn), 2);
     "closed_stdin".into()
@@ -585,7 +670,9 @@ fn closed_stdin_row() -> String {
 /// re-pointed at `/dev/null` and refused as a possible lock release, also for
 /// a mismatching file or a failed `fstat` (`rw1fstat`); a failed `fstat` or
 /// a mismatch at a read-only low slot keeps both descriptors. An SQLite error
-/// after an accepted low-slot duplicate (`memerr0`) reports the kept slot.
+/// after an accepted low-slot duplicate (`memerr0`) reports the kept slot. A
+/// FIFO at the name (`fifo0`) closes the high duplicate and reports the low
+/// slot, still open on the FIFO.
 #[test]
 fn regression_low_fd_window_policy() {
     for row in [
@@ -599,6 +686,7 @@ fn regression_low_fd_window_policy() {
         "mismatch0",
         "rw1fstat",
         "memerr0",
+        "fifo0",
     ] {
         let got = run_child(&format!("low:{row}"), None);
         if got.contains("skip:") {
@@ -633,7 +721,8 @@ fn low_row(row: &str) -> String {
     // A mismatch row has no holder: its open connection would make SQLite's
     // reuse-selection `stat` refuse before the descriptor is opened.
     let mismatch = row.contains("mismatch");
-    let holder = (!mismatch && !mem).then(|| {
+    let fifo = row == "fifo0";
+    let holder = (!mismatch && !mem && !fifo).then(|| {
         let holder = Connection::open(&a).unwrap();
         holder
             .execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2)")
@@ -645,6 +734,10 @@ fn low_row(row: &str) -> String {
         make_db(&x, 9);
         std::fs::rename(&a, dir.join("a.saved")).unwrap();
         std::fs::rename(&x, &a).unwrap();
+    }
+    if fifo {
+        std::fs::rename(&a, dir.join("a.saved")).unwrap();
+        mkfifo(&a);
     }
     let mut fillers = Vec::new();
     let mut old_limit: libc::rlimit = unsafe { std::mem::zeroed() };
@@ -685,6 +778,13 @@ fn low_row(row: &str) -> String {
             0
         );
     }
+    // The behavioral probe first: a diagnostic failure must not hide lock
+    // loss. Rows with a holder whose lock must survive; `rw1` is the
+    // documented limit (re-pointing closed a descriptor of the holder's
+    // inode), probed in its arm.
+    if holder.is_some() && !row.starts_with("rw1") {
+        assert!(other_process_sees_lock(&a), "{row}: the lock survived");
+    }
     let detail = match (row, result) {
         ("ro0" | "ro2" | "rw0", Ok(got)) => {
             assert_eq!(got.retained_low_fd, Some(slot));
@@ -692,7 +792,6 @@ fn low_row(row: &str) -> String {
             assert!(fd_is_open(slot));
             assert_eq!(fd_id(slot), id_of(&a), "the low slot is retained");
             assert_eq!(count(&got.conn), 1);
-            assert!(other_process_sees_lock(&a), "{row}: the lock survived");
             holder.unwrap().execute_batch("COMMIT").unwrap();
             format!("{row}: acquired")
         }
@@ -709,7 +808,6 @@ fn low_row(row: &str) -> String {
             );
             assert_eq!(refusal.retained_fd, Some(0));
             assert_eq!(fd_id(0), id_of(&a));
-            assert!(other_process_sees_lock(&a), "dupfail: the lock survived");
             holder.unwrap().execute_batch("COMMIT").unwrap();
             format!("{row}: {refusal}")
         }
@@ -743,7 +841,6 @@ fn low_row(row: &str) -> String {
             assert!(fd >= 3);
             assert_eq!(fd_id(fd), fd_id(0), "both descriptors kept");
             if want_fstat {
-                assert!(other_process_sees_lock(&a));
                 holder.unwrap().execute_batch("COMMIT").unwrap();
             }
             format!("{row}: {refusal}")
@@ -758,6 +855,22 @@ fn low_row(row: &str) -> String {
             assert_eq!(refusal.retained_fd, Some(0));
             assert!(fd_is_open(0));
             assert_eq!(fd_id(0), id_of(&a), "slot 0 still holds the opened file");
+            format!("{row}: {refusal}")
+        }
+        ("fifo0", Err(refusal)) => {
+            // The high duplicate of a non-regular file is closed; the low
+            // slot stays open on the FIFO and is reported.
+            assert!(
+                matches!(refusal.error, AcquireError::NotRegular { mode } if mode & 0o170000 == 0o010000),
+                "{refusal}"
+            );
+            assert_eq!(refusal.retained_fd, Some(0));
+            let st = fd_stat(0);
+            assert_eq!(
+                (st.st_mode as u32) & libc::S_IFMT as u32,
+                libc::S_IFIFO as u32
+            );
+            assert_eq!(fd_id(0), id_of(&a), "slot 0 holds the FIFO");
             format!("{row}: {refusal}")
         }
         (row, Ok(_)) => panic!("{row}: acquired"),

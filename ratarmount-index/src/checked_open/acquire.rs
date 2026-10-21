@@ -471,6 +471,11 @@ pub(crate) mod imp {
 
     thread_local! {
         static ARMED: Cell<Option<Acquisition>> = const { Cell::new(None) };
+        /// Set for the whole acquisition, independently of `ARMED`: the
+        /// callbacks take the evidence out of `ARMED` while they run, so a
+        /// nested `open_checked` from inside one (another library's wrapper
+        /// of SQLite's `open`, a test seam) must still see this thread busy.
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Read errno directly (no std machinery inside the callbacks).
@@ -498,27 +503,37 @@ pub(crate) mod imp {
 
     impl ArmGuard {
         pub(crate) fn arm(expect: Expect) -> Result<Self, AcquireError> {
+            let gone =
+                AcquireError::InvalidRequest("thread-local storage is gone (thread exiting)");
+            let Ok(active) = ACTIVE.try_with(|c| c.replace(true)) else {
+                return Err(gone);
+            };
+            if active {
+                return Err(AcquireError::Reentrant);
+            }
             ARMED
-                .try_with(|cell| match cell.take() {
-                    Some(outer) => {
-                        cell.set(Some(outer));
-                        Err(AcquireError::Reentrant)
-                    }
-                    None => {
-                        cell.set(Some(Acquisition::new(expect)));
-                        Ok(Self(()))
-                    }
+                .try_with(|cell| {
+                    let outer = cell.replace(Some(Acquisition::new(expect)));
+                    debug_assert!(outer.is_none(), "evidence without an active marker");
                 })
-                .unwrap_or(Err(AcquireError::InvalidRequest(
-                    "thread-local storage is gone (thread exiting)",
-                )))
+                .map(|()| Self(()))
+                .map_err(|_| {
+                    let _ = ACTIVE.try_with(|c| c.set(false));
+                    gone
+                })
         }
 
         /// Take the evidence and disarm.
         pub(crate) fn finish(self) -> Acquisition {
             let a = ARMED.with(|c| c.take());
+            let _ = ACTIVE.try_with(|c| c.set(false));
             std::mem::forget(self);
             a.expect("armed acquisition")
+        }
+
+        #[cfg(test)]
+        pub(crate) fn active() -> bool {
+            ACTIVE.with(|c| c.get())
         }
 
         #[cfg(test)]
@@ -539,6 +554,7 @@ pub(crate) mod imp {
     impl Drop for ArmGuard {
         fn drop(&mut self) {
             let _ = ARMED.try_with(|c| c.set(None));
+            let _ = ACTIVE.try_with(|c| c.set(false));
         }
     }
 
