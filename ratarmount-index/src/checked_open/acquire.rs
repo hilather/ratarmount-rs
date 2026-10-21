@@ -21,7 +21,9 @@
 //! SQLite ties it to an inode, so vacant slots 0-2 are filled with
 //! `/dev/null` before arming and again immediately before the real open. If
 //! another thread empties a slot in between (a contract violation), the
-//! policy of design §5 "Low descriptors" applies.
+//! policy of design §5 "Low descriptors" applies. Where `/dev/null` cannot be
+//! opened (a chroot without device nodes) the fill does nothing and that
+//! policy is the only defense.
 //!
 //! This slice requires an absolute path in [`NameMode::Path`]; URI closure and
 //! [`NameMode::Immutable`] arrive with design §6.
@@ -473,8 +475,13 @@ pub(crate) mod imp {
         static ARMED: Cell<Option<Acquisition>> = const { Cell::new(None) };
     }
 
+    /// Read errno directly (no std machinery inside the callbacks).
     fn errno() -> c_int {
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        #[cfg(target_os = "linux")]
+        let e = unsafe { *libc::__errno_location() };
+        #[cfg(target_os = "macos")]
+        let e = unsafe { *libc::__error() };
+        e
     }
 
     pub(crate) fn set_errno(e: c_int) {

@@ -1023,3 +1023,54 @@ fn regression_checked_open_invalid_requests() {
     let got = open_checked(&a, OpenFlags::default(), NameMode::Path, e).unwrap();
     assert_eq!(got.id, Some(id_of(&a)));
 }
+
+/// The VFS SQLite actually opened the main database with.
+fn vfs_name(conn: &Connection) -> String {
+    use rusqlite::ffi;
+    let mut name: *mut std::os::raw::c_char = std::ptr::null_mut();
+    // SAFETY: SQLITE_FCNTL_VFSNAME writes a sqlite3_malloc'd string.
+    unsafe {
+        let rc = ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_VFSNAME,
+            (&mut name as *mut *mut std::os::raw::c_char).cast(),
+        );
+        assert_eq!(rc, ffi::SQLITE_OK);
+        let s = std::ffi::CStr::from_ptr(name)
+            .to_string_lossy()
+            .into_owned();
+        ffi::sqlite3_free(name.cast());
+        s
+    }
+}
+
+/// Regression (r9 v2 #4): checked opens pin the VFS whose syscall table
+/// carries the wrappers: `"unix-posix"` on macOS (no AFP/dotlock/nolock
+/// selection by pathname), `"unix"` on Linux; a reused descriptor goes
+/// through the same VFS and the holder's lock survives the reuse and close.
+#[test]
+fn regression_macos_checked_open_uses_posix_vfs() {
+    let want = if cfg!(target_os = "macos") {
+        "unix-posix"
+    } else {
+        "unix"
+    };
+    let (_t, dir) = tempdir();
+    let a = dir.join("a.sqlite");
+    make_db(&a, 1);
+    let holder = Connection::open(&a).unwrap();
+    holder
+        .execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2)")
+        .unwrap();
+    let r1 = open_checked(&a, RO, NameMode::Path, existing(&a, true)).unwrap();
+    assert_eq!(r1.verification, Verification::UnixDescriptor);
+    assert_eq!(vfs_name(&r1.conn), want);
+    drop(r1);
+    let r2 = open_checked(&a, RO, NameMode::Path, existing(&a, true)).unwrap();
+    assert_eq!(r2.verification, Verification::UnixReuse);
+    assert_eq!(vfs_name(&r2.conn), want);
+    drop(r2);
+    assert!(other_process_sees_lock(&a), "the holder's lock survived");
+    holder.execute_batch("COMMIT").unwrap();
+}
