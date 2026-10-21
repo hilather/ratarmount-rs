@@ -208,6 +208,17 @@ example through `wrap_pymodule!` or the inittab), its import raises the same
 module's own check refuses only an image that itself exports
 `sqlite3_libversion`.
 
+Python's own `sqlite3` module may load a different SQLite library than the
+one inside `_native`; the wheel's SQLite is private, so the two are separate
+SQLite instances. Do not open the same database file (an overlay database, an
+index sidecar) through both at the same time in one process (#154): each
+instance keeps its own lock bookkeeping, and closing a connection of one can
+release the POSIX locks the other holds ([SQLite: multiple copies of SQLite
+in one application](https://www.sqlite.org/howtocorrupt.html#multiple_copies_of_sqlite_linked_into_the_same_application)).
+Hiding `_native`'s symbols keeps the checked-open wrappers out of the other
+instance; it does not make the two share locks. See the platform table in
+[sandbox.md](sandbox.md#checked-overlay-database-opens-by-platform).
+
 `ratarmount_rs._native._checked_open_status()` is a diagnostic. It returns a
 dict with `installed`, `why` (`"SingleThread"` or `"PrivateInstance"`),
 `threads_at_install`, `status`, `detail` and `constructor` (what the load-time

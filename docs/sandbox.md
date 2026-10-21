@@ -1778,20 +1778,58 @@ blocks only the request that opens it, never another overlay-database open.
 Not covered: a payload descriptor opened before its inode is first opened as
 a database in this process (no mount path does this: the database is opened
 before anything is served), files read by generic folder sources or
-backing extents of non-overlay sources, and an overlay database swapped away
-and back at its path during its own open (the registered inode is the one at
-the path right after SQLite's open, not proved to be SQLite's descriptor).
-Nor are these opens, which do not go through the check: `overlay seal`'s
-permission walk (`chmod_tree`, #149), the removal of a database that a failed
-create just made (#160), the database copy `overlay pack` reads (#156), the
-optional journal and index files `overlay pack --include-journal` /
-`--include-index` reads, and the commit journal's opens of the archive
-itself. The seal walk runs while seal's own connection is open (#149); for the
-others no CLI path keeps another lock-holding connection to that database
-open. Of the checked sites, the ZIP commit reader, the
+backing extents of non-overlay sources, a rename or truncation of the
+database after its open (the open proves which file it got, not that the name
+keeps pointing at it), and descriptors SQLite itself closes while an open is
+still failing, before the database is registered. Nor are these opens, which
+do not go through the check: the journal file `overlay pack --include-journal`
+reads (a JSON log, not a database) and the commit journal's opens of the
+archive itself. Opens that used to bypass the check no longer open a data
+descriptor at all: `overlay seal`'s and `unseal`'s permission walk and the
+unpack stage's mode pass change modes through an `O_PATH` pin on Linux (by
+name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the
+check and the change is not detected) (#149); a failed first open leaves an
+existing 0-byte database to SQLite's rollback instead of truncating it (#160);
+and `overlay pack` ships SQLite copies of the layer database and of the base
+index (#156). Of the checked sites, the ZIP commit reader, the
 read-only layer, live diff, the seal sentinels, the pack member, sentinel and
 lock reads and the macOS park share the tested helper but have no test of
 their own.
+
+These protections keep the SQLite locks of a process that holds the database
+for its whole life: a foreground mount or export server (`-f`; `sandbox run`
+and the sandbox supervisor run ratarmount that way), or a library or Python
+user. A daemonized ratarmount (the default without `-f`, for a FUSE mount and
+for an export server alike) currently holds no kernel lock on its overlay
+database at all: the database is opened and locked before the fork, POSIX
+locks are not inherited by the child, and the parent's exit releases them
+(#183). Until that is fixed, run with `-f` when another process may open the
+same overlay.
+
+### Checked overlay-database opens by platform
+
+Every overlay-database open goes through a checked SQLite open (#151): wrappers
+around the `open` and `stat` calls of ratarmount's bundled SQLite judge the
+descriptor SQLite actually opened (or the parked one it reuses), so a name
+swapped to another file and back during the open (another database, an empty
+file, a FIFO, a symlink to `/dev/null`) is refused instead of read as the
+overlay. Which guarantee a process gets depends on the platform and on how the
+wrappers could be installed:
+
+| Platform / host | Installation | Checked open |
+|---|---|---|
+| Linux CLI and Rust test binaries (64-bit little-endian x86_64/aarch64, glibc) | Load-time constructor, only when the process has exactly one thread | `"unix"` VFS; SQLite's own descriptor and every reuse are checked. An unknown thread count (no `/proc`) or a thread started before the constructor leaves the wrappers uninstalled, and checked opens refuse |
+| Linux Python wheel (`_native`) | Constructor, or the module installs into its private SQLite before it publishes anything | As above. `import ratarmount_rs` raises `ImportError` if neither can install ([Python](python.md#import-and-checked-sqlite-opens)) |
+| Linux Rust program embedding the library | Constructor only | As above; a thread started before the library loads leaves checked opens refusing |
+| macOS CLI and test binaries (arm64/x86_64) | Constructor (task thread count) | `"unix-posix"` VFS (POSIX locks only, no fallback to other locking styles); descriptor and reuse checked |
+| macOS Python wheel | Constructor or private install, as on Linux | As above |
+| Windows library builds | None | The path is checked to be a regular file (no symlink under `SQLITE_OPEN_NOFOLLOW`) before and after SQLite's open; no file identity, so no swap-back detection. Commit-journal recovery needs Linux or macOS |
+| Any other Unix ABI (musl, 32-bit, big-endian, BSD) | None | Refused (`UnsupportedAbi` / `UnsupportedPlatform`): every `-w` mount and overlay verb that opens an overlay database fails, rather than falling back to pathname checks |
+
+`ratarmount_rs._native._checked_open_status()` reports the installation in a
+Python process. Python's own `sqlite3` module and `_native` may be separate
+SQLite instances; opening one database file through both at once in one
+process is unsupported (#154, see [Python](python.md#import-and-checked-sqlite-opens)).
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE
