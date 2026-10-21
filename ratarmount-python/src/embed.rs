@@ -4,10 +4,11 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::{PyException, PyIsADirectoryError, PyKeyError, PyValueError};
+use pyo3::exceptions::{PyException, PyImportError, PyIsADirectoryError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyType};
+use ratarmount_index::checked_open::{self, InstallStatus, Witness};
 use ratarmount_session::{
     DirCursor, DirEnt, Error, ExtractRequest, IndexPolicy, OffsetCursor, OpenRequest, Overwrite,
     ParallelizationSpec, ReadRequest, Recreate, Session,
@@ -407,8 +408,89 @@ fn published_pointer(
     })
 }
 
-#[pymodule]
-fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+/// Status of the checked SQLite opens (#151), for tests and diagnostics:
+/// `installed`, `why` (`"SingleThread"` / `"PrivateInstance"`),
+/// `threads_at_install`, `status` (the `InstallStatus` when not installed),
+/// `detail` and `constructor` (what the load-time constructor saw). Installs
+/// nothing.
+#[pyfunction]
+fn _checked_open_status(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let status = PyDict::new(py);
+    match checked_open::installed() {
+        Ok(witness) => {
+            status.set_item("installed", true)?;
+            status.set_item("why", format!("{:?}", witness.why))?;
+            status.set_item("threads_at_install", witness.threads_at_install)?;
+            status.set_item("status", "Installed")?;
+            status.set_item("detail", "")?;
+        }
+        Err(why_not) => {
+            status.set_item("installed", false)?;
+            status.set_item("why", py.None())?;
+            status.set_item("threads_at_install", py.None())?;
+            status.set_item("status", format!("{why_not:?}"))?;
+            status.set_item("detail", why_not.to_string())?;
+        }
+    }
+    status.set_item(
+        "constructor",
+        checked_open::constructor_observation().map(|seen| format!("{seen:?}")),
+    )?;
+    Ok(status)
+}
+
+/// Code in this module's image: the private-instance proof requires it, the
+/// constructor and SQLite to share one image that is not the executable.
+#[cfg(feature = "extension-module")]
+#[inline(never)]
+extern "C" fn module_anchor() {
+    std::hint::black_box(());
+}
+
+/// The installation result the initializer acts on. Only the extension module
+/// (a wheel's `_native`, whose bundled SQLite is private to it and not yet
+/// reachable) may take the private-instance path; an embedding relies on the
+/// load-time constructor alone (design §9).
+fn checked_open_installation() -> Result<Witness, InstallStatus> {
+    #[cfg(feature = "extension-module")]
+    {
+        // SAFETY: this is the first operation of the module initializer,
+        // before anything is published. The wheel links its SQLite
+        // statically with no `sqlite3_*` export (the wheel export audit,
+        // packaging/audit_native_exports.py, checks that), nothing in this
+        // image reaches SQLite before this returns, and nothing replaces the
+        // hooks or reconfigures SQLite afterwards. A second import (or a
+        // reload) gets the terminal result back without installing again.
+        unsafe { checked_open::install_private_instance(module_anchor as *const std::ffi::c_void) }
+    }
+    #[cfg(not(feature = "extension-module"))]
+    {
+        checked_open::installed()
+    }
+}
+
+/// Publication rule (design §4, "Publication behavior"): on a supported Unix
+/// target the module is published only when the wrappers are installed.
+/// Windows and unverified Unix ABIs have no wrappers to install; there the
+/// module is published and checked opens refuse (or take the Windows
+/// path-type check) on their own.
+fn publication_gate(installation: Result<Witness, InstallStatus>) -> Result<(), String> {
+    match installation {
+        Ok(_) | Err(InstallStatus::UnsupportedPlatform | InstallStatus::UnsupportedAbi) => Ok(()),
+        Err(status) => Err(format!(
+            "ratarmount_rs._native was not initialized: checked SQLite opens are unavailable \
+             ({status:?}: {status})"
+        )),
+    }
+}
+
+/// Gate, then publish. Nothing is added to `module` when the gate refuses.
+fn publish(
+    py: Python<'_>,
+    module: &Bound<'_, PyModule>,
+    installation: Result<Witness, InstallStatus>,
+) -> PyResult<()> {
+    publication_gate(installation).map_err(PyImportError::new_err)?;
     module.add_class::<Archive>()?;
     module.add_class::<Entry>()?;
     module.add("RatarmountError", py.get_type::<RatarmountError>())?;
@@ -418,13 +500,122 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(open, module)?)?;
     module.add_function(wrap_pyfunction!(split_url, module)?)?;
     module.add_function(wrap_pyfunction!(published_pointer, module)?)?;
+    module.add_function(wrap_pyfunction!(_checked_open_status, module)?)?;
     Ok(())
+}
+
+#[pymodule]
+fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    publish(py, module, checked_open_installation())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
+
+    /// Regression (#151, design §4 "Publication behavior"): `_native` must not
+    /// publish on a supported Unix target when the SQLite system-call
+    /// wrappers are not installed (constructor abstained and the private
+    /// proof refused, a failed install, nothing run); the import error names
+    /// the status. Windows and unverified Unix ABIs publish (their checked
+    /// opens refuse or take the path-type check on their own).
+    #[test]
+    fn regression_native_publication_gate_table() {
+        use ratarmount_index::checked_open::{HostFailure, InstallFailure, InstallWhy};
+        for why in [InstallWhy::SingleThread, InstallWhy::PrivateInstance] {
+            let witness = Witness {
+                why,
+                threads_at_install: Some(1),
+            };
+            assert_eq!(publication_gate(Ok(witness)), Ok(()));
+        }
+        for status in [
+            InstallStatus::UnsupportedPlatform,
+            InstallStatus::UnsupportedAbi,
+        ] {
+            assert_eq!(publication_gate(Err(status)), Ok(()), "{status:?}");
+        }
+        for (status, text) in [
+            (InstallStatus::NotRun, "NotRun"),
+            (
+                InstallStatus::AbstainedThreads(Some(3)),
+                "AbstainedThreads(Some(3))",
+            ),
+            (
+                InstallStatus::AbstainedThreads(None),
+                "AbstainedThreads(None)",
+            ),
+            (
+                InstallStatus::NotPrivate(HostFailure::MainExecutable {
+                    what: "constructor",
+                }),
+                "is in the main executable",
+            ),
+            (
+                InstallStatus::NotPrivate(HostFailure::SqliteExported),
+                "exports sqlite3_libversion",
+            ),
+            (
+                InstallStatus::Failed(InstallFailure::RestoreFailed("open")),
+                "RestoreFailed",
+            ),
+        ] {
+            let error = publication_gate(Err(status)).unwrap_err();
+            assert!(error.contains("not initialized"), "{error}");
+            assert!(error.contains(text), "{status:?}: {error}");
+        }
+    }
+
+    /// Regression (#151): a refused initialization adds nothing to the module
+    /// (no class, function or exception is reachable) and raises ImportError;
+    /// an accepted one publishes everything, the status function included.
+    #[test]
+    fn regression_native_refused_init_publishes_nothing() {
+        Python::initialize();
+        Python::attach(|py| {
+            let refused = PyModule::new(py, "refused").unwrap();
+            let error =
+                publish(py, &refused, Err(InstallStatus::AbstainedThreads(Some(2)))).unwrap_err();
+            assert!(error.is_instance_of::<PyImportError>(py), "{error}");
+            assert!(error.to_string().contains("AbstainedThreads(Some(2))"));
+            let fresh = PyModule::new(py, "fresh").unwrap().dict().len();
+            assert_eq!(refused.dict().len(), fresh, "nothing was added");
+            for name in ["Archive", "open", "RatarmountError", "_checked_open_status"] {
+                assert!(!refused.hasattr(name).unwrap(), "{name} was published");
+            }
+            let published = PyModule::new(py, "published").unwrap();
+            publish(py, &published, Err(InstallStatus::UnsupportedAbi)).unwrap();
+            for name in ["Archive", "open", "RatarmountError", "_checked_open_status"] {
+                assert!(published.hasattr(name).unwrap(), "{name} missing");
+            }
+        });
+    }
+
+    /// Regression (#151): the status function reports the installation this
+    /// process has. This test binary starts with one thread, so its
+    /// load-time constructor installed the wrappers (`SingleThread`), and the
+    /// real module initializer published.
+    #[test]
+    fn regression_native_status_reports_constructor_install() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let module = pyo3::wrap_pymodule!(_native)(py);
+            let status = module.getattr(py, "_checked_open_status")?.call0(py)?;
+            let status = status.bind(py).cast::<PyDict>()?;
+            let get = |key: &str| status.get_item(key).unwrap().unwrap();
+            assert!(get("installed").extract::<bool>()?, "{status}");
+            assert_eq!(get("why").extract::<String>()?, "SingleThread");
+            assert_eq!(get("threads_at_install").extract::<u32>()?, 1);
+            assert_eq!(get("status").extract::<String>()?, "Installed");
+            assert_eq!(
+                get("constructor").extract::<String>()?,
+                "AttemptedSingleThread"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
 
     /// Regression: remote pointer readback must fill short reads and reject oversized JSON.
     #[test]

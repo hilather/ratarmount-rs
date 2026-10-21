@@ -5533,6 +5533,7 @@ version = "0.1.35"
 dependencies = [
  "pyo3",
  "ratarmount-formats-tar",
+ "ratarmount-index",
  "ratarmount-remote",
  "ratarmount-session",
  "secrecy",

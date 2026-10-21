@@ -19,6 +19,9 @@ extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
 ratarmount-session.workspace = true
+# `checked_open`: the module initializer installs the SQLite system-call
+# wrappers into this artifact's private SQLite before publishing (#151).
+ratarmount-index.workspace = true
 ratarmount-remote = { workspace = true, optional = true }
 pyo3 = { version = "=0.29.2", optional = true, default-features = false, features = ["macros", "abi3-py39"] }
 secrecy = { version = "0.8", optional = true }
