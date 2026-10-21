@@ -11,6 +11,7 @@
 //! stays `"0.7.0"`. Normal [`SqliteIndex::create_writable`] / cold index does
 //! **not** create `"files_fts"`.
 
+pub mod checked_open;
 mod digest_cache;
 mod dirent_order;
 mod hashing;
