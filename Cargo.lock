@@ -4925,6 +4925,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratarmount-checked-open-fixture"
+version = "0.1.35"
+dependencies = [
+ "libc",
+ "ratarmount-index",
+ "rusqlite",
+]
+
+[[package]]
 name = "ratarmount-compositing"
 version = "0.1.35"
 dependencies = [

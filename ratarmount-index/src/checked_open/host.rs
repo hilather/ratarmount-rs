@@ -264,7 +264,8 @@ mod tests {
     /// a SQLite (or one of its entry points) from another image than the
     /// constructor: an interposed or separately linked SQLite resolves to its
     /// own image. Catalog rows plus the real loader (this test binary is a PIE
-    /// executable; libc is a real shared object).
+    /// executable; libc is a real shared object unless linked `crt-static`).
+    /// The real shared-object fixture is `test-harness/checked-open-dso`.
     #[test]
     fn regression_host_rejects_executable_and_foreign_sqlite() {
         assert_eq!(same_private_image(&catalog, &anchors(0x104)), Ok(LIB));
@@ -347,7 +348,11 @@ mod tests {
                 Lookup::Found(exe),
                 "bundled SQLite is linked into the executable"
             );
+            // A static executable (`crt-static`) carries libc itself.
             match host_object(libc::qsort as *const () as usize) {
+                Lookup::Found(libc_image) if cfg!(target_feature = "crt-static") => {
+                    assert_eq!(libc_image, exe, "static libc is in the executable");
+                }
                 Lookup::Found(libc_image) => {
                     assert!(!libc_image.main, "libc is a shared object: {libc_image:?}");
                     assert_ne!(libc_image.id, exe.id);
