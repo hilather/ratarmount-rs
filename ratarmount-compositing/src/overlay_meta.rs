@@ -266,16 +266,17 @@ impl OverlayMeta {
             )));
         }
         let read = || -> Result<Option<Self>> {
-            let conn = crate::open_overlay_db(
+            let conn = crate::overlay_db::open_overlay_db_required(
                 &db,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 crate::DbName::Path,
+                required,
             )?;
             conn.busy_timeout(std::time::Duration::ZERO)?;
             // One read transaction: the `files` check and the `meta` rows
             // describe the same database state.
             let tx = conn.unchecked_transaction()?;
-            Self::from_connection_required(&tx, required)
+            Self::from_connection_required(&tx, required || conn.required_record())
         };
         let result = match read() {
             Err(OverlayError::Sqlite(error)) if recover_hot && is_hot_journal(&error) => {
@@ -314,6 +315,12 @@ impl OverlayMeta {
         // Read-only: dropping the transaction rolls it back.
         let tx = conn.unchecked_transaction()?;
         Self::from_transaction_required(&tx, required)
+    }
+
+    /// [`Self::from_connection_required`] of a validated open, with the
+    /// requirement it latched ([`crate::OverlayDb::required_record`]).
+    pub fn from_opened(db: &crate::OverlayDb) -> Result<Option<Self>> {
+        Self::from_connection_required(db, db.required_record())
     }
 
     /// [`Self::from_connection_required`] inside a transaction the caller

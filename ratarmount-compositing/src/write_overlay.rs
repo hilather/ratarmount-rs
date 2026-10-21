@@ -193,6 +193,23 @@ pub fn overlay_db_entry(dir: &Path) -> Result<DbEntry> {
     })
 }
 
+/// [`overlay_db_entry`] of the database file `db` itself (Fable r11 N2): the
+/// overlay directory's classification when `db` is named [`HIDDEN_DB`] (its
+/// markers count), else the type of `db` alone, never marked (a staging copy,
+/// a test's `real.sqlite`).
+pub(crate) fn overlay_db_entry_for(db: &Path) -> Result<DbEntry> {
+    if db.file_name() == Some(std::ffi::OsStr::new(HIDDEN_DB)) {
+        return overlay_db_entry(db.parent().unwrap_or(Path::new("")));
+    }
+    Ok(match overlay_db_regular(db, false)? {
+        None => DbEntry::Absent,
+        Some(metadata) => DbEntry::Present {
+            marked: false,
+            metadata,
+        },
+    })
+}
+
 /// Nothing at all is at `dir`'s overlay database path and no marker says the
 /// overlay was used ([`DbEntry::Absent`]). A symlink (dangling or not), a
 /// directory, a FIFO, an entry that cannot be statted (R7-E2, R10-B) or a lost
@@ -1210,7 +1227,13 @@ impl WriteOverlay {
             DbEntry::Lost { markers, .. } => return Err(lost_record_error(&root, &markers)),
             DbEntry::Present { metadata, .. } => Some(metadata.len()),
         };
-        let opened = crate::open_overlay_db(&db_path, OpenFlags::default(), crate::DbName::Path)?;
+        let opened = crate::overlay_db::open_overlay_db_required(
+            &db_path,
+            OpenFlags::default(),
+            crate::DbName::Path,
+            marker,
+        )?;
+        let required = marker || opened.required_record();
         let db_id = opened.id();
         let (mut conn, db_registration) = opened.into_parts();
         let had_files = conn
@@ -1221,7 +1244,7 @@ impl WriteOverlay {
             )
             .optional()?
             .is_some();
-        if !had_files && (marker || db_len.is_some_and(|n| n > 0)) {
+        if !had_files && (required || db_len.is_some_and(|n| n > 0)) {
             drop(conn);
             return Err(OverlayError::Msg(format!(
                 "overlay database {} has no files table; its deletions would be lost \
@@ -7187,14 +7210,17 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
         )));
     }
     let conn = if db_regular {
-        let conn = crate::open_overlay_db(
+        let conn = crate::overlay_db::open_overlay_db_required(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             crate::DbName::Path,
+            marker.is_some(),
         )?;
         // A used overlay's database without its `files` table is a lost
         // record (R10-B): refuse with its path, never plan without deletions.
-        if marker.is_some() && !crate::overlay_meta::has_files_table(&conn)? {
+        if (marker.is_some() || conn.required_record())
+            && !crate::overlay_meta::has_files_table(&conn)?
+        {
             return Err(OverlayError::Msg(format!(
                 "{}: {}; refusing to commit without its deletions",
                 db_path.display(),

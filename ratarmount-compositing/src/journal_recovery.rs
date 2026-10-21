@@ -177,10 +177,11 @@ fn vanished(db: &Path) -> io::Error {
 
 /// A used overlay's database `db` still has its `files` table (read-only).
 fn require_files(db: &Path) -> io::Result<()> {
-    let conn = crate::open_overlay_db(
+    let conn = crate::overlay_db::open_overlay_db_required(
         db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         crate::DbName::Path,
+        true,
     )
     .map_err(|e| io::Error::other(format!("cannot open {}: {e}", db.display())))?;
     // Under the archive lock: never wait on another holder of the database
@@ -336,11 +337,14 @@ impl<'a> Rows<'a> {
                     // A raw overlay directory: nothing to restamp.
                     return Ok(());
                 }
-                let conn = crate::open_overlay_db(
+                // The latch goes into the acquisition (a required record
+                // must be the non-empty file classified) and comes back.
+                let conn = crate::overlay_db::open_overlay_db_required(
                     db,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                     crate::DbName::Path,
+                    required_files.get(),
                 )
                 .map_err(|e| {
                     io::Error::other(format!(
@@ -348,6 +352,9 @@ impl<'a> Rows<'a> {
                         db.display()
                     ))
                 })?;
+                if conn.required_record() {
+                    required_files.set(true);
+                }
                 f(&conn, required_files.get())
             }
         }

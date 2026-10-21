@@ -263,7 +263,7 @@ pub(crate) fn seal_impl(
     // Readers can still take snapshots for canonical hashing. Competing writers,
     // including mounts in exclusive locking mode, cannot enter this interval.
     conn.execute_batch("BEGIN IMMEDIATE").map_err(sql_error)?;
-    if OverlayMeta::from_connection(&conn)
+    if OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
         .is_some_and(|m| m.layer_sealed())
     {
@@ -290,7 +290,7 @@ pub(crate) fn seal_impl(
         // overlay recorded no kind: the seal writes it now (no digest). An
         // accepted move to another place (a local copy of a remote archive)
         // is recorded too, so the sealed layer names the base it was sealed on.
-        let meta = OverlayMeta::from_connection(&conn).map_err(overlay_error)?;
+        let meta = OverlayMeta::from_opened(&conn).map_err(overlay_error)?;
         if !matches!(
             crate::overlay_gate::Recorded::from_meta(meta.as_ref()),
             crate::overlay_gate::Recorded::Nothing | crate::overlay_gate::Recorded::Unknown
@@ -318,7 +318,7 @@ pub(crate) fn seal_impl(
         )
         .map_err(sql_error)?;
     }
-    if OverlayMeta::from_connection(&conn)
+    if OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
         .is_none_or(|m| m.format_version().ok().flatten().is_none())
     {
@@ -453,7 +453,7 @@ pub fn check_hash_format<'a>(get: impl Fn(&str) -> Option<&'a str>) -> io::Resul
 pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<VerifyReport> {
     let root = root(dir)?;
     let conn = connection(dir, true)?;
-    let meta = OverlayMeta::from_connection(&conn)
+    let meta = OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
         .filter(OverlayMeta::layer_sealed)
         .ok_or_else(|| io::Error::other("overlay is not sealed"))?;

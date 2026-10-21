@@ -647,20 +647,6 @@ fn database_error(dir: &Path, error: rusqlite::Error) -> io::Error {
     )
 }
 
-pub(crate) fn immutable_uri(path: &Path) -> String {
-    use std::fmt::Write;
-    let mut uri = String::from("file:");
-    for byte in path.as_os_str().as_encoded_bytes() {
-        if byte.is_ascii_alphanumeric() || b"/-._~".contains(byte) {
-            uri.push(*byte as char);
-        } else {
-            write!(&mut uri, "%{byte:02X}").expect("write URI");
-        }
-    }
-    uri.push_str("?mode=ro&immutable=1");
-    uri
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

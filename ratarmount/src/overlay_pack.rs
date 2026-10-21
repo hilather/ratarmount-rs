@@ -156,14 +156,13 @@ fn sanitized_db(
     if &clean == meta.values() {
         return Ok(None);
     }
-    let source = directory.join(HIDDEN_DB).canonicalize()?;
-    let mut uri =
-        url::Url::from_file_path(&source).map_err(|()| invalid("invalid database path"))?;
-    uri.set_query(Some("mode=ro&immutable=1"));
+    // The overlay's own name (the open classifies it with its markers); the
+    // checked open resolves the directory and builds the immutable URI.
+    let source = directory.join(HIDDEN_DB);
     let conn = ratarmount_compositing::open_overlay_db(
         &source,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        ratarmount_compositing::DbName::Uri(uri.as_str()),
+        ratarmount_compositing::DbName::Immutable,
     )?;
     // VACUUM INTO opens its target with this connection's flags, so NOFOLLOW
     // rejects a symlink in any component of the staging path (every macOS temp
@@ -560,17 +559,14 @@ fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(invalid("layer database is not a regular file"));
     }
-    // URL encoding prevents SQLite URI syntax in a host filename from changing
-    // the immutable/read-only parameters.
-    let db = directory.join(HIDDEN_DB).canonicalize()?;
-    let mut uri = url::Url::from_file_path(&db).map_err(|()| invalid("invalid database path"))?;
-    uri.set_query(Some("mode=ro&immutable=1"));
+    // The checked open percent-encodes the path into the immutable URI, so
+    // SQLite URI syntax in a host filename cannot change its parameters.
     let conn = ratarmount_compositing::open_overlay_db(
-        &db,
+        &directory.join(HIDDEN_DB),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        ratarmount_compositing::DbName::Uri(uri.as_str()),
+        ratarmount_compositing::DbName::Immutable,
     )?;
-    let meta = OverlayMeta::from_connection(&conn)
+    let meta = OverlayMeta::from_opened(&conn)
         .map_err(io::Error::other)?
         .filter(OverlayMeta::layer_sealed)
         .ok_or_else(|| invalid("overlay is not sealed"))?;

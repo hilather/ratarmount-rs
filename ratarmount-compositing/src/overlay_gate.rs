@@ -835,22 +835,29 @@ pub(crate) fn check_commit_base_offline_with(
     )>,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
     let db = overlay.join(HIDDEN_DB);
+    let markers = || {
+        crate::write_overlay::overlay_markers(overlay)
+            .map(|m| !m.is_empty())
+            .map_err(|e| {
+                CommitBaseRefusal(format!(
+                    "cannot read the markers of {}: {e}",
+                    overlay.display()
+                ))
+            })
+    };
+    // A marker seen before the open requires the record, whatever the open
+    // and the later lookup see (a monotonic latch, #151).
+    let marked_before = markers()?;
     // The validated open (R7-F1): a database that is not a regular file
     // refuses here, before any authorization or recovery reads it.
-    let conn = crate::open_overlay_db(
+    let conn = crate::overlay_db::open_overlay_db_required(
         &db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         crate::DbName::Path,
+        marked_before,
     )
     .map_err(|e| CommitBaseRefusal(format!("cannot open {}: {e}", db.display())))?;
-    let marked = !crate::write_overlay::overlay_markers(overlay)
-        .map_err(|e| {
-            CommitBaseRefusal(format!(
-                "cannot read the markers of {}: {e}",
-                overlay.display()
-            ))
-        })?
-        .is_empty();
+    let marked = marked_before || conn.required_record() || markers()?;
     check_commit_base_with(&conn, base, archive, locked, marked)
 }
 
