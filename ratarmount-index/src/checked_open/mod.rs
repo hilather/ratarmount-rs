@@ -19,9 +19,11 @@
 //! result or why nothing was installed. The installed wrappers currently
 //! forward every call unchanged.
 //!
-//! The constructor calls `sqlite3_initialize()` in every binary that links
-//! this crate, so no code may call `sqlite3_config` (rusqlite's `config_log`
-//! included) afterwards; a test pins that.
+//! The constructor calls `sqlite3_initialize()` in every binary that reaches
+//! `checked_open` ([`installed`] references the constructor, so the linker
+//! keeps it; a binary that never names this module may run no constructor).
+//! No code may call `sqlite3_config` (rusqlite's `config_log` included) or
+//! `sqlite3_shutdown` afterwards; a test pins that.
 
 mod host;
 // Unverified targets keep the state machine (and its tests) but never call it.

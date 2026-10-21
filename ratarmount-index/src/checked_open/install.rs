@@ -137,7 +137,8 @@ impl fmt::Display for InstallStatus {
             }
             Self::AbstainedThreads(None) => write!(
                 f,
-                "the thread count could not be read at load time (is /proc masked?); {CONTRACT}"
+                "the thread count could not be read at load time ({}); {CONTRACT}",
+                THREAD_COUNT_SOURCE
             ),
             Self::NotPrivate(host) => write!(f, "not a private SQLite instance: {host}"),
             Self::Failed(failure) => {
@@ -158,6 +159,15 @@ impl fmt::Display for InstallStatus {
         }
     }
 }
+
+/// Where the constructor reads the thread count, for the abstention message.
+const THREAD_COUNT_SOURCE: &str = if cfg!(target_os = "linux") {
+    "/proc/self/stat was unreadable or malformed; is /proc masked?"
+} else if cfg!(target_os = "macos") {
+    "proc_pidinfo(PROC_PIDTASKINFO) failed"
+} else {
+    "no thread-count source on this platform"
+};
 
 /// The two once cells of design §3.
 pub(crate) struct InstallState {
@@ -1199,9 +1209,16 @@ mod tests {
         assert_eq!(fake.sets.get(), 0);
         assert!(originals.get().is_none());
         assert_eq!(state.status(), Err(InstallStatus::AbstainedThreads(None)));
-        assert!(InstallStatus::AbstainedThreads(None)
-            .to_string()
-            .contains("could not be read"));
+        let unknown = InstallStatus::AbstainedThreads(None).to_string();
+        assert!(unknown.contains("could not be read"), "{unknown}");
+        // The message names this platform's source (r11 S1 review nit 4).
+        #[cfg(target_os = "linux")]
+        assert!(unknown.contains("/proc/self/stat"), "{unknown}");
+        #[cfg(target_os = "macos")]
+        assert!(
+            unknown.contains("proc_pidinfo") && !unknown.contains("/proc"),
+            "{unknown}"
+        );
         assert!(InstallStatus::AbstainedThreads(Some(4))
             .to_string()
             .contains("4 threads"));
@@ -1410,14 +1427,17 @@ mod tests {
     }
 
     /// Regression (Fable r11 nit 13): the constructor initializes SQLite in
-    /// every binary linking this crate, so a later `sqlite3_config` call (or
-    /// rusqlite's `config_log`, which calls it) would fail at run time. No
-    /// workspace source may call either.
+    /// every binary that reaches `checked_open`, so a later `sqlite3_config`
+    /// call (or rusqlite's `config_log`, which calls it) would fail at run
+    /// time, and a `sqlite3_shutdown` would discard the installed hooks'
+    /// contract (`install_private_instance`'s safety section). No workspace
+    /// source may call any of them.
     #[test]
     fn regression_no_sqlite_config_after_constructor() {
         let needles = [
             ["sqlite3_", "config("].concat(),
             ["config_", "log("].concat(),
+            ["sqlite3_", "shutdown("].concat(),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1453,7 +1473,7 @@ mod tests {
         );
         assert!(
             hits.is_empty(),
-            "sqlite3_config after the constructor: {hits:?}"
+            "sqlite3_config or sqlite3_shutdown after the constructor: {hits:?}"
         );
     }
 }
