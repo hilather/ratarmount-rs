@@ -482,7 +482,7 @@ pub fn open_checked(
     };
     let request = request(path, flags, mode, expect).map_err(refuse)?;
     #[cfg(windows)]
-    return windows::open(&request, expect);
+    return path_type_only::open(&request, expect);
     #[cfg(not(windows))]
     {
         if let Err(status) = super::install::installed() {
@@ -494,14 +494,36 @@ pub fn open_checked(
 
 /// Windows (design §9): no syscall hook, so pathname type checks before and
 /// after the open, and no identity ([`Verification::WindowsPathTypeOnly`]).
-#[cfg(windows)]
-mod windows {
-    use rusqlite::Connection;
+/// SQLite's Windows VFS ignores `SQLITE_OPEN_NOFOLLOW`, so both checks use
+/// `lstat` semantics under that flag: a final-component symlink substituted
+/// after the first check is refused by the second. Compiled into Unix tests
+/// too, which pin that substitution.
+#[cfg(any(windows, test))]
+pub(crate) mod path_type_only {
+    use std::fs;
+
+    use rusqlite::{Connection, OpenFlags};
 
     use super::{AcquireError, Acquired, Expect, Refusal, Request, Verification};
 
-    fn check(request: &Request, expect: Expect, after: bool) -> Result<(), AcquireError> {
-        match std::fs::metadata(&request.path) {
+    #[cfg(test)]
+    thread_local! {
+        /// Runs once between SQLite's open and the check after it.
+        pub(crate) static AFTER_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) fn check(
+        request: &Request,
+        expect: Expect,
+        after: bool,
+    ) -> Result<(), AcquireError> {
+        let entry = if request.flags.contains(OpenFlags::SQLITE_OPEN_NOFOLLOW) {
+            fs::symlink_metadata(&request.path)
+        } else {
+            fs::metadata(&request.path)
+        };
+        match entry {
             Ok(m) if !m.is_file() => Err(AcquireError::NotRegular { mode: 0 }),
             Ok(m) => match expect {
                 Expect::Fresh if !after && m.len() > 0 => {
@@ -519,7 +541,7 @@ mod windows {
         }
     }
 
-    pub(super) fn open(request: &Request, expect: Expect) -> Result<Acquired, Refusal> {
+    pub(crate) fn open(request: &Request, expect: Expect) -> Result<Acquired, Refusal> {
         let refuse = |error| Refusal {
             error,
             retained_fd: None,
@@ -527,6 +549,10 @@ mod windows {
         check(request, expect, false).map_err(refuse)?;
         let conn = Connection::open_with_flags(&request.name, request.flags)
             .map_err(|e| refuse(AcquireError::Sqlite(e)))?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_OPEN.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
         check(request, expect, true).map_err(refuse)?;
         Ok(Acquired {
             conn,
@@ -534,6 +560,99 @@ mod windows {
             verification: Verification::WindowsPathTypeOnly,
             retained_low_fd: None,
         })
+    }
+}
+
+/// Regression (S3 skeptic #1): the Windows path-type-only open ignored
+/// `SQLITE_OPEN_NOFOLLOW` (both checks followed symlinks), so a final
+/// component replaced by a symlink after the first check was accepted.
+#[cfg(all(test, unix))]
+mod path_type_only_tests {
+    use std::fs;
+
+    use rusqlite::{Connection, OpenFlags};
+
+    use super::path_type_only::{check, open, AFTER_OPEN};
+    use super::{request, AcquireError, Expect, NameMode, Verification};
+
+    const RO: OpenFlags = OpenFlags::SQLITE_OPEN_READ_ONLY;
+
+    /// The Windows check ignores the identity.
+    fn existing() -> Expect {
+        Expect::Existing {
+            id: (0, 0),
+            require_nonempty: true,
+        }
+    }
+
+    #[test]
+    fn regression_path_type_only_open_honours_nofollow() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.sqlite");
+        let other = dir.path().join("other.sqlite");
+        for p in [&a, &other] {
+            Connection::open(p)
+                .unwrap()
+                .execute_batch("CREATE TABLE t(x)")
+                .unwrap();
+        }
+        let link = dir.path().join("link.sqlite");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+
+        // A symlink at the name: refused before the open under NOFOLLOW,
+        // followed without it.
+        let nofollow = request(
+            &link,
+            RO | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            NameMode::Path,
+            existing(),
+        )
+        .unwrap();
+        assert!(matches!(
+            check(&nofollow, existing(), false),
+            Err(AcquireError::NotRegular { .. })
+        ));
+        let follow = request(&link, RO, NameMode::Path, existing()).unwrap();
+        check(&follow, existing(), false).unwrap();
+
+        // Substituted after SQLite's open: the check after it refuses.
+        let substitute = || {
+            let (a, other) = (a.clone(), other.clone());
+            AFTER_OPEN.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    fs::remove_file(&a).unwrap();
+                    std::os::unix::fs::symlink(&other, &a).unwrap();
+                }))
+            });
+        };
+        substitute();
+        let req = request(
+            &a,
+            RO | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            NameMode::Path,
+            existing(),
+        )
+        .unwrap();
+        let Err(refusal) = open(&req, existing()) else {
+            panic!("a symlink substituted after the open must be refused");
+        };
+        assert!(
+            matches!(refusal.error, AcquireError::NotRegular { .. }),
+            "{:?}",
+            refusal.error
+        );
+
+        // Without NOFOLLOW the symlink to a regular file is followed.
+        fs::remove_file(&a).unwrap();
+        Connection::open(&a)
+            .unwrap()
+            .execute_batch("CREATE TABLE t(x)")
+            .unwrap();
+        substitute();
+        let req = request(&a, RO, NameMode::Path, existing()).unwrap();
+        let acquired = open(&req, existing()).expect("followed without NOFOLLOW");
+        assert_eq!(acquired.verification, Verification::WindowsPathTypeOnly);
+        assert!(acquired.id.is_none());
     }
 }
 
