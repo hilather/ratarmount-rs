@@ -848,8 +848,23 @@ pub fn snapshot_index_into(path: &Path, dest: &Path) -> std::io::Result<()> {
 
 /// `VACUUM INTO dest`, with `dest` bound as the bytes of the path (a
 /// non-UTF-8 path is not mangled by a lossy conversion).
+///
+/// `dest` must be absolute. The bundled SQLite is built with
+/// `SQLITE_USE_URI`, so a relative name starting with `file:` is parsed as a
+/// URI: `file:x?mode=memory` writes nothing and reports success, and
+/// `file:y?mode=rwc` writes `y`. An absolute path never starts with `file:`.
 pub fn vacuum_into(conn: &Connection, dest: &Path) -> rusqlite::Result<()> {
     use rusqlite::types::{ToSqlOutput, ValueRef};
+    if !dest.is_absolute() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(format!(
+                "VACUUM INTO destination {} is not absolute (a relative `file:` name \
+                 would be read as a URI)",
+                dest.display()
+            )),
+        ));
+    }
     let name = ToSqlOutput::Borrowed(ValueRef::Text(dest.as_os_str().as_encoded_bytes()));
     conn.execute("VACUUM INTO ?1", [name])?;
     Ok(())

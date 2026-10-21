@@ -1717,3 +1717,38 @@ fn regression_snapshot_index_copies_and_keeps_wal_writer_lock() {
     drop(holder);
     assert_eq!(count(&Connection::open(out.join("wal.sqlite")).unwrap()), 2);
 }
+
+/// Regression (R11-S5-FIX6): `vacuum_into` bound a relative destination as
+/// is, and SQLite (built with `SQLITE_USE_URI`) read a `file:` name as a URI:
+/// `file:memory-output?mode=memory` reported success and wrote no file. A
+/// relative destination is refused before SQLite sees it; an absolute one
+/// whose last component looks like a URI is written under exactly that name.
+#[test]
+fn regression_vacuum_into_refuses_relative_uri_destination() {
+    let (_dir, dir) = tempdir();
+    let src = dir.join("src.sqlite");
+    make_db(&src, 1);
+    let conn = Connection::open(&src).unwrap();
+    for relative in [
+        "file:memory-output?mode=memory",
+        "file:redirected.sqlite?mode=rwc",
+        "plain-relative.sqlite",
+    ] {
+        let err = crate::vacuum_into(&conn, Path::new(relative)).unwrap_err();
+        assert!(
+            err.to_string().contains("not absolute"),
+            "{relative}: {err}"
+        );
+    }
+    for leftover in ["redirected.sqlite", "plain-relative.sqlite"] {
+        assert!(
+            std::fs::symlink_metadata(leftover).is_err(),
+            "{leftover} was written in the working directory"
+        );
+    }
+
+    let literal = dir.join("file:redirected.sqlite?mode=rwc");
+    crate::vacuum_into(&conn, &literal).unwrap();
+    assert_eq!(count(&Connection::open(&literal).unwrap()), 1);
+    assert!(std::fs::symlink_metadata(dir.join("redirected.sqlite")).is_err());
+}
