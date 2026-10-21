@@ -523,6 +523,13 @@ mod tests {
     /// (A→X→A, invisible to any look at the name before or after): the open
     /// is refused and neither inode is registered. A normal open registers
     /// the acquired inode for exactly the connection's life.
+    // The acquisition seams exist only where the wrappers are installed.
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    ))]
     #[test]
     fn regression_checked_open_registration_uses_acquired_inode() {
         use ratarmount_core::db_inodes::is_db_inode;

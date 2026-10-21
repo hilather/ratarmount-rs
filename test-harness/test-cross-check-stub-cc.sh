@@ -60,5 +60,11 @@ check x86_64-pc-windows-gnu -p ratarmount-formats-zip -p ratarmount-formats-tar 
 CROSS_CHECK_RUSTFLAGS="" check x86_64-pc-windows-gnu -p ratarmount-compositing
 check aarch64-apple-darwin -p ratarmount-core -p ratarmount-index -p ratarmount-compositing \
   -p ratarmount-formats-tar --all-targets
+# An unverified Unix ABI (outside the checked-open predicate): tests that use
+# the acquisition seams must be gated out, not fail to compile (R11-S3).
+# Without -Dwarnings: ratarmount-formats-zip uses `libc::time_t`, deprecated
+# on musl (CI builds no musl target).
+CROSS_CHECK_RUSTFLAGS="" check x86_64-unknown-linux-musl -p ratarmount-core -p ratarmount-index -p ratarmount-compositing \
+  --all-targets
 
 exit "$failed"

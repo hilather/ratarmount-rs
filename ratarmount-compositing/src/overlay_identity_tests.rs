@@ -6004,7 +6004,13 @@ fn offline_commit_with_recovery_seams(
 /// the archive's journal (one this overlay never started) back. The checked
 /// acquisition refuses SQLite's descriptor of X: the archive, its journal and
 /// its locator are unchanged.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+// The acquisition seams exist only where the wrappers are installed.
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+))]
 #[test]
 fn regression_offline_gate_refuses_swap_inside_sqlite_open() {
     use ratarmount_index::checked_open::test_seams::{Seam, Seams};
@@ -6094,8 +6100,9 @@ fn mutate_record_and_markers(overlay: &Path, db: &Path, row: &str) {
 /// before its required snapshot read, together with the overlay's markers
 /// (`drop`: its tables are dropped; `truncate`: the same inode is emptied).
 /// The offline gate looked the markers up after its open and read an
-/// unmarked, table-less (or empty) database as "unrecorded" (accepted); in a
-/// whole commit, recovery's own earlier observations must refuse too. The
+/// unmarked, table-less (or empty) database as "unrecorded" (accepted; this
+/// half fails without the latch). In a whole commit, recovery's own earlier
+/// observations refuse too (an inherited r10 pin: it passed before #151). The
 /// requirement latched at the classification survives: refused (no `files`
 /// table, or SQLite's corruption/I/O error), never an unrecorded success,
 /// with the archive and its journal unchanged.
