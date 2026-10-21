@@ -90,6 +90,7 @@ pub(crate) fn same_private_image(
     not(all(
         target_pointer_width = "64",
         any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
         any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
     )),
     allow(dead_code)
@@ -365,15 +366,35 @@ mod tests {
                 Lookup::Unknown,
                 "stack"
             );
-            // The real private proof of this executable refuses at its first anchor.
-            assert_eq!(
-                super::super::install::private_proof(
-                    regression_host_rejects_executable_and_foreign_sqlite as *const libc::c_void
-                ),
-                Err(HostFailure::MainExecutable {
-                    what: "constructor"
-                })
+            // The real private proof of this executable refuses at its first
+            // anchor: the constructor, which only verified targets have
+            // (r11 S1 skeptic P2: i686/riscv64/ppc64le glibc have none).
+            let proof = super::super::install::private_proof(
+                regression_host_rejects_executable_and_foreign_sqlite as *const libc::c_void,
             );
+            if cfg!(all(
+                target_pointer_width = "64",
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                target_endian = "little",
+                any(
+                    all(target_os = "linux", target_env = "gnu"),
+                    target_os = "macos"
+                )
+            )) {
+                assert_eq!(
+                    proof,
+                    Err(HostFailure::MainExecutable {
+                        what: "constructor"
+                    })
+                );
+            } else {
+                assert_eq!(
+                    proof,
+                    Err(HostFailure::UnknownImage {
+                        what: "constructor"
+                    })
+                );
+            }
         }
     }
 }

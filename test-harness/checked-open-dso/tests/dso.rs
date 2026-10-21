@@ -79,13 +79,25 @@ fn regression_dso_private_instance_installs_after_abstention() {
     assert!(unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"sqlite3_vfs_find".as_ptr()) }.is_null());
 
     let before = status();
+    let slot_before = open_slot();
+    assert_ne!(slot_before, 0);
+    // A target outside the production predicate (32-bit, musl, BSD,
+    // big-endian) installs nothing: the fixture reports why, so this test
+    // needs no copy of the predicate (r11 S1 skeptic P2).
+    if before.contains("Unsupported") {
+        assert_eq!(before, "(None, Err(UnsupportedAbi))");
+        assert_eq!(install(0), "Err(UnsupportedAbi)");
+        assert_eq!(open_slot(), slot_before);
+        eprintln!("skip: checked opens are unsupported on this target; private-install rows");
+        drop(tx);
+        parked.join().unwrap();
+        return;
+    }
     assert!(
         before.starts_with("(Some(AbstainedThreads(Some(")
             && before.contains("Err(AbstainedThreads(Some("),
         "constructor did not abstain: {before}"
     );
-    let slot_before = open_slot();
-    assert_ne!(slot_before, 0);
 
     // Refused proofs: nothing installed, nothing poisoned.
     let exe_anchor = fixture_path as *const () as usize;

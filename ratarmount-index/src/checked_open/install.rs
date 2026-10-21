@@ -434,10 +434,12 @@ pub(crate) fn private_proof(
 }
 
 /// The installation state, once cells and wrappers of verified targets:
-/// 64-bit Linux glibc and macOS on x86_64/aarch64. Other targets fail closed.
+/// 64-bit little-endian Linux glibc and macOS on x86_64/aarch64. Other
+/// targets (`aarch64_be` included) fail closed.
 #[cfg(all(
     target_pointer_width = "64",
     any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
     any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
 ))]
 mod imp {
@@ -691,7 +693,10 @@ mod imp {
     /// caller of `installed()` links the object that carries it.
     #[used]
     #[cfg_attr(target_os = "linux", link_section = ".init_array")]
-    #[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
+    #[cfg_attr(
+        target_os = "macos",
+        link_section = "__DATA,__mod_init_func,mod_init_funcs"
+    )]
     static CTOR_ANCHOR: extern "C" fn() = constructor;
 
     pub(super) fn ctor_anchor() -> usize {
@@ -1011,6 +1016,7 @@ mod imp {
 #[cfg(not(all(
     target_pointer_width = "64",
     any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
     any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
 )))]
 mod imp {
@@ -1397,6 +1403,58 @@ mod tests {
                 Err(InstallStatus::Failed(InstallFailure::Verify("stat")))
             );
         }
+    }
+
+    /// Regression (r11 S1 review 5): the supported-target predicate matched
+    /// big-endian `aarch64_be`, whose ABI is not verified. Every copy (the
+    /// `imp` modules, `mod.rs`, `host.rs`, the tests) must be the same
+    /// little-endian predicate.
+    #[test]
+    fn regression_target_predicate_copies_agree() {
+        let compact = |s: &str| s.split_whitespace().collect::<String>();
+        let predicate = compact(
+            "target_pointer_width = \"64\", \
+             any(target_arch = \"x86_64\", target_arch = \"aarch64\"), \
+             target_endian = \"little\", \
+             any(all(target_os = \"linux\", target_env = \"gnu\"), target_os = \"macos\")",
+        );
+        for (file, text, min) in [
+            ("mod.rs", include_str!("mod.rs"), 1),
+            ("install.rs", include_str!("install.rs"), 3),
+            ("host.rs", include_str!("host.rs"), 2),
+        ] {
+            let text = compact(text);
+            let starts = text
+                .matches(&predicate[..predicate.find(',').unwrap()])
+                .count();
+            let full = text.matches(predicate.as_str()).count();
+            assert!(full >= min, "{file}: {full} copies of the predicate");
+            assert_eq!(starts, full, "{file}: a predicate copy differs");
+        }
+    }
+
+    /// Regression (r11 S1 skeptic P2): on a target outside the predicate
+    /// (32-bit, musl, BSD, big-endian, Windows) nothing is installed and the
+    /// status says why; a private initializer gets the same answer.
+    #[cfg(not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    )))]
+    #[test]
+    fn regression_unsupported_target_reports_unsupported() {
+        let want = if cfg!(unix) {
+            InstallStatus::UnsupportedAbi
+        } else {
+            InstallStatus::UnsupportedPlatform
+        };
+        assert_eq!(installed(), Err(want));
+        assert_eq!(constructor_observation(), None);
+        let anchor = regression_unsupported_target_reports_unsupported as *const std::ffi::c_void;
+        // SAFETY: nothing is installed on this target.
+        assert_eq!(unsafe { install_private_instance(anchor) }, Err(want));
+        assert_eq!(installed(), Err(want));
     }
 
     /// Regression: `/proc/self/stat` parsing must take the fields after the
