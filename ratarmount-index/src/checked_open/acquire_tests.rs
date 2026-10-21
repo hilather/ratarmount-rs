@@ -1220,9 +1220,64 @@ fn regression_checked_open_sqlite_error_after_accepted_descriptor() {
     );
 }
 
+/// The native `struct stat` layout as SQLite's amalgamation sees it (its
+/// large-file defines first), from a C probe compiled and run at test time:
+/// `(size, align, st_dev, st_ino, st_mode, st_size)`. `None` without a C
+/// compiler (`CC`, else `cc`). Never in a build script: that would run in
+/// every consumer build and break the stub-compiler cross-check (Fable nit 8).
+fn native_c_stat_layout(dir: &Path) -> Option<(usize, usize, usize, usize, usize, usize)> {
+    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let source = dir.join("stat_probe.c");
+    let exe = dir.join("stat_probe");
+    std::fs::write(
+        &source,
+        "#define _LARGE_FILE 1\n\
+         #ifndef _FILE_OFFSET_BITS\n#define _FILE_OFFSET_BITS 64\n#endif\n\
+         #define _LARGEFILE_SOURCE 1\n\
+         #include <stddef.h>\n#include <stdio.h>\n#include <sys/stat.h>\n\
+         int main(void) {\n\
+           printf(\"%zu %zu %zu %zu %zu %zu\\n\", sizeof(struct stat),\n\
+                  _Alignof(struct stat), offsetof(struct stat, st_dev),\n\
+                  offsetof(struct stat, st_ino), offsetof(struct stat, st_mode),\n\
+                  offsetof(struct stat, st_size));\n\
+           return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let built = Command::new(&cc)
+        .arg("-std=c11")
+        .arg("-o")
+        .arg(&exe)
+        .arg(&source)
+        .status();
+    match built {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("the C stat probe did not compile with {cc:?}: {status}"),
+        Err(e) => {
+            eprintln!("skip: no C compiler ({cc:?}: {e}); native stat probe not run");
+            return None;
+        }
+    }
+    let out = Command::new(&exe).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let v: Vec<usize> = String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .map(|n| n.parse().unwrap())
+        .collect();
+    assert_eq!(v.len(), 6, "{v:?}");
+    Some((v[0], v[1], v[2], v[3], v[4], v[5]))
+}
+
 /// Pins `libc::stat` to the native `struct stat` the wrappers read (Fable
 /// nit 8: size, alignment and the four fields judged), and a real round trip
 /// through the installed `stat`/`open` wrappers.
+///
+/// Regression (#151, design §5 "ABI and TLS"; S2 review deferred it to S4):
+/// the per-target table alone could agree with `libc::stat` while both
+/// disagreed with the system headers SQLite is compiled against; a C probe
+/// with SQLite's large-file defines must report the same layout (`skip:` for
+/// that half without a C compiler).
 #[test]
 fn regression_sqlite_syscall_stat_abi() {
     use std::mem::{align_of, offset_of, size_of};
@@ -1247,6 +1302,9 @@ fn regression_sqlite_syscall_stat_abi() {
     );
     assert_eq!(got, want);
     let (_t, dir) = tempdir();
+    if let Some(native) = native_c_stat_layout(&dir) {
+        assert_eq!(native, want, "C headers vs the pinned table");
+    }
     let a = dir.join("a.sqlite");
     make_db(&a, 1);
     let got = open_checked(&a, RO, NameMode::Path, existing(&a, true)).unwrap();
