@@ -1449,9 +1449,11 @@ fn regression_macos_checked_open_uses_posix_vfs() {
     holder.execute_batch("COMMIT").unwrap();
 }
 
-/// Regression (S3 review nit): the seams carry a `RATARMOUNT_TEST_` string,
-/// so the release check (`packaging/test-no-test-hooks-in-release.sh`) sees
-/// a binary built with the `test-hooks` feature. This test binary has them.
+/// Regression (S3 review nit): the seams carry a `RATARMOUNT_TEST_` string
+/// for the release check (`packaging/test-no-test-hooks-in-release.sh`).
+/// This checks the prefix and that the string is in a linked binary; this
+/// test references the constant itself, so it does not prove that
+/// `seams::fire`'s reference alone keeps it in a non-test build.
 #[test]
 fn regression_seams_carry_release_marker() {
     assert!(super::imp::seams::RELEASE_MARKER.starts_with("RATARMOUNT_TEST_"));
