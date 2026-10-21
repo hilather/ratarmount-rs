@@ -186,6 +186,29 @@ formats, corrupt indexes, cancellation, write-permission and other engine
 errors raise `RatarmountError` with the engine detail. Standard Python I/O
 and mmap errors retain their usual types.
 
+### Import and checked SQLite opens
+
+Overlay databases are opened through checked SQLite opens, which need
+wrappers around the `open` and `stat` calls of the SQLite bundled in
+`_native` (#151). The wrappers are installed when the module loads. If the
+process has one thread at that point, a load-time constructor installs them.
+If other threads are already running, the module installs them into its
+private SQLite as its first step, before it publishes anything. That is safe
+only because the wheel exports no `sqlite3_*` symbol, and the wheels workflow
+audits every repaired wheel for that (`packaging/audit_native_exports.py`).
+On Linux and macOS (64-bit x86_64/aarch64, glibc or macOS), if neither path
+can install the wrappers, `import ratarmount_rs` raises `ImportError` naming
+the reason; nothing from the module is usable then. On Windows and other
+platforms the module imports, and checked opens refuse or use the Windows
+path-type check. A Rust program that embeds the rlib (`--features embedding`)
+gets only the load-time constructor; threads started before it loads leave
+checked opens refusing.
+
+`ratarmount_rs._native._checked_open_status()` is a diagnostic. It returns a
+dict with `installed`, `why` (`"SingleThread"` or `"PrivateInstance"`),
+`threads_at_install`, `status`, `detail` and `constructor` (what the load-time
+constructor saw, such as `"AbstainedThreads(Some(2))"`). It installs nothing.
+
 ## Mount from Python
 
 ```python

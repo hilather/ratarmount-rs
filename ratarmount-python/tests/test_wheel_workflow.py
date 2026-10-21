@@ -20,6 +20,19 @@ def test_regression_wheel_matrix_tests_installed_artifacts_without_publishing():
     mac_repair = next(step for step in wheel_steps if "delocate-wheel" in step.get("run", ""))
     assert mac_repair["if"] == "runner.os == 'macOS'"
     assert "--require-archs arm64" in mac_repair["run"]
+    # Regression (#151): every repaired wheel (Linux and macOS) is audited
+    # for SQLite exports after the repair, before upload.
+    names = [step.get("name") for step in wheel_steps]
+    audit = next(step for step in wheel_steps if "audit_native_exports.py" in step.get("run", ""))
+    assert "if" not in audit
+    assert "dist/*.whl" in audit["run"]
+    assert names.index(audit["name"]) > wheel_steps.index(mac_repair)
+    upload = next(step for step in wheel_steps if step.get("uses") == "actions/upload-artifact@v4")
+    assert wheel_steps.index(audit) < wheel_steps.index(upload)
+    # Regression (#151): the rlib's Rust tests (the _native publication gate)
+    # run somewhere; the default workspace build compiles no PyO3.
+    embedding = "\n".join(step.get("run", "") for step in jobs["embedding"]["steps"])
+    assert "cargo test -p ratarmount-python --features embedding" in embedding
     assert jobs["test"]["needs"] == "wheels"
     test_steps = jobs["test"]["steps"]
     assert any(step.get("uses") == "actions/download-artifact@v4" for step in test_steps)

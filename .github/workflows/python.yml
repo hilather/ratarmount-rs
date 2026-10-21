@@ -6,6 +6,7 @@ on:
       - 'ratarmount-*/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'packaging/audit_native_exports.py'
       - '.github/workflows/python.yml'
   push:
     branches: [main]
@@ -64,11 +65,34 @@ jobs:
           "$RUNNER_TEMP/repair-venv/bin/delocate-wheel" --require-archs arm64 -w repaired dist/*.whl
           rm dist/*.whl
           mv repaired/*.whl dist/
+      # The repaired wheel's _native may export no sqlite3_* symbol and only
+      # the allowlisted entry points (#151, private-instance installation).
+      - name: Audit wheel exports
+        run: python -I packaging/audit_native_exports.py dist/*.whl
       - uses: actions/upload-artifact@v4
         with:
           name: python-${{ matrix.target }}
           path: dist/*.whl
           if-no-files-found: error
+
+  embedding:
+    # The rlib's Rust tests, including the _native publication gate and the
+    # checked-open status (#151); the default workspace build compiles no PyO3.
+    name: Rust embedding tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y -o Acquire::Retries=5 pkg-config libarchive-dev zlib1g-dev
+      - name: cargo test --features embedding
+        run: cargo test -p ratarmount-python --features embedding --lib
 
   sdist:
     runs-on: ubuntu-24.04
