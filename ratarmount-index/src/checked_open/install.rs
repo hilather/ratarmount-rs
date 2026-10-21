@@ -532,13 +532,31 @@ mod imp {
         if vfs.is_null() {
             return Err(InstallFailure::VfsMissing(label));
         }
-        let v = unsafe { &*vfs };
-        if v.iVersion < 3 {
+        // SAFETY: a registered VFS is at least the version-1 prefix.
+        unsafe { check_vfs(vfs, label) }
+    }
+
+    /// Version gate of a VFS that may be a shorter version-1/2 structure: read
+    /// only `iVersion` through the raw pointer, and touch (or borrow) the
+    /// version-3 fields only after `iVersion >= 3`.
+    ///
+    /// # Safety
+    ///
+    /// `vfs` points to a live structure of at least SQLite's version-1 layout.
+    pub(super) unsafe fn check_vfs(
+        vfs: *mut ffi::sqlite3_vfs,
+        label: &'static str,
+    ) -> Result<*mut ffi::sqlite3_vfs, InstallFailure> {
+        // SAFETY: `iVersion` is the first field of every version.
+        let version = unsafe { std::ptr::addr_of!((*vfs).iVersion).read() };
+        if version < 3 {
             return Err(InstallFailure::VfsVersion {
                 vfs: label,
-                version: v.iVersion,
+                version,
             });
         }
+        // SAFETY: version 3 has the full structure.
+        let v = unsafe { &*vfs };
         if v.xSetSystemCall.is_none() || v.xGetSystemCall.is_none() {
             return Err(InstallFailure::NoSyscallInterface(label));
         }
@@ -683,6 +701,57 @@ mod imp {
             let conn = rusqlite::Connection::open(&path).unwrap();
             let x: i64 = conn.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
             assert_eq!(x, 7);
+        }
+
+        /// Regression (r11 S1 skeptic P1): the version gate borrowed the whole
+        /// `sqlite3_vfs` before checking `iVersion`, which is undefined
+        /// behaviour for a legacy VFS registered as the shorter version-1/2
+        /// structure. The gate must read only `iVersion` of such a structure.
+        /// Each one is placed so that it ends at a `PROT_NONE` guard page: a
+        /// read of any version-3 field faults.
+        #[test]
+        fn regression_install_short_vfs_version_checked_before_borrow() {
+            let v1 = std::mem::offset_of!(ffi::sqlite3_vfs, xCurrentTimeInt64);
+            let v2 = std::mem::offset_of!(ffi::sqlite3_vfs, xSetSystemCall);
+            assert!(v1 < v2 && v2 < std::mem::size_of::<ffi::sqlite3_vfs>());
+            // SAFETY: anonymous private mapping, unmapped below.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let map = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    2 * page,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(map, libc::MAP_FAILED);
+            let guard = unsafe { map.cast::<u8>().add(page) };
+            assert_eq!(
+                unsafe { libc::mprotect(guard.cast(), page, libc::PROT_NONE) },
+                0
+            );
+            for (size, version) in [(v1, 1), (v2, 2)] {
+                assert_eq!(size % 8, 0);
+                let short = unsafe { guard.sub(size) };
+                // SAFETY: `size` writable bytes before the guard page.
+                unsafe {
+                    std::ptr::write_bytes(short, 0, size);
+                    short.cast::<std::os::raw::c_int>().write(version);
+                }
+                assert_eq!(
+                    unsafe { check_vfs(short.cast(), "short") },
+                    Err(InstallFailure::VfsVersion {
+                        vfs: "short",
+                        version
+                    })
+                );
+            }
+            assert_eq!(unsafe { libc::munmap(map, 2 * page) }, 0);
+            // The real VFS passes the same gate.
+            let unix = unsafe { ffi::sqlite3_vfs_find(c"unix".as_ptr()) };
+            assert_eq!(unsafe { check_vfs(unix, "unix") }, Ok(unix));
         }
 
         const CHILD_ENV: &str = "RATARMOUNT_TEST_ABSTAIN_CHILD";
