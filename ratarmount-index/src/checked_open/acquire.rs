@@ -1026,7 +1026,14 @@ pub(crate) mod imp {
             static FSTAT: Cell<Option<i32>> = const { Cell::new(None) };
         }
 
+        /// A `RATARMOUNT_TEST_` string in every binary built with these
+        /// seams, so `packaging/test-no-test-hooks-in-release.sh` finds a
+        /// `test-hooks` build (the seams have no environment name of their
+        /// own).
+        pub const RELEASE_MARKER: &str = "RATARMOUNT_TEST_CHECKED_OPEN_SEAMS";
+
         pub(crate) fn fire(seam: Seam) {
+            std::hint::black_box(RELEASE_MARKER);
             HOOK.with(|h| {
                 if let Some(f) = h.borrow_mut().as_mut() {
                     f(seam)

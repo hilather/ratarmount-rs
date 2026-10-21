@@ -1448,3 +1448,17 @@ fn regression_macos_checked_open_uses_posix_vfs() {
     assert!(other_process_sees_lock(&a), "the holder's lock survived");
     holder.execute_batch("COMMIT").unwrap();
 }
+
+/// Regression (S3 review nit): the seams carry a `RATARMOUNT_TEST_` string,
+/// so the release check (`packaging/test-no-test-hooks-in-release.sh`) sees
+/// a binary built with the `test-hooks` feature. This test binary has them.
+#[test]
+fn regression_seams_carry_release_marker() {
+    assert!(super::imp::seams::RELEASE_MARKER.starts_with("RATARMOUNT_TEST_"));
+    let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+    let marker = super::imp::seams::RELEASE_MARKER.as_bytes();
+    assert!(
+        exe.windows(marker.len()).any(|w| w == marker),
+        "the linked binary keeps the marker"
+    );
+}

@@ -118,8 +118,9 @@ pub(crate) fn not_regular_message(db: &Path, metadata: &fs::Metadata) -> String 
 pub enum DbName<'a> {
     /// The path itself.
     Path,
-    /// `file:<canonical path>?mode=ro&immutable=1`, built by the checked
-    /// open (read-only flags without `SQLITE_OPEN_CREATE`).
+    /// `file:<path>?mode=ro&immutable=1`, built by the checked open from the
+    /// absolute path (its parent directory resolved, the final component
+    /// kept as given); read-only flags without `SQLITE_OPEN_CREATE`.
     Immutable,
     /// Deprecated (#153): a caller-built URI could carry `vfs=` or `modeof=`.
     /// Always refused, before anything is opened; use [`DbName::Immutable`].
@@ -265,7 +266,8 @@ pub(crate) fn open_overlay_db_required(
     let (expect, required) = match entry {
         DbEntry::Absent if previously_required => {
             return Err(OverlayDbError::Refused(format!(
-                "overlay database {} is missing, but its record was required earlier (the                  overlay was used); it is not created anew",
+                "overlay database {} is missing, but its record was required earlier (the \
+                 overlay was used); it is not created anew",
                 db.display()
             )))
         }
@@ -492,10 +494,19 @@ mod tests {
         // Required earlier, unmarked now: a missing record is not created.
         fs::remove_file(dir.join(crate::OVERLAY_MARKER)).unwrap();
         fs::remove_file(&hidden).unwrap();
-        assert!(matches!(
-            open_overlay_db_required(&hidden, OpenFlags::default(), DbName::Path, true),
-            Err(OverlayDbError::Refused(_))
-        ));
+        match open_overlay_db_required(&hidden, OpenFlags::default(), DbName::Path, true) {
+            // The message is one sentence (S3 review nit: a missing line
+            // continuation put a run of spaces in it).
+            Err(OverlayDbError::Refused(msg)) => assert_eq!(
+                msg,
+                format!(
+                    "overlay database {} is missing, but its record was required earlier \
+                     (the overlay was used); it is not created anew",
+                    hidden.display()
+                )
+            ),
+            other => panic!("a required missing record must refuse: {other:?}"),
+        }
         assert!(!hidden.exists());
         // Unmarked and never required: created fresh.
         let fresh = open_overlay_db(&hidden, OpenFlags::default(), DbName::Path).unwrap();
