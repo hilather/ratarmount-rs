@@ -78,8 +78,13 @@ jobs:
   embedding:
     # The rlib's Rust tests, including the _native publication gate and the
     # checked-open status (#151); the default workspace build compiles no PyO3.
-    name: Rust embedding tests
-    runs-on: ubuntu-24.04
+    name: Rust embedding tests (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every packaged Linux target runs the checked-open status natively.
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -131,6 +136,9 @@ jobs:
             python: '3.9'
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            python: '3.12'
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
             python: '3.12'
           - runner: macos-14
             target: aarch64-apple-darwin

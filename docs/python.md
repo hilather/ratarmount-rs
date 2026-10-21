@@ -35,7 +35,7 @@ linked shared libraries (`uv pip install --python
 ratarmount-python/.venv/bin/python patchelf`). The version comes from the Rust
 workspace. The Python wheels workflow builds abi3 wheels for manylinux_2_28
 x86_64/aarch64 and macOS 14+ arm64, plus an sdist, and tests installed wheels in
-fresh venvs on Linux x86_64 and macOS arm64. Linux wheels require glibc 2.28+;
+fresh venvs on Linux x86_64 and aarch64 and macOS arm64. Linux wheels require glibc 2.28+;
 linked libraries such as libarchive are bundled by maturin on Linux and
 delocate on macOS. Library reads need no FUSE; optional mounting uses a separate CLI.
 The workflow uploads build artifacts only; PyPI publishing is not enabled, so
