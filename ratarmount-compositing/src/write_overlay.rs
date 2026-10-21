@@ -1266,22 +1266,16 @@ impl WriteOverlay {
         // take the backfill path and run unmarked).
         // Remove a database file this call created, so a failed first open
         // leaves the folder as it was (not "non-empty DB without files").
+        // A database that existed (0 bytes included) is left to SQLite's own
+        // rollback: truncating it through a descriptor of our own would close
+        // that descriptor, which releases every fcntl lock this process holds
+        // on the file, another connection's included (#160).
         let undo_new_db = |conn: Connection| {
             drop(conn);
-            match db_len {
-                None => {
-                    for suf in ["", "-journal", "-shm", "-wal"] {
-                        let _ = fs::remove_file(root.join(format!("{HIDDEN_DB}{suf}")));
-                    }
+            if db_len.is_none() {
+                for suf in ["", "-journal", "-shm", "-wal"] {
+                    let _ = fs::remove_file(root.join(format!("{HIDDEN_DB}{suf}")));
                 }
-                // It was 0 bytes: put it back that way.
-                Some(0) => {
-                    let _ = fs::OpenOptions::new()
-                        .write(true)
-                        .open(&db_path)
-                        .and_then(|f| f.set_len(0));
-                }
-                Some(_) => {}
             }
         };
         // A legacy-named marker is migrated: `rm .ratarmount.overlay.sqlite*`
@@ -12790,6 +12784,49 @@ pub(crate) mod tests {
             assert!(ov.join(OVERLAY_MARKER).is_file(), "{}", ov.display());
             assert!(has_files_table(&ov.join(HIDDEN_DB)));
         }
+    }
+
+    /// Regression (#160): a failed first open of a folder holding a 0-byte
+    /// database "put it back" by truncating the file through a descriptor of
+    /// its own. Closing that descriptor released every fcntl lock this
+    /// process held on the file, so another connection's SHARED lock was gone
+    /// (another process could then take EXCLUSIVE under it). The holder keeps
+    /// its lock, the file stays 0 bytes (SQLite's rollback), and the holder
+    /// still reads and writes.
+    #[test]
+    fn regression_failed_open_cleanup_keeps_empty_db_holders_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().canonicalize().unwrap().join("zero");
+        fs::create_dir(&overlay).unwrap();
+        let db = overlay.join(HIDDEN_DB);
+        fs::write(&db, b"").unwrap();
+        let holder = Connection::open(&db).unwrap();
+        holder
+            .execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;")
+            .unwrap();
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&db),
+            "the holder's SHARED lock"
+        );
+        // The schema commit needs EXCLUSIVE, which the holder's SHARED lock
+        // refuses: the open fails and takes the cleanup path.
+        let error = msg_of(reopen_keep_overlay(&overlay));
+        assert!(
+            error.contains("locked") || error.contains("busy"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::metadata(&db).unwrap().len(),
+            0,
+            "rolled back to 0 bytes"
+        );
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&db),
+            "the failed open's cleanup released the holder's lock"
+        );
+        holder
+            .execute_batch("SELECT count(*) FROM sqlite_master; COMMIT; CREATE TABLE t (x);")
+            .unwrap();
     }
 
     /// Overlays created before the marker existed get it on their next open.

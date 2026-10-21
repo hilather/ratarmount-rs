@@ -360,6 +360,40 @@ pub(crate) fn lock_probe_is_busy(db: &Path) -> bool {
     false
 }
 
+/// Set by [`other_process_sees_lock`] for the child it spawns.
+#[cfg(all(test, unix))]
+pub(crate) const GETLK_PROBE_ENV: &str = "RATARMOUNT_TEST_GETLK_PROBE";
+
+/// Does ANOTHER process see any SQLite lock this process holds on `db`? A
+/// child of this test binary asks `F_GETLK` for a write lock over SQLite's
+/// lock bytes (PENDING, RESERVED and the SHARED range at `0x40000000`), so a
+/// SHARED lock (which `BEGIN IMMEDIATE` cannot see) counts, and a read-only
+/// file can be probed. The child opens the file read-only and writes nothing.
+#[cfg(all(test, unix))]
+pub(crate) fn other_process_sees_lock(db: &Path) -> bool {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "overlay_db::tests::getlk_probe_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(GETLK_PROBE_ENV, db)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "probe child failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if stdout.contains("GETLK:locked") {
+        return true;
+    }
+    assert!(stdout.contains("GETLK:unlocked"), "probe child: {stdout}");
+    false
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -645,6 +679,37 @@ mod tests {
                 println!("PROBE:busy")
             }
             Err(e) => panic!("probe: {e}"),
+        }
+    }
+
+    /// The child half of [`other_process_sees_lock`]. A no-op unless spawned.
+    #[test]
+    fn getlk_probe_child() {
+        use std::os::fd::AsRawFd;
+        let Some(db) = std::env::var_os(GETLK_PROBE_ENV) else {
+            return;
+        };
+        let file = fs::File::open(db).unwrap();
+        // SAFETY: a zeroed `flock` is a valid argument; F_GETLK only fills it.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        lock.l_start = 0x4000_0000;
+        lock.l_len = 512;
+        // SAFETY: `file` is open and `lock` lives across the call.
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) },
+            0,
+            "F_GETLK: {}",
+            io::Error::last_os_error()
+        );
+        // `F_UNLCK` is a `c_short` on Apple platforms, a `c_int` on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        let unlocked = i32::from(lock.l_type) == libc::F_UNLCK as i32;
+        if unlocked {
+            println!("GETLK:unlocked");
+        } else {
+            println!("GETLK:locked");
         }
     }
 
