@@ -1118,6 +1118,19 @@ mod imp {
     }
 }
 
+/// Whether this target is one the wrappers are verified for (the
+/// checked-open target predicate). On any other target [`installed`] is
+/// `UnsupportedPlatform` (Windows) or `UnsupportedAbi` (another Unix ABI).
+pub const VERIFIED_TARGET: bool = cfg!(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    any(
+        all(target_os = "linux", target_env = "gnu"),
+        target_os = "macos"
+    )
+));
+
 /// The terminal installation result, or why there is none. Never installs.
 pub fn installed() -> Result<Witness, InstallStatus> {
     imp::status()
@@ -1525,7 +1538,7 @@ mod tests {
         );
         for (file, text, min) in [
             ("mod.rs", include_str!("mod.rs"), 1),
-            ("install.rs", include_str!("install.rs"), 3),
+            ("install.rs", include_str!("install.rs"), 4),
             ("host.rs", include_str!("host.rs"), 2),
             ("acquire.rs", include_str!("acquire.rs"), 3),
         ] {
@@ -1537,6 +1550,19 @@ mod tests {
             assert!(full >= min, "{file}: {full} copies of the predicate");
             assert_eq!(starts, full, "{file}: a predicate copy differs");
         }
+    }
+
+    /// Regression (r11 S4 skeptic P2): `VERIFIED_TARGET` is what dependents
+    /// (the `_native` status test) branch on; it must agree with the
+    /// installation status: false exactly when the status is the unsupported
+    /// fallback.
+    #[test]
+    fn regression_verified_target_matches_install_status() {
+        let unsupported = matches!(
+            installed(),
+            Err(InstallStatus::UnsupportedPlatform | InstallStatus::UnsupportedAbi)
+        );
+        assert_eq!(super::VERIFIED_TARGET, !unsupported);
     }
 
     /// Regression (r11 S1 skeptic P2): on a target outside the predicate

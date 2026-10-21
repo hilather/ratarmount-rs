@@ -593,9 +593,13 @@ mod tests {
     }
 
     /// Regression (#151): the status function reports the installation this
-    /// process has. This test binary starts with one thread, so its
-    /// load-time constructor installed the wrappers (`SingleThread`), and the
-    /// real module initializer published.
+    /// process has. This test binary starts with one thread, so on a verified
+    /// target (`checked_open::VERIFIED_TARGET`) its load-time constructor
+    /// installed the wrappers (`SingleThread`). Regression (r11 S4 skeptic
+    /// P2): elsewhere nothing is installed and the status is the documented
+    /// fallback (`UnsupportedPlatform` on Windows, `UnsupportedAbi` on another
+    /// Unix ABI), which the publication gate accepts; the real module
+    /// initializer published in both cases.
     #[test]
     fn regression_native_status_reports_constructor_install() {
         Python::initialize();
@@ -604,14 +608,27 @@ mod tests {
             let status = module.getattr(py, "_checked_open_status")?.call0(py)?;
             let status = status.bind(py).cast::<PyDict>()?;
             let get = |key: &str| status.get_item(key).unwrap().unwrap();
-            assert!(get("installed").extract::<bool>()?, "{status}");
-            assert_eq!(get("why").extract::<String>()?, "SingleThread");
-            assert_eq!(get("threads_at_install").extract::<u32>()?, 1);
-            assert_eq!(get("status").extract::<String>()?, "Installed");
-            assert_eq!(
-                get("constructor").extract::<String>()?,
-                "AttemptedSingleThread"
-            );
+            if checked_open::VERIFIED_TARGET {
+                assert!(get("installed").extract::<bool>()?, "{status}");
+                assert_eq!(get("why").extract::<String>()?, "SingleThread");
+                assert_eq!(get("threads_at_install").extract::<u32>()?, 1);
+                assert_eq!(get("status").extract::<String>()?, "Installed");
+                assert_eq!(
+                    get("constructor").extract::<String>()?,
+                    "AttemptedSingleThread"
+                );
+            } else {
+                let fallback = if cfg!(unix) {
+                    "UnsupportedAbi"
+                } else {
+                    "UnsupportedPlatform"
+                };
+                assert!(!get("installed").extract::<bool>()?, "{status}");
+                assert!(get("why").is_none(), "{status}");
+                assert!(get("threads_at_install").is_none(), "{status}");
+                assert_eq!(get("status").extract::<String>()?, fallback);
+                assert!(get("constructor").is_none(), "{status}");
+            }
             Ok(())
         })
         .unwrap();

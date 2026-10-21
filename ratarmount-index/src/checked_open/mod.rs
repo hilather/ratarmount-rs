@@ -69,5 +69,5 @@ pub use acquire::{
 pub use host::{HostFailure, ImageIdentity};
 pub use install::{
     constructor_observation, install_private_instance, installed, CtorObservation, InstallFailure,
-    InstallStatus, InstallWhy, Witness,
+    InstallStatus, InstallWhy, Witness, VERIFIED_TARGET,
 };
