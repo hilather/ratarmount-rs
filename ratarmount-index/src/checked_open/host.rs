@@ -266,7 +266,7 @@ mod tests {
     /// constructor: an interposed or separately linked SQLite resolves to its
     /// own image. Catalog rows plus the real loader (this test binary is a PIE
     /// executable; libc is a real shared object unless linked `crt-static`).
-    /// The real shared-object fixture is `test-harness/checked-open-dso`.
+    /// The real shared-object fixture is `test-harness/ratarmount-checked-open-fixture`.
     #[test]
     fn regression_host_rejects_executable_and_foreign_sqlite() {
         assert_eq!(same_private_image(&catalog, &anchors(0x104)), Ok(LIB));
