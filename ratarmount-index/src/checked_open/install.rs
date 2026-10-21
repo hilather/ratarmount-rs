@@ -449,6 +449,7 @@ mod imp {
 
     use rusqlite::ffi;
 
+    use super::super::acquire::imp as acquire;
     use super::super::host::{host_object, same_image_as, HostFailure, ImageIdentity, Lookup};
     use super::{
         install_overrides, private_proof, thread_count, CtorObservation, ErasedFn, InstallFailure,
@@ -458,8 +459,7 @@ mod imp {
     pub(super) static STATE: InstallState = InstallState::new();
     pub(super) static ORIGINALS: OnceLock<Originals> = OnceLock::new();
 
-    pub(super) type RealOpen = unsafe extern "C" fn(*const c_char, c_int, c_int) -> c_int;
-    pub(super) type RealStat = unsafe extern "C" fn(*const c_char, *mut libc::stat) -> c_int;
+    pub(super) use acquire::{RealOpen, RealStat};
 
     /// The only conversions between SQLite's erased `sqlite3_syscall_ptr` and
     /// the real signatures. SAFETY: SQLite's `"open"` slot holds an
@@ -485,25 +485,19 @@ mod imp {
     }
 
     fn set_errno(e: c_int) {
-        #[cfg(target_os = "linux")]
-        unsafe {
-            *libc::__errno_location() = e
-        };
-        #[cfg(target_os = "macos")]
-        unsafe {
-            *libc::__error() = e
-        };
+        acquire::set_errno(e)
     }
 
-    /// Unarmed pass-through to the captured `open`. No allocation, logging or
-    /// panic; errno is the original's.
+    /// The `open` wrapper: a pass-through to the captured original unless
+    /// this thread is inside a checked acquisition (design §5). No
+    /// allocation, logging or panic.
     pub(super) unsafe extern "C" fn hook_open(
         path: *const c_char,
         flags: c_int,
         mode: c_int,
     ) -> c_int {
         match ORIGINALS.get() {
-            Some(o) => unsafe { erased::to_open(o.open)(path, flags, mode) },
+            Some(o) => unsafe { acquire::on_open(erased::to_open(o.open), path, flags, mode) },
             None => {
                 set_errno(libc::ENOSYS);
                 -1
@@ -511,10 +505,11 @@ mod imp {
         }
     }
 
-    /// Unarmed pass-through to the captured `stat`.
+    /// The `stat` wrapper: the original's result; an armed acquisition
+    /// judges each successful stat.
     pub(super) unsafe extern "C" fn hook_stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
         match ORIGINALS.get() {
-            Some(o) => unsafe { erased::to_stat(o.stat)(path, buf) },
+            Some(o) => unsafe { acquire::on_stat(erased::to_stat(o.stat), path, buf) },
             None => {
                 set_errno(libc::ENOSYS);
                 -1
@@ -1021,7 +1016,25 @@ mod imp {
             conn.execute_batch("CREATE TABLE t(x)").unwrap();
             drop(conn);
             let dir = tempfile::tempdir().unwrap();
-            drop(rusqlite::Connection::open(dir.path().join("t.sqlite")).unwrap());
+            let db = dir.path().canonicalize().unwrap().join("t.sqlite");
+            drop(rusqlite::Connection::open(&db).unwrap());
+            // A checked open fails closed and installs nothing either.
+            let refusal = crate::checked_open::open_checked(
+                &db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                crate::checked_open::NameMode::Path,
+                crate::checked_open::Expect::Fresh,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    refusal.error,
+                    crate::checked_open::AcquireError::Unavailable(
+                        InstallStatus::AbstainedThreads(got)
+                    ) if got == want
+                ),
+                "{refusal}"
+            );
             // An executable is no private instance; the refusal does not poison.
             assert_eq!(
                 private(abstain_child as *const std::ffi::c_void),
@@ -1038,9 +1051,9 @@ mod imp {
 
         /// Regression: a constructor that saw more than one thread (or could
         /// not count them) must not install, and nothing later (database
-        /// opens, `installed()`, a refused private initializer) may install
-        /// lazily: SQLite's slots stay untouched. (S2 adds: a checked open
-        /// then refuses with `Unavailable`.)
+        /// opens, `installed()`, a refused private initializer, a checked
+        /// open) may install lazily: SQLite's slots stay untouched, and the
+        /// checked open refuses with `Unavailable`.
         #[test]
         fn regression_checked_open_never_installs_lazily() {
             for (pretend, want) in [("2", "2"), ("unknown", "none")] {
@@ -1505,6 +1518,7 @@ mod tests {
             ("mod.rs", include_str!("mod.rs"), 1),
             ("install.rs", include_str!("install.rs"), 3),
             ("host.rs", include_str!("host.rs"), 2),
+            ("acquire.rs", include_str!("acquire.rs"), 3),
         ] {
             let text = compact(text);
             let starts = text

@@ -16,8 +16,9 @@
 //!   the module anchor and SQLite live in one non-executable image.
 //!
 //! A database open never installs anything. [`installed`] reports the terminal
-//! result or why nothing was installed. The installed wrappers currently
-//! forward every call unchanged.
+//! result or why nothing was installed. The installed wrappers forward every
+//! call unchanged unless the calling thread is inside [`open_checked`], which
+//! refuses with [`AcquireError::Unavailable`] when nothing is installed.
 //!
 //! The constructor runs in every binary that reaches `checked_open`
 //! ([`installed`] references the constructor, so the linker keeps it; a binary
@@ -27,6 +28,7 @@
 //! No code may call `sqlite3_config` (rusqlite's `config_log` included) or
 //! `sqlite3_shutdown` afterwards; a test pins that.
 
+mod acquire;
 mod host;
 // Unverified targets keep the state machine (and its tests) but never call it.
 #[cfg_attr(
@@ -40,6 +42,9 @@ mod host;
 )]
 mod install;
 
+pub use acquire::{
+    open_checked, AcquireError, Acquired, DbId, Expect, NameMode, Refusal, Verification,
+};
 pub use host::{HostFailure, ImageIdentity};
 pub use install::{
     constructor_observation, install_private_instance, installed, CtorObservation, InstallFailure,
