@@ -184,12 +184,25 @@ impl std::ops::DerefMut for OverlayDb {
     }
 }
 
+/// A test seam: called with the database path on every open of this thread.
+#[cfg(test)]
+pub(crate) type Seam = std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>>;
+
 #[cfg(test)]
 thread_local! {
-    /// Test seam: runs once on this thread after the classification and
-    /// before the checked acquisition.
-    pub(crate) static AFTER_CLASSIFY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
+    /// After the classification, before the checked acquisition.
+    pub(crate) static AFTER_CLASSIFY: Seam = const { std::cell::RefCell::new(None) };
+    /// After the acquisition, before the caller reads anything.
+    pub(crate) static AFTER_ACQUIRE: Seam = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn fire(seam: &'static std::thread::LocalKey<Seam>, db: &Path) {
+    seam.with(|hook| {
+        if let Some(f) = hook.borrow_mut().as_mut() {
+            f(db)
+        }
+    })
 }
 
 /// Open the overlay database at `db` with `flags`; see the module docs.
@@ -276,9 +289,7 @@ pub(crate) fn open_overlay_db_required(
         }
     };
     #[cfg(test)]
-    if let Some(hook) = AFTER_CLASSIFY.with(|hook| hook.borrow_mut().take()) {
-        hook();
-    }
+    fire(&AFTER_CLASSIFY, db);
     let acquired = checked_open::open_checked(db, flags, mode, expect).map_err(|refusal| {
         match refusal.error {
             AcquireError::Sqlite(e) => OverlayDbError::Sqlite(e),
@@ -290,6 +301,8 @@ pub(crate) fn open_overlay_db_required(
     let registration = acquired
         .id
         .map(|id| ratarmount_core::db_inodes::register_db_inode(id, db));
+    #[cfg(test)]
+    fire(&AFTER_ACQUIRE, db);
     Ok(OverlayDb {
         conn: acquired.conn,
         id: acquired.id,
@@ -526,7 +539,7 @@ mod tests {
         {
             let (a, x, saved) = (a.clone(), x.clone(), saved.clone());
             AFTER_CLASSIFY.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move || {
+                *hook.borrow_mut() = Some(Box::new(move |_| {
                     fs::rename(&a, &saved).unwrap();
                     fs::rename(&x, &a).unwrap();
                 }))
@@ -542,6 +555,7 @@ mod tests {
             })
         };
         let error = open_overlay_db(&a, RO, DbName::Path).unwrap_err();
+        AFTER_CLASSIFY.with(|hook| *hook.borrow_mut() = None);
         drop(restore);
         // Another test's open connection makes SQLite's reuse-selection
         // `stat` see X first, which refuses before any `open` (no restore).
