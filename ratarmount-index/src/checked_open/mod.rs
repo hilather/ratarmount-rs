@@ -28,9 +28,19 @@
 //! No code may call `sqlite3_config` (rusqlite's `config_log` included) or
 //! `sqlite3_shutdown` afterwards; a test pins that.
 
+// Unverified targets keep the state machines (and their tests) but never
+// call them: the acquisition evidence is only fed by the installed wrappers.
+#[cfg_attr(
+    not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    )),
+    allow(dead_code)
+)]
 mod acquire;
 mod host;
-// Unverified targets keep the state machine (and its tests) but never call it.
 #[cfg_attr(
     not(all(
         target_pointer_width = "64",

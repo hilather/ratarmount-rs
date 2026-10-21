@@ -7,6 +7,7 @@
 # build scripts only need their C objects to exist (nothing is linked), so an
 # empty object file stands in for each. Type-checks the Rust code only.
 # A target that is not installed (`rustup target add ...`) is skipped.
+# Warnings are errors, as in CI (override with CROSS_CHECK_RUSTFLAGS).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -40,17 +41,23 @@ check() {
   fi
   local var="${target//-/_}"
   echo "== cargo check --target $target $*"
+  # CI's workflow-level RUSTFLAGS=-Dwarnings (the windows-lib job too): a
+  # dead_code warning on another target fails CI (R11-S2-FIX1).
   if ! env "CC_$var=$STUB_DIR/cc" "AR_$var=ar" CARGO_TARGET_DIR="$TARGET_DIR" \
+    RUSTFLAGS="${CROSS_CHECK_RUSTFLAGS--Dwarnings}" \
     cargo check --manifest-path "$ROOT/Cargo.toml" --target "$target" "$@"; then
     echo "FAIL: cargo check --target $target $*" >&2
     failed=1
   fi
 }
 
-# The windows-lib CI crates plus compositing (CI checks it only through
-# ratarmount-session, and skips that step without libarchive).
-check x86_64-pc-windows-gnu -p ratarmount-core -p ratarmount-index \
-  -p ratarmount-formats-zip -p ratarmount-formats-tar -p ratarmount-compositing
+# The windows-lib CI gate, as CI runs it (warnings are errors), plus
+# compositing type-checked without -Dwarnings (CI checks it only through
+# ratarmount-session, and skips that step without libarchive; it still has
+# Windows-only unused-code warnings).
+check x86_64-pc-windows-gnu -p ratarmount-core -p ratarmount-index --all-targets
+check x86_64-pc-windows-gnu -p ratarmount-formats-zip -p ratarmount-formats-tar --all-targets
+CROSS_CHECK_RUSTFLAGS="" check x86_64-pc-windows-gnu -p ratarmount-compositing
 check aarch64-apple-darwin -p ratarmount-core -p ratarmount-index -p ratarmount-compositing \
   -p ratarmount-formats-tar --all-targets
 
