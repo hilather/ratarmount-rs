@@ -761,6 +761,18 @@ pub(crate) fn open_lookup_connection(path: &Path) -> rusqlite::Result<Connection
     snapshot_connection(&absolute)
 }
 
+/// Write a consistent copy of the index at `path` to `dest` (which must not
+/// exist) with `VACUUM INTO`, through the same no-side-file read-only open as
+/// a lookup ([`open_lookup_connection`]). For a caller that ships the index
+/// (`overlay pack --include-index`): reading the live file through a
+/// descriptor of its own would, on close, release every fcntl lock this
+/// process holds on it, a session's included.
+pub fn snapshot_index_into(path: &Path, dest: &Path) -> rusqlite::Result<()> {
+    let conn = open_lookup_connection(path)?;
+    conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
+    Ok(())
+}
+
 /// Copy the index and its existing companions into a private temporary
 /// directory and open the copy (read-write there: recovery of a hot journal
 /// and creation of `-shm` happen on the copy).

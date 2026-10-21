@@ -1228,7 +1228,11 @@ files, publishes the completed bundle atomically, and prints `layer_digest`.
 Packing the same layer with the same optional inputs produces identical bytes.
 Paths are sorted, archive uid/gid are zero, and layer modes, mtimes and symlink
 targets are preserved. File content is streamed; symlinks are never followed.
-In-use markers and COW/spool temporary files are excluded.
+In-use markers and COW/spool temporary files are excluded. The database member
+and the optional index are copies SQLite writes (`VACUUM INTO`) in a private
+staging directory, never the live files read directly (closing such a read
+would release this process's SQLite locks on them, #156): their rows are the
+layer's and the sidecar's, their bytes need not be.
 
 The ordinary TAR layout is:
 
