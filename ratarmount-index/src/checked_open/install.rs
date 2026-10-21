@@ -743,6 +743,9 @@ mod imp {
         /// Regression: the constructor of this (single-threaded at load time)
         /// test binary must install the wrappers; SQLite's `open`/`stat` slots
         /// then hold the pass-throughs and an ordinary database still works.
+        /// Needs a single-threaded start before `main`: under an `LD_PRELOAD`
+        /// that starts threads, or ThreadSanitizer, the constructor correctly
+        /// abstains and this test fails.
         #[test]
         fn regression_sqlite_hook_installed_with_one_thread() {
             assert_eq!(
@@ -928,11 +931,11 @@ mod imp {
                     return;
                 }
             };
-            let in_libc = [
-                libc::qsort as *const () as usize,
-                libc::free as *const () as usize,
-                libc::malloc as *const () as usize,
-            ];
+            // One address for all three methods: only the image matters, and
+            // Darwin's `free`/`malloc` live in libsystem_malloc, not in
+            // `qsort`'s libsystem_c (r11 S1 skeptic P2).
+            let qsort = libc::qsort as *const () as usize;
+            let in_libc = [qsort; 3];
             let all_libc = fake_vfs(in_libc);
             let vfs = |v: &ffi::sqlite3_vfs| (v as *const _ as *mut ffi::sqlite3_vfs, UNIX_METHODS);
             assert_eq!(
@@ -1569,7 +1572,9 @@ mod tests {
     /// call (or rusqlite's `config_log`, which calls it) would fail at run
     /// time, and a `sqlite3_shutdown` would discard the installed hooks'
     /// contract (`install_private_instance`'s safety section). No workspace
-    /// source may call any of them.
+    /// source may call any of them. Limit: only workspace `.rs` sources are
+    /// scanned; a dependency calling `sqlite3_config` would show up only as a
+    /// run-time `SQLITE_MISUSE`.
     #[test]
     fn regression_no_sqlite_config_after_constructor() {
         let needles = [

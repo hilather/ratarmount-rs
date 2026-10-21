@@ -40,9 +40,19 @@ fn text(f: impl FnOnce(*mut u8, usize) -> usize) -> String {
 /// constructor must abstain; a module anchor in the executable or in libc
 /// must be refused without poisoning; the real private initializer must then install
 /// (`PrivateInstance`), change SQLite's `"open"` slot, keep databases
-/// working and return the same terminal result on a second call.
+/// working and return the same terminal result on a second call. Needs a
+/// readable thread count (else `skip:`).
+///
+/// Regression (r11 S1 fix skeptic P2): a statically linked target (GNU
+/// `+crt-static`, default musl) builds no `cdylib`, so this test panicked on
+/// the missing fixture; it skips there, and the installer's own tests keep
+/// the static coverage.
 #[test]
 fn regression_dso_private_instance_installs_after_abstention() {
+    if cfg!(target_feature = "crt-static") {
+        eprintln!("skip: statically linked target builds no cdylib fixture");
+        return;
+    }
     let Some(path) = fixture_path() else {
         panic!(
             "the fixture shared object was not built beside {:?}",
