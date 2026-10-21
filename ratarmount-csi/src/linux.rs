@@ -232,14 +232,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| s.starts_with('/'))
         .ok_or("endpoint must be unix:///absolute/path")?;
     ratarmount_csi::options::validate_target(socket)?;
+    let path = std::path::Path::new(socket);
+    // Refuse an unbindable endpoint before Driver::open creates --state-dir (#185).
+    socket_path_fits(path)?;
     let mounter = Arc::new(ProcessMounter::new(
         args.ratarmount,
         args.overlay_root,
         Duration::from_secs(args.mount_timeout_seconds),
     ));
     let driver = Driver::open(args.node_id, &args.state_dir, &args.target_root, mounter).await?;
-    let path = std::path::Path::new(socket);
-    socket_path_fits(path)?;
     std::fs::create_dir_all(path.parent().ok_or("socket has no parent")?)?;
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if !meta.file_type().is_socket() {

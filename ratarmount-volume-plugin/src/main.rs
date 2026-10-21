@@ -224,8 +224,12 @@ mod linux {
         Ok(listener)
     }
 
+    fn socket_activated() -> bool {
+        env::var("LISTEN_PID").ok().as_deref() == Some(&std::process::id().to_string())
+    }
+
     fn listener(path: &Path) -> io::Result<UnixListener> {
-        if env::var("LISTEN_PID").ok().as_deref() == Some(&std::process::id().to_string()) {
+        if socket_activated() {
             if env::var("LISTEN_FDS").ok().as_deref() != Some("1") {
                 return Err(io::Error::other("expected exactly one systemd socket"));
             }
@@ -274,6 +278,11 @@ mod linux {
 
     pub fn run() -> Result<(), String> {
         let args = Args::parse();
+        // Refuse an unbindable socket before Driver::open creates --state-dir (#185).
+        if !socket_activated() {
+            socket_path_fits(&args.socket)
+                .map_err(|e| format!("cannot open plugin socket: {e}"))?;
+        }
         let driver = Arc::new(Mutex::new(Driver::open(
             &args.state_dir,
             ProcessMounter::new(args.ratarmount, Duration::from_secs(args.mount_timeout)),

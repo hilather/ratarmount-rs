@@ -112,35 +112,39 @@ async fn regression_identity_and_node_rpc_over_unix_socket() {
     driver.shutdown().await.unwrap();
 }
 
-/// Regression #185: an over-long endpoint under missing parents exits 1 and
-/// leaves no parent directories behind (the state dir is still created first).
+/// Regression #185: an over-long endpoint exits 1 before creating any directory:
+/// neither the socket's missing parents nor a fresh `--state-dir`, including a
+/// state dir that shares the socket's missing ancestor.
 #[tokio::test]
 async fn regression_185_too_long_endpoint_creates_no_parent_dirs() {
     let dir = tempfile::tempdir().unwrap();
     let absent = dir.path().join("absent");
     let socket = absent.join("n1").join("n2").join("s".repeat(120));
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_ratarmount-csi"))
-        .env("NODE_ID", "n")
-        .arg("--endpoint")
-        .arg(format!("unix://{}", socket.display()))
-        .arg("--state-dir")
-        .arg(dir.path().join("state"))
-        .arg("--target-root")
-        .arg(dir.path())
-        .arg("--ratarmount")
-        .arg("/bin/false")
-        .stdout(std::process::Stdio::null())
-        .output()
-        .await
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("107-byte sun_path limit"), "{stderr}");
-    assert!(
-        !absent.exists(),
-        "parent dirs left behind: {}",
-        absent.display()
-    );
+    for state in [dir.path().join("state"), absent.join("state")] {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_ratarmount-csi"))
+            .env("NODE_ID", "n")
+            .arg("--endpoint")
+            .arg(format!("unix://{}", socket.display()))
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("--target-root")
+            .arg(dir.path())
+            .arg("--ratarmount")
+            .arg("/bin/false")
+            .stdout(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("107-byte sun_path limit"), "{stderr}");
+        assert!(!state.exists(), "state dir created: {}", state.display());
+        assert!(
+            !absent.exists(),
+            "parent dirs left behind: {}",
+            absent.display()
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
