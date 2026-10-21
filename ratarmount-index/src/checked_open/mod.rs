@@ -52,8 +52,19 @@ mod host;
 )]
 mod install;
 
+/// Thread-local seams inside the acquisition, for other crates' tests
+/// (`test-hooks` feature; never in a normal build).
+#[cfg(all(
+    feature = "test-hooks",
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+))]
+pub use acquire::imp::seams as test_seams;
 pub use acquire::{
-    open_checked, AcquireError, Acquired, DbId, Expect, NameMode, Refusal, Verification,
+    immutable_uri, open_checked, AcquireError, Acquired, DbId, Expect, NameMode, Refusal,
+    Verification,
 };
 pub use host::{HostFailure, ImageIdentity};
 pub use install::{

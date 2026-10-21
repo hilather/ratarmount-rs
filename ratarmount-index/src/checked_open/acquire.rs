@@ -25,11 +25,17 @@
 //! opened (a chroot without device nodes) the fill does nothing and that
 //! policy is the only defense.
 //!
-//! This slice requires an absolute path in [`NameMode::Path`]; URI closure and
-//! [`NameMode::Immutable`] arrive with design §6.
+//! Names (design §6): a relative path is made absolute (its final symlink is
+//! not resolved). That is what keeps SQLite's URI syntax out: libsqlite3-sys
+//! compiles `SQLITE_USE_URI`, so SQLite parses EVERY name that starts with
+//! `file:` as a URI (whose `vfs=` would override the pinned VFS and whose
+//! `modeof=` would `stat` another path inside the armed window), whether or
+//! not the caller's flags carry `SQLITE_OPEN_URI`; a name starting with `/`
+//! never does. [`NameMode::Immutable`] is the only URI: built here from the
+//! absolute path, every byte outside `[A-Za-z0-9/._~-]` percent-encoded.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -54,8 +60,8 @@ pub enum Expect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameMode {
     Path,
-    /// Read-only `immutable=1` URI built by this module (design §6; refused
-    /// with [`AcquireError::InvalidRequest`] until then).
+    /// `file:<percent-encoded absolute path>?mode=ro&immutable=1`, built by
+    /// this module. The flags must be read-only, without `SQLITE_OPEN_CREATE`.
     Immutable,
 }
 
@@ -393,35 +399,74 @@ pub(crate) fn decide(
     }
 }
 
-/// Validate the request (before anything is armed) and return SQLite's flags.
-pub(crate) fn request_flags(
+/// The `file:` URI of [`NameMode::Immutable`] for the absolute `path`.
+pub fn immutable_uri(path: &Path) -> String {
+    use std::fmt::Write;
+    let mut uri = String::from("file:");
+    for byte in path.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(byte) {
+            uri.push(*byte as char);
+        } else {
+            write!(&mut uri, "%{byte:02X}").expect("write URI");
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    uri
+}
+
+/// Validate the request (before anything is armed): the name SQLite gets
+/// (see the module docs) and its flags.
+pub(crate) fn request(
     path: &Path,
     flags: OpenFlags,
     mode: NameMode,
     expect: Expect,
-) -> Result<OpenFlags, AcquireError> {
-    if mode == NameMode::Immutable {
-        return Err(AcquireError::InvalidRequest(
-            "immutable checked opens are not implemented yet",
-        ));
-    }
-    // A leading `/` can never be parsed as a `file:` URI, whatever
-    // SQLITE_OPEN_URI says (libsqlite3-sys compiles SQLITE_USE_URI).
-    if !path.is_absolute() {
-        return Err(AcquireError::InvalidRequest("the path must be absolute"));
-    }
+) -> Result<Request, AcquireError> {
     if flags.intersects(OpenFlags::SQLITE_OPEN_MEMORY | OpenFlags::SQLITE_OPEN_SHARED_CACHE) {
         return Err(AcquireError::InvalidRequest(
             "memory and shared-cache databases bypass the acquisition evidence",
         ));
     }
+    if mode == NameMode::Immutable
+        && (flags.intersects(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)
+            || !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY))
+    {
+        return Err(AcquireError::InvalidRequest(
+            "an immutable open must be read-only, without SQLITE_OPEN_CREATE",
+        ));
+    }
+    // Not canonicalized: the final component may be a symlink SQLite follows
+    // (or refuses under SQLITE_OPEN_NOFOLLOW) itself.
+    let path = std::path::absolute(path)
+        .map_err(|_| AcquireError::InvalidRequest("the path cannot be made absolute"))?;
+    // Stripping SQLITE_OPEN_URI does not stop URI parsing (see the module
+    // docs); the absolute name does. It is only added back for the URI built
+    // here.
     let mut flags = (flags - OpenFlags::SQLITE_OPEN_URI) | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
     // An existing file that vanished must not be created anew (and then
     // refused and retained as a 0-byte file).
     if matches!(expect, Expect::Existing { .. }) {
         flags -= OpenFlags::SQLITE_OPEN_CREATE;
     }
-    Ok(flags)
+    let name = match mode {
+        NameMode::Path => path.clone(),
+        NameMode::Immutable => {
+            flags |= OpenFlags::SQLITE_OPEN_URI;
+            PathBuf::from(immutable_uri(&path))
+        }
+    };
+    Ok(Request { path, name, flags })
+}
+
+/// A validated request.
+#[derive(Debug)]
+pub(crate) struct Request {
+    /// The absolute path of the database.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) path: PathBuf,
+    /// What SQLite gets: `path`, or the immutable URI.
+    pub(crate) name: PathBuf,
+    pub(crate) flags: OpenFlags,
 }
 
 /// Open `path` and prove which inode SQLite acquired.
@@ -435,11 +480,61 @@ pub fn open_checked(
         error,
         retained_fd: None,
     };
-    if let Err(status) = super::install::installed() {
-        return Err(refuse(AcquireError::Unavailable(status)));
+    let request = request(path, flags, mode, expect).map_err(refuse)?;
+    #[cfg(windows)]
+    return windows::open(&request, expect);
+    #[cfg(not(windows))]
+    {
+        if let Err(status) = super::install::installed() {
+            return Err(refuse(AcquireError::Unavailable(status)));
+        }
+        imp::open(&request.name, request.flags, expect)
     }
-    let flags = request_flags(path, flags, mode, expect).map_err(refuse)?;
-    imp::open(path, flags, expect)
+}
+
+/// Windows (design §9): no syscall hook, so pathname type checks before and
+/// after the open, and no identity ([`Verification::WindowsPathTypeOnly`]).
+#[cfg(windows)]
+mod windows {
+    use rusqlite::Connection;
+
+    use super::{AcquireError, Acquired, Expect, Refusal, Request, Verification};
+
+    fn check(request: &Request, expect: Expect, after: bool) -> Result<(), AcquireError> {
+        match std::fs::metadata(&request.path) {
+            Ok(m) if !m.is_file() => Err(AcquireError::NotRegular { mode: 0 }),
+            Ok(m) => match expect {
+                Expect::Fresh if !after && m.len() > 0 => {
+                    Err(AcquireError::NotFresh { len: m.len() })
+                }
+                Expect::Existing {
+                    require_nonempty: true,
+                    ..
+                } if m.len() == 0 => Err(AcquireError::EmptyRecord),
+                _ => Ok(()),
+            },
+            // Missing before the open: SQLite creates it or fails itself.
+            Err(_) if !after => Ok(()),
+            Err(e) => Err(AcquireError::Fstat(e.raw_os_error().unwrap_or(0))),
+        }
+    }
+
+    pub(super) fn open(request: &Request, expect: Expect) -> Result<Acquired, Refusal> {
+        let refuse = |error| Refusal {
+            error,
+            retained_fd: None,
+        };
+        check(request, expect, false).map_err(refuse)?;
+        let conn = Connection::open_with_flags(&request.name, request.flags)
+            .map_err(|e| refuse(AcquireError::Sqlite(e)))?;
+        check(request, expect, true).map_err(refuse)?;
+        Ok(Acquired {
+            conn,
+            id: None,
+            verification: Verification::WindowsPathTypeOnly,
+            retained_low_fd: None,
+        })
+    }
 }
 
 #[cfg(all(
@@ -655,7 +750,7 @@ pub(crate) mod imp {
             return -1;
         }
         fill_low_descriptors();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         seams::fire(seams::Seam::AfterLowFdFill);
         let fd = unsafe { real(path, flags | libc::O_NONBLOCK, mode) };
         if fd < 0 {
@@ -663,7 +758,7 @@ pub(crate) mod imp {
             return fd;
         }
         a.opened = true;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         {
             let e = errno();
             seams::fire(seams::Seam::AfterRealOpen);
@@ -673,7 +768,7 @@ pub(crate) mod imp {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::fstat(fd, &mut st) };
         let fstat_errno = if rc == 0 { 0 } else { errno() };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let (rc, fstat_errno) = match seams::fstat_failure() {
             Some(e) => (-1, e),
             None => (rc, fstat_errno),
@@ -767,7 +862,7 @@ pub(crate) mod imp {
         if let Ok(Some(mut a)) = ARMED.try_with(|c| c.take()) {
             // SAFETY: the original filled `buf`.
             a.on_stat(seen(unsafe { &*buf }));
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             seams::fire(seams::Seam::AfterArmedStat(a.stats));
             let _ = ARMED.try_with(|c| c.set(Some(a)));
         }
@@ -787,13 +882,15 @@ pub(crate) mod imp {
     }
 
     /// Test seams: thread-local, so parallel tests never see each other's.
-    #[cfg(test)]
-    pub(crate) mod seams {
+    /// Other crates' tests reach them through the `test-hooks` feature
+    /// (`checked_open::test_seams`); a normal build has none.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub mod seams {
         use std::cell::{Cell, RefCell};
 
         #[allow(clippy::enum_variant_names)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub(crate) enum Seam {
+        pub enum Seam {
             /// In the `open` wrapper, after the low-descriptor fill.
             AfterLowFdFill,
             /// After SQLite's real database `open` succeeded.
@@ -823,14 +920,14 @@ pub(crate) mod imp {
         }
 
         /// Removes the seams of this thread when dropped.
-        pub(crate) struct Seams;
+        pub struct Seams;
 
         impl Seams {
-            pub(crate) fn set(hook: impl FnMut(Seam) + 'static) -> Self {
+            pub fn set(hook: impl FnMut(Seam) + 'static) -> Self {
                 HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
                 Self
             }
-            pub(crate) fn fail_fstat(self, errno: i32) -> Self {
+            pub fn fail_fstat(self, errno: i32) -> Self {
                 FSTAT.with(|c| c.set(Some(errno)));
                 self
             }

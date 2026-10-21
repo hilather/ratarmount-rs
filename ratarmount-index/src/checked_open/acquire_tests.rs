@@ -92,6 +92,11 @@ fn tempdir() -> (tempfile::TempDir, PathBuf) {
 /// Run `row` in a child of this test binary (watchdog: 60 s) and return
 /// what it wrote to its result file.
 fn run_child(row: &str, db: Option<&Path>) -> String {
+    run_child_in(row, db, None)
+}
+
+/// [`run_child`] with the child's working directory set to `cwd`.
+fn run_child_in(row: &str, db: Option<&Path>, cwd: Option<&Path>) -> String {
     let (_dir, dir) = tempdir();
     let result = dir.join("result");
     let mut cmd = Command::new(std::env::current_exe().unwrap());
@@ -105,6 +110,9 @@ fn run_child(row: &str, db: Option<&Path>) -> String {
     .env(RESULT_ENV, &result);
     if let Some(db) = db {
         cmd.env(DB_ENV, db);
+    }
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
     }
     let out_path = dir.join("out");
     let err_path = dir.join("err");
@@ -163,6 +171,7 @@ fn acquire_child() {
         r if r.starts_with("low:") => low_row(&r["low:".len()..]),
         "reenter" => reenter_row(),
         "rwretry" => rw_retry_row(),
+        "uri_relative" => uri_relative_row(),
         other => panic!("unknown row {other}"),
     };
     write_result(&format!("ok {detail}"));
@@ -1252,30 +1261,141 @@ fn regression_checked_open_invalid_requests() {
     let a = dir.join("a.sqlite");
     make_db(&a, 1);
     let e = existing(&a, true);
-    for (path, flags, mode) in [
-        (Path::new("a.sqlite"), RO, NameMode::Path),
-        (
-            a.as_path(),
-            RO | OpenFlags::SQLITE_OPEN_MEMORY,
-            NameMode::Path,
-        ),
-        (
-            a.as_path(),
-            RO | OpenFlags::SQLITE_OPEN_SHARED_CACHE,
-            NameMode::Path,
-        ),
-        (a.as_path(), RO, NameMode::Immutable),
+    for (flags, mode) in [
+        (RO | OpenFlags::SQLITE_OPEN_MEMORY, NameMode::Path),
+        (RO | OpenFlags::SQLITE_OPEN_SHARED_CACHE, NameMode::Path),
+        (RW, NameMode::Immutable),
+        (RO | OpenFlags::SQLITE_OPEN_CREATE, NameMode::Immutable),
+        (OpenFlags::default(), NameMode::Immutable),
     ] {
-        let refusal = open_checked(path, flags, mode, e).unwrap_err();
+        let refusal = open_checked(&a, flags, mode, e).unwrap_err();
         assert!(
             matches!(refusal.error, AcquireError::InvalidRequest(_)),
-            "{path:?} {flags:?} {mode:?}: {refusal}"
+            "{flags:?} {mode:?}: {refusal}"
         );
         assert_eq!(ArmGuard::peek(), None);
     }
     // SQLITE_OPEN_URI (part of `OpenFlags::default()`) is stripped.
     let got = open_checked(&a, OpenFlags::default(), NameMode::Path, e).unwrap();
     assert_eq!(got.id, Some(id_of(&a)));
+}
+
+/// The pinned VFS's name on this target.
+fn want_vfs() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "unix-posix"
+    } else {
+        "unix"
+    }
+}
+
+/// Regression (#153, Fable r11 N1): a name with SQLite URI syntax opens the
+/// literal file through the pinned VFS. libsqlite3-sys compiles
+/// `SQLITE_USE_URI`, so stripping `SQLITE_OPEN_URI` alone does nothing: a
+/// relative `file:x?vfs=unix-none` would be parsed as a URI (VFS override),
+/// and a URI `modeof=` would `stat` another path inside the armed window.
+/// Absolute names (a relative one is made absolute) and the percent-encoded
+/// immutable URI keep every such name literal.
+#[test]
+fn regression_checked_open_uri_cannot_override_vfs() {
+    // Relative names, in a child whose working directory is a temp dir (the
+    // parent's must not change under parallel tests).
+    let (_t, cwd) = tempdir();
+    let got = run_child_in("uri_relative", None, Some(&cwd));
+    assert_eq!(got.trim(), "ok literal");
+
+    let (_t, dir) = tempdir();
+    let sub = dir.join("file:d");
+    std::fs::create_dir(&sub).unwrap();
+    for name in [
+        dir.join("a?vfs=unix-none"),
+        dir.join("b%3Fvfs=unix-none"),
+        dir.join("c#vfs=unix-none"),
+        sub.join("x?vfs=unix-none&mode=memory"),
+    ] {
+        make_db(&name, 1);
+        for flags in [RO, OpenFlags::default()] {
+            let got = open_checked(&name, flags, NameMode::Path, existing(&name, true))
+                .unwrap_or_else(|r| panic!("{name:?}: {r}"));
+            assert_eq!(got.id, Some(id_of(&name)), "{name:?}");
+            assert_eq!(vfs_name(&got.conn), want_vfs(), "{name:?}");
+            assert_eq!(count(&got.conn), 1, "{name:?}");
+        }
+    }
+
+    // A fresh database whose name carries `modeof=`: created literally, with
+    // the mode a plain name gets, not the mode of the `modeof` target.
+    let target = dir.join("target");
+    std::fs::write(&target, b"x").unwrap();
+    std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let plain = dir.join("plain.sqlite");
+    // (A `/` in the value would make it a directory path, so `target` is
+    // named relative to the working directory as SQLite would resolve it.)
+    let modeof = dir.join("m?modeof=target&vfs=unix-none");
+    for name in [&plain, &modeof] {
+        let got = open_checked(name, RWC, NameMode::Path, Expect::Fresh)
+            .unwrap_or_else(|r| panic!("{name:?}: {r}"));
+        assert_eq!(vfs_name(&got.conn), want_vfs());
+        assert_eq!(got.id, Some(id_of(name)));
+    }
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().mode() & 0o777;
+    assert_eq!(mode(&modeof), mode(&plain));
+
+    // The immutable URI encodes every reserved byte: the literal file opens,
+    // read-only.
+    let weird = dir.join("e?vfs=unix-none&modeof=x#y%41 z");
+    make_db(&weird, 7);
+    let got = open_checked(&weird, RO, NameMode::Immutable, existing(&weird, true)).unwrap();
+    assert_eq!(got.id, Some(id_of(&weird)));
+    assert_eq!(vfs_name(&got.conn), want_vfs());
+    assert_eq!(
+        got.conn
+            .query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    assert!(got.conn.execute_batch("INSERT INTO t VALUES (8)").is_err());
+    assert_eq!(
+        immutable_uri(&weird),
+        format!(
+            "file:{}/e%3Fvfs%3Dunix-none%26modeof%3Dx%23y%2541%20z?mode=ro&immutable=1",
+            dir.display()
+        )
+    );
+}
+
+/// The child half of [`regression_checked_open_uri_cannot_override_vfs`]:
+/// relative names under this process's working directory.
+fn uri_relative_row() -> String {
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let literal = cwd.join("file:x?vfs=unix-none");
+    make_db(&literal, 3);
+    let got = open_checked(
+        Path::new("file:x?vfs=unix-none"),
+        OpenFlags::default(),
+        NameMode::Path,
+        existing(&literal, true),
+    )
+    .unwrap();
+    assert_eq!(got.id, Some(id_of(&literal)));
+    assert_eq!(vfs_name(&got.conn), want_vfs());
+    assert_eq!(count(&got.conn), 1);
+    drop(got);
+    // `modeof=` names a file that exists; as a URI it would set the new
+    // database's mode (and be `stat`ed while armed). It is a literal name.
+    std::fs::write(cwd.join("target"), b"x").unwrap();
+    std::fs::set_permissions(
+        cwd.join("target"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    let relative = "file:y?modeof=target&vfs=unix-none";
+    let got = open_checked(Path::new(relative), RWC, NameMode::Path, Expect::Fresh).unwrap();
+    assert_eq!(vfs_name(&got.conn), want_vfs());
+    let created = cwd.join(relative);
+    assert_eq!(got.id, Some(id_of(&created)));
+    assert!(!cwd.join("y").exists());
+    "literal".into()
 }
 
 /// The VFS SQLite actually opened the main database with.
