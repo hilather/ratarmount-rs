@@ -1223,10 +1223,15 @@ fn regression_checked_open_sqlite_error_after_accepted_descriptor() {
 /// The native `struct stat` layout as SQLite's amalgamation sees it (its
 /// large-file defines first), from a C probe compiled and run at test time:
 /// `(size, align, st_dev, st_ino, st_mode, st_size)`. `None` without a C
-/// compiler (`CC`, else `cc`). Never in a build script: that would run in
+/// compiler (`CC`, split on whitespace so it may carry arguments, else `cc`).
+/// It compiles for the host, so under `--target` it is meaningful only when
+/// the target is the host (the only such catalog row). Never in a build script: that would run in
 /// every consumer build and break the stub-compiler cross-check (Fable nit 8).
 fn native_c_stat_layout(dir: &Path) -> Option<(usize, usize, usize, usize, usize, usize)> {
-    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let cc_line = std::env::var("CC").unwrap_or_default();
+    let mut words = cc_line.split_whitespace();
+    let cc = words.next().unwrap_or("cc").to_owned();
+    let cc_args: Vec<String> = words.map(str::to_owned).collect();
     let source = dir.join("stat_probe.c");
     let exe = dir.join("stat_probe");
     std::fs::write(
@@ -1245,6 +1250,7 @@ fn native_c_stat_layout(dir: &Path) -> Option<(usize, usize, usize, usize, usize
     )
     .unwrap();
     let built = Command::new(&cc)
+        .args(&cc_args)
         .arg("-std=c11")
         .arg("-o")
         .arg(&exe)

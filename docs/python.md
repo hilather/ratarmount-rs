@@ -202,7 +202,11 @@ the reason; nothing from the module is usable then. On Windows and other
 platforms the module imports, and checked opens refuse or use the Windows
 path-type check. A Rust program that embeds the rlib (`--features embedding`)
 gets only the load-time constructor; threads started before it loads leave
-checked opens refusing.
+checked opens refusing, and if that program also registers `_native` (for
+example through `wrap_pymodule!` or the inittab), its import raises the same
+`ImportError`. A wheel you build yourself from the sdist is not audited; the
+module's own check refuses only an image that itself exports
+`sqlite3_libversion`.
 
 `ratarmount_rs._native._checked_open_status()` is a diagnostic. It returns a
 dict with `installed`, `why` (`"SingleThread"` or `"PrivateInstance"`),

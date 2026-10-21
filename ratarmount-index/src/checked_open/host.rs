@@ -128,6 +128,10 @@ pub(crate) fn same_image_as(
 /// itself (a handle also searches the image's dependencies, whose exports are
 /// not its own). A conservative rejection check, not an export proof: the
 /// final-wheel export audit (`packaging/audit_native_exports.py`) is that.
+/// When the probe cannot look (`dladdr` fails, no file name, no
+/// `RTLD_NOLOAD` handle) `found` is `None` and the image is accepted. A wheel
+/// built locally from the sdist is never audited, so this one-symbol check is
+/// its only runtime evidence.
 pub(crate) fn refuse_exported_sqlite(
     lookup: &dyn Fn(usize) -> Lookup,
     image: ImageIdentity,
