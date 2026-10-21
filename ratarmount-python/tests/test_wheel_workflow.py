@@ -33,6 +33,9 @@ def test_regression_wheel_matrix_tests_installed_artifacts_without_publishing():
     # run somewhere; the default workspace build compiles no PyO3.
     embedding = "\n".join(step.get("run", "") for step in jobs["embedding"]["steps"])
     assert "cargo test -p ratarmount-python --features embedding" in embedding
+    # Regression (r11 S4 review nit 8): both non-default feature sets are linted.
+    assert "cargo clippy -p ratarmount-python --features embedding --all-targets -- -D warnings" in embedding
+    assert "cargo clippy -p ratarmount-python --features extension-module --lib -- -D warnings" in embedding
     assert jobs["test"]["needs"] == "wheels"
     test_steps = jobs["test"]["steps"]
     assert any(step.get("uses") == "actions/download-artifact@v4" for step in test_steps)

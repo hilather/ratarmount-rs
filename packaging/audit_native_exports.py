@@ -14,7 +14,8 @@ or an installed `_native` shared object):
 
 Linux: `nm -D --defined-only`. macOS: `nm -gU`, with the leading underscore
 removed. Exit status: 0 clean, 1 offending exports (each is printed),
-2 usage or tool errors.
+2 usage or tool errors (a self-test whose C compiler fails included; `CC`
+may carry arguments).
 
 Usage:
   audit_native_exports.py FILE...   (FILE: a .whl or a shared object)
@@ -23,6 +24,7 @@ Usage:
 Stdlib only; runs on Python 3.9.
 """
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -78,7 +80,9 @@ def parse_nm(output, macho):
     names = []
     for line in output.splitlines():
         fields = line.split()
-        if len(fields) < 2:
+        # A header line: "FILE:" or, for a universal (fat) Mach-O,
+        # "FILE (for architecture arm64):".
+        if len(fields) < 2 or line.rstrip().endswith(":"):
             continue
         name = fields[-1].split("@", 1)[0]
         if macho and name.startswith("_"):
@@ -139,6 +143,43 @@ def audit(path):
     return [(os.path.basename(path), o) for o in audit_object(path, ALLOWED)]
 
 
+def compiler_command(value):
+    """The compiler command line from `CC` (which may carry arguments)."""
+    return shlex.split(value) or ["cc"]
+
+
+def build(cc, tmp, name, symbols):
+    """A real shared object exporting exactly `symbols`. The export list is
+    explicit (an ELF version script or a Mach-O exported-symbols list), as a
+    cdylib's is, so linker-defined symbols (`_init`, `_end`, ...) that some
+    toolchains leave exported cannot fail the clean rows. A compiler failure
+    is an AuditError (exit status 2)."""
+    source = os.path.join(tmp, name + ".c")
+    with open(source, "w") as f:
+        for symbol in symbols:
+            f.write("int {}(void) {{ return 0; }}\n".format(symbol))
+    exports_file = os.path.join(tmp, name + ".exports")
+    with open(exports_file, "w") as f:
+        if sys.platform == "darwin":
+            f.write("".join("_{}\n".format(symbol) for symbol in symbols))
+        else:
+            f.write("{{ global: {} local: *; }};\n".format(
+                "".join("{}; ".format(symbol) for symbol in symbols)))
+    flag = ("-Wl,-exported_symbols_list," if sys.platform == "darwin"
+            else "-Wl,--version-script=") + exports_file
+    out = os.path.join(tmp, name)
+    command = cc + ["-shared", "-fPIC", flag, "-o", out, source]
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True)
+    except OSError as error:
+        raise AuditError("{}: {}".format(" ".join(command), error))
+    if result.returncode != 0:
+        raise AuditError("{}: exit {}: {}".format(
+            " ".join(command), result.returncode, result.stderr.strip()))
+    return out
+
+
 def self_test():
     """Verdict rows, then (with a C compiler) real shared objects and wheels.
     Returns a list of failure descriptions."""
@@ -159,20 +200,23 @@ def self_test():
           ["PyInit__native", "foo"])
     check("nm macho", parse_nm("0000 T _PyInit__native\n0001 T _sqlite3_malloc\n", True),
           ["PyInit__native", "sqlite3_malloc"])
+    check("nm fat", parse_nm(
+        "\n/x/_native.so (for architecture arm64):\n0000 T _PyInit__native\n"
+        "\n/x/_native.so (for architecture x86_64):\n0000 T _PyInit__native\n", True),
+        ["PyInit__native", "PyInit__native"])
+    check("cc words", compiler_command("gcc -m64"), ["gcc", "-m64"])
+    check("cc default", compiler_command(""), ["cc"])
+    try:
+        build([sys.executable, "-c", "import sys; sys.exit(1)"], tempfile.gettempdir(),
+              "_native.never.so", ["PyInit__native"])
+        failures.append("failing compiler: no AuditError")
+    except AuditError:
+        pass
 
-    cc = os.environ.get("CC") or shutil.which("cc")
-    if cc is None or shutil.which("nm") is None:
+    cc = compiler_command(os.environ.get("CC", ""))
+    if shutil.which(cc[0]) is None or shutil.which("nm") is None:
         print("skip: no C compiler or nm; real-object rows not run")
         return failures
-
-    def build(tmp, name, symbols):
-        source = os.path.join(tmp, name + ".c")
-        with open(source, "w") as f:
-            for symbol in symbols:
-                f.write("int {}(void) {{ return 0; }}\n".format(symbol))
-        out = os.path.join(tmp, name)
-        subprocess.check_call([cc, "-shared", "-fPIC", "-o", out, source])
-        return out
 
     def wheel(tmp, name, members):
         path = os.path.join(tmp, name)
@@ -182,13 +226,13 @@ def self_test():
         return path
 
     with tempfile.TemporaryDirectory() as tmp:
-        clean = build(tmp, "_native.clean.so", ["PyInit__native", "bz_internal_error"])
+        clean = build(cc, tmp, "_native.clean.so", ["PyInit__native", "bz_internal_error"])
         # A non-`libversion` SQLite export: the runtime own-handle probe looks
         # only for sqlite3_libversion, so this is what the audit adds.
-        leaky = build(tmp, "_native.leaky.so", ["PyInit__native", "sqlite3_vfs_find"])
-        extra = build(tmp, "_native.extra.so", ["PyInit__native", "ratarmount_extra"])
-        grafted = build(tmp, "libarchive.so.13", ["archive_read_new"])
-        grafted_sqlite = build(tmp, "libsqlite3.so.0", ["sqlite3_open_v2"])
+        leaky = build(cc, tmp, "_native.leaky.so", ["PyInit__native", "sqlite3_vfs_find"])
+        extra = build(cc, tmp, "_native.extra.so", ["PyInit__native", "ratarmount_extra"])
+        grafted = build(cc, tmp, "libarchive.so.13", ["archive_read_new"])
+        grafted_sqlite = build(cc, tmp, "libsqlite3.so.0", ["sqlite3_open_v2"])
         check("object clean", audit(clean), [])
         check("object leaky", audit(leaky),
               [("_native.leaky.so", "exports SQLite symbol sqlite3_vfs_find")])
@@ -212,7 +256,12 @@ def self_test():
 
 def main(argv):
     if argv == ["--self-test"]:
-        failures = self_test()
+        try:
+            failures = self_test()
+        except (AuditError, OSError, zipfile.BadZipFile) as error:
+            print("audit_native_exports self-test: tool error: {}".format(error),
+                  file=sys.stderr)
+            return 2
         for failure in failures:
             print("audit_native_exports self-test: " + failure, file=sys.stderr)
         if not failures:

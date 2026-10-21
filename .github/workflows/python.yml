@@ -86,11 +86,19 @@ jobs:
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system deps
         run: |
           sudo apt-get update -o Acquire::Retries=5
           sudo apt-get install -y -o Acquire::Retries=5 pkg-config libarchive-dev zlib1g-dev
+      - name: cargo clippy (embedding, extension-module)
+        # The workspace clippy uses default features and lints neither the
+        # embedding tests nor the extension-module initializer.
+        run: |
+          cargo clippy -p ratarmount-python --features embedding --all-targets -- -D warnings
+          cargo clippy -p ratarmount-python --features extension-module --lib -- -D warnings
       - name: cargo test --features embedding
         # The test binary links libpython (auto-initialize); point the loader at it.
         env:
