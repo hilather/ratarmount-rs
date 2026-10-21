@@ -32,6 +32,9 @@ pub enum HostFailure {
     MainExecutable { what: &'static str },
     /// The address is in a different image than the first anchor.
     ImageMismatch { what: &'static str },
+    /// The proof image's own handle resolves `sqlite3_libversion` to itself:
+    /// its SQLite is exported, so not private (design §4, "Symbol privacy").
+    SqliteExported,
 }
 
 impl fmt::Display for HostFailure {
@@ -44,6 +47,7 @@ impl fmt::Display for HostFailure {
             Self::ImageMismatch { what } => {
                 write!(f, "{what} is in another image than the constructor")
             }
+            Self::SqliteExported => write!(f, "the image exports sqlite3_libversion"),
         }
     }
 }
@@ -116,6 +120,52 @@ pub(crate) fn same_image_as(
         }
     }
     Ok(())
+}
+
+/// The own-handle export probe of design §4 ("Symbol privacy"): `found` is
+/// what `dlsym` on the proof image's own handle returned for
+/// `sqlite3_libversion`. Refuse only when that symbol is defined in the image
+/// itself (a handle also searches the image's dependencies, whose exports are
+/// not its own). A conservative rejection check, not an export proof: the
+/// final-wheel export audit (`packaging/audit_native_exports.py`) is that.
+pub(crate) fn refuse_exported_sqlite(
+    lookup: &dyn Fn(usize) -> Lookup,
+    image: ImageIdentity,
+    found: Option<usize>,
+) -> Result<(), HostFailure> {
+    match found.map(lookup) {
+        Some(Lookup::Found(owner)) if owner.id == image.id => Err(HostFailure::SqliteExported),
+        _ => Ok(()),
+    }
+}
+
+/// `dlsym(name)` through the own handle of the image containing `anchor`
+/// (`dladdr`, then `dlopen(RTLD_NOLOAD)`, which loads nothing). `None` when
+/// the image has no handle or the name resolves nowhere.
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+pub(crate) fn own_handle_symbol(anchor: usize, name: &std::ffi::CStr) -> Option<usize> {
+    // SAFETY: `Dl_info` is plain data; `dladdr` fills it or returns 0. The
+    // handle from `dlopen(RTLD_NOLOAD)` refers to an already loaded image and
+    // is released with `dlclose` after the lookup.
+    unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(anchor as *const libc::c_void, &mut info) == 0 || info.dli_fname.is_null() {
+            return None;
+        }
+        let handle = libc::dlopen(info.dli_fname, libc::RTLD_LAZY | libc::RTLD_NOLOAD);
+        if handle.is_null() {
+            return None;
+        }
+        let found = libc::dlsym(handle, name.as_ptr());
+        libc::dlclose(handle);
+        (!found.is_null()).then_some(found as usize)
+    }
+}
+
+/// Every other platform: no loader, nothing found.
+#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
+pub(crate) fn own_handle_symbol(_anchor: usize, _name: &std::ffi::CStr) -> Option<usize> {
+    None
 }
 
 /// Linux: the unique image with a `PT_LOAD` segment containing `addr`; the
@@ -395,6 +445,67 @@ mod tests {
                     })
                 );
             }
+        }
+    }
+
+    /// Regression (#151, design §4 "Symbol privacy"): the private-instance
+    /// proof must refuse an image whose own handle resolves
+    /// `sqlite3_libversion` to itself (its SQLite is exported, so another
+    /// library may already call it), and must not refuse because a dependency
+    /// of the image exports one. Catalog rows, then the real `dlopen`
+    /// (`RTLD_NOLOAD`) / `dlsym` probe on libc, which does export its own
+    /// `qsort` and no `sqlite3_libversion`. The fixture DSO test runs the probe
+    /// on an image that must pass.
+    #[test]
+    fn regression_private_proof_refuses_exported_sqlite() {
+        assert_eq!(refuse_exported_sqlite(&catalog, LIB, None), Ok(()));
+        assert_eq!(
+            refuse_exported_sqlite(&catalog, LIB, Some(0x150)),
+            Err(HostFailure::SqliteExported)
+        );
+        for dependency in [0x250, 0x350, 0x450, 0x550, 0x950] {
+            assert_eq!(
+                refuse_exported_sqlite(&catalog, LIB, Some(dependency)),
+                Ok(()),
+                "{dependency:#x}"
+            );
+        }
+        assert_eq!(
+            HostFailure::SqliteExported.to_string(),
+            "the image exports sqlite3_libversion"
+        );
+
+        #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+        {
+            if cfg!(target_feature = "crt-static") {
+                eprintln!("skip: static libc has no own handle");
+                return;
+            }
+            let qsort = libc::qsort as *const () as usize;
+            let Lookup::Found(libc_image) = host_object(qsort) else {
+                panic!("libc's qsort is in no image");
+            };
+            let own = own_handle_symbol(qsort, c"qsort");
+            assert!(own.is_some(), "libc's own handle resolves qsort");
+            assert_eq!(
+                refuse_exported_sqlite(&host_object, libc_image, own),
+                Err(HostFailure::SqliteExported),
+                "an own export is seen through the real loader"
+            );
+            assert_eq!(
+                refuse_exported_sqlite(
+                    &host_object,
+                    libc_image,
+                    own_handle_symbol(qsort, c"sqlite3_libversion")
+                ),
+                Ok(())
+            );
+            let local = 0u8;
+            assert_eq!(
+                own_handle_symbol(&local as *const u8 as usize, c"qsort"),
+                None,
+                "an address in no image has no handle"
+            );
         }
     }
 }

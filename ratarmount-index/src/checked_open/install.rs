@@ -12,7 +12,10 @@ use std::sync::OnceLock;
 
 use rusqlite::ffi;
 
-use super::host::{host_object, same_private_image, HostFailure, ImageIdentity};
+use super::host::{
+    host_object, own_handle_symbol, refuse_exported_sqlite, same_private_image, HostFailure,
+    ImageIdentity,
+};
 
 /// What the load-time constructor saw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -430,7 +433,13 @@ pub(crate) fn private_proof(
             ffi::sqlite3_open_v2 as *const () as usize,
         ),
     ];
-    same_private_image(&host_object, &anchors)
+    let image = same_private_image(&host_object, &anchors)?;
+    refuse_exported_sqlite(
+        &host_object,
+        image,
+        own_handle_symbol(module_anchor as usize, c"sqlite3_libversion"),
+    )?;
+    Ok(image)
 }
 
 /// The installation state, once cells and wrappers of verified targets:
