@@ -59,6 +59,9 @@ pub enum InstallFailure {
     },
     /// The getter did not return the pointer just set.
     Verify(&'static str),
+    /// An earlier installation attempt already published other original
+    /// pointers than the ones now in the slots.
+    OriginalsDiffer,
     /// Private-instance path: a VFS method lives in another image.
     ForeignVfs(HostFailure),
     /// Undoing a partial installation failed for this syscall: the slot holds
@@ -91,6 +94,10 @@ impl fmt::Display for InstallFailure {
             Self::Verify(name) => {
                 write!(f, "SQLite's {name:?} system call did not take the wrapper")
             }
+            Self::OriginalsDiffer => write!(
+                f,
+                "SQLite's system calls differ from the originals an earlier install captured"
+            ),
             Self::ForeignVfs(host) => write!(f, "SQLite VFS method check: {host}"),
             Self::RestoreFailed(name) => {
                 write!(
@@ -252,7 +259,7 @@ pub(crate) fn install_overrides(
     let saved = *originals.get_or_init(|| Originals { open, stat });
     if saved.open as usize != open as usize || saved.stat as usize != stat as usize {
         // Another installation already published different originals.
-        return Err(InstallFailure::Verify("originals"));
+        return Err(InstallFailure::OriginalsDiffer);
     }
     let slots: [(&CStr, &'static str, ErasedFn, ErasedFn); 2] = [
         (c"open", "open", open, open_hook),
@@ -430,7 +437,7 @@ mod imp {
 
     use rusqlite::ffi;
 
-    use super::super::host::{host_object, same_private_image, HostFailure, ImageIdentity};
+    use super::super::host::{host_object, same_image_as, HostFailure, ImageIdentity, Lookup};
     use super::{
         install_overrides, private_proof, thread_count, CtorObservation, ErasedFn, InstallFailure,
         InstallState, InstallStatus, InstallWhy, Originals, SyscallPtr, SyscallTable, Witness,
@@ -563,6 +570,55 @@ mod imp {
         Ok(vfs)
     }
 
+    /// Method labels of each VFS whose image the private path checks.
+    pub(super) type MethodLabels = [&'static str; 3];
+    pub(super) const UNIX_METHODS: MethodLabels =
+        ["unix xOpen", "unix xSetSystemCall", "unix xGetSystemCall"];
+    #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+    pub(super) const POSIX_METHODS: MethodLabels = [
+        "unix-posix xOpen",
+        "unix-posix xSetSystemCall",
+        "unix-posix xGetSystemCall",
+    ];
+
+    /// The VFSes whose methods serve checked opens: `"unix"`, whose syscall
+    /// table is set, and on macOS the selected `"unix-posix"` (design §6).
+    pub(super) fn selected_vfses(
+        unix: *mut ffi::sqlite3_vfs,
+    ) -> Result<Vec<(*mut ffi::sqlite3_vfs, MethodLabels)>, InstallFailure> {
+        #[allow(unused_mut)]
+        let mut vfses = vec![(unix, UNIX_METHODS)];
+        #[cfg(target_os = "macos")]
+        vfses.push((find_vfs(c"unix-posix", "unix-posix")?, POSIX_METHODS));
+        Ok(vfses)
+    }
+
+    /// Design §4: `xOpen`, `xSetSystemCall` and `xGetSystemCall` of every
+    /// selected VFS live in the proof's image.
+    ///
+    /// # Safety
+    ///
+    /// Every VFS passed the version-3 gate ([`check_vfs`]).
+    pub(super) unsafe fn vfs_methods_in_image(
+        lookup: &dyn Fn(usize) -> Lookup,
+        image: ImageIdentity,
+        vfses: &[(*mut ffi::sqlite3_vfs, MethodLabels)],
+    ) -> Result<(), HostFailure> {
+        for &(vfs, labels) in vfses {
+            let v = unsafe { &*vfs };
+            same_image_as(
+                lookup,
+                image,
+                &[
+                    (labels[0], v.xOpen.map_or(0, |f| f as usize)),
+                    (labels[1], v.xSetSystemCall.map_or(0, |f| f as usize)),
+                    (labels[2], v.xGetSystemCall.map_or(0, |f| f as usize)),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     /// The real installer (design §3 steps 1-7). `image`: the private-instance
     /// proof, whose image must also own the selected VFS's methods.
     pub(super) fn install_real(
@@ -576,10 +632,17 @@ mod imp {
             return Err(InstallFailure::SqliteInitialize(rc));
         }
         let unix = find_vfs(c"unix", "unix")?;
+        let vfses = selected_vfses(unix)?;
+        // The selected VFS's methods are checked before any of them is called.
+        if let Some(image) = image {
+            // SAFETY: every entry passed `find_vfs`.
+            unsafe { vfs_methods_in_image(&host_object, image, &vfses) }
+                .map_err(InstallFailure::ForeignVfs)?;
+        }
         let table = VfsTable(unix);
         #[cfg(target_os = "macos")]
         {
-            let posix = find_vfs(c"unix-posix", "unix-posix")?;
+            let posix = vfses[1].0;
             let (u, p) = unsafe { (&*unix, &*posix) };
             let same = |a: Option<usize>, b: Option<usize>| a.is_some() && a == b;
             let posix_table = VfsTable(posix);
@@ -593,24 +656,6 @@ mod imp {
                 || super::addr(table.get(c"stat")) != super::addr(posix_table.get(c"stat"))
             {
                 return Err(InstallFailure::VfsSyscallsDiffer);
-            }
-        }
-        if let Some(image) = image {
-            let v = unsafe { &*unix };
-            let anchors = [
-                ("constructor", ctor_anchor()),
-                ("xOpen", v.xOpen.map_or(0, |f| f as usize)),
-                ("xSetSystemCall", v.xSetSystemCall.map_or(0, |f| f as usize)),
-                ("xGetSystemCall", v.xGetSystemCall.map_or(0, |f| f as usize)),
-            ];
-            match same_private_image(&host_object, &anchors) {
-                Ok(found) if found.id == image.id => {}
-                Ok(_) => {
-                    return Err(InstallFailure::ForeignVfs(HostFailure::ImageMismatch {
-                        what: "constructor",
-                    }))
-                }
-                Err(host) => return Err(InstallFailure::ForeignVfs(host)),
             }
         }
         install_overrides(
@@ -752,6 +797,138 @@ mod imp {
             // The real VFS passes the same gate.
             let unix = unsafe { ffi::sqlite3_vfs_find(c"unix".as_ptr()) };
             assert_eq!(unsafe { check_vfs(unix, "unix") }, Ok(unix));
+        }
+
+        /// A zeroed version-3 VFS whose three checked methods are `methods`
+        /// (addresses only; never called).
+        fn fake_vfs(methods: [usize; 3]) -> Box<ffi::sqlite3_vfs> {
+            // SAFETY: all-zero is a valid `sqlite3_vfs` (null pointers, `None`
+            // methods); each method is written as a non-null pointer value.
+            let mut vfs: Box<ffi::sqlite3_vfs> = Box::new(unsafe { std::mem::zeroed() });
+            vfs.iVersion = 3;
+            let p: *mut ffi::sqlite3_vfs = &mut *vfs;
+            unsafe {
+                std::ptr::addr_of_mut!((*p).xOpen)
+                    .cast::<usize>()
+                    .write(methods[0]);
+                std::ptr::addr_of_mut!((*p).xSetSystemCall)
+                    .cast::<usize>()
+                    .write(methods[1]);
+                std::ptr::addr_of_mut!((*p).xGetSystemCall)
+                    .cast::<usize>()
+                    .write(methods[2]);
+            }
+            vfs
+        }
+
+        /// Regression (r11 S1 review/skeptic P2): on macOS the private path
+        /// checked the image of `"unix"`'s `xOpen` although `"unix-posix"` is
+        /// the VFS that opens databases, so a `"unix-posix"` from another image
+        /// sharing unix's syscall methods passed. Every selected VFS's `xOpen`,
+        /// `xSetSystemCall` and `xGetSystemCall` must be in the proof's image,
+        /// and a refusal names the method. Catalog rows, the platform's
+        /// selected list, and the real loader.
+        #[test]
+        fn regression_install_foreign_vfs_method_refused() {
+            const LIB: ImageIdentity = ImageIdentity {
+                id: 0x1000,
+                main: false,
+            };
+            let catalog = |addr: usize| match addr >> 8 {
+                1 => Lookup::Found(LIB),
+                2 => Lookup::Found(ImageIdentity {
+                    id: 0x2000,
+                    main: false,
+                }),
+                3 => Lookup::Found(ImageIdentity {
+                    id: 0x3000,
+                    main: true,
+                }),
+                _ => Lookup::Unknown,
+            };
+            let unix = fake_vfs([0x101, 0x102, 0x103]);
+            let check = |posix_open: usize| {
+                let posix = fake_vfs([posix_open, 0x102, 0x103]);
+                let vfses = [
+                    (&*unix as *const _ as *mut ffi::sqlite3_vfs, UNIX_METHODS),
+                    (&*posix as *const _ as *mut ffi::sqlite3_vfs, POSIX_METHODS),
+                ];
+                unsafe { vfs_methods_in_image(&catalog, LIB, &vfses) }
+            };
+            assert_eq!(check(0x104), Ok(()));
+            assert_eq!(
+                check(0x201),
+                Err(HostFailure::ImageMismatch {
+                    what: "unix-posix xOpen"
+                })
+            );
+            assert_eq!(
+                check(0x301),
+                Err(HostFailure::MainExecutable {
+                    what: "unix-posix xOpen"
+                })
+            );
+            assert_eq!(
+                check(0x901),
+                Err(HostFailure::UnknownImage {
+                    what: "unix-posix xOpen"
+                })
+            );
+            assert_eq!(
+                InstallFailure::ForeignVfs(HostFailure::ImageMismatch {
+                    what: "unix-posix xOpen"
+                })
+                .to_string(),
+                "SQLite VFS method check: unix-posix xOpen is in another image than the constructor"
+            );
+
+            // The selected list: "unix-posix" on macOS (design §6), with "unix".
+            let real_unix = find_vfs(c"unix", "unix").unwrap();
+            let selected = selected_vfses(real_unix).unwrap();
+            assert_eq!(selected[0], (real_unix, UNIX_METHODS));
+            #[cfg(target_os = "macos")]
+            {
+                let posix = find_vfs(c"unix-posix", "unix-posix").unwrap();
+                assert_eq!(selected[1..], [(posix, POSIX_METHODS)]);
+            }
+            #[cfg(not(target_os = "macos"))]
+            assert_eq!(selected.len(), 1);
+
+            // The real loader, with libc as the "private" image.
+            let libc_image = match host_object(libc::qsort as *const () as usize) {
+                Lookup::Found(image) if !image.main => image,
+                other => {
+                    eprintln!("skip: libc linked statically ({other:?}); real-loader rows");
+                    return;
+                }
+            };
+            let in_libc = [
+                libc::qsort as *const () as usize,
+                libc::free as *const () as usize,
+                libc::malloc as *const () as usize,
+            ];
+            let all_libc = fake_vfs(in_libc);
+            let vfs = |v: &ffi::sqlite3_vfs| (v as *const _ as *mut ffi::sqlite3_vfs, UNIX_METHODS);
+            assert_eq!(
+                unsafe { vfs_methods_in_image(&host_object, libc_image, &[vfs(&all_libc)]) },
+                Ok(())
+            );
+            let exe_getter = fake_vfs([
+                in_libc[0],
+                in_libc[1],
+                regression_install_foreign_vfs_method_refused as *const () as usize,
+            ]);
+            assert_eq!(
+                unsafe { vfs_methods_in_image(&host_object, libc_image, &[vfs(&exe_getter)]) },
+                Err(HostFailure::MainExecutable {
+                    what: "unix xGetSystemCall"
+                })
+            );
+            // This executable's bundled SQLite is no method of libc's image.
+            assert_eq!(
+                unsafe { vfs_methods_in_image(&host_object, libc_image, &selected) },
+                Err(HostFailure::MainExecutable { what: "unix xOpen" })
+            );
         }
 
         const CHILD_ENV: &str = "RATARMOUNT_TEST_ABSTAIN_CHILD";

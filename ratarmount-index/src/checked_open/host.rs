@@ -86,6 +86,37 @@ pub(crate) fn same_private_image(
     })
 }
 
+#[cfg_attr(
+    not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    )),
+    allow(dead_code)
+)]
+/// Inside the private-instance installation: every `anchor` (the selected
+/// VFS's methods) resolves to `image`, the image the proof established. An
+/// error names the anchor that failed.
+pub(crate) fn same_image_as(
+    lookup: &dyn Fn(usize) -> Lookup,
+    image: ImageIdentity,
+    anchors: &[(&'static str, usize)],
+) -> Result<(), HostFailure> {
+    for &(what, addr) in anchors {
+        match lookup(addr) {
+            Lookup::Found(found) if found.main => return Err(HostFailure::MainExecutable { what }),
+            Lookup::Found(found) if found.id != image.id => {
+                return Err(HostFailure::ImageMismatch { what })
+            }
+            Lookup::Found(_) => {}
+            Lookup::Unknown => return Err(HostFailure::UnknownImage { what }),
+            Lookup::Ambiguous => return Err(HostFailure::Ambiguous { what }),
+            Lookup::Unavailable => return Err(HostFailure::LoaderUnavailable),
+        }
+    }
+    Ok(())
+}
+
 /// Linux: the unique image with a `PT_LOAD` segment containing `addr`; the
 /// main executable is the one whose program headers are `getauxval(AT_PHDR)`.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -180,7 +211,7 @@ pub(crate) fn host_object(addr: usize) -> Lookup {
     }
     Lookup::Found(ImageIdentity {
         id: info.dli_fbase as usize,
-        main: info.dli_fbase as usize == main as usize,
+        main: std::ptr::eq(info.dli_fbase.cast_const(), main.cast::<libc::c_void>()),
     })
 }
 
@@ -267,6 +298,21 @@ mod tests {
         for (addr, want) in rows {
             assert_eq!(
                 same_private_image(&catalog, &anchors(addr)),
+                Err(want),
+                "{addr:#x}"
+            );
+        }
+        // Inside the installation: each VFS method against the proof's image.
+        assert_eq!(same_image_as(&catalog, LIB, &[("xOpen", 0x101)]), Ok(()));
+        for (addr, want) in [
+            (0x201, HostFailure::ImageMismatch { what: "xOpen" }),
+            (0x301, HostFailure::MainExecutable { what: "xOpen" }),
+            (0x401, HostFailure::Ambiguous { what: "xOpen" }),
+            (0x501, HostFailure::LoaderUnavailable),
+            (0, HostFailure::UnknownImage { what: "xOpen" }),
+        ] {
+            assert_eq!(
+                same_image_as(&catalog, LIB, &[("xSetSystemCall", 0x102), ("xOpen", addr)]),
                 Err(want),
                 "{addr:#x}"
             );

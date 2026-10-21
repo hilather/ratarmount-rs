@@ -51,7 +51,7 @@ check() {
 # ratarmount-session, and skips that step without libarchive).
 check x86_64-pc-windows-gnu -p ratarmount-core -p ratarmount-index \
   -p ratarmount-formats-zip -p ratarmount-formats-tar -p ratarmount-compositing
-check aarch64-apple-darwin -p ratarmount-core -p ratarmount-compositing \
+check aarch64-apple-darwin -p ratarmount-core -p ratarmount-index -p ratarmount-compositing \
   -p ratarmount-formats-tar --all-targets
 
 exit "$failed"
