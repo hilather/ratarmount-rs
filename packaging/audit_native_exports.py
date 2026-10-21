@@ -206,12 +206,13 @@ def self_test():
         ["PyInit__native", "PyInit__native"])
     check("cc words", compiler_command("gcc -m64"), ["gcc", "-m64"])
     check("cc default", compiler_command(""), ["cc"])
-    try:
-        build([sys.executable, "-c", "import sys; sys.exit(1)"], tempfile.gettempdir(),
-              "_native.never.so", ["PyInit__native"])
-        failures.append("failing compiler: no AuditError")
-    except AuditError:
-        pass
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            build([sys.executable, "-c", "import sys; sys.exit(1)"], tmp,
+                  "_native.never.so", ["PyInit__native"])
+            failures.append("failing compiler: no AuditError")
+        except AuditError:
+            pass
 
     cc = compiler_command(os.environ.get("CC", ""))
     if shutil.which(cc[0]) is None or shutil.which("nm") is None:
