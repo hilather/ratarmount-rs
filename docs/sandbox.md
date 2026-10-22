@@ -1846,6 +1846,25 @@ refused, its read-only retry calls `open` again instead of reusing a parked
 descriptor (SQLite 3.46.0 and later reuse one), and the wrappers refuse that
 second `open` before it reaches the file.
 
+Before the Python wheel installs into its private SQLite on Linux, it reads
+every exported dynamic symbol of its own image and refuses on any `sqlite3*`
+name, or when it cannot read the symbol table completely; on macOS it checks
+only `sqlite3_libversion`. Neither check can see an entry point that other
+code obtained and handed out before the module finished initializing (for
+example from a dependency's initializer). Proving that for an arbitrary
+shared object is not possible from these observations (#192), so it stays the
+caller contract of the private-instance path.
+
+Every checked open first checks that SQLite's VFS (`"unix"`, and
+`"unix-posix"` on macOS) and its `open` and `stat` slots still hold what the
+installation left. If other code replaced them, the open refuses with
+`HooksReplaced` naming what changed, repairs nothing, and the installation
+status keeps reporting the original installation; restoring the exact state
+lets later opens proceed. This is a diagnostic: a replacement that is undone
+between two opens, or one made concurrently with an open, is not seen.
+Reconfiguring SQLite (`sqlite3_config`, `sqlite3_shutdown`, another VFS or
+syscall hook) after the installation remains unsupported.
+
 `ratarmount_rs._native._checked_open_status()` reports the installation in a
 Python process. Python's own `sqlite3` module and `_native` may be separate
 SQLite instances; opening one database file through both at once in one

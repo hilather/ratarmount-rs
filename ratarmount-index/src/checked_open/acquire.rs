@@ -488,6 +488,13 @@ pub fn open_checked(
         if let Err(status) = super::install::installed() {
             return Err(refuse(AcquireError::Unavailable(status)));
         }
+        // F6 (r11 S6): the VFS and the two syscall slots still hold what the
+        // installation left; checked before arming, never repaired.
+        if let Err(reason) = super::install::hooks_intact() {
+            return Err(refuse(AcquireError::Unavailable(
+                super::install::InstallStatus::HooksReplaced(reason),
+            )));
+        }
         imp::open(&request.name, request.flags, expect)
     }
 }
@@ -715,8 +722,15 @@ pub(crate) mod imp {
     /// Arms this thread; disarms on every exit.
     pub(crate) struct ArmGuard(());
 
+    /// How many acquisitions this process armed (tests: a refusal before
+    /// arming leaves it unchanged).
+    #[cfg(test)]
+    pub(crate) static ARMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
     impl ArmGuard {
         pub(crate) fn arm(expect: Expect) -> Result<Self, AcquireError> {
+            #[cfg(test)]
+            ARMS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let gone =
                 AcquireError::InvalidRequest("thread-local storage is gone (thread exiting)");
             let Ok(active) = ACTIVE.try_with(|c| c.replace(true)) else {

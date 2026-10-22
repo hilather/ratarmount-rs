@@ -130,6 +130,12 @@ pub enum InstallStatus {
     /// A Unix target whose `stat` layout and loader proof are not verified
     /// (32-bit, musl, BSDs, ...).
     UnsupportedAbi,
+    /// Acquisition only (r11 S6, F6): the installation succeeded, but the
+    /// selected VFS or one of the two syscall slots no longer holds what it
+    /// left (named here). Never stored: [`installed`] keeps reporting the
+    /// historical installation result. Nothing is repaired; restoring the
+    /// exact state lets later acquisitions proceed.
+    HooksReplaced(&'static str),
 }
 
 impl fmt::Display for InstallStatus {
@@ -162,6 +168,11 @@ impl fmt::Display for InstallStatus {
                     "checked SQLite opens are not verified for this target's ABI"
                 )
             }
+            Self::HooksReplaced(reason) => write!(
+                f,
+                "the SQLite system-call wrappers were installed, but {reason}; \
+                 something reconfigured SQLite after the installation"
+            ),
         }
     }
 }
@@ -532,6 +543,132 @@ mod imp {
 
     pub(super) static STATE: InstallState = InstallState::new();
     pub(super) static ORIGINALS: OnceLock<Originals> = OnceLock::new();
+    /// F6: the selected VFSes as the successful installation left them,
+    /// published before the installation result.
+    pub(super) static SNAPSHOT: OnceLock<Vec<VfsSnapshot>> = OnceLock::new();
+
+    /// Why [`check_hooks`] refused, per VFS.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Reasons {
+        missing: &'static str,
+        replaced: &'static str,
+        version: &'static str,
+        methods: &'static str,
+        open: &'static str,
+        stat: &'static str,
+    }
+
+    pub(super) const UNIX_REASONS: Reasons = Reasons {
+        missing: "the \"unix\" VFS is no longer registered",
+        replaced: "the \"unix\" VFS was replaced",
+        version: "the \"unix\" VFS changed its version",
+        methods: "a \"unix\" VFS method (xOpen, xSetSystemCall, xGetSystemCall) changed",
+        open: "the \"unix\" VFS's \"open\" system call was replaced",
+        stat: "the \"unix\" VFS's \"stat\" system call was replaced",
+    };
+    #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+    pub(super) const POSIX_REASONS: Reasons = Reasons {
+        missing: "the \"unix-posix\" VFS is no longer registered",
+        replaced: "the \"unix-posix\" VFS was replaced",
+        version: "the \"unix-posix\" VFS changed its version",
+        methods: "a \"unix-posix\" VFS method (xOpen, xSetSystemCall, xGetSystemCall) changed",
+        open: "the \"unix-posix\" VFS's \"open\" system call was replaced",
+        stat: "the \"unix-posix\" VFS's \"stat\" system call was replaced",
+    };
+
+    /// One selected VFS at installation: identity, version and the three
+    /// methods the installation relies on.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct VfsSnapshot {
+        pub(super) name: &'static CStr,
+        pub(super) reasons: &'static Reasons,
+        pub(super) vfs: usize,
+        pub(super) version: c_int,
+        pub(super) methods: [usize; 3],
+    }
+
+    /// The three methods of a VFS that passed the version-3 gate.
+    ///
+    /// # Safety
+    ///
+    /// `vfs` points to a live structure of SQLite's version-3 layout.
+    unsafe fn methods(vfs: *mut ffi::sqlite3_vfs) -> [usize; 3] {
+        let v = unsafe { &*vfs };
+        [
+            v.xOpen.map_or(0, |f| f as usize),
+            v.xSetSystemCall.map_or(0, |f| f as usize),
+            v.xGetSystemCall.map_or(0, |f| f as usize),
+        ]
+    }
+
+    /// F6 (r11 S6): every snapshotted VFS is still the registered one under
+    /// its name, with the same version and methods, and its `open`/`stat`
+    /// slots hold `hooks`. Identity and version are compared before any
+    /// version-3 field is read, and the methods before the getter is called;
+    /// a VFS whose identity changed is never dereferenced. A diagnostic under
+    /// the continuing contract (nothing reconfigures SQLite concurrently),
+    /// not synchronization: a replace-and-restore between two checks, or a
+    /// change after this one, is not seen.
+    ///
+    /// # Safety
+    ///
+    /// `find` returns null or a live registered VFS; a snapshot's VFS, when
+    /// `find` returns it, still has its version-3 layout (it is compared
+    /// first).
+    pub(super) unsafe fn check_hooks(
+        snaps: &[VfsSnapshot],
+        find: &dyn Fn(&CStr) -> *mut ffi::sqlite3_vfs,
+        hooks: [usize; 2],
+    ) -> Result<(), &'static str> {
+        for s in snaps {
+            let cur = find(s.name);
+            if cur.is_null() {
+                return Err(s.reasons.missing);
+            }
+            if cur as usize != s.vfs {
+                return Err(s.reasons.replaced);
+            }
+            // SAFETY: `iVersion` is the first field of every version.
+            let version = unsafe { std::ptr::addr_of!((*cur).iVersion).read() };
+            if version != s.version {
+                return Err(s.reasons.version);
+            }
+            // SAFETY: the same VFS with the same (>= 3) version as installed.
+            if unsafe { methods(cur) } != s.methods {
+                return Err(s.reasons.methods);
+            }
+            let table = VfsTable(cur);
+            if super::addr(table.get(c"open")) != hooks[0] {
+                return Err(s.reasons.open);
+            }
+            if super::addr(table.get(c"stat")) != hooks[1] {
+                return Err(s.reasons.stat);
+            }
+        }
+        Ok(())
+    }
+
+    /// The installed wrappers' addresses as SQLite's slots hold them.
+    fn hook_addrs() -> [usize; 2] {
+        [
+            erased::from_open(hook_open) as usize,
+            erased::from_stat(hook_stat) as usize,
+        ]
+    }
+
+    pub(super) fn hooks_intact() -> Result<(), &'static str> {
+        let snaps = SNAPSHOT
+            .get()
+            .ok_or("no snapshot of the installation was published")?;
+        let find = |name: &CStr| {
+            // SAFETY: SQLite is initialized (the installation ran); a
+            // registered VFS lives for the process.
+            unsafe { ffi::sqlite3_vfs_find(name.as_ptr()) }
+        };
+        // SAFETY: `find` is SQLite's own lookup; the snapshot passed the
+        // version-3 gate at installation.
+        unsafe { check_hooks(snaps, &find, hook_addrs()) }
+    }
 
     pub(super) use acquire::{RealOpen, RealStat};
 
@@ -747,6 +884,22 @@ mod imp {
             erased::from_open(hook_open),
             erased::from_stat(hook_stat),
         )?;
+        // F6: published before the caller stores the installation result.
+        let names: [(&'static CStr, &'static Reasons); 2] =
+            [(c"unix", &UNIX_REASONS), (c"unix-posix", &POSIX_REASONS)];
+        let snaps = vfses
+            .iter()
+            .zip(names)
+            .map(|(&(vfs, _), (name, reasons))| VfsSnapshot {
+                name,
+                reasons,
+                vfs: vfs as usize,
+                // SAFETY: every entry passed `find_vfs` (version >= 3).
+                version: unsafe { std::ptr::addr_of!((*vfs).iVersion).read() },
+                methods: unsafe { methods(vfs) },
+            })
+            .collect();
+        let _ = SNAPSHOT.set(snaps);
         Ok(Witness {
             why,
             threads_at_install: threads,
@@ -1076,6 +1229,239 @@ mod imp {
             );
         }
 
+        thread_local! {
+            /// The fake getter's `open` and `stat` slots.
+            static FAKE_SLOTS: std::cell::Cell<[usize; 2]> =
+                const { std::cell::Cell::new([0x501, 0x502]) };
+        }
+
+        unsafe extern "C" fn fake_get(
+            _vfs: *mut ffi::sqlite3_vfs,
+            name: *const c_char,
+        ) -> ffi::sqlite3_syscall_ptr {
+            let [open, stat] = FAKE_SLOTS.with(|s| s.get());
+            let name = unsafe { CStr::from_ptr(name) };
+            let addr = if name == c"open" { open } else { stat };
+            // SAFETY: only compared as an address, never called.
+            unsafe { std::mem::transmute::<usize, ffi::sqlite3_syscall_ptr>(addr) }
+        }
+
+        /// Regression (r11 S6, F6): an acquisition must not arm when the
+        /// selected VFS, its methods or a syscall slot no longer hold what
+        /// the installation left. Fake catalog: a VFS that is gone, replaced
+        /// (another structure under the name: never dereferenced), of
+        /// another version (compared before any version-3 field), with a
+        /// changed method, or with a replaced `open` or `stat`; each refusal
+        /// names the VFS (the macOS pair: `"unix-posix"` after `"unix"`).
+        #[test]
+        fn regression_hooks_intact_vfs_validation() {
+            let getter = fake_get as *const () as usize;
+            let unix = fake_vfs([0x101, 0x102, getter]);
+            let posix = fake_vfs([0x201, 0x102, getter]);
+            let snap = |vfs: &ffi::sqlite3_vfs, name, reasons| VfsSnapshot {
+                name,
+                reasons,
+                vfs: vfs as *const _ as usize,
+                version: 3,
+                methods: [vfs.xOpen.map_or(0, |f| f as usize), 0x102, getter],
+            };
+            let snaps = [
+                snap(&unix, c"unix", &UNIX_REASONS),
+                snap(&posix, c"unix-posix", &POSIX_REASONS),
+            ];
+            let hooks = [0x501, 0x502];
+            let ptr = |v: &ffi::sqlite3_vfs| v as *const _ as *mut ffi::sqlite3_vfs;
+            let catalog = |u: *mut ffi::sqlite3_vfs, p: *mut ffi::sqlite3_vfs| {
+                move |name: &CStr| if name == c"unix" { u } else { p }
+            };
+            let check = |find: &dyn Fn(&CStr) -> *mut ffi::sqlite3_vfs| unsafe {
+                check_hooks(&snaps, find, hooks)
+            };
+            assert_eq!(check(&catalog(ptr(&unix), ptr(&posix))), Ok(()));
+            assert_eq!(
+                check(&catalog(std::ptr::null_mut(), ptr(&posix))),
+                Err(UNIX_REASONS.missing)
+            );
+            assert_eq!(
+                check(&catalog(ptr(&unix), std::ptr::null_mut())),
+                Err(POSIX_REASONS.missing)
+            );
+            // Another structure under the name: refused on identity alone (its
+            // version is 0, which the check never reaches).
+            let other: Box<ffi::sqlite3_vfs> = Box::new(unsafe { std::mem::zeroed() });
+            assert_eq!(
+                check(&catalog(ptr(&other), ptr(&posix))),
+                Err(UNIX_REASONS.replaced)
+            );
+            let mut changed = fake_vfs([0x101, 0x102, getter]);
+            let mut snaps2 = snaps;
+            snaps2[0].vfs = ptr(&changed) as usize;
+            changed.iVersion = 2;
+            assert_eq!(
+                unsafe { check_hooks(&snaps2, &catalog(ptr(&changed), ptr(&posix)), hooks) },
+                Err(UNIX_REASONS.version)
+            );
+            changed.iVersion = 3;
+            assert_eq!(
+                unsafe { check_hooks(&snaps2, &catalog(ptr(&changed), ptr(&posix)), hooks) },
+                Ok(())
+            );
+            unsafe {
+                std::ptr::addr_of_mut!((*ptr(&changed)).xOpen)
+                    .cast::<usize>()
+                    .write(0x109)
+            };
+            assert_eq!(
+                unsafe { check_hooks(&snaps2, &catalog(ptr(&changed), ptr(&posix)), hooks) },
+                Err(UNIX_REASONS.methods)
+            );
+            for (slots, want) in [
+                ([0x509, 0x502], UNIX_REASONS.open),
+                ([0x501, 0x509], UNIX_REASONS.stat),
+                ([0x501, 0x502], ""),
+            ] {
+                FAKE_SLOTS.with(|s| s.set(slots));
+                let got = check(&catalog(ptr(&unix), ptr(&posix)));
+                if want.is_empty() {
+                    assert_eq!(got, Ok(()));
+                } else {
+                    assert_eq!(got, Err(want));
+                }
+            }
+            // The posix VFS is checked too: replace it alone.
+            let snaps_posix_only = [snaps[1]];
+            FAKE_SLOTS.with(|s| s.set([0x509, 0x502]));
+            let got =
+                unsafe { check_hooks(&snaps_posix_only, &catalog(ptr(&unix), ptr(&posix)), hooks) };
+            assert_eq!(got, Err(POSIX_REASONS.open));
+            assert!(POSIX_REASONS.open.contains("unix-posix"));
+            FAKE_SLOTS.with(|s| s.set([0x501, 0x502]));
+            // The real installation published its snapshot: the platform's
+            // selected VFSes, intact.
+            let real = SNAPSHOT.get().expect("snapshot");
+            let want: &[&CStr] = if cfg!(target_os = "macos") {
+                &[c"unix", c"unix-posix"]
+            } else {
+                &[c"unix"]
+            };
+            assert_eq!(real.iter().map(|s| s.name).collect::<Vec<_>>(), want);
+            assert_eq!(hooks_intact(), Ok(()));
+        }
+
+        const HOOKS_CHILD_ENV: &str = "RATARMOUNT_TEST_HOOKS_CHILD";
+
+        /// Child of `regression_hooks_replaced_refuses_before_arming`.
+        #[test]
+        fn hooks_child() {
+            use crate::checked_open::{open_checked, AcquireError, Expect, NameMode};
+            use std::sync::atomic::Ordering;
+            if std::env::var_os(HOOKS_CHILD_ENV).is_none() {
+                return;
+            }
+            let arms = || crate::checked_open::acquire::imp::ARMS.load(Ordering::SeqCst);
+            let installed = status();
+            assert!(
+                matches!(
+                    installed,
+                    Ok(Witness {
+                        why: InstallWhy::SingleThread,
+                        ..
+                    })
+                ),
+                "{installed:?}"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().canonicalize().unwrap().join("t.sqlite");
+            let open = || {
+                open_checked(
+                    &db,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                    NameMode::Path,
+                    Expect::Fresh,
+                )
+            };
+            let _ = std::fs::remove_file(&db);
+            assert!(open().is_ok());
+            let table = VfsTable(find_vfs(c"unix", "unix").unwrap());
+            let originals = *ORIGINALS.get().unwrap();
+            for (name, label, original, hook, reason) in [
+                (
+                    c"open",
+                    "open",
+                    originals.open,
+                    erased::from_open(hook_open),
+                    UNIX_REASONS.open,
+                ),
+                (
+                    c"stat",
+                    "stat",
+                    originals.stat,
+                    erased::from_stat(hook_stat),
+                    UNIX_REASONS.stat,
+                ),
+            ] {
+                // Another library sets the slot back to the original.
+                assert_eq!(table.set(name, Some(original)), ffi::SQLITE_OK, "{label}");
+                let before = arms();
+                let refusal = open().unwrap_err();
+                assert!(
+                    matches!(
+                        refusal.error,
+                        AcquireError::Unavailable(InstallStatus::HooksReplaced(r)) if r == reason
+                    ),
+                    "{label}: {refusal}"
+                );
+                assert!(
+                    refusal.to_string().contains("reconfigured SQLite"),
+                    "{refusal}"
+                );
+                assert_eq!(arms(), before, "{label}: refused before arming");
+                assert_eq!(
+                    super::super::addr(table.get(name)),
+                    original as usize,
+                    "no repair"
+                );
+                // The installation history is unchanged.
+                assert_eq!(status(), installed, "{label}");
+                assert_eq!(hooks_intact(), Err(reason));
+                // Restoring the exact state lets acquisitions proceed again.
+                assert_eq!(table.set(name, Some(hook)), ffi::SQLITE_OK);
+                assert_eq!(hooks_intact(), Ok(()));
+                let _ = std::fs::remove_file(&db);
+                assert!(open().is_ok(), "{label}: after restoration");
+                assert_eq!(status(), installed);
+            }
+            println!("HOOKS-CHILD:ok");
+        }
+
+        /// Regression (r11 S6, F6): a syscall slot replaced after a successful
+        /// installation (another library, in this child: `open`, then
+        /// `stat`) must make checked acquisitions refuse with
+        /// `HooksReplaced` before arming, repair nothing, and leave
+        /// `installed()` reporting the historical result; restoring the
+        /// wrapper lets acquisitions proceed. Runs in a child (it rewrites
+        /// this process's SQLite slots).
+        #[test]
+        fn regression_hooks_replaced_refuses_before_arming() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "checked_open::install::imp::tests::hooks_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(HOOKS_CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("HOOKS-CHILD:ok"),
+                "child failed: {stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
         const CHILD_ENV: &str = "RATARMOUNT_TEST_ABSTAIN_CHILD";
 
         /// Child of `regression_checked_open_never_installs_lazily` (no-op
@@ -1188,6 +1574,9 @@ mod imp {
     pub(super) fn private(_anchor: *const std::ffi::c_void) -> Result<Witness, InstallStatus> {
         Err(UNSUPPORTED)
     }
+    pub(super) fn hooks_intact() -> Result<(), &'static str> {
+        Err("checked opens are not supported on this target")
+    }
 }
 
 /// Whether this target is one the wrappers are verified for (the
@@ -1206,6 +1595,13 @@ pub const VERIFIED_TARGET: bool = cfg!(all(
 /// The terminal installation result, or why there is none. Never installs.
 pub fn installed() -> Result<Witness, InstallStatus> {
     imp::status()
+}
+
+/// F6 (r11 S6), called by every checked acquisition after [`installed`]
+/// succeeded and before arming: the VFS and syscall slots still hold what
+/// the installation left. Repairs nothing.
+pub(crate) fn hooks_intact() -> Result<(), &'static str> {
+    imp::hooks_intact()
 }
 
 /// What the load-time constructor observed (`None`: it did not run, or the
