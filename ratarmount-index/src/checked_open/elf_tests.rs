@@ -1242,8 +1242,56 @@ mod real_dso {
     use std::process::Command;
 
     use super::super::super::host::{host_object, same_private_image, HostFailure, Lookup};
-    use super::super::super::install::{export_check, proof_decision};
+    use super::super::super::install::{
+        export_check, proof_decision, InstallState, InstallStatus, InstallWhy, Witness,
+    };
     use super::*;
+
+    /// Drives the private initializer's cell with the proof's own decision
+    /// over the real loader lookup and the real export check of `anchor`'s
+    /// image, and asserts that it refuses with `refusal` before any
+    /// installation, leaving the cell non-terminal (a later passing proof
+    /// still installs once).
+    ///
+    /// Where the tested seam ends: `private_proof` itself is a one-line
+    /// delegate (`proof_decision(&anchors, module, &host_object,
+    /// export_check)`) whose anchors are this test executable's constructor
+    /// and linked SQLite, which refuse `MainExecutable` before the export
+    /// check runs. Everything from `proof_decision` down (image check,
+    /// `export_check`, `elf::image_containing`, the export walk,
+    /// `export_refusal`) and the cell (`InstallState::private`) is driven
+    /// here on a real loaded image; only that delegate's argument list is
+    /// not driven negatively.
+    fn assert_refused_before_install(anchor: usize, refusal: HostFailure) {
+        const WITNESS: Witness = Witness {
+            why: InstallWhy::PrivateInstance,
+            threads_at_install: Some(2),
+            exports_checked: Some(1),
+        };
+        let state = InstallState::new();
+        let calls = std::cell::Cell::new(0u32);
+        let got = state.private(
+            || proof_decision(&[("module", anchor)], anchor, &host_object, export_check),
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(WITNESS)
+            },
+        );
+        assert_eq!(got, Err(InstallStatus::NotPrivate(refusal)));
+        assert_eq!(calls.get(), 0, "refused before any installation");
+        assert_eq!(state.status(), Err(InstallStatus::NotRun), "not terminal");
+        assert_eq!(state.observation(), None, "no constructor observation");
+        // Non-terminal: a later passing proof still installs, once.
+        let got = state.private(
+            || Ok(()),
+            |()| {
+                calls.set(calls.get() + 1);
+                Ok(WITNESS)
+            },
+        );
+        assert_eq!(got, Ok(WITNESS));
+        assert_eq!(calls.get(), 1);
+    }
 
     /// A statically linked test executable would load these objects against
     /// a second (shared) libc; their threads and initializers would run
@@ -1513,6 +1561,12 @@ int rows_other(void) { return 1; }
                 false
             )))
         );
+        // Through the private initializer's cell: refused before any
+        // installation, the state unchanged and non-terminal.
+        assert_refused_before_install(
+            anchor,
+            HostFailure::SqliteExportedNamed(SymbolName::from_prefix(b"sqlite3_fake_open", false)),
+        );
         let libc_image =
             same_private_image(&host_object, &[("libc", libc::qsort as *const () as usize)])
                 .unwrap();
@@ -1582,5 +1636,20 @@ int sysv_other(void) { return 1; }
                 "SysV hash (index past nchain)"
             )))
         );
+        // Regression (r11 S6 fix skeptic g4 #1): an image whose export
+        // inspection cannot complete refuses through the proof's own
+        // decision with the real loader lookup and the real export check
+        // (`ExportInspection`, not an accepted partial walk), before any
+        // installation, leaving the cell non-terminal.
+        let anchor = lib.sym(c"sysv_other");
+        let refusal =
+            HostFailure::ExportInspection(ElfError::Malformed("SysV hash (index past nchain)"));
+        let image = same_private_image(&host_object, &[("module", anchor)]).unwrap();
+        assert_eq!(export_check(anchor, image), Err(refusal));
+        assert_eq!(
+            proof_decision(&[("module", anchor)], anchor, &host_object, export_check),
+            Err(refusal)
+        );
+        assert_refused_before_install(anchor, refusal);
     }
 }
