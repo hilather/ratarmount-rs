@@ -170,8 +170,9 @@ is not opened. A missing file with no marker is not opened.
 opens a regular archive with `File::open`. Recovery follows a
 `user.ratarmount.commit-journal` locator when one is set. Otherwise it looks
 beside the canonical archive path, or beside the path as given when
-`canonicalize` fails, for a name ending in `.ratarmount-commit-journal`. A successful in-place
-suffix replacement deletes the journal it created on that canonical path. When
+`canonicalize` fails, for a name ending in `.ratarmount-commit-journal`. A
+successful in-place suffix replacement deletes the journal it created on that
+path. When
 rebuilding the zstd seek table would need a frame size that does not fit in a
 `u32`, the suffix is published by copy and rename and no journal file is
 created. The default
@@ -193,21 +194,27 @@ not return through the manifest or metadata path.
 no metadata or xattr changes reaches that arm only when `is_zip_archive` is
 false and `detect_compression` returns uncompressed. `commit_overlay_tar` opens
 the archive in `detect_compression` before that check. Gzip, bzip2, and xz take
-the other arm, where `is_uncompressed_tar` opens the decompressed temporary,
-and only when there is no `--commit-manifest` and no metadata or xattr plan.
+the other arm, where `is_uncompressed_tar` opens the decompressed temporary
+after `ensure_gnu_tar` succeeds, and only when there is no `--commit-manifest`
+and no metadata or xattr plan. If GNU tar is missing, that temporary is not
+created.
 Zstd is handled by `commit_overlay_tar_zst` and does not call
 `is_uncompressed_tar`. Any `--commit-manifest` sets `manifest_hashes` and calls
 `live_commit_is_supported` first, which rejects gzip, bzip2, and xz.
 
-A non-empty plan with metadata or xattr changes, or with `--commit-manifest`
-and hash mode `all` or `new`, asks for confirmation unless `--yes` is set. A
-declined confirmation returns before the plan is applied and before
+After `live_commit_is_supported` succeeds, a non-empty plan with metadata or
+xattr changes, or with `--commit-manifest` and hash mode `all` or `new`, asks
+for confirmation unless `--yes` is set. ZIP, gzip, bzip2, and xz fail that
+check before `confirm_commit`, with or without `--yes`. A declined
+confirmation returns before the plan is applied and before
 `commit_overlay_tar`. If it proceeds, `persist_provenance_plan` applies the
-plan. Copy mode rewrites an uncompressed archive or splices `.tar.zst`. Append
-mode, and auto when the archive has one hard link and nothing was deleted, may
-replace a suffix in place. A sidecar whose tarstats still match is patched
-afterward; a stale sidecar is removed before the archive changes. A manifest
-file is written on this path only when `--commit-manifest` was set.
+plan. Copy mode rewrites an uncompressed archive or splices `.tar.zst`. On
+Linux and macOS, append mode and auto (auto only when the archive has one
+hard link) may replace a suffix in place when the plan has no deletions and
+no metadata or xattr rewrite of an existing member. A zstd in-place
+replacement also needs a seek table. A sidecar whose tarstats still match is
+patched afterward; a stale sidecar is removed before the archive changes.
+A manifest file is written on this path only when `--commit-manifest` was set.
 `commit_overlay` then returns before `commit_overlay_tar`.
 `--commit-manifest --manifest-hashes none` with no metadata or xattr changes
 calls `live_commit_is_supported` and does not call `persist_provenance_plan`.
