@@ -930,9 +930,10 @@ mod imp {
                 methods: unsafe { methods(vfs) },
             })
             .collect();
-        // The only setter, reached once: `STATE` admits one installation.
-        let fresh = SNAPSHOT.set(snaps).is_ok();
-        debug_assert!(fresh, "F6 snapshot published twice");
+        // Cannot fail: this is the only setter, and `STATE` admits one
+        // installation. No assertion: this runs in the load-time
+        // constructor, where a panic would abort the process.
+        let _ = SNAPSHOT.set(snaps);
         Ok(Witness {
             why,
             threads_at_install: threads,
