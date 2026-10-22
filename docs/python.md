@@ -194,8 +194,10 @@ wrappers around the `open` and `stat` calls of the SQLite bundled in
 process has one thread at that point, a load-time constructor installs them.
 If other threads are already running, the module installs them into its
 private SQLite as its first step, before it publishes anything. That is safe
-only because the wheel exports no `sqlite3_*` symbol, and the wheels workflow
-audits every repaired wheel for that (`packaging/audit_native_exports.py`).
+only if the wheel exports no `sqlite3_*` symbol (the wheels workflow audits
+every repaired wheel for that, `packaging/audit_native_exports.py`) and
+nothing obtains and calls an entry point of the module before it finishes
+initializing (no check can prove that second condition, #192).
 On Linux and macOS (64-bit x86_64/aarch64, glibc or macOS), if neither path
 can install the wrappers, `import ratarmount_rs` raises `ImportError` naming
 the reason; nothing from the module is usable then. On Windows and other
@@ -205,7 +207,9 @@ gets only the load-time constructor; threads started before it loads leave
 checked opens refusing, and if that program also registers `_native` (for
 example through `wrap_pymodule!` or the inittab), its import raises the same
 `ImportError`. A wheel you build yourself from the sdist is not audited.
-Before it installs into its private SQLite, the module also checks its own
+Before it installs into its private SQLite (only when threads were already
+running at import; a single-threaded import installs through the load-time
+constructor and does not run this check), the module also checks its own
 image at run time. On Linux (glibc, 64-bit x86_64/aarch64) it reads every
 defined, externally visible dynamic symbol of `_native` and refuses (the
 import raises `ImportError`) if any name starts with `sqlite3` (any case),

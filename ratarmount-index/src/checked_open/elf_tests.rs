@@ -102,6 +102,12 @@ impl Built {
     }
 
     fn image(&self) -> ElfImage<'_> {
+        self.image_at(BIAS)
+    }
+
+    /// The image loaded at `bias` (an image larger than [`BIAS`] needs a
+    /// higher one, or every table pointer is mapped both raw and relocated).
+    fn image_at(&self, bias: usize) -> ElfImage<'_> {
         let phdrs = [
             Phdr {
                 p_type: PT_LOAD,
@@ -124,10 +130,10 @@ impl Built {
         ];
         ElfImage::from_phdrs(
             0x1234,
-            BIAS,
+            bias,
             phdrs.len(),
             phdrs.into_iter(),
-            Some((BIAS, &self.bytes)),
+            Some((bias, &self.bytes)),
         )
         .unwrap()
     }
@@ -538,6 +544,83 @@ fn regression_elf_dynamic_bounds() {
         symbol_name(&image, &t, 1, &mut budget).err(),
         Some(ElfError::WorkLimit("name bytes"))
     );
+    // Charged per name byte, terminator included (not per 64-byte chunk):
+    // "ordinary_function" is 17 bytes plus its NUL.
+    let mut budget = 18;
+    assert!(symbol_name(&image, &t, 1, &mut budget).is_ok());
+    assert_eq!(budget, 0);
+    let mut budget = 17;
+    assert_eq!(
+        symbol_name(&image, &t, 1, &mut budget).err(),
+        Some(ElfError::WorkLimit("name bytes"))
+    );
+    // The budget spans every inspected name of the walk.
+    let two = with_syms(vec![
+        func("aaaa", GLOBAL, DEFAULT, 0x10),
+        func("bbbb", GLOBAL, DEFAULT, 0x20),
+    ]);
+    let built = build(&two);
+    let image = built.image();
+    assert_eq!(for_each_export_within(&image, 10, &mut |_| true), Ok(2));
+    assert_eq!(
+        for_each_export_within(&image, 9, &mut |_| true),
+        Err(ElfError::WorkLimit("name bytes"))
+    );
+}
+
+/// Regression (r11 S6 review N5): the walk's name budget is
+/// [`MAX_NAME_BYTES`] across all names. 64 exports of 1 MiB names (plus
+/// their terminators) exceed it by 64 bytes; the same walk with 64 more
+/// bytes of budget passes.
+#[test]
+fn regression_elf_name_budget_spans_the_walk() {
+    let long = MAX_NAME_BYTES / 64;
+    let syms = (0..64u8)
+        .map(|i| {
+            let mut name = vec![b'n'; long];
+            name[0] = b'a' + (i % 26);
+            name[1] = b'a' + (i / 26);
+            Sym {
+                name,
+                ..func("x", GLOBAL, DEFAULT, 0x10)
+            }
+        })
+        .collect();
+    let built = build(&Spec {
+        adjusted: false,
+        ..with_syms(syms)
+    });
+    let image = built.image_at(1 << 40);
+    assert_eq!(
+        for_each_export(&image, &mut |_| true),
+        Err(ElfError::WorkLimit("name bytes"))
+    );
+    assert_eq!(
+        for_each_export_within(&image, MAX_NAME_BYTES + 64, &mut |_| true),
+        Ok(64)
+    );
+}
+
+/// Regression (r11 S6 review N5): an extended-section-index definition
+/// whose address overflows refuses like an ordinary one (it returned
+/// `Ok(None)`, the TLS answer).
+#[test]
+fn regression_elf_xindex_address_overflow_refuses() {
+    let export = |shndx, value| Export {
+        name: SymbolName::from_prefix(b"x", false),
+        sqlite: false,
+        kind: FUNC,
+        shndx,
+        value,
+    };
+    for shndx in [1, SHN_XINDEX] {
+        assert_eq!(
+            export(shndx, u64::MAX).address(1),
+            Err(ElfError::Bounds("symbol value")),
+            "{shndx:#x}"
+        );
+        assert_eq!(export(shndx, 0x10).address(0x1000), Ok(Some(0x1010)));
+    }
 }
 
 /// Regression (r11 S6): glibc relocates some dynamic pointers in place and
@@ -997,6 +1080,11 @@ fn regression_elf_exports_walk_matches_dlsym() {
             // skips them.
             continue;
         }
+        if !image.contains(found, 1, 0) {
+            // `dlsym` on libc's handle also searches its dependencies (ld.so
+            // on older glibc); a definition found there is not libc's.
+            continue;
+        }
         assert!(
             addrs.contains(&found),
             "{}: dlsym {found:#x}, walk {addrs:x?}",
@@ -1007,9 +1095,17 @@ fn regression_elf_exports_walk_matches_dlsym() {
     assert!(by_name.contains_key(&b"qsort"[..]));
     assert!(checked > 500, "{checked}");
     unsafe { libc::dlclose(handle) };
-    // libc has an init array; its DT_INIT, when present, is no export.
+    // libc has an init array. Its DT_INIT (absent on current glibc) is
+    // either no export, or option (b) names the export at that address.
     let init = initialization(&image).expect("libc initialization facts");
-    check_initialization(&image, init.first_init_array).expect("libc option (b)");
+    match check_initialization(&image, init.first_init_array) {
+        Ok(_) => {}
+        Err(InitRefusal::ExportedDtInit(name)) => {
+            assert!(init.dt_init.is_some());
+            eprintln!("note: libc's DT_INIT is the export {name}");
+        }
+        Err(other) => panic!("libc option (b): {other:?}"),
+    }
 }
 
 /// Real shared objects compiled at test time (`CC`, split on whitespace,
@@ -1026,8 +1122,20 @@ mod real_dso {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use super::super::super::host::{host_object, same_private_image, Lookup};
+    use super::super::super::host::{host_object, same_private_image, HostFailure, Lookup};
+    use super::super::super::install::export_check;
     use super::*;
+
+    /// A statically linked test executable would load these objects against
+    /// a second (shared) libc; their threads and initializers would run
+    /// there. Skip, like `regression_elf_exports_walk_matches_dlsym`.
+    fn static_executable() -> bool {
+        if cfg!(target_feature = "crt-static") {
+            eprintln!("skip: libc is linked statically into this executable");
+            return true;
+        }
+        false
+    }
 
     /// Compile `source` into `dir/lib{name}.so` with extra link `args`.
     /// `None` when there is no C compiler.
@@ -1133,6 +1241,9 @@ void *pubdep_published(void) { return (void *)atomic_load(&slot); }
     /// published capability is harmless (no SQLite is involved).
     #[test]
     fn regression_dependency_publication_is_not_proved() {
+        if static_executable() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path();
         let Some(_dep) = shared_object(dir, "pubdep", DEPENDENCY, &[]) else {
@@ -1186,6 +1297,9 @@ void *pubdep_published(void) { return (void *)atomic_load(&slot); }
     /// `sqlite3_libversion` refuses the full export walk.
     #[test]
     fn regression_dso_initializer_and_export_rows() {
+        if static_executable() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path();
         let source = r#"
@@ -1228,6 +1342,10 @@ int rows_ran(void) { return ran; }
         let elf = image_containing(ctor).unwrap();
         let init = check_initialization(&elf, ctor).expect("hidden DT_INIT is assumed");
         assert!(init.dt_init.is_some());
+        // The private proof's export check accepts it and reports the count.
+        let image = same_private_image(&host_object, &[("module", ctor)]).unwrap();
+        let walked = image_exports_no_sqlite(&elf).unwrap();
+        assert_eq!(export_check(ctor, image), Ok(Some(walked)));
         drop(lib);
 
         let sqlite = r#"
@@ -1248,5 +1366,27 @@ int rows_other(void) { return 1; }
         );
         // The one-name probe this walk replaced did not see it.
         assert!(unsafe { libc::dlsym(lib.0, c"sqlite3_libversion".as_ptr()) }.is_null());
+        // Regression (r11 S6 review N2): the private proof's export check
+        // turns the walk's finding into its refusal (not dropped by an
+        // `.ok()` or a mapping), and refuses an image that is not the one
+        // the proof named.
+        let anchor = lib.sym(c"rows_other");
+        let image = same_private_image(&host_object, &[("module", anchor)]).unwrap();
+        assert_eq!(
+            export_check(anchor, image),
+            Err(HostFailure::SqliteExportedNamed(SymbolName::from_prefix(
+                b"sqlite3_fake_open",
+                false
+            )))
+        );
+        let libc_image =
+            same_private_image(&host_object, &[("libc", libc::qsort as *const () as usize)])
+                .unwrap();
+        assert_eq!(
+            export_check(anchor, libc_image),
+            Err(HostFailure::ImageMismatch {
+                what: "export inspection"
+            })
+        );
     }
 }

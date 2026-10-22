@@ -526,7 +526,9 @@ mod tests {
     /// opens refuse or take the path-type check on their own).
     #[test]
     fn regression_native_publication_gate_table() {
-        use ratarmount_index::checked_open::{ElfError, HostFailure, InstallFailure, InstallWhy};
+        use ratarmount_index::checked_open::{
+            ElfError, HostFailure, InstallFailure, InstallWhy, SymbolName,
+        };
         for why in [InstallWhy::SingleThread, InstallWhy::PrivateInstance] {
             let witness = Witness {
                 why,
@@ -560,6 +562,12 @@ mod tests {
             (
                 InstallStatus::NotPrivate(HostFailure::SqliteExported),
                 "exports sqlite3_libversion",
+            ),
+            (
+                InstallStatus::NotPrivate(HostFailure::SqliteExportedNamed(
+                    SymbolName::from_prefix(b"sqlite3_open_v2", false),
+                )),
+                "exports sqlite3_open_v2",
             ),
             (
                 InstallStatus::NotPrivate(HostFailure::ExportInspection(ElfError::Bounds(

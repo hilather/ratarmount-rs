@@ -228,8 +228,9 @@ def self_test():
 
     with tempfile.TemporaryDirectory() as tmp:
         clean = build(cc, tmp, "_native.clean.so", ["PyInit__native", "bz_internal_error"])
-        # A non-`libversion` SQLite export: the runtime own-handle probe looks
-        # only for sqlite3_libversion, so this is what the audit adds.
+        # A non-`libversion` SQLite export: the macOS runtime probe looks only
+        # for sqlite3_libversion (Linux walks every export, but only on the
+        # private-instance path), so the audit is the check for every wheel.
         leaky = build(cc, tmp, "_native.leaky.so", ["PyInit__native", "sqlite3_vfs_find"])
         extra = build(cc, tmp, "_native.extra.so", ["PyInit__native", "ratarmount_extra"])
         grafted = build(cc, tmp, "libarchive.so.13", ["archive_read_new"])

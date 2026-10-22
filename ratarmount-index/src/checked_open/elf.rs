@@ -20,7 +20,11 @@
 //!   remain assumptions (issue #192 closed the arbitrary-DSO exclusivity
 //!   proof as not implementable). No installation path calls it: the
 //!   loader-private path it was designed for is not built, and the tests use
-//!   it to show what it does and does not see.
+//!   it to show what it does and does not see. Do not wire it to the current
+//!   constructor anchor without moving that constructor first: option (b)
+//!   was specified for a thunk at `.init_array.00000`, and today Rust std's
+//!   `.init_array.00099` entry and the CRT's `frame_dummy` precede the
+//!   anchor, so the entry-zero check would refuse every real host.
 //!
 //! Every read is checked against the image's readable `PT_LOAD` ranges with
 //! checked arithmetic; tables, chains and names are bounded by explicit work
@@ -81,7 +85,9 @@ pub struct SymbolName {
 }
 
 impl SymbolName {
-    pub(crate) fn from_prefix(prefix: &[u8], truncated: bool) -> Self {
+    /// A name from its first bytes (at most 32 are kept; `truncated`: the
+    /// full name was longer). For diagnostics and tests.
+    pub fn from_prefix(prefix: &[u8], truncated: bool) -> Self {
         let mut bytes = [0u8; 32];
         let len = prefix.len().min(32);
         bytes[..len].copy_from_slice(&prefix[..len]);
@@ -388,7 +394,8 @@ fn tables(image: &ElfImage<'_>, d: &Dynamic) -> Result<Tables, ElfError> {
     let sysv = match d.hash {
         Some(raw) => {
             let h = image.table_ptr(raw, "DT_HASH")?;
-            Some(image.u32_at(h + 4, "DT_HASH")? as usize)
+            let nchain = h.checked_add(4).ok_or(ElfError::Bounds("DT_HASH"))?;
+            Some(image.u32_at(nchain, "DT_HASH")? as usize)
         }
         None => None,
     };
@@ -433,8 +440,9 @@ fn tables(image: &ElfImage<'_>, d: &Dynamic) -> Result<Tables, ElfError> {
 fn gnu_symbol_count(image: &ElfImage<'_>, h: usize) -> Result<usize, ElfError> {
     const WHAT: &str = "DT_GNU_HASH";
     let nbuckets = image.u32_at(h, WHAT)? as usize;
-    let symoffset = image.u32_at(h + 4, WHAT)? as usize;
-    let bloom_size = image.u32_at(h + 8, WHAT)? as usize;
+    let field = |k: usize| h.checked_add(k).ok_or(ElfError::Bounds(WHAT));
+    let symoffset = image.u32_at(field(4)?, WHAT)? as usize;
+    let bloom_size = image.u32_at(field(8)?, WHAT)? as usize;
     if nbuckets == 0 {
         return Err(ElfError::Malformed("GNU hash (no buckets)"));
     }
@@ -508,7 +516,10 @@ impl Export {
         let value = usize::try_from(self.value).map_err(|_| ElfError::Bounds("symbol value"))?;
         match self.shndx {
             SHN_ABS => Ok(Some(value)),
-            SHN_XINDEX => Ok(bias.checked_add(value)),
+            SHN_XINDEX => bias
+                .checked_add(value)
+                .map(Some)
+                .ok_or(ElfError::Bounds("symbol value")),
             s if s >= SHN_LORESERVE => Err(ElfError::Unsupported("reserved section index")),
             _ => bias
                 .checked_add(value)
@@ -526,9 +537,18 @@ pub(crate) fn for_each_export(
     image: &ElfImage<'_>,
     visit: &mut dyn FnMut(Export) -> bool,
 ) -> Result<u32, ElfError> {
+    for_each_export_within(image, MAX_NAME_BYTES, visit)
+}
+
+/// [`for_each_export`] with an explicit name-byte budget (every byte of every
+/// inspected name, its terminator included).
+fn for_each_export_within(
+    image: &ElfImage<'_>,
+    mut name_budget: usize,
+    visit: &mut dyn FnMut(Export) -> bool,
+) -> Result<u32, ElfError> {
     let d = dynamic(image)?;
     let t = tables(image, &d)?;
-    let mut name_budget = MAX_NAME_BYTES;
     let mut visited = 0u32;
     for i in 0..t.count {
         let mut sym = [0u8; SYM_SIZE];
@@ -584,12 +604,14 @@ fn symbol_name(
             return Err(ElfError::Malformed("string table (unterminated name)"));
         }
         let n = chunk.len().min(t.strsz - off);
-        if n > *budget {
-            return Err(ElfError::WorkLimit("name bytes"));
-        }
-        *budget -= n;
         image.read(t.strtab + off, &mut chunk[..n], "string table")?;
         let end = chunk[..n].iter().position(|&b| b == 0);
+        // Charged per name byte (terminator included), not per chunk read.
+        let used = end.map_or(n, |e| e + 1);
+        if used > *budget {
+            return Err(ElfError::WorkLimit("name bytes"));
+        }
+        *budget -= used;
         for &b in &chunk[..end.unwrap_or(n)] {
             if len < prefix.len() {
                 prefix[len] = b;

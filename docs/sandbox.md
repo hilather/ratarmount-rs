@@ -1846,7 +1846,9 @@ refused, its read-only retry calls `open` again instead of reusing a parked
 descriptor (SQLite 3.46.0 and later reuse one), and the wrappers refuse that
 second `open` before it reaches the file.
 
-Before the Python wheel installs into its private SQLite on Linux, it reads
+When threads are already running at import, so the Python wheel installs
+into its private SQLite instead of through the load-time constructor (which
+does not run this check), on Linux it first reads
 every exported dynamic symbol of its own image and refuses on any `sqlite3*`
 name, or when it cannot read the symbol table completely; on macOS it checks
 only `sqlite3_libversion`. Neither check can see an entry point that other

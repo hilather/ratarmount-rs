@@ -168,6 +168,11 @@ impl fmt::Display for InstallStatus {
                     "checked SQLite opens are not verified for this target's ABI"
                 )
             }
+            Self::HooksReplaced(reason) if *reason == NO_SNAPSHOT => write!(
+                f,
+                "the SQLite system-call wrappers were installed, but {reason} \
+                 (an internal fault of the installation, not outside code)"
+            ),
             Self::HooksReplaced(reason) => write!(
                 f,
                 "the SQLite system-call wrappers were installed, but {reason}; \
@@ -176,6 +181,10 @@ impl fmt::Display for InstallStatus {
         }
     }
 }
+
+/// F6: the installation result exists but its VFS snapshot does not (an
+/// internal fault: the installer publishes the snapshot before the result).
+pub(crate) const NO_SNAPSHOT: &str = "no snapshot of the installation was published";
 
 /// Where the constructor reads the thread count, for the abstention message.
 const THREAD_COUNT_SOURCE: &str = if cfg!(target_os = "linux") {
@@ -465,7 +474,10 @@ pub(crate) fn private_proof(
     target_os = "linux",
     target_env = "gnu"
 ))]
-fn export_check(anchor: usize, image: ImageIdentity) -> Result<Option<u32>, HostFailure> {
+pub(super) fn export_check(
+    anchor: usize,
+    image: ImageIdentity,
+) -> Result<Option<u32>, HostFailure> {
     let elf = super::elf::image_containing(anchor).map_err(HostFailure::ExportInspection)?;
     if elf.id != image.id {
         return Err(HostFailure::ImageMismatch {
@@ -487,7 +499,10 @@ fn export_check(anchor: usize, image: ImageIdentity) -> Result<Option<u32>, Host
     target_os = "linux",
     target_env = "gnu"
 )))]
-fn export_check(anchor: usize, image: ImageIdentity) -> Result<Option<u32>, HostFailure> {
+pub(super) fn export_check(
+    anchor: usize,
+    image: ImageIdentity,
+) -> Result<Option<u32>, HostFailure> {
     use super::host::{own_handle_symbol, refuse_exported_sqlite};
     refuse_exported_sqlite(
         &host_object,
@@ -657,9 +672,7 @@ mod imp {
     }
 
     pub(super) fn hooks_intact() -> Result<(), &'static str> {
-        let snaps = SNAPSHOT
-            .get()
-            .ok_or("no snapshot of the installation was published")?;
+        let snaps = SNAPSHOT.get().ok_or(super::NO_SNAPSHOT)?;
         let find = |name: &CStr| {
             // SAFETY: SQLite is initialized (the installation ran); a
             // registered VFS lives for the process.
@@ -788,16 +801,31 @@ mod imp {
         Ok(vfs)
     }
 
-    /// Method labels of each VFS whose image the private path checks.
-    pub(super) type MethodLabels = [&'static str; 3];
-    pub(super) const UNIX_METHODS: MethodLabels =
-        ["unix xOpen", "unix xSetSystemCall", "unix xGetSystemCall"];
+    /// One selectable VFS: its registered name, the method labels the
+    /// private path's image check reports, and F6's refusal texts. The name
+    /// travels with the VFS pointer, so the snapshot never pairs them by
+    /// position.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct MethodLabels {
+        pub(super) name: &'static CStr,
+        pub(super) methods: [&'static str; 3],
+        pub(super) reasons: &'static Reasons,
+    }
+    pub(super) const UNIX_METHODS: MethodLabels = MethodLabels {
+        name: c"unix",
+        methods: ["unix xOpen", "unix xSetSystemCall", "unix xGetSystemCall"],
+        reasons: &UNIX_REASONS,
+    };
     #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
-    pub(super) const POSIX_METHODS: MethodLabels = [
-        "unix-posix xOpen",
-        "unix-posix xSetSystemCall",
-        "unix-posix xGetSystemCall",
-    ];
+    pub(super) const POSIX_METHODS: MethodLabels = MethodLabels {
+        name: c"unix-posix",
+        methods: [
+            "unix-posix xOpen",
+            "unix-posix xSetSystemCall",
+            "unix-posix xGetSystemCall",
+        ],
+        reasons: &POSIX_REASONS,
+    };
 
     /// The VFSes whose methods serve checked opens: `"unix"`, whose syscall
     /// table is set, and on macOS the selected `"unix-posix"` (design §6).
@@ -828,9 +856,15 @@ mod imp {
                 lookup,
                 image,
                 &[
-                    (labels[0], v.xOpen.map_or(0, |f| f as usize)),
-                    (labels[1], v.xSetSystemCall.map_or(0, |f| f as usize)),
-                    (labels[2], v.xGetSystemCall.map_or(0, |f| f as usize)),
+                    (labels.methods[0], v.xOpen.map_or(0, |f| f as usize)),
+                    (
+                        labels.methods[1],
+                        v.xSetSystemCall.map_or(0, |f| f as usize),
+                    ),
+                    (
+                        labels.methods[2],
+                        v.xGetSystemCall.map_or(0, |f| f as usize),
+                    ),
                 ],
             )?;
         }
@@ -885,21 +919,20 @@ mod imp {
             erased::from_stat(hook_stat),
         )?;
         // F6: published before the caller stores the installation result.
-        let names: [(&'static CStr, &'static Reasons); 2] =
-            [(c"unix", &UNIX_REASONS), (c"unix-posix", &POSIX_REASONS)];
         let snaps = vfses
             .iter()
-            .zip(names)
-            .map(|(&(vfs, _), (name, reasons))| VfsSnapshot {
-                name,
-                reasons,
+            .map(|&(vfs, labels)| VfsSnapshot {
+                name: labels.name,
+                reasons: labels.reasons,
                 vfs: vfs as usize,
                 // SAFETY: every entry passed `find_vfs` (version >= 3).
                 version: unsafe { std::ptr::addr_of!((*vfs).iVersion).read() },
                 methods: unsafe { methods(vfs) },
             })
             .collect();
-        let _ = SNAPSHOT.set(snaps);
+        // The only setter, reached once: `STATE` admits one installation.
+        let fresh = SNAPSHOT.set(snaps).is_ok();
+        debug_assert!(fresh, "F6 snapshot published twice");
         Ok(Witness {
             why,
             threads_at_install: threads,
@@ -1246,13 +1279,31 @@ mod imp {
             unsafe { std::mem::transmute::<usize, ffi::sqlite3_syscall_ptr>(addr) }
         }
 
+        thread_local! {
+            static GETTER_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+
+        /// A getter that counts its calls and answers like [`fake_get`].
+        unsafe extern "C" fn counting_get(
+            vfs: *mut ffi::sqlite3_vfs,
+            name: *const c_char,
+        ) -> ffi::sqlite3_syscall_ptr {
+            GETTER_CALLS.with(|c| c.set(c.get() + 1));
+            unsafe { fake_get(vfs, name) }
+        }
+
         /// Regression (r11 S6, F6): an acquisition must not arm when the
         /// selected VFS, its methods or a syscall slot no longer hold what
         /// the installation left. Fake catalog: a VFS that is gone, replaced
         /// (another structure under the name: never dereferenced), of
         /// another version (compared before any version-3 field), with a
-        /// changed method, or with a replaced `open` or `stat`; each refusal
-        /// names the VFS (the macOS pair: `"unix-posix"` after `"unix"`).
+        /// changed method (`xOpen`, `xSetSystemCall`, `xGetSystemCall`, a
+        /// missing getter; every method compared before the getter is
+        /// called), or with a replaced `open` or `stat`; each refusal names
+        /// the VFS (the macOS pair: `"unix-posix"` after `"unix"`). A missing
+        /// snapshot is reported as an internal fault, not as outside code.
+        /// The real-snapshot rows need a single-threaded start (the
+        /// constructor installed).
         #[test]
         fn regression_hooks_intact_vfs_validation() {
             let getter = fake_get as *const () as usize;
@@ -1306,14 +1357,85 @@ mod imp {
                 unsafe { check_hooks(&snaps2, &catalog(ptr(&changed), ptr(&posix)), hooks) },
                 Ok(())
             );
-            unsafe {
-                std::ptr::addr_of_mut!((*ptr(&changed)).xOpen)
-                    .cast::<usize>()
-                    .write(0x109)
+            // Written through the owning `Box` (never through a pointer made
+            // from a shared reference).
+            let set_method = |vfs: &mut ffi::sqlite3_vfs, i: usize, value: usize| {
+                let p: *mut ffi::sqlite3_vfs = vfs;
+                // SAFETY: a method slot is a nullable function pointer;
+                // `value` is only compared as an address, never called
+                // (except `counting_get`, a real getter).
+                unsafe {
+                    match i {
+                        0 => std::ptr::addr_of_mut!((*p).xOpen)
+                            .cast::<usize>()
+                            .write(value),
+                        1 => std::ptr::addr_of_mut!((*p).xSetSystemCall)
+                            .cast::<usize>()
+                            .write(value),
+                        _ => std::ptr::addr_of_mut!((*p).xGetSystemCall)
+                            .cast::<usize>()
+                            .write(value),
+                    }
+                }
             };
+            set_method(&mut changed, 0, 0x109);
             assert_eq!(
                 unsafe { check_hooks(&snaps2, &catalog(ptr(&changed), ptr(&posix)), hooks) },
                 Err(UNIX_REASONS.methods)
+            );
+            set_method(&mut changed, 0, 0x101);
+            // Every method is compared, and all of them before the getter is
+            // called: a changed setter, a changed getter (a counting getter
+            // that must never run) and a missing getter refuse as `methods`.
+            let counting = counting_get as *const () as usize;
+            for (i, value) in [(1, 0x10a), (2, counting), (2, 0)] {
+                set_method(&mut changed, i, value);
+                GETTER_CALLS.with(|c| c.set(0));
+                assert_eq!(
+                    unsafe { check_hooks(&snaps2, &catalog(ptr(&changed), ptr(&posix)), hooks) },
+                    Err(UNIX_REASONS.methods),
+                    "method {i} = {value:#x}"
+                );
+                assert_eq!(GETTER_CALLS.with(|c| c.get()), 0, "getter called");
+                set_method(&mut changed, i, [0x101, 0x102, getter][i]);
+            }
+            // The getter of an intact VFS is called (the counting getter
+            // installed in the snapshot too).
+            let mut counted = snaps2;
+            counted[0].methods[2] = counting;
+            set_method(&mut changed, 2, counting);
+            GETTER_CALLS.with(|c| c.set(0));
+            assert_eq!(
+                unsafe { check_hooks(&counted, &catalog(ptr(&changed), ptr(&posix)), hooks) },
+                Ok(())
+            );
+            assert_eq!(GETTER_CALLS.with(|c| c.get()), 2, "open and stat read");
+            set_method(&mut changed, 2, getter);
+            // A changed method of the second (macOS) VFS refuses with its name.
+            let mut posix_changed = fake_vfs([0x201, 0x10b, getter]);
+            let mut snaps_posix = snaps;
+            snaps_posix[1].vfs = ptr(&posix_changed) as usize;
+            set_method(&mut posix_changed, 1, 0x102);
+            assert_eq!(
+                unsafe {
+                    check_hooks(
+                        &snaps_posix,
+                        &catalog(ptr(&unix), ptr(&posix_changed)),
+                        hooks,
+                    )
+                },
+                Ok(())
+            );
+            set_method(&mut posix_changed, 1, 0x10b);
+            assert_eq!(
+                unsafe {
+                    check_hooks(
+                        &snaps_posix,
+                        &catalog(ptr(&unix), ptr(&posix_changed)),
+                        hooks,
+                    )
+                },
+                Err(POSIX_REASONS.methods)
             );
             for (slots, want) in [
                 ([0x509, 0x502], UNIX_REASONS.open),
@@ -1346,6 +1468,11 @@ mod imp {
             };
             assert_eq!(real.iter().map(|s| s.name).collect::<Vec<_>>(), want);
             assert_eq!(hooks_intact(), Ok(()));
+            let internal = InstallStatus::HooksReplaced(super::super::NO_SNAPSHOT).to_string();
+            assert!(internal.contains("internal fault"), "{internal}");
+            assert!(!internal.contains("reconfigured"), "{internal}");
+            let outside = InstallStatus::HooksReplaced(UNIX_REASONS.open).to_string();
+            assert!(outside.contains("reconfigured SQLite"), "{outside}");
         }
 
         const HOOKS_CHILD_ENV: &str = "RATARMOUNT_TEST_HOOKS_CHILD";
@@ -1615,6 +1742,14 @@ pub fn constructor_observation() -> Option<CtorObservation> {
 /// leaves installation possible for a later call. Once the proof passes, every
 /// result is terminal, a failed VFS-method image check inside the installation
 /// ([`InstallFailure::ForeignVfs`]) included.
+///
+/// The loader proof refuses ([`InstallStatus::NotPrivate`]) an executable
+/// host, anchors in different images, and an image that exports SQLite: on
+/// 64-bit little-endian Linux glibc any defined, externally bindable
+/// `sqlite3*` dynamic symbol ([`HostFailure::SqliteExportedNamed`]) or a
+/// dynamic symbol table it cannot read completely
+/// ([`HostFailure::ExportInspection`]); on macOS an own-handle
+/// `sqlite3_libversion`.
 ///
 /// # Safety
 ///
