@@ -5171,9 +5171,10 @@ fn regression_t13a_unresolved_target_refuses_before_rollback_truncate() {
             let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
             let journal_bytes = fs::read(&journal).unwrap();
             let before = locator(&fx.archive);
-            // Live Io: [`Unresolved::plant`] rewrites the open database, so the
-            // identity gate can fail on that connection before `check_live`.
-            // The stat seam alone is the unresolved entry; the file bytes stay.
+            // Live Io: [`Unresolved::plant`] renames the open database inode
+            // aside and writes a new file at that path, so the identity gate
+            // can fail on the connection before `check_live`. The stat seam
+            // alone is the unresolved entry; the open file's bytes stay.
             let planted = if row == "live" && matches!(how, Unresolved::Io) {
                 Some(Some(FollowedStatErrno::set(libc::EIO)))
             } else {
