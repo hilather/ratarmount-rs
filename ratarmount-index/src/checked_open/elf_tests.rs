@@ -1011,3 +1011,242 @@ fn regression_elf_exports_walk_matches_dlsym() {
     let init = initialization(&image).expect("libc initialization facts");
     check_initialization(&image, init.first_init_array).expect("libc option (b)");
 }
+
+/// Real shared objects compiled at test time (`CC`, split on whitespace,
+/// else `cc`; `skip:` without a C compiler), loaded through the real loader.
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    target_os = "linux",
+    target_env = "gnu"
+))]
+mod real_dso {
+    use std::ffi::CString;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use super::super::super::host::{host_object, same_private_image, Lookup};
+    use super::*;
+
+    /// Compile `source` into `dir/lib{name}.so` with extra link `args`.
+    /// `None` when there is no C compiler.
+    fn shared_object(dir: &Path, name: &str, source: &str, args: &[&str]) -> Option<PathBuf> {
+        let cc_line = std::env::var("CC").unwrap_or_default();
+        let mut words = cc_line.split_whitespace();
+        let cc = words.next().unwrap_or("cc").to_owned();
+        let c = dir.join(format!("{name}.c"));
+        let so = dir.join(format!("lib{name}.so"));
+        std::fs::write(&c, source).unwrap();
+        let built = Command::new(&cc)
+            .args(words)
+            .args(["-shared", "-fPIC", "-O1", "-pthread", "-o"])
+            .arg(&so)
+            .arg(&c)
+            .args(args)
+            .status();
+        match built {
+            Ok(status) if status.success() => Some(so),
+            Ok(status) => panic!("{name}.c did not compile with {cc:?}: {status}"),
+            Err(e) => {
+                eprintln!("skip: no C compiler ({cc:?}: {e})");
+                None
+            }
+        }
+    }
+
+    struct Loaded(*mut libc::c_void);
+
+    impl Loaded {
+        fn open(path: &Path) -> Self {
+            let c = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: loading a fixture compiled by this test; its
+            // initializers are the code under test and are harmless.
+            let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+            assert!(!handle.is_null(), "dlopen {path:?}: {:?}", unsafe {
+                std::ffi::CStr::from_ptr(libc::dlerror())
+            });
+            Self(handle)
+        }
+
+        fn sym(&self, name: &std::ffi::CStr) -> usize {
+            let p = unsafe { libc::dlsym(self.0, name.as_ptr()) } as usize;
+            assert_ne!(p, 0, "missing {name:?}");
+            p
+        }
+    }
+
+    impl Drop for Loaded {
+        fn drop(&mut self) {
+            unsafe { libc::dlclose(self.0) };
+        }
+    }
+
+    const TARGET: &str = r#"
+static int ctor_ran;
+/* Priority 101: sorted before the CRT's unprioritized entries, so this is
+   init-array entry zero (what F3 checks). */
+__attribute__((constructor(101))) void pub_target_constructor(void) { ctor_ran = 1; }
+/* A harmless exported entry point: 1 before the constructor ran, 2 after. */
+int pub_target_ping(void) { return ctor_ran ? 2 : 1; }
+"#;
+
+    const DEPENDENCY: &str = r#"
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
+/* The target's exported entry point; bound when this dependency is
+   relocated, before any initializer of the target's load runs. */
+extern int pub_target_ping(void);
+static int (*_Atomic slot)(void);
+static atomic_int done;
+static int seen = -1;
+static void *run(void *arg) {
+    int (*f)(void);
+    (void)arg;
+    while (!(f = atomic_load(&slot))) sched_yield();
+    seen = f();
+    atomic_store(&done, 1);
+    return 0;
+}
+__attribute__((constructor)) static void pubdep_init(void) {
+    pthread_t worker;
+    /* The worker exists first; then the entry point is published to it. */
+    if (pthread_create(&worker, 0, run, 0) != 0) return;
+    atomic_store(&slot, &pub_target_ping);
+    while (!atomic_load(&done)) sched_yield();
+    pthread_join(worker, 0);
+}
+int pubdep_seen(void) { return seen; }
+void *pubdep_published(void) { return (void *)atomic_load(&slot); }
+"#;
+
+    /// Regression (r11 S6, issue #192, the publication counterexample): a
+    /// dependency B of a target image A obtains A's exported entry point
+    /// and hands it to a worker thread that calls it, all inside B's
+    /// initializer, before A's constructor runs. A exports no `sqlite3*`
+    /// name, its constructor is init-array entry zero, and its `DT_INIT` is
+    /// no export: image ownership (F1), the full export walk (F2) and option
+    /// (b) (F3) all accept A. The checks do not see the publication; that
+    /// exclusivity stays the documented caller contract of
+    /// `install_private_instance`, not a property any of them proves. The
+    /// published capability is harmless (no SQLite is involved).
+    #[test]
+    fn regression_dependency_publication_is_not_proved() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let Some(_dep) = shared_object(dir, "pubdep", DEPENDENCY, &[]) else {
+            return;
+        };
+        let rpath = format!("-Wl,-rpath,{}", dir.display());
+        let link = format!("-L{}", dir.display());
+        let Some(target) = shared_object(
+            dir,
+            "pubtarget",
+            TARGET,
+            &[&link, &rpath, "-Wl,--no-as-needed", "-lpubdep"],
+        ) else {
+            return;
+        };
+        let lib = Loaded::open(&target);
+        let ctor = lib.sym(c"pub_target_constructor");
+        let ping = lib.sym(c"pub_target_ping");
+        let seen = lib.sym(c"pubdep_seen");
+        let published = lib.sym(c"pubdep_published");
+        // SAFETY: the fixture's functions, with these C signatures.
+        let (seen, published, ping_fn) = unsafe {
+            let seen: extern "C" fn() -> i32 = std::mem::transmute(seen);
+            let published: extern "C" fn() -> usize = std::mem::transmute(published);
+            let ping_fn: extern "C" fn() -> i32 = std::mem::transmute(ping);
+            (seen(), published(), ping_fn)
+        };
+
+        // The publication happened: B's worker called A's entry point before
+        // A's constructor ran.
+        assert_eq!(seen, 1, "the worker did not call A before its constructor");
+        assert_eq!(published, ping, "the published pointer is A's export");
+        assert_eq!(ping_fn(), 2, "A's constructor ran afterwards");
+
+        // A's own observations accept it.
+        let image = same_private_image(&host_object, &[("constructor", ctor), ("module", ping)])
+            .expect("F1: one non-main image");
+        assert_eq!(host_object(published), Lookup::Found(image));
+        let elf = image_containing(ctor).unwrap();
+        assert_eq!(elf.id, image.id);
+        let exports = image_exports_no_sqlite(&elf).expect("F2: no sqlite3* export");
+        assert!(exports >= 2, "{exports}");
+        let init = check_initialization(&elf, ctor).expect("F3 (b): entry zero, DT_INIT no export");
+        assert_eq!(init.first_init_array, ctor);
+    }
+
+    /// Regression (r11 S6, F3 option (b) on real images): an exported custom
+    /// initializer (`-Wl,-init=` an exported function) refuses as
+    /// `ExportedDtInit`; a hidden one passes (an assumption, not an
+    /// observation); a protected `sqlite3*` export that is not
+    /// `sqlite3_libversion` refuses the full export walk.
+    #[test]
+    fn regression_dso_initializer_and_export_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let source = r#"
+static int ran;
+__attribute__((constructor(101))) void rows_constructor(void) { ran |= 1; }
+void rows_custom_init(void) { ran |= 2; }
+__attribute__((visibility("hidden"))) void rows_hidden_init(void) { ran |= 4; }
+int rows_ran(void) { return ran; }
+"#;
+        let Some(exported) =
+            shared_object(dir, "rowsexported", source, &["-Wl,-init=rows_custom_init"])
+        else {
+            return;
+        };
+        let lib = Loaded::open(&exported);
+        let ran: extern "C" fn() -> i32 = unsafe { std::mem::transmute(lib.sym(c"rows_ran")) };
+        assert_eq!(ran(), 3, "the custom initializer and the constructor ran");
+        let ctor = lib.sym(c"rows_constructor");
+        let elf = image_containing(ctor).unwrap();
+        let init = initialization(&elf).unwrap();
+        assert_eq!(init.dt_init, Some(lib.sym(c"rows_custom_init")));
+        assert_eq!(
+            check_initialization(&elf, ctor),
+            Err(InitRefusal::ExportedDtInit(SymbolName::from_prefix(
+                b"rows_custom_init",
+                false
+            )))
+        );
+        drop(lib);
+
+        let Some(hidden) =
+            shared_object(dir, "rowshidden", source, &["-Wl,-init=rows_hidden_init"])
+        else {
+            return;
+        };
+        let lib = Loaded::open(&hidden);
+        let ran: extern "C" fn() -> i32 = unsafe { std::mem::transmute(lib.sym(c"rows_ran")) };
+        assert_eq!(ran(), 5, "the hidden initializer and the constructor ran");
+        let ctor = lib.sym(c"rows_constructor");
+        let elf = image_containing(ctor).unwrap();
+        let init = check_initialization(&elf, ctor).expect("hidden DT_INIT is assumed");
+        assert!(init.dt_init.is_some());
+        drop(lib);
+
+        let sqlite = r#"
+__attribute__((visibility("protected"))) int sqlite3_fake_open(void) { return 0; }
+int rows_other(void) { return 1; }
+"#;
+        let Some(sq) = shared_object(dir, "rowssqlite", sqlite, &[]) else {
+            return;
+        };
+        let lib = Loaded::open(&sq);
+        let elf = image_containing(lib.sym(c"rows_other")).unwrap();
+        assert_eq!(
+            image_exports_no_sqlite(&elf),
+            Err(ExportFailure::Sqlite(SymbolName::from_prefix(
+                b"sqlite3_fake_open",
+                false
+            )))
+        );
+        // The one-name probe this walk replaced did not see it.
+        assert!(unsafe { libc::dlsym(lib.0, c"sqlite3_libversion".as_ptr()) }.is_null());
+    }
+}
