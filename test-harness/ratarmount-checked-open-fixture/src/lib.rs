@@ -104,3 +104,62 @@ pub unsafe extern "C" fn fixture_db_roundtrip(path: *const c_char) -> c_int {
         _ => 1,
     }
 }
+
+/// `{:?}` of a checked-open round trip at `path`: create it through
+/// `open_checked` (`Expect::Fresh`), write a row, reopen it read-only as the
+/// inode just created (`Expect::Existing`) and read the row back. `Ok(..)`
+/// names the value read and both verifications.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string; `buf` is null or points to `len`
+/// writable bytes.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "C" fn fixture_checked_roundtrip(
+    path: *const c_char,
+    buf: *mut u8,
+    len: usize,
+) -> usize {
+    use rusqlite::OpenFlags;
+    use std::os::unix::fs::MetadataExt;
+
+    use checked_open::{open_checked, Expect, NameMode};
+
+    // SAFETY: the caller passes a NUL-terminated path.
+    let path = std::path::PathBuf::from(
+        unsafe { CStr::from_ptr(path) }
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let run = || -> Result<String, String> {
+        let rw = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+        let created =
+            open_checked(&path, rw, NameMode::Path, Expect::Fresh).map_err(|e| format!("{e:?}"))?;
+        created
+            .conn
+            .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (7);")
+            .map_err(|e| e.to_string())?;
+        let first = created.verification;
+        drop(created);
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        let id = (meta.dev(), meta.ino());
+        let reopened = open_checked(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            NameMode::Path,
+            Expect::Existing {
+                id,
+                require_nonempty: true,
+            },
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let x: i64 = reopened
+            .conn
+            .query_row("SELECT x FROM t", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok(format!("{x} {first:?} {:?}", reopened.verification))
+    };
+    // SAFETY: the caller's buffer contract.
+    unsafe { put(&format!("{:?}", run()), buf, len) }
+}

@@ -83,6 +83,13 @@ fn regression_dso_private_instance_installs_after_abstention() {
         unsafe { std::mem::transmute(sym(c"fixture_open_slot")) };
     let roundtrip: unsafe extern "C" fn(*const libc::c_char) -> libc::c_int =
         unsafe { std::mem::transmute(sym(c"fixture_db_roundtrip")) };
+    let checked_at: unsafe extern "C" fn(*const libc::c_char, *mut u8, usize) -> usize =
+        unsafe { std::mem::transmute(sym(c"fixture_checked_roundtrip")) };
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = |name: &str| {
+        CString::new(dir.path().join(name).into_os_string().into_encoded_bytes()).unwrap()
+    };
+    let checked = |db: &CString| text(|b, n| unsafe { checked_at(db.as_ptr(), b, n) });
     // No SQLite in the global scope (a dynamically linked system libsqlite3
     // would be). This cannot see a SQLite linked statically into this
     // executable; `install(0)` returning `PrivateInstance` below is what
@@ -145,6 +152,13 @@ fn regression_dso_private_instance_installs_after_abstention() {
     }
     assert_eq!(status(), before, "a refused proof stores nothing");
     assert_eq!(open_slot(), slot_before);
+    // Before any installation a checked open refuses (it never installs
+    // lazily).
+    let early = checked(&db_path("early.sqlite"));
+    assert!(
+        early.starts_with("Err(\"Refusal { error: Unavailable("),
+        "{early}"
+    );
 
     let first = install(0);
     assert!(
@@ -173,18 +187,20 @@ fn regression_dso_private_instance_installs_after_abstention() {
     let after = status();
     assert!(after.contains(&first), "{after}");
 
-    let dir = tempfile::tempdir().unwrap();
-    let db = CString::new(
-        dir.path()
-            .join("t.sqlite")
-            .into_os_string()
-            .into_encoded_bytes(),
-    )
-    .unwrap();
+    let db = db_path("t.sqlite");
     assert_eq!(
         unsafe { roundtrip(db.as_ptr()) },
         0,
         "database work through the wrappers"
+    );
+    // Regression (r11 S6 skeptic #3): the private install's F6 snapshot
+    // admits checked opens. Only ordinary SQLite opens ran after a real
+    // `PrivateInstance` installation; a missing or wrong snapshot would make
+    // every `open_checked` refuse (`HooksReplaced`) unnoticed.
+    assert_eq!(
+        checked(&db_path("checked.sqlite")),
+        "Ok(\"7 UnixDescriptor UnixDescriptor\")",
+        "checked open after the private install"
     );
 
     drop(tx);
