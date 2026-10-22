@@ -410,9 +410,10 @@ fn published_pointer(
 
 /// Status of the checked SQLite opens (#151), for tests and diagnostics:
 /// `installed`, `why` (`"SingleThread"` / `"PrivateInstance"`),
-/// `threads_at_install`, `status` (the `InstallStatus` when not installed),
-/// `detail` and `constructor` (what the load-time constructor saw). Installs
-/// nothing.
+/// `threads_at_install`, `exports_checked` (how many exported dynamic
+/// symbols the Linux private-instance proof inspected; `None` otherwise),
+/// `status` (the `InstallStatus` when not installed), `detail` and
+/// `constructor` (what the load-time constructor saw). Installs nothing.
 #[pyfunction]
 fn _checked_open_status(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let status = PyDict::new(py);
@@ -421,6 +422,7 @@ fn _checked_open_status(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
             status.set_item("installed", true)?;
             status.set_item("why", format!("{:?}", witness.why))?;
             status.set_item("threads_at_install", witness.threads_at_install)?;
+            status.set_item("exports_checked", witness.exports_checked)?;
             status.set_item("status", "Installed")?;
             status.set_item("detail", "")?;
         }
@@ -428,6 +430,7 @@ fn _checked_open_status(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
             status.set_item("installed", false)?;
             status.set_item("why", py.None())?;
             status.set_item("threads_at_install", py.None())?;
+            status.set_item("exports_checked", py.None())?;
             status.set_item("status", format!("{why_not:?}"))?;
             status.set_item("detail", why_not.to_string())?;
         }
@@ -457,7 +460,8 @@ fn checked_open_installation() -> Result<Witness, InstallStatus> {
         // SAFETY: this is the first operation of the module initializer,
         // before anything is published. The wheel links its SQLite
         // statically with no `sqlite3_*` export (the wheel export audit,
-        // packaging/audit_native_exports.py, checks that), nothing in this
+        // packaging/audit_native_exports.py, checks that; on Linux the
+        // private proof walks every export too), nothing in this
         // image reaches SQLite before this returns, and nothing replaces the
         // hooks or reconfigures SQLite afterwards. A second import (or a
         // reload) gets the terminal result back without installing again.
@@ -522,11 +526,12 @@ mod tests {
     /// opens refuse or take the path-type check on their own).
     #[test]
     fn regression_native_publication_gate_table() {
-        use ratarmount_index::checked_open::{HostFailure, InstallFailure, InstallWhy};
+        use ratarmount_index::checked_open::{ElfError, HostFailure, InstallFailure, InstallWhy};
         for why in [InstallWhy::SingleThread, InstallWhy::PrivateInstance] {
             let witness = Witness {
                 why,
                 threads_at_install: Some(1),
+                exports_checked: Some(7),
             };
             assert_eq!(publication_gate(Ok(witness)), Ok(()));
         }
@@ -555,6 +560,12 @@ mod tests {
             (
                 InstallStatus::NotPrivate(HostFailure::SqliteExported),
                 "exports sqlite3_libversion",
+            ),
+            (
+                InstallStatus::NotPrivate(HostFailure::ExportInspection(ElfError::Bounds(
+                    "symbol table",
+                ))),
+                "could not be inspected",
             ),
             (
                 InstallStatus::Failed(InstallFailure::RestoreFailed("open")),
@@ -612,6 +623,7 @@ mod tests {
                 assert!(get("installed").extract::<bool>()?, "{status}");
                 assert_eq!(get("why").extract::<String>()?, "SingleThread");
                 assert_eq!(get("threads_at_install").extract::<u32>()?, 1);
+                assert!(get("exports_checked").is_none(), "{status}");
                 assert_eq!(get("status").extract::<String>()?, "Installed");
                 assert_eq!(
                     get("constructor").extract::<String>()?,

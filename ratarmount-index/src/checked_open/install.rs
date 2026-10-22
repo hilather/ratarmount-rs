@@ -12,10 +12,8 @@ use std::sync::OnceLock;
 
 use rusqlite::ffi;
 
-use super::host::{
-    host_object, own_handle_symbol, refuse_exported_sqlite, same_private_image, HostFailure,
-    ImageIdentity,
-};
+use super::elf::ExportFailure;
+use super::host::{host_object, same_private_image, HostFailure, ImageIdentity};
 
 /// What the load-time constructor saw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +37,11 @@ pub enum InstallWhy {
 pub struct Witness {
     pub why: InstallWhy,
     pub threads_at_install: Option<u32>,
+    /// How many exported dynamic symbols the Linux private-instance proof
+    /// inspected (none starts with `sqlite3`). `None` for the single-thread
+    /// constructor and on macOS, whose proof keeps the one-name probe.
+    /// Diagnostic evidence, not another authorization.
+    pub exports_checked: Option<u32>,
 }
 
 /// Why the installer failed. Terminal: the installer never runs twice.
@@ -413,10 +416,12 @@ fn os_thread_count() -> Option<u32> {
 }
 
 /// The loader check of design §4: the constructor, `module_anchor` and the
-/// linked SQLite entry points are in one image that is not the executable.
+/// linked SQLite entry points are in one image that is not the executable,
+/// and that image exports no SQLite ([`export_check`]). Returns the image and
+/// how many exports were inspected (Linux).
 pub(crate) fn private_proof(
     module_anchor: *const std::ffi::c_void,
-) -> Result<ImageIdentity, HostFailure> {
+) -> Result<(ImageIdentity, Option<u32>), HostFailure> {
     let anchors = [
         ("constructor", imp::ctor_anchor()),
         ("module", module_anchor as usize),
@@ -434,12 +439,72 @@ pub(crate) fn private_proof(
         ),
     ];
     let image = same_private_image(&host_object, &anchors)?;
+    let exports = export_check(module_anchor as usize, image)?;
+    Ok((image, exports))
+}
+
+/// The private-instance export check, 64-bit little-endian Linux glibc (r11
+/// S6): every defined, externally bindable dynamic symbol of the proof image
+/// is inspected; a `sqlite3*` name, or an inspection that cannot complete,
+/// refuses. Replaces the one-name `sqlite3_libversion` probe there.
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    target_os = "linux",
+    target_env = "gnu"
+))]
+fn export_check(anchor: usize, image: ImageIdentity) -> Result<Option<u32>, HostFailure> {
+    let elf = super::elf::image_containing(anchor).map_err(HostFailure::ExportInspection)?;
+    if elf.id != image.id {
+        return Err(HostFailure::ImageMismatch {
+            what: "export inspection",
+        });
+    }
+    super::elf::image_exports_no_sqlite(&elf)
+        .map(Some)
+        .map_err(export_refusal)
+}
+
+/// Elsewhere (macOS): the own-handle `sqlite3_libversion` probe, a
+/// conservative rejection check (design §4, "Symbol privacy"); the wheel
+/// export audit is the exhaustive check there.
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    target_os = "linux",
+    target_env = "gnu"
+)))]
+fn export_check(anchor: usize, image: ImageIdentity) -> Result<Option<u32>, HostFailure> {
+    use super::host::{own_handle_symbol, refuse_exported_sqlite};
     refuse_exported_sqlite(
         &host_object,
         image,
-        own_handle_symbol(module_anchor as usize, c"sqlite3_libversion"),
+        own_handle_symbol(anchor, c"sqlite3_libversion"),
     )?;
-    Ok(image)
+    Ok(None)
+}
+
+/// A failed export inspection as the private proof reports it.
+#[cfg_attr(
+    not(any(
+        test,
+        all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            target_endian = "little",
+            target_os = "linux",
+            target_env = "gnu"
+        )
+    )),
+    allow(dead_code)
+)]
+fn export_refusal(failure: ExportFailure) -> HostFailure {
+    match failure {
+        ExportFailure::Elf(e) => HostFailure::ExportInspection(e),
+        ExportFailure::Sqlite(name) => HostFailure::SqliteExportedNamed(name),
+    }
 }
 
 /// The installation state, once cells and wrappers of verified targets:
@@ -641,7 +706,7 @@ mod imp {
     pub(super) fn install_real(
         why: InstallWhy,
         threads: Option<u32>,
-        image: Option<ImageIdentity>,
+        image: Option<(ImageIdentity, Option<u32>)>,
         lookup: &dyn Fn(usize) -> Lookup,
     ) -> Result<Witness, InstallFailure> {
         // SAFETY: called only under an exclusion proof.
@@ -652,7 +717,7 @@ mod imp {
         let unix = find_vfs(c"unix", "unix")?;
         let vfses = selected_vfses(unix)?;
         // The selected VFS's methods are checked before any of them is called.
-        if let Some(image) = image {
+        if let Some((image, _)) = image {
             // SAFETY: every entry passed `find_vfs`.
             unsafe { vfs_methods_in_image(lookup, image, &vfses) }
                 .map_err(InstallFailure::ForeignVfs)?;
@@ -685,6 +750,7 @@ mod imp {
         Ok(Witness {
             why,
             threads_at_install: threads,
+            exports_checked: image.and_then(|(_, exports)| exports),
         })
     }
 
@@ -756,7 +822,8 @@ mod imp {
                 status(),
                 Ok(Witness {
                     why: InstallWhy::SingleThread,
-                    threads_at_install: Some(1)
+                    threads_at_install: Some(1),
+                    exports_checked: None,
                 })
             );
             assert_eq!(observation(), Some(CtorObservation::AttemptedSingleThread));
@@ -988,7 +1055,12 @@ mod imp {
                 })
             };
             assert_eq!(
-                install_real(InstallWhy::PrivateInstance, Some(3), Some(OTHER), &lookup),
+                install_real(
+                    InstallWhy::PrivateInstance,
+                    Some(3),
+                    Some((OTHER, None)),
+                    &lookup
+                ),
                 Err(InstallFailure::ForeignVfs(HostFailure::ImageMismatch {
                     what: "unix xOpen"
                 }))
@@ -1174,6 +1246,7 @@ mod tests {
     const PRIVATE: Witness = Witness {
         why: InstallWhy::PrivateInstance,
         threads_at_install: Some(3),
+        exports_checked: Some(9),
     };
 
     // Distinct bodies so no two share an address.
@@ -1375,6 +1448,51 @@ mod tests {
         );
     }
 
+    /// Regression (r11 S6): the Linux private proof walks every export; an
+    /// inspection that cannot complete, or a `sqlite3*` export, refuses
+    /// before any installation and leaves the cell empty (a later valid
+    /// proof still installs). Each refusal names what it saw.
+    #[test]
+    fn regression_private_export_inspection_fails_closed() {
+        use super::super::elf::{ElfError, SymbolName};
+        let named =
+            HostFailure::SqliteExportedNamed(SymbolName::from_prefix(b"sqlite3_open", false));
+        for (failure, refusal, text) in [
+            (
+                ExportFailure::Elf(ElfError::Missing("DT_SYMENT")),
+                HostFailure::ExportInspection(ElfError::Missing("DT_SYMENT")),
+                "could not be inspected: no DT_SYMENT",
+            ),
+            (
+                ExportFailure::Elf(ElfError::WorkLimit("symbols")),
+                HostFailure::ExportInspection(ElfError::WorkLimit("symbols")),
+                "too many symbols",
+            ),
+            (
+                ExportFailure::Sqlite(SymbolName::from_prefix(b"sqlite3_open", false)),
+                named,
+                "exports sqlite3_open",
+            ),
+        ] {
+            assert_eq!(export_refusal(failure), refusal);
+            let shown = InstallStatus::NotPrivate(refusal).to_string();
+            assert!(shown.contains(text), "{shown}");
+            let state = InstallState::new();
+            let calls = AtomicU32::new(0);
+            let got = state.private(
+                || Err::<(), _>(refusal),
+                |()| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(PRIVATE)
+                },
+            );
+            assert_eq!(got, Err(InstallStatus::NotPrivate(refusal)));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(state.status(), Err(InstallStatus::NotRun));
+            assert_eq!(state.private(|| Ok(()), |()| Ok(PRIVATE)), Ok(PRIVATE));
+        }
+    }
+
     /// Regression: a failure after the first mutation must restore the EXACT
     /// captured pointer (not null, which SQLite maps to its built-in default),
     /// be terminal (no second attempt touches the table), and a failed
@@ -1526,29 +1644,45 @@ mod tests {
     /// Regression (r11 S1 review 5): the supported-target predicate matched
     /// big-endian `aarch64_be`, whose ABI is not verified. Every copy (the
     /// `imp` modules, `mod.rs`, `host.rs`, the tests) must be the same
-    /// little-endian predicate.
+    /// little-endian predicate. Regression (r11 S6): the live ELF inspection
+    /// (`elf.rs`, the Linux export check) uses the narrower Linux glibc copy
+    /// of it, which must be identical everywhere too.
     #[test]
     fn regression_target_predicate_copies_agree() {
         let compact = |s: &str| s.split_whitespace().collect::<String>();
-        let predicate = compact(
-            "target_pointer_width = \"64\", \
+        let head = "target_pointer_width = \"64\", \
              any(target_arch = \"x86_64\", target_arch = \"aarch64\"), \
-             target_endian = \"little\", \
-             any(all(target_os = \"linux\", target_env = \"gnu\"), target_os = \"macos\")",
-        );
-        for (file, text, min) in [
-            ("mod.rs", include_str!("mod.rs"), 1),
-            ("install.rs", include_str!("install.rs"), 4),
-            ("host.rs", include_str!("host.rs"), 2),
-            ("acquire.rs", include_str!("acquire.rs"), 3),
+             target_endian = \"little\", ";
+        let predicate = compact(&format!(
+            "{head}any(all(target_os = \"linux\", target_env = \"gnu\"), target_os = \"macos\")"
+        ));
+        let linux = compact(&format!(
+            "{head}target_os = \"linux\", target_env = \"gnu\")"
+        ));
+        for (file, text, min, min_linux) in [
+            ("mod.rs", include_str!("mod.rs"), 1, 1),
+            ("install.rs", include_str!("install.rs"), 4, 3),
+            ("host.rs", include_str!("host.rs"), 2, 0),
+            ("acquire.rs", include_str!("acquire.rs"), 3, 0),
+            ("elf.rs", include_str!("elf.rs"), 0, 1),
+            ("elf_tests.rs", include_str!("elf_tests.rs"), 0, 1),
         ] {
             let text = compact(text);
             let starts = text
                 .matches(&predicate[..predicate.find(',').unwrap()])
                 .count();
             let full = text.matches(predicate.as_str()).count();
+            let full_linux = text.matches(linux.as_str()).count();
             assert!(full >= min, "{file}: {full} copies of the predicate");
-            assert_eq!(starts, full, "{file}: a predicate copy differs");
+            assert!(
+                full_linux >= min_linux,
+                "{file}: {full_linux} copies of the Linux predicate"
+            );
+            assert_eq!(
+                starts,
+                full + full_linux,
+                "{file}: a predicate copy differs"
+            );
         }
     }
 

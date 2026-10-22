@@ -153,6 +153,20 @@ fn regression_dso_private_instance_installs_after_abstention() {
     );
     let slot_after = open_slot();
     assert_ne!(slot_after, slot_before, "the open slot holds the wrapper");
+    // Regression (r11 S6): on Linux the proof walked every export of the
+    // fixture (none is `sqlite3*`) and says how many; macOS keeps the
+    // one-name probe and reports none.
+    if cfg!(target_os = "linux") {
+        let n: u32 = first
+            .split("exports_checked: Some(")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no export count: {first}"));
+        assert!(n > 0, "{first}");
+    } else {
+        assert!(first.contains("exports_checked: None"), "{first}");
+    }
     assert_eq!(install(0), first, "terminal result");
     assert_eq!(install(exe_anchor), first, "terminal result, any anchor");
     assert_eq!(open_slot(), slot_after);

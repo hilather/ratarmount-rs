@@ -81,11 +81,18 @@ def test_regression_native_thread_before_import(tmp_path):
     assert threaded["constructor"].startswith("AbstainedThreads("), threaded
     assert threaded["constructor"] != "AbstainedThreads(Some(1))", threaded
     assert threaded["threads_at_install"] != 1, threaded
+    # Regression (r11 S6): on Linux the private proof walked every exported
+    # dynamic symbol of the repaired `_native` (none is `sqlite3*`).
+    if sys.platform.startswith("linux"):
+        assert threaded["exports_checked"] > 0, threaded
+    else:
+        assert threaded["exports_checked"] is None, threaded
 
     single = _child("single", tmp_path)
     assert single["installed"] is True, single
     assert single["why"] == "SingleThread", single
     assert single["threads_at_install"] == 1, single
+    assert single["exports_checked"] is None, single
     assert single["constructor"] == "AttemptedSingleThread", single
 
 
@@ -94,7 +101,8 @@ def test_regression_native_status_exposes_no_installer():
     the constructor observation; the module publishes no installer."""
     status = native._checked_open_status()
     assert set(status) == {
-        "installed", "why", "threads_at_install", "status", "detail", "constructor",
+        "installed", "why", "threads_at_install", "exports_checked", "status",
+        "detail", "constructor",
     }
     if _supported():
         assert status["installed"] is True, status

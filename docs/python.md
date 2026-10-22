@@ -204,9 +204,17 @@ path-type check. A Rust program that embeds the rlib (`--features embedding`)
 gets only the load-time constructor; threads started before it loads leave
 checked opens refusing, and if that program also registers `_native` (for
 example through `wrap_pymodule!` or the inittab), its import raises the same
-`ImportError`. A wheel you build yourself from the sdist is not audited; the
-module's own check refuses only an image that itself exports
-`sqlite3_libversion`.
+`ImportError`. A wheel you build yourself from the sdist is not audited.
+Before it installs into its private SQLite, the module also checks its own
+image at run time. On Linux (glibc, 64-bit x86_64/aarch64) it reads every
+defined, externally visible dynamic symbol of `_native` and refuses (the
+import raises `ImportError`) if any name starts with `sqlite3` (any case),
+or if the dynamic symbol table cannot be read completely (a malformed table,
+a pointer it cannot place, a work limit). On macOS the check refuses only an
+image that itself exports `sqlite3_libversion`; the wheel audit is the full
+check there. Neither check sees an entry point that something else published
+before the module initialized; that is still the caller contract of the
+private-instance path (#192).
 
 Python's own `sqlite3` module may load a different SQLite library than the
 one inside `_native`; the wheel's SQLite is private, so the two are separate
@@ -221,8 +229,10 @@ instance; it does not make the two share locks. See the platform table in
 
 `ratarmount_rs._native._checked_open_status()` is a diagnostic. It returns a
 dict with `installed`, `why` (`"SingleThread"` or `"PrivateInstance"`),
-`threads_at_install`, `status`, `detail` and `constructor` (what the load-time
-constructor saw, such as `"AbstainedThreads(Some(2))"`). It installs nothing.
+`threads_at_install`, `exports_checked` (how many exported symbols the Linux
+private-instance check read; `None` for the single-thread constructor and on
+macOS), `status`, `detail` and `constructor` (what the load-time constructor
+saw, such as `"AbstainedThreads(Some(2))"`). It installs nothing.
 
 ## Mount from Python
 

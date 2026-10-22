@@ -13,7 +13,8 @@
 //! * by [`install_private_instance`], the first operation of an artifact whose
 //!   SQLite is private to it and not yet reachable
 //!   ([`InstallWhy::PrivateInstance`]), after a loader check that this module,
-//!   the module anchor and SQLite live in one non-executable image.
+//!   the module anchor and SQLite live in one non-executable image and (on
+//!   Linux) that image exports no `sqlite3*` dynamic symbol.
 //!
 //! A database open never installs anything. [`installed`] reports the terminal
 //! result or why nothing was installed. The installed wrappers forward every
@@ -40,6 +41,19 @@
     allow(dead_code)
 )]
 mod acquire;
+// The live image is read only on 64-bit little-endian Linux glibc; elsewhere
+// the parser is exercised by its synthetic tests alone.
+#[cfg_attr(
+    not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        target_os = "linux",
+        target_env = "gnu"
+    )),
+    allow(dead_code)
+)]
+mod elf;
 mod host;
 #[cfg_attr(
     not(all(
@@ -66,6 +80,7 @@ pub use acquire::{
     immutable_uri, open_checked, AcquireError, Acquired, DbId, Expect, NameMode, Refusal,
     Verification,
 };
+pub use elf::{ElfError, SymbolName};
 pub use host::{HostFailure, ImageIdentity};
 pub use install::{
     constructor_observation, install_private_instance, installed, CtorObservation, InstallFailure,

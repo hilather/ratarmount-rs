@@ -8,6 +8,8 @@
 
 use std::fmt;
 
+use super::elf::{ElfError, SymbolName};
+
 /// One loaded image, as the loader reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageIdentity {
@@ -35,6 +37,12 @@ pub enum HostFailure {
     /// The proof image's own handle resolves `sqlite3_libversion` to itself:
     /// its SQLite is exported, so not private (design §4, "Symbol privacy").
     SqliteExported,
+    /// Linux: the proof image's dynamic symbols could not be inspected
+    /// completely (partial inspection never accepts).
+    ExportInspection(ElfError),
+    /// Linux: the proof image exports this `sqlite3*` dynamic symbol (a full
+    /// walk of its defined, externally bindable dynamic symbols).
+    SqliteExportedNamed(SymbolName),
 }
 
 impl fmt::Display for HostFailure {
@@ -48,6 +56,10 @@ impl fmt::Display for HostFailure {
                 write!(f, "{what} is in another image than the constructor")
             }
             Self::SqliteExported => write!(f, "the image exports sqlite3_libversion"),
+            Self::ExportInspection(e) => {
+                write!(f, "the image's dynamic symbols could not be inspected: {e}")
+            }
+            Self::SqliteExportedNamed(name) => write!(f, "the image exports {name}"),
         }
     }
 }
@@ -130,8 +142,10 @@ pub(crate) fn same_image_as(
 /// final-wheel export audit (`packaging/audit_native_exports.py`) is that.
 /// When the probe cannot look (`dladdr` fails, no file name, no
 /// `RTLD_NOLOAD` handle) `found` is `None` and the image is accepted. A wheel
-/// built locally from the sdist is never audited, so this one-symbol check is
-/// its only runtime evidence.
+/// built locally from the sdist is never audited, so on macOS this one-symbol
+/// check is its only runtime evidence. 64-bit Linux glibc walks every export
+/// instead (r11 S6, `elf::image_exports_no_sqlite`).
+#[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
 pub(crate) fn refuse_exported_sqlite(
     lookup: &dyn Fn(usize) -> Lookup,
     image: ImageIdentity,
@@ -147,6 +161,7 @@ pub(crate) fn refuse_exported_sqlite(
 /// (`dladdr`, then `dlopen(RTLD_NOLOAD)`, which loads nothing). `None` when
 /// the image has no handle or the name resolves nowhere.
 #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+#[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
 pub(crate) fn own_handle_symbol(anchor: usize, name: &std::ffi::CStr) -> Option<usize> {
     // SAFETY: `Dl_info` is plain data; `dladdr` fills it or returns 0. The
     // handle from `dlopen(RTLD_NOLOAD)` refers to an already loaded image and
@@ -168,6 +183,7 @@ pub(crate) fn own_handle_symbol(anchor: usize, name: &std::ffi::CStr) -> Option<
 
 /// Every other platform: no loader, nothing found.
 #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
+#[allow(dead_code)]
 pub(crate) fn own_handle_symbol(_anchor: usize, _name: &std::ffi::CStr) -> Option<usize> {
     None
 }
