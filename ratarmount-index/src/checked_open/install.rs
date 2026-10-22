@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use rusqlite::ffi;
 
 use super::elf::ExportFailure;
-use super::host::{host_object, same_private_image, HostFailure, ImageIdentity};
+use super::host::{host_object, same_private_image, HostFailure, ImageIdentity, Lookup};
 
 /// What the load-time constructor saw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,8 +458,21 @@ pub(crate) fn private_proof(
             ffi::sqlite3_open_v2 as *const () as usize,
         ),
     ];
-    let image = same_private_image(&host_object, &anchors)?;
-    let exports = export_check(module_anchor as usize, image)?;
+    proof_decision(&anchors, module_anchor as usize, &host_object, export_check)
+}
+
+/// The decision of [`private_proof`], with the loader lookup and the export
+/// check as parameters so tests drive it: every anchor in one non-executable
+/// image, then that image's export check; either refusal is the proof's
+/// (r11 S6 skeptic: a refusal dropped here passed every test).
+fn proof_decision(
+    anchors: &[(&'static str, usize)],
+    module: usize,
+    lookup: &dyn Fn(usize) -> Lookup,
+    exports: impl FnOnce(usize, ImageIdentity) -> Result<Option<u32>, HostFailure>,
+) -> Result<(ImageIdentity, Option<u32>), HostFailure> {
+    let image = same_private_image(lookup, anchors)?;
+    let exports = exports(module, image)?;
     Ok((image, exports))
 }
 
@@ -1478,7 +1491,8 @@ mod imp {
 
         const HOOKS_CHILD_ENV: &str = "RATARMOUNT_TEST_HOOKS_CHILD";
 
-        /// Child of `regression_hooks_replaced_refuses_before_arming`.
+        /// Child of `regression_hooks_replaced_refuses_before_arming` and
+        /// `regression_hooks_status_is_historical`.
         #[test]
         fn hooks_child() {
             use crate::checked_open::{open_checked, AcquireError, Expect, NameMode};
@@ -1498,6 +1512,7 @@ mod imp {
                 ),
                 "{installed:?}"
             );
+            let observed = observation();
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().canonicalize().unwrap().join("t.sqlite");
             let open = || {
@@ -1550,15 +1565,26 @@ mod imp {
                     original as usize,
                     "no repair"
                 );
-                // The installation history is unchanged.
+                // The installation history is unchanged: `installed()`, the
+                // constructor's observation, and the terminal result a
+                // private initializer gets (nothing reinstalls or repairs).
                 assert_eq!(status(), installed, "{label}");
+                assert_eq!(observation(), observed, "{label}");
+                assert_eq!(private(hooks_child as *const std::ffi::c_void), installed);
+                assert_eq!(
+                    super::super::addr(table.get(name)),
+                    original as usize,
+                    "{label}: a private initializer repairs nothing"
+                );
                 assert_eq!(hooks_intact(), Err(reason));
+                println!("HOOKS-CHILD:historical {label}");
                 // Restoring the exact state lets acquisitions proceed again.
                 assert_eq!(table.set(name, Some(hook)), ffi::SQLITE_OK);
                 assert_eq!(hooks_intact(), Ok(()));
                 let _ = std::fs::remove_file(&db);
                 assert!(open().is_ok(), "{label}: after restoration");
                 assert_eq!(status(), installed);
+                assert_eq!(observation(), observed);
             }
             println!("HOOKS-CHILD:ok");
         }
@@ -1572,6 +1598,29 @@ mod imp {
         /// this process's SQLite slots).
         #[test]
         fn regression_hooks_replaced_refuses_before_arming() {
+            run_hooks_child();
+        }
+
+        /// Regression (r11 S6 fix skeptic #2, addendum §8): while a slot is
+        /// replaced, `installed()`, the constructor's observation and a
+        /// private initializer's terminal result keep the historical
+        /// installation (nothing reinstalls or repairs), and restoring the
+        /// slot changes none of them. Same child as
+        /// `regression_hooks_replaced_refuses_before_arming`; this test
+        /// requires its per-slot historical rows.
+        #[test]
+        fn regression_hooks_status_is_historical() {
+            let stdout = run_hooks_child();
+            for label in ["open", "stat"] {
+                assert!(
+                    stdout.contains(&format!("HOOKS-CHILD:historical {label}\n")),
+                    "{label}: {stdout}"
+                );
+            }
+        }
+
+        /// Run `hooks_child` in a child process; its stdout on success.
+        fn run_hooks_child() -> String {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1582,12 +1631,13 @@ mod imp {
                 .env(HOOKS_CHILD_ENV, "1")
                 .output()
                 .unwrap();
-            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             assert!(
                 out.status.success() && stdout.contains("HOOKS-CHILD:ok"),
                 "child failed: {stdout}\n{}",
                 String::from_utf8_lossy(&out.stderr)
             );
+            stdout
         }
 
         const CHILD_ENV: &str = "RATARMOUNT_TEST_ABSTAIN_CHILD";
@@ -1984,9 +2034,60 @@ mod tests {
     /// inspection that cannot complete, or a `sqlite3*` export, refuses
     /// before any installation and leaves the cell empty (a later valid
     /// proof still installs). Each refusal names what it saw.
+    ///
+    /// Regression (r11 S6 fix skeptic #1): this test fabricated the refusal
+    /// inside `InstallState::private`, so replacing the proof's
+    /// `export_check(..)?` with `.ok().flatten()` passed every test. The
+    /// refusals now go through the proof's own decision ([`proof_decision`],
+    /// called by `private_proof` with the real lookup and export check), and
+    /// the export check must run on the proof's image and module anchor.
     #[test]
     fn regression_private_export_inspection_fails_closed() {
         use super::super::elf::{ElfError, SymbolName};
+        const IMAGE: ImageIdentity = ImageIdentity {
+            id: 0x7000,
+            main: false,
+        };
+        const MODULE: usize = 0x7010;
+        let anchors = [
+            ("constructor", 0x7008),
+            ("module", MODULE),
+            ("sqlite3_open_v2", 0x7020),
+        ];
+        let lookup = |addr: usize| {
+            if (0x7000..0x8000).contains(&addr) {
+                Lookup::Found(IMAGE)
+            } else {
+                Lookup::Unknown
+            }
+        };
+        let seen = Cell::new(None);
+        let check = |result: Result<Option<u32>, HostFailure>| {
+            let seen = &seen;
+            move |module: usize, image: ImageIdentity| {
+                seen.set(Some((module, image)));
+                result
+            }
+        };
+        // A passing inspection: the proof's image and the walked count.
+        assert_eq!(
+            proof_decision(&anchors, MODULE, &lookup, check(Ok(Some(42)))),
+            Ok((IMAGE, Some(42)))
+        );
+        assert_eq!(seen.take(), Some((MODULE, IMAGE)));
+        // An image refusal comes first: the export check does not run.
+        assert_eq!(
+            proof_decision(
+                &[("constructor", 0x9000), ("module", MODULE)],
+                MODULE,
+                &lookup,
+                check(Ok(Some(1)))
+            ),
+            Err(HostFailure::UnknownImage {
+                what: "constructor"
+            })
+        );
+        assert_eq!(seen.take(), None);
         let named =
             HostFailure::SqliteExportedNamed(SymbolName::from_prefix(b"sqlite3_open", false));
         for (failure, refusal, text) in [
@@ -2012,16 +2113,39 @@ mod tests {
             let state = InstallState::new();
             let calls = AtomicU32::new(0);
             let got = state.private(
-                || Err::<(), _>(refusal),
-                |()| {
+                || {
+                    proof_decision(
+                        &anchors,
+                        MODULE,
+                        &lookup,
+                        check(Err(export_refusal(failure))),
+                    )
+                },
+                |(image, exports)| {
+                    assert_eq!((image, exports), (IMAGE, Some(42)));
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(PRIVATE)
                 },
             );
             assert_eq!(got, Err(InstallStatus::NotPrivate(refusal)));
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-            assert_eq!(state.status(), Err(InstallStatus::NotRun));
-            assert_eq!(state.private(|| Ok(()), |()| Ok(PRIVATE)), Ok(PRIVATE));
+            assert_eq!(
+                seen.take(),
+                Some((MODULE, IMAGE)),
+                "checked the proof's image"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing installed");
+            assert_eq!(state.status(), Err(InstallStatus::NotRun), "not terminal");
+            // A later valid proof still installs.
+            let got = state.private(
+                || proof_decision(&anchors, MODULE, &lookup, check(Ok(Some(42)))),
+                |(image, exports)| {
+                    assert_eq!((image, exports), (IMAGE, Some(42)));
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(PRIVATE)
+                },
+            );
+            assert_eq!(got, Ok(PRIVATE));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
     }
 
