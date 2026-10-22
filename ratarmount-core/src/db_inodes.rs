@@ -398,6 +398,57 @@ mod tests {
         (m.dev(), m.ino())
     }
 
+    fn timestamp_ns(seconds: i64, nanos: i64) -> i128 {
+        i128::from(seconds) * 1_000_000_000 + i128::from(nanos)
+    }
+
+    fn mtime_ns(meta: &fs::Metadata) -> i128 {
+        timestamp_ns(meta.mtime(), meta.mtime_nsec())
+    }
+
+    fn ctime_ns(meta: &fs::Metadata) -> i128 {
+        timestamp_ns(meta.ctime(), meta.ctime_nsec())
+    }
+
+    /// Wait until realtime is strictly after `ctime_ns` and in a later Unix
+    /// second, so a 1-second timestamp filesystem still shows an `ftruncate`
+    /// update. Panics if that has not happened within 3 seconds.
+    fn wait_until_next_second(ctime_ns: i128) {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let ctime_sec = ctime_ns / 1_000_000_000;
+        loop {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            let now_ns = i128::from(now.as_secs()) * 1_000_000_000 + i128::from(now.subsec_nanos());
+            if now_ns > ctime_ns && i128::from(now.as_secs()) > ctime_sec {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "realtime did not pass the recorded ctime"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Selects `generic()` on Linux for this thread. macOS always uses it;
+    /// setting the cell there does not change the path.
+    #[must_use]
+    struct ForceGenericGuard;
+
+    impl ForceGenericGuard {
+        fn enter() -> Self {
+            super::unix::FORCE_GENERIC.with(|cell| cell.set(true));
+            Self
+        }
+    }
+
+    impl Drop for ForceGenericGuard {
+        fn drop(&mut self) {
+            super::unix::FORCE_GENERIC.with(|cell| cell.set(false));
+        }
+    }
+
     /// Regression (R10-C, #148): the admitted open refuses every other name
     /// of a registered inode (read, write, `O_TRUNC`, `O_CREAT`, relative to a
     /// directory descriptor) with `PermissionDenied` naming the database,
@@ -530,5 +581,93 @@ mod tests {
         assert_eq!(fs::metadata(&fresh).unwrap().mode() & 0o7777, 0);
         truncated.unwrap();
         assert_eq!(fs::metadata(&existing).unwrap().len(), 0);
+    }
+
+    /// Regression: empty writable `O_TRUNC` on the generic path left ctime and
+    /// mtime unchanged (R10-FIX10). An existing empty read-only `O_TRUNC` open
+    /// must not be reopened (R10-FIX9).
+    #[test]
+    fn regression_generic_open_truncates_empty_writable_file() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let _generic = ForceGenericGuard::enter();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let parent = fs::File::open(dir).unwrap();
+        let past = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+
+        // Mode 0444: a writable reopen is EACCES, and ftruncate on the
+        // read-only descriptor fails, so Ok with unchanged timestamps means
+        // the empty read-only open was not reopened (R10-FIX9).
+        let readonly = dir.join("empty-r");
+        fs::write(&readonly, b"").unwrap();
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&readonly)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o444)).unwrap();
+        let before_r = fs::metadata(&readonly).unwrap();
+        let fd = openat_admitted(
+            Some(parent.as_fd()),
+            Path::new("empty-r"),
+            libc::O_RDONLY | libc::O_TRUNC,
+            0,
+        )
+        .unwrap();
+        let after_r = fs::metadata(&readonly).unwrap();
+        drop(fd);
+        assert_eq!(after_r.len(), 0);
+        assert_eq!(
+            mtime_ns(&after_r),
+            mtime_ns(&before_r),
+            "empty read-only O_TRUNC changed mtime"
+        );
+        assert_eq!(
+            ctime_ns(&after_r),
+            ctime_ns(&before_r),
+            "empty read-only O_TRUNC changed ctime"
+        );
+
+        // FIX9 skipped ftruncate whenever size was 0, so mtime stayed at the
+        // stamped past value. ftruncate(0) updates both timestamps even though
+        // the size stays 0 (R10-FIX10).
+        let writable = dir.join("empty-w");
+        fs::write(&writable, b"").unwrap();
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&writable)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let before_w = fs::metadata(&writable).unwrap();
+        wait_until_next_second(ctime_ns(&before_w));
+        let fd = openat_admitted(
+            Some(parent.as_fd()),
+            Path::new("empty-w"),
+            libc::O_WRONLY | libc::O_TRUNC,
+            0,
+        )
+        .unwrap();
+        let after_w = fs::metadata(&writable).unwrap();
+        drop(fd);
+        assert_eq!(after_w.len(), 0);
+        assert!(
+            mtime_ns(&after_w) > mtime_ns(&before_w),
+            "empty writable O_TRUNC did not update mtime ({} -> {})",
+            mtime_ns(&before_w),
+            mtime_ns(&after_w)
+        );
+        assert!(
+            ctime_ns(&after_w) > ctime_ns(&before_w),
+            "empty writable O_TRUNC did not update ctime ({} -> {})",
+            ctime_ns(&before_w),
+            ctime_ns(&after_w)
+        );
     }
 }
