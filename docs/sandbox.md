@@ -150,6 +150,72 @@ prefix, and current/legacy overlay markers are omitted at every depth.
 Statistics do not require or compare against the original archive; additions
 and modifications are consequently reported together.
 
+## Overlay database locks and commit probes
+
+A writable mount opens `.ratarmount.overlay.sqlite` with the SQLite library
+linked into that process. `overlay-stats` opens that file read-only when
+`symlink_metadata` reports a regular file. A Python process that has imported
+`ratarmount_rs` also contains that bundled library, which is distinct from
+CPython's `sqlite3`. Those two copies must not have the same overlay database,
+or the same index file, open at the same time. Closing one copy's connection
+can release the other's POSIX locks. See
+[SQLite copies in one process](python.md#sqlite-copies-in-one-process).
+
+`commit_overlay` opens `.ratarmount.overlay.sqlite` when `metadata` says the
+path is a regular file and either there is no overlay marker or the length is
+greater than zero. A missing or empty database next to a marker is refused and
+is not opened. A missing file with no marker is not opened.
+
+On Linux and macOS, `commit_overlay` calls `commit_journal::recover`, which
+opens a regular archive with `File::open`. Recovery follows a
+`user.ratarmount.commit-journal` locator when one is set, and otherwise looks
+for `<canonical-archive>.ratarmount-commit-journal`. A successful in-place
+suffix replacement deletes the journal it created on that canonical path. When
+rebuilding the zstd seek table would need a frame size that does not fit in a
+`u32`, the suffix is published by copy and rename and no journal file is
+created. The default
+`--commit-overlay-mode copy` does not write a journal.
+
+`is_zip_archive` opens its path with `File::open`. `live_commit_is_supported`
+calls it on the archive, then opens the archive again in `detect_compression`.
+It calls `is_uncompressed_tar` only when that detection returns uncompressed.
+When detection returns zstd, a name ending in `.tar.zst`, `.tzst`, or
+`.tar.zstd` is accepted without reading a decompressed body. Gzip, bzip2, and
+xz are rejected in that function, including a `.tar.zst` name whose magic is
+one of those formats. `commit_overlay` also calls `is_zip_archive` when it does
+not return through the manifest or metadata path.
+
+`is_uncompressed_tar` opens the archive on the uncompressed arm of
+`commit_overlay_tar`. A default `copy` commit with no `--commit-manifest` and
+no metadata or xattr changes reaches that arm only when `is_zip_archive` is
+false and `detect_compression` returns uncompressed. `commit_overlay_tar` opens
+the archive in `detect_compression` before that check. Gzip, bzip2, and xz take
+the other arm, where `is_uncompressed_tar` opens the decompressed temporary,
+and only when there is no `--commit-manifest` and no metadata or xattr plan.
+Zstd is handled by `commit_overlay_tar_zst` and does not call
+`is_uncompressed_tar`. Any `--commit-manifest` sets `manifest_hashes` and calls
+`live_commit_is_supported` first, which rejects gzip, bzip2, and xz.
+
+A non-empty plan with metadata or xattr changes, or with `--commit-manifest`
+and hash mode `all` or `new`, asks for confirmation unless `--yes` is set. A
+declined confirmation returns before the plan is applied and before
+`commit_overlay_tar`. If it proceeds, `persist_provenance_plan` applies the
+plan. Copy mode rewrites an uncompressed archive or splices `.tar.zst`. Append
+mode, and auto when the archive has one hard link and nothing was deleted, may
+replace a suffix in place. A sidecar whose tarstats still match is patched
+afterward; a stale sidecar is removed before the archive changes. A manifest
+file is written on this path only when `--commit-manifest` was set.
+`commit_overlay` then returns before `commit_overlay_tar`.
+`--commit-manifest --manifest-hashes none` with no metadata or xattr changes
+calls `live_commit_is_supported` and does not call `persist_provenance_plan`.
+ZIP, gzip, bzip2, and xz stop in that check. An uncompressed TAR, or a zstd
+TAR that passes the check, continues into `commit_overlay_tar`, and a
+successful TAR commit then writes the manifest.
+
+This build has no `--journal` FUSE operation-log writer and does not hash the
+base archive on a background task. It has no overlay `seal` or `unseal`, and
+it does not walk the overlay tree changing modes around a seal connection.
+
 ## diff
 
 Export an attempt's patch offline, without a mount or a Git executable:
