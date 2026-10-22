@@ -392,11 +392,7 @@ fn tables(image: &ElfImage<'_>, d: &Dynamic) -> Result<Tables, ElfError> {
         return Err(ElfError::Bounds("string table"));
     }
     let sysv = match d.hash {
-        Some(raw) => {
-            let h = image.table_ptr(raw, "DT_HASH")?;
-            let nchain = h.checked_add(4).ok_or(ElfError::Bounds("DT_HASH"))?;
-            Some(image.u32_at(nchain, "DT_HASH")? as usize)
-        }
+        Some(raw) => Some(sysv_symbol_count(image, image.table_ptr(raw, "DT_HASH")?)?),
         None => None,
     };
     let gnu = match d.gnu_hash {
@@ -430,6 +426,62 @@ fn tables(image: &ElfImage<'_>, d: &Dynamic) -> Result<Tables, ElfError> {
         strtab,
         strsz,
     })
+}
+
+/// The number of dynamic symbols a SysV hash table covers: `nchain`, once
+/// every index the loader can reach is below it. glibc's SysV lookup never
+/// reads `nchain`; it follows `bucket[h % nbucket]` and then `chain[i]` to
+/// a zero. So the bucket and chain arrays must lie in readable memory, and
+/// every bucket's chain is walked to its terminator: an index at or past
+/// `nchain` refuses (a shrunken `nchain` would otherwise hide symbols the
+/// loader still binds). A valid table visits each symbol at most once, so
+/// more than `nbucket + nchain` steps (a cycle) refuses, as does
+/// [`MAX_HASH_STEPS`].
+fn sysv_symbol_count(image: &ElfImage<'_>, h: usize) -> Result<usize, ElfError> {
+    const WHAT: &str = "DT_HASH";
+    let field = |k: usize| h.checked_add(k).ok_or(ElfError::Bounds(WHAT));
+    let nbucket = image.u32_at(h, WHAT)? as usize;
+    let nchain = image.u32_at(field(4)?, WHAT)? as usize;
+    if nbucket == 0 {
+        return Err(ElfError::Malformed("SysV hash (no buckets)"));
+    }
+    if nchain > MAX_SYMBOLS {
+        return Err(ElfError::WorkLimit("symbols"));
+    }
+    let buckets = field(8)?;
+    let chains = nbucket
+        .checked_mul(4)
+        .and_then(|b| buckets.checked_add(b))
+        .ok_or(ElfError::Bounds(WHAT))?;
+    let chain_len = nchain.checked_mul(4).ok_or(ElfError::Bounds(WHAT))?;
+    if !image.contains(buckets, chains - buckets, PF_R)
+        || (chain_len > 0 && !image.contains(chains, chain_len, PF_R))
+    {
+        return Err(ElfError::Bounds(WHAT));
+    }
+    let limit = nbucket.saturating_add(nchain).min(MAX_HASH_STEPS);
+    let mut steps = 0usize;
+    for b in 0..nbucket {
+        let mut i = image.u32_at(buckets + b * 4, WHAT)? as usize;
+        loop {
+            steps += 1;
+            if steps > limit {
+                return Err(if limit == MAX_HASH_STEPS {
+                    ElfError::WorkLimit("hash-table steps")
+                } else {
+                    ElfError::Malformed("SysV hash (chain cycle)")
+                });
+            }
+            if i == 0 {
+                break;
+            }
+            if i >= nchain {
+                return Err(ElfError::Malformed("SysV hash (index past nchain)"));
+            }
+            i = image.u32_at(chains + i * 4, WHAT)? as usize;
+        }
+    }
+    Ok(nchain)
 }
 
 /// The number of dynamic symbols a GNU hash table covers: one past the

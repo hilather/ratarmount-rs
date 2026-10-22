@@ -66,5 +66,27 @@ check aarch64-apple-darwin -p ratarmount-core -p ratarmount-index -p ratarmount-
 # on musl (CI builds no musl target).
 CROSS_CHECK_RUSTFLAGS="" check x86_64-unknown-linux-musl -p ratarmount-core -p ratarmount-index -p ratarmount-compositing \
   --all-targets
+# A 32-bit target (R11-S6-FIX3): portable tests must not use addresses or
+# shifts that overflow a 32-bit `usize` (`1 << 40` as a load bias). That
+# deny-by-default `arithmetic_overflow` lint runs during code generation,
+# which `cargo check` skips, so the lib test harness is compiled
+# (`cargo rustc --profile test`) and "linked" with `true`.
+codegen_tests() {
+  local target="$1"
+  shift
+  if ! grep -qx "$target" <<<"$installed"; then
+    echo "skip: rust target $target is not installed"
+    return
+  fi
+  local var="${target//-/_}"
+  echo "== cargo rustc --target $target --profile test $* (codegen, no link)"
+  if ! env "CC_$var=$STUB_DIR/cc" "AR_$var=ar" CARGO_TARGET_DIR="$TARGET_DIR" \
+    cargo rustc --manifest-path "$ROOT/Cargo.toml" --target "$target" --profile test "$@" \
+    -- -C linker=true; then
+    echo "FAIL: cargo rustc --target $target --profile test $*" >&2
+    failed=1
+  fi
+}
+codegen_tests i686-unknown-linux-gnu -p ratarmount-index --lib
 
 exit "$failed"

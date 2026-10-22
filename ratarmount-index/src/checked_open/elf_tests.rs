@@ -93,6 +93,7 @@ struct Built {
     code_off: usize,
     dyn_len: usize,
     strsz: usize,
+    sysv_off: usize,
     gnu_off: usize,
 }
 
@@ -163,7 +164,9 @@ fn build(spec: &Spec) -> Built {
         let symtab_end = SYMTAB_OFF + n * SYM_SIZE;
         let strtab_off = symtab_end;
         let sysv_off = (strtab_off + strtab.len() + 7) & !7;
-        let gnu_off = sysv_off + 16;
+        // SysV: one bucket, a chain over every symbol (header, bucket, n
+        // chain words).
+        let gnu_off = (sysv_off + 12 + 4 * n + 7) & !7;
         let symoffset = 1 + spec.unhashed;
         let hashed = n.saturating_sub(symoffset);
         let gnu_len = 16 + 8 + 4 + 4 * hashed;
@@ -187,9 +190,16 @@ fn build(spec: &Spec) -> Built {
             put(&mut bytes, SYMTAB_OFF + (i + 1) * SYM_SIZE, &e);
         }
         put(&mut bytes, strtab_off, &strtab);
-        // SysV: nbucket = 1, nchain = n, bucket 0, chain zeros (unused).
+        // SysV: nbucket = 1, nchain = n; bucket 0 starts at the last symbol
+        // and each chain word names the one before it (the hash function
+        // does not matter: the inspection checks reachability only).
         put(&mut bytes, sysv_off, &1u32.to_le_bytes());
         put(&mut bytes, sysv_off + 4, &(n as u32).to_le_bytes());
+        put(&mut bytes, sysv_off + 8, &((n - 1) as u32).to_le_bytes());
+        for i in 0..n {
+            let next = i.saturating_sub(1) as u32;
+            put(&mut bytes, sysv_off + 12 + 4 * i, &next.to_le_bytes());
+        }
         // GNU: one bucket, one bloom word.
         put(&mut bytes, gnu_off, &1u32.to_le_bytes());
         put(&mut bytes, gnu_off + 4, &(symoffset as u32).to_le_bytes());
@@ -255,6 +265,7 @@ fn build(spec: &Spec) -> Built {
             code_off,
             dyn_len,
             strsz: strtab.len(),
+            sysv_off,
             gnu_off,
         }
     }
@@ -520,15 +531,18 @@ fn regression_elf_dynamic_bounds() {
         gnu: false,
         ..Spec::default()
     });
-    let sysv_off = (SYMTAB_OFF + 3 * SYM_SIZE + built.strsz + 7) & !7;
+    let sysv_off = built.sysv_off;
     built.bytes[sysv_off + 4..sysv_off + 8]
         .copy_from_slice(&(MAX_SYMBOLS as u32 + 1).to_le_bytes());
     assert_eq!(
         image_exports_no_sqlite(&built.image()),
         Err(ExportFailure::Elf(ElfError::WorkLimit("symbols")))
     );
-    // A symbol table running past the image.
-    built.bytes[sysv_off + 4..sysv_off + 8].copy_from_slice(&100_000u32.to_le_bytes());
+    // A symbol table running past the image (its 500 chain words still fit
+    // before the code area; the symbols do not).
+    assert!(sysv_off + 12 + 4 * 500 <= built.code_off);
+    assert!(SYMTAB_OFF + 500 * SYM_SIZE > built.code_off + CODE_LEN);
+    built.bytes[sysv_off + 4..sysv_off + 8].copy_from_slice(&500u32.to_le_bytes());
     assert_eq!(
         image_exports_no_sqlite(&built.image()),
         Err(ExportFailure::Elf(ElfError::Bounds("symbol table")))
@@ -590,7 +604,9 @@ fn regression_elf_name_budget_spans_the_walk() {
         adjusted: false,
         ..with_syms(syms)
     });
-    let image = built.image_at(1 << 40);
+    // Above the image (64 MiB of names) so raw table offsets and relocated
+    // pointers never both map; representable on 32-bit targets too.
+    let image = built.image_at(1 << 30);
     assert_eq!(
         for_each_export(&image, &mut |_| true),
         Err(ElfError::WorkLimit("name bytes"))
@@ -777,8 +793,8 @@ fn regression_elf_gnu_hash_bounds() {
     };
     // Conflicting dual counts.
     let mut built = build(&spec);
-    let sysv_off = built.gnu_off - 16;
-    built.bytes[sysv_off + 4..sysv_off + 8].copy_from_slice(&3u32.to_le_bytes());
+    let sysv_off = built.sysv_off;
+    built.bytes[sysv_off + 4..sysv_off + 8].copy_from_slice(&5u32.to_le_bytes());
     assert_eq!(
         image_exports_no_sqlite(&built.image()),
         Err(ExportFailure::Elf(ElfError::Malformed(
@@ -854,6 +870,99 @@ fn regression_elf_gnu_hash_bounds() {
         gnu_symbol_count(&image, BIAS),
         Err(ElfError::WorkLimit("hash-table steps"))
     );
+}
+
+/// Regression (r11 S6 skeptic #1): the SysV `DT_HASH` count was `nchain`,
+/// read without checking the buckets or chains. glibc's SysV lookup never
+/// reads `nchain` (it follows `bucket[h % nbucket]` and `chain[i]` to a
+/// zero), so shrinking `nchain` from 4 to 1 hid a `sqlite3*` export the
+/// loader still binds, and the inspection accepted (`Ok(0)`). Now every
+/// chain is walked: an index at or past `nchain`, no buckets, a cycle, and
+/// bucket or chain arrays outside readable memory refuse; a broken SysV
+/// table refuses even when a valid GNU table is present.
+#[test]
+fn regression_elf_sysv_hash_chains_bound_nchain() {
+    let sysv = Spec {
+        syms: vec![
+            func("a", GLOBAL, DEFAULT, 0),
+            func("b", GLOBAL, DEFAULT, 1),
+            func("sqlite3_hidden_by_nchain", GLOBAL, DEFAULT, 2),
+        ],
+        gnu: false,
+        sysv: true,
+        ..Spec::default()
+    };
+    // The well-formed table: every symbol reachable, the export found.
+    assert_eq!(name_of(exports(&sysv)), "sqlite3_hidden_by_nchain");
+    let edit = |f: &dyn Fn(&mut Built)| {
+        let mut built = build(&sysv);
+        f(&mut built);
+        image_exports_no_sqlite(&built.image())
+    };
+    let word = |b: &mut Built, k: usize, v: u32| {
+        let at = b.sysv_off + 4 * k;
+        b.bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    let malformed = |what| Err(ExportFailure::Elf(ElfError::Malformed(what)));
+    // The skeptic's repro: nchain 4 -> 1 (was Ok(0)).
+    assert_eq!(
+        edit(&|b| word(b, 1, 1)),
+        malformed("SysV hash (index past nchain)")
+    );
+    // nchain 4 -> 3: the export (index 3) is the bucket head.
+    assert_eq!(
+        edit(&|b| word(b, 1, 3)),
+        malformed("SysV hash (index past nchain)")
+    );
+    // A chain word past nchain (chain[2] is word 3 + 2).
+    assert_eq!(
+        edit(&|b| word(b, 5, 9)),
+        malformed("SysV hash (index past nchain)")
+    );
+    // A cycle: chain[1] -> 3 -> 2 -> 1 -> 3 ...
+    assert_eq!(
+        edit(&|b| word(b, 4, 3)),
+        malformed("SysV hash (chain cycle)")
+    );
+    // A self-loop at the bucket head.
+    assert_eq!(
+        edit(&|b| word(b, 6, 3)),
+        malformed("SysV hash (chain cycle)")
+    );
+    // No buckets.
+    assert_eq!(
+        edit(&|b| word(b, 0, 0)),
+        malformed("SysV hash (no buckets)")
+    );
+    // A bucket array past the readable image.
+    assert_eq!(
+        edit(&|b| word(b, 0, 0x0100_0000)),
+        Err(ExportFailure::Elf(ElfError::Bounds("DT_HASH")))
+    );
+    // A chain array past the readable image (nchain within the symbol
+    // limit, larger than the image).
+    assert_eq!(
+        edit(&|b| word(b, 1, 0x0004_0000)),
+        Err(ExportFailure::Elf(ElfError::Bounds("DT_HASH")))
+    );
+    // nchain above the symbol limit.
+    assert_eq!(
+        edit(&|b| word(b, 1, (MAX_SYMBOLS + 1) as u32)),
+        Err(ExportFailure::Elf(ElfError::WorkLimit("symbols")))
+    );
+    // Both tables: a broken SysV table refuses although the GNU table (the
+    // one glibc uses) is valid and the counts would agree.
+    let both = Spec {
+        gnu: true,
+        ..sysv.clone()
+    };
+    let mut built = build(&both);
+    word(&mut built, 5, 9);
+    assert_eq!(
+        image_exports_no_sqlite(&built.image()),
+        malformed("SysV hash (index past nchain)")
+    );
+    assert_eq!(name_of(exports(&both)), "sqlite3_hidden_by_nchain");
 }
 
 /// Regression (r11 S6, F3 option (b), issue #192): the original F3 required
@@ -1095,9 +1204,19 @@ fn regression_elf_exports_walk_matches_dlsym() {
     assert!(by_name.contains_key(&b"qsort"[..]));
     assert!(checked > 500, "{checked}");
     unsafe { libc::dlclose(handle) };
-    // libc has an init array. Its DT_INIT (absent on current glibc) is
-    // either no export, or option (b) names the export at that address.
-    let init = initialization(&image).expect("libc initialization facts");
+    // libc has an init array on toolchains configured with
+    // `--enable-initfini-array` (every current one); without one there is
+    // nothing for option (b) to compare. Its DT_INIT (absent on current
+    // glibc) is either no export, or option (b) names the export at that
+    // address.
+    let init = match initialization(&image) {
+        Ok(init) => init,
+        Err(InitRefusal::InitArray("no DT_INIT_ARRAY")) => {
+            eprintln!("skip: this libc has no DT_INIT_ARRAY (option (b) rows not run)");
+            return;
+        }
+        Err(other) => panic!("libc initialization facts: {other:?}"),
+    };
     match check_initialization(&image, init.first_init_array) {
         Ok(_) => {}
         Err(InitRefusal::ExportedDtInit(name)) => {
@@ -1153,6 +1272,9 @@ mod real_dso {
             .arg(&c)
             .args(args)
             .status();
+        // Only a missing compiler skips. A compiler that runs and fails
+        // (missing pthread headers, an odd `CC`) panics: a silent skip there
+        // would hide the rows on a host that claims to have a compiler.
         match built {
             Ok(status) if status.success() => Some(so),
             Ok(status) => panic!("{name}.c did not compile with {cc:?}: {status}"),
@@ -1387,6 +1509,66 @@ int rows_other(void) { return 1; }
             Err(HostFailure::ImageMismatch {
                 what: "export inspection"
             })
+        );
+    }
+
+    /// Regression (r11 S6 skeptic #1, on the real loader): a SysV-only
+    /// image (`-Wl,--hash-style=sysv`) whose `DT_HASH` `nchain` is patched
+    /// from its real value to 1. glibc ignores `nchain`, so `dlsym` still
+    /// binds `sqlite3_fake_open` in the patched copy; the inspection
+    /// accepted it (`Ok(0)`) and now refuses as malformed. The unpatched
+    /// image refuses as a SQLite export.
+    #[test]
+    fn regression_dso_sysv_hash_nchain() {
+        if static_executable() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let source = r#"
+int sqlite3_fake_open(void) { return 7; }
+int sysv_other(void) { return 1; }
+"#;
+        let Some(so) = shared_object(dir, "sysvhash", source, &["-Wl,--hash-style=sysv"]) else {
+            return;
+        };
+        let lib = Loaded::open(&so);
+        let elf = image_containing(lib.sym(c"sysv_other")).unwrap();
+        let d = dynamic(&elf).unwrap();
+        assert!(d.gnu_hash.is_none(), "--hash-style=sysv wrote DT_GNU_HASH");
+        let h = elf.table_ptr(d.hash.expect("DT_HASH"), "DT_HASH").unwrap();
+        let nchain = elf.u32_at(h + 4, "DT_HASH").unwrap();
+        assert!(nchain > 2, "{nchain}");
+        assert_eq!(
+            image_exports_no_sqlite(&elf),
+            Err(ExportFailure::Sqlite(SymbolName::from_prefix(
+                b"sqlite3_fake_open",
+                false
+            )))
+        );
+        // The hash table's file offset: the first load segment maps the file
+        // from offset 0 at the load bias (checked against the loaded bytes).
+        let off = h - elf.bias;
+        drop(lib);
+        let mut bytes = std::fs::read(&so).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()),
+            nchain,
+            "DT_HASH is not at its virtual address in the file"
+        );
+        bytes[off + 4..off + 8].copy_from_slice(&1u32.to_le_bytes());
+        let patched = dir.join("libsysvpatched.so");
+        std::fs::write(&patched, &bytes).unwrap();
+        let lib = Loaded::open(&patched);
+        let fake: extern "C" fn() -> i32 =
+            unsafe { std::mem::transmute(lib.sym(c"sqlite3_fake_open")) };
+        assert_eq!(fake(), 7, "glibc binds the export past nchain");
+        let elf = image_containing(lib.sym(c"sysv_other")).unwrap();
+        assert_eq!(
+            image_exports_no_sqlite(&elf),
+            Err(ExportFailure::Elf(ElfError::Malformed(
+                "SysV hash (index past nchain)"
+            )))
         );
     }
 }
