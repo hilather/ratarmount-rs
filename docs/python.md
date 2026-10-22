@@ -200,7 +200,9 @@ includes a write-overlay database (`.ratarmount.overlay.sqlite`) and any index
 the native module opens. `index=None` (the default) and `index="temp"` are a
 temporary on-disk index. `index="sidecar"` or an explicit path uses that path.
 An on-disk index is switched to WAL when it is published, so the same rule
-covers its `-wal`, `-shm`, and `-journal` files while they exist. The public
+covers the `-wal` and `-shm` files that mode creates. A leftover `-journal`
+file from an earlier rollback-journal mode is a separate SQLite file; do not
+open that through both copies either. The public
 archive API does not open the overlay database. `mount()` runs the `ratarmount`
 CLI in a separate process. Opening the overlay file with `sqlite3` while
 `_native` also has it open is unsupported.

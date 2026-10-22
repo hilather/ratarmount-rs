@@ -56,10 +56,12 @@ ratarmount --commit-overlay -w ./changes archive.tar            # prompts; --yes
 ratarmount --commit-overlay --yes -w ./changes --commit-manifest archive.tar.zst
 ```
 
-With default `copy` mode and no metadata or xattr changes, the `archive.tar`
-command opens that archive with `File::open` in commit-journal recovery, in
-`is_zip_archive`, in compression detection, and in `is_uncompressed_tar`, and
-opens it once more to copy the bytes. The `--commit-manifest archive.tar.zst`
+With default `copy` mode, no metadata or xattr changes, and GNU tar on `PATH`,
+the `archive.tar` command opens that archive with `File::open` twice in
+commit-journal recovery (the CLI, then `commit_overlay`), then in
+`is_zip_archive` and in compression detection. After `ensure_gnu_tar`
+succeeds it opens the archive in `is_uncompressed_tar` and once more to copy
+the bytes. The `--commit-manifest archive.tar.zst`
 command's opens before the splice include commit-journal recovery,
 `is_zip_archive`, and compression detection. When the magic is zstd and the
 name ends in `.tar.zst`, `.tzst`, or `.tar.zstd`, it does not call

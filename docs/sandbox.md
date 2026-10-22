@@ -166,10 +166,11 @@ path is a regular file and either there is no overlay marker or the length is
 greater than zero. A missing or empty database next to a marker is refused and
 is not opened. A missing file with no marker is not opened.
 
-On Linux and macOS, `commit_overlay` calls `commit_journal::recover`, which
+`commit_overlay` calls `commit_journal::recover`. On Linux and macOS that
 opens a regular archive with `File::open`. Recovery follows a
-`user.ratarmount.commit-journal` locator when one is set, and otherwise looks
-for `<canonical-archive>.ratarmount-commit-journal`. A successful in-place
+`user.ratarmount.commit-journal` locator when one is set. Otherwise it looks
+beside the canonical archive path, or beside the path as given when
+`canonicalize` fails, for a name ending in `.ratarmount-commit-journal`. A successful in-place
 suffix replacement deletes the journal it created on that canonical path. When
 rebuilding the zstd seek table would need a frame size that does not fit in a
 `u32`, the suffix is published by copy and rename and no journal file is
@@ -177,8 +178,10 @@ created. The default
 `--commit-overlay-mode copy` does not write a journal.
 
 `is_zip_archive` opens its path with `File::open`. `live_commit_is_supported`
-calls it on the archive, then opens the archive again in `detect_compression`.
-It calls `is_uncompressed_tar` only when that detection returns uncompressed.
+calls it on the archive and returns immediately when that probe is true, so a
+ZIP is not opened again. When the probe is false, it opens the archive again
+in `detect_compression`. It calls `is_uncompressed_tar` only when that
+detection returns uncompressed.
 When detection returns zstd, a name ending in `.tar.zst`, `.tzst`, or
 `.tar.zstd` is accepted without reading a decompressed body. Gzip, bzip2, and
 xz are rejected in that function, including a `.tar.zst` name whose magic is
