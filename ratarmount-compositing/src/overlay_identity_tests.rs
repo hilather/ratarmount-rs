@@ -5095,7 +5095,24 @@ fn regression_stale_prepare_locator_unresolved_target_is_kept() {
                         .unwrap()
                         .recover_member_journal(&fx.archive)
                         .unwrap_err();
-                    RecoverError::Refused(std::io::Error::other(error.to_string()))
+                    // Regression (#177): this entry returns `OverlayError`, not
+                    // `RecoverError`. Wrapping the string as `Refused` made the
+                    // variant assert unable to fail. `cannot be classified` is
+                    // the guard (`check_live` → `unusable`). The locator and
+                    // archive bytes below prove nothing was written.
+                    assert!(
+                        error.to_string().contains("cannot be classified"),
+                        "{how:?} live: {error}"
+                    );
+                    drop(seam);
+                    assert_eq!(locator(&fx.archive), before, "{how:?} live: locator kept");
+                    assert_eq!(fs::read(&fx.archive).unwrap(), bytes, "{how:?} live");
+                    assert!(
+                        !ratarmount_compress::commit_journal::journal_path(&fx.archive).exists(),
+                        "{how:?} live: no journal appears"
+                    );
+                    how.cleanup(&fx.overlay);
+                    continue;
                 }
             };
             assert!(
@@ -5110,6 +5127,156 @@ fn regression_stale_prepare_locator_unresolved_target_is_kept() {
                 "{how:?} {row}: no journal appears"
             );
             how.cleanup(&fx.overlay);
+        }
+    }
+}
+
+/// Regression (#178, v4 T13a truncation seam): an unresolved overlay database
+/// beside a journal stopped at the archive-truncate hook is refused before
+/// `rollback truncate`. The rollback truncate seam must not run.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_t13a_unresolved_target_refuses_before_rollback_truncate() {
+    use ratarmount_compress::commit_journal::RecoverError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    /// Clears the truncation seam and undoes [`Unresolved::Access`] even when
+    /// an assert panics.
+    struct Guard {
+        how: Unresolved,
+        overlay: PathBuf,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ratarmount_compress::commit_journal::fault::clear();
+            self.how.cleanup(&self.overlay);
+        }
+    }
+    for how in Unresolved::ALL {
+        for row in ["mount top", "lower only", "offline path", "live"] {
+            let fx = Fixture::new();
+            let live = fx.open(BaseDigestRequest::Compute, false);
+            let live = if row == "live" {
+                Some(live)
+            } else {
+                drop(live);
+                None
+            };
+            interrupt_append(&fx.archive);
+            let bytes = fs::read(&fx.archive).unwrap();
+            let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+            let journal_bytes = fs::read(&journal).unwrap();
+            let before = locator(&fx.archive);
+            // Live Io: [`Unresolved::plant`] rewrites the open database, so the
+            // identity gate can fail on that connection before `check_live`.
+            // The stat seam alone is the unresolved entry; the file bytes stay.
+            let planted = if row == "live" && matches!(how, Unresolved::Io) {
+                Some(Some(FollowedStatErrno::set(libc::EIO)))
+            } else {
+                how.plant(&fx.overlay)
+            };
+            let Some(seam) = planted else {
+                continue;
+            };
+            let _guard = Guard {
+                how,
+                overlay: fx.overlay.clone(),
+            };
+            let fired = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&fired);
+            ratarmount_compress::commit_journal::fault::install(move |step| {
+                if step == "rollback truncate" {
+                    flag.store(true, Ordering::SeqCst);
+                    Err(std::io::Error::other("rollback truncate seam"))
+                } else {
+                    Ok(())
+                }
+            });
+            let db = fx.overlay.join(HIDDEN_DB);
+            let text = match row {
+                "mount top" => {
+                    let records = records_of(&fx);
+                    let error = crate::recover_journal_at(
+                        &fx.archive,
+                        Some(&db),
+                        crate::Owner::Mount {
+                            records: &records,
+                            member: &fx.archive,
+                        },
+                    )
+                    .map(drop)
+                    .unwrap_err();
+                    assert!(
+                        matches!(error, RecoverError::Refused(_)),
+                        "{how:?} {row}: {error:?}"
+                    );
+                    error.to_string()
+                }
+                "lower only" => {
+                    let records = MountRecords {
+                        lowers: vec![fx.overlay.clone()],
+                        ..Default::default()
+                    };
+                    let error = crate::recover_journal_at(
+                        &fx.archive,
+                        None,
+                        crate::Owner::Mount {
+                            records: &records,
+                            member: &fx.archive,
+                        },
+                    )
+                    .map(drop)
+                    .unwrap_err();
+                    assert!(
+                        matches!(error, RecoverError::Refused(_)),
+                        "{how:?} {row}: {error:?}"
+                    );
+                    error.to_string()
+                }
+                "offline path" => {
+                    let error =
+                        crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Inode)
+                            .map(drop)
+                            .unwrap_err();
+                    assert!(
+                        matches!(error, RecoverError::Refused(_)),
+                        "{how:?} {row}: {error:?}"
+                    );
+                    error.to_string()
+                }
+                _ => live
+                    .as_ref()
+                    .unwrap()
+                    .recover_member_journal(&fx.archive)
+                    .unwrap_err()
+                    .to_string(),
+            };
+            assert!(
+                text.contains("cannot be classified"),
+                "{how:?} {row}: {text}"
+            );
+            assert!(
+                !fired.load(Ordering::SeqCst),
+                "{how:?} {row}: rollback truncate ran"
+            );
+            assert_eq!(
+                fs::read(&fx.archive).unwrap(),
+                bytes,
+                "{how:?} {row}: archive"
+            );
+            assert_eq!(
+                fs::read(&journal).unwrap(),
+                journal_bytes,
+                "{how:?} {row}: journal"
+            );
+            assert_eq!(locator(&fx.archive), before, "{how:?} {row}: locator");
+            assert!(journal.exists(), "{how:?} {row}: journal kept");
+            // Held through the recovery call and these asserts.
+            drop(seam);
         }
     }
 }
@@ -5557,6 +5724,62 @@ fn regression_lost_record_refuses_before_recovery() {
                 assert!(fs::read(path).unwrap() == *journal_bytes, "{what}: journal");
             }
         }
+    }
+}
+
+/// Regression (#172): a lost record beside a complete journal is
+/// `RecoverError::Refused`, not `RecoverError::Committed`. A missing `C`
+/// journal is still `Committed` because the guard is not called.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_lost_record_beside_complete_journal_is_refused_not_committed() {
+    use ratarmount_compress::commit_journal::RecoverError;
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for present in [true, false] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        interrupt_complete(&fx.archive);
+        let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+        let journal_bytes = if present {
+            fs::read(&journal).unwrap()
+        } else {
+            fs::remove_file(&journal).unwrap();
+            Vec::new()
+        };
+        lose_db(&fx.overlay, "deleted");
+        let bytes = fs::read(&fx.archive).unwrap();
+        let before = locator(&fx.archive);
+        let db = fx.overlay.join(HIDDEN_DB);
+        let error = crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Inode)
+            .map(drop)
+            .unwrap_err();
+        if present {
+            assert!(
+                matches!(error, RecoverError::Refused(_)),
+                "present journal must be Refused, not Committed: {error:?}"
+            );
+            assert!(
+                error.to_string().contains("missing or empty"),
+                "present: {error}"
+            );
+            assert_eq!(fs::read(&journal).unwrap(), journal_bytes, "journal");
+        } else {
+            assert!(
+                matches!(error, RecoverError::Committed(_)),
+                "missing C journal must stay Committed: {error:?}"
+            );
+            assert_eq!(before.get(4), Some(&b'C'), "locator state {before:?}");
+            assert!(!journal.exists(), "journal stays absent");
+        }
+        assert_eq!(
+            fs::read(&fx.archive).unwrap(),
+            bytes,
+            "archive present={present}"
+        );
+        assert_eq!(locator(&fx.archive), before, "locator present={present}");
     }
 }
 

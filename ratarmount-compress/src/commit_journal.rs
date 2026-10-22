@@ -290,6 +290,26 @@ pub fn recover_with(
 /// clear) and immediately before the rollback, never on the paths that write
 /// nothing (`None`, `D`) or that refuse a missing complete journal (`C`), so
 /// their outcomes keep their error variants.
+///
+/// A guard error on the present-journal path, complete or not, is
+/// [`RecoverError::Refused`]. A lost record beside a complete journal is
+/// therefore `Refused`, not the [`RecoverError::Committed`] a later
+/// `before_unlink` failure on that complete journal would have produced
+/// (#172). A missing `C` journal still returns `Committed` and does not call
+/// the guard. `recover_journal_after_gate` maps `Committed` the same way.
+///
+/// The guard is not atomic with the first write of a present journal (#173,
+/// r10 design v4 §4; that text is not in this tree). After `before_write`
+/// returns, `rollback` validates and `authorize` runs. A mount owner re-reads
+/// its records there (`authorize_mount_recovery`) and a refusal is `Refused`,
+/// before any write. The first write is `rollback truncate` when the journal
+/// is incomplete and the old bytes are not already in place. A record lost
+/// after that write is caught by the `before_unlink` hook: `Rows::with`
+/// re-classifies the rows about to be restamped (`Rows::None` does not), and
+/// a hook error keeps the journal (`Committed` only when the journal is
+/// complete; an incomplete journal's hook error is `Journal`, after the
+/// truncate). The stale-`P` arm does not classify again between the guard and
+/// `clear_marker`.
 pub fn recover_guarded(
     archive: &Path,
     before_write: BeforeWrite,
