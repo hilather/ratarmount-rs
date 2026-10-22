@@ -75,8 +75,8 @@ or xattr changes call `is_uncompressed_tar` on the decompressed temporary after
 created. Any `--commit-manifest` rejects those three formats inside
 `live_commit_is_supported`, before that temporary open. The default mode does
 not write an append-commit journal. A successful in-place suffix replacement
-writes `<archive>.ratarmount-commit-journal` beside the canonical path, or beside the
-path as given when `canonicalize` fails, and deletes that file when the
+canonicalizes the archive first, writes
+`<canonical-path>.ratarmount-commit-journal`, and deletes that file when the
 replacement finishes. See
 [Overlay database locks and commit probes](sandbox.md#overlay-database-locks-and-commit-probes).
 

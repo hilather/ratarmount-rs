@@ -171,11 +171,12 @@ opens a regular archive with `File::open`. Recovery follows a
 `user.ratarmount.commit-journal` locator when one is set. Otherwise it looks
 beside the canonical archive path, or beside the path as given when
 `canonicalize` fails, for a name ending in `.ratarmount-commit-journal`. A
-successful in-place suffix replacement deletes the journal it created on that
-path. When
-rebuilding the zstd seek table would need a frame size that does not fit in a
-`u32`, the suffix is published by copy and rename and no journal file is
-created. The default
+successful in-place suffix replacement canonicalizes the archive first, writes
+`<canonical-path>.ratarmount-commit-journal`, and deletes that file when it
+finishes. If `canonicalize` fails, that replacement returns before creating a
+journal. When rebuilding the zstd seek table would need a frame size that does
+not fit in a `u32`, the suffix is published by copy and rename and no journal
+file is created. The default
 `--commit-overlay-mode copy` does not write a journal.
 
 `is_zip_archive` opens its path with `File::open`. `live_commit_is_supported`
