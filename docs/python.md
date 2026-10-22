@@ -186,6 +186,29 @@ formats, corrupt indexes, cancellation, write-permission and other engine
 errors raise `RatarmountError` with the engine detail. Standard Python I/O
 and mmap errors retain their usual types.
 
+## SQLite copies in one process
+
+`ratarmount_rs._native` links rusqlite's bundled SQLite through
+`ratarmount-index` and `ratarmount-compositing`. CPython's `sqlite3` module is
+another SQLite library in that same process. The two copies keep separate lock
+state. Closing a connection from one copy can release the POSIX locks the other
+copy holds on the same file. SQLite documents this as
+[multiple copies of SQLite linked into the same application](https://www.sqlite.org/howtocorrupt.html#multiple_copies_of_sqlite_linked_into_the_same_application).
+
+Do not open one database file through both copies at the same time. That
+includes a write-overlay database (`.ratarmount.overlay.sqlite`) and any index
+the native module opens. `index=None` (the default) and `index="temp"` are a
+temporary on-disk index. `index="sidecar"` or an explicit path uses that path.
+An on-disk index is switched to WAL when it is published, so the same rule
+covers the `-wal` and `-shm` files that mode creates. A leftover `-journal`
+file from an earlier rollback-journal mode is not part of that WAL pair. The
+public archive API does not open the overlay database. `mount()` runs the
+`ratarmount` CLI in a separate process. Opening the overlay file with
+`sqlite3` while `_native` also has it open is unsupported.
+
+[`clients/python/ratarmount_sandbox.py`](../clients/python/ratarmount_sandbox.py)
+uses the Python standard library only and does not load `_native`.
+
 ## Mount from Python
 
 ```python

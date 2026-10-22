@@ -56,6 +56,30 @@ ratarmount --commit-overlay -w ./changes archive.tar            # prompts; --yes
 ratarmount --commit-overlay --yes -w ./changes --commit-manifest archive.tar.zst
 ```
 
+With default `copy` mode, no metadata or xattr changes, and GNU tar on `PATH`,
+on Linux and macOS an existing uncompressed `archive.tar` is opened with
+`File::open` twice in commit-journal recovery (the CLI, then `commit_overlay`),
+then in `is_zip_archive` and in compression detection. After `ensure_gnu_tar`
+succeeds it opens the archive in `is_uncompressed_tar` and once more to copy
+the bytes. The `--commit-manifest archive.tar.zst`
+command's opens before the splice include commit-journal recovery,
+`is_zip_archive`, and compression detection. When the magic is zstd and the
+name ends in `.tar.zst`, `.tzst`, or `.tar.zstd`, it does not call
+`is_uncompressed_tar`. A non-empty plan is then applied by
+`persist_provenance_plan` after confirmation (`--yes` skips the prompt). A
+sidecar whose tarstats still match is patched; a stale sidecar is removed
+before the archive changes. The manifest is written, and `commit_overlay`
+returns. Gzip, bzip2, and xz without `--commit-manifest` and without metadata
+or xattr changes call `is_uncompressed_tar` on the decompressed temporary after
+`ensure_gnu_tar` succeeds. If GNU tar is missing, that temporary is not
+created. Any `--commit-manifest` rejects those three formats inside
+`live_commit_is_supported`, before that temporary open. The default mode does
+not write an append-commit journal. A successful in-place suffix replacement
+canonicalizes the archive first, writes
+`<canonical-path>.ratarmount-commit-journal`, and deletes that file when the
+replacement finishes. See
+[Overlay database locks and commit probes](sandbox.md#overlay-database-locks-and-commit-probes).
+
 | Archive | Offline commit |
 |---|---|
 | Uncompressed `.tar` | Rewritten; a missing `.tar` is created as an empty base when `-w` is set |
