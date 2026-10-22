@@ -465,7 +465,7 @@ pub(crate) fn private_proof(
 /// check as parameters so tests drive it: every anchor in one non-executable
 /// image, then that image's export check; either refusal is the proof's
 /// (r11 S6 skeptic: a refusal dropped here passed every test).
-fn proof_decision(
+pub(super) fn proof_decision(
     anchors: &[(&'static str, usize)],
     module: usize,
     lookup: &dyn Fn(usize) -> Lookup,

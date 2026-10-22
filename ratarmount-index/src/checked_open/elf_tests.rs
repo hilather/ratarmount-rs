@@ -1242,7 +1242,7 @@ mod real_dso {
     use std::process::Command;
 
     use super::super::super::host::{host_object, same_private_image, HostFailure, Lookup};
-    use super::super::super::install::export_check;
+    use super::super::super::install::{export_check, proof_decision};
     use super::*;
 
     /// A statically linked test executable would load these objects against
@@ -1496,6 +1496,18 @@ int rows_other(void) { return 1; }
         let image = same_private_image(&host_object, &[("module", anchor)]).unwrap();
         assert_eq!(
             export_check(anchor, image),
+            Err(HostFailure::SqliteExportedNamed(SymbolName::from_prefix(
+                b"sqlite3_fake_open",
+                false
+            )))
+        );
+        // Regression (r11 S6 fix skeptic #1): the proof's decision, with the
+        // real loader lookup and the real export check, refuses this image
+        // (its anchor passes the image check). Only `private_proof`'s
+        // one-line delegate to `proof_decision` is not driven negatively:
+        // the test executable's own proof refuses `MainExecutable` first.
+        assert_eq!(
+            proof_decision(&[("module", anchor)], anchor, &host_object, export_check),
             Err(HostFailure::SqliteExportedNamed(SymbolName::from_prefix(
                 b"sqlite3_fake_open",
                 false
