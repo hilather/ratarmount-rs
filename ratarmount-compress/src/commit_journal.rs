@@ -309,7 +309,7 @@ pub fn recover_with(
 /// a hook error keeps the journal (`Committed` only when the journal is
 /// complete; an incomplete journal's hook error is `Journal`, after the
 /// truncate). The stale-`P` arm does not classify again between the guard and
-/// `clear_marker`.
+/// `clear_marker`, and it never calls `before_unlink`.
 pub fn recover_guarded(
     archive: &Path,
     before_write: BeforeWrite,
