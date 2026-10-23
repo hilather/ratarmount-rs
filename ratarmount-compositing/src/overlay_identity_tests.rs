@@ -315,8 +315,16 @@ fn regression_remote_base_without_scheme_creates_without_digest_lookup() {
             keep_alive: Box::new(()),
         })
         .unwrap();
-        for digest in [BaseDigestRequest::Compute, BaseDigestRequest::None] {
-            let overlay = fx.overlay.with_file_name(format!("o-{}", typed.len()));
+        // A second create of the same database path is refused once the
+        // first open has latched it (R11-S8), so each digest uses its own
+        // overlay directory.
+        for (label, digest) in [
+            ("compute", BaseDigestRequest::Compute),
+            ("none", BaseDigestRequest::None),
+        ] {
+            let overlay = fx
+                .overlay
+                .with_file_name(format!("o-{}-{label}", typed.len()));
             let ov = WriteOverlay::open(
                 &token,
                 token.source(),
@@ -5130,10 +5138,7 @@ fn regression_live_recovery_refuses_a_replaced_or_lost_database() {
         let db = fx.overlay.join(HIDDEN_DB);
         fs::rename(&db, fx.overlay.with_file_name("held.sqlite")).unwrap();
         if replaced {
-            rusqlite::Connection::open(&db)
-                .unwrap()
-                .execute_batch("CREATE TABLE files (x)")
-                .unwrap();
+            plant_sqlite_at(&db, "CREATE TABLE files (x)");
         }
         let error = ov
             .recover_member_journal(&fx.archive)
@@ -5179,9 +5184,7 @@ fn regression_restamp_refuses_when_the_record_vanishes_after_authorization() {
                 "emptied" => fs::write(&db2, b"")?,
                 "no files table" => {
                     fs::remove_file(&db2)?;
-                    rusqlite::Connection::open(&db2)
-                        .and_then(|c| c.execute_batch("CREATE TABLE other (x)"))
-                        .map_err(std::io::Error::other)?;
+                    plant_sqlite_at(&db2, "CREATE TABLE other (x)");
                 }
                 _ => {
                     fs::remove_file(&db2)?;
@@ -5223,16 +5226,26 @@ fn regression_restamp_refuses_when_the_record_vanishes_after_authorization() {
     }
 }
 
+/// Put a new SQLite file at `db` without asking SQLite to create that path.
+/// A successful overlay open latches the path (R11-S8); `Connection::open` of
+/// a missing latched path is refused. The file is created under another name
+/// and renamed into place.
+#[cfg(unix)]
+fn plant_sqlite_at(db: &Path, sql: &str) {
+    let planted = db.with_file_name("planted-other.sqlite");
+    let conn = rusqlite::Connection::open(&planted).unwrap();
+    conn.execute_batch(sql).unwrap();
+    drop(conn);
+    fs::rename(&planted, db).unwrap();
+}
+
 /// Replace `overlay`'s database with another SQLite file that has no `files`
 /// table (the marker stays): the record of a used overlay is lost.
 #[cfg(unix)]
 fn replace_db_without_files(overlay: &Path) {
     let db = overlay.join(HIDDEN_DB);
     fs::remove_file(&db).unwrap();
-    rusqlite::Connection::open(&db)
-        .unwrap()
-        .execute_batch("CREATE TABLE other (x); INSERT INTO other VALUES (1)")
-        .unwrap();
+    plant_sqlite_at(&db, "CREATE TABLE other (x); INSERT INTO other VALUES (1)");
     assert!(overlay.join(crate::OVERLAY_MARKER).is_file(), "marker kept");
 }
 

@@ -1771,3 +1771,148 @@ fn regression_vacuum_into_refuses_relative_uri_destination() {
     assert_eq!(count(&Connection::open(&literal).unwrap()), 1);
     assert!(std::fs::symlink_metadata(dir.join("redirected.sqlite")).is_err());
 }
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().expect("file name").to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// The installed `"open"` slot (the S8 hook), not `libc::open`.
+fn hooked_open(path: &Path, flags: libc::c_int) -> (libc::c_int, libc::c_int) {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let c_path = std::ffi::CString::new(bytes).unwrap();
+    unsafe {
+        let vfs = rusqlite::ffi::sqlite3_vfs_find(c"unix".as_ptr());
+        assert!(!vfs.is_null(), "unix VFS");
+        let get = (*vfs).xGetSystemCall.expect("xGetSystemCall");
+        let slot = get(vfs, c"open".as_ptr()).expect("open slot");
+        let open: super::imp::RealOpen = std::mem::transmute(slot);
+        let fd = open(c_path.as_ptr(), flags, 0o644);
+        #[cfg(target_os = "linux")]
+        let err = *libc::__errno_location();
+        #[cfg(target_os = "macos")]
+        let err = *libc::__error();
+        (fd, err)
+    }
+}
+
+/// Regression (R11-S8): one latched inode, probed in DELETE mode, cannot
+/// create `-shm` by switching to WAL. SQLite records WAL in the database
+/// header before it creates the companions, and answers `"wal"` from the
+/// pragma. The write that follows is what opens `-wal` (VFS `xOpen` →
+/// `robust_open`) and would then open `-shm` (`unixOpenSharedMemory` →
+/// `robust_open`, which does not go through VFS `xOpen`). Both creates hit
+/// the hooked `open` and fail closed, so neither file appears. The probe's
+/// own `-journal` create still works. A direct `-shm` create is
+/// [`regression_latched_shm_create_fails_closed`]: this write never reaches
+/// `unixOpenSharedMemory` once `-wal` is refused.
+#[test]
+fn regression_latched_delete_to_wal_cannot_create_shm() {
+    let (_t, dir) = tempdir();
+    let db = dir.join("ov.sqlite");
+    let got = open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap();
+    let id = got.id.expect("inode");
+    crate::checked_open::latch_overlay_nocreate(Some(id), &db);
+    got.conn
+        .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+        .unwrap();
+    let probed: i64 = got
+        .conn
+        .query_row("SELECT x FROM t", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(probed, 1);
+    let mode: String = got
+        .conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    let after: String = got
+        .conn
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, "wal", "SQLite records WAL before creating -wal");
+    let wrote = got.conn.execute("INSERT INTO t VALUES (2)", []);
+    assert!(
+        wrote.is_err(),
+        "WAL write created companions on a latched database: {wrote:?}"
+    );
+    assert!(
+        !sibling(&db, "-shm").exists(),
+        "latched DELETE→WAL created -shm"
+    );
+    assert!(
+        !sibling(&db, "-wal").exists(),
+        "latched DELETE→WAL created -wal"
+    );
+    // The connection is stuck in the WAL mode SQLite recorded in the header
+    // and cannot open `-wal`, so it will not read either. The probe row was
+    // read above, before that pragma.
+    assert_eq!(id_of(&db), id, "same inode");
+}
+
+/// Regression (R11-S8): a direct `O_CREAT` of `{db}-shm` through the installed
+/// `open` slot fails closed and leaves no file. A different name is not
+/// covered by the latch.
+#[test]
+fn regression_latched_shm_create_fails_closed() {
+    let (_t, dir) = tempdir();
+    let db = dir.join("ov.sqlite");
+    let got = open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap();
+    crate::checked_open::latch_overlay_nocreate(got.id, &db);
+    drop(got);
+    let shm = sibling(&db, "-shm");
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
+    let (fd, err) = hooked_open(&shm, flags);
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+    assert!(fd < 0, "latched -shm create returned {fd}");
+    assert_eq!(err, libc::EACCES, "errno {err}");
+    assert!(!shm.exists(), "refused create still left -shm");
+
+    let other = dir.join("other-shm");
+    let (fd, _) = hooked_open(&other, flags);
+    assert!(fd >= 0, "unlatched create was refused");
+    unsafe { libc::close(fd) };
+    assert!(other.is_file());
+}
+
+/// Regression (R11-S8): SQLite resolves a symlink in the directory before it
+/// builds `-shm` (`unixFullPathname`). Latching only the path that was opened
+/// would miss that spelling. The canonical `{db}-shm` is refused too.
+#[test]
+fn regression_latched_shm_create_fails_closed_via_symlink_dir() {
+    let (_t, dir) = tempdir();
+    let real = dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let db = link.join("ov.sqlite");
+    let got = open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap();
+    crate::checked_open::latch_overlay_nocreate(got.id, &db);
+    drop(got);
+    let canonical = std::fs::canonicalize(link.join("ov.sqlite")).unwrap();
+    assert_ne!(canonical, std::path::absolute(&db).unwrap());
+    let shm = sibling(&canonical, "-shm");
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
+    let (fd, err) = hooked_open(&shm, flags);
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+    assert!(fd < 0, "canonical -shm create returned {fd}");
+    assert_eq!(err, libc::EACCES, "errno {err}");
+    assert!(!shm.exists(), "refused create still left -shm");
+}
+
+/// Regression (R11-S8): a checked open that nobody latched can still create
+/// the file again. Index, SQLAR and digest-cache opens stay on that path.
+#[test]
+fn regression_unlatched_checked_open_can_create_again() {
+    let (_t, dir) = tempdir();
+    let db = dir.join("index.sqlite");
+    drop(open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap());
+    std::fs::remove_file(&db).unwrap();
+    drop(open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap());
+    assert!(db.is_file(), "an unlatched checked open refused to create");
+}

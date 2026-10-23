@@ -22,7 +22,13 @@
 //!    open (A→X→A) is refused, and a refused descriptor is never handed to
 //!    SQLite or closed;
 //! 3. that acquired `(dev, ino)` is registered as an open database inode
-//!    ([`ratarmount_core::db_inodes`]) for the connection's life.
+//!    ([`ratarmount_core::db_inodes`]) for the connection's life, and the
+//!    database path plus its `-wal` / `-shm` / `-journal` names are latched
+//!    for the rest of the process ([`ratarmount_index::checked_open::latch_overlay_nocreate`],
+//!    R11-S8): a later checked open of that path cannot create the file, and
+//!    on a verified Unix host neither can an `open` of a missing `-wal` or
+//!    `-shm`. `-journal` stays creatable (DELETE journal mode). Index and
+//!    other checked opens are not latched.
 //!
 //! Nothing here opens a descriptor of its own (R7-H1): on POSIX, closing ANY
 //! descriptor of an inode releases every fcntl lock this process holds on
@@ -299,7 +305,10 @@ pub(crate) fn open_overlay_db_required(
         }
     })?;
     // Only the acquired identity is registered, after SQLite's open: the
-    // registry lock is never held across an open (R10-D).
+    // registry lock is never held across an open (R10-D). The no-create
+    // latch is the same moment: the open has succeeded, and the hook is not
+    // on the stack (it must not run while this lock is held).
+    checked_open::latch_overlay_nocreate(acquired.id, db);
     let registration = acquired
         .id
         .map(|id| ratarmount_core::db_inodes::register_db_inode(id, db));
@@ -542,10 +551,14 @@ mod tests {
             other => panic!("a required missing record must refuse: {other:?}"),
         }
         assert!(!hidden.exists());
-        // Unmarked and never required: created fresh.
-        let fresh = open_overlay_db(&hidden, OpenFlags::default(), DbName::Path).unwrap();
-        assert!(!fresh.required_record());
-        assert_eq!(fresh.id(), file_id(&fs::metadata(&hidden).unwrap()));
+        // The successful opens above latched this path for the process
+        // (R11-S8). Dropping the marker does not make a later Fresh open
+        // create it again.
+        let error = open_overlay_db(&hidden, OpenFlags::default(), DbName::Path).unwrap_err();
+        assert!(
+            !hidden.exists(),
+            "a latched overlay database was created again: {error}"
+        );
     }
 
     /// Regression (#153): a caller-built URI is refused before anything is
@@ -754,5 +767,78 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         holder.execute_batch("COMMIT").unwrap();
+    }
+
+    /// Regression (R11-S8): the first `Expect::Fresh` overlay open creates the
+    /// database (and can write; DELETE mode creates `-journal`). After that
+    /// open succeeds the path is latched, so deleting the file and opening
+    /// again does not create another one.
+    #[test]
+    fn regression_fresh_creates_once_then_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let db = dir.join("fresh.sqlite");
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+        let opened = open_overlay_db(&db, flags, DbName::Path).unwrap();
+        opened
+            .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        assert!(opened.id().is_some());
+        drop(opened);
+        fs::remove_file(&db).unwrap();
+        let error = open_overlay_db(&db, flags, DbName::Path).unwrap_err();
+        assert!(
+            !db.exists(),
+            "a second Fresh open created the database: {error}"
+        );
+        for suffix in ["-shm", "-wal"] {
+            let mut name = db.file_name().unwrap().to_os_string();
+            name.push(suffix);
+            assert!(
+                !dir.join(&name).exists(),
+                "{name:?} appeared on the refused open"
+            );
+        }
+    }
+
+    /// Regression (R11-S8): `Expect::Existing` never creates. The file is
+    /// removed after classification and before SQLite's open (the marker
+    /// stays); no 0-byte database is left beside it.
+    #[test]
+    fn regression_existing_never_creates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let db = dir.join(crate::HIDDEN_DB);
+        let marker = dir.join(crate::OVERLAY_MARKER);
+        real_db(&db);
+        fs::write(&marker, b"").unwrap();
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                AFTER_CLASSIFY.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        let _clear = Clear;
+        AFTER_CLASSIFY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|db| {
+                fs::remove_file(db).unwrap();
+            }))
+        });
+        let error = open_overlay_db(&db, OpenFlags::default(), DbName::Path).unwrap_err();
+        assert!(
+            !db.exists(),
+            "Existing created a database beside the marker: {error}"
+        );
+        assert!(marker.is_file(), "marker removed");
+        for suffix in ["-shm", "-wal", "-journal"] {
+            let mut name = db.file_name().unwrap().to_os_string();
+            name.push(suffix);
+            let path = dir.join(&name);
+            assert!(
+                !path.exists(),
+                "created {} beside the marker",
+                path.display()
+            );
+        }
     }
 }
