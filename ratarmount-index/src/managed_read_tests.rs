@@ -1,4 +1,6 @@
 //! Primitive regressions of the managed byte reader (#151, R11-S7).
+// Most regressions (locks, descriptors, modes) are Unix-only.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use super::*;
 use rusqlite::Connection;

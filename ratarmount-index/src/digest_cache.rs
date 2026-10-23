@@ -263,7 +263,7 @@ fn open_cache_read_only(index: Option<&Path>) -> Option<Cache> {
 /// `create_table`: false for a read-only peek, which must not wait out another
 /// mount creating the table (a missing table is simply a miss).
 /// The VFS names of the cache's writable and read-only connections (tests).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn cache_vfs_names(index: &Path) -> (Option<String>, Option<String>) {
     let vfs = |c: Cache| crate::managed_read::connection_vfs_name(&c.conn);
     (

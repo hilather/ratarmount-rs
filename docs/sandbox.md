@@ -1872,6 +1872,103 @@ Python process. Python's own `sqlite3` module and `_native` may be separate
 SQLite instances; opening one database file through both at once in one
 process is unsupported (#154, see [Python](python.md#import-and-checked-sqlite-opens)).
 
+### Internal reads of index and database files
+
+The same POSIX rule applies to ratarmount's own reads of a file that is open as
+a database in this process: an index read through its pointer, a hash of an
+archive that is an SQLAR, a copy of a cached index blob, the HTTP index
+sidecar. Closing an ordinary `File` of that inode released the connection's
+locks (#151). These internal reads now go through a managed byte reader that
+opens the file through the bundled SQLite's own VFS as a read-only main-database
+byte file (`"unix"`; `"unix-posix"` on macOS). SQLite registers the descriptor
+in its per-inode bookkeeping and, on close, parks it instead of closing it while
+any connection of this SQLite instance holds a lock on the inode; a later read
+reuses the parked descriptor. The byte reader opens no SQL connection, takes no
+lock, never touches `-wal`/`-shm` and never reads the bytes as a database. Each
+read is bounded by the current length (and 128 KiB); a file that shrinks while
+it is read is an error, never a digest over zero fill. No failure falls back to
+an ordinary file read. On Windows the reader reads an ordinary private file.
+
+Covered (each with a regression test; `packaging/internal-read-inventory.json`
+lists every site): index pointers (`{archive}.index.ptr`); the index blob hash
+behind pointer ids, snapshot verification and publication; the `snapshot_index_id`
+copy fallback; the compression probe and decompression input of an index; the
+meta-v3 metadata cache (the `$XDG_CACHE_HOME/ratarmount/meta-v3` LRU of whole
+sidecar downloads: header, blob digest, install copy); the remote index id
+comparison and the copy of a fetched or meta-v3 blob to the local cache name;
+the HTTP sidecar endpoint; index publication (snapshot bytes, atomic copy, Hub
+body) and live-commit publication (Hub, S3, GCS, Azure: sidecar and staged
+archive bodies, multipart parts, MD5 passes); archive digests and their refresh
+after a commit, tarstats edge/full hashes and content hashes; strong directory
+digests, pending-base hashing, `overlay verify`'s strong check and
+`overlay digest-base`; the remote spool fingerprints of a live commit; the
+bytes of `overlay pack`'s database snapshot and `--include-index` snapshot;
+SQLAR byte probes; export-index inputs; shard artifact hashes; the private
+lookup copy of an index with a hot journal; and the sync of a published index.
+
+Not covered, by design of this slice (#196; each site has a residual entry with
+its reason, and the list is open): generic folder reads and backing extents,
+overlay payload descriptors (admitted opens) and the TAR commit helper, the
+plain TAR backend, the HF payload cache and its repository backing, the range
+and payload caches (the payload-v1 header read and staging reopen included),
+the HTTP body spool, the factory's format probe chain and every other format or
+compression reader (protecting SQLAR's own probes does not protect earlier
+probes of the chain), foreign-library readers (libgit2, libarchive, PDF),
+commit-journal recovery and splice sources (`open_copy_source`, the zstd
+splices), the local-index-v1 cache headers of 0.7.x sidecars, the HF
+tree-listing cache, the torrent checksum cache and `.torrent` metainfo, and
+SQLite's own auxiliary files (`-wal`, `-shm`, `-journal` locking and
+lifetime). Configuration and credential files, `/proc` and mount tables,
+daemon state and journal records, patch and bundle input streams, logger and
+stdio setup and directory handles are outside the internal-read families.
+
+Before every managed open on a Unix target, vacant standard descriptors 0-2
+are filled with `/dev/null` (SQLite's `robust_open` closes a new descriptor
+that lands below 3, which would release a lock); if that fails the open is
+refused before SQLite's `xOpen`. Another thread emptying a standard slot
+between that check and the open violates the host contract, as for checked
+opens. On a macOS FAT or exFAT volume SQLite writes an `S` byte into an empty
+file when it registers it; on the read-only descriptor that fails, so a managed
+read of an empty file there is an error.
+
+Failure handling: a read error is never a successful result. Tarstats hashes
+stay best effort (size and mtime are still stored; a failed hash is omitted),
+an index pointer still records partial archive stats, `overlay verify` reports
+a failed strong hash as skipped (`base_ok: null`, exit status unchanged),
+content hashing skips a member whose read failed (no partial digest) but fails
+when the archive cannot be opened, a meta-v3 read error keeps the cache entry
+(no refetch; a missing or malformed entry, or a blob evicted by another
+process, is still a miss), a remote id-hash error is not a mismatch (the blob
+stays, that candidate is not used), and a failed upload body aborts a
+multipart upload without completing it.
+
+Copies: the private lookup copies and the meta-v3 `.part` staging file are
+created exclusively (`O_EXCL`) with the source's mode under the umask, get the
+source's exact permissions through the handle after the copy, refuse a source
+that changed during the copy, and remove only their own output on failure. The
+copy of a fetched index to the local cache name keeps create-or-truncate
+semantics (an existing, possibly empty, destination is filled): it is opened
+with the source's mode and gets the source's exact permissions (0600 for a
+fetched blob) through the handle before the first byte is written; on a read
+error the fetched path is used and the partial destination stays. These
+streaming copies keep bytes and Unix mode bits only: on macOS they do not carry
+the ACLs, extended attributes, resource forks or clones that `std::fs::copy`
+may carry. Other creates keep their modes: SQLite creates the overlay database
+and the cold index `0644 & !umask`, publication's rename keeps the temporary
+database's mode, companions take the database's mode, temporary files stay
+`0600 & !umask`.
+
+Connections and VFSes: checked overlay-database opens and the checked
+`snapshot_index_into` source use `"unix"` on Linux and `"unix-posix"` on macOS
+(POSIX locks only). Ordinary index, SQLAR, digest-cache and publication-snapshot
+connections keep SQLite's default `"unix"` VFS, which on macOS picks the
+locking style per filesystem (auto). Managed byte readers use `"unix"`
+(`"unix-posix"` on macOS) and take no lock.
+
+`python3 -I packaging/test-internal-read-inventory.py` checks the inventory
+(`--self-test` for the scanner's own tests); a new production pathname read,
+copy, create or descriptor conversion fails the check until it is classified.
+
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE
 libraries even for offline work. An optional FUSE-free build is not implemented.

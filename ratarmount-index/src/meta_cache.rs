@@ -65,7 +65,7 @@ impl MetaCache {
     }
 
     /// A cache in `dir` with `budget` bytes (tests).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_dir(dir: PathBuf, budget: u64) -> Self {
         Self {
             dir,
@@ -74,13 +74,13 @@ impl MetaCache {
     }
 
     /// [`Self::install`] for `backend_url` (tests).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn install_for(&self, backend_url: &str, src: &Path) -> io::Result<PathBuf> {
         self.install(&sha256_hex(backend_url.as_bytes()), src, None)
     }
 
     /// The blob path of `backend_url` (tests).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn blob_path_for(&self, backend_url: &str) -> PathBuf {
         self.blob_path(&sha256_hex(backend_url.as_bytes()))
     }

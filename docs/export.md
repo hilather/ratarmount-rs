@@ -48,7 +48,7 @@ curl -I http://127.0.0.1:20491/.ratarmount-control/index.sqlite
 | Range | Single `bytes=start-end` → 206 + `Content-Range`. Multiple ranges: first only or 200 full. Unsatisfiable → 416 |
 | Auth | None (localhost) |
 | Writes | Out of v1 (use `--webdav -w`) |
-| GET `/.ratarmount-control/index.sqlite` | HTTP-only sidecar download; `Content-Type: application/vnd.ratarmount.index.v1+sqlite`. 404 if `:memory:` / missing. Not an archive server. Inbound discovery uses `Link` on the **archive** HEAD, not this export |
+| GET `/.ratarmount-control/index.sqlite` | HTTP-only sidecar download; `Content-Type: application/vnd.ratarmount.index.v1+sqlite`. 404 if `:memory:` / missing. Not an archive server. Inbound discovery uses `Link` on the **archive** HEAD, not this export. Serves the live sidecar's raw bytes (not an SQLite snapshot) through a managed reader, so a download never releases the mount's own locks on the index (#151). At most 8 sidecar requests (GET, Range **and HEAD**) hold a reader at a time; more get `503 Service Unavailable` with `Retry-After: 1`. A body that comes up short closes the connection before `Content-Length` bytes (never a complete response); a client that stops reading is dropped after the body write timeout (30 s) |
 
 ## WebDAV (`--webdav`) — P-6 `done`
 
