@@ -678,7 +678,7 @@
    "fingerprint": "5ee8ed52082e07fb",
    "disposition": "out-of-family",
    "category": "patch-or-bundle-input",
-   "reason": "bundle input stream"
+   "reason": "bundle input stream copied privately before extraction"
   },
   {
    "file": "ratarmount/src/overlay_pack.rs",
@@ -784,7 +784,7 @@
    "function": "build",
    "op": "tempfile",
    "ordinal": 1,
-   "line": 324,
+   "line": 323,
    "fingerprint": "c4f357978284bab5",
    "baseline_fingerprint": "c4f357978284bab5",
    "disposition": "output-owner",
@@ -795,7 +795,7 @@
    "function": "build",
    "op": "OpenOptions",
    "ordinal": 1,
-   "line": 334,
+   "line": 333,
    "fingerprint": "5fec77197cdf7bc2",
    "baseline_fingerprint": "5fec77197cdf7bc2",
    "disposition": "output-owner",
@@ -806,7 +806,7 @@
    "function": "build",
    "op": "tempfile",
    "ordinal": 2,
-   "line": 369,
+   "line": 368,
    "fingerprint": "77aa3461b559962d",
    "baseline_fingerprint": "77aa3461b559962d",
    "disposition": "output-owner",
@@ -817,7 +817,7 @@
    "function": "sha256",
    "op": "managed_read::sha256_hex",
    "ordinal": 1,
-   "line": 416,
+   "line": 415,
    "fingerprint": "d60c37bd7a353e04",
    "disposition": "managed-read",
    "regression": "regression_shard_artifact_hash_keeps_aliased_database_lock"
@@ -827,7 +827,7 @@
    "function": "run",
    "op": "tempdir",
    "ordinal": 1,
-   "line": 497,
+   "line": 496,
    "fingerprint": "eebb1b118f383e92",
    "baseline_fingerprint": "eebb1b118f383e92",
    "disposition": "output-owner",
@@ -838,7 +838,7 @@
    "function": "run",
    "op": "OpenOptions",
    "ordinal": 1,
-   "line": 533,
+   "line": 532,
    "fingerprint": "8c098dbf04d95472",
    "baseline_fingerprint": "8c098dbf04d95472",
    "disposition": "output-owner",
@@ -849,7 +849,7 @@
    "function": "run",
    "op": "tempfile",
    "ordinal": 1,
-   "line": 577,
+   "line": 576,
    "fingerprint": "da0b6939ad6761a9",
    "baseline_fingerprint": "da0b6939ad6761a9",
    "disposition": "output-owner",
@@ -1703,17 +1703,6 @@
   },
   {
    "file": "ratarmount-compositing/src/write_overlay.rs",
-   "function": "publish_cow_staging",
-   "op": "File::open",
-   "ordinal": 1,
-   "line": 6557,
-   "fingerprint": "083321ca7f488809",
-   "disposition": "out-of-family",
-   "category": "directory-handle-or-durability",
-   "reason": "directory handle opened only to fsync a directory entry"
-  },
-  {
-   "file": "ratarmount-compositing/src/write_overlay.rs",
    "function": "uncompressed_append_offset",
    "op": "File::open",
    "ordinal": 1,
@@ -2045,18 +2034,7 @@
    "disposition": "residual",
    "family": "commit-journal-recovery",
    "issue": "#196",
-   "reason": "base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery"
-  },
-  {
-   "file": "ratarmount-compress/src/commit_journal.rs",
-   "function": "recover",
-   "op": "OpenOptions",
-   "ordinal": 1,
-   "line": 1096,
-   "fingerprint": "471cd09d12cbe9f1",
-   "baseline_fingerprint": "471cd09d12cbe9f1",
-   "disposition": "output-owner",
-   "mode_policy": "unchanged-from-e6ca64e"
+   "reason": "base-archive bytes read by journal recovery; recovery and mutation ownership belong to the excluded broader machinery"
   },
   {
    "file": "ratarmount-compress/src/commit_journal.rs",
@@ -2707,6 +2685,18 @@
    "family": "factory-and-format-readers",
    "issue": "#196",
    "reason": "archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes"
+  },
+  {
+   "file": "ratarmount-compress/src/zstd_seek.rs",
+   "function": "ZstdBackend::open_compressed",
+   "op": "File::open",
+   "ordinal": 1,
+   "line": 1112,
+   "fingerprint": "bd7eae89f6a39f01",
+   "disposition": "residual",
+   "family": "factory-and-format-readers",
+   "issue": "#196",
+   "reason": "zstd backend reader of a mounted base; broader backend migration is excluded"
   },
   {
    "file": "ratarmount-compress/src/zstd_seek.rs",
@@ -4372,7 +4362,7 @@
    "fingerprint": "1917b72fc6bbc2e1",
    "disposition": "managed-read",
    "regression": "regression_lookup_snapshot_main_copy_keeps_index_lock",
-   "mode_policy": "exact source permissions (exclusive-new, source mode & !umask at creation)"
+   "mode_policy": "exclusive-new in the private directory with the source mode & !umask; exact source permissions through the handle after the copy"
   },
   {
    "file": "ratarmount-index/src/lib.rs",
@@ -4641,20 +4631,6 @@
   },
   {
    "file": "ratarmount-index/src/managed_read.rs",
-   "function": "ensure_standard_descriptors",
-   "op": "libc::open",
-   "ordinal": 1,
-   "line": 471,
-   "fingerprint": "9cc009b5867739e2",
-   "disposition": "out-of-family",
-   "category": "runtime-resource-or-descriptor-handoff",
-   "reason": "/dev/null placeholder for a vacant standard descriptor before a byte open",
-   "non_mandatory_callers": [
-    "ByteFile::open"
-   ]
-  },
-  {
-   "file": "ratarmount-index/src/managed_read.rs",
    "function": "ByteFile::open",
    "op": "File::open",
    "ordinal": 1,
@@ -4711,6 +4687,18 @@
   },
   {
    "file": "ratarmount-index/src/payload_cache.rs",
+   "function": "PayloadCache::lookup",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 125,
+   "fingerprint": "bb01dd72976e9cfe",
+   "disposition": "residual",
+   "family": "payload-cache",
+   "issue": "#196",
+   "reason": "payload-cache blob owner / staging reopen; payload cache ownership and backing export are excluded"
+  },
+  {
+   "file": "ratarmount-index/src/payload_cache.rs",
    "function": "PayloadCache::install_open",
    "op": "File::open",
    "ordinal": 1,
@@ -4723,6 +4711,30 @@
   },
   {
    "file": "ratarmount-index/src/payload_cache.rs",
+   "function": "PayloadCache::install_open",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 210,
+   "fingerprint": "c5b6e11287ad3ed9",
+   "disposition": "residual",
+   "family": "payload-cache",
+   "issue": "#196",
+   "reason": "payload-cache blob owner / staging reopen; payload cache ownership and backing export are excluded"
+  },
+  {
+   "file": "ratarmount-index/src/payload_cache.rs",
+   "function": "PayloadCache::read_header",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 268,
+   "fingerprint": "08082b920330dc04",
+   "disposition": "residual",
+   "family": "payload-cache",
+   "issue": "#196",
+   "reason": "payload-cache header read (payload_cache.rs:266-270): payload-v1 cache, not the meta-v3 metadata cache, so not mandatory"
+  },
+  {
+   "file": "ratarmount-index/src/payload_cache.rs",
    "function": "copy_hash_to_tmp",
    "op": "OpenOptions",
    "ordinal": 1,
@@ -4731,6 +4743,30 @@
    "baseline_fingerprint": "51ce410d74515ca1",
    "disposition": "output-owner",
    "mode_policy": "unchanged-from-e6ca64e"
+  },
+  {
+   "file": "ratarmount-index/src/range_cache.rs",
+   "function": "RangeCache::open",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 262,
+   "fingerprint": "77183eda313b2e30",
+   "disposition": "residual",
+   "family": "range-cache",
+   "issue": "#196",
+   "reason": "range-cache completion owner, header or recency read; needs broader lifecycle work"
+  },
+  {
+   "file": "ratarmount-index/src/range_cache.rs",
+   "function": "RangeCache::header",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 268,
+   "fingerprint": "2ab15bb2bf7a5292",
+   "disposition": "residual",
+   "family": "range-cache",
+   "issue": "#196",
+   "reason": "range-cache completion owner, header or recency read; needs broader lifecycle work"
   },
   {
    "file": "ratarmount-index/src/range_cache.rs",
@@ -4756,6 +4792,42 @@
    "baseline_fingerprint": "912ff14ca243a7c4",
    "disposition": "output-owner",
    "mode_policy": "unchanged-from-e6ca64e"
+  },
+  {
+   "file": "ratarmount-index/src/range_cache.rs",
+   "function": "SharedBudget::flush_recency",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 974,
+   "fingerprint": "f37341ec24d4f09a",
+   "disposition": "residual",
+   "family": "range-cache",
+   "issue": "#196",
+   "reason": "range-cache completion owner, header or recency read; needs broader lifecycle work"
+  },
+  {
+   "file": "ratarmount-index/src/range_cache.rs",
+   "function": "SharedBudget::flush_recency",
+   "op": "open_regular",
+   "ordinal": 2,
+   "line": 976,
+   "fingerprint": "7fc25a958df04d28",
+   "disposition": "residual",
+   "family": "range-cache",
+   "issue": "#196",
+   "reason": "range-cache completion owner, header or recency read; needs broader lifecycle work"
+  },
+  {
+   "file": "ratarmount-index/src/range_cache.rs",
+   "function": "SharedBudget::reconcile",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 1065,
+   "fingerprint": "7252a91abdf03580",
+   "disposition": "residual",
+   "family": "range-cache",
+   "issue": "#196",
+   "reason": "range-cache completion owner, header or recency read; needs broader lifecycle work"
   },
   {
    "file": "ratarmount-index/src/checked_open/acquire.rs",
@@ -4947,6 +5019,17 @@
   },
   {
    "file": "ratarmount-remote/src/hf.rs",
+   "function": "Config::from_values",
+   "op": "fs::read_to_string",
+   "ordinal": 1,
+   "line": 327,
+   "fingerprint": "3cd7855b2470a12f",
+   "disposition": "out-of-family",
+   "category": "configuration-or-credentials",
+   "reason": "HF token file"
+  },
+  {
+   "file": "ratarmount-remote/src/hf.rs",
    "function": "HfRepo::fetch_to_temp",
    "op": "tempfile",
    "ordinal": 1,
@@ -5039,6 +5122,102 @@
   },
   {
    "file": "ratarmount-remote/src/hf_cache.rs",
+   "function": "HubCache::checked",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 356,
+   "fingerprint": "abb563da2eb8573f",
+   "disposition": "residual",
+   "family": "hf-payload-cache",
+   "issue": "#196",
+   "reason": "huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"
+  },
+  {
+   "file": "ratarmount-remote/src/hf_cache.rs",
+   "function": "HubCache::tree_hashes",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 484,
+   "fingerprint": "ef3c448c63c53485",
+   "disposition": "residual",
+   "family": "hf-payload-cache",
+   "issue": "#196",
+   "reason": "huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"
+  },
+  {
+   "file": "ratarmount-remote/src/hf_cache.rs",
+   "function": "HubCache::copied_hash",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 526,
+   "fingerprint": "6633b92cc269d28f",
+   "disposition": "residual",
+   "family": "hf-payload-cache",
+   "issue": "#196",
+   "reason": "huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"
+  },
+  {
+   "file": "ratarmount-remote/src/hf_cache.rs",
+   "function": "HubCache::observe_ref",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 563,
+   "fingerprint": "c2a877876267480b",
+   "disposition": "residual",
+   "family": "hf-payload-cache",
+   "issue": "#196",
+   "reason": "huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"
+  },
+  {
+   "file": "ratarmount-remote/src/hf_cache.rs",
+   "function": "HubCache::install",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 616,
+   "fingerprint": "9c5e44f9fe828c12",
+   "disposition": "residual",
+   "family": "hf-payload-cache",
+   "issue": "#196",
+   "reason": "huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"
+  },
+  {
+   "file": "ratarmount-remote/src/hf_cache.rs",
+   "function": "HubCache::install_with",
+   "op": "OpenOptions",
+   "ordinal": 1,
+   "line": 742,
+   "fingerprint": "ee4c6d22bf6448ea",
+   "disposition": "residual",
+   "family": "hf-payload-cache",
+   "issue": "#196",
+   "reason": "huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"
+  },
+  {
+   "file": "ratarmount-remote/src/hf_cache.rs",
+   "function": "HubCache::install_with",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 776,
+   "fingerprint": "8144cf6d7caa9163",
+   "disposition": "residual",
+   "family": "hf-payload-cache",
+   "issue": "#196",
+   "reason": "huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"
+  },
+  {
+   "file": "ratarmount-remote/src/hf_cache.rs",
+   "function": "HubCache::snapshot",
+   "op": "try_clone",
+   "ordinal": 1,
+   "line": 837,
+   "fingerprint": "924b252a34a7607a",
+   "disposition": "residual",
+   "family": "hf-payload-cache",
+   "issue": "#196",
+   "reason": "huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"
+  },
+  {
+   "file": "ratarmount-remote/src/hf_cache.rs",
    "function": "LocalBlob::backing_file",
    "op": "try_clone",
    "ordinal": 1,
@@ -5060,6 +5239,18 @@
    "family": "hf-payload-cache",
    "issue": "#196",
    "reason": "HF payload owner clone / backing transfer"
+  },
+  {
+   "file": "ratarmount-remote/src/hf_cache.rs",
+   "function": "HfCacheMountSource::with_cache",
+   "op": "open_regular",
+   "ordinal": 1,
+   "line": 1282,
+   "fingerprint": "73afd55b1567acc3",
+   "disposition": "residual",
+   "family": "hf-payload-cache",
+   "issue": "#196",
+   "reason": "huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"
   },
   {
    "file": "ratarmount-remote/src/hf_commit.rs",

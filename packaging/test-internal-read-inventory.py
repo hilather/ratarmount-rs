@@ -36,6 +36,10 @@ Usage:
                                              classification of matching keys,
                                              refresh fingerprints and lines,
                                              add new operations UNCLASSIFIED
+  test-internal-read-inventory.py --verify-baseline DIR
+                                             check every `unchanged-from-<baseline>`
+                                             create against a checkout of the
+                                             baseline (git archive e6ca64e)
   test-internal-read-inventory.py --self-test
 
 Stdlib only; runs on Python 3.9.
@@ -215,6 +219,44 @@ def test_spans(text, raw=None):
             if not nxt:
                 break
             k += nxt.end()
+        item = re.match(
+            r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+|async\s+|const\s+|extern\s+(?:\"[^\"]*\"\s+)?)*"
+            r"(fn|mod|impl|struct|enum|trait|union|use|type|static|const|macro_rules!|extern)\b",
+            text[k:],
+        )
+        mac = re.match(r"\s*[\w:]+!\s*([{(\[])", text[k:])
+        if not item and mac:
+            # A macro item (`thread_local! { .. }`): to its closing bracket.
+            open_at = k + mac.end() - 1
+            pairs = {"{": "}", "(": ")", "[": "]"}
+            depth, j = 0, open_at
+            while j < len(text):
+                if text[j] == text[open_at]:
+                    depth += 1
+                elif text[j] == pairs[text[open_at]]:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            spans.append((m.start(), j))
+            continue
+        if not item:
+            # A field, statement or expression: it ends at the first `,` or
+            # `;` (or the enclosing `}`) outside nested brackets.
+            depth, j = 0, k
+            while j < len(text):
+                ch = text[j]
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif ch in ",;" and depth == 0:
+                    break
+                j += 1
+            spans.append((m.start(), j))
+            continue
         semi = text.find(";", k)
         brace = text.find("{", k)
         decl = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", text[k:])
@@ -335,6 +377,8 @@ def op_patterns(text):
         (r"(?<![\w.])(?:(?:std|tokio)::fs::)?OpenOptions::new\s*\(|(?<![\w.])(?:(?:std|tokio)::)?(?:fs::)?(?:%s)::options\s*\(" % files, "OpenOptions"),
         (r"(?<![\w.])(?<!fn )(?:ratarmount_core::db_inodes::)?(open_admitted|openat_admitted)\s*\(", "{0}"),
         (r"\.reopen\s*\(\s*\)", "tempfile::reopen"),
+        # Private open helpers of the caches: each call is its own entry.
+        (r"(?<![\w.:])(?<!fn )open_regular\s*\(", "open_regular"),
         (r"\.try_clone\s*\(", "try_clone"),
         (r"\b(from_raw_fd|into_raw_fd|from_raw_handle|into_raw_handle)\s*\(", "{0}"),
         (r"(?<![\w.])(?:libc::)(open|openat|open64)\s*\(", "libc::{0}"),
@@ -673,6 +717,16 @@ def main(argv):
         for o in ops:
             print("%s:%d\t%s\t%s#%d" % (o["file"], o["line"], o["function"], o["op"], o["ordinal"]))
         return 0
+    if len(argv) == 3 and argv[1] == "--verify-baseline":
+        ops, _, _ = scan(argv[2])
+        at_base = {(o["file"], o["fingerprint"]) for o in ops}
+        bad = [e for e in load(MANIFEST)["entries"]
+               if e.get("mode_policy") == UNCHANGED
+               and (e["file"], e.get("baseline_fingerprint")) not in at_base]
+        for e in bad:
+            print("inventory: not a baseline create: %s:%d %s %s#%d"
+                  % (e["file"], e["line"], e["function"], e["op"], e["ordinal"]))
+        return 1 if bad else 0
     if argv[1:] == ["--write"]:
         print("wrote %d entries" % write(ROOT, MANIFEST))
         return 0
@@ -725,8 +779,12 @@ def expect(cond, what):
 
 
 def regression_internal_read_inventory_detects_aliased_convenience_reads():
-    """Regression: `File as RawFile` / `fs as disk` / bare imports hid reads."""
+    """Regression: `File as RawFile` / `fs as disk` / bare imports hid reads;
+    a `#[cfg(test)]` field hid the rest of the file."""
     root = fake({"c/src/lib.rs": (
+        "struct S {\n    a: u8,\n    #[cfg(test)]\n    t: u8,\n}\n"
+        "#[cfg(test)]\nthread_local! {\n    static X: u8 = 0;\n}\n"
+        "fn f(p: &Path) { let _ = std::fs::read(p); }\n"
         "use std::fs::File as RawFile;\nuse std::fs as disk;\nuse std::fs::{read_to_string as rts};\n"
         "fn a(p: &Path) { let _ = RawFile::open(p); }\n"
         "fn b(p: &Path) { let _ = disk::read(p); }\n"
@@ -737,7 +795,7 @@ def regression_internal_read_inventory_detects_aliased_convenience_reads():
     )})
     ops, _, _ = scan(root)
     got = sorted((o["function"], o["op"]) for o in ops)
-    expect(got == [("a", "File::open"), ("b", "fs::read"), ("c", "fs::read_to_string")], got)
+    expect(got == [("a", "File::open"), ("b", "fs::read"), ("c", "fs::read_to_string"), ("f", "fs::read")], got)
 
 
 def regression_internal_read_inventory_rejects_unclassified_site():
