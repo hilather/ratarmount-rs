@@ -383,6 +383,10 @@ fn child_row(row: &str, dir: &Path) -> String {
     if row == "nomem" {
         return nomem_row(dir);
     }
+    #[cfg(target_os = "linux")]
+    if row == "oom" {
+        return oom_row(dir);
+    }
     if let Some(umask) = row.strip_prefix("copymodes:") {
         let umask = u32::from_str_radix(umask, 8).unwrap();
         // SAFETY: a single-threaded child.
@@ -849,4 +853,54 @@ fn regression_sqlite_nomem_is_not_a_missing_file() {
         "ok kind=OutOfMemory cache=OutOfMemory,OutOfMemory",
         "{got}"
     );
+}
+
+/// Regression (R11-S7-FIX8): `managed_read::read` sized its buffer with an
+/// infallible `Vec::with_capacity(file length)`, so a file larger than the
+/// process may allocate (a 4 GiB sparse file under an address-space limit)
+/// aborted the process (SIGABRT) where `std::fs::read` returned
+/// `OutOfMemory`. Index-pointer and metadata-cache reads reach this helper.
+/// Runs in a child: the limit is process-wide.
+#[cfg(target_os = "linux")]
+#[test]
+fn regression_managed_read_large_file_is_out_of_memory_not_abort() {
+    let (_d, dir) = tempdir();
+    let got = run_child("oom", &dir);
+    assert_eq!(got.trim(), "ok kind=OutOfMemory", "{got}");
+}
+
+/// The child half: a 4 GiB sparse file, an address-space limit 256 MiB
+/// above what the child already maps, then a whole-file managed read.
+#[cfg(target_os = "linux")]
+fn oom_row(dir: &Path) -> String {
+    let big = dir.join("big.bin");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(4 << 30)
+        .unwrap();
+    let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+    let pages: u64 = statm.split_whitespace().next().unwrap().parse().unwrap();
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let cap = pages * page + (256 << 20);
+    let lim = libc::rlimit {
+        rlim_cur: cap as libc::rlim_t,
+        rlim_max: cap as libc::rlim_t,
+    };
+    // SAFETY: a valid rlimit for this (child) process.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &lim) }, 0);
+    match read(&big) {
+        Ok(v) => format!("kind=Ok len={}", v.len()),
+        Err(e) => format!("kind={:?}", e.kind()),
+    }
+}
+
+/// Regression (R11-S7-FIX8): the managed `sync_all` asked SQLite's `xSync`
+/// for `SQLITE_SYNC_NORMAL`, a plain `fsync` on macOS, where the
+/// `File::sync_all` it replaced issues `F_FULLFSYNC`; `SQLITE_SYNC_FULL`
+/// makes SQLite's unix VFS use `F_FULLFSYNC` there.
+#[cfg(unix)]
+#[test]
+fn regression_managed_sync_requests_full_fsync() {
+    assert_eq!(imp::SYNC_FLAGS, rusqlite::ffi::SQLITE_SYNC_FULL);
 }

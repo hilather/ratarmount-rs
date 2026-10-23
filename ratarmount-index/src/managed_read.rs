@@ -175,10 +175,21 @@ impl Drop for Owner {
 // Whole-file helpers.
 // --------------------------------------------------------------------------
 
-/// Read the whole file.
+/// Read the whole file. The buffer is reserved fallibly: a file larger than
+/// the memory this process may allocate is an `OutOfMemory` error, not an
+/// abort.
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
     let mut c = ManagedReadCursor::open(path)?;
-    let mut out = Vec::with_capacity(usize::try_from(c.len()?).unwrap_or(0));
+    let len = c.len()?;
+    let oom = || {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("cannot allocate {len} bytes to read {}", path.display()),
+        )
+    };
+    let mut out = Vec::new();
+    out.try_reserve_exact(usize::try_from(len).map_err(|_| oom())?)
+        .map_err(|_| oom())?;
     c.read_to_end(&mut out)?;
     Ok(out)
 }
@@ -561,6 +572,11 @@ mod imp {
         io::Error::other(format!("{what}: SQLite code {rc}"))
     }
 
+    /// `SQLITE_SYNC_FULL`: on macOS SQLite's unix VFS then issues
+    /// `F_FULLFSYNC`, as `File::sync_all` (which this replaced) did; on
+    /// other systems it is a plain `fsync`.
+    pub(super) const SYNC_FLAGS: c_int = ffi::SQLITE_SYNC_FULL;
+
     impl ByteFile {
         pub(super) fn open(path: &Path) -> io::Result<Self> {
             // The VFS opens with O_NOFOLLOW: resolve symlinks first (an
@@ -728,7 +744,7 @@ mod imp {
                 return Err(io::Error::other("SQLite VFS has no xSync"));
             };
             // SAFETY: an open file object.
-            let rc = unsafe { sync(self.file, ffi::SQLITE_SYNC_NORMAL) };
+            let rc = unsafe { sync(self.file, SYNC_FLAGS) };
             if rc != ffi::SQLITE_OK {
                 return Err(sqlite_err(rc, "fsync", self.last_errno()));
             }
