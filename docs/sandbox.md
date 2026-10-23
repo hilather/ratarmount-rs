@@ -1976,7 +1976,11 @@ locking style per filesystem (auto). Managed byte readers use `"unix"`
 
 `python3 -I packaging/test-internal-read-inventory.py` checks the inventory
 (`--self-test` for the scanner's own tests); a new production pathname read,
-copy, create or descriptor conversion fails the check until it is classified.
+copy, create or descriptor conversion fails the check until it is classified,
+and so does a form the scanner cannot follow: an import from `std::fs` or
+`tokio::fs` it cannot resolve, or an `OpenOptions` builder bound to a variable
+that escapes its function. `--verify-baseline DIR` (run in CI) checks that every
+create recorded as unchanged from the baseline still exists unchanged there.
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE
