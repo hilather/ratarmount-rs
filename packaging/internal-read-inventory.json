@@ -3220,6 +3220,17 @@
   },
   {
    "file": "ratarmount-core/src/db_inodes.rs",
+   "function": "coordinate_retained_fd",
+   "op": "from_raw_fd",
+   "ordinal": 1,
+   "line": 173,
+   "fingerprint": "9e15532d70ca9d5c",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "takes the retained mismatch descriptor of a checked index, SQLAR or digest-cache open so it can be closed when this process does not hold the inode (#193)"
+  },
+  {
+   "file": "ratarmount-core/src/db_inodes.rs",
    "function": "openat_raw",
    "op": "libc::openat",
    "ordinal": 1,

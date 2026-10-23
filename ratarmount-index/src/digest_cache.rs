@@ -195,6 +195,10 @@ pub fn archive_digest_cache_available(index: Option<&Path>) -> bool {
 
 struct Cache {
     conn: Connection,
+    /// Kept so a mismatch descriptor of this inode stays until `conn` drops.
+    /// Never read; declared after `conn` so the connection closes first.
+    #[allow(dead_code)]
+    hold: Option<ratarmount_core::db_inodes::DbLockHold>,
     index: PathBuf,
 }
 
@@ -247,9 +251,9 @@ fn open_cache_read_only(index: Option<&Path>) -> Option<Cache> {
     let index = cache_read_target(index)?;
     // A peek is a pure lookup: it must not create `-wal` / `-shm` beside the
     // index of a WAL sidecar (see `open_lookup_connection`).
-    let conn = crate::open_lookup_connection(&index).ok()?;
-    conn.busy_timeout(Duration::ZERO).ok()?;
-    let has_cache: bool = conn
+    let opened = crate::open_lookup_connection(&index).ok()?;
+    opened.busy_timeout(Duration::ZERO).ok()?;
+    let has_cache: bool = opened
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='overlay_base_digests')
              AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='files')",
@@ -257,7 +261,8 @@ fn open_cache_read_only(index: Option<&Path>) -> Option<Cache> {
             |row| row.get(0),
         )
         .ok()?;
-    has_cache.then_some(Cache { conn, index })
+    let crate::LookupConn { conn, hold } = opened;
+    has_cache.then_some(Cache { conn, hold, index })
 }
 
 /// `create_table`: false for a read-only peek, which must not wait out another
@@ -277,12 +282,17 @@ fn open_cache(index: Option<&Path>, create_table: bool) -> Option<Cache> {
 }
 
 fn open_cache_at(index: PathBuf, create_table: bool) -> Option<Cache> {
-    let conn = Connection::open_with_flags(&index, OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
+    let opened = crate::open_database(
+        &index,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+        crate::checked_open::NameMode::Path,
+    )
+    .ok()?;
     // A peek stays instant on a busy index. A caller that goes on to hash and
     // store must not mistake another mount's write lock for "no cache": that
     // would skip the per-archive lock and hash the archive again.
-    set_open_busy(&conn, create_table).ok()?;
-    let has_files: bool = conn
+    set_open_busy(&opened, create_table).ok()?;
+    let has_files: bool = opened
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='files')",
             [],
@@ -292,7 +302,7 @@ fn open_cache_at(index: PathBuf, create_table: bool) -> Option<Cache> {
     if !has_files {
         return None;
     }
-    let has_table: bool = conn
+    let has_table: bool = opened
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='overlay_base_digests')",
             [],
@@ -305,17 +315,19 @@ fn open_cache_at(index: PathBuf, create_table: bool) -> Option<Cache> {
         }
         // Concurrent first mounts all create it; wait out the winner instead
         // of mistaking its write lock for "no cache".
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS overlay_base_digests (
+        opened
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS overlay_base_digests (
                 path BLOB PRIMARY KEY, size TEXT NOT NULL, mtime_ns TEXT NOT NULL,
                 inode TEXT NOT NULL, sha256 TEXT NOT NULL
             );",
-        )
-        .ok()?;
+            )
+            .ok()?;
     }
     // Lookups stay instant on a busy index; only the write waits (below).
-    conn.busy_timeout(Duration::ZERO).ok()?;
-    Some(Cache { conn, index })
+    opened.busy_timeout(Duration::ZERO).ok()?;
+    let crate::LookupConn { conn, hold } = opened;
+    Some(Cache { conn, hold, index })
 }
 
 fn open_lock_file(index: &Path) -> Option<fs::File> {
