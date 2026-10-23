@@ -857,6 +857,20 @@ fn install_hf_live_commit(
     Ok(())
 }
 
+/// The staged `.tar.zst`'s `zstdblocks` pairs, read through a managed reader
+/// (the staged file may be open as a database in this process; a raw `File`
+/// close would release that connection's locks).
+fn staged_zstd_blocks(staged: &Path) -> Result<Vec<(i64, i64)>, String> {
+    let mut cursor = ratarmount_index::managed_read::ManagedReadCursor::open(staged)
+        .map_err(|e| e.to_string())?;
+    let blocks = ratarmount_compress::export_zstd_blocks_from_reader(&mut cursor)
+        .map_err(|e| e.to_string())?;
+    Ok(blocks
+        .into_iter()
+        .map(|(c, d)| (c as i64, d as i64))
+        .collect())
+}
+
 fn publish_hf(
     state: &mut HfLiveCommit,
     opts: &OpenOptions,
@@ -908,12 +922,7 @@ fn publish_hf(
         .store_tarstats_for_path(&req.staged)
         .map_err(|e| retryable(e.to_string()))?;
     if url_is_tar_zst(&state.repo.location.path) {
-        let blocks = ratarmount_compress::export_zstd_blocks(&req.staged)
-            .map_err(|e| retryable(e.to_string()))?;
-        let blocks: Vec<_> = blocks
-            .into_iter()
-            .map(|(c, d)| (c as i64, d as i64))
-            .collect();
+        let blocks = staged_zstd_blocks(&req.staged).map_err(retryable)?;
         index
             .set_zstd_blocks(&blocks)
             .map_err(|e| retryable(e.to_string()))?;
@@ -3300,6 +3309,41 @@ mod tests {
             "{scheme}: session A's lock on the index survived the publish"
         );
         drop(session);
+    }
+
+    /// Regression (R11-S7-FIX2, #151): the Hub live commit exported the staged
+    /// `.tar.zst`'s `zstdblocks` through `export_zstd_blocks`, a raw `File`
+    /// whose close released every POSIX lock this process held on the file.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_zstd_blocks_keep_staged_lock() {
+        use ratarmount_index::managed_read::{lock_probe::other_process_sees_lock, VfsLockHolder};
+        let dir = tempfile::tempdir().unwrap();
+        let zst = dir.path().join("a.tar.zst");
+        let mut body = Vec::new();
+        for chunk in [&b"first frame"[..], &b"second frame"[..]] {
+            body.extend(zstd::encode_all(chunk, 3).unwrap());
+        }
+        std::fs::write(&zst, body).unwrap();
+        let holder = VfsLockHolder::shared(&zst).unwrap();
+        assert!(other_process_sees_lock(&zst));
+        let blocks = staged_zstd_blocks(&zst).unwrap();
+        assert!(
+            other_process_sees_lock(&zst),
+            "the zstdblocks export kept this process's lock on the staged file"
+        );
+        drop(holder);
+        let want: Vec<(i64, i64)> = ratarmount_compress::export_zstd_blocks(&zst)
+            .unwrap()
+            .into_iter()
+            .map(|(c, d)| (c as i64, d as i64))
+            .collect();
+        assert_eq!(blocks, want);
+        assert_eq!(
+            blocks.len(),
+            3,
+            "two frames and the EOF sentinel: {blocks:?}"
+        );
     }
 
     /// Regression (R11-S7, #151): the S3 live commit read the staged archive

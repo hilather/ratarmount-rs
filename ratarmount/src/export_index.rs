@@ -5,7 +5,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
-use ratarmount_compress::{scan_zstd_frames_path, ZstdFrameInfo};
+use ratarmount_compress::{scan_zstd_frames, ZstdFrameInfo};
 use ratarmount_index::{IndexLocation, SqliteIndex};
 use ratarmount_session::{resolve_index, IndexPolicy, Session};
 use rusqlite::{Connection, OpenFlags};
@@ -205,7 +205,9 @@ fn frame_map(index: &SqliteIndex, archive: Option<&Path>) -> Result<Vec<ZstdFram
     if let Some(archive) = archive {
         let magic = ratarmount_index::managed_read::read_prefix(archive, 4)?;
         if magic.as_slice() == [0x28, 0xb5, 0x2f, 0xfd] {
-            return Ok(scan_zstd_frames_path(archive)?.frames);
+            // A managed reader: the archive may be open as a database here.
+            let mut cursor = ratarmount_index::managed_read::ManagedReadCursor::open(archive)?;
+            return Ok(scan_zstd_frames(&mut cursor)?.frames);
         }
     }
     Ok(Vec::new())
@@ -532,7 +534,8 @@ mod tests {
             let shard_rows: Vec<_> = rows.iter().filter(|r| r["shard"] == shard.name).collect();
             assert_eq!(shard_rows.len() as i64, expected);
             total += expected;
-            let frames = scan_zstd_frames_path(&output.join(&shard.name)).unwrap();
+            let frames =
+                ratarmount_compress::scan_zstd_frames_path(&output.join(&shard.name)).unwrap();
             for row in shard_rows {
                 let (offset, header, size): (Option<i64>, Option<i64>, Option<i64>) = conn.query_row("SELECT offset,offsetheader,size FROM files WHERE name=?1 AND offsetheader IS ?2", rusqlite::params![row["name"].as_str().unwrap(), row["offsetheader"].as_i64()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
                 assert_eq!(row["offset"].as_i64(), offset);
@@ -869,13 +872,20 @@ mod tests {
         }
         assert!(other_process_sees_lock(&index_path), "session lock kept");
         drop(holder);
-        // The frame map's zstd magic probe (an index without zstd blocks);
-        // the frame scan after it is a residual format reader (#196).
+        // The frame map's zstd magic probe and frame scan (an index without
+        // zstd blocks) are both managed reads (R11-S7-FIX2: the scan used a
+        // raw `File`), and a lock this process holds on the archive survives.
         let archive = output.join(&manifest.shards[0].name);
         let empty = SqliteIndex::create_writable(None).unwrap();
+        let holder = ratarmount_index::managed_read::VfsLockHolder::shared(&archive).unwrap();
         let (frames, probes) = with_close_probes(|_| true, || frame_map(&empty, Some(&archive)));
         assert!(!frames.unwrap().is_empty());
-        assert_eq!(probes.len(), 1, "{probes:?}");
-        assert!(probes[0].1, "magic probe kept the lock: {probes:?}");
+        assert_eq!(probes.len(), 2, "{probes:?}");
+        assert!(probes.iter().all(|(_, kept)| *kept), "{probes:?}");
+        assert!(
+            other_process_sees_lock(&archive),
+            "the frame scan kept this process's lock on the archive"
+        );
+        drop(holder);
     }
 }

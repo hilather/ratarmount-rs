@@ -27,7 +27,20 @@ managed entry, on a managed function reaching a helper whose reads are not
 managed, on a raw descriptor escape from a managed function, and on an
 exclusive create without a mode policy.
 
-This is a reviewed change detector, not a dataflow analysis.
+This is a reviewed change detector, not a dataflow analysis. It fails closed
+on forms it cannot follow: an import from `std::fs`/`tokio::fs` (or a glob,
+or an aliased `tempfile` item) it cannot resolve, and an `OpenOptions`
+builder bound to a variable that escapes its function or never reaches
+`.open(`. Code under `#[cfg(..)]` is skipped only when the predicate is
+false without `test` (`feature = "test-hooks"` counts as `test`: release
+builds never enable it, packaging/test-no-test-hooks-in-release.sh).
+Fingerprints hash the comment-stripped statement with its literal values,
+plus every later statement that configures a bound builder. The helper walk
+follows same-crate free-function calls transitively.
+
+Known limits: a renamed crate root (`use std as s`), a glob import of a local
+module that re-exports an fs function, openers of other crates (`nix`),
+method and cross-crate calls in the helper walk.
 
 Usage:
   test-internal-read-inventory.py            check the workspace (exit 0/1)
@@ -36,6 +49,12 @@ Usage:
                                              classification of matching keys,
                                              refresh fingerprints and lines,
                                              add new operations UNCLASSIFIED
+  test-internal-read-inventory.py --write --baseline DIR
+                                             as --write, and refresh the
+                                             `baseline_fingerprint` of each
+                                             `unchanged-from-<baseline>` create
+                                             whose (file, fingerprint) the
+                                             baseline checkout DIR has
   test-internal-read-inventory.py --verify-baseline DIR
                                              check every `unchanged-from-<baseline>`
                                              create against a checkout of the
@@ -128,9 +147,11 @@ ESCAPES = ("into_raw_fd", "as_raw_fd", "try_clone", "from_raw_fd", "File::from")
 # --------------------------------------------------------------------------
 
 
-def mask(src):
-    """Return `src` with comments and string/char literal contents blanked."""
+def mask(src, strings=True):
+    """Return `src` with comments and (unless `strings` is false) string/char
+    literal contents blanked. Offsets and newlines are kept."""
     out = list(src)
+    keep_strings = not strings
     i, n = 0, len(src)
 
     def blank(a, b):
@@ -161,6 +182,9 @@ def mask(src):
             close = '"' + m.group(1)
             j = src.find(close, i + m.end())
             j = n if j < 0 else j + len(close)
+            if keep_strings:
+                i = j
+                continue
             blank(i + m.end(), j - len(close))
             i = j
         elif c == '"' or (c == "b" and src.startswith('b"', i) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))):
@@ -168,16 +192,21 @@ def mask(src):
             start = j
             while j < n and src[j] != '"':
                 j += 2 if src[j] == "\\" else 1
+            if keep_strings:
+                i = j + 1
+                continue
             blank(start, min(j, n))
             i = j + 1
         elif c == "'":
             if i + 1 < n and src[i + 1] == "\\":
                 j = src.find("'", i + 2)
                 j = n if j < 0 else j
-                blank(i + 1, j)
+                if not keep_strings:
+                    blank(i + 1, j)
                 i = j + 1
             elif i + 2 < n and src[i + 2] == "'":
-                blank(i + 1, i + 2)
+                if not keep_strings:
+                    blank(i + 1, i + 2)
                 i += 3
             else:
                 i += 1
@@ -201,13 +230,58 @@ def match_brace(text, open_pos):
 TEST_ATTR = re.compile(r"#\[\s*(?:test|tokio::test|cfg\s*\(([^\]]*)\))\s*\]")
 
 
+def cfg_test_only(pred):
+    """Whether the cfg predicate `pred` is false whenever `test` is false (so
+    the item exists only in test builds). `feature = "test-hooks"` counts as
+    `test` (release builds never enable it). Other atoms are unknown, so
+    `any(test, feature = "x")` is NOT test-only. Kleene logic: `test` is
+    test-only, another atom is not; `all(..)` is test-only when any argument
+    is; `any(..)` when every argument is (and there is one); `not(..)` never
+    (conservative: the item is scanned)."""
+    toks = re.findall(r'[A-Za-z_]\w*|"[^"]*"|[(),=]', pred)
+    pos = [0]
+
+    def peek():
+        return toks[pos[0]] if pos[0] < len(toks) else None
+
+    def take():
+        pos[0] += 1
+        return toks[pos[0] - 1]
+
+    def expr():
+        name = take() if peek() is not None else ""
+        if peek() == "(" and name in ("all", "any", "not"):
+            take()
+            args = []
+            while peek() not in (")", None):
+                args.append(expr())
+                if peek() == ",":
+                    take()
+            if peek() == ")":
+                take()
+            if name == "all":
+                return any(args)
+            if name == "any":
+                return bool(args) and all(args)
+            return False
+        if peek() == "=":
+            take()
+            value = take() if peek() is not None else ""
+            # `test-hooks` is never enabled in a release build
+            # (packaging/test-no-test-hooks-in-release.sh).
+            return name == "feature" and value == '"test-hooks"'
+        return name == "test"
+
+    try:
+        return expr()
+    except IndexError:
+        return False
+
+
 def is_test_cfg(attr_body):
     if attr_body is None:
         return True
-    body = re.sub(r"\s+", "", attr_body)
-    if "not(test)" in body:
-        return False
-    return re.search(r"(?<![\w\"])test(?![\w\"-])", body) is not None
+    return cfg_test_only(attr_body)
 
 
 def test_spans(text, raw=None):
@@ -215,7 +289,10 @@ def test_spans(text, raw=None):
     `mod name;` declarations (a `#[path = "..."]` file name when given)."""
     spans, test_mods = [], []
     for m in TEST_ATTR.finditer(text):
-        if not is_test_cfg(m.group(1)):
+        body = m.group(1)
+        if body is not None and raw is not None:
+            body = raw[m.start(1):m.end(1)]  # literal values (`feature = ".."`)
+        if not is_test_cfg(body):
             continue
         # The item after the attribute (skip further attributes).
         k = m.end()
@@ -243,6 +320,31 @@ def test_spans(text, raw=None):
                     if depth == 0:
                         break
                 j += 1
+            spans.append((m.start(), j))
+            continue
+        block = re.match(r"\s*(?:if|match|while|for|loop|unsafe)\b|\s*\{", text[k:])
+        if not item and block:
+            # A block-like expression statement (`#[cfg(test)] if x { .. }`):
+            # it ends at the brace closing its first top-level block, or the
+            # last one of an `else` chain. It needs no `;`, so the `;` rule
+            # below would swallow the statements after it.
+            j = k
+            while True:
+                depth = 0
+                while j < len(text):
+                    ch = text[j]
+                    if ch in "([":
+                        depth += 1
+                    elif ch in ")]":
+                        depth -= 1
+                    elif ch == "{" and depth == 0:
+                        break
+                    j += 1
+                j = match_brace(text, j)
+                nxt = re.match(r"\s*else\b", text[j + 1:])
+                if not nxt:
+                    break
+                j = j + 1 + nxt.end()
             spans.append((m.start(), j))
             continue
         if not item:
@@ -341,45 +443,156 @@ def enclosing(fns, pos):
 # --------------------------------------------------------------------------
 
 
+def use_leaves(text):
+    """Every `use` declaration flattened to (path segments, local name) with
+    its offset; `*` leaves have local name `*`."""
+    out = []
+    for m in re.finditer(r"(?<![\w:])use\s+([^;]*);", text):
+        toks = re.findall(r"::|[A-Za-z_]\w*|[{},*]", m.group(1))
+        pos = [0]
+
+        def peek():
+            return toks[pos[0]] if pos[0] < len(toks) else None
+
+        def take():
+            pos[0] += 1
+            return toks[pos[0] - 1]
+
+        def tree(prefix):
+            path = list(prefix)
+            while True:
+                t = peek()
+                if t is None:
+                    return
+                if t == "::":
+                    take()
+                    continue
+                if t == "{":
+                    take()
+                    while peek() not in ("}", None):
+                        tree(path)
+                        if peek() == ",":
+                            take()
+                    if peek() == "}":
+                        take()
+                    return
+                if t == "*":
+                    take()
+                    out.append((path, "*", m.start()))
+                    return
+                if t in (",", "}"):
+                    return
+                take()
+                if t == "self":
+                    seg_path = path
+                else:
+                    seg_path = path + [t]
+                if peek() == "::":
+                    path = seg_path
+                    continue
+                alias = seg_path[-1] if seg_path else t
+                if peek() == "as":
+                    take()
+                    alias = take() if peek() not in (None, ",", "}") else alias
+                out.append((seg_path, alias, m.start()))
+                return
+
+        while peek() is not None:
+            tree([])
+            if peek() == ",":
+                take()
+            elif peek() is not None:
+                take()
+    return out
+
+
+# std::fs / tokio::fs items that open no file by path (anything else imported
+# from those modules must be resolved below or is an error).
+FS_PASSIVE = frozenset({
+    "DirBuilder", "DirEntry", "FileTimes", "FileType", "Metadata", "Permissions", "ReadDir",
+    "canonicalize", "create_dir", "create_dir_all", "exists", "hard_link", "metadata",
+    "read_dir", "read_link", "remove_dir", "remove_dir_all", "remove_file", "rename",
+    "set_permissions", "soft_link", "symlink", "symlink_metadata", "try_exists",
+    "symlink_file", "symlink_dir",
+})
+FS_BARE = ("read", "read_to_string", "copy", "write")
+# tempfile items the patterns know by their own name; an alias is an error.
+TEMPFILE_ITEMS = frozenset({"NamedTempFile", "TempDir", "Builder", "tempfile", "tempfile_in",
+                            "tempdir", "tempdir_in", "TempPath", "PersistError", "SpooledTempFile",
+                            "spooled_tempfile", "env"})
+
+
 def aliases(text):
-    """Local names for `std::fs::File` and `std::fs`, and bare fs functions."""
-    file_names, fs_names, bare = {"File"}, {"fs"}, set()
-    rustix = {"rustix::fs"}
-    for m in re.finditer(r"use\s+rustix::fs\s+as\s+(\w+)\s*;", text):
-        rustix.add(m.group(1))
-    for m in re.finditer(r"use\s+rustix::fs::\{([^}]*)\}", text):
-        am = re.search(r"\bself\s+as\s+(\w+)", m.group(1))
-        if am:
-            rustix.add(am.group(1))
-    for m in re.finditer(r"use\s+(?:std|tokio)::fs::File\s+as\s+(\w+)\s*;", text):
-        file_names.add(m.group(1))
-    for m in re.finditer(r"use\s+(?:std|tokio)::fs\s+as\s+(\w+)\s*;", text):
-        fs_names.add(m.group(1))
-    for m in re.finditer(r"use\s+std::fs::\{([^}]*)\}", text):
-        for part in m.group(1).split(","):
-            part = part.strip()
-            am = re.match(r"(\w+)(?:\s+as\s+(\w+))?$", part)
-            if not am:
-                continue
-            name, alias = am.group(1), am.group(2) or am.group(1)
-            if name == "File":
-                file_names.add(alias)
-            elif name == "self":
+    """Local names for `std::fs::File`, `std::fs::OpenOptions`, `std::fs`,
+    bare fs functions and rustix's fs module, plus every import this scanner
+    cannot resolve (`(offset, description)`, reported as an error: it fails
+    closed instead of skipping an aliased opener)."""
+    file_names, fs_names, bare, oo_names = {"File"}, {"fs"}, set(), {"OpenOptions"}
+    rustix, rustix_bare, tempfile_bare, unsupported = {"rustix::fs"}, set(), set(), []
+    oo_imported = False
+    for path, alias, at in use_leaves(text):
+        if len(path) >= 2 and path[0] in ("std", "tokio") and path[1] == "fs":
+            rest = path[2:]
+            if alias == "*":
+                unsupported.append((at, "glob import of %s" % "::".join(path)))
+            elif not rest:
                 fs_names.add(alias)
-            elif name in ("read", "read_to_string", "copy", "write"):
-                bare.add((alias, name))
-    return file_names, fs_names, bare, rustix
+            elif len(rest) > 1:
+                unsupported.append((at, "import of %s" % "::".join(path)))
+            elif rest[0] == "File":
+                file_names.add(alias)
+            elif rest[0] == "OpenOptions":
+                oo_names.add(alias)
+                oo_imported = oo_imported or alias == "OpenOptions"
+            elif rest[0] in FS_BARE:
+                bare.add((alias, rest[0]))
+            elif rest[0] not in FS_PASSIVE:
+                unsupported.append((at, "import of %s" % "::".join(path)))
+        elif len(path) >= 2 and path[0] == "rustix" and path[1] == "fs":
+            rest = path[2:]
+            if alias == "*":
+                unsupported.append((at, "glob import of rustix::fs"))
+            elif not rest:
+                rustix.add(alias)
+            elif rest[0] in ("open", "openat", "openat2"):
+                rustix_bare.add((alias, rest[0]))
+        elif path and path[0] == "tempfile":
+            rest = path[1:]
+            if alias == "*":
+                unsupported.append((at, "glob import of tempfile"))
+            elif not rest:
+                if alias != "tempfile":
+                    unsupported.append((at, "tempfile imported as %s" % alias))
+            elif rest[0] not in TEMPFILE_ITEMS or alias != rest[-1]:
+                unsupported.append((at, "import of %s as %s" % ("::".join(path), alias)))
+            elif rest[0] in ("tempfile", "tempfile_in"):
+                tempfile_bare.add(alias)
+    return {"file": file_names, "fs": fs_names, "bare": bare, "oo": oo_names,
+            "oo_imported": oo_imported,
+            "rustix": rustix, "rustix_bare": rustix_bare, "tempfile_bare": tempfile_bare,
+            "unsupported": unsupported}
 
 
-def op_patterns(text):
-    file_names, fs_names, bare, rustix = aliases(text)
-    rx = "|".join(sorted(re.escape(n) for n in rustix))
-    files = "|".join(sorted(re.escape(n) for n in file_names))
-    fss = "|".join(sorted(re.escape(n) for n in fs_names))
+def builder_factories(text, names):
+    """Free functions returning a `std::fs::OpenOptions` builder: each call is
+    an `OpenOptions` operation (`open_options_nofollow().create(true).open(p)`)."""
+    # A bare `OpenOptions` return type is std's only when imported from it
+    # (the session crate has an `OpenOptions` of its own).
+    imported = sorted(n for n in names["oo"] if n != "OpenOptions" or names["oo_imported"])
+    alts = [r"(?:std|tokio)::fs::OpenOptions", r"fs::OpenOptions"] + [re.escape(n) for n in imported]
+    return set(re.findall(r"\bfn\s+([a-z_]\w*)\s*\([^)]*\)\s*->\s*(?:%s)\b" % "|".join(alts), text))
+
+
+def op_patterns(text, factories=()):
+    names = aliases(text)
+    rx = "|".join(sorted(re.escape(n) for n in names["rustix"]))
+    files = "|".join(sorted(re.escape(n) for n in names["file"]))
+    fss = "|".join(sorted(re.escape(n) for n in names["fs"]))
+    oos = "|".join(sorted(re.escape(n) for n in names["oo"]))
     pats = [
         (r"(?<![\w.])(?:(?:std|tokio)::fs::)?(?:%s)::(open|create|create_new)\s*\(" % files, "File::{0}"),
         (r"(?<![\w.])(?:(?:std|tokio)::)?(?:%s)::(read|read_to_string|copy|write)\s*\(" % fss, "fs::{0}"),
-        (r"(?<![\w.])(?:(?:std|tokio)::fs::)?OpenOptions::new\s*\(|(?<![\w.])(?:(?:std|tokio)::)?(?:fs::)?(?:%s)::options\s*\(" % files, "OpenOptions"),
+        (r"(?<![\w.])(?:(?:std|tokio)::fs::|(?:%s)::)?(?:%s)::new\s*\(|(?<![\w.])(?:(?:std|tokio)::)?(?:fs::)?(?:%s)::options\s*\(" % (fss, oos, files), "OpenOptions"),
         (r"(?<![\w.])(?<!fn )(?:ratarmount_core::db_inodes::)?(open_admitted|openat_admitted)\s*\(", "{0}"),
         (r"\.reopen\s*\(\s*\)", "tempfile::reopen"),
         # Private open helpers of the caches: each call is its own entry.
@@ -387,30 +600,82 @@ def op_patterns(text):
         (r"\.try_clone\s*\(", "try_clone"),
         (r"\b(from_raw_fd|into_raw_fd|from_raw_handle|into_raw_handle)\s*\(", "{0}"),
         (r"(?<![\w.])(?:libc::)(open|openat|open64)\s*\(", "libc::{0}"),
-        (r"(?<![\w.:])(?:%s)::(open|openat)\s*\(" % rx, "rustix::{0}"),
+        (r"(?<![\w.:])(?:%s)::(open|openat|openat2)\s*\(" % rx, "rustix::{0}"),
         (r"(?<![\w])NamedTempFile::(?:new|new_in)\s*\(|\.tempfile(?:_in)?\s*\(|(?<![\w.])tempfile::tempfile(?:_in)?\s*\(", "tempfile"),
         (r"(?<![\w.])(?:tempfile::)?(?:tempdir|tempdir_in)\s*\(|\.tempdir(?:_in)?\s*\(|(?<![\w.])TempDir::new(?:_in)?\s*\(", "tempdir"),
         (r"(?<![\w.])ManagedReadCursor::open\s*\(", "ManagedReadCursor::open"),
         (r"(?<![\w.])managed_read::(\w+)\s*\(", "managed_read::{0}"),
     ]
-    for alias, name in sorted(bare):
-        pats.append((r"(?<![\w.:])%s\s*\(" % re.escape(alias), "fs::" + name))
+    for alias, name in sorted(names["bare"]):
+        pats.append((r"(?<![\w.:])(?<!fn )%s\s*\(" % re.escape(alias), "fs::" + name))
+    for alias, name in sorted(names["rustix_bare"]):
+        pats.append((r"(?<![\w.:])(?<!fn )%s\s*\(" % re.escape(alias), "rustix::" + name))
+    for alias in sorted(names["tempfile_bare"]):
+        pats.append((r"(?<![\w.:])(?<!fn )%s(?:_in)?\s*\(" % re.escape(alias), "tempfile"))
+    for name in sorted(factories):
+        pats.append((r"(?<![\w.])(?<!fn )(?:[a-z_]\w*::)*%s\s*\(" % re.escape(name), "OpenOptions"))
     return [(re.compile(p), label) for p, label in pats]
 
 
-def statement(text, pos):
-    """The normalized statement around `pos` (up to `;`/`{`, at most 6 lines)."""
+def extent(text, pos):
+    """(start, end) of the statement around `pos` in the masked `text`: from
+    the start of its line to the first `;` or block `{` outside brackets, or
+    the `}` closing the enclosing block (a tail expression), at most 40 lines."""
     start = text.rfind("\n", 0, pos) + 1
-    end = pos
-    lines = 0
-    while end < len(text) and lines < 6:
+    end, lines, depth = pos, 0, 0
+    while end < len(text) and lines < 40:
         ch = text[end]
-        if ch == ";":
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "{":
+            if depth <= 0:
+                break
+            depth += 1
+        elif ch == "}":
+            if depth <= 0:
+                break
+            depth -= 1
+        elif ch == ";" and depth <= 0:
             break
-        if ch == "\n":
+        elif ch == "\n":
             lines += 1
         end += 1
-    return re.sub(r"\s+", "", text[start:end])
+    return start, end
+
+
+def statement(ctext, spans):
+    """The normalized text of `spans` in the comment-masked source: literal
+    values are kept, so a changed path or mode changes the fingerprint."""
+    return "\n".join(re.sub(r"\s+", "", ctext[a:b]) for a, b in spans)
+
+
+def builder_spans(text, pos, first, fn_end, factory):
+    """For `let [mut] NAME = OpenOptions::new()..;` every later statement of
+    the function that uses NAME (its configuration and its `.open`), and an
+    error string when NAME is used other than by a method call (it escapes)
+    or never reaches `.open(` (unless the function returns the builder)."""
+    line = text[text.rfind("\n", 0, pos) + 1:pos]
+    m = re.search(r"\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=]*)?=\s*$", line)
+    if not m or m.group(1) == "_" or re.search(r"\.\s*open\s*\(", text[pos:first]):
+        return [], None
+    name = m.group(1)
+    spans, opened, problem = [], False, None
+    for u in re.finditer(r"(?<![\w.])%s\b" % re.escape(name), text[first:fn_end]):
+        at = first + u.start()
+        after = text[at + len(name):at + len(name) + 40]
+        sp = extent(text, at)
+        if re.match(r"\s*\.", after):
+            if re.search(r"\.\s*open\s*\(", text[at:sp[1]]):
+                opened = True
+        elif not (factory and re.match(r"\s*\}", after)):
+            problem = "builder %s escapes its function (used other than by a method call)" % name
+        if sp not in spans:
+            spans.append(sp)
+    if not opened and not factory and problem is None:
+        problem = "builder %s never reaches .open( in its function" % name
+    return spans, problem
 
 
 def fingerprint(stmt):
@@ -451,14 +716,18 @@ def module_file(rel, name, root):
     return None
 
 
-def scan(root):
-    """Every production operation: list of dicts (key fields + evidence)."""
+def scan(root, problems=None):
+    """Every production operation: list of dicts (key fields + evidence).
+    Unsupported forms (an unresolvable import, an escaping builder) are
+    appended to `problems` when given."""
+    problems = [] if problems is None else problems
     files = rust_files(root)
-    texts, raws, test_files = {}, {}, set()
+    texts, raws, ctexts, test_files = {}, {}, {}, set()
     for rel in files:
         with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
             raws[rel] = fh.read()
             texts[rel] = mask(raws[rel])
+            ctexts[rel] = mask(raws[rel], strings=False)
     # Files that are test-only modules (and everything below them).
     changed = True
     while changed:
@@ -476,17 +745,25 @@ def scan(root):
                 if mf and mf not in test_files:
                     test_files.add(mf)
                     changed = True
+    factories = {}
+    for rel in files:
+        if rel not in test_files:
+            factories.setdefault(crate_of(rel), set()).update(builder_factories(texts[rel], aliases(texts[rel])))
     ops, fn_index = [], {}
     for rel in files:
         if rel in test_files:
             continue
-        text = texts[rel]
-        spans, _ = test_spans(text)
+        text, ctext = texts[rel], ctexts[rel]
+        spans, _ = test_spans(text, raws[rel])
+        for at, what in aliases(text)["unsupported"]:
+            if not any(a <= at <= b for a, b in spans):
+                problems.append("unsupported import (resolve it in the scanner or import by a known name): %s:%d %s"
+                                % (rel, text.count("\n", 0, at) + 1, what))
         fns = [f for f in fn_spans(text) if not any(a <= f[0] <= b for a, b in spans)]
         for a, b, name in fns:
             fn_index.setdefault(crate_of(rel), {}).setdefault(name.split("::")[-1], []).append((rel, name))
         found = []
-        for pat, label in op_patterns(text):
+        for pat, label in op_patterns(text, factories.get(crate_of(rel), ())):
             for m in pat.finditer(text):
                 if any(a <= m.start() <= b for a, b in spans):
                     continue
@@ -498,7 +775,17 @@ def scan(root):
             fn = enclosing(fns, pos)
             k = (fn, op)
             seen[k] = seen.get(k, 0) + 1
-            stmt = statement(text, pos)
+            first = extent(text, pos)
+            parts = [first]
+            if op == "OpenOptions":
+                fn_end = max([b for a, b, n in fns if a <= pos <= b and n == fn] or [len(text)])
+                extra, problem = builder_spans(text, pos, first[1], fn_end,
+                                               fn.split("::")[-1] in factories.get(crate_of(rel), ()))
+                parts += extra
+                if problem:
+                    problems.append("unsupported OpenOptions builder: %s:%d %s: %s"
+                                    % (rel, text.count("\n", 0, pos) + 1, fn, problem))
+            stmt = statement(ctext, parts)
             ops.append({
                 "file": rel,
                 "function": fn,
@@ -512,19 +799,19 @@ def scan(root):
                 or (op == "OpenOptions" and ".create_new(true)" in stmt)
                 or (op in RAW_OPENS and re.search(r"O_EXCL|EXCL", stmt) is not None),
             })
-    return ops, texts, fns_by_file(texts, files, test_files)
+    return ops, texts, fns_by_file(texts, raws, files, test_files)
 
 
 def crate_of(rel):
     return rel.split("/")[0]
 
 
-def fns_by_file(texts, files, test_files):
+def fns_by_file(texts, raws, files, test_files):
     out = {}
     for rel in files:
         if rel in test_files:
             continue
-        spans, _ = test_spans(texts[rel])
+        spans, _ = test_spans(texts[rel], raws[rel])
         out[rel] = [f for f in fn_spans(texts[rel]) if not any(a <= f[0] <= b for a, b in spans)]
     return out
 
@@ -541,7 +828,7 @@ def key(e):
 def check(root, manifest):
     """Return a list of error strings (empty: clean)."""
     errors = []
-    ops, texts, fns = scan(root)
+    ops, texts, fns = scan(root, errors)
     entries = manifest.get("entries", [])
     by_key = {}
     for e in entries:
@@ -625,9 +912,13 @@ def resolves(rel, text, prefix, callee, target):
 
 
 def helper_errors(entries, scanned, texts, fns):
-    """A function with a managed entry must not reach a same-crate free helper
-    whose reads are not managed, and must not hold a raw descriptor except
-    around a classified non-managed operation on the same line."""
+    """A function with a managed entry must not reach (directly or through any
+    chain of same-crate free functions) a helper whose reads are not managed,
+    and must not hold a raw descriptor except around a classified
+    non-managed operation on the same line. A helper's entry may excuse a
+    caller by listing, in `non_mandatory_callers`, the managed root or the
+    function that calls the helper directly. Limits: methods and associated
+    functions are not followed, nor calls across crates."""
     errs = []
     by_key = {key(e): e for e in entries}
     managed_fns = {}
@@ -641,7 +932,27 @@ def helper_errors(entries, scanned, texts, fns):
             continue
         lines_by_fn[(o["file"], o["function"])].add(o["line"])
         if "::" not in o["function"]:
-            raw_by_fn.setdefault(crate_of(o["file"]), {}).setdefault(o["function"], []).append(o)
+            raw_by_fn.setdefault((crate_of(o["file"]), o["function"]), []).append(o)
+    # Free functions by (crate, name): [(file, start, end)].
+    free = {}
+    for rel, lst in fns.items():
+        for a, b, qual in lst:
+            if "::" not in qual:
+                free.setdefault((crate_of(rel), qual), []).append((rel, a, b))
+
+    def callees(rel, a, b, leaf):
+        text = texts[rel]
+        body = text[a:b]
+        out = []
+        for m in CALL_RE.finditer(body):
+            prefix, callee = m.group(1), m.group(2)
+            if callee == leaf or text[max(0, a + m.start() - 3):a + m.start()].endswith("fn "):
+                continue
+            for target, ta, tb in free.get((crate_of(rel), callee), []):
+                if resolves(rel, text, prefix, callee, target):
+                    out.append((callee, target, ta, tb))
+        return out
+
     for rel, names in managed_fns.items():
         text = texts.get(rel)
         if text is None:
@@ -656,23 +967,30 @@ def helper_errors(entries, scanned, texts, fns):
                     if line in lines_by_fn.get((rel, qual), set()):
                         continue
                     errs.append("raw descriptor escape %s in managed function %s (%s:%d)" % (esc, qual, rel, line))
-            leaf = qual.split("::")[-1]
-            for m in CALL_RE.finditer(body):
-                prefix, callee = m.group(1), m.group(2)
-                if callee == leaf or text[max(0, a + m.start() - 3):a + m.start()].endswith("fn "):
+            # Breadth-first over the call graph; `via` is the direct caller.
+            queue = [(qual, callee, target, ta, tb) for callee, target, ta, tb in callees(rel, a, b, qual.split("::")[-1])]
+            visited = set()
+            while queue:
+                via, callee, target, ta, tb = queue.pop(0)
+                if (target, callee) in visited:
                     continue
-                for o in raw_by_fn.get(crate_of(rel), {}).get(callee, []):
-                    if not resolves(rel, text, prefix, callee, o["file"]):
+                visited.add((target, callee))
+                for o in raw_by_fn.get((crate_of(rel), callee), []):
+                    if o["file"] != target:
                         continue
                     ent = by_key.get(key(o))
                     if ent is None or ent.get("disposition") in ("managed-read", "sqlite-snapshot", "output-owner"):
                         continue
-                    if qual in (ent.get("non_mandatory_callers") or []):
+                    excused = ent.get("non_mandatory_callers") or []
+                    if qual in excused or via in excused:
                         continue
                     if ent.get("category") == "directory-handle-or-durability":
                         continue  # a directory handle reads no file content
-                    errs.append("managed function %s (%s) reaches helper %s with a non-managed read (%s %s#%d)"
-                                % (qual, rel, callee, o["file"], o["op"], o["ordinal"]))
+                    chain = "" if via == qual else " via %s" % via
+                    errs.append("managed function %s (%s) reaches helper %s%s with a non-managed read (%s %s#%d)"
+                                % (qual, rel, callee, chain, o["file"], o["op"], o["ordinal"]))
+                for nxt in callees(target, ta, tb, callee):
+                    queue.append((callee,) + nxt)
     return sorted(set(errs))
 
 
@@ -686,7 +1004,14 @@ def load(path):
         return json.load(fh)
 
 
-def write(root, path):
+def write(root, path, baseline_dir=None):
+    """Rewrite the manifest. `baseline_dir` (a checkout of the baseline) is
+    the only way a `baseline_fingerprint` is refreshed: an
+    `unchanged-from-<baseline>` create gets its current fingerprint as its
+    baseline one only when the baseline has the same (file, fingerprint)."""
+    at_base = None
+    if baseline_dir is not None:
+        at_base = {(o["file"], o["fingerprint"]) for o in scan(baseline_dir)[0]}
     try:
         manifest = load(path)
     except FileNotFoundError:
@@ -698,12 +1023,23 @@ def write(root, path):
         e = dict(old.get(key(o)) or {"disposition": "UNCLASSIFIED"})
         for f in ("file", "function", "op", "ordinal", "line", "fingerprint"):
             e[f] = o[f]
+        if at_base is not None and e.get("mode_policy") == UNCHANGED and (o["file"], o["fingerprint"]) in at_base:
+            e["baseline_fingerprint"] = o["fingerprint"]
         out.append(order(e))
     manifest["entries"] = out
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=1, sort_keys=False)
         fh.write("\n")
     return len(out)
+
+
+def verify_baseline(baseline_dir, manifest):
+    """The `unchanged-from-<baseline>` entries whose (file,
+    baseline_fingerprint) the baseline checkout does not have."""
+    at_base = {(o["file"], o["fingerprint"]) for o in scan(baseline_dir)[0]}
+    return [e for e in manifest["entries"]
+            if e.get("mode_policy") == UNCHANGED
+            and (e["file"], e.get("baseline_fingerprint")) not in at_base]
 
 
 FIELD_ORDER = ("file", "function", "op", "ordinal", "line", "fingerprint", "baseline_fingerprint",
@@ -724,17 +1060,16 @@ def main(argv):
             print("%s:%d\t%s\t%s#%d" % (o["file"], o["line"], o["function"], o["op"], o["ordinal"]))
         return 0
     if len(argv) == 3 and argv[1] == "--verify-baseline":
-        ops, _, _ = scan(argv[2])
-        at_base = {(o["file"], o["fingerprint"]) for o in ops}
-        bad = [e for e in load(MANIFEST)["entries"]
-               if e.get("mode_policy") == UNCHANGED
-               and (e["file"], e.get("baseline_fingerprint")) not in at_base]
+        bad = verify_baseline(argv[2], load(MANIFEST))
         for e in bad:
             print("inventory: not a baseline create: %s:%d %s %s#%d"
                   % (e["file"], e["line"], e["function"], e["op"], e["ordinal"]))
         return 1 if bad else 0
     if argv[1:] == ["--write"]:
         print("wrote %d entries" % write(ROOT, MANIFEST))
+        return 0
+    if len(argv) == 4 and argv[1:3] == ["--write", "--baseline"]:
+        print("wrote %d entries" % write(ROOT, MANIFEST, argv[3]))
         return 0
     if len(argv) > 1:
         print(__doc__, file=sys.stderr)
@@ -909,6 +1244,150 @@ def regression_exclusive_create_requires_mode_policy():
     m = classify(root, {("b", "libc::open"): {"disposition": "output-owner"},
                         ("c", "rustix::openat"): {"disposition": "output-owner"}})
     expect(sum("mode policy" in e for e in check(root, m)) == 2, check(root, m))
+
+
+def regression_inventory_cfg_test_block_and_any_test_do_not_hide_code():
+    """Regression (R11-S7-FIX1): a `#[cfg(test)] if .. { .. }` statement (no
+    `;`) hid every statement after it in the function, so the production
+    `libc::open` of `ensure_standard_descriptors` had no entry; and
+    `cfg(any(test, feature = "http"))` code, compiled in production with the
+    feature, was skipped as test-only."""
+    root = fake({"c/src/lib.rs": (
+        "fn fill() {\n    #[cfg(test)]\n    if FAIL.with(|f| f.get()) {\n        return;\n    }\n"
+        "    loop {\n        let fd = unsafe { libc::open(c\"/dev/null\".as_ptr(), libc::O_RDWR) };\n    }\n}\n"
+        "fn chain(p: &Path) {\n    #[cfg(test)]\n    if X { return; } else if Y { return; } else { () }\n"
+        "    #[cfg(test)]\n    let _t = std::fs::read(\"t\");\n    let _ = std::fs::read(p);\n}\n"
+        "#[cfg(any(test, feature = \"http\"))]\nfn served(p: &Path) { let _ = std::fs::read(p); }\n"
+        "#[cfg(all(test, unix))]\nfn only_tests(p: &Path) { let _ = std::fs::read(p); }\n"
+        "#[cfg(not(test))]\nfn not_tests(p: &Path) { let _ = std::fs::read(p); }\n"
+        "#[cfg(any(test, all(test, unix)))]\nfn also_tests(p: &Path) { let _ = std::fs::read(p); }\n"
+        "#[cfg(any(test, feature = \"test-hooks\"))]\nfn hooks(p: &Path) { let _ = std::fs::read(p); }\n"
+    )})
+    ops, _, _ = scan(root)
+    got = sorted((o["function"], o["op"]) for o in ops)
+    expect(got == [("chain", "fs::read"), ("fill", "libc::open"), ("not_tests", "fs::read"), ("served", "fs::read")], got)
+
+
+def regression_inventory_aliased_imports_resolve_or_fail_closed():
+    """Regression (R11-S7-FIX1): `use std::fs::read as read_file;`,
+    `OpenOptions as FsOpenOptions` and nested `std::{fs::{..}}` imports hid
+    their reads and creates; an import the scanner cannot resolve was
+    skipped instead of failing."""
+    root = fake({"c/src/lib.rs": (
+        "use std::fs::read as read_file;\n"
+        "use std::fs::{self as stdfs, OpenOptions as FsOpenOptions, Metadata};\n"
+        "use std::{fs::{File as F2}, io};\n"
+        "use rustix::fs::{self, Mode};\n"
+        "fn a(p: &Path) { let _ = read_file(p); }\n"
+        "fn b(p: &Path) { let _ = FsOpenOptions::new().write(true).create(true).open(p); }\n"
+        "fn c(p: &Path) { let _ = stdfs::read(p); }\n"
+        "fn d(p: &Path) { let _ = F2::open(p); }\n"
+        "fn e(d: &OwnedFd) { let _ = fs::openat(d, \"x\", OFlags::RDONLY, Mode::empty()); }\n"
+    )})
+    errs = []
+    ops, _, _ = scan(root, errs)
+    got = sorted((o["function"], o["op"], o["creates"]) for o in ops)
+    expect(got == [("a", "fs::read", False), ("b", "OpenOptions", True), ("c", "fs::read", False),
+                   ("d", "File::open", False), ("e", "rustix::openat", False)], got)
+    expect(errs == [], errs)
+    for bad in ("use std::fs::*;\n", "use std::fs::{open_new_thing};\n", "use tempfile::NamedTempFile as Tmp;\n",
+                "use std::fs::File::open;\n", "use tempfile as tf;\n"):
+        root = fake({"c/src/lib.rs": bad + "fn a() {}\n"})
+        errs = check(root, {"entries": []})
+        expect(any("unsupported import" in e for e in errs), (bad, errs))
+
+
+def regression_inventory_helper_walk_is_transitive():
+    """Regression (R11-S7-FIX1): a managed function reaching a raw read
+    through two helpers (`hash -> mid -> leaf`, `leaf` in another module) was
+    not reported; the check followed one call only."""
+    root = fake({
+        "c/src/lib.rs": "mod util;\nuse crate::util::leaf;\nfn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; mid(p); }\nfn mid(p: &Path) { leaf(p); }\n",
+        "c/src/util.rs": "pub fn leaf(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("leaf", "fs::read"): OOF})
+    errs = check(root, m)
+    expect(any("reaches helper leaf via mid" in e for e in errs), errs)
+    m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                        ("leaf", "fs::read"): dict(OOF, non_mandatory_callers=["mid"])})
+    expect(check(root, m) == [], check(root, m))
+
+
+def regression_inventory_fingerprint_keeps_literals_and_builder_configuration():
+    """Regression (R11-S7-FIX1): fingerprints hashed literal-masked text, so
+    `"config.json"` -> `"index.sqlite"` kept the entry; a builder configured
+    in later statements (`let mut o = OpenOptions::new(); o.mode(..);
+    o.open(p)`) was neither a create nor fingerprinted past its first
+    statement, so `.mode(0o600)` -> `.mode(0o666)` passed."""
+    src = "fn a(p: &Path) { let _ = std::fs::read(p.join(\"config.json\")); }\n"
+    root = fake({"c/src/lib.rs": src})
+    m = classify(root, {("a", "fs::read"): OOF})
+    with open(os.path.join(root, "c/src/lib.rs"), "w") as fh:
+        fh.write(src.replace("config.json", "index.sqlite"))
+    expect(any("changed operation" in e for e in check(root, m)), check(root, m))
+    builder = (
+        "fn copy(p: &Path) -> io::Result<File> {\n    let mut opts = std::fs::OpenOptions::new();\n"
+        "    opts.write(true).create_new(true);\n    #[cfg(unix)]\n    {\n        opts.mode(0o600);\n    }\n"
+        "    let f = opts.open(p)?;\n    Ok(f)\n}\n"
+    )
+    root = fake({"c/src/lib.rs": builder})
+    ops, _, _ = scan(root)
+    expect(len(ops) == 1 and ops[0]["creates"] and ops[0]["exclusive"], ops)
+    m = classify(root, {("copy", "OpenOptions"): {"disposition": "output-owner", "mode_policy": "0600"}})
+    expect(check(root, m) == [], check(root, m))
+    with open(os.path.join(root, "c/src/lib.rs"), "w") as fh:
+        fh.write(builder.replace("0o600", "0o666"))
+    expect(any("changed operation" in e for e in check(root, m)), check(root, m))
+    # A long chain: the mode on its ninth line is part of the fingerprint.
+    chain = "fn l(p: &Path) {\n    let _ = OpenOptions::new()\n" + "        .read(true)\n" * 7 + "        .mode(0o600)\n        .open(p);\n}\n"
+    root = fake({"c/src/lib.rs": chain})
+    m = classify(root, {("l", "OpenOptions"): OOF})
+    with open(os.path.join(root, "c/src/lib.rs"), "w") as fh:
+        fh.write(chain.replace("0o600", "0o666"))
+    expect(any("changed operation" in e for e in check(root, m)), check(root, m))
+    # Builder factories: each call is an operation; an escaping builder fails.
+    root = fake({"c/src/lib.rs": (
+        "use std::fs::OpenOptions as Fs;\n"
+        "fn opts() -> Fs {\n    let mut o = Fs::new();\n    o.read(true);\n    o\n}\n"
+        "fn user(p: &Path) { let _ = opts().write(true).create(true).open(p); }\n"
+        "fn escapes(p: &Path) { let mut o = Fs::new(); configure(&mut o); let _ = o.open(p); }\n"
+        "fn unopened() { let mut o = Fs::new(); o.read(true); }\n"
+    )})
+    errs = []
+    ops, _, _ = scan(root, errs)
+    got = sorted((o["function"], o["op"], o["creates"]) for o in ops)
+    expect(got == [("escapes", "OpenOptions", False), ("opts", "OpenOptions", False),
+                   ("unopened", "OpenOptions", False), ("user", "OpenOptions", True)], got)
+    expect(len(errs) == 2 and any("escapes its function" in e for e in errs)
+           and any("never reaches .open(" in e for e in errs), errs)
+
+
+def regression_inventory_baseline_fingerprint_comes_only_from_the_baseline():
+    """Regression (R11-S7-FIX1): a new create could claim
+    `unchanged-from-<baseline>` by copying its own fingerprint into
+    `baseline_fingerprint`; only `--write --baseline DIR` may set it, and
+    `--verify-baseline` (now in CI) rejects a copied one."""
+    base_src = "fn a(p: &Path) { let _ = std::fs::File::create(p); }\n"
+    base = fake({"c/src/lib.rs": base_src})
+    cur = fake({"c/src/lib.rs": base_src + "fn b(p: &Path) { let _ = std::fs::File::create(p.join(\"new\")); }\n"})
+    path = os.path.join(cur, "manifest.json")
+    m = classify(cur, {("a", "File::create"): {"disposition": "output-owner", "mode_policy": UNCHANGED},
+                       ("b", "File::create"): {"disposition": "output-owner", "mode_policy": UNCHANGED}})
+    with open(path, "w") as fh:
+        json.dump(m, fh)
+    write(cur, path)
+    expect(not any("baseline_fingerprint" in e for e in load(path)["entries"]), "plain --write set one")
+    write(cur, path, base)
+    m = load(path)
+    have = {e["function"]: e.get("baseline_fingerprint") for e in m["entries"]}
+    expect(have["a"] and have["b"] is None, have)
+    errs = check(cur, m)
+    expect(len(errs) == 1 and "valid only for an unchanged baseline" in errs[0] and " b " in errs[0], errs)
+    for e in m["entries"]:
+        e["baseline_fingerprint"] = e["fingerprint"]  # the self-copy
+    expect(check(cur, m) == [], check(cur, m))
+    bad = verify_baseline(base, m)
+    expect([e["function"] for e in bad] == ["b"], bad)
 
 
 def self_test():

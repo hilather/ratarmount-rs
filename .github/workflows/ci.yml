@@ -53,6 +53,11 @@ jobs:
         run: |
           python3 -I packaging/test-internal-read-inventory.py --self-test
           python3 -I packaging/test-internal-read-inventory.py
+          # `unchanged-from-e6ca64e` creates must exist unchanged at the baseline.
+          git fetch --no-tags --depth=1 origin e6ca64e3a3d2c509840ca147fcf0d71703546318
+          mkdir -p "$RUNNER_TEMP/inventory-baseline"
+          git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/inventory-baseline"
+          python3 -I packaging/test-internal-read-inventory.py --verify-baseline "$RUNNER_TEMP/inventory-baseline"
 
       - name: aarch64 checked-open CI contract
         run: |
