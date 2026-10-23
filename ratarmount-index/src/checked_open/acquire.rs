@@ -699,6 +699,12 @@ pub(crate) mod imp {
         static ACTIVE: Cell<bool> = const { Cell::new(false) };
     }
 
+    /// Whether this thread is inside an acquisition (`false` if its
+    /// thread-local storage is gone).
+    pub(crate) fn thread_is_acquiring() -> bool {
+        ACTIVE.try_with(|c| c.get()).unwrap_or(false)
+    }
+
     /// Read errno directly (no std machinery inside the callbacks).
     fn errno() -> c_int {
         #[cfg(target_os = "linux")]

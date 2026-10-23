@@ -457,6 +457,8 @@ def scan(root):
                 "ordinal": seen[k],
                 "line": text.count("\n", 0, pos) + 1,
                 "fingerprint": fingerprint(stmt),
+                "creates": op in CREATE_OPS and (op != "OpenOptions" or re.search(r"\.(create|create_new)\(true\)", stmt) is not None)
+                or op == "rustix::openat" and "CREATE" in stmt,
                 "exclusive": op in ("File::create_new", "tempfile", "tempdir", "managed_read::copy_exclusive_new")
                 or (op == "OpenOptions" and ".create_new(true)" in stmt),
             })
@@ -521,7 +523,8 @@ def entry_errors(e, o, where):
         return ["unclassified operation (disposition %r): %s" % (d, where)]
     managed = o["op"] in MANAGED_OPS
     if d in ("managed-read", "sqlite-snapshot"):
-        if not managed:
+        backend = e.get("managed_backend") and o["file"] == "ratarmount-index/src/managed_read.rs"
+        if not managed and not backend:
             errs.append("mandatory read uses a raw reader (%s): %s" % (o["op"], where))
         if not e.get("regression"):
             errs.append("mandatory read without a named regression: " + where)
@@ -539,7 +542,7 @@ def entry_errors(e, o, where):
             errs.append("out-of-family without a specific reason: " + where)
         if e.get("mandatory_helper"):
             errs.append("mandatory helper classified out-of-family: " + where)
-    if o["op"] in CREATE_OPS or o["exclusive"]:
+    if o["creates"] or o["exclusive"]:
         policy = (e.get("mode_policy") or "").strip()
         if not policy:
             errs.append("create without a mode policy: " + where)
@@ -655,7 +658,7 @@ def write(root, path):
 
 FIELD_ORDER = ("file", "function", "op", "ordinal", "line", "fingerprint", "baseline_fingerprint",
                "disposition", "family", "category", "issue", "reason", "regression",
-               "mandatory_helper", "non_mandatory_callers", "mode_policy")
+               "mandatory_helper", "managed_backend", "non_mandatory_callers", "mode_policy")
 
 
 def order(e):

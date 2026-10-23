@@ -17,6 +17,7 @@ mod dirent_order;
 mod hashing;
 mod local_cache;
 mod location;
+pub mod managed_read;
 mod mem;
 mod meta_cache;
 mod nested;

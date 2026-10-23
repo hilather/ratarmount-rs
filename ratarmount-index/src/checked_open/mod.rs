@@ -81,6 +81,30 @@ pub use acquire::{
     Verification,
 };
 pub use elf::{ElfError, SymbolName};
+
+/// Whether this thread is inside [`open_checked`] (a managed byte read there
+/// would be taken for SQLite's own `open`).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn thread_is_acquiring() -> bool {
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    ))]
+    {
+        acquire::imp::thread_is_acquiring()
+    }
+    #[cfg(not(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_endian = "little",
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    )))]
+    {
+        false
+    }
+}
 pub use host::{HostFailure, ImageIdentity};
 pub use install::{
     constructor_observation, install_private_instance, installed, CtorObservation, InstallFailure,
