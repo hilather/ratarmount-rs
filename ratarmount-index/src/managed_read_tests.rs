@@ -248,9 +248,15 @@ fn regression_internal_cursor_failure_has_no_raw_fallback() {
     );
 }
 
-/// Regression: an empty file on an ordinary filesystem reads as EOF.
+/// Regression: an empty file on an ordinary filesystem reads as EOF; a
+/// 1-byte file (which SQLite's xFileSize reports as 0) reads its byte.
 #[test]
 fn regression_internal_cursor_empty_native_file_reads_eof() {
+    let (_d, dir) = tempdir();
+    let one = dir.join("one");
+    std::fs::write(&one, b"Z").unwrap();
+    assert_eq!(ManagedReadCursor::open(&one).unwrap().len().unwrap(), 1);
+    assert_eq!(read(&one).unwrap(), b"Z");
     let (_d, dir) = tempdir();
     let f = dir.join("empty");
     std::fs::write(&f, b"").unwrap();

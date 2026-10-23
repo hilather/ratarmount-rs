@@ -53,7 +53,7 @@ pub struct ManagedReadCursor {
 }
 
 struct Owner {
-    file: Mutex<imp::ByteFile>,
+    file: std::mem::ManuallyDrop<Mutex<imp::ByteFile>>,
 }
 
 impl ManagedReadCursor {
@@ -63,7 +63,7 @@ impl ManagedReadCursor {
         let file = imp::ByteFile::open(path)?;
         Ok(Self {
             owner: Arc::new(Owner {
-                file: Mutex::new(file),
+                file: std::mem::ManuallyDrop::new(Mutex::new(file)),
             }),
             pos: 0,
         })
@@ -158,6 +158,9 @@ impl Seek for ManagedReadCursor {
 impl Drop for Owner {
     fn drop(&mut self) {
         let _ = seams::fire(Seam::BeforeClose);
+        // SAFETY: dropped exactly once, here.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.file) };
+        let _ = seams::fire(Seam::AfterClose);
     }
 }
 
@@ -346,6 +349,8 @@ pub enum Seam {
     BeforeRead,
     /// Before the owner is closed (`xClose`).
     BeforeClose,
+    /// After the owner was closed.
+    AfterClose,
     /// Copy: before the source permissions are applied.
     BeforePermissions,
     /// Copy: before the exclusive copy is handed back.
@@ -631,6 +636,21 @@ mod imp {
             if rc != ffi::SQLITE_OK {
                 return Err(sqlite_err(rc, "file size", self.last_errno()));
             }
+            if n == 0 {
+                // SQLite reports a 1-byte file as 0 bytes (its macOS msdos
+                // workaround, ticket #3260): probe one byte to tell them apart.
+                let Some(read) = self.methods().xRead else {
+                    return Err(io::Error::other("SQLite VFS has no xRead"));
+                };
+                let mut b = 0u8;
+                // SAFETY: one byte of valid memory.
+                let rc = unsafe { read(self.file, (&mut b as *mut u8).cast::<c_void>(), 1, 0) };
+                return match rc {
+                    ffi::SQLITE_OK => Ok(1),
+                    ffi::SQLITE_IOERR_SHORT_READ => Ok(0),
+                    _ => Err(sqlite_err(rc, "read", self.last_errno())),
+                };
+            }
             u64::try_from(n).map_err(|_| io::Error::other("negative file size"))
         }
 
@@ -667,6 +687,25 @@ mod imp {
                 return Err(sqlite_err(rc, "fsync", self.last_errno()));
             }
             Ok(())
+        }
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        pub(super) fn lock_shared(&mut self) -> io::Result<()> {
+            let lock = self.methods().xLock.expect("xLock");
+            // SAFETY: an open file object.
+            let rc = unsafe { lock(self.file, ffi::SQLITE_LOCK_SHARED) };
+            if rc != ffi::SQLITE_OK {
+                return Err(sqlite_err(rc, "lock", self.last_errno()));
+            }
+            Ok(())
+        }
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        pub(super) fn unlock(&mut self) {
+            if let Some(unlock) = self.methods().xUnlock {
+                // SAFETY: an open file object.
+                unsafe { unlock(self.file, ffi::SQLITE_LOCK_NONE) };
+            }
         }
 
         pub(super) fn has_moved(&mut self) -> io::Result<bool> {
@@ -797,6 +836,30 @@ pub mod lock_probe {
                 n => panic!("probe child failed ({n})"),
             }
         }
+    }
+}
+
+/// Holds a SHARED lock on any file through this SQLite instance's own VFS
+/// (a stand-in for a connection on a file that is not a database, e.g. a
+/// compressed index or an archive). Tests only.
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
+pub struct VfsLockHolder {
+    file: imp::ByteFile,
+}
+
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
+impl VfsLockHolder {
+    pub fn shared(path: &Path) -> io::Result<Self> {
+        let mut file = imp::ByteFile::open(path)?;
+        file.lock_shared()?;
+        Ok(Self { file })
+    }
+}
+
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
+impl Drop for VfsLockHolder {
+    fn drop(&mut self) {
+        self.file.unlock();
     }
 }
 

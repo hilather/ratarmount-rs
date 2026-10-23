@@ -15,6 +15,8 @@ pub mod checked_open;
 mod digest_cache;
 mod dirent_order;
 mod hashing;
+#[cfg(all(test, unix))]
+mod internal_reads_tests;
 mod local_cache;
 mod location;
 pub mod managed_read;
@@ -309,8 +311,9 @@ pub fn tar_stats_from_metadata(meta: &std::fs::Metadata) -> TarStats {
 pub fn archive_edge_hashes(path: &Path) -> Result<(String, String)> {
     use std::io::{Seek, SeekFrom};
 
-    let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
+    // Managed (#151): the archive may be a database open in this process.
+    let mut f = managed_read::ManagedReadCursor::open(path)?;
+    let len = f.len()?;
     let mut buf = [0u8; TARSTATS_SAMPLE_BYTES];
     let prefix_len = TARSTATS_SAMPLE_BYTES.min(len as usize);
     let prefix_hex = hashing::sha256_hex_window(&mut f, &mut buf, prefix_len)?;
@@ -329,8 +332,8 @@ pub fn archive_edge_hashes(path: &Path) -> Result<(String, String)> {
 /// Streams until EOF (no second size cap, no file-sized `Vec`). Policy cap is
 /// the `st_size` gate only — do not change [`TARSTATS_FULL_HASH_MAX`].
 pub fn archive_full_hash(path: &Path) -> Result<Option<String>> {
-    let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
+    let mut f = managed_read::ManagedReadCursor::open(path)?;
+    let len = f.len()?;
     if len > TARSTATS_FULL_HASH_MAX {
         return Ok(None);
     }
@@ -891,15 +894,33 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
     };
     let dir = tempfile::tempdir().map_err(io)?;
     let copy = dir.path().join("snapshot.sqlite");
-    std::fs::copy(absolute, &copy).map_err(io)?;
+    // Managed sources (#151): the index and its companions are open in this
+    // process. Exclusive-new outputs in the fresh directory with the exact
+    // source permissions; a failed copy removes its own output.
+    let exclusive = |from: &Path, to: &Path| {
+        managed_read::copy_exclusive_new(
+            from,
+            to,
+            managed_read::CopySourcePermissions::Exact,
+            managed_read::CopyDigest::None,
+        )
+        .map(drop)
+    };
+    exclusive(absolute, &copy).map_err(io)?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut from = absolute.as_os_str().to_owned();
         from.push(suffix);
         let mut to = copy.as_os_str().to_owned();
         to.push(suffix);
-        match std::fs::copy(PathBuf::from(from), PathBuf::from(to)) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        let from = PathBuf::from(from);
+        // A missing SOURCE companion is fine; a destination collision is not.
+        match std::fs::symlink_metadata(&from) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            _ => {}
+        }
+        match exclusive(&from, Path::new(&to)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !from.exists() => {}
             Err(e) => return Err(io(e)),
         }
     }
@@ -1699,10 +1720,9 @@ impl SqliteIndex {
             let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
             *guard = Connection::open_in_memory()?;
         }
-        {
-            let f = std::fs::File::open(&tmp)?;
-            f.sync_all()?;
-        }
+        // Managed sync (#151): the temporary index may be another name of a
+        // database open in this process.
+        managed_read::ManagedReadCursor::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &dest)?;
         self.publish_target = None;
         self.path = Some(dest.clone());
