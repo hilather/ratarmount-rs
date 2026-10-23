@@ -1058,8 +1058,14 @@ fn http_state_debug_redacts_password() {
 
 /// Regression: HTTP GET of the sidecar is Content-Type `INDEX_MEDIA_TYPE`,
 /// not a FUSE control file, and `--http` still serves the indexed tree.
+/// Every test that serves the index sidecar (managed reads, process-wide
+/// `XOPEN_CALLS`) holds this, so the admission test's open count is not
+/// moved by another test's reads.
+static SIDECAR_SERIAL: Mutex<()> = Mutex::new(());
+
 #[test]
 fn index_content_type() {
+    let _g = SIDECAR_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let td = tempfile::tempdir().expect("sidecar tempdir");
     let sidecar = td.path().join("archive.tar.index.sqlite");
     let blob = b"SQLite format 3\0portable-index-bytes";
@@ -1137,7 +1143,7 @@ mod sidecar_s7 {
     use std::time::Instant;
 
     /// The sidecar tests count the process-wide managed opens.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    use super::SIDECAR_SERIAL as SERIAL;
 
     struct Srv {
         handle: Option<ExportServerHandle>,

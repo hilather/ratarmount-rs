@@ -1891,8 +1891,11 @@ in its per-inode bookkeeping and, on close, parks it instead of closing it while
 any connection of this SQLite instance holds a lock on the inode; a later read
 reuses the parked descriptor. The byte reader opens no SQL connection, takes no
 lock, never touches `-wal`/`-shm` and never reads the bytes as a database. Each
-read is bounded by the current length (and 128 KiB); a file that shrinks while
-it is read is an error, never a digest over zero fill. No failure falls back to
+read is bounded by the current length (and 128 KiB); a short read from SQLite
+(which zero-fills the rest of its buffer) is an error, so a zero-filled tail is
+never hashed or copied. A file that shrinks between two reads simply ends early
+there, as an ordinary read would; the copy helpers compare the copied length
+with the length seen at open and refuse, other readers do not. No failure falls back to
 an ordinary file read. On Windows the reader reads an ordinary private file.
 
 Covered (each with a regression test; `packaging/internal-read-inventory.json`

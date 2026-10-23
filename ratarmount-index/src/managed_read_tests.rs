@@ -590,9 +590,18 @@ fn regression_internal_copy_destination_failures() {
         assert!(e.to_string().contains("injected"));
         assert!(!dest.exists(), "{seam:?}: owned destination removed");
     }
-    // The source replaced at its name during the copy: refused.
+    // The source replaced at its name during the copy: refused (Unix only:
+    // `has_moved` is always false on Windows).
+    #[cfg(unix)]
+    {
+        moved_source_is_refused(&src, &dir);
+    }
+}
+
+#[cfg(unix)]
+fn moved_source_is_refused(src: &Path, dir: &Path) {
     let dest = dir.join("moved");
-    let (s2, d2) = (src.clone(), dir.join("other"));
+    let (s2, d2) = (src.to_path_buf(), dir.join("other"));
     std::fs::write(&d2, vec![3u8; 300_000]).unwrap();
     let mut renamed = false;
     let e = seams::with(
@@ -603,7 +612,7 @@ fn regression_internal_copy_destination_failures() {
             }
             Ok(())
         },
-        || copy_exclusive_new(&src, &dest, CopySourcePermissions::Exact, CopyDigest::None),
+        || copy_exclusive_new(src, &dest, CopySourcePermissions::Exact, CopyDigest::None),
     )
     .unwrap_err();
     assert!(e.to_string().contains("changed while it was copied"), "{e}");
