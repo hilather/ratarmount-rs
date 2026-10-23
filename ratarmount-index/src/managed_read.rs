@@ -536,8 +536,21 @@ mod imp {
     // VFS methods are thread-safe for distinct calls on one file object.
     unsafe impl Send for ByteFile {}
 
-    fn sqlite_err(rc: c_int, what: &str, errno: c_int) -> io::Error {
-        if errno != 0 {
+    /// Map an SQLite result to an `io::Error`. `errno` is consulted only for
+    /// results that come from a system call (`SQLITE_CANTOPEN` and the
+    /// `SQLITE_IOERR` family other than `SQLITE_IOERR_NOMEM`): any other
+    /// result leaves a stale `errno` behind, and an allocation failure read
+    /// as a stale `ENOENT` would be taken for a missing file (a metadata
+    /// cache entry dropped and refetched).
+    pub(super) fn sqlite_err(rc: c_int, what: &str, errno: c_int) -> io::Error {
+        if rc == ffi::SQLITE_NOMEM || rc == ffi::SQLITE_IOERR_NOMEM {
+            return io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("{what}: SQLite out of memory (SQLite code {rc})"),
+            );
+        }
+        let primary = rc & 0xff;
+        if errno != 0 && (primary == ffi::SQLITE_CANTOPEN || primary == ffi::SQLITE_IOERR) {
             let os = io::Error::from_raw_os_error(errno);
             return io::Error::new(os.kind(), format!("{what}: {os} (SQLite code {rc})"));
         }

@@ -380,6 +380,9 @@ fn child_row(row: &str, dir: &Path) -> String {
         drop(h);
         return format!("xopen={} kept={kept} err={refused}", after - before);
     }
+    if row == "nomem" {
+        return nomem_row(dir);
+    }
     if let Some(umask) = row.strip_prefix("copymodes:") {
         let umask = u32::from_str_radix(umask, 8).unwrap();
         // SAFETY: a single-threaded child.
@@ -399,6 +402,95 @@ fn child_row(row: &str, dir: &Path) -> String {
         return mode_rows(dir, umask);
     }
     panic!("unknown row {row}")
+}
+
+/// Set this thread's `errno`.
+#[cfg(unix)]
+fn set_errno(e: libc::c_int) {
+    // SAFETY: the thread's own errno slot.
+    unsafe {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            *libc::__errno_location() = e;
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        {
+            *libc::__error() = e;
+        }
+        #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+        {
+            *libc::__errno() = e;
+        }
+    }
+}
+
+/// The child half of [`regression_sqlite_nomem_is_not_a_missing_file`]: a
+/// real `SQLITE_NOMEM` from `xOpen` (SQLite's hard heap limit set right
+/// before it) with a stale `errno` of `ENOENT`.
+#[cfg(unix)]
+fn nomem_row(dir: &Path) -> String {
+    use crate::meta_cache::MetaCache;
+    // Fail the `n`th managed open of this thread with SQLite out of memory.
+    fn nomem_at(n: u32) -> impl FnMut(Seam) -> io::Result<()> {
+        let mut opens = 0;
+        move |s| {
+            if s == Seam::BeforeOpen {
+                opens += 1;
+                if opens == n {
+                    // SAFETY: plain C call; the child is single-threaded.
+                    unsafe { rusqlite::ffi::sqlite3_hard_heap_limit64(1) };
+                    set_errno(libc::ENOENT);
+                }
+            }
+            Ok(())
+        }
+    }
+    fn lift() {
+        // SAFETY: as above; 0 removes the limit.
+        unsafe { rusqlite::ffi::sqlite3_hard_heap_limit64(0) };
+    }
+    let f = dir.join("plain");
+    std::fs::write(&f, b"some bytes").unwrap();
+    let got = seams::with(nomem_at(1), || ManagedReadCursor::open(&f).map(drop));
+    lift();
+    let err = got.expect_err("a refused allocation must fail the open");
+    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
+    assert!(ManagedReadCursor::open(&f).is_ok(), "the limit was lifted");
+
+    // A metadata-cache hit whose header or blob read fails that way keeps
+    // the entry (no invalidation, no refetch).
+    let cache = MetaCache::with_dir(dir.join("meta-v3"), 64 << 20);
+    let fetched = dir.join("fetched.sqlite");
+    database(&fetched, false);
+    let url = "http|https://example.invalid/nomem.index.sqlite";
+    let blob = cache
+        .get_or_fetch_path_with_etag::<io::Error, _>(url, None, || Ok((fetched.clone(), None)))
+        .unwrap();
+    let bytes = std::fs::read(&blob).unwrap();
+    let mut kinds = Vec::new();
+    for n in [1, 2] {
+        let got = seams::with(nomem_at(n), || {
+            cache.get_or_fetch_path_with_etag::<io::Error, _>(url, None, || {
+                Err(io::Error::other("refetched"))
+            })
+        });
+        lift();
+        let err = got.expect_err("an allocation failure is an error");
+        assert!(!err.to_string().contains("refetched"), "no refetch: {err}");
+        assert_eq!(
+            std::fs::read(&blob).unwrap(),
+            bytes,
+            "entry kept (open {n})"
+        );
+        kinds.push(format!("{:?}", err.kind()));
+    }
+    let hit = cache
+        .get_or_fetch_path_with_etag::<io::Error, _>(url, None, || {
+            Err(io::Error::other("refetched"))
+        })
+        .unwrap();
+    assert_eq!(hit, blob, "still a hit afterwards");
+    format!("kind={:?} cache={}", err.kind(), kinds.join(","))
 }
 
 #[cfg(not(unix))]
@@ -720,4 +812,41 @@ fn regression_sqlite_companions_inherit_database_mode() {
         let got = run_child(&format!("companions:{umask}"), &dir);
         assert_eq!(got.trim(), "ok 600,640,666", "umask {umask}");
     }
+}
+
+/// Regression: an SQLite allocation failure in the managed open (with a
+/// stale `errno` of `ENOENT` left behind) was reported as `NotFound`, so a
+/// metadata-cache hit took its valid entry for an evicted one, invalidated
+/// it and refetched. `errno` now counts only for `SQLITE_CANTOPEN` and the
+/// `SQLITE_IOERR` family; `SQLITE_NOMEM` is `OutOfMemory`.
+#[cfg(unix)]
+#[test]
+fn regression_sqlite_nomem_is_not_a_missing_file() {
+    use rusqlite::ffi;
+    let map = |rc, errno| imp::sqlite_err(rc, "x", errno).kind();
+    assert_eq!(
+        map(ffi::SQLITE_NOMEM, libc::ENOENT),
+        io::ErrorKind::OutOfMemory
+    );
+    assert_eq!(
+        map(ffi::SQLITE_IOERR_NOMEM, libc::ENOENT),
+        io::ErrorKind::OutOfMemory
+    );
+    assert_eq!(
+        map(ffi::SQLITE_CANTOPEN, libc::ENOENT),
+        io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        map(ffi::SQLITE_IOERR_READ, libc::EACCES),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(map(ffi::SQLITE_ERROR, libc::ENOENT), io::ErrorKind::Other);
+    assert_eq!(map(ffi::SQLITE_CANTOPEN, 0), io::ErrorKind::Other);
+    let (_d, dir) = tempdir();
+    let got = run_child("nomem", &dir);
+    assert_eq!(
+        got.trim(),
+        "ok kind=OutOfMemory cache=OutOfMemory,OutOfMemory",
+        "{got}"
+    );
 }
