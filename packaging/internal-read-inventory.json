@@ -3585,10 +3585,10 @@
   {
    "file": "ratarmount-formats-sqlar/src/lib.rs",
    "function": "read_header",
-   "op": "File::open",
+   "op": "managed_read::read_prefix",
    "ordinal": 1,
-   "line": 318,
-   "fingerprint": "c548a92b383f1422",
+   "line": 320,
+   "fingerprint": "451fe09475b93a6b",
    "disposition": "managed-read",
    "regression": "regression_sqlar_header_probes_keep_sqlar_lock",
    "mandatory_helper": true
@@ -3596,10 +3596,10 @@
   {
    "file": "ratarmount-formats-sqlar/src/lib.rs",
    "function": "looks_like_sqlar",
-   "op": "File::open",
+   "op": "managed_read::read_prefix",
    "ordinal": 1,
    "line": 590,
-   "fingerprint": "427c917fa0848b00",
+   "fingerprint": "e36d3f75ef5f2d5b",
    "disposition": "managed-read",
    "regression": "regression_sqlar_header_probes_keep_sqlar_lock",
    "mandatory_helper": true
