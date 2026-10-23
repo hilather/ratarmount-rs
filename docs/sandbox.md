@@ -2022,8 +2022,18 @@ reported. A test-only match arm ends at its block-like body (`unsafe { .. }`,
 `loop`, `match`, an `if`/`else` chain) as well as at a bare block. Descriptor
 duplication and ownership conversion are operations of their own:
 `try_clone_to_owned`, `libc::dup`/`dup2`/`dup3`, `fcntl(.., F_DUPFD[_CLOEXEC],
-..)` and any `File::from(..)` (an `OwnedFd` included; closing a duplicate
-releases this process's locks on the file like any other close).
+..)` and any `File::from(..)` or `<File>::from(..)` (an `OwnedFd` included;
+closing a duplicate releases this process's locks on the file like any other
+close). `OpenOptions::default()` is a builder like `OpenOptions::new()` (a bare
+`OpenOptions` counts when it is imported from `std::fs`); a value typed by
+`let o: OpenOptions = Default::default()` is not recognised. A test-only
+`if`/`else` arm ends at the last block of its chain even when a branch holds a
+`match`; labeled blocks, `const { .. }` and `async { .. }` bodies end where they
+close; a test-only statement or arm whose span still holds a second top-level
+`=>`, or code after a closed top-level block, is reported as an unsupported
+test-only form instead of hiding what follows. A qualified call
+(`util::load(p)`) also resolves to a definition inside an inline
+`mod util { .. }`.
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE

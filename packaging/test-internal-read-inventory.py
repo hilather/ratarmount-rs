@@ -341,10 +341,66 @@ def is_test_cfg(attr_body):
     return cfg_test_only(attr_body)
 
 
-def test_spans(text, raw=None):
+def chain_end(text, j):
+    """The brace closing the block-like expression from `j`: its first
+    top-level `{ .. }` (skipping `(..)` / `[..]`), or the last block of an
+    `else` / `else if` chain."""
+    while True:
+        depth = 0
+        while j < len(text):
+            ch = text[j]
+            if ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth -= 1
+            elif ch == "{" and depth == 0:
+                break
+            j += 1
+        j = match_brace(text, j)
+        nxt = re.match(r"\s*else\b", text[j + 1:])
+        if not nxt:
+            return j
+        j = j + 1 + nxt.end()
+
+
+# What may follow a top-level block inside one statement or arm: an `else`,
+# `as`, a method call, `?`, an operator or the end of the span.
+AFTER_BLOCK = re.compile(r"\s*(?:$|else\b|as\b|[^\w\s'#{\"])", re.S)
+
+
+def unclean_span(span):
+    """Why a test-only statement / arm span (from its first token) may hold
+    more than one statement or arm: a second top-level `=>`, or code after a
+    closed top-level block (`'a: { .. }` then the next statement)."""
+    depth, arrows, i = 0, 0, 0
+    while i < len(span):
+        ch = span[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0 and ch == "}" and not AFTER_BLOCK.match(span, i + 1):
+                return "code after a closed block"
+        elif span.startswith("=>", i) and depth == 0:
+            arrows += 1
+            if arrows > 1:
+                return "a second match arm"
+        i += 1
+    return None
+
+
+def test_spans(text, raw=None, problems=None):
     """Spans of items under `#[test]` / `#[cfg(test ...)]`, and test-only
-    `mod name;` declarations (a `#[path = "..."]` file name when given)."""
+    `mod name;` declarations (a `#[path = "..."]` file name when given).
+    A test-only statement or arm whose span may hold more than one statement
+    or arm (a form the span rules do not know) is appended to `problems` as
+    `(span start, offset, why)`: it fails closed instead of hiding production code."""
     spans, test_mods = [], []
+
+    def check_span(k, j):
+        why = unclean_span(text[k:j + 1 if j < len(text) and text[j] == "}" else j])
+        if why is not None and problems is not None:
+            problems.append((m.start(), k, why))
     for m in TEST_ATTR.finditer(text):
         body = m.group(1)
         if body is not None and raw is not None:
@@ -360,7 +416,7 @@ def test_spans(text, raw=None):
             k += nxt.end()
         item = re.match(
             r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+|async\s+|const\s+|extern\s+(?:\"[^\"]*\"\s+)?)*"
-            r"(fn|mod|impl|struct|enum|trait|union|use|type|static|const|macro_rules!|extern)\b",
+            r"(?:(fn|mod|impl|struct|enum|trait|union|use|type|static|const|extern)\b|macro_rules!)",
             text[k:],
         )
         mac = re.match(r"\s*[\w:]+!\s*([{(\[])", text[k:])
@@ -379,30 +435,16 @@ def test_spans(text, raw=None):
                 j += 1
             spans.append((m.start(), j))
             continue
-        block = re.match(r"\s*(?:if|match|while|for|loop|unsafe)\b|\s*\{", text[k:])
+        block = re.match(r"\s*(?:'\w+\s*:\s*)?(?:(?:if|match|while|for|loop|unsafe)\b|\{)"
+                         r"|\s*async\b(?:\s+move\b)?\s*\{", text[k:])
         if not item and block:
             # A block-like expression statement (`#[cfg(test)] if x { .. }`):
             # it ends at the brace closing its first top-level block, or the
             # last one of an `else` chain. It needs no `;`, so the `;` rule
             # below would swallow the statements after it.
-            j = k
-            while True:
-                depth = 0
-                while j < len(text):
-                    ch = text[j]
-                    if ch in "([":
-                        depth += 1
-                    elif ch in ")]":
-                        depth -= 1
-                    elif ch == "{" and depth == 0:
-                        break
-                    j += 1
-                j = match_brace(text, j)
-                nxt = re.match(r"\s*else\b", text[j + 1:])
-                if not nxt:
-                    break
-                j = j + 1 + nxt.end()
+            j = chain_end(text, k)
             spans.append((m.start(), j))
+            check_span(k, j)
             continue
         if not item:
             # A field, statement, expression or match arm: it ends at the
@@ -421,8 +463,10 @@ def test_spans(text, raw=None):
                     j = match_brace(text, j)
                     nxt = re.match(r"\s*else\b", text[j + 1:])
                     if nxt:
-                        j = j + 1 + nxt.end()
-                        continue
+                        # The rest of the `else` / `else if` chain: never
+                        # re-test `ARM_BLOCK`, whose `if` form cannot cross a
+                        # `=>` inside an earlier branch (R11-S7-FIX14).
+                        j = chain_end(text, j + 1 + nxt.end())
                     if re.match(r"\s*[.?]", text[j + 1:]):
                         j += 1
                         continue
@@ -437,6 +481,7 @@ def test_spans(text, raw=None):
                     break
                 j += 1
             spans.append((m.start(), j))
+            check_span(k, j)
             continue
         semi = text.find(";", k)
         brace = text.find("{", k)
@@ -459,7 +504,7 @@ def test_spans(text, raw=None):
 
 # The text of a match arm up to the first top-level `{` of a block-like body.
 ARM_BLOCK = re.compile(
-    r"=>\s*(?:(?:unsafe|async(?:\s+move)?|(?:'\w+\s*:\s*)?(?:loop|while|for|match|if)\b(?:(?!=>).)*?))?\s*$",
+    r"=>\s*(?:(?:unsafe|async(?:\s+move)?|const|'\w+\s*:|(?:'\w+\s*:\s*)?(?:loop|while|for|match|if)\b(?:(?!=>).)*?))?\s*$",
     re.S)
 
 
@@ -701,10 +746,15 @@ def op_patterns(text, factories=()):
     files = "|".join(sorted(re.escape(n) for n in names["file"]))
     fss = "|".join(sorted(re.escape(n) for n in names["fs"]))
     oos = "|".join(sorted(re.escape(n) for n in names["oo"]))
+    std_oos = "|".join(sorted(re.escape(n) for n in names["oo"] if n != "OpenOptions" or names["oo_imported"])) or "(?!)"
     pats = [
         (r"(?<![\w.])(?:(?:std|tokio)::fs::)?(?:%s)>?::(open|create|create_new)\s*\(" % files, "File::{0}"),
         (r"(?<![\w.])(?:(?:std|tokio)::)?(?:%s)::(read|read_to_string|copy|write)\s*\(" % fss, "fs::{0}"),
         (r"(?<![\w.])(?:(?:std|tokio)::fs::|(?:%s)::)?(?:%s)::new\s*\(|(?<![\w.])(?:(?:std|tokio)::)?(?:fs::)?(?:%s)::options\s*\(" % (fss, oos, files), "OpenOptions"),
+        # `OpenOptions::default()` is `OpenOptions::new()` (R11-S7-FIX14); a
+        # bare name is std's only when imported from it (`ratarmount_core`
+        # has an `OpenOptions` of its own).
+        (r"(?<![\w.:])(?:(?:(?:std|tokio)::)?(?:%s)::(?:%s)|%s)::default\s*\(" % (fss, oos, std_oos), "OpenOptions"),
         (r"(?<![\w.])(?<!fn )(?:ratarmount_core::db_inodes::)?(open_admitted|openat_admitted)\s*\(", "{0}"),
         (r"\.reopen\s*\(\s*\)", "tempfile::reopen"),
         # Private open helpers of the caches: each call is its own entry.
@@ -713,7 +763,7 @@ def op_patterns(text, factories=()):
         (r"\.try_clone_to_owned\s*\(", "try_clone_to_owned"),
         (r"(?<![\w.:])(?:libc::|(?:rustix::)?io::|rustix::)(dup|dup2|dup3)\s*\(", "{0}"),
         (r"(?<![\w])(F_DUPFD(?:_CLOEXEC)?)\b", "{0}"),
-        (r"(?<![\w.])(?:(?:std|tokio)::fs::)?(?:%s)::from\s*\(" % files, "File::from"),
+        (r"(?<![\w.])(?:(?:std|tokio)::fs::)?(?:%s)>?::from\s*\(" % files, "File::from"),
         (r"\b(from_raw_fd|into_raw_fd|from_raw_handle|into_raw_handle)\s*\(", "{0}"),
         (r"(?<![\w.])(?:libc::)(open|openat|open64)\s*\(", "libc::{0}"),
         (r"(?<![\w.:])(?:%s)::(open|openat|openat2)\s*\(" % rx, "rustix::{0}"),
@@ -885,7 +935,13 @@ def scan(root, problems=None):
         if rel in test_files:
             continue
         text, ctext = texts[rel], ctexts[rel]
-        spans, _ = test_spans(text, raws[rel])
+        forms = []
+        spans, _ = test_spans(text, raws[rel], forms)
+        for own, at, why in forms:
+            # Inside another test-only span (a statement in `mod tests`) it hides nothing.
+            if not any(a <= at <= b and a != own for a, b in spans):
+                problems.append("unsupported test-only form (%s; end it with `,` / `;` or move it into a "
+                                "test function): %s:%d" % (why, rel, text.count("\n", 0, at) + 1))
         for at, what in aliases(text)["unsupported"]:
             if not any(a <= at <= b for a, b in spans):
                 problems.append("unsupported import (resolve it in the scanner or import by a known name): %s:%d %s"
@@ -1053,29 +1109,37 @@ def renamed_imports(text, crate, free):
     return fns, mods
 
 
-def resolves(rel, text, prefix, callee, target, hint=None, mods=None):
+def inline_mods(text):
+    """[(name, open brace, close brace)] of every inline `mod name { .. }`."""
+    return [(m.group(1), m.end() - 1, match_brace(text, m.end() - 1))
+            for m in re.finditer(r"\bmod\s+([A-Za-z_]\w*)\s*\{", text)]
+
+
+def resolves(rel, text, prefix, callee, target, hint=None, mods=None, owners=()):
     """Whether a call `prefix callee(` in `rel` may name `callee` in `target`:
     the same file for a bare call (or a file whose module the caller imports
     the name from), the named module for a qualified call (through a renamed
-    module import too); `hint` is the module a renamed function import names."""
+    module import too); `hint` is the module a renamed function import names.
+    `owners` are the inline modules (`mod util { .. }`) around the definition:
+    each is a module name of it as well as the file's (R11-S7-FIX14)."""
+    names = {stem(target)} | set(owners)
     segs = [p for p in prefix.split("::") if p]
     if segs and segs[-1] not in ("self", "super", "crate"):
-        return stem(target) == (mods or {}).get(segs[-1], segs[-1])
+        return (mods or {}).get(segs[-1], segs[-1]) in names
     if segs:
         # `crate::helper(p)`, `super::helper(p)`, `self::helper(p)`: no module
         # is named, so any same-crate definition (over-reporting is safe).
         return True
     if hint is not None:
-        return hint == "" or stem(target) == hint
+        return hint == "" or hint in names
     if target == rel:
         return True
-    mod = stem(target)
     # Any import form: `use crate::m::leaf;`, nested braces
     # (`use crate::{m::leaf, ..}`), or a glob of the module (`use crate::m::*;`).
     for path, alias, _ in use_leaves(text):
-        if alias == "*" and path and path[-1] == mod:
+        if alias == "*" and path and path[-1] in names:
             return True
-        if len(path) >= 2 and path[-2:] == [mod, callee]:
+        if len(path) >= 2 and path[-1] == callee and path[-2] in names:
             return True
     return False
 
@@ -1103,11 +1167,13 @@ def helper_errors(entries, scanned, texts, fns):
         if "::" not in o["function"]:
             raw_by_fn.setdefault((crate_of(o["file"]), o["function"]), []).append(o)
     # Free functions by (crate, name): [(file, start, end)].
-    free = {}
+    free, owners = {}, {}
     for rel, lst in fns.items():
+        inl = inline_mods(texts[rel]) if rel in texts else []
         for a, b, qual in lst:
             if "::" not in qual:
                 free.setdefault((crate_of(rel), qual), []).append((rel, a, b))
+                owners[(rel, a)] = tuple(n for n, o, c in inl if o < a < c)
 
     renames = {}
 
@@ -1134,7 +1200,7 @@ def helper_errors(entries, scanned, texts, fns):
                 # itself (`other::read_index(p)` from `read_index`).
                 if (target, ta) == (rel, a):
                     continue
-                if resolves(rel, text, prefix, callee, target, hint, mod_alias):
+                if resolves(rel, text, prefix, callee, target, hint, mod_alias, owners[(target, ta)]):
                     out.append((callee, target, ta, tb))
         return out
 
@@ -1914,6 +1980,118 @@ def regression_inventory_const_generic_helper_calls_are_followed():
     errs = check(root, classify(root, {}))
     expect(any("unsupported generic arguments" in e for e in errs), errs)
 
+
+
+def regression_inventory_test_only_if_else_arm_with_nested_arrow_does_not_hide_arms():
+    """Regression (R11-S7-FIX14): after the `else` of a test-only `if` arm
+    the scanner re-tested its arm-body pattern, whose `if` form cannot cross
+    a `=>`, so a `match` inside an earlier branch made the production arm
+    after the chain part of the test-only span. Labeled bare blocks,
+    `const { .. }` and `async { .. }` bodies (statements too) end where they
+    close."""
+    for body in ("if x > 1 { match x { _ => () } } else { () }",
+                 "if x > 1 { match x { _ => () } } else if x > 2 { () } else { () }",
+                 "if x > 1 { () } else if x > 2 { match x { _ => () } } else { () }",
+                 "if x > 1 { () } else { match x { _ => () } }",
+                 "'a: { () }", "const { 1 }", "async move { () }"):
+        root = fake({"c/src/lib.rs": (
+            "fn m(p: &Path, x: u8) {\n    match x {\n        #[cfg(test)]\n"
+            "        0 => %s\n"
+            "        1 => {\n            let _ = std::fs::read(p);\n        }\n"
+            "        _ => (),\n    }\n}\n" % body
+        )})
+        ops, _, _ = scan(root)
+        got = [(o["function"], o["op"]) for o in ops]
+        expect(got == [("m", "fs::read")], (body, got))
+        errs = check(root, classify(root, {("m", "fs::read"): OOF}))
+        expect(errs == [], (body, errs))
+    for stmt in ("'l: loop { break 'l }", "'a: { t() }", "async { t() }"):
+        root = fake({"c/src/lib.rs": (
+            "fn s(p: &Path) {\n    #[cfg(test)]\n    %s\n    let _ = std::fs::read(p);\n}\n" % stmt)})
+        ops, _, _ = scan(root)
+        expect([o["op"] for o in ops] == ["fs::read"], (stmt, ops))
+
+
+def regression_inventory_unknown_test_only_form_fails_closed():
+    """Regression (R11-S7-FIX14): a test-only statement or arm in a form the
+    span rules do not know swallowed the code after it silently; a span
+    holding a second top-level `=>`, or code after a closed top-level block,
+    is reported instead. A `#[cfg(test)] macro_rules!` is an item (it hid
+    the `#[cfg(not(test))]` definition after it)."""
+    arm = ("fn m(p: &Path, x: u8) {\n    match x {\n        #[cfg(test)]\n"
+           "        0 => try { t() }\n        1 => { let _ = std::fs::read(p); }\n        _ => (),\n    }\n}\n")
+    stmt = "fn s(p: &Path) {\n    #[cfg(test)]\n    try { t() }\n    let _ = std::fs::read(p);\n}\n"
+    arms = ("fn m(p: &Path, x: u8) {\n    match x {\n        #[cfg(test)]\n"
+            "        0 => t()\n        1 => { let _ = std::fs::read(p); }\n        _ => (),\n    }\n}\n")
+    for src, why in ((arm, "code after a closed block"), (arms, "a second match arm"),
+                     (stmt, "code after a closed block")):
+        root = fake({"c/src/lib.rs": src})
+        errs = check(root, classify(root, {}))
+        expect(any("unsupported test-only form (%s" % why in e for e in errs), (src, errs))
+    # Inside a test module it hides nothing.
+    root = fake({"c/src/lib.rs": "#[cfg(test)]\nmod tests {\n    fn t() {\n" + stmt.split("\n", 1)[1] + "}\n"})
+    expect(check(root, classify(root, {})) == [], check(root, classify(root, {})))
+    root = fake({"c/src/lib.rs": (
+        "#[cfg(test)]\nmacro_rules! st {\n    ($s:expr) => {\n        $s.t()\n    };\n}\n"
+        "#[cfg(not(test))]\nmacro_rules! st {\n    ($s:expr) => {\n        std::fs::read($s)\n    };\n}\n")})
+    ops, _, _ = scan(root)
+    expect([o["op"] for o in ops] == ["fs::read"], ops)
+
+
+def regression_inventory_open_options_default_is_a_builder():
+    """Regression (R11-S7-FIX14): `OpenOptions::default()` built a std
+    builder the scanner did not recognize, so a read or an exclusive create
+    through it was no operation at all. A bare `OpenOptions` is std's only
+    when imported from it (`ratarmount_core::OpenOptions::default()` is a
+    mount option set)."""
+    for src, exclusive in (
+            ("fn a(p: &Path) { let _ = std::fs::OpenOptions::default().read(true).open(p); }\n", False),
+            ("fn a(p: &Path) { let _ = std::fs::OpenOptions::default().write(true).create_new(true).open(p); }\n", True),
+            ("use std::fs::OpenOptions;\nfn a(p: &Path) { let _ = OpenOptions::default().read(true).open(p); }\n", False),
+            ("use std::fs;\nfn a(p: &Path) { let _ = fs::OpenOptions::default().write(true).create_new(true).open(p); }\n", True)):
+        root = fake({"c/src/lib.rs": src})
+        ops, _, _ = scan(root)
+        expect([(o["op"], o["exclusive"]) for o in ops] == [("OpenOptions", exclusive)], (src, ops))
+        errs = check(root, classify(root, {}))
+        expect(any("unclassified" in e for e in errs), (src, errs))
+        if exclusive:
+            errs = check(root, classify(root, {("a", "OpenOptions"): OOF}))
+            expect(any("create without a mode policy" in e for e in errs), (src, errs))
+    root = fake({"c/src/lib.rs": ("use ratarmount_core::OpenOptions;\n"
+                                  "fn a() -> OpenOptions { OpenOptions { x: 1, ..OpenOptions::default() } }\n"
+                                  "fn b() { let _ = f(&OpenOptions::default()); }\n"
+                                  "fn c() { let _ = ratarmount_core::OpenOptions::default(); }\n")})
+    ops, _, _ = scan(root)
+    expect(ops == [], ops)
+
+
+def regression_inventory_helper_walk_follows_inline_modules():
+    """Regression (R11-S7-FIX14): a qualified call resolved only against the
+    defining file's module name, so `util::load(p)` from a managed function
+    reached a raw-reading helper in an inline `mod util { .. }` with an
+    unchanged manifest (an unqualified `load(p)` was reported)."""
+    leaf = "mod util {\n    pub fn load(p: &Path) { let _ = std::fs::read(p); }\n}\n"
+    nested = "mod a {\n    pub mod util {\n        pub fn load(p: &Path) { let _ = std::fs::read(p); }\n    }\n}\n"
+    for files in (
+            {"c/src/lib.rs": leaf + "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; util::load(p); }\n"},
+            {"c/src/lib.rs": leaf + "use self::util as u;\nfn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; u::load(p); }\n"},
+            {"c/src/lib.rs": leaf + "use crate::util::load;\nfn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; load(p); }\n"},
+            {"c/src/lib.rs": "mod h;\n" + nested, "c/src/h.rs": "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; crate::a::util::load(p); }\n"},
+            {"c/src/lib.rs": "mod h;\n" + nested, "c/src/h.rs": "use crate::a::util::load;\nfn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; load(p); }\n"},
+            # Control: an unqualified call in the same file.
+            {"c/src/lib.rs": leaf + "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; load(p); }\n"}):
+        root = fake(files)
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF})
+        errs = check(root, m)
+        expect(any("reaches helper load" in e for e in errs), (files, errs))
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                            ("load", "fs::read"): dict(OOF, non_mandatory_callers=["hash"])})
+        expect(check(root, m) == [], (files, check(root, m)))
+    # Another module's function of the same name is not this helper.
+    root = fake({"c/src/lib.rs": leaf + "mod other;\nfn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; other::load(p); }\n",
+                 "c/src/other.rs": "pub fn load(p: &Path) {}\n"})
+    m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF})
+    expect(check(root, m) == [], check(root, m))
 
 def self_test():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("regression_") and callable(v)]

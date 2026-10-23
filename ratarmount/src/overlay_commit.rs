@@ -3442,11 +3442,19 @@ mod tests {
     /// Regression (R11-S7, #151): the Hub live commit read the fresh sidecar's
     /// body and the staged archive (pointer tarstats, LFS upload) through raw
     /// `File`s; every managed read keeps a lock taken on the file it reads.
+    /// R11-S7-FIX14: the close probes alone were satisfied by the pointer
+    /// hash's read of the sidecar, so a raw body read after it passed; a lock
+    /// is now held on the sidecar from its first managed open to the end of
+    /// the tick and probed at every later managed open of another file (the
+    /// LFS upload's open of the staged archive comes after the body read).
     #[cfg(unix)]
     #[test]
     fn regression_live_commit_hf_reads_keep_index_lock() {
         use crate::publish_index::tests::{PublishEnv, PublishServer};
-        use ratarmount_index::managed_read::with_close_probes;
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        use ratarmount_index::managed_read::{seams, Seam, VfsLockHolder};
+        use std::cell::RefCell;
+        use std::rc::Rc;
         let dir = tempfile::tempdir().unwrap();
         let server = PublishServer::live(hf_test_archive(true));
         let _env = PublishEnv::new(&[
@@ -3464,15 +3472,76 @@ mod tests {
         let url = "hf://datasets/org/data@main/a.tar.zst";
         let overlay = hf_test_overlay(url, &dir.path().join("ov"), false);
         std::fs::write(overlay.root().join("hello.txt"), b"new bytes").unwrap();
-        let (got, probes) = with_close_probes(|_| true, || hf_test_tick(&overlay, url));
+        // Every managed open takes a lock that its close is probed against
+        // (`with_close_probes`); the sidecar's first open also takes one held
+        // to the end of the tick, probed at each later open of another file.
+        type Held = Rc<RefCell<Vec<(PathBuf, VfsLockHolder)>>>;
+        let per_open: Held = Rc::default();
+        let sidecar: Held = Rc::default();
+        let closes: Rc<RefCell<Vec<(PathBuf, bool)>>> = Rc::default();
+        let later: Rc<RefCell<Vec<(PathBuf, bool)>>> = Rc::default();
+        let (h2, s2, c2, l2) = (
+            Rc::clone(&per_open),
+            Rc::clone(&sidecar),
+            Rc::clone(&closes),
+            Rc::clone(&later),
+        );
+        let got = seams::with(
+            move |s| {
+                let Some(path) = seams::opened_path() else {
+                    return Ok(());
+                };
+                match s {
+                    Seam::AfterOpen => {
+                        let mut held = s2.borrow_mut();
+                        match held.first() {
+                            None if path.file_name().is_some_and(|n| n == "index.sqlite") => {
+                                held.push((path.clone(), VfsLockHolder::shared(&path)?));
+                            }
+                            Some((index, _)) if *index != path => {
+                                l2.borrow_mut()
+                                    .push((path.clone(), other_process_sees_lock(index)));
+                            }
+                            _ => {}
+                        }
+                        h2.borrow_mut()
+                            .push((path.clone(), VfsLockHolder::shared(&path)?));
+                    }
+                    Seam::AfterClose => {
+                        let mut held = h2.borrow_mut();
+                        if let Some(i) = held.iter().rposition(|(p, _)| *p == path) {
+                            let (p, lock) = held.remove(i);
+                            c2.borrow_mut()
+                                .push((p.clone(), other_process_sees_lock(&p)));
+                            drop(lock);
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+            || hf_test_tick(&overlay, url),
+        );
+        per_open.borrow_mut().clear();
+        sidecar.borrow_mut().clear();
         assert_eq!(got.unwrap(), CommitOutcome::DidWork);
+        let closes = closes.borrow();
         assert!(
-            probes
+            closes
                 .iter()
                 .any(|(p, _)| p.file_name().unwrap() == "index.sqlite"),
-            "the sidecar body was read through a managed reader: {probes:?}"
+            "the sidecar was read through a managed reader: {closes:?}"
         );
-        assert!(probes.iter().all(|(_, kept)| *kept), "{probes:?}");
+        assert!(closes.iter().all(|(_, kept)| *kept), "{closes:?}");
+        let later = later.borrow();
+        assert!(
+            !later.is_empty(),
+            "a managed open (the LFS upload) follows the sidecar body read"
+        );
+        assert!(
+            later.iter().all(|(_, kept)| *kept),
+            "the sidecar body read kept this process's lock on the sidecar: {later:?}"
+        );
     }
 }
 
