@@ -846,6 +846,12 @@ pub struct WriteOverlay {
     /// The database inode stays registered as open while the mount lives
     /// (R10-C). After `db`: dropped once the connection is closed.
     _db_registration: Option<ratarmount_core::db_inodes::DbInodeRegistration>,
+    /// The real connection was closed before `fork` and replaced with an
+    /// in-memory placeholder. The serving child opens a new connection and
+    /// takes `EXCLUSIVE` itself (#183). POSIX locks are not inherited, and a
+    /// connection that crossed `fork` still believes it holds a lock SQLite
+    /// will not take again.
+    connection_released_for_fork: AtomicBool,
     /// Mount paths with `deleted = 1` (for example `/dir/file`).
     ///
     /// `is_deleted` checks this set. The `files` table remains the durable
@@ -1434,6 +1440,7 @@ impl WriteOverlay {
             db: Mutex::new(conn),
             db_id,
             _db_registration: db_registration,
+            connection_released_for_fork: AtomicBool::new(false),
             tombstones: Mutex::new(tombstones),
             pending_rows: Mutex::new(Vec::new()),
             commit_gate: RwLock::new(()),
@@ -1559,6 +1566,94 @@ impl WriteOverlay {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Drop the overlay-database connection before `fork` (#183).
+    ///
+    /// The kernel lock is released in this process, before the child exists.
+    /// A parent that still held `EXCLUSIVE` while it waited for the mount
+    /// would make the child's `BEGIN EXCLUSIVE` return `SQLITE_BUSY`. The
+    /// connection left behind is an in-memory placeholder, not the overlay
+    /// file. Idempotent.
+    pub fn release_db_before_fork(&self) -> Result<()> {
+        if self.connection_released_for_fork.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let placeholder = Connection::open_in_memory()?;
+        {
+            let mut db = self.db.lock().expect("overlay db");
+            let old = std::mem::replace(&mut *db, placeholder);
+            // Closes the overlay file in this process and drops its fcntl lock.
+            drop(old);
+        }
+        self.connection_released_for_fork
+            .store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Open the overlay database in the serving child and take `EXCLUSIVE`
+    /// (#183). Does not touch a connection that crossed `fork`.
+    pub fn acquire_exclusive_after_fork(&self) -> Result<()> {
+        self.install_exclusive_connection(true)
+    }
+
+    /// Re-open the overlay database when `fork` itself failed (this process
+    /// never split, so the placeholder is closed normally).
+    pub fn restore_db_after_failed_fork(&self) -> Result<()> {
+        self.install_exclusive_connection(false)
+    }
+
+    /// Replace the placeholder with a new exclusive connection.
+    ///
+    /// `forget_placeholder` is for the child: the placeholder was opened in
+    /// the parent, and `sqlite3_close` on a connection that crossed `fork` is
+    /// not safe. It is an in-memory database, so leaking it does not release
+    /// the lock just taken on the overlay file. The new
+    /// [`DbInodeRegistration`] is dropped at once; the registration copied
+    /// with this value already counts the inode.
+    fn install_exclusive_connection(&self, forget_placeholder: bool) -> Result<()> {
+        if !self
+            .connection_released_for_fork
+            .swap(false, Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let path = self.root.join(HIDDEN_DB);
+        // `previously_required`: the first open already created this record.
+        // A database that vanished in the unlocked window must not be created
+        // again.
+        let opened = crate::overlay_db::open_overlay_db_required(
+            &path,
+            OpenFlags::default(),
+            crate::DbName::Path,
+            true,
+        )?;
+        if let (Some(expected), Some(got)) = (self.db_id, opened.id()) {
+            if expected != got {
+                return Err(OverlayError::Msg(format!(
+                    "overlay database {} changed inode before the serving process locked it",
+                    path.display()
+                )));
+            }
+        }
+        let (conn, registration) = opened.into_parts();
+        drop(registration);
+        conn.busy_timeout(Duration::ZERO)?;
+        // Same lock the first open takes. No schema run and no staging sweep:
+        // the first open already did both, and a sweep without this exclusive
+        // lock is the #126 bug.
+        conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
+        conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        let fresh = tombstone_set_from_conn(&conn)?;
+        {
+            let mut guard = self.db.lock().expect("overlay db");
+            let placeholder = std::mem::replace(&mut *guard, conn);
+            if forget_placeholder {
+                std::mem::forget(placeholder);
+            }
+        }
+        *self.tombstones.lock().expect("overlay tombstones") = fresh;
+        Ok(())
     }
 
     /// Mount `-e` / `--encoding` for live `.tar.zst` persist (ustar/PAX names).
@@ -9143,6 +9238,94 @@ pub(crate) mod tests {
     use std::process::Command as StdCommand;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+    /// Regression (#183): the process that serves a daemonized mount must hold
+    /// the overlay database's exclusive lock. POSIX locks are not inherited,
+    /// so locking before `fork` and exiting the parent left `BEGIN IMMEDIATE`
+    /// free to succeed while the child was still serving.
+    #[cfg(unix)]
+    #[test]
+    fn regression_183_fork_child_holds_exclusive_lock() {
+        if std::env::var_os("RATARMOUNT_TEST_183_FORK").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "write_overlay::tests::regression_183_fork_child_holds_exclusive_lock",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("RATARMOUNT_TEST_183_FORK", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fork child:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let overlay_dir = dir.path().join("ov");
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[("/a", b"a")])), &overlay_dir)
+                .unwrap();
+        let db = overlay_dir.join(HIDDEN_DB);
+        assert!(
+            crate::overlay_db::lock_probe_is_busy(&db),
+            "the opener must hold the lock"
+        );
+        ov.release_db_before_fork().unwrap();
+        assert!(
+            !crate::overlay_db::lock_probe_is_busy(&db),
+            "the parent must release the lock before fork"
+        );
+        // SAFETY: this process was re-executed with `--test-threads=1` and
+        // has not spawned a thread. The child must not use the connection
+        // that crossed the fork; it opens a new one.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            if let Err(e) = ov.acquire_exclusive_after_fork() {
+                eprintln!("acquire_exclusive_after_fork: {e}");
+                std::process::exit(3);
+            }
+            if crate::overlay_db::lock_probe_is_busy(&db) {
+                std::process::exit(0);
+            }
+            eprintln!("BEGIN IMMEDIATE acquired the overlay database in another process");
+            std::process::exit(2);
+        }
+        let mut status = 0;
+        let started = std::time::Instant::now();
+        let waited = loop {
+            // SAFETY: `pid` is the child just forked; `status` is a live i32.
+            // WNOHANG so a child stuck in SQLite after fork fails the test
+            // instead of hanging it.
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid {
+                break waited;
+            }
+            assert!(waited == 0, "waitpid: {}", std::io::Error::last_os_error());
+            if started.elapsed() > Duration::from_secs(30) {
+                // SAFETY: `pid` is the child just forked.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                panic!("serving child did not exit within 30s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(waited, pid);
+        assert!(
+            libc::WIFEXITED(status),
+            "serving child did not exit (status {status})"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "serving child exit {}",
+            libc::WEXITSTATUS(status)
+        );
+    }
 
     /// Regression: a panicking policy must not poison every subsequent mutation.
     #[test]
