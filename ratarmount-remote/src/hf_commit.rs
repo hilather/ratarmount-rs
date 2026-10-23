@@ -129,9 +129,14 @@ impl HfRepo {
         parent_commit: &str,
     ) -> Result<HfCommitResult> {
         self.require_publish_token()?;
+        // Managed (#151): the staged archive may be a database open in this
+        // process; the one reader is sampled, hashed, rewound and kept through
+        // the LFS uploads and their retries.
         let mut files = vec![UploadFile::new(
             &self.location.path,
-            Box::new(std::fs::File::open(archive)?),
+            Box::new(ratarmount_index::managed_read::ManagedReadCursor::open(
+                archive,
+            )?),
             true,
         )?];
         for file in siblings {
@@ -1026,5 +1031,72 @@ mod tests {
         assert!(repo
             .write_request("POST", "https://example.org/outside/commit")
             .is_err());
+    }
+
+    /// Regression (R11-S7, #151): the staged archive was opened with a raw
+    /// `File` (sampled, hashed, rewound, uploaded); its close released this
+    /// process's lock on it. Basic and multipart LFS, and a failing upload.
+    #[cfg(unix)]
+    #[test]
+    fn regression_hf_archive_upload_keeps_index_lock() {
+        use ratarmount_index::managed_read::{lock_probe::other_process_sees_lock, VfsLockHolder};
+        for (transfer, fail) in [("basic", false), ("multipart", false), ("basic", true)] {
+            let archive: Vec<u8> = (0..300_000u32).map(|i| (i % 249) as u8).collect();
+            let uploaded = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let up = uploaded.clone();
+            let storage = Server::spawn(move |r| {
+                if r.method == "PUT" {
+                    if fail {
+                        return (500, vec![], vec![]);
+                    }
+                    up.lock().unwrap().extend_from_slice(&r.body);
+                    return (
+                        200,
+                        vec![("ETag".into(), format!("etag{}", r.path))],
+                        vec![],
+                    );
+                }
+                response(json!({}))
+            });
+            let href = storage.url.clone();
+            let size = archive.len();
+            let hub = Server::spawn(move |r| {
+                if r.path.contains("preupload") {
+                    response(modes(&r, true))
+                } else if r.path.ends_with("batch") {
+                    let v: Value = serde_json::from_slice(&r.body).unwrap();
+                    let oid = v["objects"][0]["oid"].clone();
+                    if transfer == "basic" {
+                        response(json!({"transfer":"basic","objects":[{"oid":oid,"size":size,
+                            "actions":{"upload":{"href":format!("{href}/archive")}}}]}))
+                    } else {
+                        response(
+                            json!({"transfer":"multipart","objects":[{"oid":oid,"size":size,
+                            "actions":{"upload":{"href":format!("{href}/complete"),
+                            "header":{"chunk_size":"200000","1":format!("{href}/1"),"2":format!("{href}/2")}}}}]}),
+                        )
+                    }
+                } else {
+                    response(json!({"commitOid":"b".repeat(40)}))
+                }
+            });
+            let repo = crate::hf::commit_test_repo(&hub.url, Some("hub-secret"));
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), &archive).unwrap();
+            let lock = VfsLockHolder::shared(file.path()).unwrap();
+            assert!(other_process_sees_lock(file.path()));
+            let got = repo.commit_archive(file.path(), &[], "main", false, &repo.commit);
+            if fail {
+                assert!(got.is_err());
+            } else {
+                got.unwrap();
+                assert_eq!(*uploaded.lock().unwrap(), archive, "{transfer}");
+            }
+            assert!(
+                other_process_sees_lock(file.path()),
+                "{transfer}: lock kept"
+            );
+            drop(lock);
+        }
     }
 }

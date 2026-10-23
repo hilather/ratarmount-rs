@@ -1185,12 +1185,15 @@ pub fn put_azure_blocks(
     if_match: Option<&str>,
 ) -> Result<()> {
     let _ = resolve_put_auth()?;
-    let len = std::fs::metadata(path)
-        .map_err(|e| azure_err(format!("reading {} for PUT: {e}", path.display())))?
-        .len();
+    // Managed (#151): the file may be an index open in this process. One
+    // owner; the single body and every block are independent cursors.
+    let owner = ratarmount_index::managed_read::ManagedReadCursor::open(path)
+        .map_err(|e| azure_err(format!("opening {} for PUT: {e}", path.display())))?;
+    let len = owner
+        .len()
+        .map_err(|e| azure_err(format!("reading {} for PUT: {e}", path.display())))?;
     if len <= AZURE_PUT_BLOB_MAX {
-        let file = std::fs::File::open(path)
-            .map_err(|e| azure_err(format!("opening {} for PUT: {e}", path.display())))?;
+        let file = owner.independent_cursor();
         return send_azure_put(loc, AzurePutKind::Blob, content_type, len, if_match, file);
     }
     let mut ids = Vec::new();
@@ -1199,8 +1202,7 @@ pub fn put_azure_blocks(
     while offset < len {
         let n = (len - offset).min(AZURE_PUT_BLOB_MAX);
         let id = azure_block_id(generation, part);
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| azure_err(format!("opening {} for Put Block: {e}", path.display())))?;
+        let mut file = owner.independent_cursor();
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| azure_err(format!("seeking {} for Put Block: {e}", path.display())))?;
         send_azure_put(
@@ -3019,5 +3021,35 @@ mod tests {
                 .any(|l| l.starts_with("Range: bytes=0-") && l != "Range: bytes=0-0"),
             "expected a content range after the probe, log={log:?}"
         );
+    }
+
+    /// Regression (R11-S7, #151): Put Blob and every Put Block opened the
+    /// file with a raw `File`; each close released this process's lock on
+    /// it. One managed owner, independent cursors.
+    #[cfg(unix)]
+    #[test]
+    fn regression_azure_single_and_block_uploads_keep_index_lock() {
+        use ratarmount_index::managed_read::{lock_probe::other_process_sees_lock, VfsLockHolder};
+        let secret = b"azure-shared-key-secret!!";
+        for len in [5000u64, AZURE_PUT_BLOB_MAX + 4096] {
+            let (base, hits, _accepts) = spawn_put_listener(false);
+            let _g = EnvGuard::acquire(AZ_ENV_KEYS);
+            _g.set(AZURE_ACCOUNT_ENV, "acct");
+            _g.set(AZURE_KEY_ENV, &base64_encode(secret));
+            _g.set(AZURE_ENDPOINT_ENV, &base);
+            _g.set(AZURE_IMDS_BASE_ENV, "http://127.0.0.1:1");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("blob.bin");
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            let lock = VfsLockHolder::shared(&path).unwrap();
+            assert!(other_process_sees_lock(&path));
+            let loc = parse_azure_url("az://ctr/obj.bin").unwrap();
+            put_azure_blocks(&loc, &path, "application/octet-stream", 1, None).unwrap();
+            let n = hits.lock().unwrap().len();
+            assert_eq!(n, if len <= AZURE_PUT_BLOB_MAX { 1 } else { 3 }, "{len}");
+            assert!(other_process_sees_lock(&path), "{len}: lock kept");
+            drop(lock);
+        }
     }
 }
