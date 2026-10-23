@@ -374,6 +374,17 @@ pub mod seams {
 
     thread_local! {
         static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static PATH: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// The (resolved) path of the managed open in progress or last done on
+    /// this thread, for a hook that must tell files apart.
+    pub fn opened_path() -> Option<std::path::PathBuf> {
+        PATH.with(|p| p.borrow().clone())
+    }
+
+    pub(crate) fn set_path(path: &std::path::Path) {
+        PATH.with(|p| *p.borrow_mut() = Some(path.to_path_buf()));
     }
 
     /// Run `f` with `hook` installed on this thread.
@@ -409,6 +420,8 @@ pub mod seams {
 #[cfg(not(any(test, feature = "test-hooks")))]
 mod seams {
     use super::Seam;
+    #[inline(always)]
+    pub(crate) fn set_path(_: &std::path::Path) {}
     #[inline(always)]
     pub(crate) fn fire(_: Seam) -> std::io::Result<()> {
         Ok(())
@@ -574,6 +587,7 @@ mod imp {
                     name,
                     open: false,
                 };
+                seams::set_path(&real);
                 super::ensure_standard_descriptors()?;
                 seams::fire(Seam::BeforeOpen)?;
                 #[cfg(any(test, feature = "test-hooks"))]
@@ -760,6 +774,7 @@ mod imp {
 
     impl ByteFile {
         pub(super) fn open(path: &Path) -> io::Result<Self> {
+            super::seams::set_path(path);
             super::seams::fire(super::Seam::BeforeOpen)?;
             #[cfg(any(test, feature = "test-hooks"))]
             super::XOPEN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
