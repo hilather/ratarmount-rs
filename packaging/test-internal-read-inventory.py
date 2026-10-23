@@ -38,8 +38,14 @@ Fingerprints hash the comment-stripped statement with its literal values,
 plus every later statement that configures a bound builder. An
 `OpenOptions` `.create(..)` / `.create_new(..)` with any argument but a
 literal `false` is a create (it needs a mode policy). A test-only match arm
-ends at its block body. The helper walk follows same-crate free-function
-calls transitively, through `use .. as` renames of a function or a module.
+ends at its block or block-like body (`unsafe`, `loop`, `match`, `if`/`else`).
+The helper walk follows same-crate free-function calls transitively, through
+`use .. as` renames of a function or a module, `crate::`/`super::`/`self::`
+paths (any same-crate definition) and calls of the caller's own name in
+another module. Generic argument lists (`::<..>`) are matched balanced; an
+unbalanced one is reported. Descriptor duplication and ownership conversion
+(`try_clone_to_owned`, `dup`/`dup2`/`dup3`, `F_DUPFD[_CLOEXEC]`, `File::from`)
+are operations.
 Pathname opens inside foreign libraries (libgit2 `Repository::open`,
 libarchive `archive_read_open_filename`, lopdf `Document::load`) are
 operations of their own.
@@ -146,7 +152,8 @@ RAW_OPENS = frozenset({
     "libc::open", "libc::openat", "libc::open64", "rustix::open", "rustix::openat",
     "open_admitted", "openat_admitted",
 })
-ESCAPES = ("into_raw_fd", "as_raw_fd", "try_clone", "from_raw_fd", "File::from")
+ESCAPES = ("into_raw_fd", "as_raw_fd", "try_clone", "try_clone_to_owned", "from_raw_fd", "File::from",
+           "dup", "dup2", "dup3", "F_DUPFD", "F_DUPFD_CLOEXEC")
 
 
 # --------------------------------------------------------------------------
@@ -225,6 +232,44 @@ def mask(src, strings=True, lit_fill=None):
         else:
             i += 1
     return "".join(out)
+
+
+def blank_generics(text):
+    """`text` with the contents of every explicit generic argument list
+    (`::<..>`) blanked, so call patterns see `load::<   >(p)` whatever the
+    arguments are (`::<{ 64 * 1024 }>`, `::<Vec<u8>>`, `::<fn() -> T>`).
+    Angle brackets nest only outside `()`/`[]`/`{}`; `->` closes nothing.
+    Returns (text, [offset of each list that does not close before a `;`
+    outside brackets]): an unsupported form the caller reports."""
+    out = list(text)
+    bad = []
+    for m in re.finditer(r"::\s*<", text):
+        k = m.end()
+        angle, stack = 1, 0
+        while k < len(text):
+            ch = text[k]
+            if ch in "([{":
+                stack += 1
+            elif ch in ")]}":
+                stack -= 1
+                if stack < 0:
+                    break
+            elif stack == 0 and ch == "<":
+                angle += 1
+            elif stack == 0 and ch == ">" and text[k - 1] != "-":
+                angle -= 1
+                if angle == 0:
+                    break
+            elif stack == 0 and ch == ";":
+                break
+            k += 1
+        if k >= len(text) or text[k] != ">" or angle:
+            bad.append(m.start())
+            continue
+        for i in range(m.end(), k):
+            if out[i] != "\n":
+                out[i] = " "
+    return "".join(out), bad
 
 
 def match_brace(text, open_pos):
@@ -368,8 +413,19 @@ def test_spans(text, raw=None):
             depth, j = 0, k
             while j < len(text):
                 ch = text[j]
-                if ch == "{" and depth == 0 and re.search(r"=>\s*$", text[k:j]):
+                if ch == "{" and depth == 0 and ARM_BLOCK.search(text[k:j]):
+                    # The arm's body is a block-like expression (`{ .. }`,
+                    # `unsafe { .. }`, `loop`, `match`, `if`/`else` chain):
+                    # it ends at its last block unless a method call or `?`
+                    # continues it.
                     j = match_brace(text, j)
+                    nxt = re.match(r"\s*else\b", text[j + 1:])
+                    if nxt:
+                        j = j + 1 + nxt.end()
+                        continue
+                    if re.match(r"\s*[.?]", text[j + 1:]):
+                        j += 1
+                        continue
                     break
                 if ch in "([{":
                     depth += 1
@@ -399,6 +455,12 @@ def test_spans(text, raw=None):
             continue
         spans.append((m.start(), match_brace(text, brace)))
     return spans, test_mods
+
+
+# The text of a match arm up to the first top-level `{` of a block-like body.
+ARM_BLOCK = re.compile(
+    r"=>\s*(?:(?:unsafe|async(?:\s+move)?|(?:'\w+\s*:\s*)?(?:loop|while|for|match|if)\b(?:(?!=>).)*?))?\s*$",
+    re.S)
 
 
 FN_RE = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
@@ -648,6 +710,10 @@ def op_patterns(text, factories=()):
         # Private open helpers of the caches: each call is its own entry.
         (r"(?<![\w.:])(?<!fn )open_regular\s*\(", "open_regular"),
         (r"\.try_clone\s*\(", "try_clone"),
+        (r"\.try_clone_to_owned\s*\(", "try_clone_to_owned"),
+        (r"(?<![\w.:])(?:libc::|(?:rustix::)?io::|rustix::)(dup|dup2|dup3)\s*\(", "{0}"),
+        (r"(?<![\w])(F_DUPFD(?:_CLOEXEC)?)\b", "{0}"),
+        (r"(?<![\w.])(?:(?:std|tokio)::fs::)?(?:%s)::from\s*\(" % files, "File::from"),
         (r"\b(from_raw_fd|into_raw_fd|from_raw_handle|into_raw_handle)\s*\(", "{0}"),
         (r"(?<![\w.])(?:libc::)(open|openat|open64)\s*\(", "libc::{0}"),
         (r"(?<![\w.:])(?:%s)::(open|openat|openat2)\s*\(" % rx, "rustix::{0}"),
@@ -786,11 +852,11 @@ def scan(root, problems=None):
     appended to `problems` when given."""
     problems = [] if problems is None else problems
     files = rust_files(root)
-    texts, raws, ctexts, lits, test_files = {}, {}, {}, {}, set()
+    texts, raws, ctexts, lits, test_files, generic_errs = {}, {}, {}, {}, set(), {}
     for rel in files:
         with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
             raws[rel] = fh.read()
-            texts[rel] = mask(raws[rel])
+            texts[rel], generic_errs[rel] = blank_generics(mask(raws[rel]))
             ctexts[rel] = mask(raws[rel], strings=False)
             lits[rel] = mask(raws[rel], lit_fill="\0")
     # Files that are test-only modules (and everything below them).
@@ -824,6 +890,10 @@ def scan(root, problems=None):
             if not any(a <= at <= b for a, b in spans):
                 problems.append("unsupported import (resolve it in the scanner or import by a known name): %s:%d %s"
                                 % (rel, text.count("\n", 0, at) + 1, what))
+        for at in generic_errs[rel]:
+            if not any(a <= at <= b for a, b in spans):
+                problems.append("unsupported generic arguments (unbalanced ::<..>): %s:%d"
+                                % (rel, text.count("\n", 0, at) + 1))
         fns = [f for f in fn_spans(text) if not any(a <= f[0] <= b for a, b in spans)]
         for a, b, name in fns:
             fn_index.setdefault(crate_of(rel), {}).setdefault(name.split("::")[-1], []).append((rel, name))
@@ -991,6 +1061,10 @@ def resolves(rel, text, prefix, callee, target, hint=None, mods=None):
     segs = [p for p in prefix.split("::") if p]
     if segs and segs[-1] not in ("self", "super", "crate"):
         return stem(target) == (mods or {}).get(segs[-1], segs[-1])
+    if segs:
+        # `crate::helper(p)`, `super::helper(p)`, `self::helper(p)`: no module
+        # is named, so any same-crate definition (over-reporting is safe).
+        return True
     if hint is not None:
         return hint == "" or stem(target) == hint
     if target == rel:
@@ -1037,7 +1111,7 @@ def helper_errors(entries, scanned, texts, fns):
 
     renames = {}
 
-    def callees(rel, a, b, leaf):
+    def callees(rel, a, b):
         text = texts[rel]
         body = text[a:b]
         if rel not in renames:
@@ -1053,9 +1127,13 @@ def helper_errors(entries, scanned, texts, fns):
                 # same-crate definition (over-reporting is safe).
                 callee, hint = fn_alias[callee]
                 hint = hint or ""
-            if callee == leaf or text[max(0, a + m.start() - 3):a + m.start()].endswith("fn "):
+            if text[max(0, a + m.start() - 3):a + m.start()].endswith("fn "):
                 continue
             for target, ta, tb in free.get((crate_of(rel), callee), []):
+                # A call of the same name is followed unless it is the caller
+                # itself (`other::read_index(p)` from `read_index`).
+                if (target, ta) == (rel, a):
+                    continue
                 if resolves(rel, text, prefix, callee, target, hint, mod_alias):
                     out.append((callee, target, ta, tb))
         return out
@@ -1069,13 +1147,14 @@ def helper_errors(entries, scanned, texts, fns):
                 continue
             body = text[a:b]
             for esc in ESCAPES:
-                for m in re.finditer(r"(?<![\w])%s\s*\(" % re.escape(esc), body):
+                tail = r"\b" if esc.startswith("F_") else r"\s*\("
+                for m in re.finditer(r"(?<![\w])%s%s" % (re.escape(esc), tail), body):
                     line = text.count("\n", 0, a + m.start()) + 1
                     if line in lines_by_fn.get((rel, qual), set()):
                         continue
                     errs.append("raw descriptor escape %s in managed function %s (%s:%d)" % (esc, qual, rel, line))
             # Breadth-first over the call graph; `via` is the direct caller.
-            queue = [(qual, callee, target, ta, tb) for callee, target, ta, tb in callees(rel, a, b, qual.split("::")[-1])]
+            queue = [(qual, callee, target, ta, tb) for callee, target, ta, tb in callees(rel, a, b)]
             visited = set()
             while queue:
                 via, callee, target, ta, tb = queue.pop(0)
@@ -1096,7 +1175,7 @@ def helper_errors(entries, scanned, texts, fns):
                     chain = "" if via == qual else " via %s" % via
                     errs.append("managed function %s (%s) reaches helper %s%s with a non-managed read (%s %s#%d)"
                                 % (qual, rel, callee, chain, o["file"], o["op"], o["ordinal"]))
-                for nxt in callees(target, ta, tb, callee):
+                for nxt in callees(target, ta, tb):
                     queue.append((callee,) + nxt)
     return sorted(set(errs))
 
@@ -1731,6 +1810,109 @@ def regression_inventory_baseline_claims_match_identity_and_multiplicity():
     # The baseline's own operation still verifies.
     m["entries"] = [e for e in m["entries"] if (e["function"], e["ordinal"]) == ("a", 1)]
     expect(verify_baseline(base, m) == [], verify_baseline(base, m))
+
+
+def regression_inventory_helper_walk_follows_crate_super_and_same_name_calls():
+    """Regression (R11-S7-FIX12): the helper walk did not follow
+    `crate::helper(p)` or `super::helper(p)` to a helper in another file
+    (no import names its module), and skipped every call whose name equals
+    the caller's (`util::read_index(p)` from `read_index`), so a managed
+    function reached a raw-reading helper with an unchanged manifest."""
+    cases = [
+        ("helper", {
+            "c/src/lib.rs": "mod a;\npub fn helper(p: &Path) { let _ = std::fs::read(p); }\n",
+            "c/src/a.rs": "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; crate::helper(p); }\n",
+        }),
+        ("helper", {
+            "c/src/lib.rs": "mod a;\n",
+            "c/src/a.rs": "mod b;\npub fn helper(p: &Path) { let _ = std::fs::read(p); }\n",
+            "c/src/a/b.rs": "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; super::helper(p); }\n",
+        }),
+        ("read_index", {
+            "c/src/lib.rs": ("mod util;\nfn read_index(p: &Path) { let c = ManagedReadCursor::open(p)?;"
+                             " util::read_index(p); }\n"),
+            "c/src/util.rs": "pub fn read_index(p: &Path) { let _ = std::fs::read(p); }\n",
+        }),
+    ]
+    for name, files in cases:
+        root = fake(files)
+        managed = "read_index" if name == "read_index" else "hash"
+        m = classify(root, {(managed, "ManagedReadCursor::open"): MANAGED, (name, "fs::read"): OOF})
+        errs = check(root, m)
+        expect(any("reaches helper %s" % name in e for e in errs), (files, errs))
+    # A function's call of itself is not a helper.
+    root = fake({"c/src/lib.rs": "fn walk(p: &Path) { let c = ManagedReadCursor::open(p)?; walk(p); }\n"})
+    m = classify(root, {("walk", "ManagedReadCursor::open"): MANAGED})
+    expect(check(root, m) == [], check(root, m))
+
+
+def regression_inventory_test_only_block_like_match_arms_do_not_hide_arms():
+    """Regression (R11-S7-FIX12): a `#[cfg(test)]` match arm whose body is a
+    block-like expression other than a bare block (`unsafe { .. }`, `loop`,
+    `match`, an `if`/`else` chain) needs no trailing comma, and the scanner
+    hid the production arm after it."""
+    for body in ("unsafe { t() }", "loop { break }", "match x { _ => () }",
+                 "if x > 1 { () } else { () }", "if x > 1 { () } else if x > 2 { () } else { () }",
+                 "'outer: loop { break 'outer }", "unsafe { t() }.min(1),"):
+        root = fake({"c/src/lib.rs": (
+            "fn m(p: &Path, x: u8) {\n    match x {\n        #[cfg(test)]\n"
+            "        0 => %s\n"
+            "        1 => {\n            let _ = std::fs::read(p);\n        }\n"
+            "        _ => (),\n    }\n}\n" % body
+        )})
+        ops, _, _ = scan(root)
+        got = [(o["function"], o["op"]) for o in ops]
+        expect(got == [("m", "fs::read")], (body, got))
+
+
+def regression_inventory_descriptor_duplication_and_conversion_are_operations():
+    """Regression (R11-S7-FIX12): `try_clone_to_owned`, `libc::dup`/`dup2`,
+    `fcntl(.., F_DUPFD[_CLOEXEC], ..)` and `File::from(OwnedFd)` duplicate or
+    take ownership of a descriptor (its close releases this process's locks
+    on the file) but were no operations, so three production sites were
+    missing from the inventory."""
+    root = fake({"c/src/lib.rs": (
+        "fn d(fd: i32) {\n"
+        "    let o = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;\n"
+        "    let f = std::fs::File::from(o);\n"
+        "    let a = unsafe { libc::dup(1) };\n"
+        "    unsafe { libc::dup2(a, 1) };\n"
+        "    let b = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };\n"
+        "    let c = unsafe { libc::fcntl(fd, libc::F_DUPFD, 0) };\n"
+        "    let g = File::from(c);\n}\n"
+    )})
+    ops, _, _ = scan(root)
+    got = sorted((o["op"], o["ordinal"]) for o in ops)
+    want = sorted([("try_clone_to_owned", 1), ("File::from", 1), ("File::from", 2), ("dup", 1),
+                   ("dup2", 1), ("F_DUPFD_CLOEXEC", 1), ("F_DUPFD", 1)])
+    expect(got == want, got)
+    m = classify(root, {})
+    errs = check(root, m)
+    expect(sum("unclassified operation" in e for e in errs) == len(want), errs)
+
+
+def regression_inventory_const_generic_helper_calls_are_followed():
+    """Regression (R11-S7-FIX12): the generic-argument pattern excluded
+    braces, so `load::<{ 64 * 1024 }>(p)` reached a raw-reading helper with
+    an unchanged manifest while `load::<65536>(p)` failed. Generic argument
+    lists are matched balanced (`{ N > 3 }`, `fn() -> T`); an unbalanced one
+    is reported."""
+    for call in ("load::<{ 64 * 1024 }>(p)", "load::<{ N > 3 }, Vec<u8>>(p)",
+                 "util::load::<fn() -> u8>(p)", "load::<65536>(p)"):
+        root = fake({
+            "c/src/lib.rs": ("mod util;\nuse crate::util::load;\n"
+                             "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; let _ = %s; }\n" % call),
+            "c/src/util.rs": "pub fn load<const N: usize>(p: &Path) { let _ = std::fs::read(p); }\n",
+        })
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF})
+        errs = check(root, m)
+        expect(any("reaches helper load" in e for e in errs), (call, errs))
+    root = fake({"c/src/lib.rs": "fn f(p: &Path) { let _ = std::fs::read::<{ 1 }>(p); }\n"})
+    ops, _, _ = scan(root)
+    expect([o["op"] for o in ops] == ["fs::read"], ops)
+    root = fake({"c/src/lib.rs": "fn f(p: &Path) { let _ = load::<Vec<u8>(p); }\n"})
+    errs = check(root, classify(root, {}))
+    expect(any("unsupported generic arguments" in e for e in errs), errs)
 
 
 def self_test():

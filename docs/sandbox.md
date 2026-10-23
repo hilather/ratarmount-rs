@@ -2013,7 +2013,17 @@ mandatory-helper walk. An `unchanged-from-<baseline>` claim must match a
 baseline operation with the same file, function, operation and fingerprint,
 and each baseline operation backs at most one entry: an identical create
 copied into another function, or a second copy in the same function, is not
-a baseline create.
+a baseline create. The helper walk also follows `crate::helper(p)`,
+`super::helper(p)` and `self::helper(p)` (to any same-crate definition of
+that name) and a call whose name equals its caller's (`util::read_index(p)`
+from `read_index`); generic argument lists are matched balanced
+(`load::<{ 64 * 1024 }>(p)`, `::<fn() -> T>`) and an unbalanced one is
+reported. A test-only match arm ends at its block-like body (`unsafe { .. }`,
+`loop`, `match`, an `if`/`else` chain) as well as at a bare block. Descriptor
+duplication and ownership conversion are operations of their own:
+`try_clone_to_owned`, `libc::dup`/`dup2`/`dup3`, `fcntl(.., F_DUPFD[_CLOEXEC],
+..)` and `File::from(OwnedFd)` (closing a duplicate releases this process's
+locks on the file like any other close).
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE

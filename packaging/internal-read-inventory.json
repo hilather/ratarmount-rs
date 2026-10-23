@@ -15,6 +15,17 @@
   {
    "file": "ratarmount/src/diff.rs",
    "function": "ProgressToStderr::new",
+   "op": "F_DUPFD_CLOEXEC",
+   "ordinal": 1,
+   "line": 222,
+   "fingerprint": "039c7f3a7f81d9d9",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
+  },
+  {
+   "file": "ratarmount/src/diff.rs",
+   "function": "ProgressToStderr::new",
    "op": "from_raw_fd",
    "ordinal": 1,
    "line": 226,
@@ -22,6 +33,28 @@
    "disposition": "out-of-family",
    "category": "runtime-resource-or-descriptor-handoff",
    "reason": "standard descriptor handoff"
+  },
+  {
+   "file": "ratarmount/src/diff.rs",
+   "function": "ProgressToStderr::new",
+   "op": "dup2",
+   "ordinal": 1,
+   "line": 227,
+   "fingerprint": "2dc44a5972edeaf9",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
+  },
+  {
+   "file": "ratarmount/src/diff.rs",
+   "function": "ProgressToStderr::drop",
+   "op": "dup2",
+   "ordinal": 1,
+   "line": 238,
+   "fingerprint": "dfcd70db78e1989c",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
   },
   {
    "file": "ratarmount/src/diff.rs",
@@ -89,6 +122,17 @@
   {
    "file": "ratarmount/src/export_index.rs",
    "function": "cli_stdout",
+   "op": "F_DUPFD_CLOEXEC",
+   "ordinal": 1,
+   "line": 410,
+   "fingerprint": "4920e3977ce64f0f",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
+  },
+  {
+   "file": "ratarmount/src/export_index.rs",
+   "function": "cli_stdout",
    "op": "from_raw_fd",
    "ordinal": 1,
    "line": 414,
@@ -96,6 +140,17 @@
    "disposition": "out-of-family",
    "category": "runtime-resource-or-descriptor-handoff",
    "reason": "standard descriptor handoff"
+  },
+  {
+   "file": "ratarmount/src/export_index.rs",
+   "function": "cli_stdout",
+   "op": "dup2",
+   "ordinal": 1,
+   "line": 415,
+   "fingerprint": "2dc44a5972edeaf9",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
   },
   {
    "file": "ratarmount/src/export_index.rs",
@@ -110,6 +165,17 @@
   },
   {
    "file": "ratarmount/src/find.rs",
+   "function": "silence_stdout",
+   "op": "dup",
+   "ordinal": 1,
+   "line": 337,
+   "fingerprint": "2a8db6512c0f177c",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
+  },
+  {
+   "file": "ratarmount/src/find.rs",
    "function": "restore_stdout_after",
    "op": "OpenOptions",
    "ordinal": 1,
@@ -120,6 +186,28 @@
    "category": "runtime-resource-or-descriptor-handoff",
    "reason": "standard descriptor handoff",
    "mode_policy": "unchanged-from-e6ca64e"
+  },
+  {
+   "file": "ratarmount/src/find.rs",
+   "function": "restore_stdout_after",
+   "op": "dup2",
+   "ordinal": 1,
+   "line": 350,
+   "fingerprint": "85bd3ad9584df630",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
+  },
+  {
+   "file": "ratarmount/src/find.rs",
+   "function": "restore_stdout_after",
+   "op": "dup2",
+   "ordinal": 2,
+   "line": 354,
+   "fingerprint": "cdd46d1dbab619a6",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
   },
   {
    "file": "ratarmount/src/journal_cmd.rs",
@@ -246,6 +334,17 @@
   },
   {
    "file": "ratarmount/src/main.rs",
+   "function": "neutralize_dead_stdio",
+   "op": "dup2",
+   "ordinal": 1,
+   "line": 5027,
+   "fingerprint": "027136a54e840a25",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
+  },
+  {
+   "file": "ratarmount/src/main.rs",
    "function": "redirect_stdio_to_null",
    "op": "OpenOptions",
    "ordinal": 1,
@@ -256,6 +355,39 @@
    "category": "runtime-resource-or-descriptor-handoff",
    "reason": "logger output or standard descriptor setup",
    "mode_policy": "unchanged-from-e6ca64e"
+  },
+  {
+   "file": "ratarmount/src/main.rs",
+   "function": "redirect_stdio_to_null",
+   "op": "dup2",
+   "ordinal": 1,
+   "line": 5051,
+   "fingerprint": "891b081f12df1009",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
+  },
+  {
+   "file": "ratarmount/src/main.rs",
+   "function": "redirect_stdio_to_null",
+   "op": "dup2",
+   "ordinal": 2,
+   "line": 5052,
+   "fingerprint": "fc50b3fc4beafda9",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
+  },
+  {
+   "file": "ratarmount/src/main.rs",
+   "function": "redirect_stdio_to_null",
+   "op": "dup2",
+   "ordinal": 3,
+   "line": 5053,
+   "fingerprint": "7bc0d99056ef2441",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
   },
   {
    "file": "ratarmount/src/mount_guard.rs",
@@ -328,7 +460,7 @@
    "line": 1137,
    "fingerprint": "2dbd75bc1ad966d3",
    "disposition": "managed-read",
-   "regression": "regression_live_commit_s3_reads_keep_index_lock"
+   "regression": "regression_live_commit_s3_single_put_body_keeps_archive_lock"
   },
   {
    "file": "ratarmount/src/overlay_commit.rs",
@@ -447,6 +579,21 @@
   {
    "file": "ratarmount/src/overlay_pack.rs",
    "function": "append_host",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 263,
+   "fingerprint": "a272921f1bda464e",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "takes ownership of the descriptor the entry above opened (no new open); pack payload branch (None): admitted open of an overlay payload; reverse-order payload ownership needs the excluded coordinator",
+   "non_mandatory_callers": [
+    "pack"
+   ]
+  },
+  {
+   "file": "ratarmount/src/overlay_pack.rs",
+   "function": "append_host",
    "op": "openat_admitted",
    "ordinal": 1,
    "line": 263,
@@ -490,6 +637,17 @@
    "fingerprint": "2acc407ce793b7cc",
    "disposition": "sqlite-snapshot",
    "regression": "regression_pack_snapshot_output_readers_keep_database_lock"
+  },
+  {
+   "file": "ratarmount/src/overlay_pack.rs",
+   "function": "pack",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 367,
+   "fingerprint": "8aecf5d3c2939dd0",
+   "disposition": "out-of-family",
+   "category": "structured-control-record",
+   "reason": "takes ownership of the descriptor the entry above opened (no new open); --include-journal: operation journal JSONL summarized into the bundle (documented residual of the lock guarantee)"
   },
   {
    "file": "ratarmount/src/overlay_pack.rs",
@@ -541,6 +699,21 @@
   },
   {
    "file": "ratarmount/src/overlay_pack.rs",
+   "function": "sentinel_matches",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 617,
+   "fingerprint": "5bc92b1484fc6ae7",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "takes ownership of the descriptor the entry above opened (no new open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)",
+   "non_mandatory_callers": [
+    "pack"
+   ]
+  },
+  {
+   "file": "ratarmount/src/overlay_pack.rs",
    "function": "cleanup_dirs",
    "op": "rustix::openat",
    "ordinal": 1,
@@ -583,6 +756,36 @@
    "family": "payload-admitted-readers",
    "issue": "#196",
    "reason": "overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)",
+   "non_mandatory_callers": [
+    "pack"
+   ]
+  },
+  {
+   "file": "ratarmount/src/overlay_pack.rs",
+   "function": "sweep_pack_temps_in",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 876,
+   "fingerprint": "8ec0ed5269b5bcf5",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "takes ownership of the descriptor the entry above opened (no new open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)",
+   "non_mandatory_callers": [
+    "pack"
+   ]
+  },
+  {
+   "file": "ratarmount/src/overlay_pack.rs",
+   "function": "open_lock_at",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 1015,
+   "fingerprint": "e3db9a8f1a7552ae",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "takes ownership of the descriptor the entry above opened (no new open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)",
    "non_mandatory_callers": [
     "pack"
    ]
@@ -659,6 +862,15 @@
   },
   {
    "file": "ratarmount/src/overlay_pack.rs",
+   "function": "extract_with_limits",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 1295,
+   "fingerprint": "c42820d57069ea28",
+   "disposition": "output-owner"
+  },
+  {
+   "file": "ratarmount/src/overlay_pack.rs",
    "function": "finalize_stage",
    "op": "rustix::openat",
    "ordinal": 1,
@@ -678,6 +890,17 @@
    "disposition": "out-of-family",
    "category": "directory-handle-or-durability",
    "reason": "O_DIRECTORY handle for a descriptor-relative walk; no file content read"
+  },
+  {
+   "file": "ratarmount/src/overlay_pack.rs",
+   "function": "finalize_stage",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 1384,
+   "fingerprint": "8ec0ed5269b5bcf5",
+   "disposition": "out-of-family",
+   "category": "directory-handle-or-durability",
+   "reason": "takes ownership of the descriptor the entry above opened (no new open); O_DIRECTORY handle for a descriptor-relative walk; no file content read"
   },
   {
    "file": "ratarmount/src/overlay_pack.rs",
@@ -930,6 +1153,18 @@
    "disposition": "out-of-family",
    "category": "directory-handle-or-durability",
    "reason": "O_DIRECTORY handle for a descriptor-relative walk; no file content read"
+  },
+  {
+   "file": "ratarmount/src/diff/live.rs",
+   "function": "LiveView::open",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 91,
+   "fingerprint": "f731e446892a02aa",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "takes ownership of the descriptor the entry above opened (no new open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
   },
   {
    "file": "ratarmount/src/diff/live.rs",
@@ -1451,6 +1686,18 @@
   {
    "file": "ratarmount-compositing/src/overlay_layer.rs",
    "function": "ReadOnlyOverlayLayer::open_host",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 344,
+   "fingerprint": "0bcc9f50403c451e",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "takes ownership of the descriptor the entry above opened (no new open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
+  },
+  {
+   "file": "ratarmount-compositing/src/overlay_layer.rs",
+   "function": "ReadOnlyOverlayLayer::open_host",
    "op": "openat_admitted",
    "ordinal": 1,
    "line": 344,
@@ -1548,6 +1795,30 @@
    "reason": "overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
   },
   {
+   "file": "ratarmount-compositing/src/overlay_seal.rs",
+   "function": "finish_sealed",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 376,
+   "fingerprint": "ef1c2217c58eeefd",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "takes ownership of the open_sentinel descriptor (no new open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
+  },
+  {
+   "file": "ratarmount-compositing/src/overlay_seal.rs",
+   "function": "verify",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 493,
+   "fingerprint": "85f9488c3841327d",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "takes ownership of the open_sentinel descriptor (no new open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
+  },
+  {
    "file": "ratarmount-compositing/src/write_overlay.rs",
    "function": "WriteOverlay::open_with_create_info",
    "op": "File::open",
@@ -1557,6 +1828,18 @@
    "disposition": "out-of-family",
    "category": "directory-handle-or-durability",
    "reason": "directory handle opened only to fsync a directory entry"
+  },
+  {
+   "file": "ratarmount-compositing/src/write_overlay.rs",
+   "function": "WriteOverlay::clone_overlay_fd",
+   "op": "F_DUPFD_CLOEXEC",
+   "ordinal": 1,
+   "line": 2160,
+   "fingerprint": "e6569ba956e05aae",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "duplicates a live overlay handle (no pathname open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
   },
   {
    "file": "ratarmount-compositing/src/write_overlay.rs",
@@ -3922,6 +4205,18 @@
   {
    "file": "ratarmount-formats-tar/src/write.rs",
    "function": "write_file_on_disk",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 1027,
+   "fingerprint": "e115e514ef317010",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "takes ownership of the descriptor the entry above opened (no new open); TAR commit helper opens an overlay payload through admission"
+  },
+  {
+   "file": "ratarmount-formats-tar/src/write.rs",
+   "function": "write_file_on_disk",
    "op": "open_admitted",
    "ordinal": 1,
    "line": 1027,
@@ -4364,6 +4659,30 @@
   },
   {
    "file": "ratarmount-fuse/src/lib.rs",
+   "function": "RatarmountFs::passthrough_file",
+   "op": "try_clone_to_owned",
+   "ordinal": 1,
+   "line": 1052,
+   "fingerprint": "61bb649ed12a9e5c",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "FUSE passthrough duplicates the handle's already-admitted overlay payload descriptor (OverlayFd) and never reopens its pathname; reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
+  },
+  {
+   "file": "ratarmount-fuse/src/lib.rs",
+   "function": "RatarmountFs::passthrough_file",
+   "op": "File::from",
+   "ordinal": 1,
+   "line": 1053,
+   "fingerprint": "8e51f21a2f970306",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "FUSE passthrough duplicates the handle's already-admitted overlay payload descriptor (OverlayFd) and never reopens its pathname; reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
+  },
+  {
+   "file": "ratarmount-fuse/src/lib.rs",
    "function": "reopen_parked_readonly",
    "op": "libc::open",
    "ordinal": 1,
@@ -4373,6 +4692,18 @@
    "family": "payload-admitted-readers",
    "issue": "#196",
    "reason": "overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
+  },
+  {
+   "file": "ratarmount-fuse/src/lib.rs",
+   "function": "reopen_parked_readonly",
+   "op": "F_DUPFD_CLOEXEC",
+   "ordinal": 1,
+   "line": 2913,
+   "fingerprint": "400bacca0462d773",
+   "disposition": "residual",
+   "family": "payload-admitted-readers",
+   "issue": "#196",
+   "reason": "non-Linux duplicate of the parked payload descriptor (no pathname open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)"
   },
   {
    "file": "ratarmount-fuse/src/lib.rs",
@@ -5081,6 +5412,28 @@
    "disposition": "out-of-family",
    "category": "runtime-resource-or-descriptor-handoff",
    "reason": "/dev/null placeholder for standard descriptors"
+  },
+  {
+   "file": "ratarmount-index/src/checked_open/acquire.rs",
+   "function": "repoint_to_devnull",
+   "op": "dup2",
+   "ordinal": 1,
+   "line": 831,
+   "fingerprint": "a10e993d6f0d1cdc",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content"
+  },
+  {
+   "file": "ratarmount-index/src/checked_open/acquire.rs",
+   "function": "armed_open",
+   "op": "F_DUPFD_CLOEXEC",
+   "ordinal": 1,
+   "line": 938,
+   "fingerprint": "e74653c019e1ed9c",
+   "disposition": "out-of-family",
+   "category": "runtime-resource-or-descriptor-handoff",
+   "reason": "checked open moves the descriptor SQLite's open landed on a standard slot (0-2) above it; the low slot stays open and reported; opens no pathname and reads no file content"
   },
   {
    "file": "ratarmount-index/src/checked_open/install.rs",

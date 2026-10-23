@@ -3355,6 +3355,74 @@ mod tests {
         s7_object_store_publish("s3", publish_s3);
     }
 
+    /// Regression (R11-S7-FIX12, #151): the S3 single PutObject body was read
+    /// with `std::fs::read`, whose close released every POSIX lock this
+    /// process held on the staged archive. The test above still passed with
+    /// that raw read (other managed reads of the archive satisfied its probe
+    /// and nothing locked the archive), so this one holds a lock on the
+    /// staged archive, takes the single-PUT path with no sidecar (no other
+    /// read of the archive), and checks that the lock survives and the PUT
+    /// carried the archive's bytes.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_s3_single_put_body_keeps_archive_lock() {
+        use crate::publish_index::tests::{publish_tar, PublishEnv, PublishServer};
+        use ratarmount_index::managed_read::{lock_probe::other_process_sees_lock, VfsLockHolder};
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("a.tar");
+        std::fs::write(&tar, publish_tar()).unwrap();
+        let server = PublishServer::new(publish_tar(), false, false);
+        let _env = PublishEnv::new(&[
+            ("AWS_ACCESS_KEY_ID", "test"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_ENDPOINT_URL", &server.url),
+            ("AWS_REGION", "us-east-1"),
+            ("RATARMOUNT_S3_ANONYMOUS", "0"),
+            ("AWS_ANONYMOUS", "0"),
+        ]);
+        let stats = ratarmount_index::tar_stats_from_path(&tar).unwrap();
+        let req = RemotePublishRequest {
+            staged: tar.clone(),
+            prefix_compressed_bytes: 0,
+            etag_at_download: None,
+            window: ratarmount_compositing::IndexPatchWindow {
+                window_start: 0,
+                from_frame: None,
+                offsets_shifted: false,
+            },
+            skip_object_put: false,
+            presplice_len: stats.st_size,
+            presplice_sha256: stats.full_sha256.clone().unwrap(),
+            presplice_prefix512_sha256: stats.prefix512_sha256.clone().unwrap(),
+            presplice_suffix512_sha256: stats.suffix512_sha256.clone().unwrap(),
+            commit_generation: 1,
+        };
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let holder = VfsLockHolder::shared(&tar).unwrap();
+        assert!(other_process_sees_lock(&tar));
+        publish_s3("s3://bucket/a.tar", &opts, &req).unwrap();
+        assert!(
+            other_process_sees_lock(&tar),
+            "the single-PUT body read kept this process's lock on the staged archive"
+        );
+        drop(holder);
+        let state = server.state.lock().unwrap();
+        let puts: Vec<_> = state
+            .requests
+            .iter()
+            .filter(|(m, _, _)| m == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 1, "one PutObject, no pointer: {puts:?}");
+        assert_eq!(
+            puts[0].2,
+            publish_tar(),
+            "the PUT body is the staged archive"
+        );
+    }
+
     /// Regression (R11-S7, #151): the GCS live commit read the staged archive
     /// (MD5 + body) and the index blob through raw `File`s.
     #[cfg(unix)]

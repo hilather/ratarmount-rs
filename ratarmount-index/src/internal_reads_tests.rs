@@ -591,20 +591,52 @@ fn regression_content_hashes_keep_aliased_database_lock() {
 
 /// Regression: a member whose hash failed mid-stream must store no (partial)
 /// digest; the other member still gets one; an initial open failure
-/// propagates.
+/// propagates. Member `b` spans several hashing chunks and its second read
+/// fails (R11-S7-FIX12: the test failed the first read, before any bytes).
 #[test]
 fn regression_content_hash_failure_does_not_store_partial_digest() {
     let (_d, dir) = tempdir();
     let archive = dir.join("a.bin");
-    std::fs::write(&archive, vec![9u8; 110_000]).unwrap();
-    let idx = content_index(None);
-    seams::with(fail_read(1), || {
+    let big = 3 * crate::hashing::HASH_STREAM_CHUNK + 17;
+    std::fs::write(&archive, vec![9u8; 100_000 + big]).unwrap();
+    let idx = SqliteIndex::create_writable(None).unwrap();
+    idx.insert_file(
+        "", "a", 0, 0, 3000, 0.0, 0o100644, 0, "", 0, 0, true, false, false, 0,
+    )
+    .unwrap();
+    idx.insert_file(
+        "", "b", 1, 100_000, big as i64, 0.0, 0o100644, 0, "", 0, 0, true, false, false, 0,
+    )
+    .unwrap();
+    // Read 1 is all of `a`; reads 2..=5 are `b`'s chunks: fail its second.
+    let reads = Rc::new(Cell::new(0));
+    let counted = Rc::clone(&reads);
+    let probe = SqliteIndex::create_writable(None).unwrap();
+    probe
+        .insert_file(
+            "", "b", 1, 100_000, big as i64, 0.0, 0o100644, 0, "", 0, 0, true, false, false, 0,
+        )
+        .unwrap();
+    seams::with(
+        move |s| {
+            if s == Seam::BeforeRead {
+                counted.set(counted.get() + 1);
+            }
+            Ok(())
+        },
+        || fill_content_hashes(&probe, &archive, &["sha256".into()]),
+    )
+    .unwrap();
+    assert_eq!(reads.get(), 4, "`b` alone takes four reads");
+    seams::with(fail_read(3), || {
         fill_content_hashes(&idx, &archive, &["sha256".into()])
     })
     .unwrap();
-    let a = idx.list_xattr_keys(0).unwrap().len();
-    let b = idx.list_xattr_keys(1).unwrap().len();
-    assert_eq!(a + b, 1, "exactly the member that read fine has a digest");
+    assert_eq!(idx.list_xattr_keys(0).unwrap().len(), 1, "`a` read fine");
+    assert!(
+        idx.list_xattr_keys(1).unwrap().is_empty(),
+        "`b` failed mid-stream and stores no partial digest"
+    );
     let idx = content_index(None);
     let e = seams::with(fail_open(1), || {
         fill_content_hashes(&idx, &archive, &["sha256".into()])
