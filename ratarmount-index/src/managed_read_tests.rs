@@ -413,9 +413,13 @@ fn child_row(row: &str, dir: &Path) -> String {
 fn set_errno(e: libc::c_int) {
     // SAFETY: the thread's own errno slot.
     unsafe {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(target_os = "linux")]
         {
             *libc::__errno_location() = e;
+        }
+        #[cfg(target_os = "android")]
+        {
+            *libc::__errno() = e;
         }
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
         {

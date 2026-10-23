@@ -885,24 +885,30 @@ def rust_files(root):
     return out
 
 
-def module_file(rel, name, root):
+def module_file(rel, name, root, chain=()):
+    """File of `mod name;` in `rel`, inside the inline modules `chain`
+    (`mod outer { mod name; }` is `outer/name.rs`, R11-S7-FIX16)."""
     d = os.path.dirname(rel)
     base = os.path.basename(rel)
     if base not in ("lib.rs", "main.rs", "mod.rs"):
         d = os.path.join(d, base[:-3])
+    d = os.path.join(d, *chain)
     for cand in (os.path.join(d, name + ".rs"), os.path.join(d, name, "mod.rs")):
         if os.path.exists(os.path.join(root, cand)):
-            return cand.replace(os.sep, "/")
+            return os.path.normpath(cand).replace(os.sep, "/")
     return None
 
 
 def mod_decls(text, raw):
-    """[(offset, name)] for every `mod name;` declaration; `name` is
-    `("path", file)` when a `#[path = ".."]` attribute names its file."""
+    """[(offset, name, chain)] for every `mod name;` declaration; `name` is
+    `("path", file)` when a `#[path = ".."]` attribute names its file, and
+    `chain` the names of the inline modules around it, outermost first."""
     out = []
+    inl = inline_mods(text)
     for m in re.finditer(r"(?:^|\n|;|\}|\{)\s*((?:#\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", text):
         pm = re.search(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]', raw[m.start(1):m.end(1)])
-        out.append((m.start(2), ("path", pm.group(1)) if pm else m.group(2)))
+        chain = tuple(n for n, a, b in sorted(inl, key=lambda x: x[1]) if a < m.start(2) <= b)
+        out.append((m.start(2), ("path", pm.group(1)) if pm else m.group(2), chain))
     return out
 
 
@@ -922,11 +928,20 @@ def scan(root, problems=None):
     # Files that are test-only modules (and everything below them). A file
     # that a production `mod` declaration also names is production code
     # (`#[cfg(test)] #[path = "util.rs"] mod t; mod util;`, R11-S7-FIX15).
-    def mod_target(rel, name):
+    # Declarations inside inline modules resolve below them (`mod outer {
+    # pub mod util; }` is `outer/util.rs`), and a production declaration
+    # that resolves to no file fails closed (R11-S7-FIX16).
+    def mod_target(rel, name, chain):
         if isinstance(name, tuple):
-            return os.path.normpath(os.path.join(os.path.dirname(rel), name[1])).replace(os.sep, "/")
-        return module_file(rel, name, root)
-    spans_mods = {rel: test_spans(texts[rel], raws[rel]) for rel in files}
+            d = os.path.dirname(rel)
+            if chain:
+                if os.path.basename(rel) not in ("lib.rs", "main.rs", "mod.rs"):
+                    d = os.path.join(d, os.path.basename(rel)[:-3])
+                d = os.path.join(d, *chain)
+            return os.path.normpath(os.path.join(d, name[1])).replace(os.sep, "/")
+        return module_file(rel, name, root, chain)
+    spans_of = {rel: test_spans(texts[rel], raws[rel])[0] for rel in files}
+    decls = {rel: mod_decls(texts[rel], raws[rel]) for rel in files}
     changed = True
     while changed:
         changed = False
@@ -934,21 +949,25 @@ def scan(root, problems=None):
         for rel in files:
             if rel in test_files:
                 continue
-            spans = spans_mods[rel][0]
-            for name in mod_decls(texts[rel], raws[rel]):
-                at, name = name
-                if not any(a <= at <= b for a, b in spans):
-                    prod.add(mod_target(rel, name))
+            for at, name, chain in decls[rel]:
+                if not any(a <= at <= b for a, b in spans_of[rel]):
+                    prod.add(mod_target(rel, name, chain))
         for rel in files:
-            mods = spans_mods[rel][1]
-            nested = []
-            if rel in test_files:
-                nested = [name for _, name in mod_decls(texts[rel], raws[rel])]
-            for name in list(mods) + nested:
-                mf = mod_target(rel, name)
-                if mf and mf not in test_files and mf not in prod:
-                    test_files.add(mf)
-                    changed = True
+            for at, name, chain in decls[rel]:
+                if rel in test_files or any(a <= at <= b for a, b in spans_of[rel]):
+                    mf = mod_target(rel, name, chain)
+                    if mf and mf not in test_files and mf not in prod:
+                        test_files.add(mf)
+                        changed = True
+    for rel in files:
+        if rel in test_files:
+            continue
+        for at, name, chain in decls[rel]:
+            mf = mod_target(rel, name, chain)
+            if not any(a <= at <= b for a, b in spans_of[rel]) and (mf is None or not os.path.isfile(os.path.join(root, mf))):
+                problems.append("unresolved production module (no file for `mod %s;`; the scanner cannot tell "
+                                "which file it names): %s:%d"
+                                % (name[1] if isinstance(name, tuple) else name, rel, texts[rel].count("\n", 0, at) + 1))
     factories = {}
     for rel in files:
         if rel not in test_files:
@@ -2135,6 +2154,37 @@ def regression_inventory_production_module_shared_with_test_module_is_scanned():
     # Control: a file named only by test-only declarations stays excluded.
     root = fake(dict(util, **{"c/src/lib.rs": '#[cfg(test)]\n#[path = "util.rs"]\nmod test_util;\n'}))
     expect(scan(root)[0] == [], scan(root)[0])
+
+
+def regression_inventory_modules_inside_inline_modules_resolve_below_them():
+    """Regression (R11-S7-FIX16): a `mod util;` inside `mod outer { .. }`
+    resolved as if it were at the top of its file, so a test-only alias
+    `#[path = "outer/util.rs"]` excluded the production file `outer/util.rs`
+    (zero operations, an empty manifest passed). A production declaration
+    that names no file now fails closed."""
+    read = "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n"
+    alias = '#[cfg(test)]\n#[path = "outer/util.rs"]\nmod test_util;\n'
+    for files, util in (
+            ({"c/src/lib.rs": "mod outer {\n    pub mod util;\n}\n" + alias}, "c/src/outer/util.rs"),
+            ({"c/src/lib.rs": "mod outer {\n    pub mod util;\n}\n" + alias.replace("outer/util.rs", "outer/util/mod.rs")},
+             "c/src/outer/util/mod.rs"),
+            ({"c/src/lib.rs": "mod a;\n", "c/src/a.rs": "mod outer {\n    mod inner {\n        pub mod util;\n    }\n}\n"
+              + alias.replace("outer/util.rs", "a/outer/inner/util.rs")}, "c/src/a/outer/inner/util.rs"),
+            ({"c/src/lib.rs": 'mod outer {\n    #[path = "x.rs"]\n    pub mod util;\n}\n'
+              + alias.replace("outer/util.rs", "outer/x.rs")}, "c/src/outer/x.rs")):
+        root = fake(dict(files, **{util: read}))
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"]) for o in ops] == [(util, "load")], (files, ops, problems))
+        expect(problems == [], (files, problems))
+        expect(check(root, {"baseline": BASELINE, "entries": []}) != [], files)
+    # Control: a test-only declaration inside an inline module stays excluded.
+    root = fake({"c/src/lib.rs": "mod outer {\n    #[cfg(test)]\n    mod t;\n}\n", "c/src/outer/t.rs": read})
+    expect(scan(root)[0] == [], scan(root)[0])
+    # A production declaration the scanner cannot resolve fails closed.
+    root = fake({"c/src/lib.rs": "mod outer {\n    pub mod util;\n}\n" + alias, "c/src/util.rs": read})
+    errs = check(root, classify(root, {}))
+    expect(any("unresolved production module (no file for `mod util;`" in e for e in errs), errs)
 
 
 def regression_inventory_helper_walk_visits_same_named_helpers_by_definition():

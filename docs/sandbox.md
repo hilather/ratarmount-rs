@@ -2038,6 +2038,10 @@ A file that a test-only `mod` declaration names is skipped only when no
 production `mod` declaration names it too (`#[cfg(test)] #[path = "util.rs"]
 mod t; mod util;` scans `util.rs`), and the helper walk tells two helpers of
 one name in one file apart (`first::bridge`, `second::bridge`).
+A `mod` declaration inside an inline module resolves below it
+(`mod outer { pub mod util; }` names `outer/util.rs`), and a production `mod`
+declaration that names no file is reported instead of leaving its file
+unscanned.
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE
