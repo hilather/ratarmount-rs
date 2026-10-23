@@ -172,6 +172,9 @@ fn acquire_child() {
         "reenter" => reenter_row(),
         "rwretry" => rw_retry_row(),
         "uri_relative" => uri_relative_row(),
+        "not_fresh" => not_fresh_row(),
+        "unheld" => unheld_row(),
+        "budget" => budget_row(),
         other => panic!("unknown row {other}"),
     };
     write_result(&format!("ok {detail}"));
@@ -1931,9 +1934,16 @@ fn regression_193_publish_tmp_before_selection_stat_adopts() {
 
 /// Regression (#193): a rename of a closed index over the classified path is
 /// adopted, and the mismatch descriptor is closed because nobody holds it.
+///
+/// Runs in a child. In the parent, another test's connection makes SQLite
+/// `stat` the new inode before `open`, so `OtherFile` is latched with no
+/// descriptor and the close count does not move.
 #[test]
 fn regression_193_unheld_rename_closes_the_mismatch_fd() {
-    let _serial = serial_193();
+    run_child("unheld", None);
+}
+
+fn unheld_row() -> String {
     let (_dir, dir) = tempdir();
     let dest = dir.join("idx.index.sqlite");
     let other = dir.join("other.index.sqlite");
@@ -1963,6 +1973,7 @@ fn regression_193_unheld_rename_closes_the_mismatch_fd() {
         quarantined
     );
     drop(reader);
+    "unheld".into()
 }
 
 /// Regression (#193): a directory or a FIFO is not a database. The open
@@ -2012,9 +2023,15 @@ fn regression_193_non_regular_stops_at_three_attempts() {
 }
 
 /// Regression (#193): once 100 ms have passed, a swapped file is not adopted.
+/// The retained descriptor of the unheld inode is closed. See
+/// [`regression_193_unheld_rename_closes_the_mismatch_fd`] for why this is a
+/// child.
 #[test]
 fn regression_193_time_budget_does_not_adopt_the_new_file() {
-    let _serial = serial_193();
+    run_child("budget", None);
+}
+
+fn budget_row() -> String {
     let (_dir, dir) = tempdir();
     let dest = dir.join("idx.index.sqlite");
     let other = dir.join("other.index.sqlite");
@@ -2047,13 +2064,21 @@ fn regression_193_time_budget_does_not_adopt_the_new_file() {
         0
     );
     assert_eq!(ratarmount_core::db_inodes::coordinated_closed(), closed + 1);
+    "budget".into()
 }
 
 /// Regression (#193): a file planted where none existed is `NotFresh`, not a
 /// retry, and its descriptor is closed when nobody holds the inode.
+///
+/// Runs in a child. In the parent, another test's connection makes SQLite
+/// `stat` the planted file before `open`, so `NotFresh` is latched with no
+/// descriptor and the close count does not move.
 #[test]
 fn regression_193_not_fresh_is_not_retried() {
-    let _serial = serial_193();
+    run_child("not_fresh", None);
+}
+
+fn not_fresh_row() -> String {
     let (_dir, dir) = tempdir();
     let path = dir.join("new.sqlite");
     let planted = path.clone();
@@ -2075,6 +2100,7 @@ fn regression_193_not_fresh_is_not_retried() {
         0
     );
     assert_eq!(ratarmount_core::db_inodes::coordinated_closed(), closed + 1);
+    "not_fresh".into()
 }
 
 /// Regression (#193): an overlay acquisition still refuses in one attempt.

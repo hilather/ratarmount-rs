@@ -561,13 +561,9 @@ pub fn open_checked(
     mode: NameMode,
     expect: Expect,
 ) -> Result<Acquired, Refusal> {
-    let refuse = |error| Refusal {
-        error,
-        retained_fd: None,
-    };
     #[cfg(not(windows))]
     if let Err(error) = require_installed() {
-        return Err(refuse(error));
+        return Err(refuse_none(error));
     }
     open_armed(path, flags, mode, expect, PINNED_VFS)
 }
