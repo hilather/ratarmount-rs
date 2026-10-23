@@ -3302,6 +3302,18 @@
    "reason": "archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes"
   },
   {
+   "file": "ratarmount-formats-git/src/lib.rs",
+   "function": "GitMountSource::open",
+   "op": "git2::Repository::open",
+   "ordinal": 1,
+   "line": 153,
+   "fingerprint": "624071a0d9d61883",
+   "disposition": "residual",
+   "family": "foreign-library-or-caller-owned",
+   "issue": "#196",
+   "reason": "libgit2 opens the repository (config, HEAD, refs, packs, loose objects) by pathname with its own descriptors; the git backend's ownership is outside this process's Rust readers (a repository file aliasing an open database would be closed by libgit2)"
+  },
+  {
    "file": "ratarmount-formats-git/src/secure_cache.rs",
    "function": "fd_result",
    "op": "from_raw_fd",
@@ -3437,6 +3449,18 @@
   },
   {
    "file": "ratarmount-formats-libarchive/src/lib.rs",
+   "function": "ArchiveHandle::open_path_inner",
+   "op": "libarchive::archive_read_open_filename",
+   "ordinal": 1,
+   "line": 124,
+   "fingerprint": "5955efcf080ea20b",
+   "disposition": "residual",
+   "family": "foreign-library-or-caller-owned",
+   "issue": "#196",
+   "reason": "libarchive opens and closes the archive by pathname with its own descriptor (the libarchive backend's reader is not a managed owner)"
+  },
+  {
+   "file": "ratarmount-formats-libarchive/src/lib.rs",
    "function": "looks_like_lrzip",
    "op": "File::open",
    "ordinal": 1,
@@ -3554,6 +3578,18 @@
    "family": "factory-and-format-readers",
    "issue": "#196",
    "reason": "archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes"
+  },
+  {
+   "file": "ratarmount-formats-pdf/src/lib.rs",
+   "function": "PdfMountSource::create_index",
+   "op": "lopdf::Document::load",
+   "ordinal": 1,
+   "line": 1073,
+   "fingerprint": "79db88a0f3ffab9f",
+   "disposition": "residual",
+   "family": "foreign-library-or-caller-owned",
+   "issue": "#196",
+   "reason": "lopdf opens and reads the whole PDF by pathname with its own std::fs::File (the PDF backend's reader is not a managed owner)"
   },
   {
    "file": "ratarmount-formats-qcow2/src/disk.rs",
@@ -4806,7 +4842,7 @@
    "function": "ByteFile::open",
    "op": "File::open",
    "ordinal": 1,
-   "line": 796,
+   "line": 809,
    "fingerprint": "529fa3b1dea7facb",
    "disposition": "managed-read",
    "reason": "non-Unix backend of ManagedReadCursor (an ordinary private file)",

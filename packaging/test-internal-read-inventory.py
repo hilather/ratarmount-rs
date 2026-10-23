@@ -35,12 +35,19 @@ builder bound to a variable that escapes its function or never reaches
 false without `test` (`feature = "test-hooks"` counts as `test`: release
 builds never enable it, packaging/test-no-test-hooks-in-release.sh).
 Fingerprints hash the comment-stripped statement with its literal values,
-plus every later statement that configures a bound builder. The helper walk
-follows same-crate free-function calls transitively.
+plus every later statement that configures a bound builder. An
+`OpenOptions` `.create(..)` / `.create_new(..)` with any argument but a
+literal `false` is a create (it needs a mode policy). A test-only match arm
+ends at its block body. The helper walk follows same-crate free-function
+calls transitively, through `use .. as` renames of a function or a module.
+Pathname opens inside foreign libraries (libgit2 `Repository::open`,
+libarchive `archive_read_open_filename`, lopdf `Document::load`) are
+operations of their own.
 
 Known limits: a renamed crate root (`use std as s`), a glob import of a local
-module that re-exports an fs function, openers of other crates (`nix`),
-method and cross-crate calls in the helper walk.
+module that re-exports an fs function, a `pub use .. as` re-export called
+through its new path, openers of other crates (`nix`) and foreign openers not
+listed above, method and cross-crate calls in the helper walk.
 
 Usage:
   test-internal-read-inventory.py            check the workspace (exit 0/1)
@@ -348,11 +355,17 @@ def test_spans(text, raw=None):
             spans.append((m.start(), j))
             continue
         if not item:
-            # A field, statement or expression: it ends at the first `,` or
-            # `;` (or the enclosing `}`) outside nested brackets.
+            # A field, statement, expression or match arm: it ends at the
+            # first `,` or `;` (or the enclosing `}`) outside nested
+            # brackets, or at the brace closing an arm's block body
+            # (`PAT => { .. }` needs no `,`, so the `,` rule would swallow
+            # the arms after it).
             depth, j = 0, k
             while j < len(text):
                 ch = text[j]
+                if ch == "{" and depth == 0 and re.search(r"=>\s*$", text[k:j]):
+                    j = match_brace(text, j)
+                    break
                 if ch in "([{":
                     depth += 1
                 elif ch in ")]}":
@@ -604,6 +617,11 @@ def op_patterns(text, factories=()):
         (r"(?<![\w])NamedTempFile::(?:new|new_in)\s*\(|\.tempfile(?:_in)?\s*\(|(?<![\w.])tempfile::tempfile(?:_in)?\s*\(", "tempfile"),
         (r"(?<![\w.])(?:tempfile::)?(?:tempdir|tempdir_in)\s*\(|\.tempdir(?:_in)?\s*\(|(?<![\w.])TempDir::new(?:_in)?\s*\(", "tempdir"),
         (r"(?<![\w.])ManagedReadCursor::open\s*\(", "ManagedReadCursor::open"),
+        # Foreign libraries that open a pathname themselves (#196 residuals:
+        # their descriptors are outside this process's Rust code).
+        (r"(?<![\w.])(?:git2::)?Repository::(open|open_bare|open_ext|open_from_env|discover)\s*\(", "git2::Repository::{0}"),
+        (r"(?<![\w.])(?<!fn )(?:[a-z_]\w*::)*(archive_read_open_filename(?:_w)?|archive_read_open_filenames)\s*\(", "libarchive::{0}"),
+        (r"(?<![\w.])(?:lopdf::)?Document::(load|load_filtered|load_with_password)\s*\(", "lopdf::Document::{0}"),
         (r"(?<![\w.])managed_read::(\w+)\s*\(", "managed_read::{0}"),
     ]
     for alias, name in sorted(names["bare"]):
@@ -793,10 +811,12 @@ def scan(root, problems=None):
                 "ordinal": seen[k],
                 "line": text.count("\n", 0, pos) + 1,
                 "fingerprint": fingerprint(stmt),
-                "creates": op in CREATE_OPS and (op != "OpenOptions" or re.search(r"\.(create|create_new)\(true\)", stmt) is not None)
+                # Any `.create(..)` / `.create_new(..)` but a literal `false`
+                # may create (`{ true }`, a variable).
+                "creates": op in CREATE_OPS and (op != "OpenOptions" or re.search(r"\.(create|create_new)\((?!false\))", stmt) is not None)
                 or (op in RAW_OPENS and re.search(r"O_CREAT|CREATE", stmt) is not None),
                 "exclusive": op in ("File::create_new", "tempfile", "tempdir", "managed_read::copy_exclusive_new")
-                or (op == "OpenOptions" and ".create_new(true)" in stmt)
+                or (op == "OpenOptions" and re.search(r"\.create_new\((?!false\))", stmt) is not None)
                 or (op in RAW_OPENS and re.search(r"O_EXCL|EXCL", stmt) is not None),
             })
     return ops, texts, fns_by_file(texts, raws, files, test_files)
@@ -898,13 +918,33 @@ def stem(rel):
     return os.path.basename(os.path.dirname(rel)) if base in ("mod", "lib", "main") else base
 
 
-def resolves(rel, text, prefix, callee, target):
+def renamed_imports(text, crate, free):
+    """`use .. as` renames in one file: `{alias: (name, module or None)}` for
+    an imported same-crate free function (`use crate::m::read_index as
+    legacy_read`), and `{alias: module}` for a renamed module
+    (`use crate::util as u`)."""
+    fns, mods = {}, {}
+    for path, alias, _ in use_leaves(text):
+        if alias == "*" or not path or alias == path[-1]:
+            continue
+        hint = path[-2] if len(path) >= 2 and path[-2] not in ("crate", "self", "super") else None
+        if (crate, path[-1]) in free:
+            fns[alias] = (path[-1], hint)
+        if path[-1] not in ("crate", "self", "super"):
+            mods[alias] = path[-1]
+    return fns, mods
+
+
+def resolves(rel, text, prefix, callee, target, hint=None, mods=None):
     """Whether a call `prefix callee(` in `rel` may name `callee` in `target`:
     the same file for a bare call (or a file whose module the caller imports
-    the name from), the named module for a qualified call."""
+    the name from), the named module for a qualified call (through a renamed
+    module import too); `hint` is the module a renamed function import names."""
     segs = [p for p in prefix.split("::") if p]
     if segs and segs[-1] not in ("self", "super", "crate"):
-        return stem(target) == segs[-1]
+        return stem(target) == (mods or {}).get(segs[-1], segs[-1])
+    if hint is not None:
+        return hint == "" or stem(target) == hint
     if target == rel:
         return True
     mod = stem(target)
@@ -940,16 +980,28 @@ def helper_errors(entries, scanned, texts, fns):
             if "::" not in qual:
                 free.setdefault((crate_of(rel), qual), []).append((rel, a, b))
 
+    renames = {}
+
     def callees(rel, a, b, leaf):
         text = texts[rel]
         body = text[a:b]
+        if rel not in renames:
+            renames[rel] = renamed_imports(text, crate_of(rel), free)
+        fn_alias, mod_alias = renames[rel]
         out = []
         for m in CALL_RE.finditer(body):
             prefix, callee = m.group(1), m.group(2)
+            hint = None
+            if not prefix and callee in fn_alias:
+                # `use crate::m::read_index as legacy_read; legacy_read(p)`.
+                # A `crate::`/`self::`/`super::` path names no module: any
+                # same-crate definition (over-reporting is safe).
+                callee, hint = fn_alias[callee]
+                hint = hint or ""
             if callee == leaf or text[max(0, a + m.start() - 3):a + m.start()].endswith("fn "):
                 continue
             for target, ta, tb in free.get((crate_of(rel), callee), []):
-                if resolves(rel, text, prefix, callee, target):
+                if resolves(rel, text, prefix, callee, target, hint, mod_alias):
                     out.append((callee, target, ta, tb))
         return out
 
@@ -1388,6 +1440,80 @@ def regression_inventory_baseline_fingerprint_comes_only_from_the_baseline():
     expect(check(cur, m) == [], check(cur, m))
     bad = verify_baseline(base, m)
     expect([e["function"] for e in bad] == ["b"], bad)
+
+
+def regression_inventory_test_only_match_arm_block_does_not_hide_arms():
+    """Regression (R11-S7-FIX5): a `#[cfg(test)]` match arm whose body is a
+    block (`0 => { .. }`, no trailing comma) hid every arm after it."""
+    root = fake({"c/src/lib.rs": (
+        "fn m(p: &Path, x: u8) {\n    match x {\n        #[cfg(test)]\n"
+        "        0 => {\n            let _ = std::fs::read(\"t\");\n        }\n"
+        "        1 => {\n            let _ = std::fs::read(p);\n        }\n"
+        "        #[cfg(test)]\n        2 => if x > 1 { () } else { () },\n"
+        "        _ => { let _ = std::fs::read_to_string(p); }\n    }\n}\n"
+    )})
+    ops, _, _ = scan(root)
+    got = sorted((o["function"], o["op"]) for o in ops)
+    expect(got == [("m", "fs::read"), ("m", "fs::read_to_string")], got)
+
+
+def regression_inventory_helper_walk_follows_renamed_imports():
+    """Regression (R11-S7-FIX5): a managed function reaching a raw helper
+    through `use crate::util::read_index as legacy_read` (or a renamed
+    module, `use crate::util as u; u::read_index(p)`) was not reported: the
+    walk looked the callee up by its local spelling."""
+    leaf = "pub fn read_index(p: &Path) { let _ = std::fs::read(p); }\n"
+    for caller in ("use crate::util::read_index as legacy_read;\nfn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; legacy_read(p); }\n",
+                   "use crate::util::{read_index as legacy_read};\nfn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; legacy_read(p); }\n",
+                   "use crate::util as u;\nfn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; u::read_index(p); }\n"):
+        root = fake({"c/src/lib.rs": "mod util;\n" + caller, "c/src/util.rs": leaf})
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("read_index", "fs::read"): OOF})
+        errs = check(root, m)
+        expect(any("reaches helper read_index" in e for e in errs), (caller, errs))
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                            ("read_index", "fs::read"): dict(OOF, non_mandatory_callers=["hash"])})
+        expect(check(root, m) == [], (caller, check(root, m)))
+    # A rename of a function in another module than the one called.
+    root = fake({"c/src/lib.rs": "mod util;\nmod other;\nuse crate::other::read_index as legacy_read;\n"
+                                 "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; legacy_read(p); }\n",
+                 "c/src/util.rs": leaf, "c/src/other.rs": "pub fn read_index(p: &Path) {}\n"})
+    m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("read_index", "fs::read"): OOF})
+    expect(check(root, m) == [], check(root, m))
+
+
+def regression_inventory_non_literal_create_flags_are_creates():
+    """Regression (R11-S7-FIX5): only a literal `.create(true)` /
+    `.create_new(true)` counted, so `.create_new({ true })` or
+    `.create_new(flag)` landed without a mode policy; anything but a literal
+    `false` is a (possible) create now."""
+    for flag, exclusive in (("create_new({ true })", True), ("create_new(flag)", True),
+                            ("create(flag)", False), ("create( true )", False)):
+        root = fake({"c/src/lib.rs": "fn a(p: &Path, flag: bool) { let _ = OpenOptions::new().write(true).%s.open(p); }\n" % flag})
+        ops, _, _ = scan(root)
+        expect(ops[0]["creates"] and ops[0]["exclusive"] == exclusive, (flag, ops))
+        m = classify(root, {("a", "OpenOptions"): {"disposition": "output-owner"}})
+        expect(any("mode policy" in e for e in check(root, m)), (flag, check(root, m)))
+    root = fake({"c/src/lib.rs": "fn a(p: &Path) { let _ = OpenOptions::new().write(true).create(false).create_new(false).open(p); }\n"})
+    ops, _, _ = scan(root)
+    expect(not ops[0]["creates"] and not ops[0]["exclusive"], ops)
+
+
+def regression_inventory_records_foreign_library_openers():
+    """Regression (R11-S7-FIX5): pathname opens inside foreign libraries
+    (libgit2 `Repository::open`, libarchive `archive_read_open_filename`,
+    lopdf `Document::load`) had no manifest entry."""
+    root = fake({"c/src/lib.rs": (
+        "extern \"C\" {\n    pub fn archive_read_open_filename(a: *mut A, p: *const c_char, n: usize) -> c_int;\n}\n"
+        "fn g(p: &Path) { let _ = Repository::open(p); let _ = git2::Repository::discover(p); }\n"
+        "fn l(a: *mut A, p: &CStr) { let _ = unsafe { archive_read_open_filename(a, p.as_ptr(), 10240) }; }\n"
+        "fn d(p: &Path) { let _ = Document::load(p); let _ = Document::load_mem(&[]); }\n"
+    )})
+    ops, _, _ = scan(root)
+    got = sorted((o["function"], o["op"]) for o in ops)
+    expect(got == [("d", "lopdf::Document::load"), ("g", "git2::Repository::discover"), ("g", "git2::Repository::open"),
+                   ("l", "libarchive::archive_read_open_filename")], got)
+    errs = check(root, classify(root, {}))
+    expect(sum("unclassified" in e for e in errs) == 4, errs)
 
 
 def self_test():
