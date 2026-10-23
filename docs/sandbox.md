@@ -1811,6 +1811,9 @@ unpack stage's mode pass change modes through an `O_PATH` pin on Linux (by
 name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the
 check and the change is not detected) (#149); a failed first open leaves an
 existing 0-byte database to SQLite's rollback instead of truncating it (#160);
+a first open of a folder with no database initializes in a staging file and
+publishes the database and then the marker only after the schema commits, so
+a failure leaves the folder unmarked (#194);
 and `overlay pack` ships SQLite copies of the layer database and of the base
 index (#156). Of the checked sites, the ZIP commit reader, the
 read-only layer, live diff, the seal sentinels, the pack member, sentinel and

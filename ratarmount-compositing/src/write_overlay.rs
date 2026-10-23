@@ -59,6 +59,13 @@ pub const LEGACY_OVERLAY_MARKER: &str = ".ratarmount.overlay.sqlite.used";
 /// ignored, same as [`HIDDEN_DB`].
 const COW_STAGING_PREFIX: &str = ".ratarmount.overlay.cow-";
 
+/// First-open database staging (#194). Starts with [`HIDDEN_DB`] so it is
+/// already an internal name (hidden, not committed). Not the database: a
+/// crash or a failed init leaves this file and no marker, and the next open
+/// ignores it. The random suffix is unique per attempt so a sweep of one
+/// open cannot delete another open's file.
+const OVERLAY_DB_STAGING_PREFIX: &str = ".ratarmount.overlay.sqlite.staging-";
+
 fn has_ascii_prefix(name: &str, prefix: &str) -> bool {
     let n = name.as_bytes();
     let p = prefix.as_bytes();
@@ -242,8 +249,10 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
-    /// Test seam (#160 fix round): when set, a `-w` open runs it once in its
-    /// schema step and then fails there, taking the failed-open cleanup.
+    /// Test seam (#160 fix round, #194): when set, a `-w` open runs it once
+    /// in its schema step and then fails there. A folder with no database
+    /// yet fails before anything is published; a folder that already has a
+    /// database takes the failed-open cleanup.
     pub(crate) static FAIL_SCHEMA_STEP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1224,6 +1233,19 @@ impl WriteOverlay {
         // Canonical root so confinement checks use a stable absolute prefix.
         let root = root.canonicalize().map_err(OverlayError::Io)?;
         let db_path = root.join(HIDDEN_DB);
+        // #194: nothing at the database path and no marker. The schema,
+        // including the base walk, runs in a staging file. The database is
+        // renamed into place only after that commit, and the marker is
+        // created only after the rename. A failure deletes the staging file
+        // and leaves the folder unmarked, so the next open still treats it
+        // as new. A database that already exists (0 bytes included) stays on
+        // the in-place path below (#160).
+        let published_fresh = if overlay_db_absent(&root) {
+            publish_fresh_overlay_database(&root, &db_path, info, exclude_plan.as_ref(), identity)?
+                == FreshDatabase::Published
+        } else {
+            false
+        };
         let found_marker = overlay_marker(&root)?;
         let marker = found_marker.is_some();
         let marker_path = found_marker.unwrap_or_else(|| root.join(OVERLAY_MARKER));
@@ -1269,9 +1291,11 @@ impl WriteOverlay {
                 )
             )));
         }
-        // Marker before SCHEMA: a brand-new overlay whose marker cannot be
-        // written must not leave a `files` table behind (the next open would
-        // take the backfill path and run unmarked).
+        // Marker before SCHEMA when a database file is already here: failing
+        // to write the marker must not leave a `files` table behind (the next
+        // open would take the backfill path and run unmarked). A folder with
+        // no database yet never reaches this; its marker is created only
+        // after the staging file is published (#194).
         // Remove a database file that was absent before this call (a stat
         // before SQLite's open; an empty file planted between that stat and
         // the open is indistinguishable, see `Expect::Fresh`), so a failed
@@ -1322,34 +1346,16 @@ impl WriteOverlay {
                 }
             }
         }
-        let opened = (|| -> Result<HashSet<String>> {
-            #[cfg(test)]
-            if let Some(hook) = FAIL_SCHEMA_STEP.with(|seam| seam.borrow_mut().take()) {
-                hook();
-                return Err(OverlayError::Msg("test: schema step failed".into()));
-            }
-            conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
-            let transaction = conn.transaction()?;
-            transaction.execute_batch(SCHEMA)?;
-            if crate::OverlayMeta::from_connection(&transaction)?
-                .as_ref()
-                .is_some_and(crate::OverlayMeta::layer_sealed)
-            {
-                return Err(OverlayError::Msg(
-                    "overlay is sealed; mount it with --lower, or `overlay unseal`".into(),
-                ));
-            }
-            crate::overlay_meta::initialize(
-                &transaction,
-                had_files,
-                info,
-                exclude_plan.as_ref(),
-                identity,
-            )?;
-            let tombstones = tombstone_set_from_conn(&transaction)?;
-            transaction.commit()?;
-            Ok(tombstones)
-        })();
+        // The staging publish already committed the schema and the base
+        // identity. Running it again would hash a directory base twice.
+        let opened = commit_overlay_schema(
+            &mut conn,
+            had_files,
+            info,
+            exclude_plan.as_ref(),
+            identity,
+            !(published_fresh && had_files),
+        );
         let mut tombstones = match opened {
             Ok(t) => t,
             Err(e) => {
@@ -6449,6 +6455,249 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+}
+
+/// What [`publish_fresh_overlay_database`] did with a folder that had no database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshDatabase {
+    /// This open published the database and then the marker.
+    Published,
+    /// The database name appeared while this open was initializing. The
+    /// staging file was removed; the name was not.
+    Raced,
+}
+
+/// `path` with `suf` appended to the file name (`db` + `-journal`).
+fn with_suffix(path: &Path, suf: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suf);
+    PathBuf::from(name)
+}
+
+fn remove_sqlite_sidecars(path: &Path) {
+    for suf in ["-journal", "-shm", "-wal"] {
+        let _ = fs::remove_file(with_suffix(path, suf));
+    }
+}
+
+/// Remove the regular file at `path` when it is still `id` (`None` on a
+/// platform with no file identity: the path itself). Sidecars of that name
+/// go with it. A different inode, a symlink or a directory is left alone.
+fn remove_db_file_if_ours(path: &Path, id: Option<(u64, u64)>) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        remove_sqlite_sidecars(path);
+        return;
+    };
+    if !meta.file_type().is_file() {
+        return;
+    }
+    let ours = match (id, crate::overlay_db::file_id(&meta)) {
+        (Some(want), Some(got)) => want == got,
+        (None, None) => true,
+        _ => false,
+    };
+    if !ours {
+        return;
+    }
+    let _ = fs::remove_file(path);
+    remove_sqlite_sidecars(path);
+}
+
+/// A path under `root` whose name starts with [`OVERLAY_DB_STAGING_PREFIX`].
+/// The placeholder file is removed so SQLite creates the database itself
+/// (`0644 & !umask`, same as every other new overlay database).
+fn reserve_staging_path(root: &Path) -> io::Result<PathBuf> {
+    let named = tempfile::Builder::new()
+        .prefix(OVERLAY_DB_STAGING_PREFIX)
+        .make_in(root, |path| {
+            let mut opts = open_options_nofollow();
+            opts.write(true).create_new(true).open(path)
+        })?;
+    let path = named.path().to_path_buf();
+    named.close()?;
+    Ok(path)
+}
+
+/// Publish `from` as `to` without replacing an existing `to`.
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let parent = from
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let from_name = from
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "staging file has no name"))?;
+    let to_name = to.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "overlay database file has no name",
+        )
+    })?;
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        let dir = File::open(parent)?;
+        match rustix::fs::renameat_with(
+            &dir,
+            from_name,
+            &dir,
+            to_name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) if e == rustix::io::Errno::EXIST => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("overlay database {} already exists", to.display()),
+            )),
+            Err(e) => Err(io::Error::from(e)),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = (parent, from_name, to_name);
+        match fs::hard_link(from, to) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("overlay database {} already exists", to.display()),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+        // `link` created `to` as a second name of the inode `from` had at
+        // that moment. Unlink `from` only while it is still that inode.
+        let same = match (fs::symlink_metadata(from), fs::symlink_metadata(to)) {
+            (Ok(a), Ok(b)) => crate::overlay_db::file_id(&a) == crate::overlay_db::file_id(&b),
+            _ => false,
+        };
+        if same {
+            let _ = fs::remove_file(from);
+        }
+        Ok(())
+    }
+}
+
+fn sync_overlay_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(dir)?.sync_all()
+    }
+}
+
+/// Schema, seal check and (when `run_initialize`) the creation record.
+/// One transaction. The test seam fails before any of that SQL.
+fn commit_overlay_schema(
+    conn: &mut Connection,
+    had_files: bool,
+    info: Option<&crate::overlay_meta::OverlayCreateInfo>,
+    exclude_plan: Option<&crate::overlay_meta::ExcludePlan>,
+    identity: Option<&crate::ClassifiedBase>,
+    run_initialize: bool,
+) -> Result<HashSet<String>> {
+    #[cfg(test)]
+    if let Some(hook) = FAIL_SCHEMA_STEP.with(|seam| seam.borrow_mut().take()) {
+        hook();
+        return Err(OverlayError::Msg("test: schema step failed".into()));
+    }
+    conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
+    let transaction = conn.transaction()?;
+    transaction.execute_batch(SCHEMA)?;
+    if crate::OverlayMeta::from_connection(&transaction)?
+        .as_ref()
+        .is_some_and(crate::OverlayMeta::layer_sealed)
+    {
+        return Err(OverlayError::Msg(
+            "overlay is sealed; mount it with --lower, or `overlay unseal`".into(),
+        ));
+    }
+    if run_initialize {
+        crate::overlay_meta::initialize(&transaction, had_files, info, exclude_plan, identity)?;
+    }
+    let tombstones = tombstone_set_from_conn(&transaction)?;
+    transaction.commit()?;
+    Ok(tombstones)
+}
+
+/// Initialize a new overlay database in a staging file and publish it.
+///
+/// The marker is created only after the rename. A folder that never got that
+/// far is not marked, so a later open does not refuse it as "used" (#194).
+/// The staging file is the only name removed on failure: a file that appears
+/// at the database path during init is left where it is (another open won,
+/// or a test planted it).
+fn publish_fresh_overlay_database(
+    root: &Path,
+    db_path: &Path,
+    info: Option<&crate::overlay_meta::OverlayCreateInfo>,
+    exclude_plan: Option<&crate::overlay_meta::ExcludePlan>,
+    identity: Option<&crate::ClassifiedBase>,
+) -> Result<FreshDatabase> {
+    let staging = reserve_staging_path(root)?;
+    let opened = match crate::overlay_db::open_overlay_db(
+        &staging,
+        OpenFlags::default(),
+        crate::DbName::Path,
+    ) {
+        Ok(opened) => opened,
+        Err(e) => {
+            // A refusal after SQLite created the file leaves a hidden staging
+            // name. It is not the database and there is no marker. Do not
+            // delete a file this open did not identify.
+            return Err(e.into());
+        }
+    };
+    let id = opened.id();
+    let (mut conn, registration) = opened.into_parts();
+    let schema = commit_overlay_schema(&mut conn, false, info, exclude_plan, identity, true);
+    // Drop the connection before any other close of this inode, and before
+    // the rename: SQLite keeps the path it opened for its journal.
+    drop(conn);
+    drop(registration);
+    if let Err(e) = schema {
+        remove_db_file_if_ours(&staging, id);
+        return Err(e);
+    }
+    remove_sqlite_sidecars(&staging);
+    match rename_no_replace(&staging, db_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            remove_db_file_if_ours(&staging, id);
+            return Ok(FreshDatabase::Raced);
+        }
+        Err(e) => {
+            remove_db_file_if_ours(&staging, id);
+            return Err(OverlayError::Io(e));
+        }
+    }
+    let published_id = fs::symlink_metadata(db_path)
+        .ok()
+        .and_then(|m| crate::overlay_db::file_id(&m));
+    if let Err(e) = sync_overlay_dir(root) {
+        log::warn!(
+            "could not sync overlay folder {} after publishing the database: {e}",
+            root.display()
+        );
+    }
+    // Marker last. A crash before this leaves a database with a `files`
+    // table and no marker; the next open backfills the marker. A failure
+    // here removes the database this open just published, so the folder
+    // does not stay marked and does not keep a `files` table either.
+    if let Err(e) = create_overlay_marker(&root.join(OVERLAY_MARKER)) {
+        remove_db_file_if_ours(db_path, published_id);
+        return Err(OverlayError::Io(e));
+    }
+    if let Err(e) = sync_overlay_dir(root) {
+        log::warn!(
+            "could not sync overlay folder {} after creating the marker: {e}",
+            root.display()
+        );
+    }
+    Ok(FreshDatabase::Published)
 }
 
 /// Create the empty [`OVERLAY_MARKER`] without following a symlink. An existing
@@ -12753,30 +13002,104 @@ pub(crate) mod tests {
         assert!(e.contains(OVERLAY_MARKER), "{e}");
     }
 
-    /// Regression: a first open that fails after the marker was created
-    /// (SCHEMA on a read-only 0-byte database) must not leave the marker.
+    /// Names left under `dir` that are a marker or a first-open staging file.
+    fn marker_or_staging_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                n == OVERLAY_MARKER
+                    || n == LEGACY_OVERLAY_MARKER
+                    || n.starts_with(OVERLAY_DB_STAGING_PREFIX)
+            })
+            .collect()
+    }
+
+    /// Regression (#194): a first open that fails must not leave the folder
+    /// marked. A folder with no database yet publishes nothing (staging file
+    /// included). A folder that already holds a database still drops a marker
+    /// this open created, and still opens as new afterwards.
     #[test]
     fn overlay_first_open_failure_removes_marker() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let overlay = dir.path().join("ov");
-        fs::create_dir(&overlay).unwrap();
-        let db = overlay.join(HIDDEN_DB);
+
+        // No database yet: the schema step fails before the rename. Nothing
+        // is published, and the next open creates the overlay.
+        let fresh = dir.path().join("fresh");
+        fs::create_dir(&fresh).unwrap();
+        FAIL_SCHEMA_STEP.with(|seam| *seam.borrow_mut() = Some(Box::new(|| {})));
+        let error = msg_of(reopen_keep_overlay(&fresh));
+        assert!(error.contains("schema step failed"), "{error}");
+        assert!(
+            !fresh.join(HIDDEN_DB).exists(),
+            "the database was published"
+        );
+        let left = marker_or_staging_names(&fresh);
+        assert!(left.is_empty(), "marked or staging left: {left:?}");
+        assert!(
+            !matches!(overlay_db_entry(&fresh).unwrap(), DbEntry::Lost { .. }),
+            "folder stayed marked as used"
+        );
+        let opened = reopen_keep_overlay(&fresh).expect("folder still opens as new");
+        drop(opened);
+        assert!(
+            fresh.join(OVERLAY_MARKER).is_file(),
+            "retry publishes the marker"
+        );
+        assert!(has_files_table(&fresh.join(HIDDEN_DB)));
+        let left = marker_or_staging_names(&fresh);
+        assert!(
+            left.as_slice() == [OVERLAY_MARKER],
+            "retry left extras: {left:?}"
+        );
+
+        // An existing read-only 0-byte database fails before it can be
+        // initialized. It must not stay marked, and it still opens once it
+        // is writable.
+        let readonly = dir.path().join("readonly");
+        fs::create_dir(&readonly).unwrap();
+        let db = readonly.join(HIDDEN_DB);
         fs::write(&db, b"").unwrap();
         fs::set_permissions(&db, fs::Permissions::from_mode(0o444)).unwrap();
         if fs::OpenOptions::new().write(true).open(&db).is_ok() {
             eprintln!("skip: read-only file is writable (running as root?)");
-            return;
+        } else {
+            let r = reopen_keep_overlay(&readonly);
+            assert!(r.is_err(), "a read-only database must fail");
+            assert!(
+                marker_or_staging_names(&readonly).is_empty(),
+                "marker must not stay"
+            );
+            assert!(
+                !matches!(overlay_db_entry(&readonly).unwrap(), DbEntry::Lost { .. }),
+                "read-only folder stayed marked as used"
+            );
+            fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(fs::metadata(&db).unwrap().len(), 0);
+            reopen_keep_overlay(&readonly).expect("folder still opens as new");
         }
-        let r = reopen_keep_overlay(&overlay);
-        assert!(r.is_err(), "SCHEMA on a read-only DB must fail");
+
+        // An existing writable 0-byte database fails in the schema step,
+        // after the marker was created. The cleanup removes that marker and
+        // leaves the 0-byte file to SQLite (#160); the folder opens as new.
+        let zero = dir.path().join("zero");
+        fs::create_dir(&zero).unwrap();
+        let db = zero.join(HIDDEN_DB);
+        fs::write(&db, b"").unwrap();
+        FAIL_SCHEMA_STEP.with(|seam| *seam.borrow_mut() = Some(Box::new(|| {})));
+        let error = msg_of(reopen_keep_overlay(&zero));
+        assert!(error.contains("schema step failed"), "{error}");
+        assert_eq!(fs::metadata(&db).unwrap().len(), 0, "0-byte file removed");
         assert!(
-            !overlay.join(OVERLAY_MARKER).exists(),
-            "marker must be removed"
+            marker_or_staging_names(&zero).is_empty(),
+            "marker stayed after the schema failure"
         );
-        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(fs::metadata(&db).unwrap().len(), 0);
-        reopen_keep_overlay(&overlay).expect("folder still opens as new");
+        assert!(
+            !matches!(overlay_db_entry(&zero).unwrap(), DbEntry::Lost { .. }),
+            "0-byte folder stayed marked as used"
+        );
+        reopen_keep_overlay(&zero).expect("0-byte folder still opens as new");
     }
 
     /// Robo-Ilya: a directory at the database path is named as such.
@@ -12854,11 +13177,10 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    /// Regression (#160 fix round): the failed first open removed the
-    /// database name whenever a stat before SQLite's open found nothing, even
-    /// when the name held another file by the time of the cleanup. A new
-    /// database the open created is removed; a file put at the name after
-    /// SQLite's open is left alone.
+    /// Regression (#194, was #160): a failed first open of a folder with no
+    /// database deletes only its staging file. It does not publish, and it
+    /// does not remove a file planted at the database name during the schema
+    /// step. The folder stays unmarked.
     #[test]
     fn regression_failed_first_open_removes_only_the_database_it_opened() {
         let dir = tempfile::tempdir().unwrap();
@@ -12867,7 +13189,16 @@ pub(crate) mod tests {
         FAIL_SCHEMA_STEP.with(|seam| *seam.borrow_mut() = Some(Box::new(|| {})));
         let error = msg_of(reopen_keep_overlay(&fresh));
         assert!(error.contains("schema step failed"), "{error}");
-        assert!(!fresh.join(HIDDEN_DB).exists(), "the new database stayed");
+        assert!(
+            !fresh.join(HIDDEN_DB).exists(),
+            "the database was published"
+        );
+        let left = marker_or_staging_names(&fresh);
+        assert!(left.is_empty(), "staging or marker left: {left:?}");
+        assert!(
+            matches!(overlay_db_entry(&fresh).unwrap(), DbEntry::Absent),
+            "fresh folder is no longer absent"
+        );
 
         let swapped = dir.path().canonicalize().unwrap().join("swapped");
         fs::create_dir(&swapped).unwrap();
@@ -12885,7 +13216,13 @@ pub(crate) mod tests {
         assert_eq!(
             fs::read(&db).unwrap(),
             b"another file",
-            "the cleanup removed a file it never opened"
+            "the failed open removed a file it never published"
+        );
+        let left = marker_or_staging_names(&swapped);
+        assert!(left.is_empty(), "staging or marker left: {left:?}");
+        assert!(
+            !matches!(overlay_db_entry(&swapped).unwrap(), DbEntry::Lost { .. }),
+            "planted file left the folder marked as used"
         );
     }
 
