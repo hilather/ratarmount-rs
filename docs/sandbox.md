@@ -1979,8 +1979,18 @@ locking style per filesystem (auto). Managed byte readers use `"unix"`
 copy, create or descriptor conversion fails the check until it is classified,
 and so does a form the scanner cannot follow: an import from `std::fs` or
 `tokio::fs` it cannot resolve, or an `OpenOptions` builder bound to a variable
-that escapes its function. `--verify-baseline DIR` (run in CI) checks that every
-create recorded as unchanged from the baseline still exists unchanged there.
+that escapes its function. Any `.create(..)` or `.create_new(..)` argument other
+than a literal `false` counts as a create that needs a mode policy; a managed
+read reaching a raw helper is found through `use .. as` renames of the helper or
+its module; and the pathname opens done inside libgit2 (`Repository::open`),
+libarchive (`archive_read_open_filename`) and lopdf (`Document::load`) are
+recorded as #196 residuals (those libraries own their descriptors).
+`--verify-baseline DIR` (run in CI) checks that every create recorded as
+unchanged from the baseline still exists unchanged there.
+
+A managed read reports an SQLite allocation failure as out of memory, never as
+the stale `errno` SQLite leaves behind (a metadata-cache entry is kept, not
+dropped and refetched as if it had been evicted).
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE
