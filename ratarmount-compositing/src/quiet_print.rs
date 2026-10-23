@@ -129,12 +129,15 @@ mod tests {
             debug: 1,
             ..Default::default()
         };
-        if !matches!(crate::commit_overlay(overlay, archive, &ask), Ok(false)) {
+        if !matches!(
+            crate::commit_overlay_raw_dir(overlay, archive, &ask).map(|done| done.committed),
+            Ok(false)
+        ) {
             return 5;
         }
         // `--yes` path: plan lines, GNU tar, `Committed successfully`.
         let yes = crate::CommitOverlayOptions { yes: true, ..ask };
-        match crate::commit_overlay(overlay, archive, &yes) {
+        match crate::commit_overlay_raw_dir(overlay, archive, &yes).map(|done| done.committed) {
             Ok(true) => 0,
             Err(e)
                 if {

@@ -27,11 +27,22 @@ pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
+thread_local! {
+    static SHA256_STREAM_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whole-stream hashes started on this thread (test instrumentation: lets a
+/// test prove an operation hashed no file content).
+pub fn sha256_stream_calls_this_thread() -> u64 {
+    SHA256_STREAM_CALLS.with(std::cell::Cell::get)
+}
+
 /// Stream `reader` until EOF (`n == 0`), hashing whatever was read (no `max_bytes`).
 ///
 /// Short reads are not an error: the digest covers bytes received, matching
 /// today's `read_to_end` then `Sha256::digest`. Never materializes a body `Vec`.
 pub fn sha256_hex_stream<R: Read + ?Sized>(reader: &mut R) -> std::io::Result<String> {
+    SHA256_STREAM_CALLS.with(|c| c.set(c.get() + 1));
     let mut hasher = Sha256::new();
     let mut buf = [0u8; HASH_STREAM_CHUNK];
     loop {

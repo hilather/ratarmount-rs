@@ -4,11 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
 
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OpenFlags;
 
 use crate::write_overlay::is_overlay_internal_path;
 use crate::{OverlayError, OverlayMutation, OverlayPolicy, HIDDEN_DB};
@@ -70,9 +71,10 @@ impl OverlayStats {
             )
             .into());
         }
-        let conn = Connection::open_with_flags(
-            db,
+        let conn = crate::open_overlay_db(
+            &db,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            crate::DbName::Path,
         )?;
         let files_deleted =
             conn.query_row("SELECT count(*) FROM files WHERE deleted = 1", [], |row| {
@@ -107,10 +109,15 @@ pub fn parse_overlay_size(value: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("overlay size {value:?} overflows u64"))
 }
 
-struct PathGlob(Vec<Option<Regex>>);
+struct PathGlob {
+    pattern: String,
+    parts: Vec<Option<Regex>>,
+    literal_components: usize,
+}
 
 impl PathGlob {
     fn new(pattern: &str) -> io::Result<Self> {
+        let original = pattern.to_string();
         let pattern = pattern.trim_start_matches('/').trim_end_matches('/');
         if pattern.is_empty()
             || pattern
@@ -145,61 +152,145 @@ impl PathGlob {
             regex.push('$');
             parts.push(Some(Regex::new(&regex).map_err(io::Error::other)?));
         }
-        Ok(Self(parts))
+        Ok(Self {
+            pattern: original,
+            parts,
+            literal_components: pattern
+                .split('/')
+                .filter(|part| !part.contains(['*', '?']))
+                .count(),
+        })
     }
 
-    // NFA states after consuming path components. A completed pattern protects
-    // everything below it; remaining states describe possible protected children.
+    // A completed pattern covers everything below it. Remaining states describe
+    // possible matching children, even if they do not currently exist.
     fn protects(&self, path: &str, ancestors: bool) -> bool {
+        Self::matches(&self.parts, path, ancestors, true)
+    }
+
+    fn is_root(&self, path: &str) -> bool {
+        let end = self
+            .parts
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |i| i + 1);
+        Self::matches(&self.parts[..end], path, false, false)
+    }
+
+    fn matches(parts: &[Option<Regex>], path: &str, ancestors: bool, subtree: bool) -> bool {
+        let epsilon = |states: &mut HashSet<usize>| {
+            for (i, part) in parts.iter().enumerate() {
+                if part.is_none() && states.contains(&i) {
+                    states.insert(i + 1);
+                }
+            }
+        };
         let mut states = HashSet::from([0]);
         for component in path.trim_matches('/').split('/').filter(|c| !c.is_empty()) {
-            self.epsilon(&mut states);
-            if states.contains(&self.0.len()) {
+            epsilon(&mut states);
+            if subtree && states.contains(&parts.len()) {
                 return true;
             }
             states = states
                 .into_iter()
-                .filter_map(|i| match &self.0[i] {
-                    None => Some(i),
-                    Some(re) if re.is_match(component) => Some(i + 1),
+                .filter_map(|i| match parts.get(i) {
+                    Some(None) => Some(i),
+                    Some(Some(re)) if re.is_match(component) => Some(i + 1),
                     _ => None,
                 })
                 .collect();
         }
-        self.epsilon(&mut states);
-        states.contains(&self.0.len()) || ancestors && !states.is_empty()
-    }
-
-    fn epsilon(&self, states: &mut HashSet<usize>) {
-        for i in 0..self.0.len() {
-            if self.0[i].is_none() && states.contains(&i) {
-                states.insert(i + 1);
-            }
-        }
+        epsilon(&mut states);
+        states.contains(&parts.len()) || ancestors && !states.is_empty()
     }
 }
 
-/// Case-sensitive, root-anchored globs; a matching directory protects its subtree.
+type DenialObserver = dyn Fn(&str, OverlayMutation) + Send + Sync;
+
+/// Case-sensitive, root-anchored rules; matches cover their entire subtree.
+/// More literal components win, with allow rules winning ties.
 pub struct ReadOnlyGlobs {
     globs: Vec<PathGlob>,
+    allows: Vec<PathGlob>,
     overlay_root: Option<PathBuf>,
     cow: Mutex<CopyReservations>,
+    erofs_denied: AtomicU64,
+    denial_observer: Mutex<Option<Arc<DenialObserver>>>,
 }
 
 impl ReadOnlyGlobs {
     /// Each item may contain comma-separated patterns. Empty items are errors.
     pub fn new(patterns: impl IntoIterator<Item = impl AsRef<str>>) -> io::Result<Self> {
-        let mut globs = Vec::new();
-        for value in patterns {
-            for pattern in value.as_ref().split(',') {
-                globs.push(PathGlob::new(pattern.trim())?);
+        Self::with_allow(patterns, std::iter::empty::<&str>())
+    }
+
+    /// Parse read-only rules and exceptions. Each item may contain comma-separated
+    /// patterns. Exceptions require at least one read-only rule.
+    pub fn with_allow(
+        readonly: impl IntoIterator<Item = impl AsRef<str>>,
+        allow: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> io::Result<Self> {
+        fn parse(patterns: impl IntoIterator<Item = impl AsRef<str>>) -> io::Result<Vec<PathGlob>> {
+            let mut globs = Vec::new();
+            for value in patterns {
+                for pattern in value.as_ref().split(',') {
+                    globs.push(PathGlob::new(pattern.trim())?);
+                }
             }
+            Ok(globs)
+        }
+        let globs = parse(readonly)?;
+        let allows = parse(allow)?;
+        if globs.is_empty() && !allows.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "overlay allow rules require at least one read-only rule",
+            ));
         }
         Ok(Self {
             globs,
+            allows,
             overlay_root: None,
             cow: Mutex::new(CopyReservations::default()),
+            erofs_denied: AtomicU64::new(0),
+            denial_observer: Mutex::new(None),
         })
+    }
+
+    /// Original rules in input order, with comma-separated items expanded and
+    /// surrounding whitespace trimmed. Suitable for overlay metadata.
+    pub fn rules_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "readonly": self.globs.iter().map(|g| &g.pattern).collect::<Vec<_>>(),
+            "allow": self.allows.iter().map(|g| &g.pattern).collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn erofs_denied(&self) -> u64 {
+        self.erofs_denied.load(Ordering::Relaxed)
+    }
+
+    /// Called once per returned EROFS, with the requested path and policy op.
+    /// Metadata/xattr changes use the existing Write/CopyOnWrite operations.
+    /// Like other policy hooks, observers must not call back into the overlay.
+    pub fn set_denial_observer(&self, f: Arc<DenialObserver>) {
+        *self
+            .denial_observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+
+    fn deny(&self, path: &str, op: OverlayMutation, message: String) -> io::Error {
+        self.erofs_denied.fetch_add(1, Ordering::Relaxed);
+        let observer = self
+            .denial_observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            observer(path, op);
+        }
+        io::Error::new(io::ErrorKind::ReadOnlyFilesystem, message)
     }
 
     /// Resolve host parent symlinks too, so full-path frontends cannot bypass
@@ -233,7 +324,33 @@ impl ReadOnlyGlobs {
     }
 
     pub fn protects(&self, path: &str) -> bool {
-        self.globs.iter().any(|glob| glob.protects(path, false))
+        self.denies_path(path, false)
+    }
+
+    fn denies_path(&self, path: &str, ancestors: bool) -> bool {
+        let allow = self
+            .allows
+            .iter()
+            .filter(|g| g.protects(path, false))
+            .map(|g| g.literal_components)
+            .max();
+        let readonly = self
+            .globs
+            .iter()
+            .filter(|g| g.protects(path, ancestors))
+            .map(|g| g.literal_components)
+            .max();
+        // Keep exception roots inside protected subtrees anchored. Fully canceled
+        // read-only rules have no protected boundary to preserve.
+        let exception_root = ancestors
+            && self.allows.iter().any(|g| g.is_root(path))
+            && self.has_protected_parent(path);
+        exception_root || readonly.is_some_and(|score| allow.is_none_or(|a| score > a))
+    }
+
+    fn has_protected_parent(&self, path: &str) -> bool {
+        let path = path.trim_matches('/');
+        !path.is_empty() && self.protects(path.rsplit_once('/').map_or("", |(parent, _)| parent))
     }
 }
 
@@ -246,16 +363,13 @@ impl OverlayPolicy for ReadOnlyGlobs {
         let mut cow = self.cow.lock().unwrap_or_else(|e| e.into_inner());
         for path in paths {
             let resolved = self.resolved_parent_path(path);
-            if self.globs.iter().any(|glob| {
-                glob.protects(path, ancestors)
-                    || resolved
-                        .as_deref()
-                        .is_some_and(|p| glob.protects(p, ancestors))
-            }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::ReadOnlyFilesystem,
-                    format!("protected overlay path: {path}"),
-                ));
+            if self.denies_path(path, ancestors)
+                || resolved
+                    .as_deref()
+                    .is_some_and(|p| self.denies_path(p, ancestors))
+            {
+                drop(cow);
+                return Err(self.deny(path, op, format!("protected overlay path: {path}")));
             }
             // COW publishes after dropping the gate to copy. Keep its parents
             // stable until accounting settles, including physical symlink targets.
@@ -286,10 +400,10 @@ impl OverlayPolicy for ReadOnlyGlobs {
                                     .is_some_and(|child| is_parent(parent, child))
                         })
                     {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ReadOnlyFilesystem,
-                            format!("cannot replace COW parent {path} while copying {copying}"),
-                        ));
+                        let message =
+                            format!("cannot replace COW parent {path} while copying {copying}");
+                        drop(cow);
+                        return Err(self.deny(path, op, message));
                     }
                 }
             }
@@ -320,6 +434,7 @@ pub struct QuotaUsage {
     pub files: u64,
     pub byte_limit: Option<u64>,
     pub file_limit: Option<u64>,
+    pub erofs_denied: u64,
 }
 
 impl QuotaUsage {
@@ -329,11 +444,12 @@ impl QuotaUsage {
                 .unwrap_or_else(|| "unlimited".into())
         };
         format!(
-            "overlay_bytes {}\noverlay_quota_bytes {}\noverlay_files {}\noverlay_quota_files {}\n",
+            "overlay_bytes {}\noverlay_quota_bytes {}\noverlay_files {}\noverlay_quota_files {}\nerofs_denied {}\n",
             self.bytes,
             limit(self.byte_limit),
             self.files,
-            limit(self.file_limit)
+            limit(self.file_limit),
+            self.erofs_denied,
         )
     }
 }
@@ -393,6 +509,7 @@ pub struct OverlayQuota {
     byte_limit: Option<u64>,
     file_limit: Option<u64>,
     state: Mutex<QuotaState>,
+    readonly: Option<Arc<ReadOnlyGlobs>>,
 }
 
 impl OverlayQuota {
@@ -400,6 +517,7 @@ impl OverlayQuota {
         let usage = OverlayUsage::scan(root)?;
         Ok(Self {
             root: root.canonicalize()?,
+            readonly: None,
             byte_limit,
             file_limit,
             state: Mutex::new(QuotaState {
@@ -410,6 +528,12 @@ impl OverlayQuota {
         })
     }
 
+    /// Include this policy's live denial count in the shared status snapshot.
+    pub fn with_readonly(mut self, rules: Arc<ReadOnlyGlobs>) -> Self {
+        self.readonly = Some(rules);
+        self
+    }
+
     pub fn usage(&self) -> QuotaUsage {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         QuotaUsage {
@@ -417,6 +541,10 @@ impl OverlayQuota {
             files: state.files + state.cow.copies.len() as u64,
             byte_limit: self.byte_limit,
             file_limit: self.file_limit,
+            erofs_denied: self
+                .readonly
+                .as_ref()
+                .map_or(0, |rules| rules.erofs_denied()),
         }
     }
 
@@ -542,6 +670,7 @@ mod tests {
     use ratarmount_core::{MountSource, OpenOptions};
     use ratarmount_formats_tar::SqliteIndexedTar;
     use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
+    use rusqlite::Connection;
     use std::fs::File;
     use std::io::{Cursor, Read};
 
@@ -629,6 +758,291 @@ mod tests {
             .is_ok());
     }
 
+    /// Regression: exceptions must permit every mutation and creation of their own root,
+    /// while both rename endpoints and protected ancestors remain guarded.
+    #[test]
+    fn regression_readonly_allow_per_op_truth_table() {
+        use OverlayMutation::*;
+        let rules = ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"]).unwrap();
+        let paths = ["/t/suite", "/t/agent", "/t/agent/leaf", "/other"];
+        for (op, expected) in [
+            (CopyOnWrite, [false, true, true, true]),
+            (Create, [false, true, true, true]),
+            (OpenWrite, [false, true, true, true]),
+            (Write, [false, true, true, true]),
+            (Mkdir, [false, true, true, true]),
+            (Unlink, [false, true, true, true]),
+            (Rmdir, [false, false, true, true]),
+            (Truncate, [false, true, true, true]),
+            (Symlink, [false, true, true, true]),
+            (Rename, [false, false, true, true]),
+            (Reset, [false, false, true, true]),
+        ] {
+            for (path, allowed) in paths.into_iter().zip(expected) {
+                let result = rules.check_mutation(op, &[path]);
+                assert_eq!(result.is_ok(), allowed, "{op:?} {path}: {result:?}");
+                if let Err(error) = result {
+                    assert_eq!(error.kind(), io::ErrorKind::ReadOnlyFilesystem);
+                }
+            }
+        }
+        for (from, to, allowed) in [
+            ("/t", "/moved", false),
+            ("/t/agent", "/moved", false),
+            ("/outside", "/t/agent", false),
+            ("/t/agent/a", "/t/agent/b", true),
+            ("/t/agent/a", "/outside", true),
+            ("/outside", "/t/agent/a", true),
+            ("/t/agent/a", "/t/suite/a", false),
+            ("/t/suite/a", "/t/agent/a", false),
+        ] {
+            assert_eq!(
+                rules.check_mutation(Rename, &[from, to]).is_ok(),
+                allowed,
+                "rename {from} -> {to}"
+            );
+        }
+        assert!(rules.check_mutation(Reset, &["/"]).is_err());
+    }
+
+    /// Regression: specificity counts whole literal components; allow wins ties,
+    /// independently of rule order, and more specific protected descendants stay fixed.
+    #[test]
+    fn regression_readonly_allow_specificity_and_ties() {
+        for readonly in [
+            ["t/**", "t/agent/private/**"],
+            ["t/agent/private/**", "t/**"],
+        ] {
+            let rules = ReadOnlyGlobs::with_allow(readonly, ["t/agent/**"]).unwrap();
+            assert!(!rules.protects("/t/agent/a"));
+            assert!(rules.protects("/t/agent/private/a"));
+            assert!(rules
+                .check_mutation(OverlayMutation::Rename, &["/t/agent"])
+                .is_err());
+        }
+        for (readonly, allow, path, denied) in [
+            ("t/agent/**", "t/agent/**", "/t/agent", false),
+            (
+                "t/*/long-literal/**",
+                "t/agent/**",
+                "/t/agent/long-literal/file",
+                false,
+            ),
+            (
+                "t/agent/**",
+                "t/ag?nt/long-literal/**",
+                "/t/agent/long-literal/file",
+                false,
+            ),
+            (
+                "t/agent/private/**",
+                "t/agent/*/**",
+                "/t/agent/private/file",
+                true,
+            ),
+            ("t/**", "t/agent/*", "/t/agent", true),
+            ("t/**", "t/agent/*", "/t/agent/file/deep", false),
+            ("t/**", "t/**/agent/**", "/t/a/b/agent", false),
+        ] {
+            let rules = ReadOnlyGlobs::with_allow([readonly], [allow]).unwrap();
+            assert_eq!(
+                rules.protects(path),
+                denied,
+                "{readonly} vs {allow}: {path}"
+            );
+        }
+        // An identical allow cancels the protected boundary at and below its root.
+        let canceled = ReadOnlyGlobs::with_allow(["t/**"], ["t/**"]).unwrap();
+        for path in ["/t", "/t/agent", "/t/agent/leaf"] {
+            canceled
+                .check_mutation(OverlayMutation::Rename, &[path])
+                .unwrap();
+        }
+        // A redundant exception inside an allowed subtree adds no boundary.
+        let redundant =
+            ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**", "t/agent/leaf/**"]).unwrap();
+        redundant
+            .check_mutation(OverlayMutation::Rename, &["/t/agent/leaf"])
+            .unwrap();
+        let rules =
+            ReadOnlyGlobs::with_allow(["t/**", "t/agent/work/*/secret"], ["t/agent/**"]).unwrap();
+        assert!(!rules.protects("/t/agent/work"));
+        assert!(rules
+            .check_mutation(OverlayMutation::Rename, &["/t/agent/work"])
+            .is_err());
+        assert!(rules
+            .check_mutation(OverlayMutation::Rename, &["/t/agent/leaf"])
+            .is_ok());
+    }
+
+    /// Regression: metadata export must preserve rule order and reject invalid exceptions.
+    #[test]
+    fn regression_readonly_rules_json_and_invalid_allow() {
+        let rules = ReadOnlyGlobs::with_allow(
+            [" t/**, /tests/ ", "src/private"],
+            ["t/agent/**,tests/new", "t/agent/**"],
+        )
+        .unwrap();
+        assert_eq!(
+            rules.rules_json(),
+            serde_json::json!({
+                "readonly": ["t/**", "/tests/", "src/private"],
+                "allow": ["t/agent/**", "tests/new", "t/agent/**"],
+            })
+        );
+        assert!(ReadOnlyGlobs::with_allow(std::iter::empty::<&str>(), ["t/agent/**"]).is_err());
+        for bad in ["", "t,,a", "../x", "a/./b", "a//b", "x**y"] {
+            assert!(ReadOnlyGlobs::with_allow(["t/**"], [bad]).is_err(), "{bad}");
+        }
+        assert_eq!(
+            ReadOnlyGlobs::new(["t"]).unwrap().rules_json(),
+            serde_json::json!({"readonly": ["t"], "allow": []})
+        );
+    }
+
+    /// Regression: multiple protected paths and COW-parent guards count and notify
+    /// exactly once per policy error; successful checks and queries never count.
+    #[test]
+    fn regression_readonly_denial_counter_and_observer_once() {
+        let rules = Arc::new(ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"]).unwrap());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let weak = Arc::downgrade(&rules);
+        let observed = events.clone();
+        rules.set_denial_observer(Arc::new(move |path, op| {
+            let rules = weak.upgrade().unwrap();
+            assert!(rules.erofs_denied() > 0);
+            // Observers run without the observer or reservation mutex held.
+            rules.set_denial_observer(Arc::new(|_, _| {}));
+            rules.bytes_changed("/unused", 0, 0);
+            observed.lock().unwrap().push((path.to_string(), op));
+        }));
+        assert!(rules.protects("/t/suite"));
+        rules
+            .check_mutation(OverlayMutation::Create, &["/t/agent/a"])
+            .unwrap();
+        assert_eq!(rules.erofs_denied(), 0);
+        assert!(rules
+            .check_mutation(OverlayMutation::Rename, &["/t/a", "/t/b"])
+            .is_err());
+        assert_eq!(rules.erofs_denied(), 1);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [("/t/a".into(), OverlayMutation::Rename)]
+        );
+        let observed = events.clone();
+        rules.set_denial_observer(Arc::new(move |path, op| {
+            observed.lock().unwrap().push((path.to_string(), op));
+        }));
+        assert!(rules.check_write("/t/a", 0, 1, 0).is_err());
+        rules.check_write("/t/agent/a", 0, 1, 0).unwrap();
+        rules
+            .check_mutation(OverlayMutation::CopyOnWrite, &["/outside/file"])
+            .unwrap();
+        rules.bytes_changed("/outside/file", 1, 0);
+        assert!(rules
+            .check_mutation(OverlayMutation::Rename, &["/outside", "/elsewhere"])
+            .is_err());
+        assert_eq!(rules.erofs_denied(), 3);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                ("/t/a".into(), OverlayMutation::Rename),
+                ("/t/a".into(), OverlayMutation::Write),
+                ("/outside".into(), OverlayMutation::Rename),
+            ]
+        );
+        rules.file_created("/outside/file");
+        rules
+            .check_mutation(OverlayMutation::Rename, &["/outside", "/elsewhere"])
+            .unwrap();
+        assert_eq!(rules.erofs_denied(), 3);
+    }
+
+    /// Regression: real overlay writes, chmod and xattrs must honor exceptions
+    /// without copying or altering protected archive members.
+    #[cfg(unix)]
+    #[test]
+    fn regression_readonly_allow_overlay_mutations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(
+            archive_with_paths(&["t/file", "t/agent/base"]),
+            root.path(),
+        )
+        .unwrap();
+        let protected = new_file(&overlay, "/t/host");
+        let rules = Arc::new(
+            ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"])
+                .unwrap()
+                .with_overlay_root(root.path())
+                .unwrap(),
+        );
+        overlay.set_policy(Some(rules.clone()));
+        let ro = io::ErrorKind::ReadOnlyFilesystem;
+        denied(overlay.create_file("/t/new", 0o644), ro);
+        denied(overlay.mkdir("/t/blocked", 0o755), ro);
+        denied(overlay.ensure_modifiable("/t/file"), ro);
+        assert_eq!(
+            overlay
+                .write_at(&protected, "/t/host", 0, b"no")
+                .unwrap_err()
+                .kind(),
+            ro
+        );
+        denied(overlay.truncate("/t/file", 0), ro);
+        denied(overlay.unlink("/t/file"), ro);
+        let attrs = crate::OverlayMetadata {
+            mode: Some(0o600),
+            ..Default::default()
+        };
+        denied(overlay.set_metadata("/t/file", &attrs), ro);
+        denied(overlay.set_xattr("/t/file", "user.test", b"x", 0), ro);
+        overlay.mkdir("/t/agent", 0o755).unwrap();
+        overlay.mkdir("/t/agent/dir", 0o755).unwrap();
+        let file = new_file(&overlay, "/t/agent/dir/new");
+        overlay
+            .write_at(&file, "/t/agent/dir/new", 0, b"yes")
+            .unwrap();
+        overlay.truncate("/t/agent/dir/new", 2).unwrap();
+        overlay.ensure_modifiable("/t/agent/base").unwrap();
+        overlay.set_metadata("/t/agent/base", &attrs).unwrap();
+        overlay
+            .set_xattr("/t/agent/base", "user.test", b"x", 0)
+            .unwrap();
+        overlay.create_symlink("/t/agent/link", "base").unwrap();
+        overlay.unlink("/t/agent/link").unwrap();
+        overlay
+            .rename("/t/agent/dir/new", "/t/agent/dir/moved")
+            .unwrap();
+        denied(overlay.rename("/t/agent/dir/moved", "/t/moved"), ro);
+        denied(overlay.rename("/t/agent", "/moved"), ro);
+        overlay.unlink("/t/agent/dir/moved").unwrap();
+        overlay.rmdir("/t/agent/dir").unwrap();
+        assert_eq!(rules.erofs_denied(), 10);
+        overlay.finish_owned_write_fd(file);
+        overlay.finish_owned_write_fd(protected);
+    }
+
+    /// Regression: an allowed spelling cannot bypass a protected host symlink target.
+    #[cfg(unix)]
+    #[test]
+    fn regression_readonly_allow_symlink_alias() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("t/agent")).unwrap();
+        fs::create_dir_all(root.path().join("t/private")).unwrap();
+        std::os::unix::fs::symlink("../private", root.path().join("t/agent/alias")).unwrap();
+        let rules = ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"])
+            .unwrap()
+            .with_overlay_root(root.path())
+            .unwrap();
+        assert!(rules
+            .check_mutation(OverlayMutation::Create, &["/t/agent/alias/file"])
+            .is_err());
+        rules
+            .check_mutation(OverlayMutation::Unlink, &["/t/agent/alias"])
+            .unwrap();
+        assert_eq!(rules.erofs_denied(), 1);
+    }
+
     /// Regression: invalid and overflowing quota sizes must fail before opening an archive.
     #[test]
     fn regression_overlay_size_overflow() {
@@ -674,7 +1088,7 @@ mod tests {
     #[test]
     fn regression_readonly_mutations_and_parent_rename() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         overlay.mkdir("/t/empty", 0o755).unwrap();
         let protected = new_file(&overlay, "/t/host");
         let outside = new_file(&overlay, "/allowed");
@@ -740,7 +1154,7 @@ mod tests {
     #[test]
     fn regression_quota_growth_unlink_and_startup_scan() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         fs::write(root.path().join("preexisting"), b"abc").unwrap();
         let quota = Arc::new(OverlayQuota::new(root.path(), Some(10), Some(3)).unwrap());
         assert_eq!((quota.usage().bytes, quota.usage().files), (3, 1));
@@ -797,7 +1211,7 @@ mod tests {
     #[test]
     fn regression_quota_concurrent_writers_never_exceed_cap() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         let quota = Arc::new(OverlayQuota::new(root.path(), Some(101), Some(8)).unwrap());
         overlay.set_policy(Some(quota.clone()));
         let overlay = Arc::new(overlay);
@@ -830,7 +1244,7 @@ mod tests {
     #[test]
     fn regression_overlay_stats_exact_counts_and_readonly_db() {
         let root = tempfile::tempdir().unwrap();
-        let overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         let file = new_file(&overlay, "/added");
         overlay.write_at(&file, "/added", 0, b"hello").unwrap();
         overlay.finish_owned_write_fd(file);
@@ -889,9 +1303,17 @@ mod tests {
     #[test]
     fn regression_control_status_live_quota_usage() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
-        let quota = Arc::new(OverlayQuota::new(root.path(), Some(10), Some(2)).unwrap());
-        overlay.set_policy(Some(quota.clone()));
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
+        let rules = Arc::new(ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"]).unwrap());
+        let quota = Arc::new(
+            OverlayQuota::new(root.path(), Some(10), Some(2))
+                .unwrap()
+                .with_readonly(rules.clone()),
+        );
+        overlay.set_policy(Some(Arc::new(CompositeOverlayPolicy(vec![
+            rules.clone(),
+            quota.clone(),
+        ]))));
         let overlay = Arc::new(overlay);
         let control =
             ControlFolderMountSource::new(overlay.clone(), ControlFolderOptions::enabled())
@@ -909,6 +1331,9 @@ mod tests {
         assert!(read_status().contains(
             "overlay_bytes 0\noverlay_quota_bytes 10\noverlay_files 0\noverlay_quota_files 2\n"
         ));
+        assert!(read_status().contains("erofs_denied 0\n"));
+        denied(overlay.unlink("/t/file"), io::ErrorKind::ReadOnlyFilesystem);
+        assert!(read_status().contains("erofs_denied 1\n"));
         let file = new_file(&overlay, "/new");
         overlay.write_at(&file, "/new", 0, b"abc").unwrap();
         assert!(
@@ -961,7 +1386,7 @@ mod tests {
                     release: release.clone(),
                     fail,
                 });
-                let mut overlay = crate::WriteOverlay::new(base, root.path()).unwrap();
+                let mut overlay = crate::WriteOverlay::new_for_tests(base, root.path()).unwrap();
                 let quota = Arc::new(OverlayQuota::new(root.path(), Some(4), Some(1)).unwrap());
                 overlay.set_policy(Some(quota.clone()));
                 let overlay = Arc::new(overlay);
@@ -989,7 +1414,7 @@ mod tests {
     #[test]
     fn regression_quota_unlinked_fd_does_not_leak_file_slot() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         let quota = Arc::new(OverlayQuota::new(root.path(), Some(10), Some(1)).unwrap());
         overlay.set_policy(Some(quota.clone()));
         let overlay = Arc::new(overlay);
@@ -1028,7 +1453,7 @@ mod tests {
             external.path().as_os_str().len() as u64 + 7
         );
         let empty = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), empty.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), empty.path()).unwrap();
         overlay.set_policy(Some(Arc::new(
             OverlayQuota::new(empty.path(), Some(0), Some(0)).unwrap(),
         )));
@@ -1047,7 +1472,7 @@ mod tests {
     #[test]
     fn regression_readonly_parent_symlink_cannot_bypass_rules() {
         let root = tempfile::tempdir().unwrap();
-        let mut overlay = crate::WriteOverlay::new(archive(), root.path()).unwrap();
+        let mut overlay = crate::WriteOverlay::new_for_tests(archive(), root.path()).unwrap();
         overlay.ensure_modifiable("/t/file").unwrap();
         overlay.set_policy(Some(Arc::new(
             ReadOnlyGlobs::new(["t/**"])
@@ -1089,7 +1514,7 @@ mod tests {
                     release: release.clone(),
                     fail,
                 });
-                let mut overlay = crate::WriteOverlay::new(base, root.path()).unwrap();
+                let mut overlay = crate::WriteOverlay::new_for_tests(base, root.path()).unwrap();
                 overlay.mkdir("/protected", 0o755).unwrap();
                 if symlinked {
                     overlay.mkdir("/physical/child", 0o755).unwrap();

@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn regression_overlay_policy_denials() {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(EmptyFs), td.path()).unwrap();
         ov.mkdir("/locked", 0o755).unwrap();
         ov.mkdir("/locked/empty", 0o755).unwrap();
         for path in ["/locked/file", "/outside", "/quota"] {
@@ -240,8 +240,9 @@ mod tests {
     #[test]
     fn overlay_helpers_create_rename_unlink() {
         let td = tempfile::tempdir().unwrap();
-        let ov = WriteOverlay::new(Arc::new(EmptyFs) as Arc<dyn MountSource>, td.path())
-            .expect("overlay");
+        let ov =
+            crate::test_overlay::new_overlay(Arc::new(EmptyFs) as Arc<dyn MountSource>, td.path())
+                .expect("overlay");
         overlay_mkdir(&ov, "/d", 0o755).expect("mkdir");
         let fd = overlay_create_file(&ov, "/d/f", 0o644).expect("create");
         ov.close_overlay_fd(fd);

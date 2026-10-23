@@ -833,8 +833,11 @@ fn create_without_overlay_is_access_denied() {
 fn overlay_create_write_read() {
     let td = tempfile::tempdir().unwrap();
     let ov = Arc::new(
-        WriteOverlay::new(Arc::new(MemFs::empty()) as Arc<dyn MountSource>, td.path())
-            .expect("overlay"),
+        crate::test_overlay::new_overlay(
+            Arc::new(MemFs::empty()) as Arc<dyn MountSource>,
+            td.path(),
+        )
+        .expect("overlay"),
     );
     let src: Arc<dyn MountSource> = Arc::clone(&ov) as Arc<dyn MountSource>;
     let srv = Serving::start(src, Some(Arc::clone(&ov)));
@@ -1014,8 +1017,11 @@ fn conflicting_open_sends_lease_break() {
 fn overlay_write_sends_lease_break() {
     let td = tempfile::tempdir().unwrap();
     let ov = Arc::new(
-        WriteOverlay::new(Arc::new(MemFs::empty()) as Arc<dyn MountSource>, td.path())
-            .expect("overlay"),
+        crate::test_overlay::new_overlay(
+            Arc::new(MemFs::empty()) as Arc<dyn MountSource>,
+            td.path(),
+        )
+        .expect("overlay"),
     );
     let src: Arc<dyn MountSource> = Arc::clone(&ov) as Arc<dyn MountSource>;
     let srv = Serving::start(src, Some(Arc::clone(&ov)));
@@ -1177,8 +1183,11 @@ fn durable_grant_omitted_when_table_full() {
 fn encrypted_write_sends_lease_break_transform() {
     let td = tempfile::tempdir().unwrap();
     let ov = Arc::new(
-        WriteOverlay::new(Arc::new(MemFs::empty()) as Arc<dyn MountSource>, td.path())
-            .expect("overlay"),
+        crate::test_overlay::new_overlay(
+            Arc::new(MemFs::empty()) as Arc<dyn MountSource>,
+            td.path(),
+        )
+        .expect("overlay"),
     );
     let src: Arc<dyn MountSource> = Arc::clone(&ov) as Arc<dyn MountSource>;
     let stop = ExportStop::new();

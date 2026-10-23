@@ -137,8 +137,12 @@ impl Session {
             matches!(&req.source, SourceSpec::Url(_)) || looks_like_url_archive(&archive_path);
 
         if !remote_archive {
-            ratarmount_compress::commit_journal::recover(&archive_path)
-                .map_err(|e| Error::Internal(e.to_string()))?;
+            ratarmount_compositing::recover_journal_at(
+                &archive_path,
+                None,
+                ratarmount_compositing::Owner::Inode,
+            )
+            .map_err(|e| Error::Internal(e.to_string()))?;
         }
 
         let (loc, mut temp_guard, index_in_memory, index_file_path) = if req.index
@@ -526,6 +530,7 @@ fn open_options(req: &OpenRequest, hooks: &IndexBuildHooks) -> OpenOptions {
         write_index,
         read_only_index,
         index_build: hooks.clone(),
+        recover_journals: true,
         ..OpenOptions::default()
     }
 }
@@ -584,8 +589,8 @@ fn check_recreate_never(archive: &Path, loc: &CatalogLoc) -> Result<(), Error> {
             if !p.exists() {
                 return Err(Error::NotFound);
             }
-            let cat = SqliteIndex::open_catalog_read_only(p)
-                .map_err(|e| Error::CorruptIndex(e.to_string()))?;
+            let cat =
+                SqliteIndex::open_lookup(p).map_err(|e| Error::CorruptIndex(e.to_string()))?;
             match cat.check_tarstats_matches_archive(archive) {
                 Ok(()) => Ok(()),
                 Err(IndexError::Mismatch(msg)) => Err(Error::CorruptIndex(msg)),
@@ -606,7 +611,8 @@ fn open_catalog_if_path(loc: &CatalogLoc) -> Result<Option<SqliteIndex>, Error> 
     if !p.exists() {
         return Ok(None);
     }
-    SqliteIndex::open_catalog_read_only(p)
+    // A read: it creates nothing beside the sidecar (see `open_lookup`).
+    SqliteIndex::open_lookup(p)
         .map(Some)
         .map_err(|e| Error::Internal(e.to_string()))
 }
@@ -618,7 +624,7 @@ fn will_cold_build(recreate: Recreate, archive: &Path, loc: &CatalogLoc) -> bool
         Recreate::IfInvalid => match loc.path() {
             None => true,
             Some(p) if !p.exists() => true,
-            Some(p) => match SqliteIndex::open_catalog_read_only(p) {
+            Some(p) => match SqliteIndex::open_lookup(p) {
                 Ok(cat) => cat.check_tarstats_matches_archive(archive).is_err(),
                 Err(_) => true,
             },
@@ -708,6 +714,7 @@ fn archive_offset_from_info(fi: &FileInfo) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::types::SourceSpec;
@@ -751,6 +758,44 @@ mod tests {
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open")
+    }
+
+    /// Regression (R6-J4, audit D7): the `Recreate::Never` check and the
+    /// will-I-rebuild probe opened a WAL sidecar read-only and left `-wal` /
+    /// `-shm` beside the archive.
+    #[test]
+    fn regression_session_lookups_of_a_wal_sidecar_create_no_side_files() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(open_tar(dir.path(), "a.tar", &[member_file("f", b"x")]));
+        let tar = dir.path().join("a.tar");
+        let index = dir.path().join("a.tar.index.sqlite");
+        let mode: String = rusqlite::Connection::open(&index)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "the sidecar is a WAL database");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        let names = || {
+            let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, bytes) = (names(), std::fs::read(&index).unwrap());
+        let loc = CatalogLoc::Path(index.clone());
+        check_recreate_never(&tar, &loc).unwrap();
+        assert!(!will_cold_build(Recreate::IfInvalid, &tar, &loc));
+        assert_eq!(names(), listing, "a lookup created files");
+        assert!(std::fs::read(&index).unwrap() == bytes, "sidecar rewritten");
+        // Regression (R6-K4): the catalog the Session HOLDS is a read too.
+        let catalog = open_catalog_if_path(&loc).unwrap().expect("catalog");
+        drop(catalog);
+        assert_eq!(names(), listing, "open_catalog_if_path created files");
+        assert!(std::fs::read(&index).unwrap() == bytes, "sidecar rewritten");
     }
 
     /// Regression: read-only Session/factory opens must repair a torn archive before probing.

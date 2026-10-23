@@ -66,7 +66,7 @@ costs more. If you own the archive, repack it once:
 
 ```bash
 ratarmount --repack-seekable big.tar.gz big.tar.zst     # multi-frame zstd with an official seek table
-ratarmount --repack-keep-gzip --repack-seekable in.gz out.gz   # keep gzip, write an out.gz.rgzi seek index instead
+ratarmount --repack-seekable in.gz out.gz   # keep gzip, write an out.gz.rgzi seek index instead
 ```
 
 `--repack-seekable IN OUT` takes exactly two paths, works on local files only,
@@ -161,6 +161,55 @@ including the safety rules and what happens on a crash, is in
 [Writing into archives](write-overlay.md). Policies for untrusted writers
 (`--overlay-readonly`, `--overlay-quota`, `--sandbox`) are in
 [Sandboxes](sandbox.md).
+
+### Agent attempts and grading
+
+A committed Git tree can become a portable base; sealed preparation layers can
+then be shared across independent writable attempts:
+
+```sh
+ratarmount snapshot repo@HEAD base.tar.zst --with-index --json
+ratarmount overlay import --no-seal prepared.patch prepared base.tar.zst
+ratarmount overlay seal prepared
+ratarmount --lower prepared -w attempt base.tar.zst mnt/
+# Run the agent and its edits through mnt/ before unmounting.
+ratarmount -u mnt/
+ratarmount overlay fsck attempt --repair
+ratarmount overlay seal attempt
+ratarmount overlay info attempt --json
+ratarmount overlay verify attempt
+ratarmount diff attempt --hash --normalize strict --json
+ratarmount diff attempt --manifest
+ratarmount diff attempt --git -o attempt.patch  # exit 1 means changes
+ratarmount overlay import --lower prepared attempt.patch replay base.tar.zst
+ratarmount overlay pack attempt attempt.tar.zst --include-index
+ratarmount overlay unpack attempt.tar.zst restored
+ratarmount overlay verify restored
+```
+
+`overlay unseal restored --i-know` explicitly makes a sealed copy writable again.
+For a stopped kernel overlayfs upperdir, use
+`ratarmount overlay import-upperdir --lower prepared upperdir imported base.tar.zst`.
+The [interop reference](sandbox.md#kernel-overlayfs-interop) describes whiteouts
+and opacity.
+
+Use a fresh top for each attempt. BASE and lowers default to recorded metadata
+in offline inspection commands. Renames are delete + add unless patch rendering
+opts into `--detect-renames`; canonical hashes always use delete + add.
+
+```sh
+ratarmount sandbox run --base base.tar.zst --lower prepared --top next-attempt \
+  --image busybox --network none --timeout 120 --journal --seal --json \
+  -- sh -c 'printf "candidate\n" > answer.txt'
+ratarmount journal summarize next-attempt.journal.jsonl --json
+```
+
+The runner needs Linux FUSE and a local Docker/Podman runtime. Its own exit 0
+means the pipeline completed; inspect JSON `exit_code` for the container result.
+For turn boundaries during a journaled mount, use
+`ratarmount journal mark mnt 'turn 1'`. See the
+[offline worked example and reference](sandbox.md) for scratch-fixture setup,
+metadata, normalization, limits, branching and the supervisor API.
 
 ## Serve over the network
 

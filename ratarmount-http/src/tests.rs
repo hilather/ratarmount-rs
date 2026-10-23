@@ -11,8 +11,6 @@ use ratarmount_core::{
     S_IFREG,
 };
 
-use ratarmount_compositing::WriteOverlay;
-
 use crate::{
     parse_http_bind, parse_webdav_bind, spawn_http_thread, spawn_webdav_thread, ExportServerHandle,
     ExportStop, HttpOptions, WebDavOptions, DEFAULT_HTTP_BIND, DEFAULT_HTTP_PORT,
@@ -274,7 +272,7 @@ impl Serving {
         let stop = ExportStop::new();
         let td = tempfile::tempdir().expect("overlay tempdir");
         let base: Arc<dyn MountSource> = Arc::new(MemFs::fixture());
-        let ov = Arc::new(WriteOverlay::new(base, td.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, td.path()).expect("overlay"));
         let opts = WebDavOptions {
             bind: "127.0.0.1:0".parse().unwrap(),
             stop: Some(stop.clone()),

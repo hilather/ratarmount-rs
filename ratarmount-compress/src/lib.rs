@@ -91,7 +91,7 @@ pub use lzo_seek::{lzo_available, open_seekable_lzo, open_seekable_lzo_with_thre
 pub use ratarmount_core::ParallelizationSpec;
 pub use repack_seekable::{
     repack_seekable, GzipSidecar, RepackAction, RepackOptions, RepackReport, ZstdFrameWriter,
-    DEFAULT_REPACK_FRAME_SIZE, DEFAULT_REPACK_ZSTD_LEVEL,
+    DEFAULT_REPACK_FRAME_SIZE, DEFAULT_REPACK_ZSTD_LEVEL, GZIDX_SIDECAR_EXT, RGZI_SIDECAR_EXT,
 };
 pub use seekable_body::{
     body_looks_like_tar, DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP,
@@ -110,8 +110,8 @@ pub use zstd_seek::{
     zstd_decode_stats, SeekableZstd, ZstdDecodeStats, ZstdFrameInfo, ZstdFrameMap, ZstdReadOptions,
 };
 pub use zstd_splice::{
-    splice_zstd_last_frames, splice_zstd_last_frames_append, splice_zstd_last_frames_replace,
-    write_zstd_splice_suffix, SpliceStats,
+    splice_zstd_last_frames, splice_zstd_last_frames_append, splice_zstd_last_frames_append_with,
+    splice_zstd_last_frames_replace, write_zstd_splice_suffix, SpliceStats,
 };
 
 use std::fs::File;
@@ -134,6 +134,11 @@ pub enum CompressError {
     Unsupported(&'static str),
     #[error("{0}")]
     Msg(String),
+    /// A journaled in-place replacement failed after it started (or was
+    /// refused before); the variant says what is on disk and whether a copy
+    /// fallback may run.
+    #[error("{0}")]
+    Replace(commit_journal::ReplaceError),
 }
 
 pub type Result<T> = std::result::Result<T, CompressError>;
@@ -317,6 +322,31 @@ pub fn materialize_xz(path: &Path) -> Result<(NamedTempFile, u64)> {
     let input = File::open(path)?;
     let decoder = XzDecoder::new_multi_decoder(BufReader::new(input));
     materialize_from_reader(decoder, "xz", path)
+}
+
+/// [`materialize`] of an already open gzip/bzip2/xz file (`path` only labels
+/// it): a commit decompresses the descriptor its gate checked, never whatever
+/// is at the path later.
+pub fn materialize_open(
+    input: File,
+    path: &Path,
+    format: CompressionFormat,
+) -> Result<(NamedTempFile, u64)> {
+    let input = BufReader::new(input);
+    match format {
+        CompressionFormat::Gzip => {
+            materialize_from_reader(MultiGzDecoder::new(input), "gzip", path)
+        }
+        CompressionFormat::Bzip2 => {
+            materialize_from_reader(MultiBzDecoder::new(input), "bzip2", path)
+        }
+        CompressionFormat::Xz => {
+            materialize_from_reader(XzDecoder::new_multi_decoder(input), "xz", path)
+        }
+        _ => Err(CompressError::Unsupported(
+            "materialize_open supports gzip, bzip2 and xz",
+        )),
+    }
 }
 
 /// Decompress zstd into a persistent temp file.

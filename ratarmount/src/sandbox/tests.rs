@@ -411,6 +411,7 @@ fn regression_base_policy_and_mount_options_forwarded() {
                 umask: Some("027".into()),
                 quota: Some(10),
                 readonly_globs: vec!["tests/**".into()],
+                allow_globs: vec!["tests/agent/**".into()],
                 passthrough: Some("off".into()),
                 binds: vec!["/data=/srv/data.tar".into()],
                 allow_other: true,
@@ -438,6 +439,7 @@ fn regression_base_policy_and_mount_options_forwarded() {
             gid: Some(456),
             umask: Some("027".into()),
             binds: vec!["/repo=/srv/repo.git@sha".into()],
+            allow_globs: vec!["tests/agent/**".into()],
             ..Default::default()
         },
     };
@@ -454,8 +456,58 @@ fn regression_base_policy_and_mount_options_forwarded() {
             .unwrap();
     assert_eq!(parsed.paths[0], PathBuf::from("--evil"));
     assert_eq!(parsed.source_binds[0].mount_path, "/repo");
+    assert_eq!(parsed.overlay_allow, ["tests/agent/**"]);
     assert!(parsed.fuse.contains("uid=123,gid=456,umask=027"));
     supervisor.destroy_all().unwrap();
+}
+
+/// Regression: v1 bases without exceptions still decode; optional exceptions reach
+/// child mounts, and invalid exceptions are rejected before persisting a base.
+#[test]
+fn regression_base_allow_globs_optional_v1() {
+    for (options, expected) in [
+        (json!({"readonly_globs": ["t/**"]}), vec![]),
+        (
+            json!({"readonly_globs": ["t/**"], "allow_globs": ["t/agent/**"]}),
+            vec!["t/agent/**".to_string()],
+        ),
+    ] {
+        let request = json!({"version": 1, "op": "create_base", "name": "task", "source": "x", "options": options});
+        let parsed = Request::parse(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let Operation::CreateBase { options, .. } = parsed.operation else {
+            panic!("create_base");
+        };
+        assert_eq!(options.allow_globs, expected);
+    }
+    let (_root, mut supervisor, _) = setup(8);
+    for options in [
+        BaseOptions {
+            allow_globs: vec!["t/agent/**".into()],
+            ..Default::default()
+        },
+        BaseOptions {
+            readonly_globs: vec!["t/**".into()],
+            allow_globs: vec!["../escape".into()],
+            ..Default::default()
+        },
+    ] {
+        assert!(supervisor
+            .handle(Operation::CreateBase {
+                name: "bad-allow".into(),
+                source: "x".into(),
+                options
+            })
+            .is_err());
+        assert_eq!(
+            supervisor
+                .handle(Operation::List {
+                    base: Some("bad-allow".into())
+                })
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+    }
 }
 
 /// Regression: invalid base definitions and destroy selectors do not mutate persistent state.
@@ -529,7 +581,7 @@ fn regression_mountinfo_decodes_escaped_mount_paths() {
 /// Regression: API diffs include composed bind paths and stats read the attempt's real overlay.
 #[test]
 fn regression_live_diff_and_stats_do_not_reopen_locked_database() {
-    use ratarmount_compositing::{FolderMountSource, WriteOverlay};
+    use ratarmount_compositing::FolderMountSource;
     let (root, mut supervisor, fake) = setup(8);
     let source = root.path().join("source");
     fs::create_dir(&source).unwrap();
@@ -558,7 +610,7 @@ fn regression_live_diff_and_stats_do_not_reopen_locked_database() {
     let attempt = supervisor.attempts.values().next().unwrap().clone();
     fs::write(empty.join("gone"), "delete me\n").unwrap();
     let overlay = Arc::new(
-        WriteOverlay::new(
+        crate::base_identity::fixtures::new_overlay(
             Arc::new(FolderMountSource::new(&empty).unwrap()),
             &attempt.overlay_dir,
         )

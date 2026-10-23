@@ -1,6 +1,6 @@
 # Mount options & abilities: Python vs Rust
 
-Last updated: 2026-10-16.
+Last updated: 2026-10-17.
 
 ## Summary
 
@@ -32,6 +32,16 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing · `[x]` Rust-only = beyond
 | `--commit-overlay-mode copy\|append\|auto` | no | **added** (default `copy`; reflink/kernel-copy acceleration; `append` journals adds-only uncompressed TAR / seek-table `.tar.zst` suffixes in place; `auto` also excludes hard-linked archives; other plans copy; in-place readers can observe the write) | `[x]` Rust-only |
 | `--commit-overlay-on-exit` | no | **added** (uncompressed TAR or `.tar.zst` + durable `-w`; same create-if-missing as `-w`; last-frame zstd rewrite — does not recompress the prefix; default copy uses reflink/kernel copy when available; opt-in append retains the prefix in place; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; copy fallback needs 2× compressed disk headroom; append needs old/new suffix space; never refuse on size; warn when last-frame uncompressed > 64 MiB; gzip rejected; live still **rejects** prefix-frame mutate — offline `--commit-overlay` is the zstd escape hatch; later-frame deletes classify past per-frame TAR EOF even when the remount omitted `-i`; SIGINT/SIGTERM / serve return) | `[x]` Rust-only |
 | `--commit-overlay-interval DURATION` | no | **added** (`0` off; `2s`/`15m`/`1h`; uncompressed TAR or `.tar.zst` + durable `-w`; same create-if-missing as `-w`; in-process; commits overlay files whose host mtime is at least DURATION old **and** that have no open write fd, not a dump of every overlay file on the clock; same last-frame cost model; later complete-TAR-frame deletes persist even if the remount omitted `-i`) | `[x]` Rust-only |
+| `--lower DIR_OR_BUNDLE` | no | **added** (repeatable, bottom to top; sealed read-only layers; optional `-w TOP`; layered commits refused) | `[x]` Rust-only |
+| `--allow-unsealed-lower` | no | **added** (explicitly accept unsealed/legacy lowers read-only; stop their writers first) | `[x]` Rust-only |
+| `--force-stack-mismatch` | no | **added** (override recorded lower-stack check and record override time) | `[x]` Rust-only |
+| `--base-digest sha256:HEX\|none` | no | **added** (trust supplied identity without hashing, or disable identity checking with a warning; requires a writable top) | `[x]` Rust-only |
+| `--force-base-mismatch` | no | **added** (override cheap remount identity check, record override time) | `[x]` Rust-only |
+| `--overlay-allow GLOBS` | no | **added** (exceptions to read-only rules; most literal components wins, allow wins ties) | `[x]` Rust-only |
+| `--journal FILE` | no | **added** (FUSE operation JSONL, including on read-only data mounts; separate from append-commit journal) | `[x]` Rust-only |
+| `--journal-reads all\|first` | no | **added** (all coalesced ranges or first nonempty range per handle; complete byte/request counters in either mode) | `[x]` Rust-only |
+| `--journal-exclude GLOB` | no | **added** (repeatable root-anchored path rules; marks retained) | `[x]` Rust-only |
+| `--journal-sync` | no | **added** (fsync operation journal at unmount) | `[x]` Rust-only |
 | `--overlay-readonly GLOBS` | no | **added** (protected overlay paths; EROFS across write frontends) | `[x]` Rust-only |
 | `--overlay-quota SIZE` / `--overlay-quota-files N` | no | **added** (shared logical content/file caps including copy-up; EDQUOT; xattr metadata excluded) | `[x]` Rust-only |
 | `--sandbox` | no | **added** (allow_other + noatime + caller uid/gid; RAM overlay unless explicit `-w`; Linux) | `[x]` Rust-only |
@@ -48,14 +58,18 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing · `[x]` Rust-only = beyond
 | `--direct-io` | no | **added** (source-member FOPEN_DIRECT_IO and local TAR/zstd eviction advice; disables passthrough; overlay stays cached) | `[x]` Rust-only |
 | `--memory-budget SIZE` | no | **added** (managed RAM pool cap; synchronous fallback under pressure; excludes kernel page cache) | `[x]` Rust-only |
 | `overlay-stats OVERLAY [--json]` | no | **added** (overlay usage/deletions without mounting) | `[x]` Rust-only |
-| `diff OVERLAY --base SOURCE [--git]` | no | **added** (unified / Git patch; exit 1 means changes, 2 means error) | `[x]` Rust-only |
-| `sandbox daemon|create-base|new|list|diff|stats|destroy|shutdown` | no | **added** (Linux supervisor; Unix socket and pure-Python client) | `[x]` Rust-only |
-| `snapshot add|list` | no | **added** (external restic CLI wrapper) | `[x]` Rust-only |
+| `diff OVERLAY [BASE]` | no | **added** (patch/Git/manifest/hash/stat/names, normalization, `--lower`, `--between`; exits 0 unchanged, 1 changed, 2 error, 3 limit; hash/manifest success is 0) | `[x]` Rust-only |
+| `overlay info\|seal\|unseal\|verify\|fsck\|import\|import-upperdir\|pack\|unpack` | no | **added** (offline layer identity, integrity, import and transport) | `[x]` Rust-only |
+| `journal summarize\|mark` | no | **added** (operation summaries and root-xattr turn markers) | `[x]` Rust-only |
+| `sandbox run` | no | **added** (container attempt, cleanup, hash/manifest/journal report; optional seal/pack) | `[x]` Rust-only |
+| `sandbox daemon\|create-base\|new\|list\|diff\|stats\|destroy\|shutdown` | no | **added** (Linux supervisor; Unix socket and pure-Python client) | `[x]` Rust-only |
+| `snapshot GIT_BASE OUT.tar.zst [--with-index]` | no | **added** (deterministic committed tree export and optional mount index) | `[x]` Rust-only |
+| `snapshot add\|list` | no | **added** (external restic CLI wrapper) | `[x]` Rust-only |
 | `corpus MANIFEST MOUNTPOINT` | no | **added** (pinned repository collection) | `[x]` Rust-only |
 | `shard` / `export-index --format parquet|jsonl|csv` | no | **added** (dataset packing and index export without FUSE; Parquet is default feature `export-parquet`) | `[x]` Rust-only |
 | `-p` / `--prefix` | yes | yes | `[x]` |
 | `--file-versions` / `--no-file-versions` | yes | **both forms** | `[x]` |
-| `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket **and** in-FS folder (`status`/`pid`/`unmount`/`help` plus read-only `search/<pattern>` glob locate; quote globs). No FUSE write-then-read `echo pat > search`. | `[x]` / overlay names not in catalog |
+| `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket **and** in-FS folder (`status`/`pid`/`unmount`/`help` plus read-only `search/<pattern>` glob locate; quote globs). No FUSE write-then-read `echo pat > search`. With `-w` the folder name is reserved (EACCES). Hidden experimental `--control-socket-only` keeps the socket and omits the folder (used by `sandbox run`). | `[x]` / overlay names not in catalog |
 | `--nfs` | no | **added** (userspace NFS; NFSv3 default; no FUSE mount required) | `[x]` Rust-only |
 | `--nfs-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20490`) | `[x]` |
 | `--nfs-vers 3\|4` | no | **added** (default `3`; `4`/`4.1` need `--nfs` + a `nfsv4` binary — Linux/macOS packages compile it; source `--features nfsv4`, rustc ≥ 1.88; ignored without `--nfs`; `4.0` rejected) | `[x]` Rust-only |

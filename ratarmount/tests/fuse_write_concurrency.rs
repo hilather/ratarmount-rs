@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
+#[path = "support/unmount.rs"]
+mod unmount;
+
 const MOUNT_DEADLINE: Duration = Duration::from_secs(10);
 const PHASE1_DEADLINE: Duration = Duration::from_secs(20);
 const WAVE_DEADLINE: Duration = Duration::from_secs(30);
@@ -221,6 +224,56 @@ impl MountGuard {
             _ => signal_kill_pid(self.daemon_pid),
         }
     }
+}
+
+/// Regression: Latin-1 file names must return EILSEQ without a U+FFFD overlay row.
+#[test]
+fn regression_non_utf8_name_create_leaves_no_overlay_row() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    if let Some(msg) = skip_reason() {
+        eprintln!("{msg}");
+        return;
+    }
+    if !on_path("tar") {
+        eprintln!("skip: tar missing");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let tar = build_fixture(root);
+    let ov = root.join("ov");
+    let mnt = root.join("mnt");
+    fs::create_dir(&ov).unwrap();
+    fs::create_dir(&mnt).unwrap();
+    let mut guard = spawn_daemon(&ratarmount_bin(), &ov, &tar, &mnt, &root.join("daemon.log"));
+    guard.wait_mounted().unwrap();
+    for bytes in [b"caf\xe9".as_slice(), b"caf\xe8".as_slice()] {
+        let path = mnt.join(OsStr::from_bytes(bytes));
+        let err = File::create(&path).expect_err("invalid UTF-8 create must fail");
+        assert_eq!(err.raw_os_error(), Some(libc::EILSEQ));
+        assert_eq!(
+            fs::symlink_metadata(&path).unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+    }
+    assert!(!mnt.join("caf�").exists());
+    guard.graceful_unmount().unwrap();
+    let db = rusqlite::Connection::open_with_flags(
+        ov.join(".ratarmount.overlay.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let rows: u64 = db.query_row(
+        "SELECT count(*) FROM files WHERE instr(path, char(65533)) > 0 OR instr(name, char(65533)) > 0",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        rows, 0,
+        "invalid names must not create replacement-character rows"
+    );
 }
 
 /// Regression: concurrent FUSE writers in one directory deadlock when kernel
@@ -526,7 +579,10 @@ impl MountGuard {
     }
 
     fn graceful_unmount(&mut self) -> Result<(), String> {
+        // Bounded EBUSY retry (desktop probers of the new mount); a mount that
+        // stays busy fails the test with its holders logged.
         if let Err(e) = graceful_fusermount_u(&self.mnt) {
+            unmount::log_holders(&self.mnt);
             return Err(format!(
                 "{e} (daemon pid {})\n{}",
                 self.daemon_pid,

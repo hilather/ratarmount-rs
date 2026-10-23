@@ -1049,7 +1049,7 @@ mod tests {
     #[test]
     fn regression_overlay_chmod_ninep_wire_times() {
         let td = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap());
+        let ov = Arc::new(crate::test_overlay::new_overlay(Arc::new(EmptyFs), td.path()).unwrap());
         let fs = Arc::new(Ratarmount9p::with_overlay(
             ov.clone(),
             0,

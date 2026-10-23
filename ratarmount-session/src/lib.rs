@@ -29,6 +29,8 @@ mod locate;
 mod read;
 mod resolve;
 mod session;
+#[cfg(test)]
+mod test_overlay;
 mod types;
 
 pub use error::Error;

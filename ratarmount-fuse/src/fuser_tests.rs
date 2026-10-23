@@ -246,11 +246,72 @@ mod protocol {
         }
     }
 
+    /// Regression: every name-taking write callback rejects invalid UTF-8 before mutation.
+    #[test]
+    fn regression_non_utf8_name_write_callbacks_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let ov = Arc::new(crate::test_overlay::new_overlay(Arc::new(Source), dir.path()).unwrap());
+        let fs = RatarmountFs::new(ov.clone(), Some(ov.clone()));
+        let mut h = Harness::with_fs(mount_config(true, ""), 1024, fs);
+        let invalid = b"caf\xe9\0";
+        let body = |mut prefix: Vec<u8>, suffix: &[u8]| {
+            prefix.extend(suffix);
+            prefix
+        };
+        // CREATE, MKNOD (regular and unsupported type), MKDIR, SYMLINK, LINK,
+        // RENAME source/destination, and RENAME2 source/destination.
+        let mut cases = vec![
+            (35, body(words(&[0, S_IFREG | 0o644, 0, 0]), invalid)),
+            (8, body(words(&[S_IFREG | 0o644, 0, 0, 0]), invalid)),
+            (8, body(words(&[libc::S_IFIFO | 0o644, 0, 0, 0]), invalid)),
+            (9, body(words(&[0o755, 0]), invalid)),
+            (6, body(invalid.to_vec(), b"target\0")),
+            (13, body(1u64.to_ne_bytes().to_vec(), invalid)),
+        ];
+        for opcode in [12, 45] {
+            let mut prefix = 1u64.to_ne_bytes().to_vec();
+            if opcode == 45 {
+                prefix.extend(words(&[0, 0]));
+            }
+            cases.push((opcode, body(body(prefix.clone(), invalid), b"dest\0")));
+            cases.push((opcode, body(body(prefix, b"f\0"), invalid)));
+        }
+        let uid = unsafe { libc::geteuid() };
+        for (opcode, body) in cases {
+            let reply = h.call_as(opcode, 1, uid, &body);
+            assert_eq!(u32_at(&reply, 4) as i32, -libc::EILSEQ, "opcode {opcode}");
+        }
+        assert!(ov.lookup("/caf�", 0).is_none());
+        assert!(ov.lookup("/dest", 0).is_none());
+        assert!(ov.lookup("/f", 0).is_some());
+        // Valid UTF-8 symlinks use the overlay; hard links remain unsupported.
+        h.call(6, 1, "café\0target\0".as_bytes());
+        assert_eq!(ov.lookup("/café", 0).unwrap().linkname, "target");
+        let reply = h.call_as(
+            13,
+            1,
+            uid,
+            &body(1u64.to_ne_bytes().to_vec(), "café\0".as_bytes()),
+        );
+        assert_eq!(u32_at(&reply, 4) as i32, -libc::EPERM);
+        // A legitimate replacement-character entry must remain unreachable by
+        // invalid byte names, including lookup before a kernel getattr.
+        ov.create_file("/caf�", 0o644)
+            .map(|fd| ov.close_overlay_fd(fd))
+            .unwrap();
+        for opcode in [1, 10, 11] {
+            let reply = h.call_as(opcode, 1, uid, invalid);
+            assert_eq!(u32_at(&reply, 4) as i32, -libc::ENOENT, "opcode {opcode}");
+        }
+        assert!(ov.lookup("/caf�", 0).is_some());
+        h.finish();
+    }
+
     /// Regression: writable FUSE xattrs must preserve flags, probes, ERANGE, and removals.
     #[test]
     fn regression_provenance_fuser_xattr_wire() {
         let dir = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(Arc::new(Source), dir.path()).unwrap());
+        let ov = Arc::new(crate::test_overlay::new_overlay(Arc::new(Source), dir.path()).unwrap());
         let fs = RatarmountFs::new(ov.clone(), Some(ov));
         let mut h = Harness::with_capabilities(
             mount_config(true, ""),
@@ -294,6 +355,86 @@ mod protocol {
         let reply = h.call_as(22, ino, uid, &get("user.test", 0));
         assert_eq!(u32_at(&reply, 4) as i32, -libc::ENODATA);
         h.finish();
+    }
+
+    /// Regression: actual FUSE packets reach the journal and root controls without /dev/fuse.
+    #[test]
+    fn regression_oplog_callbacks_record_pid_ranges_marks_and_root_status_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace");
+        let fs = RatarmountFs::new(Arc::new(Source), None)
+            .with_activity(
+                &dir.path().join("mnt"),
+                oplog::MountActivity {
+                    journal: Some(oplog::JournalOptions {
+                        path: path.clone(),
+                        exclude: vec![],
+                        reads: oplog::Reads::All,
+                        sync: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut h = Harness::with_capabilities(
+            activity_mount_config(false, "", true),
+            4096,
+            fs,
+            InitFlags::all() & !InitFlags::FUSE_SETXATTR_EXT,
+        );
+        let ino = u64_at(&h.call(1, 1, b"f\0"), 0);
+        let mut packet = request(14, ino, unsafe { libc::geteuid() }, &words(&[0, 0]));
+        packet[32..36].copy_from_slice(&4242u32.to_ne_bytes());
+        h.peer.write_all(&packet).unwrap();
+        let opened = receive(&mut h.peer);
+        assert_eq!(u32_at(&opened, 4), 0);
+        let fh = u64_at(&opened, 16);
+        assert_eq!(h.call(15, ino, &read_args(fh, 0, 3)), b"pay");
+        assert_eq!(h.call(15, ino, &read_args(fh, 3, 4)), b"load");
+        let release = |fh: u64| [fh.to_ne_bytes().to_vec(), words(&[0, 0, 0, 0])].concat();
+        h.call(18, ino, &release(fh));
+        let mut mark = words(&[4, 0]);
+        mark.extend(b"user.ratarmount.mark\0turn");
+        h.call(21, 1, &mark);
+        let denied = h.call_as(
+            14,
+            ino,
+            unsafe { libc::geteuid() },
+            &words(&[libc::O_WRONLY as u32, 0]),
+        );
+        assert_eq!(u32_at(&denied, 4) as i32, -libc::EROFS);
+        let dir_fh = u64_at(&h.call(27, 1, &words(&[0, 0])), 0);
+        h.call(28, 1, &read_args(dir_fh, 0, 4096));
+        h.call(28, 1, &read_args(dir_fh, 0, 4096));
+        h.call(29, 1, &release(dir_fh));
+        let mut get = words(&[4096, 0]);
+        get.extend(b"user.ratarmount.stats\0");
+        let stats: serde_json::Value = serde_json::from_slice(&h.call(22, 1, &get)).unwrap();
+        assert_eq!(stats["bytes_read"], 7);
+        assert_eq!(stats["erofs_denied"], 1);
+        assert_eq!(stats["ops"]["readdir"], 1);
+        let keys = h.call(23, 1, &words(&[4096, 0]));
+        assert!(keys
+            .split(|b| *b == 0)
+            .any(|key| key == b"user.ratarmount.stats"));
+        h.finish();
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .skip(1)
+                .map(|r| r["op"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["open", "read", "mark", "denied", "readdir"]
+        );
+        assert_eq!(records[1]["pid"], 4242);
+        assert_eq!(records[2]["pid"], 4242);
+        assert_eq!(records[2]["ranges"], serde_json::json!([[0, 7]]));
+        assert_eq!(records[2]["layer"], "base");
     }
 
     fn read_args(fh: u64, offset: u64, size: u32) -> Vec<u8> {
@@ -547,7 +688,7 @@ mod protocol {
     #[test]
     fn fuser_detached_inode_survives_until_final_forget() {
         let dir = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(Arc::new(Source), dir.path()).unwrap());
+        let ov = Arc::new(crate::test_overlay::new_overlay(Arc::new(Source), dir.path()).unwrap());
         let fs = RatarmountFs::new(ov.clone(), Some(ov));
         let mut harness = Harness::with_fs(mount_config(true, ""), 4096, fs);
         let create = [

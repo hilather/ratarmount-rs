@@ -2,7 +2,10 @@
 
 #[cfg(test)]
 mod fuser_tests;
+#[cfg(test)]
+mod test_overlay;
 
+pub mod oplog;
 mod passthrough;
 pub use passthrough::{PassthroughMode, PassthroughOptions};
 use ratarmount_compositing::{overlay_atime, OverlayMetadata};
@@ -22,7 +25,7 @@ use fuser::{
     ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
     ReplyXattr, Request, SessionACL, WriteFlags,
 };
-use libc::{EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
+use libc::{EACCES, EEXIST, EILSEQ, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
 use log::{debug, info, warn};
 use ratarmount_compositing::{Parked, WriteOverlay};
 use ratarmount_core::{CheapDirent, FileInfo, InodeAttrCookie, MountSource};
@@ -668,6 +671,8 @@ struct DirCacheEntry {
 }
 
 pub struct RatarmountFs {
+    oplog: Arc<oplog::OpLog>,
+    activity: oplog::MountActivity,
     passthrough: PassthroughOptions,
     passthrough_enabled: bool,
     #[cfg(all(test, target_os = "linux"))]
@@ -765,6 +770,8 @@ impl RatarmountFs {
         path_to_ino.insert("/".into(), FUSE_ROOT_ID);
         let readahead_bytes = usize::try_from(clamp_readahead(readahead)).unwrap_or(usize::MAX);
         Self {
+            oplog: Arc::new(oplog::OpLog::default()),
+            activity: oplog::MountActivity::default(),
             passthrough: PassthroughOptions::default(),
             passthrough_enabled: false,
             #[cfg(all(test, target_os = "linux"))]
@@ -799,6 +806,185 @@ impl RatarmountFs {
             #[cfg(test)]
             park_fd_drops: Mutex::new(None),
         }
+    }
+
+    /// Configure root status and optional operation journaling after daemonization.
+    pub fn with_activity(
+        mut self,
+        mount: &Path,
+        activity: oplog::MountActivity,
+    ) -> std::io::Result<Self> {
+        if let Some(options) = &activity.journal {
+            let mut metadata = activity.metadata.clone();
+            if let Some(overlay) = &self.overlay {
+                for key in ["base_digest", "stack_digest"] {
+                    if let Some(value) = overlay.meta_value(key).map_err(std::io::Error::other)? {
+                        metadata.insert(key.into(), value);
+                    }
+                }
+            }
+            self.oplog = oplog::OpLog::open(
+                options,
+                mount,
+                self.overlay.as_ref().map(|ov| ov.root()),
+                &metadata,
+            )?;
+            if let Some(overlay) = &self.overlay {
+                overlay
+                    .set_meta(
+                        "journal_path",
+                        &self.oplog.path().unwrap().to_string_lossy(),
+                    )
+                    .map_err(std::io::Error::other)?;
+            }
+            self.passthrough.mode = PassthroughMode::Off;
+        }
+        if let Some(rules) = &activity.readonly {
+            self.oplog.attach_rules(rules);
+        }
+        self.activity = activity;
+        Ok(self)
+    }
+
+    fn journal_path(&self, ino: u64) -> String {
+        self.path_for_ino(ino).unwrap_or_default()
+    }
+
+    fn journal_child(&self, parent: u64, name: &OsStr) -> String {
+        self.path_for_ino(parent)
+            .zip(name.to_str())
+            .map(|(parent, name)| join_path(&parent, name))
+            .unwrap_or_default()
+    }
+
+    fn journal_open(&self, req: &Request, ino: u64, fh: u64, flags: i32) {
+        let path = self.journal_path(ino);
+        let layer = self.journal_layer(&path);
+        self.oplog.opened(fh, &path, flags, caller(req), layer);
+    }
+
+    fn journal_layer(&self, path: &str) -> String {
+        if let Some(overlay) = &self.overlay {
+            if overlay.has_file(path) {
+                "top".into()
+            } else {
+                overlay
+                    .base_serving_layer(path)
+                    .unwrap_or(ratarmount_compositing::LayerIndex::Base)
+                    .to_string()
+            }
+        } else {
+            ratarmount_compositing::serving_layer(self.source.as_ref(), path)
+                .unwrap_or(ratarmount_compositing::LayerIndex::Base)
+                .to_string()
+        }
+    }
+
+    fn journal_mutation<T>(
+        &self,
+        req: &Request,
+        op: &str,
+        path: &str,
+        to: Option<&str>,
+        call: impl FnOnce() -> Result<T, i32>,
+    ) -> Result<T, i32> {
+        let result = self.oplog.observe(caller(req), op, path, call);
+        if result.is_ok() {
+            self.oplog.record(op, path, caller(req), to);
+        }
+        result
+    }
+
+    fn root_status(&self, key: &str) -> Result<Option<Vec<u8>>, i32> {
+        if !oplog::STATUS_KEYS.contains(&key) {
+            return Ok(None);
+        }
+        let meta = |key| -> Result<String, i32> {
+            if let Some(overlay) = &self.overlay {
+                return overlay
+                    .meta_value(key)
+                    .map(|s| s.unwrap_or_default())
+                    .map_err(|e| overlay_errno(&e));
+            }
+            Ok(self.activity.metadata.get(key).cloned().unwrap_or_default())
+        };
+        let value = match key {
+            "user.ratarmount.base_digest" => meta("base_digest")?,
+            "user.ratarmount.base_digest_state" => {
+                if self.overlay.is_some() {
+                    ratarmount_compositing::base_digest_state(
+                        Some(meta("base_digest_kind")?.as_str()).filter(|k| !k.is_empty()),
+                        &meta("base_digest")?,
+                    )
+                    .into()
+                } else {
+                    match meta("base_digest_state")? {
+                        state if state.is_empty() => "none".into(),
+                        state => state,
+                    }
+                }
+            }
+            "user.ratarmount.stack_digest" => meta("stack_digest")?,
+            "user.ratarmount.sealed" => if meta("sealed_at")?.is_empty() {
+                "0"
+            } else {
+                "1"
+            }
+            .into(),
+            "user.ratarmount.layers" => {
+                let layers = meta("lower_layers")?;
+                if layers.is_empty() {
+                    "[]".into()
+                } else {
+                    layers
+                }
+            }
+            "user.ratarmount.journal" => self
+                .oplog
+                .path()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            "user.ratarmount.stats" => self.oplog.stats(self.activity.quota.as_deref()).to_string(),
+            _ => unreachable!(),
+        };
+        Ok(Some(value.into_bytes()))
+    }
+
+    fn root_control(&self, ino: u64, name: &str, value: &[u8]) -> Option<Result<(), i32>> {
+        if ino != FUSE_ROOT_ID || !name.starts_with("user.ratarmount.") {
+            return None;
+        }
+        Some(if name == "user.ratarmount.mark" {
+            self.oplog.mark(value)
+        } else {
+            Err(libc::EPERM)
+        })
+    }
+
+    fn symlink_entry(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        target: &Path,
+    ) -> Result<(Duration, FileAttr), i32> {
+        let path = self.overlay_child_path(parent, name)?;
+        let target = target.to_str().ok_or(EILSEQ)?;
+        let name = utf8_name(name)?;
+        let overlay = self.overlay.as_ref().ok_or(EROFS)?;
+        overlay
+            .create_symlink(&path, target)
+            .map_err(|e| overlay_errno(&e))?;
+        let fi = self.source.lookup(&path, 0).ok_or(EIO)?;
+        self.note_dir_changed(parent, name);
+        if let Some(parent_path) = self.path_for_ino(parent) {
+            self.invalidate_dir_cache(&parent_path);
+        }
+        let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
+        self.bump_nlookup(ino);
+        Ok((
+            self.reply_entry_ttl(parent, name, ino, &fi),
+            self.mapped_file_attr(ino, &fi),
+        ))
     }
 
     /// Override reported ownership and mask permissions without changing stored metadata.
@@ -1381,11 +1567,12 @@ impl RatarmountFs {
 
     /// Overlay path for `parent`/`name`, or the errno to reply.
     fn overlay_child_path(&self, parent: u64, name: &OsStr) -> Result<String, i32> {
+        let name = utf8_name(name)?;
         if self.overlay.is_none() {
             return Err(EROFS);
         }
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
-        Ok(join_path(&parent_path, &name.to_string_lossy()))
+        Ok(join_path(&parent_path, name))
     }
 
     fn create_masked_entry(
@@ -1417,7 +1604,7 @@ impl RatarmountFs {
     ) -> Result<(Duration, FileAttr, u64), i32> {
         let path = self.overlay_child_path(parent, name)?;
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
-        let name = name.to_string_lossy();
+        let name = utf8_name(name)?;
         let ov = self.overlay.as_ref().ok_or(EROFS)?;
         let fd = ov.create_file(&path, mode).map_err(|e| {
             debug!("create: {e}");
@@ -1434,7 +1621,7 @@ impl RatarmountFs {
         });
         // Drop a previously cached archive member before the new
         // overlay FileInfo replaces it, or the kernel keeps 60s attrs.
-        self.note_dir_changed(parent, &name);
+        self.note_dir_changed(parent, name);
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
         self.invalidate_dir_cache(&parent_path);
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
@@ -1442,7 +1629,7 @@ impl RatarmountFs {
             .lock()
             .unwrap()
             .insert(fh, OpenBackend::OverlayFd(fd));
-        let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
+        let ttl = self.reply_entry_ttl(parent, name, ino, &fi);
         self.bump_nlookup(ino);
         Ok((ttl, self.mapped_file_attr(ino, &fi), fh))
     }
@@ -1456,7 +1643,7 @@ impl RatarmountFs {
     ) -> Result<(Duration, FileAttr), i32> {
         let path = self.overlay_child_path(parent, name)?;
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
-        let name = name.to_string_lossy();
+        let name = utf8_name(name)?;
         let ov = self.overlay.as_ref().ok_or(EROFS)?;
         ov.mkdir(&path, mode).map_err(|e| {
             debug!("mkdir: {e}");
@@ -1471,19 +1658,20 @@ impl RatarmountFs {
             gid: unsafe { libc::getegid() },
             userdata: vec![],
         });
-        self.note_dir_changed(parent, &name);
+        self.note_dir_changed(parent, name);
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
         self.invalidate_dir_cache(&parent_path);
-        let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
+        let ttl = self.reply_entry_ttl(parent, name, ino, &fi);
         self.bump_nlookup(ino);
         Ok((ttl, self.mapped_file_attr(ino, &fi)))
     }
 
     /// Body of `unlink` / `rmdir`, replying-free so it can be unit-tested.
     fn remove_entry(&self, parent: u64, name: &OsStr, dir: bool) -> Result<(), i32> {
+        let valid_name = name.to_str().ok_or(ENOENT)?;
         let path = self.overlay_child_path(parent, name)?;
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
-        let name = name.to_string_lossy();
+        let name = valid_name;
         let ov = self.overlay.as_ref().ok_or(EROFS)?;
         if dir {
             // Directories are not parked. A held directory fd can still
@@ -1493,7 +1681,7 @@ impl RatarmountFs {
                 overlay_errno(&e)
             })?;
             self.invalidate_dir_cache(&parent_path);
-            self.note_dir_changed(parent, &name);
+            self.note_dir_changed(parent, name);
             return Ok(());
         }
         // Snapshot before unlink: afterwards the name is a tombstone.
@@ -1508,7 +1696,7 @@ impl RatarmountFs {
         self.invalidate_dir_cache(&parent_path);
         // While path_to_ino still maps the name, so a 60s member still gets
         // its Entry + Inode from attr_advertised.
-        self.note_dir_changed(parent, &name);
+        self.note_dir_changed(parent, name);
         self.detach_unlinked(&path, ino, parked, snap, xattrs);
         self.mark_source_handles_detached(&path);
         Ok(())
@@ -1609,16 +1797,21 @@ impl RatarmountFs {
 
     /// FUSE `rename` body: run [`Self::rename_paths`], hand the result to
     /// `reply`, then (on success) flush the queued invalidations.
+    #[cfg(test)]
     fn rename_reply(
         &self,
         parent: u64,
-        name: &str,
+        name: &OsStr,
         newparent: u64,
-        newname: &str,
+        newname: &OsStr,
         flags: u32,
         reply: impl FnOnce(Result<(), i32>),
     ) {
-        let result = self.rename_paths(parent, name, newparent, newname, flags);
+        let result = (|| {
+            let name = utf8_name(name)?;
+            let newname = utf8_name(newname)?;
+            self.rename_paths(parent, name, newparent, newname, flags)
+        })();
         let ok = result.is_ok();
         reply(result);
         if ok {
@@ -2018,11 +2211,11 @@ impl RatarmountFs {
     /// entry TTL is recorded by [`Self::reply_entry_ttl`].
     fn lookup_entry(&self, parent: u64, name: &OsStr) -> Option<(u64, FileAttr, Duration)> {
         let parent_path = self.path_for_ino(parent)?;
-        let name = name.to_string_lossy();
-        let path = join_path(&parent_path, name.as_ref());
+        let name = name.to_str()?;
+        let path = join_path(&parent_path, name);
         let fi = self.lookup_file_info(&path)?;
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
-        let ttl = self.reply_entry_ttl(parent, name.as_ref(), ino, &fi);
+        let ttl = self.reply_entry_ttl(parent, name, ino, &fi);
         self.bump_nlookup(ino);
         Some((ino, self.mapped_file_attr(ino, &fi), ttl))
     }
@@ -2148,7 +2341,7 @@ impl RatarmountFs {
             return self.open_detached(ino, flags);
         }
         let path = self.path_for_ino(ino).ok_or(ENOENT)?;
-        let write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+        let write = (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC)) != 0;
         // Writes always go to the overlay; reads of files that exist in the overlay
         // must also use the overlay FD (not the base archive). Previously RO open
         // used a cached size-0 FileInfo → Empty backend, so write-then-cat returned "".
@@ -2204,7 +2397,7 @@ impl RatarmountFs {
     /// A new write open is `EACCES`. Does not call `open_overlay_fd` (that
     /// takes `commit_gate`, which is not reentrant with park).
     fn open_detached(&self, ino: u64, flags: i32) -> Result<(u64, u32), i32> {
-        let write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+        let write = (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC)) != 0;
         if write {
             return Err(EACCES);
         }
@@ -2434,6 +2627,9 @@ impl RatarmountFs {
 
     /// `GETXATTR` body. `Ok(None)` is ENODATA / ENOATTR.
     fn xattr_value(&self, ino: u64, key: &str) -> Result<Option<Vec<u8>>, i32> {
+        if ino == FUSE_ROOT_ID && oplog::STATUS_KEYS.contains(&key) {
+            return self.root_status(key);
+        }
         if let Some(detached) = self
             .inodes
             .lock()
@@ -2455,6 +2651,16 @@ impl RatarmountFs {
 
     /// `LISTXATTR` body.
     fn xattr_list(&self, ino: u64) -> Result<Vec<String>, i32> {
+        let mut keys = self.source_xattr_list(ino)?;
+        if ino == FUSE_ROOT_ID {
+            keys.extend(oplog::STATUS_KEYS.iter().map(|s| (*s).to_owned()));
+            keys.sort();
+            keys.dedup();
+        }
+        Ok(keys)
+    }
+
+    fn source_xattr_list(&self, ino: u64) -> Result<Vec<String>, i32> {
         if let Some(detached) = self
             .inodes
             .lock()
@@ -2564,6 +2770,11 @@ fn file_info_attr_stable(fi: &FileInfo) -> bool {
             .userdata
             .iter()
             .any(|u| matches!(u, ratarmount_core::UserData::Other(s) if s.starts_with("overlay:")))
+}
+
+/// Names entering the string-based overlay must retain their exact bytes.
+fn utf8_name(name: &OsStr) -> Result<&str, i32> {
+    name.to_str().ok_or(EILSEQ)
 }
 
 fn join_path(parent: &str, name: &str) -> String {
@@ -2793,6 +3004,14 @@ fn raise_nofile_soft_to_hard() {
     }
 }
 
+fn caller(req: &Request) -> oplog::Caller {
+    oplog::Caller {
+        pid: req.pid(),
+        uid: req.uid(),
+        gid: req.gid(),
+    }
+}
+
 impl Filesystem for RatarmountFs {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         raise_nofile_soft_to_hard();
@@ -2865,6 +3084,9 @@ impl Filesystem for RatarmountFs {
     }
 
     fn destroy(&mut self) {
+        if let Err(error) = self.oplog.finish() {
+            log::error!("operation journal unmount: {error}");
+        }
         info!(
             "fuse-read-summary requests={} requested_bytes={} max_request={} service_ns={}",
             self.read_requests.load(Ordering::Relaxed),
@@ -2892,11 +3114,33 @@ impl Filesystem for RatarmountFs {
         }
     }
 
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if self.path_for_ino(ino.0).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.oplog.opendir(fh);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.oplog.releasedir(fh.0);
+        reply.ok();
+    }
+
     fn readdir(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
@@ -2909,6 +3153,7 @@ impl Filesystem for RatarmountFs {
             return;
         };
 
+        self.oplog.readdir(fh.0, &path, entries.len());
         let mut full: Vec<(u64, FileType, String)> = Vec::new();
         full.push((ino.0, FileType::Directory, ".".into()));
         full.push((
@@ -2949,7 +3194,7 @@ impl Filesystem for RatarmountFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
@@ -2959,14 +3204,29 @@ impl Filesystem for RatarmountFs {
         match self.readdirplus_fill(ino.0, offset, |cino, off, name, ttl, attr| {
             reply.add(INodeNo(cino), off, name, ttl, attr, Generation(0))
         }) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                let path = self.journal_path(ino.0);
+                if let Some(entries) = self.list_mode_cached(&path) {
+                    self.oplog.readdir(fh.0, &path, entries.len());
+                }
+                reply.ok();
+            }
             Err(errno) => reply.error(Errno::from_i32(errno)),
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        match self.open_inode(ino.0, flags.0) {
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        match self
+            .oplog
+            .observe(caller(req), "open", &self.journal_path(ino.0), || {
+                self.open_inode(ino.0, flags.0)
+            }) {
             Ok((fh, open_flags)) => {
+                self.journal_open(req, ino.0, fh, flags.0);
+                if flags.0 & libc::O_TRUNC != 0 {
+                    self.oplog
+                        .record("truncate", &self.journal_path(ino.0), caller(req), None);
+                }
                 #[cfg(target_os = "linux")]
                 if let Some(backing) = self.open_backing(ino.0, fh, flags.0, &reply) {
                     // KEEP_CACHE is invalid with PASSTHROUGH. The backing file
@@ -3005,7 +3265,10 @@ impl Filesystem for RatarmountFs {
             .fetch_max(u64::from(size), Ordering::Relaxed);
         let start = std::time::Instant::now();
         match self.read_handle(fh.0, (offset as i64).max(0), size) {
-            Ok(buf) => reply.data(&buf),
+            Ok(buf) => {
+                self.oplog.io(fh.0, offset, buf.len() as u64, false);
+                reply.data(&buf);
+            }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
         self.read_service_ns
@@ -3014,7 +3277,7 @@ impl Filesystem for RatarmountFs {
 
     fn write(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -3024,9 +3287,14 @@ impl Filesystem for RatarmountFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.write_handle(ino.0, fh.0, (offset as i64).max(0), data) {
+        match self
+            .oplog
+            .observe(caller(req), "write", &self.journal_path(ino.0), || {
+                self.write_handle(ino.0, fh.0, (offset as i64).max(0), data)
+            }) {
             Err(e) => reply.error(Errno::from_i32(e)),
             Ok(n) => {
+                self.oplog.io(fh.0, offset, n as u64, true);
                 self.drop_stable_attr(ino.0);
                 reply.written(n as u32);
                 self.flush_kernel_invals();
@@ -3036,16 +3304,23 @@ impl Filesystem for RatarmountFs {
 
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
-        match self.create_masked_entry(parent.0, name, mode, umask) {
+        match self.journal_mutation(
+            req,
+            "create",
+            &self.journal_child(parent.0, name),
+            None,
+            || self.create_masked_entry(parent.0, name, mode, umask),
+        ) {
             Ok((ttl, attr, fh)) => {
+                self.journal_open(req, attr.ino.0, fh, flags);
                 reply.created(
                     &ttl,
                     &attr,
@@ -3061,7 +3336,7 @@ impl Filesystem for RatarmountFs {
 
     fn mknod(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -3069,11 +3344,21 @@ impl Filesystem for RatarmountFs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        if let Err(errno) = utf8_name(name) {
+            reply.error(Errno::from_i32(errno));
+            return;
+        }
         if mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFREG {
             reply.error(Errno::EOPNOTSUPP);
             return;
         }
-        match self.create_masked_entry(parent.0, name, mode, umask) {
+        match self.journal_mutation(
+            req,
+            "create",
+            &self.journal_child(parent.0, name),
+            None,
+            || self.create_masked_entry(parent.0, name, mode, umask),
+        ) {
             Ok((ttl, attr, fh)) => {
                 if let Some(OpenBackend::OverlayFd(fd)) = self.handles.lock().unwrap().remove(&fh) {
                     self.overlay.as_ref().unwrap().close_overlay_fd(fd);
@@ -3087,14 +3372,20 @@ impl Filesystem for RatarmountFs {
 
     fn mkdir(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
         reply: ReplyEntry,
     ) {
-        match self.mkdir_masked_entry(parent.0, name, mode, umask) {
+        match self.journal_mutation(
+            req,
+            "mkdir",
+            &self.journal_child(parent.0, name),
+            None,
+            || self.mkdir_masked_entry(parent.0, name, mode, umask),
+        ) {
             Ok((ttl, attr)) => {
                 reply.entry(&ttl, &attr, Generation(0));
                 self.flush_kernel_invals();
@@ -3103,8 +3394,14 @@ impl Filesystem for RatarmountFs {
         }
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.remove_entry(parent.0, name, false) {
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.journal_mutation(
+            req,
+            "unlink",
+            &self.journal_child(parent.0, name),
+            None,
+            || self.remove_entry(parent.0, name, false),
+        ) {
             Ok(()) => {
                 reply.ok();
                 self.flush_kernel_invals();
@@ -3113,19 +3410,61 @@ impl Filesystem for RatarmountFs {
         }
     }
 
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.remove_entry(parent.0, name, true) {
+    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.journal_mutation(
+            req,
+            "rmdir",
+            &self.journal_child(parent.0, name),
+            None,
+            || self.remove_entry(parent.0, name, true),
+        ) {
             Ok(()) => {
                 reply.ok();
                 self.flush_kernel_invals();
             }
             Err(errno) => reply.error(Errno::from_i32(errno)),
         }
+    }
+
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        match self.journal_mutation(
+            req,
+            "symlink",
+            &self.journal_child(parent.0, link_name),
+            None,
+            || self.symlink_entry(parent.0, link_name, target),
+        ) {
+            Ok((ttl, attr)) => {
+                reply.entry(&ttl, &attr, Generation(0));
+                self.flush_kernel_invals();
+            }
+            Err(errno) => reply.error(Errno::from_i32(errno)),
+        }
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::from_i32(
+            utf8_name(newname).err().unwrap_or(libc::EPERM),
+        ));
     }
 
     fn rename(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -3133,22 +3472,27 @@ impl Filesystem for RatarmountFs {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        self.rename_reply(
-            parent.0,
-            &name.to_string_lossy(),
-            newparent.0,
-            &newname.to_string_lossy(),
-            flags.bits(),
-            |result| match result {
-                Ok(()) => reply.ok(),
-                Err(errno) => reply.error(Errno::from_i32(errno)),
-            },
-        );
+        let path = self.journal_child(parent.0, name);
+        let to = self.journal_child(newparent.0, newname);
+        let result = self.journal_mutation(req, "rename", &path, Some(&to), || {
+            self.rename_paths(
+                parent.0,
+                utf8_name(name)?,
+                newparent.0,
+                utf8_name(newname)?,
+                flags.bits(),
+            )
+        });
+        match result {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(Errno::from_i32(errno)),
+        }
+        self.flush_kernel_invals();
     }
 
     fn setattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -3172,8 +3516,21 @@ impl Filesystem for RatarmountFs {
             atime: atime.map(|t| setattr_time(t, now)),
             mtime: mtime.map(|t| setattr_time(t, now)),
         };
-        match self.setattr_metadata_entry(ino.0, size, fh.map(|fh| fh.0), &attrs) {
+        match self.oplog.observe(
+            caller(req),
+            if size.is_some() { "truncate" } else { "chmod" },
+            &self.journal_path(ino.0),
+            || self.setattr_metadata_entry(ino.0, size, fh.map(|fh| fh.0), &attrs),
+        ) {
             Ok((ttl, attr)) => {
+                if size.is_some() {
+                    self.oplog
+                        .record("truncate", &self.journal_path(ino.0), caller(req), None);
+                }
+                if mode.is_some() {
+                    self.oplog
+                        .record("chmod", &self.journal_path(ino.0), caller(req), None);
+                }
                 reply.attr(&ttl, &attr);
                 self.flush_kernel_invals();
             }
@@ -3202,6 +3559,7 @@ impl Filesystem for RatarmountFs {
                 }
             }
         }
+        self.oplog.released(fh.0);
         reply.ok();
     }
 
@@ -3216,7 +3574,7 @@ impl Filesystem for RatarmountFs {
 
     fn setxattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         name: &OsStr,
         value: &[u8],
@@ -3224,49 +3582,62 @@ impl Filesystem for RatarmountFs {
         position: u32,
         reply: ReplyEmpty,
     ) {
-        let result = (|| {
-            if position != 0 {
-                return Err(EINVAL);
-            }
-            let overlay = self.overlay.as_ref().ok_or(EROFS)?;
-            let path = self.path_for_ino(ino.0).ok_or(EACCES)?;
-            let name = name.to_str().ok_or(EINVAL)?;
-            // macFUSE passes the native CREATE=2/REPLACE=4 bits; the storage API
-            // uses the Linux CREATE=1/REPLACE=2 encoding on every platform.
-            #[cfg(target_os = "macos")]
-            let flags = match flags {
-                0 => 0,
-                libc::XATTR_CREATE => 1,
-                libc::XATTR_REPLACE => 2,
-                _ => return Err(EINVAL),
-            };
-            overlay
-                .set_xattr(&path, name, value, flags)
-                .map_err(|e| match &e {
-                    ratarmount_compositing::OverlayError::Io(e) => {
-                        e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
-                    }
-                    _ => EIO,
-                })
-        })();
+        let result = self
+            .oplog
+            .observe(caller(req), "setxattr", &self.journal_path(ino.0), || {
+                if position != 0 {
+                    return Err(EINVAL);
+                }
+                let name = name.to_str().ok_or(EILSEQ)?;
+                if let Some(result) = self.root_control(ino.0, name, value) {
+                    return result;
+                }
+                let overlay = self.overlay.as_ref().ok_or(EROFS)?;
+                let path = self.path_for_ino(ino.0).ok_or(EACCES)?;
+                // macFUSE passes the native CREATE=2/REPLACE=4 bits; the storage API
+                // uses the Linux CREATE=1/REPLACE=2 encoding on every platform.
+                #[cfg(target_os = "macos")]
+                let flags = match flags {
+                    0 => 0,
+                    libc::XATTR_CREATE => 1,
+                    libc::XATTR_REPLACE => 2,
+                    _ => return Err(EINVAL),
+                };
+                overlay
+                    .set_xattr(&path, name, value, flags)
+                    .map_err(|e| match &e {
+                        ratarmount_compositing::OverlayError::Io(e) => {
+                            e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
+                        }
+                        _ => EIO,
+                    })
+            });
         match result {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
-    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let result = (|| {
-            let overlay = self.overlay.as_ref().ok_or(EROFS)?;
-            let path = self.path_for_ino(ino.0).ok_or(EACCES)?;
-            let name = name.to_str().ok_or(EINVAL)?;
-            overlay.remove_xattr(&path, name).map_err(|e| match &e {
-                ratarmount_compositing::OverlayError::Io(e) => {
-                    e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let result = self.oplog.observe(
+            caller(req),
+            "removexattr",
+            &self.journal_path(ino.0),
+            || {
+                let name = name.to_str().ok_or(EILSEQ)?;
+                if ino.0 == FUSE_ROOT_ID && name.starts_with("user.ratarmount.") {
+                    return Err(libc::EPERM);
                 }
-                _ => EIO,
-            })
-        })();
+                let overlay = self.overlay.as_ref().ok_or(EROFS)?;
+                let path = self.path_for_ino(ino.0).ok_or(EACCES)?;
+                overlay.remove_xattr(&path, name).map_err(|e| match &e {
+                    ratarmount_compositing::OverlayError::Io(e) => {
+                        e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
+                    }
+                    _ => EIO,
+                })
+            },
+        );
         match result {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
@@ -3380,6 +3751,10 @@ fn mount_option_from_str(s: &str) -> MountOption {
 }
 
 /// Preserve the libfuse option and access policy used before fuser 0.18.
+fn activity_mount_config(writable: bool, extra_fuse_opts: &str, root_controls: bool) -> Config {
+    mount_config(writable || root_controls, extra_fuse_opts)
+}
+
 fn mount_config(writable: bool, extra_fuse_opts: &str) -> Config {
     let mut options = vec![MountOption::FSName("ratarmount".into()), MountOption::Exec];
     if !writable {
@@ -3535,24 +3910,61 @@ pub fn mount_blocking_with_io_options(
     overlay: Option<Arc<WriteOverlay>>,
     extra_fuse_opts: &str,
     readahead: u64,
-    mut passthrough: PassthroughOptions,
+    passthrough: PassthroughOptions,
     direct_io: bool,
 ) -> std::io::Result<()> {
-    if direct_io {
+    mount_blocking_with_activity(
+        source,
+        mountpoint,
+        foreground,
+        writable,
+        overlay,
+        extra_fuse_opts,
+        readahead,
+        passthrough,
+        direct_io,
+        oplog::MountActivity::default(),
+    )
+}
+
+/// Mount with root status and an optional operation journal. Starts its writer after fork.
+#[allow(clippy::too_many_arguments)]
+pub fn mount_blocking_with_activity(
+    source: Arc<dyn MountSource>,
+    mountpoint: impl AsRef<Path>,
+    foreground: bool,
+    writable: bool,
+    overlay: Option<Arc<WriteOverlay>>,
+    extra_fuse_opts: &str,
+    readahead: u64,
+    mut passthrough: PassthroughOptions,
+    direct_io: bool,
+    activity: oplog::MountActivity,
+) -> std::io::Result<()> {
+    if direct_io || activity.journal.is_some() {
         passthrough.mode = PassthroughMode::Off;
     }
     let mapping = AttributeMapping::parse(extra_fuse_opts)
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     validate_allow_other(extra_fuse_opts)?;
-    let config = mount_config(writable, extra_fuse_opts);
+    // A read-only mount stays kernel `ro` unless it journals: only then must a
+    // root `user.ratarmount.mark` SETXATTR reach the frontend. Data mutation
+    // without an overlay still returns EROFS there.
+    let config = activity_mount_config(
+        writable,
+        extra_fuse_opts,
+        overlay.is_none() && activity.journal.is_some(),
+    );
     let _ = foreground;
     // Idempotent with `Filesystem::init`. In place before `Session::new`.
     raise_nofile_soft_to_hard();
     let mut fs = RatarmountFs::with_readahead(source, overlay, readahead)
         .with_passthrough(passthrough)
         .with_attribute_mapping(mapping)
-        .with_direct_io(direct_io);
-    fs.passthrough_readonly_mount = config.mount_options.contains(&MountOption::RO);
+        .with_direct_io(direct_io)
+        .with_activity(mountpoint.as_ref(), activity)?;
+    let oplog = fs.oplog.clone();
+    fs.passthrough_readonly_mount = !writable || config.mount_options.contains(&MountOption::RO);
     // `mount` does not hand back `Session::notifier`. The notifier thread
     // must exist before `run` so a shadowed archive member can drop a 60s
     // kernel cache, and so those writes never run on the request thread.
@@ -3576,7 +3988,8 @@ pub fn mount_blocking_with_io_options(
     let res = fuse_session_result(session.run());
     kernel_notify.clear();
     let _ = notifier_thread.join();
-    res
+    let journal_result = oplog.finish();
+    res.and(journal_result)
 }
 
 pub fn unmount(mountpoint: impl AsRef<Path>) -> std::io::Result<()> {
@@ -3874,7 +4287,7 @@ mod tests {
         }
         let td = tempfile::tempdir().unwrap();
         let quota = Arc::new(Quota(AtomicU64::new(0)));
-        let mut ov = WriteOverlay::new(Arc::new(EmptyBase), td.path()).unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(EmptyBase), td.path()).unwrap();
         ov.set_policy(Some(quota.clone()));
         ov.close_overlay_fd(ov.create_file("/file", 0o644).unwrap());
         let ov = Arc::new(ov);
@@ -3905,7 +4318,8 @@ mod tests {
     #[test]
     fn regression_write_handle_keeps_legacy_eio() {
         let td = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(Arc::new(EmptyBase), td.path()).unwrap());
+        let ov =
+            Arc::new(crate::test_overlay::new_overlay(Arc::new(EmptyBase), td.path()).unwrap());
         ov.close_overlay_fd(ov.create_file("/file", 0o644).unwrap());
         let fs = RatarmountFs::new(ov.clone(), Some(ov));
         let ino = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("file")).unwrap().0;
@@ -3943,7 +4357,7 @@ mod tests {
         }
         let td = tempfile::tempdir().unwrap();
         let probe = Arc::new(Probe(Mutex::new(std::sync::Weak::new())));
-        let mut ov = WriteOverlay::new(Arc::new(EmptyBase), td.path()).unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(EmptyBase), td.path()).unwrap();
         ov.close_overlay_fd(ov.create_file("/file", 0o644).unwrap());
         ov.set_policy(Some(probe.clone()));
         let ov = Arc::new(ov);
@@ -4020,7 +4434,8 @@ mod tests {
     #[test]
     fn passthrough_overlay_policy_keeps_writable_mount_on_daemon() {
         let dir = tempfile::tempdir().unwrap();
-        let mut overlay = WriteOverlay::new(Arc::new(EmptyBase), dir.path()).unwrap();
+        let mut overlay =
+            crate::test_overlay::new_overlay(Arc::new(EmptyBase), dir.path()).unwrap();
         let fd = overlay.create_file("/file", 0o644).unwrap();
         overlay.close_overlay_fd(fd);
         std::fs::write(dir.path().join("file"), b"payload").unwrap();
@@ -4062,7 +4477,7 @@ mod tests {
     #[test]
     fn regression_overlay_policy_denials() {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(EmptyBase), td.path()).unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(EmptyBase), td.path()).unwrap();
         ov.mkdir("/locked", 0o755).unwrap();
         ov.mkdir("/locked/empty", 0o755).unwrap();
         for path in ["/locked/file", "/outside", "/quota"] {
@@ -4364,13 +4779,12 @@ mod tests {
     /// from the inode cache (write-then-cat / stat returned empty size).
     #[test]
     fn overlay_file_info_for_ino_refreshes_size_after_write() {
-        use ratarmount_compositing::WriteOverlay;
         use std::io::Write;
         use std::os::unix::io::FromRawFd;
 
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         // Create empty file (size 0) then write payload — same sequence as FUSE create+write.
         let fd = ov.create_file("/new.txt", 0o644).expect("create");
         let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -4435,13 +4849,12 @@ mod tests {
     /// skips `has_file` and goes `file_info_for_open` + `open_source_backend`.
     #[test]
     fn overlay_open_after_create_write() {
-        use ratarmount_compositing::WriteOverlay;
         use std::io::Write;
         use std::os::unix::io::FromRawFd;
 
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fd = ov.create_file("/new.txt", 0o644).expect("create");
         let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
         f.write_all(b"hello-overlay-payload").unwrap();
@@ -4474,12 +4887,11 @@ mod tests {
     /// production open/read must return "".
     #[test]
     fn overlay_open_after_create_reads_empty() {
-        use ratarmount_compositing::WriteOverlay;
         use std::os::unix::io::FromRawFd;
 
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fd = ov.create_file("/empty.txt", 0o644).expect("create");
         drop(unsafe { std::fs::File::from_raw_fd(fd) });
 
@@ -4502,13 +4914,12 @@ mod tests {
     /// FileInfo (and never both `Some`).
     #[test]
     fn overlay_store_cookie_without_file_info() {
-        use ratarmount_compositing::WriteOverlay;
         use std::io::Write;
         use std::os::unix::io::FromRawFd;
 
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fd = ov.create_file("/cookie.txt", 0o644).expect("create");
         let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
         f.write_all(b"payload").unwrap();
@@ -4543,7 +4954,6 @@ mod tests {
     /// write still drops that cache so the next stat sees the overlay size.
     #[test]
     fn overlay_archive_member_stat_skips_repeat_lookup() {
-        use ratarmount_compositing::WriteOverlay;
         use std::sync::atomic::{AtomicU64, Ordering};
 
         struct CountingTar {
@@ -4614,7 +5024,7 @@ mod tests {
             lookups: Arc::clone(&lookups),
             opens: Arc::clone(&opens),
         }) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -4917,7 +5327,7 @@ mod tests {
     fn regression_direct_io_member_flags_leave_overlay_cached() {
         let source = OffsetShiftSource::two_members(b"archive", b"other");
         let dir = tempfile::tempdir().unwrap();
-        let ov = Arc::new(WriteOverlay::new(source, dir.path()).unwrap());
+        let ov = Arc::new(crate::test_overlay::new_overlay(source, dir.path()).unwrap());
         let fs = RatarmountFs::new(ov.clone(), Some(ov.clone())).with_direct_io(true);
         let ino = fs.ino_for_path("/a.txt");
         let (fh, flags) = fs.open_inode(ino, libc::O_RDONLY).unwrap();
@@ -5062,12 +5472,66 @@ mod tests {
     fn overlay_fs_for_rename() -> (tempfile::TempDir, Arc<WriteOverlay>, RatarmountFs) {
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
         );
         (dir, ov, fs)
+    }
+
+    /// Regression: distinct Latin-1 names must not collapse to a replacement character.
+    #[test]
+    fn regression_non_utf8_name_path_join_and_create() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        for bytes in [b"caf\xe9".as_slice(), b"caf\xe8".as_slice()] {
+            let name = OsStr::from_bytes(bytes);
+            assert_eq!(utf8_name(name), Err(EILSEQ));
+            assert_eq!(fs.overlay_child_path(FUSE_ROOT_ID, name), Err(EILSEQ));
+            assert_eq!(
+                fs.create_masked_entry(FUSE_ROOT_ID, name, 0o644, 0)
+                    .unwrap_err(),
+                EILSEQ
+            );
+            assert_eq!(
+                fs.mkdir_masked_entry(FUSE_ROOT_ID, name, 0o755, 0)
+                    .unwrap_err(),
+                EILSEQ
+            );
+        }
+        assert!(ov.lookup("/caf�", 0).is_none());
+        let name = OsStr::new("café");
+        assert_eq!(utf8_name(name), Ok("café"));
+        assert_eq!(fs.overlay_child_path(FUSE_ROOT_ID, name).unwrap(), "/café");
+        assert_eq!(join_path("/dir", utf8_name(name).unwrap()), "/dir/café");
+    }
+
+    /// Regression: invalid lookup/remove/rename names must never alias an existing U+FFFD entry.
+    #[test]
+    fn regression_non_utf8_name_no_lossy_lookup_remove_or_rename() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/caf�", b"keep");
+        overlay_write_new(&ov, "/source", b"source");
+        let invalid = OsStr::from_bytes(b"caf\xe9");
+        assert!(fs.lookup_entry(FUSE_ROOT_ID, invalid).is_none());
+        for dir in [false, true] {
+            assert_eq!(fs.remove_entry(FUSE_ROOT_ID, invalid, dir), Err(ENOENT));
+        }
+        for (from, to) in [
+            (invalid, OsStr::new("dest")),
+            (OsStr::new("source"), invalid),
+        ] {
+            fs.rename_reply(FUSE_ROOT_ID, from, FUSE_ROOT_ID, to, 0, |result| {
+                assert_eq!(result, Err(EILSEQ));
+            });
+        }
+        assert!(ov.lookup("/caf�", 0).is_some());
+        assert!(ov.lookup("/source", 0).is_some());
+        assert!(ov.lookup("/dest", 0).is_none());
     }
 
     fn overlay_write_new(ov: &WriteOverlay, path: &str, body: &[u8]) {
@@ -5253,11 +5717,9 @@ mod tests {
     /// Symptom: create file under parent, then ls misses the new name until TTL expires.
     #[test]
     fn overlay_create_invalidates_dir_cache_so_list_shows_new_name() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -5654,11 +6116,9 @@ mod tests {
     /// Regression: unlink must drop parent dir_cache so readdir does not ghost-delete.
     #[test]
     fn overlay_unlink_invalidates_dir_cache_so_list_drops_name() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -6575,11 +7035,9 @@ mod tests {
     /// so the batch is exactly `Inode(root)`.
     #[test]
     fn entry_advertised_create_unseen_name_sends_root_inode_not_entry() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -6623,14 +7081,12 @@ mod tests {
     /// unlink or create of that name sends no Entry: the pair was consumed.
     #[test]
     fn entry_advertised_lookup_inserts_pair_and_unlink_sends_entry() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(NamedMember {
             name: "m".into(),
             fi: stable_tar_fi(4),
         }) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -6759,11 +7215,9 @@ mod tests {
     }
 
     fn readable_tree_fs(entries: Vec<(String, FileInfo)>) -> (tempfile::TempDir, RatarmountFs) {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(ReadableMembers(entries)) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -6958,11 +7412,18 @@ mod tests {
         assert_eq!(ttl, TTL);
 
         let mut replied = None;
-        fs.rename_reply(FUSE_ROOT_ID, "m", FUSE_ROOT_ID, "n", 0, |result| {
-            let queued = fs.pending_inval.lock().unwrap().len();
-            let sent = rec.rx.try_recv();
-            replied = Some((result, queued, sent));
-        });
+        fs.rename_reply(
+            FUSE_ROOT_ID,
+            OsStr::new("m"),
+            FUSE_ROOT_ID,
+            OsStr::new("n"),
+            0,
+            |result| {
+                let queued = fs.pending_inval.lock().unwrap().len();
+                let sent = rec.rx.try_recv();
+                replied = Some((result, queued, sent));
+            },
+        );
         let (result, queued, sent) = replied.expect("reply called");
         assert_eq!(result, Ok(()));
         assert_eq!(
@@ -6991,9 +7452,16 @@ mod tests {
         );
 
         let mut missing = None;
-        fs.rename_reply(FUSE_ROOT_ID, "zz", FUSE_ROOT_ID, "y", 0, |result| {
-            missing = Some(result);
-        });
+        fs.rename_reply(
+            FUSE_ROOT_ID,
+            OsStr::new("zz"),
+            FUSE_ROOT_ID,
+            OsStr::new("y"),
+            0,
+            |result| {
+                missing = Some(result);
+            },
+        );
         assert_eq!(missing, Some(Err(ENOENT)));
         assert!(fs.pending_inval.lock().unwrap().is_empty());
         stop_recording(&fs, rec);
@@ -7023,8 +7491,6 @@ mod tests {
 
     /// Write-overlay fs over `GenMembers`: stable file `m`, stable dir `sub`.
     fn gen_members_fs() -> (tempfile::TempDir, RatarmountFs, Arc<AtomicU64>) {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let mut sub = stable_tar_fi(0);
         sub.mode = ratarmount_core::S_IFDIR | 0o755;
@@ -7033,7 +7499,7 @@ mod tests {
             ReadableMembers(vec![("m".into(), stable_tar_fi(4)), ("sub".into(), sub)]),
             Arc::clone(&gen),
         )) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -7164,11 +7630,9 @@ mod tests {
     /// Unlink sends no Entry and no Inode(child).
     #[test]
     fn entry_advertised_overlay_unlink_sends_no_entry_or_child_inode() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -7221,11 +7685,9 @@ mod tests {
     /// non-zero-size file. It must not insert into `entry_advertised`.
     #[test]
     fn entry_advertised_readdirplus_entry_ttl_is_zero_with_overlay() {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
@@ -7348,8 +7810,6 @@ mod tests {
     fn byte_members_fs(
         entries: &[(&str, &str)],
     ) -> (tempfile::TempDir, RatarmountFs, Arc<ByteMembers>) {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let mut files = BTreeMap::new();
         for (name, body) in entries {
@@ -7361,7 +7821,7 @@ mod tests {
             opens: Arc::new(AtomicUsize::new(0)),
         });
         let base = Arc::clone(&bytes) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(Arc::clone(&ov) as Arc<dyn MountSource>, Some(ov));
         (dir, fs, bytes)
     }
@@ -7425,11 +7885,9 @@ mod tests {
     }
 
     fn xattr_members_fs(files: BTreeMap<String, FileInfo>) -> (tempfile::TempDir, RatarmountFs) {
-        use ratarmount_compositing::WriteOverlay;
-
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(XattrMembers { files }) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let ov = Arc::new(crate::test_overlay::new_overlay(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(Arc::clone(&ov) as Arc<dyn MountSource>, Some(ov));
         (dir, fs)
     }
@@ -8190,6 +8648,171 @@ mod tests {
             .expect("unlink mode 000");
         assert!(fs.getattr_reply(gone).is_ok());
     }
+    #[test]
+    fn regression_oplog_root_control_readonly_status_and_git_xattr() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(XattrSource {
+            fi: ratarmount_core::create_root_file_info(),
+            attrs: BTreeMap::from([("user.ratarmount.git.commit".into(), b"abc".to_vec())]),
+        });
+        let plain = RatarmountFs::new(source.clone(), None);
+        assert_eq!(
+            plain.root_control(1, "user.ratarmount.mark", b"x"),
+            Some(Err(libc::ENOTSUP))
+        );
+        assert_eq!(
+            plain.xattr_value(1, "user.ratarmount.sealed").unwrap(),
+            Some(b"0".to_vec())
+        );
+        assert_eq!(
+            plain.xattr_value(1, "user.ratarmount.layers").unwrap(),
+            Some(b"[]".to_vec())
+        );
+        assert_eq!(
+            plain.xattr_value(1, "user.ratarmount.base_digest").unwrap(),
+            Some(vec![])
+        );
+        assert_eq!(
+            plain.xattr_value(1, "user.ratarmount.git.commit").unwrap(),
+            Some(b"abc".to_vec())
+        );
+        let options = oplog::JournalOptions {
+            path: dir.path().join("trace"),
+            exclude: vec![],
+            reads: oplog::Reads::All,
+            sync: false,
+        };
+        let fs = RatarmountFs::new(source, None)
+            .with_activity(
+                &dir.path().join("mnt"),
+                oplog::MountActivity {
+                    journal: Some(options.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!activity_mount_config(false, "", true)
+            .mount_options
+            .contains(&MountOption::RO));
+        assert!(activity_mount_config(false, "", false)
+            .mount_options
+            .contains(&MountOption::RO));
+        assert_eq!(
+            fs.root_control(1, "user.ratarmount.mark", b"turn"),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            fs.root_control(1, "user.ratarmount.stats", b"{}"),
+            Some(Err(libc::EPERM))
+        );
+        assert!(fs
+            .root_control(2, "user.ratarmount.mark", b"turn")
+            .is_none());
+        for key in oplog::STATUS_KEYS {
+            assert!(fs.xattr_list(1).unwrap().contains(&key.to_string()));
+        }
+        let stats: serde_json::Value =
+            serde_json::from_slice(&fs.xattr_value(1, "user.ratarmount.stats").unwrap().unwrap())
+                .unwrap();
+        assert_eq!(stats["ops"]["mark"], 1);
+        assert!(stats["overlay_bytes"].is_null());
+        drop(fs);
+        assert!(std::fs::read_to_string(options.path)
+            .unwrap()
+            .contains("turn"));
+    }
+
+    #[test]
+    fn regression_oplog_metadata_uses_mounted_connection_and_layer_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let base: Arc<dyn MountSource> = Arc::new(EmptyBase);
+        let lower_path = dir.path().join("lower");
+        let lower = crate::test_overlay::new_overlay(base.clone(), &lower_path).unwrap();
+        overlay_write_new(&lower, "/lower-file", b"lower");
+        drop(lower);
+        let stack = ratarmount_compositing::compose_stack(
+            base,
+            &[(lower_path, ratarmount_compositing::Immutability::Shared)],
+        )
+        .unwrap();
+        let overlay =
+            Arc::new(crate::test_overlay::new_overlay(stack, dir.path().join("top")).unwrap());
+        overlay.set_meta("base_digest", "sha256:base").unwrap();
+        overlay.set_meta("stack_digest", "sha256:stack").unwrap();
+        overlay.set_meta("lower_layers", "[]").unwrap();
+        overlay_write_new(&overlay, "/top-file", b"top");
+        let fs = RatarmountFs::new(overlay.clone(), Some(overlay.clone()))
+            .with_activity(
+                &dir.path().join("mnt"),
+                oplog::MountActivity {
+                    journal: Some(oplog::JournalOptions {
+                        path: dir.path().join("trace"),
+                        exclude: vec![],
+                        reads: oplog::Reads::All,
+                        sync: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fs.journal_layer("/top-file"), "top");
+        assert_eq!(fs.journal_layer("/lower-file"), "lower:1");
+        assert_eq!(
+            fs.xattr_value(1, "user.ratarmount.base_digest").unwrap(),
+            Some(b"sha256:base".to_vec())
+        );
+        // Regression: base_digest_state xattr follows the recorded kind.
+        for (kind, digest, state) in [
+            ("pending", "", "pending"),
+            ("strong", "sha256:base", "present"),
+            ("weak", "sha256:weak", "present"),
+            ("git-tree", "git-tree:abc", "present"),
+            ("none", "none", "none"),
+        ] {
+            overlay.set_meta("base_digest_kind", kind).unwrap();
+            overlay.set_meta("base_digest", digest).unwrap();
+            assert_eq!(
+                fs.xattr_value(1, "user.ratarmount.base_digest_state")
+                    .unwrap(),
+                Some(state.as_bytes().to_vec()),
+                "{kind}"
+            );
+        }
+        overlay.set_meta("base_digest_kind", "strong").unwrap();
+        overlay.set_meta("base_digest", "sha256:base").unwrap();
+        assert_eq!(
+            overlay.meta_value("journal_path").unwrap(),
+            // The journal path is canonical (macOS temp dirs live under /var -> /private/var).
+            Some(
+                dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("trace")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert!(overlay.meta_value("absent").unwrap().is_none());
+    }
+
+    #[test]
+    fn regression_oplog_symlink_and_readonly_truncation() {
+        let (_dir, overlay, fs) = overlay_fs_for_rename();
+        let (_, attr) = fs
+            .symlink_entry(1, OsStr::new("link"), Path::new("target"))
+            .unwrap();
+        assert_eq!(attr.kind, FileType::Symlink);
+        assert_eq!(overlay.lookup("/link", 0).unwrap().linkname, "target");
+        let readonly = RatarmountFs::new(Arc::new(EmptyBase), None);
+        assert_eq!(
+            readonly.open_inode(1, libc::O_RDONLY | libc::O_TRUNC),
+            Err(EROFS)
+        );
+        assert!(matches!(
+            readonly.symlink_entry(1, OsStr::new("link"), Path::new("target")),
+            Err(EROFS)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -8238,7 +8861,7 @@ mod sandbox_attr_tests {
         let base = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
-        let overlay = Arc::new(WriteOverlay::new(source, directory.path()).unwrap());
+        let overlay = Arc::new(crate::test_overlay::new_overlay(source, directory.path()).unwrap());
         let fs = RatarmountFs::new(overlay.clone(), Some(overlay.clone())).with_attribute_mapping(
             AttributeMapping::parse("uid=12345,gid=23456,umask=027").unwrap(),
         );

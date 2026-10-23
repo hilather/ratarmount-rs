@@ -828,7 +828,7 @@ impl ZipMountSource {
 
         println!(
             "Creating offset dictionary for {} ...",
-            archive_path.display()
+            ratarmount_core::redacted_display(&archive_path)
         );
         let t0 = Instant::now();
 
@@ -862,7 +862,7 @@ impl ZipMountSource {
         let secs = t0.elapsed().as_secs_f64();
         println!(
             "Creating offset dictionary for {} took {secs:.2}s",
-            archive_path.display()
+            ratarmount_core::redacted_display(&archive_path)
         );
 
         Ok(Self {
@@ -975,7 +975,7 @@ impl ZipMountSource {
     ) -> Result<Self> {
         println!(
             "Creating offset dictionary for {} ...",
-            archive_path.display()
+            ratarmount_core::redacted_display(archive_path)
         );
         let t0 = Instant::now();
 
@@ -1018,7 +1018,7 @@ impl ZipMountSource {
         let secs = t0.elapsed().as_secs_f64();
         println!(
             "Creating offset dictionary for {} took {secs:.2}s",
-            archive_path.display()
+            ratarmount_core::redacted_display(archive_path)
         );
 
         Ok(Self {

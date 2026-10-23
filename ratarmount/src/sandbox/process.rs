@@ -94,6 +94,11 @@ pub fn mount_args(
     for glob in readonly {
         args.extend(["--overlay-readonly".into(), glob.into()]);
     }
+    for glob in &base.options.allow_globs {
+        args.extend(["--overlay-allow".into(), glob.into()]);
+    }
+    // Keep the original source positional intact: the child records it as
+    // OverlayCreateInfo.base_url when it constructs the write overlay.
     args.extend([
         "--".into(),
         base.source.clone().into(),
@@ -368,6 +373,31 @@ pub fn parse_mountinfo(info: &[u8]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: daemon children must retain the base URL for overlay metadata.
+    #[test]
+    fn regression_overlay_meta_child_argv_preserves_base_url() {
+        let base = Base {
+            name: "base".into(),
+            source: "hf://datasets/org/repo@revision/tree.tar".into(),
+            options: Default::default(),
+        };
+        let attempt = Attempt {
+            id: "one".into(),
+            base: "base".into(),
+            path: "/tmp/mount".into(),
+            overlay_dir: "/tmp/overlay".into(),
+            status: "starting".into(),
+        };
+        let args = mount_args(&base, Path::new("/tmp/index"), &attempt, None, &[]);
+        let parsed =
+            crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(args))
+                .unwrap();
+        let (inputs, mountpoint) = crate::split_bound_inputs_mountpoint(&parsed);
+        assert_eq!(inputs, [PathBuf::from(&base.source)]);
+        assert_eq!(mountpoint, Some(attempt.path));
+        assert_eq!(parsed.write_overlay, Some(attempt.overlay_dir));
+    }
 
     /// Regression: a hung helper must be killed and reaped when its deadline expires.
     #[test]

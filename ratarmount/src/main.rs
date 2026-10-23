@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use clap::{ArgAction, Parser};
 use nix::unistd::{fork, setsid, ForkResult};
 use ratarmount_compositing::{
-    commit_overlay, maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource,
-    ControlFolderOptions, OverlayError, WriteOverlay, HIDDEN_DB,
+    maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource, ControlFolderOptions,
+    OverlayError, WriteOverlay, HIDDEN_DB,
 };
 use ratarmount_compress::{
     repack_seekable, strip_compression_suffix, GzipSidecar, RepackAction, RepackOptions,
@@ -19,7 +19,7 @@ use ratarmount_compress::{
 };
 use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
 use ratarmount_fuse::{
-    clamp_readahead, mount_blocking_with_io_options as mount_blocking, parse_byte_size, unmount,
+    clamp_readahead, mount_blocking_with_activity as fuse_mount_blocking, parse_byte_size, unmount,
     PassthroughMode, PassthroughOptions, RECOMMENDED_READAHEAD_BYTES,
 };
 use ratarmount_index::{
@@ -34,12 +34,19 @@ use ratarmount_session::factory;
 #[macro_use]
 mod quiet_print;
 
+mod base_digest;
+mod base_identity;
 mod corpus;
 mod diff;
 mod export_index;
 mod find;
+mod journal_cmd;
 mod mount_guard;
+mod overlay_cmd;
 mod overlay_commit;
+mod overlay_create;
+mod overlay_import;
+mod overlay_pack;
 mod overlay_stats;
 mod publish_index;
 mod sandbox;
@@ -138,6 +145,17 @@ struct Args {
     /// Unix socket for control commands (`status`, `unmount`, `ping`)
     #[arg(long = "control-interface", action = ArgAction::SetTrue)]
     control_interface: bool,
+
+    /// Serve the control socket but not the in-FS `/.ratarmount-control/`
+    /// folder (experimental; `sandbox run` uses it so the pid, memory stats
+    /// and `unmount` file are not visible in the container).
+    #[arg(
+        long = "control-socket-only",
+        hide = true,
+        requires = "control_interface",
+        action = ArgAction::SetTrue
+    )]
+    control_socket_only: bool,
 
     /// Export the archive as NFS (userspace). Does not require a FUSE mountpoint.
     /// Default protocol is NFSv3. Bind address is `--nfs-bind` (default 127.0.0.1:20490).
@@ -501,6 +519,30 @@ struct Args {
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
 
+    /// Read-only overlay layer (repeatable, bottom to top).
+    #[arg(long, value_name = "DIR", action = ArgAction::Append)]
+    lower: Vec<PathBuf>,
+
+    /// Allow unsealed or legacy lower layers (read-only, without immutable SQLite).
+    #[arg(long, requires = "lower")]
+    allow_unsealed_lower: bool,
+
+    /// Allow a different lower stack for an existing top and record the override.
+    #[arg(long)]
+    force_stack_mismatch: bool,
+
+    /// Trust a known sha256:<hex> base digest, or skip hashing with none (warns).
+    #[arg(
+        long,
+        value_name = "sha256:HEX|none",
+        conflicts_with = "commit_overlay"
+    )]
+    base_digest: Option<ratarmount_compositing::BaseDigestRequest>,
+
+    /// Allow a changed base on remount (or `--commit-overlay`) and record the override in overlay metadata.
+    #[arg(long, requires = "overlay_target")]
+    force_base_mismatch: bool,
+
     /// Container-friendly ownership, allow_other/noatime, and a throwaway RAM overlay.
     #[arg(long)]
     sandbox: bool,
@@ -517,6 +559,10 @@ struct Args {
     #[arg(long, value_delimiter = ',', action = ArgAction::Append, requires = "overlay_target", conflicts_with = "commit_overlay")]
     overlay_readonly: Vec<String>,
 
+    /// Writable exceptions to read-only rules; more literal components win (ties allow).
+    #[arg(long, value_delimiter = ',', action = ArgAction::Append, requires_all = ["overlay_target", "overlay_readonly"], conflicts_with = "commit_overlay")]
+    overlay_allow: Vec<String>,
+
     /// Maximum logical overlay bytes, including COW (bytes or binary K/M/G/T).
     #[arg(long, value_parser = ratarmount_compositing::parse_overlay_size, requires = "overlay_target", conflicts_with = "commit_overlay")]
     overlay_quota: Option<u64>,
@@ -527,6 +573,28 @@ struct Args {
 
     #[arg(skip)]
     overlay_stats: Option<overlay_stats::StatsArgs>,
+
+    /// Append filesystem operation records to a JSONL file outside the mount and overlay.
+    #[arg(long, conflicts_with_all = ["no_mount", "commit_overlay"])]
+    journal: Option<PathBuf>,
+
+    /// Exclude root-relative paths using the overlay-readonly glob syntax (repeatable).
+    #[arg(long, action = ArgAction::Append, requires = "journal")]
+    journal_exclude: Vec<String>,
+
+    /// Record all coalesced read ranges, or just the first range per handle.
+    #[arg(long, value_parser = ["all", "first"], default_value = "all", requires = "journal")]
+    journal_reads: String,
+
+    /// Fsync the operation journal at unmount.
+    #[arg(long, requires = "journal")]
+    journal_sync: bool,
+
+    #[arg(skip)]
+    journal_command: Option<journal_cmd::JournalArgs>,
+
+    #[arg(skip)]
+    overlay: Option<overlay_cmd::OverlayArgs>,
 
     #[arg(skip)]
     diff: Option<diff::DiffArgs>,
@@ -673,6 +741,24 @@ struct Args {
     find_offset_order: bool,
 }
 
+/// `--base-digest` and `--force-stack-mismatch` apply to a write overlay or to a
+/// read-only `--lower` stack; clap's `requires` cannot express that OR.
+fn base_flag_needs_target_or_lower(args: &Args) -> Result<(), clap::Error> {
+    let target = args.write_overlay.is_some() || args.overlay_tmpfs.is_some() || args.sandbox;
+    for (given, flag) in [
+        (args.base_digest.is_some(), "--base-digest"),
+        (args.force_stack_mismatch, "--force-stack-mismatch"),
+    ] {
+        if given && !target && args.lower.is_empty() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                format!("{flag} requires -w/--overlay-tmpfs/--sandbox or --lower"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse `--parallel-nested`: non-negative integer or `auto` (→ 0).
 fn parse_parallel_nested(s: &str) -> Result<u32, String> {
     let t = s.trim();
@@ -740,6 +826,24 @@ where
         } else {
             args.export_index = Some(export_index::ExportArgs::try_parse_from(argv)?);
         }
+        return Ok(args);
+    }
+    if raw.get(1).is_some_and(|s| s == "journal") {
+        let journal = journal_cmd::JournalArgs::try_parse_from(
+            std::iter::once(OsString::from("ratarmount journal"))
+                .chain(raw.iter().skip(2).cloned()),
+        )?;
+        let mut args = Args::try_parse_from(&raw[..1])?;
+        args.journal_command = Some(journal);
+        return Ok(args);
+    }
+    if raw.get(1).is_some_and(|s| s == "overlay") {
+        let overlay = overlay_cmd::OverlayArgs::try_parse_from(
+            std::iter::once(OsString::from("ratarmount overlay"))
+                .chain(raw.iter().skip(2).cloned()),
+        )?;
+        let mut args = Args::try_parse_from(&raw[..1])?;
+        args.overlay = Some(overlay);
         return Ok(args);
     }
     if raw.get(1).is_some_and(|s| s == "overlay-stats") {
@@ -816,12 +920,27 @@ where
         }
         args.commit_overlay_on_exit = true;
     }
+    if !args.lower.is_empty()
+        && (args.commit_overlay
+            || args.commit_overlay_on_exit
+            || args.commit_overlay_interval != "0")
+    {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "commit of a layered stack is not supported; flatten first",
+        ));
+    }
+    base_flag_needs_target_or_lower(&args)?;
     expand_sandbox(&mut args, caller_ids())
         .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
+    ratarmount_compositing::ReadOnlyGlobs::new(&args.journal_exclude)
+        .map_err(|e| clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string()))?;
     if !args.overlay_readonly.is_empty() {
-        ratarmount_compositing::ReadOnlyGlobs::new(&args.overlay_readonly).map_err(|e| {
-            clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string())
-        })?;
+        ratarmount_compositing::ReadOnlyGlobs::with_allow(
+            &args.overlay_readonly,
+            &args.overlay_allow,
+        )
+        .map_err(|e| clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string()))?;
     }
     if !find && !args.find_xattrs.is_empty() {
         return Err(clap::Error::raw(
@@ -1176,6 +1295,445 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
     None
 }
 
+/// Strong identity of the mounted base that may key trusted bundle
+/// verifications, obtained without hashing any content: the digest of a single
+/// archive base that is already in its index's digest cache. Everything else
+/// returns `None` (no markers, every use re-verifies): a directory has no
+/// computed strong digest, a union (several inputs) would need every input's
+/// identity and its index only covers the first, and a supplied
+/// `--base-digest` is just the caller's unchecked claim, so it never keys a
+/// marker. Any option that reshapes the mounted view (see
+/// [`mounted_view_is_default`]) disables markers (the caller never asks), and
+/// the listing options of [`mounted_view_key`] are appended to the digest so a
+/// check made under one listing never serves another.
+/// Computed only when a `--lower` bundle needs it.
+fn lower_base_key(
+    bases: &[PathBuf],
+    index: Option<&Path>,
+    lowers: &[PathBuf],
+    view_key: &str,
+) -> Option<String> {
+    let [base] = bases else {
+        return None;
+    };
+    if !lowers.iter().any(|p| p.is_file()) || !base.is_file() {
+        return None;
+    }
+    let digest = ratarmount_index::peek_archive_digest(base, index)
+        .ok()
+        .flatten()?;
+    Some(format!("{digest}.{view_key}"))
+}
+
+/// The verification marker key for this invocation: `None` unless the mount
+/// serves the base unchanged (see [`mounted_view_is_default`]) and the base has
+/// a computed identity; otherwise the base digest plus [`mounted_view_key`].
+fn lower_key_for(
+    args: &Args,
+    rolling: bool,
+    inputs: &[PathBuf],
+    index: Option<&Path>,
+) -> Option<String> {
+    mounted_view_is_default(args, rolling)
+        .then(|| lower_base_key(inputs, index, &args.lower, &mounted_view_key(args)))
+        .flatten()
+}
+
+/// The options that change which members an archive lists or how their paths
+/// are synthesized (file-version folders, zero-block handling, GNU incremental
+/// stripping, name encoding). They are part of the marker key itself, so a
+/// verification made under one listing is never reused under another. A new
+/// listing option must be added here.
+fn mounted_view_key(args: &Args) -> String {
+    format!(
+        "fv{}.iz{}.gi{}.dgi{}.enc-{}",
+        u8::from(!args.no_file_versions),
+        u8::from(args.ignore_zeros),
+        u8::from(args.gnu_incremental),
+        u8::from(args.detect_gnu_incremental),
+        args.encoding
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    )
+}
+
+/// Whether the mount serves the base's paths unchanged, so a bundle verified
+/// against the archive's content stays verified. Any option that shapes the
+/// mounted tree (prefix, transforms, recursion, binds, corpus, git prefix,
+/// rolling series, union disabling) makes this false; a new view option must
+/// be added here.
+fn mounted_view_is_default(args: &Args, rolling: bool) -> bool {
+    !rolling
+        && args.prefix.is_empty()
+        && args.transform.is_none()
+        && args.transform_recursive_mount_point.is_none()
+        && !args.recursive
+        && args.recursion_depth == 0
+        && !args.lazy
+        && !args.strip_recursive_tar_extension
+        && !args.disable_union_mount
+        && args.source_binds.is_empty()
+        && args.corpus_list.is_none()
+        && args.git_prefix.is_none()
+        && args.roll_every.is_none()
+}
+
+/// The base a mount actually serves, as far as it can be identified without
+/// reading content: what the factory reported (the token) plus what the
+/// invocation knows around it.
+#[derive(Default)]
+struct MountedBase {
+    /// What the opener served. `None` only when nothing was classified (no
+    /// `--lower` and no `-w`), in which case no lower is compared either.
+    classified: Option<ratarmount_compositing::ClassifiedBase>,
+    /// A supplied `--base-digest`, reported as the base's identity.
+    supplied: Option<String>,
+    /// Base-relative paths of this invocation's own overlay, journal and mount
+    /// point (and the existing top's recorded set), left out of the walk in
+    /// addition to the bottom lower's recorded set so a top or mount point
+    /// inside the base does not make the base differ.
+    extra_excludes: Vec<PathBuf>,
+    /// `--journal` files that already exist inside a directory base. They count
+    /// as base content (a read-only mount records no exclusions), so a changed
+    /// base is refused naming them.
+    existing_journals: Vec<PathBuf>,
+}
+
+/// Whether [`MountLowerStack`] compares the mounted base with the bottom
+/// lower's recorded identity. Only the mount path enforces it; offline
+/// commands (`verify`, `seal`, `pack`, `diff`, import) report base problems
+/// through their own checks.
+enum BaseIdentity {
+    Offline,
+    Enforce { base: MountedBase, force: bool },
+}
+
+struct MountLowerStack {
+    layers: Vec<(PathBuf, ratarmount_compositing::Immutability)>,
+    records: Vec<ratarmount_compositing::LowerLayerRecord>,
+    /// Identity of the base this stack is mounted on: the mounted base's own
+    /// when [`BaseIdentity::Enforce`] measured it (empty when unknown), else
+    /// the digest recorded by the bottom lower.
+    base_digest: Option<String>,
+}
+
+/// Compare the mounted base with what the bottom lower recorded, using
+/// metadata only (a weak directory walk with the lower's own recorded
+/// exclusions, an archive's size and mtime, a Git tree id). Returns the
+/// mounted base's own identity ("" when it cannot be known without hashing).
+fn mounted_base_identity(
+    lower: &Path,
+    meta: Option<&ratarmount_compositing::OverlayMeta>,
+    base: &MountedBase,
+    force: bool,
+) -> Result<String, String> {
+    let Some(classified) = base.classified.as_ref() else {
+        return Err("internal error: the mounted base was not classified".into());
+    };
+    let probe = ratarmount_compositing::overlay_gate::BaseProbe {
+        supplied: base.supplied.as_deref(),
+        extra_excludes: &base.extra_excludes,
+    };
+    let comparison =
+        ratarmount_compositing::overlay_gate::compare_base_identity(meta, classified, &probe)?;
+    let git_tree = classified.actual().git_tree();
+    let local_path = matches!(
+        classified.actual().location(),
+        Some(ratarmount_compositing::overlay_identity::BaseLocation::Local(_))
+    );
+    let get = |key: &str| meta.and_then(|m| m.get(key));
+    let mismatch = comparison.mismatch;
+    let identity = comparison.identity;
+    if let Some(current) = mismatch {
+        if !force {
+            let recorded = get("base_digest").unwrap_or("unknown");
+            let strong = meta.is_some_and(|m| m.base_digest_kind() == Some("strong"));
+            return Err(if strong && git_tree.is_none() && local_path {
+                format!(
+                    "lower {} was sealed against a strong base digest ({recorded}) and the mounted base's identity could not be confirmed cheaply (size/mtime or the directory manifest differ, and neither a matching --base-digest nor a matching cached SHA-256 in the base's index was found; the mount never hashes the base). Pass --base-digest {recorded} (from `overlay digest-base` on the source) if the mounted base is a copy of it, run `overlay verify {} BASE`, or pass --force-stack-mismatch as a last resort",
+                    lower.display(),
+                    lower.display()
+                )
+            } else if git_tree.is_some() || !local_path {
+                format!(
+                    "lower {} was sealed against base {recorded} but the mounted base is {current}; pass --force-stack-mismatch to override",
+                    lower.display()
+                )
+            } else {
+                let journals: String = base
+                    .existing_journals
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "; the existing --journal file {} lies inside the base and counts as base content (move it outside the base, or pass --force-stack-mismatch)",
+                            p.display()
+                        )
+                    })
+                    .collect();
+                format!(
+                    "lower {} was sealed against a different base than the mounted one; run `overlay verify {} BASE` to compare digests, or pass --force-stack-mismatch to mount anyway{journals}",
+                    lower.display(),
+                    lower.display()
+                )
+            });
+        }
+    }
+    Ok(identity)
+}
+
+impl MountLowerStack {
+    /// Open the same sealed lower stack used by the mount CLI for offline consumers.
+    pub(crate) fn compose(
+        base: Arc<dyn ratarmount_core::MountSource>,
+        paths: &[PathBuf],
+    ) -> std::io::Result<Arc<dyn ratarmount_core::MountSource>> {
+        Self::open(base, None, paths, false)
+            .map(|(_, view)| view)
+            .map_err(std::io::Error::other)
+    }
+
+    /// Open the lower stack on top of an existing `base`, bottom-up. A bundle
+    /// is verified against the view beneath it (base plus the lowers below)
+    /// before it is cached, so the base must exist first. `base_key` is the
+    /// base's strong digest when the caller already has one without reading
+    /// content (a supplied `--base-digest`, or a cached archive digest); only
+    /// then, and only above sealed immutable lowers, may a previous
+    /// verification be trusted instead of repeated.
+    pub(crate) fn open(
+        base: Arc<dyn ratarmount_core::MountSource>,
+        base_key: Option<&str>,
+        paths: &[PathBuf],
+        allow_unsealed: bool,
+    ) -> Result<(Self, Arc<dyn ratarmount_core::MountSource>), String> {
+        Self::open_in(base, base_key, paths, allow_unsealed, None)
+    }
+
+    /// [`Self::open`] with an explicit bundle cache directory (tests).
+    pub(crate) fn open_in(
+        base: Arc<dyn ratarmount_core::MountSource>,
+        base_key: Option<&str>,
+        paths: &[PathBuf],
+        allow_unsealed: bool,
+        cache: Option<&Path>,
+    ) -> Result<(Self, Arc<dyn ratarmount_core::MountSource>), String> {
+        Self::open_with(
+            base,
+            base_key,
+            paths,
+            allow_unsealed,
+            cache,
+            &BaseIdentity::Offline,
+        )
+    }
+
+    /// [`Self::open_in`] with the base identity policy (see [`BaseIdentity`]).
+    fn open_with(
+        base: Arc<dyn ratarmount_core::MountSource>,
+        base_key: Option<&str>,
+        paths: &[PathBuf],
+        allow_unsealed: bool,
+        cache: Option<&Path>,
+        identity: &BaseIdentity,
+    ) -> Result<(Self, Arc<dyn ratarmount_core::MountSource>), String> {
+        use ratarmount_compositing::{Immutability, LowerLayerRecord, OverlayMeta};
+        use sha2::{Digest, Sha256};
+        let mut stack = Self {
+            layers: Vec::new(),
+            records: Vec::new(),
+            base_digest: None,
+        };
+        let mut view = base;
+        for path in paths {
+            let cached;
+            let path = if path.is_file() {
+                let marker_key = base_key
+                    .filter(|_| {
+                        stack.layers.iter().zip(&stack.records).all(|((_, im), r)| {
+                            *im == Immutability::Immutable && !r.layer_digest.is_empty()
+                        })
+                    })
+                    .map(|key| {
+                        let mut hasher = Sha256::new();
+                        hasher.update(key.as_bytes());
+                        for record in &stack.records {
+                            hasher.update([0]);
+                            hasher.update(record.layer_digest.as_bytes());
+                        }
+                        format!("{:x}", hasher.finalize())
+                    });
+                cached = match cache {
+                    Some(cache) => overlay_pack::cached_lower_in(
+                        path,
+                        cache,
+                        view.clone(),
+                        marker_key.as_deref(),
+                    ),
+                    None => overlay_pack::cached_lower(path, view.clone(), marker_key.as_deref()),
+                }
+                .map_err(|e| format!("lower bundle {}: {e}", path.display()))?;
+                &cached
+            } else {
+                path
+            };
+            let path = path
+                .canonicalize()
+                .map_err(|e| format!("lower {}: {e}", path.display()))?;
+            let meta = OverlayMeta::read(&path).map_err(|e| overlay_open_error(&path, &e))?;
+            let sealed = meta.as_ref().is_some_and(OverlayMeta::layer_sealed);
+            if !sealed && !allow_unsealed {
+                return Err(format!(
+                    "lower {} is unsealed; pass --allow-unsealed-lower to use it",
+                    path.display()
+                ));
+            }
+            if stack.records.is_empty() {
+                stack.base_digest = match identity {
+                    BaseIdentity::Offline => meta
+                        .as_ref()
+                        .and_then(|m| m.base_digest())
+                        .map(str::to_owned),
+                    BaseIdentity::Enforce { base, force } => {
+                        Some(mounted_base_identity(&path, meta.as_ref(), base, *force)?)
+                    }
+                };
+            }
+            stack.records.push(LowerLayerRecord {
+                path: path.clone(),
+                layer_digest: meta
+                    .as_ref()
+                    .and_then(|m| m.get("layer_digest"))
+                    .unwrap_or("")
+                    .into(),
+                sealed_at: meta
+                    .as_ref()
+                    .and_then(|m| m.get("sealed_at"))
+                    .unwrap_or("")
+                    .into(),
+            });
+            let immutability = if sealed {
+                Immutability::Immutable
+            } else {
+                Immutability::Shared
+            };
+            view = ratarmount_compositing::compose_stack(view, &[(path.clone(), immutability)])
+                .map_err(|e| format!("error opening lower stack: {e}"))?;
+            stack.layers.push((path, immutability));
+        }
+        Ok((stack, view))
+    }
+
+    /// Identity a read-only composed mount (no `-w` top) serves through the
+    /// root `user.ratarmount.*` status xattrs. Empty without `--lower`.
+    fn read_only_metadata(&self) -> std::collections::BTreeMap<String, String> {
+        let mut metadata = std::collections::BTreeMap::new();
+        if self.records.is_empty() {
+            return metadata;
+        }
+        let base = self.base_digest.clone().unwrap_or_default();
+        let digests: Vec<&str> = self
+            .records
+            .iter()
+            .map(|r| r.layer_digest.as_str())
+            .collect();
+        // No stack identity without a known base (e.g. an uncached archive).
+        metadata.insert(
+            "stack_digest".into(),
+            if base.is_empty() {
+                String::new()
+            } else {
+                ratarmount_compositing::stack_digest(&base, &digests)
+            },
+        );
+        // An empty base here is an archive that was never hashed.
+        metadata.insert(
+            "base_digest_state".into(),
+            if base.is_empty() {
+                "pending"
+            } else {
+                "present"
+            }
+            .into(),
+        );
+        metadata.insert("base_digest".into(), base);
+        metadata.insert(
+            "lower_layers".into(),
+            serde_json::to_string(&self.records).expect("lower records"),
+        );
+        // The composed view cannot change only when every layer is sealed.
+        if self.records.iter().all(|r| !r.sealed_at.is_empty()) {
+            let top = self.records.last().expect("non-empty");
+            metadata.insert("sealed_at".into(), top.sealed_at.clone());
+        }
+        metadata
+    }
+
+    fn check_top(&self, dir: &Path, force: bool) -> Result<(), String> {
+        use ratarmount_compositing::OverlayMeta;
+        // A missing, unreadable, corrupt or locked database is left to
+        // `WriteOverlay::new`, whose errors name the file and the way out
+        // (#89); it also refuses a sealed top inside its open transaction.
+        if std::fs::symlink_metadata(dir.join(HIDDEN_DB)).is_err() {
+            return Ok(());
+        }
+        let Ok(meta) = OverlayMeta::read(dir) else {
+            return Ok(());
+        };
+        if meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
+            return Err(format!(
+                "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
+                dir.display()
+            ));
+        }
+        let recorded = meta
+            .as_ref()
+            .map(OverlayMeta::lower_layers)
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let same = recorded.len() == self.records.len()
+            && recorded.iter().zip(&self.records).all(|(a, b)| {
+                std::path::absolute(&a.path).is_ok_and(|path| path == b.path)
+                    && a.layer_digest == b.layer_digest
+            });
+        if same {
+            return Ok(());
+        }
+        if !force {
+            return Err(format!("overlay {} stack mismatch: recorded lower_layers {}; given --lower {}; pass --force-stack-mismatch to override",
+                dir.display(), serde_json::to_string(&recorded).expect("lower records"),
+                serde_json::to_string(&self.records).expect("lower records")));
+        }
+        let mut conn = ratarmount_compositing::open_overlay_db(
+            &dir.join(HIDDEN_DB),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            ratarmount_compositing::DbName::Path,
+        )
+        .map_err(|e| e.to_string())?;
+        conn.busy_timeout(Duration::ZERO)
+            .map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+            .map_err(|e| e.to_string())?;
+        if OverlayMeta::from_connection(&tx)
+            .map_err(|e| e.to_string())?
+            .as_ref()
+            .is_some_and(OverlayMeta::layer_sealed)
+        {
+            return Err("overlay is sealed; mount it with --lower, or `overlay unseal`".into());
+        }
+        tx.execute_batch(ratarmount_compositing::overlay_meta::META_SCHEMA)
+            .map_err(|e| e.to_string())?;
+        let timestamp: String = tx
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        OverlayMeta::set(&tx, "stack_mismatch_forced_at", &timestamp).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+}
+
 fn main() {
     // #93: a desktop launcher can hand us a pipe with no reader as
     // stdout/stderr. println!/eprintln! panic on EPIPE (exit 101) before the
@@ -1191,13 +1749,13 @@ fn main() {
     if let Some(command) = &args.sandbox_api {
         if let Err(error) = sandbox::run(command) {
             eprintln!("sandbox: {error}");
-            std::process::exit(1);
+            std::process::exit(sandbox::error_exit_code(command));
         }
         return;
     }
 
     if let Some(snapshot) = &args.snapshot {
-        match snapshot::run(snapshot, &mut std::io::stdout().lock()) {
+        match snapshot::run_cli(snapshot) {
             Ok(code) => std::process::exit(code),
             Err(error) => {
                 eprintln!("snapshot: {error}");
@@ -1206,7 +1764,10 @@ fn main() {
         }
     }
     if let Some(diff) = &args.diff {
-        std::process::exit(diff::run(diff));
+        std::process::exit(diff::run(
+            diff,
+            &overlay_run_context(diff.index_folders.as_deref()),
+        ));
     }
     if args.shard.is_some() || args.export_index.is_some() {
         let result = export_index::cli_stdout()
@@ -1228,6 +1789,44 @@ fn main() {
         return;
     }
 
+    if let Some(journal) = &args.journal_command {
+        if let Err(error) = journal_cmd::run(journal) {
+            eprintln!("journal: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if let Some(overlay) = &args.overlay {
+        match overlay_cmd::run(
+            overlay,
+            &overlay_run_context(overlay.index_folders.as_deref()),
+        ) {
+            Ok((output, code)) => {
+                println!("{}", output.trim_end());
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(
+                    if matches!(
+                        overlay.command,
+                        overlay_cmd::OverlayCommand::Import(_)
+                            | overlay_cmd::OverlayCommand::Fsck { .. }
+                            | overlay_cmd::OverlayCommand::Seal(_)
+                            | overlay_cmd::OverlayCommand::Unseal { .. }
+                            | overlay_cmd::OverlayCommand::Verify(_)
+                    ) {
+                        2
+                    } else {
+                        1
+                    },
+                );
+            }
+        }
+        return;
+    }
     if let Some(stats) = &args.overlay_stats {
         match overlay_stats::run(stats) {
             Ok(output) => println!("{}", output.trim_end()),
@@ -1335,9 +1934,49 @@ fn main() {
             eprintln!("error: {msg}");
             std::process::exit(2);
         }
-        if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
-            eprintln!("error: commit recovery for {}: {e}", archive.display());
-            std::process::exit(2);
+        // A `file://` URL names a local archive: everything below (recovery,
+        // the gate, the splice) works on the path it resolves to.
+        // Only `file://` is resolved; any other remote scheme is refused
+        // before anything could fetch it.
+        let typed = archive.to_string_lossy();
+        let resolved_archive = match ratarmount_remote::remote_url_scheme(&typed).as_deref() {
+            Some("file") => match &ratarmount_remote::resolve_to_local(&typed) {
+                Ok(ratarmount_remote::RemoteLocal::Local(path)) => path.clone(),
+                _ => archive.clone(),
+            },
+            _ if ratarmount_remote::is_remote_url(&typed) => {
+                eprintln!(
+                    "error: offline --commit-overlay takes only a local path or file:// URL, not '{typed}'"
+                );
+                std::process::exit(2);
+            }
+            _ => archive.clone(),
+        };
+        let archive = &resolved_archive;
+        // A database overlay recovers a pending commit journal only after its
+        // base identity gate (inside the commit): recovery rewrites the archive,
+        // and it must not do that to an archive the overlay does not describe.
+        // Only a missing entry is "no database" (R7-E2): a dangling symlink,
+        // a directory or anything else there takes the database path below.
+        if ratarmount_compositing::overlay_db_absent(overlay) {
+            // No recorded base to compare, but a journal started for another
+            // file (a copy of the interrupted bytes) must not be rolled in.
+            if !args.force_base_mismatch {
+                if let Err(msg) = ratarmount_compositing::ensure_journal_is_for_archive(archive) {
+                    eprintln!("error: {msg}");
+                    std::process::exit(2);
+                }
+            }
+            let owner = if args.force_base_mismatch {
+                ratarmount_compositing::Owner::Forced
+            } else {
+                ratarmount_compositing::Owner::Inode
+            };
+            let recovered = ratarmount_compositing::recover_journal_at(archive, None, owner);
+            if let Err(e) = recovered {
+                eprintln!("error: commit recovery for {}: {e}", archive.display());
+                std::process::exit(2);
+            }
         }
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
             archive,
@@ -1353,8 +1992,30 @@ fn main() {
             debug: args.debug,
             encoding: args.encoding.clone(),
             ignore_zeros: args.ignore_zeros,
+            force_base_mismatch: args.force_base_mismatch,
         };
-        match commit_overlay(overlay, archive, &opts) {
+        // An overlay with a database commits only over the base it recorded:
+        // the archive is classified through the factory and gated before the
+        // splice. A raw directory of files has no identity to check; it
+        // commits through its own entry and says so.
+        let result = if !ratarmount_compositing::overlay_db_absent(overlay) {
+            base_identity::classify_offline_commit(
+                archive,
+                &overlay_run_context(args.index_folders.as_deref()),
+            )
+            .map_err(OverlayError::Msg)
+            .and_then(|base| ratarmount_compositing::commit_overlay(overlay, archive, &base, &opts))
+        } else {
+            ratarmount_compositing::commit_overlay_raw_dir(overlay, archive, &opts).map(|done| {
+                if !done.identity_checked {
+                    println!(
+                        "note: no base identity was checked (overlay directory has no database)"
+                    );
+                }
+                done.committed
+            })
+        };
+        match result {
             Ok(_) => return,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -1428,16 +2089,11 @@ fn main() {
         }
     };
 
-    {
-        for input in &inputs {
-            if !ratarmount_remote::is_remote_url(&input.to_string_lossy()) {
-                if let Err(e) = ratarmount_compress::commit_journal::recover(input) {
-                    eprintln!("error: commit recovery for {}: {e}", input.display());
-                    std::process::exit(2);
-                }
-            }
-        }
-    }
+    // Classify every local member's commit journal against the records that
+    // vote on it BEFORE any recovery write; members a record does not own wait
+    // for the identity gates (recovered below, after the overlay opened).
+    let deferred_journals = recover_mount_journals(&args, &inputs);
+
     if args.roll_every.is_none()
         && args.write_overlay.is_some()
         && inputs.len() == 1
@@ -1477,10 +2133,7 @@ fn main() {
         }
     }
 
-    let index_folders = match &args.index_folders {
-        Some(s) => parse_index_folders(s),
-        None => default_index_folders(),
-    };
+    let index_folders = index_folders_of(&args);
 
     let mut passwords = args.passwords.clone();
     if let Some(ref pf) = args.password_file {
@@ -1582,6 +2235,7 @@ fn main() {
             })
             .unwrap_or_default(),
         index_build: Default::default(),
+        recover_journals: false,
     };
 
     if args.force_folder_index {
@@ -1647,67 +2301,119 @@ fn main() {
         ..Default::default()
     };
     if let Some(series) = &rolling {
-        bindings
-            .sources
-            .push(series.clone() as Arc<dyn MountSource>);
+        // Declared: the series is built here, so this caller names what it is.
+        let active = series.active_path();
+        bindings.sources.push(factory::DeclaredSource {
+            src: series.clone() as Arc<dyn MountSource>,
+            kind: ratarmount_compositing::ServedKind::Archive,
+            location: Some(ratarmount_compositing::ServedLocation::Local(
+                active.clone(),
+            )),
+            label: active.display().to_string(),
+        });
     }
     if let Some(list) = &args.corpus_list {
         match corpus::open(list, args.corpus_cache_size as usize) {
-            Ok(source) => bindings.sources.push(source),
+            Ok(source) => bindings.sources.push(factory::DeclaredSource {
+                src: source,
+                kind: ratarmount_compositing::ServedKind::Folder,
+                location: None,
+                label: "corpus".to_owned(),
+            }),
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(2);
             }
         }
     }
-    let mut bundle = match factory::build_mount_source_with_bindings(
-        if args.corpus_list.is_some() || rolling.is_some() {
-            &[]
+    // A `-w` or `--lower` mount classifies its base: the kind and place the
+    // factory actually served are what the overlay records and compares.
+    let wants_identity = args.write_overlay.is_some() || !args.lower.is_empty();
+    let factory_paths: Vec<PathBuf> = if args.corpus_list.is_some() || rolling.is_some() {
+        Vec::new()
+    } else {
+        source_paths.clone()
+    };
+    let factory_comp = factory::CompositingOptions {
+        recursive: args.recursive || args.recursion_depth != 0,
+        lazy: args.lazy,
+        file_versions,
+        prefix: if args.prefix.is_empty() {
+            None
         } else {
-            &source_paths
+            Some(args.prefix.clone())
         },
-        &mut open_opts,
-        args.recreate_index && !args.no_recreate_index,
-        factory::CompositingOptions {
-            recursive: args.recursive || args.recursion_depth != 0,
-            lazy: args.lazy,
-            file_versions,
-            prefix: if args.prefix.is_empty() {
-                None
+        strip_recursive_extension: args.strip_recursive_tar_extension,
+        transform_recursive: args.transform_recursive_mount_point.as_ref().and_then(|v| {
+            if v.len() == 2 {
+                Some((v[0].clone(), v[1].clone()))
             } else {
-                Some(args.prefix.clone())
-            },
-            strip_recursive_extension: args.strip_recursive_tar_extension,
-            transform_recursive: args.transform_recursive_mount_point.as_ref().and_then(|v| {
-                if v.len() == 2 {
-                    Some((v[0].clone(), v[1].clone()))
-                } else {
-                    None
-                }
-            }),
-            transform: args.transform.as_ref().and_then(|v| {
-                if v.len() == 2 {
-                    Some((v[0].clone(), v[1].clone()))
-                } else {
-                    None
-                }
-            }),
-            disable_union_mount: args.disable_union_mount,
-            recursive_extensions: Some(args.recursive_extensions.clone()),
-            union_cache: ratarmount_compositing::UnionMountOptions {
-                max_cache_depth: args.union_mount_cache_max_depth,
-                max_cache_entries: args.union_mount_cache_max_entries,
-                max_seconds_to_cache: args.union_mount_cache_timeout,
-                resolve_symlinks: args.union_resolve_symlinks,
-            },
-            parallel_nested_threads: args.parallel_nested,
+                None
+            }
+        }),
+        transform: args.transform.as_ref().and_then(|v| {
+            if v.len() == 2 {
+                Some((v[0].clone(), v[1].clone()))
+            } else {
+                None
+            }
+        }),
+        disable_union_mount: args.disable_union_mount,
+        recursive_extensions: Some(args.recursive_extensions.clone()),
+        union_cache: ratarmount_compositing::UnionMountOptions {
+            max_cache_depth: args.union_mount_cache_max_depth,
+            max_cache_entries: args.union_mount_cache_max_entries,
+            max_seconds_to_cache: args.union_mount_cache_timeout,
+            resolve_symlinks: args.union_resolve_symlinks,
         },
-        bindings,
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+        parallel_nested_threads: args.parallel_nested,
+    };
+    let recreate_index = args.recreate_index && !args.no_recreate_index;
+    let (mut bundle, classified) = if wants_identity {
+        let mut opener = base_identity::FactoryOpener::new(
+            inputs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            factory_paths,
+            &mut open_opts,
+            recreate_index,
+            factory_comp,
+            bindings,
+            args.source_binds.is_empty(),
+        );
+        match ratarmount_compositing::ClassifiedBase::open(&mut opener) {
+            Ok(base) => (
+                base_identity::MountedSource {
+                    source: base.source(),
+                    _keep_alive: Box::new(()),
+                },
+                Some(base),
+            ),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match factory::build_mount_source_with_bindings(
+            &factory_paths,
+            &mut open_opts,
+            recreate_index,
+            factory_comp,
+            bindings,
+        ) {
+            Ok(built) => (
+                base_identity::MountedSource {
+                    source: built.source.clone(),
+                    _keep_alive: built.into_keep_alive(),
+                },
+                None,
+            ),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
@@ -1834,21 +2540,98 @@ fn main() {
 
     let mut overlay_arc: Option<Arc<WriteOverlay>> = None;
     let mut overlay_quota: Option<Arc<ratarmount_compositing::OverlayQuota>> = None;
+    let mut journal_rules = None;
 
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
+
+    let lower_key = lower_key_for(&args, rolling.is_some(), &inputs, index_sidecar.as_deref());
+    let lower_identity = BaseIdentity::Enforce {
+        base: MountedBase {
+            extra_excludes: lower_extra_excludes(
+                inputs.first().map(PathBuf::as_path),
+                &args.lower,
+                args.write_overlay.as_deref(),
+                args.journal.iter().cloned().collect(),
+                // A FUSE mount point inside a directory base is refused by
+                // `mount_guard`, so it is never an exclusion.
+                None,
+            ),
+            existing_journals: existing_journals_inside_base(
+                inputs.first().map(PathBuf::as_path),
+                &args.lower,
+                &args.journal,
+            ),
+            classified: classified.clone(),
+            supplied: match &args.base_digest {
+                Some(ratarmount_compositing::BaseDigestRequest::Supplied(digest)) => {
+                    Some(digest.clone())
+                }
+                _ => None,
+            },
+        },
+        force: args.force_stack_mismatch,
+    };
+    let (lower_stack, lower_view) = MountLowerStack::open_with(
+        bundle.source.clone(),
+        lower_key.as_deref(),
+        &args.lower,
+        args.allow_unsealed_lower,
+        None,
+        &lower_identity,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    });
+    bundle.source = lower_view;
 
     if let Some(w) = &args.write_overlay {
         let overlay_path = match prepared_overlay_path.take() {
             Some(p) => p,
             None => overlay_dir_for(&args, w),
         };
-        match WriteOverlay::new(Arc::clone(&bundle.source), &overlay_path) {
+        lower_stack
+            .check_top(&overlay_path, args.force_stack_mismatch)
+            .unwrap_or_else(|error| {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            });
+        let create_options = ratarmount_compositing::CreateOptions {
+            base_digest: args.base_digest.clone().unwrap_or_default(),
+            force_base_mismatch: args.force_base_mismatch,
+            lower_layers: lower_stack.records.clone(),
+            index_writable: !open_opts.read_only_index,
+            // Journal and lower layers inside a directory base stay out of its
+            // digest. A mount point inside it is refused by `mount_guard`.
+            weak_exclude: args
+                .journal
+                .iter()
+                .cloned()
+                .chain(lower_stack.records.iter().map(|r| r.path.clone()))
+                .collect(),
+            remote_token: None,
+        };
+        match overlay_create::create_overlay(
+            classified.as_ref().expect("a -w mount classified its base"),
+            Arc::clone(&bundle.source),
+            &overlay_path,
+            create_options,
+            &inputs,
+            !args.source_binds.is_empty(),
+        ) {
             Ok(mut ov) => {
                 if let Some(series) = &rolling {
                     ov.set_rolling(series.clone());
                 }
                 ov.set_encoding(&args.encoding);
+                ov.set_control_reserved(args.control_interface && !args.control_socket_only);
+                if let Ok(Some(marker)) = ov.meta_value("import_in_progress") {
+                    eprintln!(
+                        "warning: {} holds a partial `overlay import` ({marker}); delete it and import again before sealing",
+                        overlay_path.display()
+                    );
+                }
                 ov.set_manifest_hashes(args.commit_manifest.then(|| args.manifest_hashes.clone()));
                 ov.set_commit_mode(args.commit_overlay_mode.parse().expect("clap commit mode"));
                 if !args.overlay_readonly.is_empty()
@@ -1858,28 +2641,48 @@ fn main() {
                     use ratarmount_compositing::{
                         CompositeOverlayPolicy, OverlayPolicy, OverlayQuota, ReadOnlyGlobs,
                     };
-                    let quota = match OverlayQuota::new(
+                    let mut quota = match OverlayQuota::new(
                         ov.root(),
                         args.overlay_quota,
                         args.overlay_quota_files,
                     ) {
-                        Ok(quota) => Arc::new(quota),
+                        Ok(quota) => quota,
                         Err(e) => {
                             eprintln!("error scanning write overlay: {e}");
                             std::process::exit(1);
                         }
                     };
                     let mut policies: Vec<Arc<dyn OverlayPolicy>> = Vec::new();
-                    if !args.overlay_readonly.is_empty() {
-                        policies.push(Arc::new(
-                            ReadOnlyGlobs::new(&args.overlay_readonly)
+                    let rules_json = if args.overlay_readonly.is_empty() {
+                        serde_json::json!({"readonly": [], "allow": []})
+                    } else {
+                        let rules = Arc::new(
+                            ReadOnlyGlobs::with_allow(&args.overlay_readonly, &args.overlay_allow)
                                 .and_then(|rules| rules.with_overlay_root(ov.root()))
                                 .expect("validated read-only globs and overlay root"),
-                        ));
+                        );
+                        let json = rules.rules_json();
+                        quota = quota.with_readonly(rules.clone());
+                        journal_rules = Some(rules.clone());
+                        policies.push(rules);
+                        json
+                    };
+                    // The rules of the latest -w mount, so `overlay info` shows
+                    // what the agent was allowed to change.
+                    if let Err(e) = ov.set_meta("readonly_rules", &rules_json.to_string()) {
+                        eprintln!("error recording read-only rules in overlay metadata: {e}");
+                        std::process::exit(1);
                     }
+                    let quota = Arc::new(quota);
                     policies.push(quota.clone());
                     ov.set_policy(Some(Arc::new(CompositeOverlayPolicy(policies))));
                     overlay_quota = Some(quota);
+                } else if let Err(e) = ov.set_meta(
+                    "readonly_rules",
+                    &serde_json::json!({"readonly": [], "allow": []}).to_string(),
+                ) {
+                    eprintln!("error recording read-only rules in overlay metadata: {e}");
+                    std::process::exit(1);
                 }
                 let ov = Arc::new(ov);
                 bundle.source = Arc::clone(&ov) as Arc<dyn MountSource>;
@@ -1889,6 +2692,27 @@ fn main() {
                 eprintln!("{}", overlay_open_error(&overlay_path, &e));
                 std::process::exit(1);
             }
+        }
+    }
+
+    // Members whose complete journal waited for the gates: every gate accepted,
+    // so each is recovered now (through the overlay's own connection when there
+    // is one: it holds its database exclusively).
+    for member in &deferred_journals {
+        let recovered = match overlay_arc.as_ref() {
+            Some(ov) => ov.recover_member_journal(member).map_err(|e| e.to_string()),
+            None => ratarmount_compositing::recover_journal_at(
+                member,
+                None,
+                ratarmount_compositing::Owner::Inode,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        };
+        if let Err(e) = recovered {
+            eprintln!("error: commit recovery for {}: {e}", member.display());
+            drop(overlay_arc);
+            std::process::exit(1);
         }
     }
 
@@ -2058,6 +2882,42 @@ fn main() {
         std::process::exit(2);
     }
 
+    let journal_options = args.journal.as_ref().map(|path| {
+        let Some(mp) = &fuse_mp else {
+            eprintln!("error: --journal requires a FUSE mountpoint");
+            std::process::exit(2);
+        };
+        let path = ratarmount_fuse::oplog::validate_path(
+            path,
+            mp,
+            overlay_arc.as_ref().map(|ov| ov.root()),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("journal: {error}");
+            std::process::exit(2)
+        });
+        ratarmount_fuse::oplog::JournalOptions {
+            path,
+            exclude: args.journal_exclude.clone(),
+            reads: if args.journal_reads == "first" {
+                ratarmount_fuse::oplog::Reads::First
+            } else {
+                ratarmount_fuse::oplog::Reads::All
+            },
+            sync: args.journal_sync,
+        }
+    });
+    let activity = ratarmount_fuse::oplog::MountActivity {
+        journal: journal_options,
+        quota: overlay_quota.clone(),
+        readonly: journal_rules,
+        metadata: if overlay_arc.is_none() {
+            lower_stack.read_only_metadata()
+        } else {
+            Default::default()
+        },
+    };
+
     let writable = overlay_arc.is_some();
     let fuse_opts = args.fuse.clone();
     let passthrough = PassthroughOptions {
@@ -2081,49 +2941,51 @@ fn main() {
             inputs[0].clone(),
             open_opts.clone(),
         );
-        bundle.source = Arc::new(
-            ControlFolderMountSource::new(
-                pre_control,
-                ControlFolderOptions::enabled()
-                    .with_label(mp.display().to_string())
-                    .with_on_unmount(Arc::new(move || {
-                        // The callback fires inside the FUSE request that opens or reads the
-                        // control file, so unmounting here would always find the mount busy
-                        // (and a retry would stall the request thread). Unmount on a short
-                        // thread instead: the opener's request finishes, the opener closes
-                        // the file, and the retrying unmount then succeeds. The guard only
-                        // blocks a concurrent attempt (open and read both fire); `stop` is
-                        // set after success so a failed attempt can be retried by a later read.
-                        if unmount_in_progress.swap(true, Ordering::SeqCst) {
-                            return;
-                        }
-                        let stop = Arc::clone(&stop);
-                        let mp = mp_ctrl.clone();
-                        let in_progress = Arc::clone(&unmount_in_progress);
-                        let spawned = thread::Builder::new()
-                            .name("ratarmount-control-unmount".into())
-                            .spawn(move || match unmount(&mp) {
-                                Ok(()) => stop.store(true, Ordering::SeqCst),
-                                Err(e) => {
-                                    log::warn!(
-                                        "control file unmount of {} failed: {e}",
-                                        mp.display()
-                                    );
-                                    in_progress.store(false, Ordering::SeqCst);
-                                }
-                            });
-                        if let Err(e) = spawned {
-                            log::warn!("control file unmount: cannot start thread: {e}");
-                            unmount_in_progress.store(false, Ordering::SeqCst);
-                        }
-                    }))
-                    .with_on_search(Arc::clone(&on_search)),
-            )
-            .with_on_status(overlay_quota.clone().map(|quota| {
-                Arc::new(move || quota.usage().status_text())
-                    as Arc<dyn Fn() -> String + Send + Sync>
-            })),
-        ) as Arc<dyn MountSource>;
+        if !args.control_socket_only {
+            bundle.source = Arc::new(
+                ControlFolderMountSource::new(
+                    pre_control,
+                    ControlFolderOptions::enabled()
+                        .with_label(mp.display().to_string())
+                        .with_on_unmount(Arc::new(move || {
+                            // The callback fires inside the FUSE request that opens or reads the
+                            // control file, so unmounting here would always find the mount busy
+                            // (and a retry would stall the request thread). Unmount on a short
+                            // thread instead: the opener's request finishes, the opener closes
+                            // the file, and the retrying unmount then succeeds. The guard only
+                            // blocks a concurrent attempt (open and read both fire); `stop` is
+                            // set after success so a failed attempt can be retried by a later read.
+                            if unmount_in_progress.swap(true, Ordering::SeqCst) {
+                                return;
+                            }
+                            let stop = Arc::clone(&stop);
+                            let mp = mp_ctrl.clone();
+                            let in_progress = Arc::clone(&unmount_in_progress);
+                            let spawned = thread::Builder::new()
+                                .name("ratarmount-control-unmount".into())
+                                .spawn(move || match unmount(&mp) {
+                                    Ok(()) => stop.store(true, Ordering::SeqCst),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "control file unmount of {} failed: {e}",
+                                            mp.display()
+                                        );
+                                        in_progress.store(false, Ordering::SeqCst);
+                                    }
+                                });
+                            if let Err(e) = spawned {
+                                log::warn!("control file unmount: cannot start thread: {e}");
+                                unmount_in_progress.store(false, Ordering::SeqCst);
+                            }
+                        }))
+                        .with_on_search(Arc::clone(&on_search)),
+                )
+                .with_on_status(overlay_quota.clone().map(|quota| {
+                    Arc::new(move || quota.usage().status_text())
+                        as Arc<dyn Fn() -> String + Send + Sync>
+                })),
+            ) as Arc<dyn MountSource>;
+        }
         bind_control_interface(
             mp,
             Arc::clone(&control_stop),
@@ -2173,6 +3035,7 @@ fn main() {
                     overlay_arc,
                     &fuse_opts,
                     passthrough,
+                    activity,
                     readahead,
                     nfs_opts,
                     args.foreground,
@@ -2194,6 +3057,7 @@ fn main() {
             overlay_arc,
             &fuse_opts,
             passthrough,
+            activity,
             readahead,
             Some(nfs_opts),
             plan,
@@ -2217,6 +3081,7 @@ fn main() {
             overlay_arc,
             &fuse_opts,
             passthrough,
+            activity,
             readahead,
             None,
             plan,
@@ -2239,6 +3104,7 @@ fn main() {
         overlay_arc,
         &fuse_opts,
         passthrough,
+        activity,
         readahead,
         args.foreground,
         args.log_file.is_some(),
@@ -2339,6 +3205,27 @@ fn warn_export_non_loopback(name: &str, bind: std::net::SocketAddr) {
         eprintln!(
             "warning: {name} bound on {bind} (no auth). Prefer 127.0.0.1 unless you trust the LAN."
         );
+    }
+}
+
+/// The index folders the invocation names (`--index-folders`), else the defaults.
+fn index_folders_of(args: &Args) -> Vec<PathBuf> {
+    parse_folders_or_default(args.index_folders.as_deref())
+}
+
+fn parse_folders_or_default(spec: Option<&str>) -> Vec<PathBuf> {
+    match spec {
+        Some(s) => parse_index_folders(s),
+        None => default_index_folders(),
+    }
+}
+
+/// What the offline verbs need from their invocation: the `--index-folders`
+/// they were given (`overlay ... --index-folders`, `diff --index-folders`,
+/// `--commit-overlay --index-folders`), else the defaults a mount uses.
+fn overlay_run_context(spec: Option<&str>) -> base_identity::OverlayRunContext {
+    base_identity::OverlayRunContext {
+        index_folders: parse_folders_or_default(spec),
     }
 }
 
@@ -2768,6 +3655,7 @@ fn spawn_interval_if(
     stop: Option<ratarmount_nfs::NfsStop>,
     open_opts: &OpenOptions,
 ) -> Option<thread::JoinHandle<()>> {
+    base_digest::spawn_if_pending(overlay);
     match (overlay, live_archive, commit_interval) {
         (Some(ov), Some(archive), Some(dur)) => Some(overlay_commit::spawn_interval_commits(
             Arc::clone(ov),
@@ -2799,6 +3687,7 @@ fn finish_overlay_serve(
     commit: impl FnOnce(Option<&WriteOverlay>),
 ) {
     overlay_commit::request_shutdown();
+    base_digest::join();
     if let Some(handle) = interval {
         let _ = handle.join();
     }
@@ -2822,6 +3711,7 @@ fn run_exports(
     overlay_arc: Option<Arc<WriteOverlay>>,
     fuse_opts: &str,
     passthrough: PassthroughOptions,
+    activity: ratarmount_fuse::oplog::MountActivity,
     readahead: u64,
     mut nfs_opts: Option<ratarmount_nfs::NfsOptions>,
     mut plan: ExportPlan,
@@ -2945,6 +3835,7 @@ fn run_exports(
                     readahead,
                     passthrough,
                     open_opts.direct_io,
+                    activity,
                 );
                 wait_control_reply(&control);
                 nfs_stop.request_stop();
@@ -3020,6 +3911,7 @@ fn run_exports(
                         readahead,
                         passthrough,
                         open_opts.direct_io,
+                        activity,
                     );
                     wait_control_reply(&control);
                     nfs_stop.request_stop();
@@ -3128,6 +4020,7 @@ fn run_fuse_and_nfs(
     overlay_arc: Option<Arc<WriteOverlay>>,
     fuse_opts: &str,
     passthrough: PassthroughOptions,
+    activity: ratarmount_fuse::oplog::MountActivity,
     readahead: u64,
     mut nfs_opts: ratarmount_nfs::NfsOptions,
     foreground: bool,
@@ -3180,6 +4073,7 @@ fn run_fuse_and_nfs(
             readahead,
             passthrough,
             open_opts.direct_io,
+            activity,
         );
         wait_control_reply(&control);
         stop.request_stop();
@@ -3253,6 +4147,7 @@ fn run_fuse_and_nfs(
                 readahead,
                 passthrough,
                 open_opts.direct_io,
+                activity,
             );
             wait_control_reply(&control);
             stop.request_stop();
@@ -3283,6 +4178,7 @@ fn run_fuse_only(
     overlay_arc: Option<Arc<WriteOverlay>>,
     fuse_opts: &str,
     passthrough: PassthroughOptions,
+    activity: ratarmount_fuse::oplog::MountActivity,
     readahead: u64,
     foreground: bool,
     has_log_file: bool,
@@ -3322,6 +4218,7 @@ fn run_fuse_only(
             readahead,
             passthrough,
             open_opts.direct_io,
+            activity,
         );
         wait_control_reply(&control);
         finish_overlay_serve(overlay_arc, None, interval, commit_exit);
@@ -3372,6 +4269,7 @@ fn run_fuse_only(
                 readahead,
                 passthrough,
                 open_opts.direct_io,
+                activity,
             );
             wait_control_reply(&control);
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
@@ -3643,6 +4541,68 @@ fn print_oss_attributions(full: bool) {
 
 type SearchFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
+/// `<dir>/ratarmount-control-<pid>.sock`.
+pub(crate) fn control_socket_path(dir: &Path, pid: u32) -> PathBuf {
+    dir.join(format!("ratarmount-control-{pid}.sock"))
+}
+
+/// Removes the control socket when dropped. The accept thread only unlinks
+/// after its stop flag is set, and `accept()` blocks, so an external
+/// `fusermount -u` never reaches that.
+struct ControlSocket(PathBuf);
+
+impl Drop for ControlSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The live control socket, for the serve paths that end in `process::exit`
+/// (which skips [`ControlSocket`]'s destructor): see [`mount_blocking`].
+static CONTROL_SOCKET: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// [`fuse_mount_blocking`], then unlink the control socket: the mount is over
+/// whether it ended by `fusermount -u`, the control `unmount`, or an error, and
+/// every caller goes on to `process::exit` or returns into a forked child.
+#[allow(clippy::too_many_arguments)]
+fn mount_blocking(
+    source: Arc<dyn MountSource>,
+    mountpoint: impl AsRef<Path>,
+    foreground: bool,
+    writable: bool,
+    overlay: Option<Arc<WriteOverlay>>,
+    extra_fuse_opts: &str,
+    readahead: u64,
+    passthrough: PassthroughOptions,
+    direct_io: bool,
+    activity: ratarmount_fuse::oplog::MountActivity,
+) -> std::io::Result<()> {
+    let r = fuse_mount_blocking(
+        source,
+        mountpoint,
+        foreground,
+        writable,
+        overlay,
+        extra_fuse_opts,
+        readahead,
+        passthrough,
+        direct_io,
+        activity,
+    );
+    remove_registered_control_socket();
+    r
+}
+
+fn remove_registered_control_socket() {
+    let path = CONTROL_SOCKET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// A bound control socket that is not yet served. Binding (and printing the path) happens
 /// before any fork so errors reach the user; [`ControlListener::serve`] runs in the process
 /// that serves the mount, because a thread started before `fork` does not exist in the child.
@@ -3657,8 +4617,14 @@ struct ControlListener {
 
 /// Counts control requests being answered. A reply that unmounts is in flight before the
 /// unmount starts and stays so until it is written, so the exit path can wait for it.
+/// The copy [`ControlListener::serve`] returns also owns the socket file's
+/// [`ControlSocket`] guard (the accept thread's copy has none), so the file is
+/// removed when the serving path drops it, even after an external `fusermount -u`.
 #[derive(Clone, Default)]
-struct ControlInflight(Arc<std::sync::atomic::AtomicUsize>);
+struct ControlInflight(
+    Arc<std::sync::atomic::AtomicUsize>,
+    Option<Arc<ControlSocket>>,
+);
 
 /// Marks one control request in flight until dropped (also on panic).
 struct ControlInflightGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -3708,7 +4674,7 @@ fn bind_control_interface(
     on_search: Option<SearchFn>,
     quota: Option<Arc<ratarmount_compositing::OverlayQuota>>,
 ) -> Option<ControlListener> {
-    let sock = std::env::temp_dir().join(format!("ratarmount-control-{}.sock", std::process::id()));
+    let sock = control_socket_path(&std::env::temp_dir(), std::process::id());
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
@@ -3731,7 +4697,9 @@ fn bind_control_interface(
 impl ControlListener {
     /// Start the accept thread. Call in the process that serves the mount.
     fn serve(self) -> ControlInflight {
-        let inflight = ControlInflight::default();
+        let mut inflight = ControlInflight::default();
+        // The accept thread's copy carries no socket guard: it blocks in
+        // `accept()` and never returns after an external `fusermount -u`.
         let tracker = inflight.clone();
         let ControlListener {
             listener,
@@ -3741,6 +4709,8 @@ impl ControlListener {
             on_search,
             quota,
         } = self;
+        *CONTROL_SOCKET.lock().unwrap_or_else(|e| e.into_inner()) = Some(sock.clone());
+        inflight.1 = Some(Arc::new(ControlSocket(sock.clone())));
         thread::spawn(move || {
             // Don't block forever if unmount happens
             let _ = listener.set_nonblocking(false);
@@ -4087,6 +5057,169 @@ fn split_inputs_mountpoint(paths: &[PathBuf], no_mount: bool) -> (Vec<PathBuf>, 
         return (paths.to_vec(), None);
     }
     (paths[..paths.len() - 1].to_vec(), Some(last.clone()))
+}
+
+/// Base-relative exclusions for the A2 walk of a directory base: the paths of
+/// this invocation (journal, mount point, a new `-w` overlay) resolved with the
+/// topmost-new rule, plus the set an existing `-w` overlay already recorded.
+///
+/// An invocation-only path (journal, mount point) is excluded only if it is
+/// not in the base yet, is the mount point and an empty directory, or is
+/// already in a recorded excluded set (the top's, added below, or the bottom
+/// lower's, which the walk applies itself). Anything else is base content, so
+/// a change to it is a base change, with or without `-w`.
+fn lower_extra_excludes(
+    base: Option<&Path>,
+    lowers: &[PathBuf],
+    overlay: Option<&Path>,
+    mut paths: Vec<PathBuf>,
+    mount_point: Option<&Path>,
+) -> Vec<PathBuf> {
+    use ratarmount_compositing::overlay_meta::{resolve_base_excludes, BaseExcludes};
+    let Some(base) = base.filter(|b| !lowers.is_empty() && b.is_dir()) else {
+        return Vec::new();
+    };
+    paths.retain(|p| std::fs::symlink_metadata(p).is_err());
+    if let Some(mp) = mount_point {
+        let empty_dir = std::fs::symlink_metadata(mp).map_or(true, |m| {
+            m.is_dir() && std::fs::read_dir(mp).is_ok_and(|mut d| d.next().is_none())
+        });
+        if empty_dir {
+            paths.push(mp.to_path_buf());
+        }
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(overlay) = overlay.filter(|o| o.as_os_str() != ":temp:") {
+        paths.push(overlay.to_path_buf());
+        if let Some(recorded) = ratarmount_compositing::OverlayMeta::read(overlay)
+            .ok()
+            .flatten()
+            .and_then(|m| m.get("base_weak_excludes").map(str::to_owned))
+            .and_then(|text| BaseExcludes::from_json(&text).ok())
+        {
+            out.extend(recorded.paths().iter().cloned());
+        }
+    }
+    if let Ok((_, resolved)) = resolve_base_excludes(base, &paths) {
+        out.extend(resolved.paths().iter().cloned());
+    }
+    out
+}
+
+/// The mount-time journal rule: before any recovery write, compare each
+/// member's journal against every readable overlay record (`-w` top, `--lower`
+/// directories). A journal every record agrees with (or abstains on) is
+/// recovered now and the top's rows restamped; one a record does not own is
+/// left untouched until every gate decided. A torn deferred journal is refused
+/// (nothing can open on a half-written archive); a complete one is returned for
+/// recovery after the gates. The decision is taken again under the archive lock.
+fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
+    use ratarmount_compositing::{
+        classify_mount_journal, recover_journal_at, MountJournal, MountRecords,
+    };
+    let mut members: Vec<PathBuf> = Vec::new();
+    for input in inputs {
+        let typed = input.to_string_lossy();
+        match ratarmount_remote::remote_url_scheme(&typed).as_deref() {
+            Some("file") => match &ratarmount_remote::resolve_to_local(&typed) {
+                Ok(ratarmount_remote::RemoteLocal::Local(path)) => members.push(path.clone()),
+                _ => members.push(input.clone()),
+            },
+            _ if ratarmount_remote::is_remote_url(&typed) => {}
+            _ => members.push(input.clone()),
+        }
+    }
+    if args.roll_every.is_some() && members.len() == 1 {
+        if let Ok(name) = ratarmount_compositing::SeriesName::new(&members[0]) {
+            if let Ok(found) = name.discover() {
+                members = found.into_iter().map(|(_, path)| path).collect();
+            }
+        }
+    }
+    for bind in &args.source_binds {
+        if !ratarmount_remote::is_remote_url(&bind.source) {
+            members.push(PathBuf::from(&bind.source));
+        }
+    }
+    let mut records = MountRecords::default();
+    if let Some(top) = args
+        .write_overlay
+        .as_ref()
+        .filter(|w| w.as_os_str() != ":temp:")
+    {
+        records.top = Some(top.clone());
+    }
+    for lower in &args.lower {
+        if lower.is_dir() {
+            records.lowers.push(lower.clone());
+        } else {
+            records.bundles = true;
+        }
+    }
+    let top_db = records
+        .top
+        .as_ref()
+        .map(|dir| dir.join(ratarmount_compositing::HIDDEN_DB));
+    let mut deferred = Vec::new();
+    for member in &members {
+        match classify_mount_journal(&records, member) {
+            Err(e) => {
+                eprintln!("error: commit recovery for {}: {e}", member.display());
+                std::process::exit(2);
+            }
+            Ok(MountJournal::None | MountJournal::Own) => {
+                let owner = ratarmount_compositing::Owner::Mount {
+                    records: &records,
+                    member,
+                };
+                if let Err(e) = recover_journal_at(member, top_db.as_deref(), owner) {
+                    eprintln!("error: commit recovery for {}: {e}", member.display());
+                    std::process::exit(2);
+                }
+            }
+            Ok(MountJournal::Deferred { complete: true, .. }) => deferred.push(member.clone()),
+            Ok(MountJournal::Deferred {
+                complete: false,
+                why,
+                force_flag,
+            }) => {
+                eprintln!(
+                    "error: {} {why}; the replacement did not complete, so it cannot be opened \
+                     until recovered. Recover it alone first (`ratarmount --no-mount {}` rolls \
+                     the interrupted append back) or restore the recorded base, then retry, \
+                     with {force_flag} if it is meant to replace the recorded base.",
+                    member.display(),
+                    member.display()
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+    deferred
+}
+
+/// `--journal` files that exist already and lie inside a directory base under a
+/// `--lower` stack (see [`MountedBase::existing_journals`]).
+fn existing_journals_inside_base(
+    base: Option<&Path>,
+    lowers: &[PathBuf],
+    journals: &Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let Some(base) = base.filter(|b| !lowers.is_empty() && b.is_dir()) else {
+        return Vec::new();
+    };
+    journals
+        .iter()
+        .filter(|p| std::fs::symlink_metadata(p).is_ok())
+        .filter(|p| {
+            ratarmount_compositing::overlay_meta::resolve_base_excludes(
+                base,
+                std::slice::from_ref(*p),
+            )
+            .is_ok_and(|(_, inside)| !inside.paths().is_empty())
+        })
+        .cloned()
+        .collect()
 }
 
 /// Default mount point stem for a string `url::Url` can parse (never touches the filesystem).
@@ -4442,6 +5575,111 @@ mod parallel_nested_cli_tests {
         assert_eq!(
             ratarmount_session::factory::CompositingOptions::default().parallel_nested_threads,
             0
+        );
+    }
+}
+
+#[cfg(test)]
+mod base_flag_cli_tests {
+    use super::parse_args_from;
+
+    fn parse(args: &[&str]) -> Result<super::Args, clap::Error> {
+        parse_args_from(std::iter::once("ratarmount").chain(args.iter().copied()))
+    }
+
+    /// Regression: clap rejected `--base-digest` / `--force-stack-mismatch` on a
+    /// read-only `--lower` mount, where A2 tells the user to pass them.
+    #[test]
+    fn regression_base_digest_flag_allowed_with_lower_only() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let a = parse(&["--lower", "L", "--base-digest", &digest, "base", "mnt"]).expect("parse");
+        assert_eq!(a.paths.len(), 2, "the value must not steal a positional");
+        assert!(a.base_digest.is_some());
+        assert!(parse(&["--lower", "L", "--base-digest", "none", "base", "mnt"]).is_ok());
+        assert!(parse(&["--lower", "L", "--force-stack-mismatch", "base", "mnt"]).is_ok());
+        assert!(parse(&[
+            "-w",
+            "ov",
+            "--lower",
+            "L",
+            "--force-stack-mismatch",
+            "base",
+            "mnt"
+        ])
+        .is_ok());
+        assert!(parse(&["-w", "ov", "--base-digest", &digest, "base", "mnt"]).is_ok());
+        let error = parse(&["--base-digest", &digest, "base", "mnt"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("--base-digest requires"), "{error}");
+        let error = parse(&["--force-stack-mismatch", "base", "mnt"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("--force-stack-mismatch requires"), "{error}");
+        // --force-base-mismatch still needs an overlay target.
+        assert!(parse(&["--lower", "L", "--force-base-mismatch", "base", "mnt"]).is_err());
+    }
+
+    /// Regression: the offline verbs (`overlay seal|pack|verify|import`, `diff`)
+    /// dropped the parent invocation's `--index-folders`, so the sidecar a
+    /// mount used was not the one they read. Each verb takes the flag, and the
+    /// context carries the parsed folders (the defaults when none are given).
+    #[test]
+    fn regression_index_folders_reaches_offline_verbs() {
+        let want = vec![
+            std::path::PathBuf::from("/idx/a"),
+            std::path::PathBuf::from("/idx/b"),
+        ];
+        for argv in [
+            vec!["overlay", "seal", "ov", "--index-folders", "/idx/a,/idx/b"],
+            vec![
+                "overlay",
+                "pack",
+                "ov",
+                "out.tar.zst",
+                "--index-folders",
+                "/idx/a,/idx/b",
+            ],
+            vec![
+                "overlay",
+                "verify",
+                "ov",
+                "--index-folders",
+                "/idx/a,/idx/b",
+            ],
+        ] {
+            let args = parse(&argv).unwrap();
+            let overlay = args.overlay.expect("overlay verb");
+            assert_eq!(
+                super::overlay_run_context(overlay.index_folders.as_deref()).index_folders,
+                want,
+                "{argv:?}"
+            );
+        }
+        let args = parse(&["diff", "ov", "--index-folders", "/idx/a,/idx/b"]).unwrap();
+        let diff = args.diff.expect("diff");
+        assert_eq!(
+            super::overlay_run_context(diff.index_folders.as_deref()).index_folders,
+            want
+        );
+        let args = parse(&[
+            "--index-folders",
+            "/idx/a,/idx/b",
+            "--commit-overlay",
+            "-w",
+            "ov",
+            "a.tar",
+        ])
+        .unwrap();
+        assert_eq!(
+            super::overlay_run_context(args.index_folders.as_deref()).index_folders,
+            want
+        );
+        assert_eq!(
+            super::overlay_run_context(None).index_folders,
+            ratarmount_index::default_index_folders()
         );
     }
 }
@@ -5728,7 +6966,8 @@ mod create_missing_cli_tests {
         if skip_no_bin() {
             return;
         }
-        let ov = dir.path().join("ov");
+        // This is a different base from the ZIP above; give it its own identity.
+        let ov = dir.path().join("ov-gz");
         let out = run_cli(
             &[
                 "-w",
@@ -6539,7 +7778,11 @@ mod overlay_unmount_drop_tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            crate::base_identity::fixtures::new_overlay(
+                Arc::new(EmptyBase) as Arc<dyn MountSource>,
+                &overlay,
+            )
+            .unwrap(),
         );
         let weak = Arc::downgrade(&ov);
         let held = Arc::clone(&ov);
@@ -6556,6 +7799,37 @@ mod overlay_unmount_drop_tests {
         });
         let source: Arc<dyn MountSource> = Arc::clone(&ov) as Arc<dyn MountSource>;
         finish_overlay_serve(Some(ov), Some(source), Some(interval), |_| {});
+        assert!(
+            weak.upgrade().is_none(),
+            "overlay Arc still alive after finish"
+        );
+    }
+
+    /// Regression: the lazy base-digest thread must be joined before the
+    /// overlay drops, or `process::exit` strands `WriteOverlay::drop`.
+    #[test]
+    fn finish_overlay_serve_joins_base_digest_thread() {
+        let _guard = lock_term_flag();
+        let _reset = ResetTerm;
+        crate::overlay_commit::set_term_flag_for_test(false);
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, vec![7u8; 1 << 20]).unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(
+            crate::base_identity::fixtures::overlay_over(
+                Arc::new(EmptyBase) as Arc<dyn MountSource>,
+                &overlay,
+                archive.to_str().unwrap(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        assert!(ov.pending_base().unwrap().is_some());
+        let weak = Arc::downgrade(&ov);
+        let ov = Some(ov);
+        crate::base_digest::spawn_if_pending(&ov);
+        finish_overlay_serve(ov, None, None, |_| {});
         assert!(
             weak.upgrade().is_none(),
             "overlay Arc still alive after finish"
@@ -6600,7 +7874,11 @@ mod overlay_unmount_drop_tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            crate::base_identity::fixtures::new_overlay(
+                Arc::new(EmptyBase) as Arc<dyn MountSource>,
+                &overlay,
+            )
+            .unwrap(),
         );
         let weak = Arc::downgrade(&ov);
         let interval = live_interval_thread(&ov, dir.path().join("archive.tar"));
@@ -6632,7 +7910,11 @@ mod overlay_unmount_drop_tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            crate::base_identity::fixtures::new_overlay(
+                Arc::new(EmptyBase) as Arc<dyn MountSource>,
+                &overlay,
+            )
+            .unwrap(),
         );
         let weak = Arc::downgrade(&ov);
         let interval = live_interval_thread(&ov, dir.path().join("archive.tar"));
@@ -6720,7 +8002,11 @@ mod overlay_unmount_drop_tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            crate::base_identity::fixtures::new_overlay(
+                Arc::new(EmptyBase) as Arc<dyn MountSource>,
+                &overlay,
+            )
+            .unwrap(),
         );
         let weak = Arc::downgrade(&ov);
         let cb = crate::find::live_search_callback(
@@ -6905,6 +8191,7 @@ mod sandbox_cli_tests {
     fn regression_overlay_policy_flags_require_write_overlay() {
         for flag in [
             "--overlay-readonly",
+            "--overlay-allow",
             "--overlay-quota",
             "--overlay-quota-files",
         ] {
@@ -6961,6 +8248,67 @@ mod sandbox_cli_tests {
         ])
         .is_err());
     }
+    /// Regression: a single allow value must not consume the archive positional,
+    /// and exceptions require read-only rules and a writable overlay target.
+    #[test]
+    fn regression_overlay_allow_keeps_archive_and_requires_readonly() {
+        for target in [vec!["-w", "ov"], vec!["--overlay-tmpfs"], vec!["--sandbox"]] {
+            let args = parse_args_from(["ratarmount"].into_iter().chain(target).chain([
+                "--overlay-readonly",
+                "t/**",
+                "--overlay-allow",
+                "t/agent/**,t/extra/**",
+                "--overlay-allow",
+                "t/new/**",
+                "a.tar",
+                "mnt",
+            ]))
+            .unwrap();
+            assert_eq!(args.overlay_allow, ["t/agent/**", "t/extra/**", "t/new/**"]);
+            assert_eq!(args.paths, [PathBuf::from("a.tar"), PathBuf::from("mnt")]);
+        }
+        assert!(parse_args_from([
+            "ratarmount",
+            "-w",
+            "ov",
+            "--overlay-allow",
+            "t/agent/**",
+            "a.tar"
+        ])
+        .is_err());
+        for bad in ["", "x**y", "../t", "a,,b", "a/./b"] {
+            assert!(
+                parse_args_from([
+                    "ratarmount",
+                    "-w",
+                    "ov",
+                    "--overlay-readonly",
+                    "t/**",
+                    "--overlay-allow",
+                    bad,
+                    "a.tar"
+                ])
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Regression: the control socket file name format and its Drop unlink.
+    #[test]
+    fn regression_control_socket_guard_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = control_socket_path(dir.path(), 4242);
+        assert_eq!(path, dir.path().join("ratarmount-control-4242.sock"));
+        std::fs::write(&path, b"").unwrap();
+        let other = control_socket_path(dir.path(), 1);
+        std::fs::write(&other, b"").unwrap();
+        drop(ControlSocket(path.clone()));
+        assert!(!path.exists());
+        assert!(other.exists(), "another pid's socket must survive");
+        drop(ControlSocket(path));
+    }
+
     /// Regression (I1): the exit path must wait for an unmount reply that is still being written.
     #[test]
     fn regression_control_inflight_idle_returns_immediately() {
@@ -7012,8 +8360,11 @@ mod sandbox_cli_tests {
     #[test]
     fn regression_control_socket_quota_status() {
         let root = tempfile::tempdir().unwrap();
-        let quota =
-            ratarmount_compositing::OverlayQuota::new(root.path(), Some(1024), None).unwrap();
+        use ratarmount_compositing::{OverlayMutation, OverlayPolicy, OverlayQuota, ReadOnlyGlobs};
+        let rules = Arc::new(ReadOnlyGlobs::with_allow(["t/**"], ["t/agent/**"]).unwrap());
+        let quota = OverlayQuota::new(root.path(), Some(1024), None)
+            .unwrap()
+            .with_readonly(rules.clone());
         let stop = AtomicBool::new(false);
         let reply = control_reply_with_quota(
             "status",
@@ -7024,7 +8375,7 @@ mod sandbox_cli_tests {
             &no_unmount,
         );
         assert!(reply.starts_with("mounted /mnt\nmemory_budget unlimited\n"));
-        assert!(reply.ends_with("overlay_bytes 0\noverlay_quota_bytes 1024\noverlay_files 0\noverlay_quota_files unlimited\n"));
+        assert!(reply.ends_with("overlay_bytes 0\noverlay_quota_bytes 1024\noverlay_files 0\noverlay_quota_files unlimited\nerofs_denied 0\n"));
         assert_eq!(
             control_reply_with_quota(
                 "ping",
@@ -7036,6 +8387,31 @@ mod sandbox_cli_tests {
             ),
             "pong\n"
         );
+        assert!(rules
+            .check_mutation(OverlayMutation::Create, &["/t/blocked"])
+            .is_err());
+        let reply = control_reply_with_quota(
+            "status",
+            Path::new("/mnt"),
+            &stop,
+            None,
+            Some(&quota),
+            &no_unmount,
+        );
+        assert!(reply.ends_with("erofs_denied 1\n"));
+        let unlimited = OverlayQuota::new(root.path(), None, None)
+            .unwrap()
+            .with_readonly(rules);
+        let reply = control_reply_with_quota(
+            "status",
+            Path::new("/mnt"),
+            &stop,
+            None,
+            Some(&unlimited),
+            &no_unmount,
+        );
+        assert!(reply.contains("overlay_quota_bytes unlimited\n"));
+        assert!(reply.ends_with("erofs_denied 1\n"));
     }
 }
 
@@ -7585,5 +8961,520 @@ mod torrent_policy_tests {
         let (inputs, mount) = split_inputs_mountpoint(&paths, false);
         assert_eq!(inputs, vec![PathBuf::from("source.tar")]);
         assert_eq!(mount, Some(mountpoint));
+    }
+}
+
+#[cfg(test)]
+mod lower_stack_tests {
+    use super::*;
+    use ratarmount_compositing::{FolderMountSource, Immutability, OverlayMeta};
+
+    /// Regression: --lower consumes exactly one value and never steals base/mount positionals.
+    #[test]
+    fn regression_lower_flags_keep_positionals_and_optional_top() {
+        let args = parse_args_from([
+            "ratarmount",
+            "--lower",
+            "first",
+            "--lower",
+            "second",
+            "base.tar",
+            "mnt",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.lower,
+            [PathBuf::from("first"), PathBuf::from("second")]
+        );
+        assert_eq!(
+            args.paths,
+            [PathBuf::from("base.tar"), PathBuf::from("mnt")]
+        );
+        assert!(args.write_overlay.is_none());
+        for flag in ["--overlay-tmpfs", "--sandbox"] {
+            let args = parse_args_from(["ratarmount", flag, "--lower", "first", "base.tar", "mnt"])
+                .unwrap();
+            assert!(args.overlay_tmpfs.is_some());
+        }
+        assert!(
+            parse_args_from(["ratarmount", "--allow-unsealed-lower", "base.tar", "mnt"]).is_err()
+        );
+    }
+
+    /// Regression: layered offline/live/interval/rolling commits could overwrite the base.
+    #[test]
+    fn regression_lower_stack_commit_is_refused() {
+        for extra in [
+            vec!["--commit-overlay"],
+            vec!["--commit-overlay-on-exit"],
+            vec!["--commit-overlay-interval", "2s"],
+            vec!["--roll-every", "1h"],
+        ] {
+            let mut argv = vec!["ratarmount", "-w", "top", "--lower", "prepared"];
+            argv.extend(extra);
+            argv.extend(["base.tar", "mnt"]);
+            let error = parse_args_from(argv).unwrap_err().to_string();
+            assert!(
+                error.contains("commit of a layered stack is not supported; flatten first"),
+                "{error}"
+            );
+        }
+    }
+
+    /// Regression: overlay fsck DIR was mistaken for ordinary archive/mount positionals.
+    #[test]
+    fn regression_lower_fsck_dispatch_keeps_directory() {
+        let args = parse_args_from(["ratarmount", "overlay", "fsck", "DIR", "--repair", "--json"])
+            .unwrap();
+        assert!(args.paths.is_empty());
+        assert!(
+            matches!(args.overlay.unwrap().command, overlay_cmd::OverlayCommand::Fsck { directory, repair: true, json: true } if directory == Path::new("DIR"))
+        );
+        assert!(parse_args_from(["ratarmount", "overlay", "fsck"]).is_err());
+        assert!(parse_args_from(["ratarmount", "overlay", "fsck", "a", "b"]).is_err());
+    }
+
+    /// Regression: unsealed/legacy lowers require opt-in, sealed lowers use immutable SQLite.
+    #[test]
+    fn regression_lower_unsealed_and_legacy_require_opt_in() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let dir = root.path().join("lower");
+        let view: Arc<dyn ratarmount_core::MountSource> =
+            Arc::new(FolderMountSource::new(base).unwrap());
+        drop(crate::base_identity::fixtures::new_overlay(view.clone(), &dir).unwrap());
+        let paths = [dir.clone()];
+        let open = |allow| MountLowerStack::open(view.clone(), None, &paths, allow).map(|r| r.0);
+        assert!(open(false).err().unwrap().contains("unsealed"));
+        let stack = open(true).unwrap();
+        assert_eq!(stack.layers[0].1, Immutability::Shared);
+        assert!(stack.records[0].layer_digest.is_empty());
+        let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+        conn.execute_batch("DROP TABLE meta").unwrap();
+        drop(conn);
+        assert!(open(false).is_err());
+        assert!(open(true).is_ok());
+        let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+        conn.execute_batch(ratarmount_compositing::overlay_meta::META_SCHEMA)
+            .unwrap();
+        OverlayMeta::set(&conn, "sealed_at", "2026-10-17T00:00:00Z").unwrap();
+        drop(conn);
+        assert_eq!(open(false).unwrap().layers[0].1, Immutability::Immutable);
+    }
+
+    /// A sealed lower over `base` whose recorded identity is `meta`.
+    fn identity_lower(
+        root: &Path,
+        base: &Path,
+        meta: &[(&str, &str)],
+    ) -> (Arc<dyn ratarmount_core::MountSource>, PathBuf) {
+        let view: Arc<dyn ratarmount_core::MountSource> =
+            Arc::new(FolderMountSource::new(base).unwrap());
+        let dir = root.join("lower");
+        drop(crate::base_identity::fixtures::new_overlay(view.clone(), &dir).unwrap());
+        let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+        OverlayMeta::set_many(&conn, meta).unwrap();
+        // Written by a build that records the base kind (format 2).
+        OverlayMeta::set_many(
+            &conn,
+            &[
+                ("format_version", "2"),
+                ("sealed_at", "2026-10-17T00:00:00Z"),
+                ("layer_digest", "sha256:layer"),
+            ],
+        )
+        .unwrap();
+        (view, dir)
+    }
+
+    fn enforce(base: &Path, force: bool) -> BaseIdentity {
+        BaseIdentity::Enforce {
+            base: MountedBase {
+                classified: Some(base_identity::fixtures::classify(base)),
+                ..Default::default()
+            },
+            force,
+        }
+    }
+
+    /// Regression: a read-only `--lower` mount reported the bottom lower's
+    /// recorded `base_digest` (here forged) whatever base was mounted.
+    #[test]
+    fn regression_lower_forged_digest_not_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(base.join("f"), b"one").unwrap();
+        let weak = ratarmount_compositing::overlay_meta::directory_weak_digest(
+            &base,
+            &ratarmount_compositing::overlay_meta::BaseExcludes::default(),
+        )
+        .unwrap();
+        let (view, lower) = identity_lower(
+            root.path(),
+            &base,
+            &[
+                ("base_kind", "directory"),
+                ("base_location", &format!("local:{}", base.display())),
+                ("base_digest", "sha256:forged"),
+                ("base_digest_kind", "strong"),
+                ("base_weak_digest", &weak),
+                ("base_weak_excludes", "[]"),
+            ],
+        );
+        let paths = [lower];
+        let (stack, _) =
+            MountLowerStack::open_with(view, None, &paths, false, None, &enforce(&base, false))
+                .unwrap();
+        let metadata = stack.read_only_metadata();
+        assert_eq!(metadata["base_digest"], weak);
+        assert_eq!(
+            metadata["stack_digest"],
+            ratarmount_compositing::stack_digest(&weak, &["sha256:layer"])
+        );
+    }
+
+    /// Regression: offline commands (`overlay verify`, `seal`, `pack`) must not
+    /// refuse a lower over a byte-identical copy of its base; only the mount
+    /// path enforces the identity.
+    #[test]
+    fn regression_verify_stacked_strong_overlay_over_byte_identical_copy_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        let copy = root.path().join("copy");
+        for dir in [&base, &copy] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("f"), b"one").unwrap();
+        }
+        let file = std::fs::File::options()
+            .write(true)
+            .open(copy.join("f"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        drop(file);
+        let weak = ratarmount_compositing::overlay_meta::directory_weak_digest(
+            &base,
+            &ratarmount_compositing::overlay_meta::BaseExcludes::default(),
+        )
+        .unwrap();
+        let (_, lower) = identity_lower(
+            root.path(),
+            &base,
+            &[
+                ("base_kind", "directory"),
+                ("base_location", &format!("local:{}", base.display())),
+                ("base_digest", "sha256:strong"),
+                ("base_digest_kind", "strong"),
+                ("base_weak_digest", &weak),
+            ],
+        );
+        let paths = [lower];
+        let view: Arc<dyn ratarmount_core::MountSource> =
+            Arc::new(FolderMountSource::new(&copy).unwrap());
+        MountLowerStack::open_in(view.clone(), None, &paths, false, None).unwrap();
+        let error = MountLowerStack::open_with(
+            view.clone(),
+            None,
+            &paths,
+            false,
+            None,
+            &enforce(&copy, false),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("--force-stack-mismatch"), "{error}");
+        MountLowerStack::open_with(view, None, &paths, false, None, &enforce(&copy, true)).unwrap();
+    }
+
+    /// An archive base whose digest is not cached has no identity to report:
+    /// empty `base_digest` and `stack_digest`, and no hashing at mount.
+    #[test]
+    fn regression_lower_uncached_archive_reports_no_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("base.bin");
+        std::fs::write(&archive, b"archive bytes").unwrap();
+        let stamp = ratarmount_index::ArchiveDigestStamp::read(&archive).unwrap();
+        let folder = root.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let (view, lower) = identity_lower(
+            root.path(),
+            &folder,
+            &[
+                ("base_kind", "archive"),
+                ("base_location", &format!("local:{}", archive.display())),
+                ("base_digest", ""),
+                ("base_digest_kind", "pending"),
+                ("base_size", &stamp.size.to_string()),
+                ("base_mtime_ns", &stamp.mtime_ns.to_string()),
+            ],
+        );
+        let paths = [lower];
+        let (stack, _) = MountLowerStack::open_with(
+            view,
+            None,
+            &paths,
+            false,
+            Some(root.path()),
+            &enforce(&archive, false),
+        )
+        .unwrap();
+        let metadata = stack.read_only_metadata();
+        assert_eq!(metadata["base_digest"], "");
+        assert_eq!(metadata["stack_digest"], "");
+        assert_eq!(metadata["base_digest_state"], "pending");
+    }
+}
+
+#[cfg(test)]
+mod lower_extra_excludes_tests {
+    use super::*;
+
+    /// Regression: a read-only `--lower` mount excluded an existing
+    /// `B/new.log` named by `--journal`, hiding a change to the base. Only
+    /// paths that do not exist yet are excluded without a `-w` overlay.
+    #[test]
+    fn regression_read_only_lower_excludes_only_new_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(base.join("new.log"), b"x").unwrap();
+        let lowers = [dir.path().join("lower")];
+        let out = lower_extra_excludes(
+            Some(&base),
+            &lowers,
+            None,
+            vec![base.join("new.log"), base.join("fresh/j.jsonl")],
+            None,
+        );
+        assert_eq!(out, vec![PathBuf::from("fresh")]);
+    }
+
+    /// Regression: with `-w NEWTOP` the existing-file filter was skipped, so
+    /// `--lower L -w NEWTOP --journal B/new.log` hid an ordinary `B/new.log`
+    /// added to the base after L was sealed.
+    #[test]
+    fn regression_writable_top_excludes_only_new_journal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(base.join("new.log"), b"x").unwrap();
+        let lowers = [dir.path().join("lower")];
+        let top = dir.path().join("newtop");
+        let out = lower_extra_excludes(
+            Some(&base),
+            &lowers,
+            Some(&top),
+            vec![base.join("new.log")],
+            None,
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// An empty mount point directory inside the base is excluded (a repeated
+    /// read-only `--lower` mount keeps working); one with content, or a plain
+    /// file, is base content.
+    #[test]
+    fn regression_mount_point_excluded_only_when_empty_or_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(base.join("mnt")).unwrap();
+        std::fs::create_dir_all(base.join("busy")).unwrap();
+        std::fs::write(base.join("busy/f"), b"x").unwrap();
+        std::fs::write(base.join("file"), b"x").unwrap();
+        let lowers = [dir.path().join("lower")];
+        let run = |mp: PathBuf| lower_extra_excludes(Some(&base), &lowers, None, vec![], Some(&mp));
+        assert_eq!(run(base.join("mnt")), vec![PathBuf::from("mnt")]);
+        assert_eq!(run(base.join("fresh")), vec![PathBuf::from("fresh")]);
+        assert!(run(base.join("busy")).is_empty());
+        assert!(run(base.join("file")).is_empty());
+    }
+
+    /// A `-w` remount of the same top keeps its journal inside the base: the
+    /// top's recorded set (written when the journal did not exist yet) covers it.
+    #[test]
+    fn regression_writable_remount_uses_recorded_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let top = dir.path().join("top");
+        let lowers = [dir.path().join("lower")];
+        let journal = base.join("j.log");
+        let first = lower_extra_excludes(
+            Some(&base),
+            &lowers,
+            Some(&top),
+            vec![journal.clone()],
+            None,
+        );
+        assert_eq!(first, vec![PathBuf::from("j.log")]);
+        std::fs::create_dir(&top).unwrap();
+        let conn = rusqlite::Connection::open(top.join(ratarmount_compositing::HIDDEN_DB)).unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        ratarmount_compositing::OverlayMeta::set(&conn, "base_weak_excludes", r#"["j.log"]"#)
+            .unwrap();
+        drop(conn);
+        std::fs::write(&journal, b"j").unwrap();
+        let again = lower_extra_excludes(Some(&base), &lowers, Some(&top), vec![journal], None);
+        assert!(again.contains(&PathBuf::from("j.log")), "{again:?}");
+    }
+}
+
+#[cfg(test)]
+mod lower_marker_key_tests {
+    use super::*;
+
+    /// An archive plus a warm index whose digest cache already holds its digest.
+    fn cached_archive(dir: &Path, name: &str, bytes: &[u8]) -> (PathBuf, PathBuf, String) {
+        let archive = dir.join(name);
+        std::fs::write(&archive, bytes).unwrap();
+        let index = dir.join(format!("{name}.index.sqlite"));
+        rusqlite::Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT);")
+            .unwrap();
+        let digest = ratarmount_index::cached_archive_digest(&archive, Some(&index)).unwrap();
+        (archive, index, digest)
+    }
+
+    /// Regression: `A.tar B --lower bundle` keyed the verification marker by A's
+    /// cached digest alone, so a bundle that edits `B/f` kept its marker after
+    /// `B/f` changed and skipped verification against the changed union.
+    #[test]
+    fn regression_marker_key_covers_every_base_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, index, digest) = cached_archive(dir.path(), "a.tar", b"aaaa");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(b.join("f"), b"one").unwrap();
+        let bundle = dir.path().join("l.tar.zst");
+        std::fs::write(&bundle, b"x").unwrap();
+        let lowers = [bundle];
+        let key = |inputs: &[PathBuf]| lower_base_key(inputs, Some(&index), &lowers, "v");
+        // One archive: keyed by its cached digest.
+        assert_eq!(key(std::slice::from_ref(&a)), Some(format!("{digest}.v")));
+        // A directory beside it has no computed strong identity: no marker, so
+        // every use verifies against the union as it is now.
+        assert_eq!(key(&[a.clone(), b.clone()]), None);
+        // A second archive without its own digest cache is unidentified too.
+        let (a2, _, _) = cached_archive(dir.path(), "a2.tar", b"bbbb");
+        assert_eq!(key(&[a.clone(), a2]), None);
+    }
+
+    /// Nit: a directory base has no computed strong digest, so a supplied
+    /// `--base-digest` claim cannot key a marker for it, and an archive without
+    /// a cached digest has no key either.
+    #[test]
+    fn regression_marker_key_needs_a_computed_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("l.tar.zst");
+        std::fs::write(&bundle, b"x").unwrap();
+        let lowers = [bundle];
+        assert_eq!(
+            lower_base_key(&[a_dir(dir.path())], None, &lowers, "v"),
+            None
+        );
+        let bare = dir.path().join("bare.tar");
+        std::fs::write(&bare, b"zz").unwrap();
+        assert_eq!(lower_base_key(&[bare], None, &lowers, "v"), None);
+    }
+
+    /// Regression: a marker cached for the plain view skipped verification when
+    /// the same bundle was mounted with `--prefix p` (or any other option that
+    /// reshapes the paths), accepting a Modified->Added change.
+    #[test]
+    fn regression_marker_key_needs_the_default_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, index, digest) = cached_archive(dir.path(), "a.tar", b"aaaa");
+        let bundle = dir.path().join("l.tar.zst");
+        std::fs::write(&bundle, b"x").unwrap();
+        let lowers = [bundle.clone()];
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["ratarmount"];
+            argv.extend_from_slice(extra);
+            argv.push("a.tar");
+            Args::try_parse_from(argv).unwrap()
+        };
+        let key = |extra: &[&str]| {
+            let args = parse(extra);
+            mounted_view_is_default(&args, false)
+                .then(|| {
+                    lower_base_key(
+                        std::slice::from_ref(&a),
+                        Some(&index),
+                        &lowers,
+                        &mounted_view_key(&args),
+                    )
+                })
+                .flatten()
+        };
+        assert_eq!(
+            key(&[]),
+            Some(format!("{digest}.{}", mounted_view_key(&parse(&[]))))
+        );
+        for extra in [
+            &["--prefix", "p"][..],
+            &["--transform", "a", "b"],
+            &["--transform-recursive-mount-point", "a", "b"],
+            &["-r"],
+            &["--lazy"],
+            &["--disable-union-mount"],
+            &["-s"],
+            &["--git-prefix", "x"],
+        ] {
+            assert_eq!(key(extra), None, "{extra:?}");
+        }
+        assert!(!mounted_view_is_default(&parse(&[]), true));
+    }
+
+    /// Regression: the marker key ignored `--no-file-versions`, `--ignore-zeros`
+    /// and the GNU-incremental options, so a bundle verified with
+    /// `f.versions/1` hidden was trusted on a normal remount where the base
+    /// synthesizes that path. Every listing option must change the key.
+    #[test]
+    fn regression_marker_key_covers_listing_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, index, digest) = cached_archive(dir.path(), "a.tar", b"aaaa");
+        let bundle = dir.path().join("l.tar.zst");
+        std::fs::write(&bundle, b"x").unwrap();
+        let lowers = [bundle];
+        let key = |extra: &[&str]| {
+            let mut argv = vec!["ratarmount"];
+            argv.extend_from_slice(extra);
+            argv.push("a.tar");
+            let args = Args::try_parse_from(argv).unwrap();
+            assert!(mounted_view_is_default(&args, false));
+            lower_base_key(
+                std::slice::from_ref(&a),
+                Some(&index),
+                &lowers,
+                &mounted_view_key(&args),
+            )
+            .unwrap()
+        };
+        let plain = key(&[]);
+        assert!(plain.starts_with(&digest), "{plain}");
+        let mut seen = vec![plain.clone()];
+        for extra in [
+            &["--no-file-versions"][..],
+            &["--ignore-zeros"],
+            &["--gnu-incremental"],
+            &["--detect-gnu-incremental"],
+            &["--encoding", "latin1"],
+        ] {
+            let k = key(extra);
+            assert!(!seen.contains(&k), "{extra:?} reuses a key: {k}");
+            seen.push(k);
+        }
+        // `--file-versions` is the default and keeps the plain key.
+        assert_eq!(key(&["--file-versions"]), plain);
+    }
+
+    fn a_dir(parent: &Path) -> PathBuf {
+        let d = parent.join("adir");
+        std::fs::create_dir(&d).unwrap();
+        d
     }
 }

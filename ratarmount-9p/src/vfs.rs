@@ -584,7 +584,7 @@ mod tests {
 
     fn overlay_policy_denials(real: bool) {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(EmptyFs), td.path()).unwrap();
         ov.mkdir("/locked", 0o755).unwrap();
         ov.mkdir("/locked/empty", 0o755).unwrap();
         for path in ["/locked/file", "/outside", "/quota"] {
@@ -748,7 +748,7 @@ mod tests {
     fn overlay_fs() -> (tempfile::TempDir, Ratarmount9p) {
         let td = tempfile::tempdir().unwrap();
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(EmptyFs) as Arc<dyn MountSource>, td.path())
+            crate::test_overlay::new_overlay(Arc::new(EmptyFs) as Arc<dyn MountSource>, td.path())
                 .expect("overlay"),
         );
         let fs = Ratarmount9p::with_overlay(ov.clone(), 0, 8, Some(ov));

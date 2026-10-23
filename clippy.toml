@@ -1,0 +1,15 @@
+# R7-C4: the commit journal's recovery, replacement and copy-guard entry points
+# are named only by ratarmount-compositing's `journal_recovery` (which says who
+# may apply a journal and answers a failed replacement once) and by tests.
+disallowed-methods = [
+    { path = "ratarmount_compress::commit_journal::recover", reason = "test helper; recover through ratarmount_compositing::recover_journal_at with an Owner" },
+    { path = "ratarmount_compress::commit_journal::recover_with", reason = "recover through ratarmount_compositing::recover_journal_at with an Owner" },
+    { path = "ratarmount_compress::commit_journal::authorize_owned", reason = "use ratarmount_compositing::Owner::Inode" },
+    { path = "ratarmount_compress::commit_journal::authorize_forced", reason = "use ratarmount_compositing::Owner::Forced (only behind a --force-* flag)" },
+    { path = "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with", reason = "use journal_recovery::replace_committing" },
+    { path = "ratarmount_compress::commit_journal::replace_suffix_with_hook", reason = "the death seam is for tests only" },
+    { path = "ratarmount_compress::commit_journal::guard_copy", reason = "use journal_recovery::publish_over" },
+    { path = "ratarmount_compress::splice_zstd_last_frames_append", reason = "use journal_recovery::splice_append_committing" },
+    { path = "ratarmount_compress::splice_zstd_last_frames_append_with", reason = "use journal_recovery::splice_append_committing" },
+    { path = "ratarmount_compress::splice_zstd_last_frames_replace", reason = "use journal_recovery::splice_replace_over" },
+]

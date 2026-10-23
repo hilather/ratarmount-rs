@@ -284,7 +284,18 @@ impl RollingMountSource {
         policy: RollPolicy,
         opener: impl Fn(&Path) -> Result<Arc<dyn MountSource>> + Send + Sync + 'static,
     ) -> Result<Self> {
-        Self::with_clock(base, policy, opener, SystemTime::now)
+        Self::open_with_recovery(base, policy, opener, true)
+    }
+
+    /// [`Self::open`] that recovers each generation's pending journal only
+    /// when `recover` (a mount that classified its members first passes `false`).
+    pub fn open_with_recovery(
+        base: &Path,
+        policy: RollPolicy,
+        opener: impl Fn(&Path) -> Result<Arc<dyn MountSource>> + Send + Sync + 'static,
+        recover: bool,
+    ) -> Result<Self> {
+        Self::with_clock(base, policy, opener, SystemTime::now, recover)
     }
 
     fn with_clock(
@@ -292,6 +303,7 @@ impl RollingMountSource {
         policy: RollPolicy,
         opener: impl Fn(&Path) -> Result<Arc<dyn MountSource>> + Send + Sync + 'static,
         clock: impl Fn() -> SystemTime + Send + Sync + 'static,
+        recover: bool,
     ) -> Result<Self> {
         let name = SeriesName::new(base)?;
         let mut found = name.discover()?;
@@ -305,7 +317,14 @@ impl RollingMountSource {
         let members: Vec<_> = found
             .iter()
             .map(|(_, path)| {
-                ratarmount_compress::commit_journal::recover(path)?;
+                if recover {
+                    crate::journal_recovery::recover_journal_at(
+                        path,
+                        None,
+                        crate::journal_recovery::Owner::Inode,
+                    )
+                    .map_err(ratarmount_compress::commit_journal::RecoverError::into_io)?;
+                }
                 Ok(Arc::new(Member {
                     path: path.clone(),
                     live: AtomicBool::new(true),
@@ -534,7 +553,7 @@ mod tests {
     }
 
     fn overlay(dir: &Path, series: &Arc<RollingMountSource>, mode: CommitMode) -> WriteOverlay {
-        let mut overlay = WriteOverlay::new(
+        let mut overlay = WriteOverlay::new_for_tests(
             Arc::new(crate::FileVersionLayer::new(series.clone())),
             dir.join("overlay"),
         )
@@ -674,9 +693,13 @@ mod tests {
         let clock = Arc::new(AtomicU64::new(3599));
         let now = clock.clone();
         let series = Arc::new(
-            RollingMountSource::with_clock(&base, "1h".parse().unwrap(), open_tar, move || {
-                UNIX_EPOCH + Duration::from_secs(now.load(Ordering::SeqCst))
-            })
+            RollingMountSource::with_clock(
+                &base,
+                "1h".parse().unwrap(),
+                open_tar,
+                move || UNIX_EPOCH + Duration::from_secs(now.load(Ordering::SeqCst)),
+                true,
+            )
             .unwrap(),
         );
         let ov = overlay(dir.path(), &series, CommitMode::Append);

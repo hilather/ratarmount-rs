@@ -279,7 +279,7 @@ impl AsarMountSource {
         let _ = options;
         println!(
             "Creating offset dictionary for {} ...",
-            archive_path.display()
+            ratarmount_core::redacted_display(archive_path)
         );
         let t0 = Instant::now();
 
@@ -306,7 +306,7 @@ impl AsarMountSource {
         index.commit_write()?;
         println!(
             "Creating offset dictionary for {} took {:.2}s",
-            archive_path.display(),
+            ratarmount_core::redacted_display(archive_path),
             t0.elapsed().as_secs_f64()
         );
 

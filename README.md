@@ -112,17 +112,18 @@ BitTorrent is on in the release packages; cargo builds need `--features bittorre
 ### Agent sandboxes from one snapshot
 
 ```bash
-ratarmount --git-ref <base-commit> --git-synthetic-head -w attempt-07 \
-  --overlay-readonly 'tests/**' --overlay-quota 2G repo.git mnt/attempt-07
+ratarmount snapshot repo@HEAD base.tar.zst --with-index
+ratarmount sandbox run --base base.tar.zst --top attempt-07 --image busybox \
+  --readonly 'tests/**' --quota 2G --journal --seal --pack attempt-07.tar.zst --json \
+  -- sh -c 'printf "candidate\n" > answer.txt'
 ```
 
-Mount a repository at a commit once, give every agent attempt its own write
-overlay, protect the test suite, cap how much an attempt may write, and throw
-the attempt away by deleting a directory. The supervisor
-(`ratarmount sandbox`) manages hundreds of attempts at a time and exports each
-attempt's patch. On this laptop, 64 parallel attempts cost 5.2 s each to set
-up and tear down, against 7.7 s for `git worktree` and 8.1 s for `docker cp`.
-[Sandbox guide](docs/sandbox.md) · [SWE-bench recipe](docs/recipes/swe-bench-sandboxes.md) · [rootfs + repository](docs/recipes/sandbox-rootfs.md)
+Each attempt gets a private top over the same snapshot and optional sealed
+`--lower` layers. The runner executes a container, cleans up the mount, and
+reports its exit status, strict patch hash, manifest and journal summary as JSON.
+Offline commands import patches, seal and verify layers, compare attempts, and
+pack portable bundles. The supervisor API manages fleets of attempts.
+[Sandbox guide and offline worked example](docs/sandbox.md) · [SWE-bench recipe](docs/recipes/swe-bench-sandboxes.md) · [rootfs + repository](docs/recipes/sandbox-rootfs.md)
 
 ### Shards for training
 
@@ -244,6 +245,22 @@ ratarmount --repack-seekable big.tar.gz big.tar.zst   # make a gzip archive rand
 The full command tour, with explanations and the useful flags for each
 scenario, is in [Getting started](docs/getting-started.md).
 
+Commands beyond mounting (see `ratarmount COMMAND --help`):
+
+| Subcommand | Purpose |
+|---|---|
+| `diff OVERLAY [BASE]` | Patch, manifest, canonical hash, names or statistics; compare attempts with `--between` |
+| `overlay info\|seal\|unseal\|verify\|fsck` | Inspect identity and manage layer integrity |
+| `overlay import\|import-upperdir\|pack\|unpack` | Replay patches or overlayfs upperdirs; transport sealed layers |
+| `journal summarize\|mark` | Summarize operation JSONL or mark an agent turn |
+| `sandbox run` | Run one container command and finalize its attempt |
+| `sandbox daemon\|create-base\|new\|list\|diff\|stats\|destroy\|shutdown` | Manage attempts through the supervisor API |
+| `snapshot <git> OUT.tar.zst` | Export a deterministic committed Git snapshot, optionally with its index |
+| `snapshot add\|list` | Wrap local restic snapshots |
+
+The [command tour](docs/getting-started.md) also covers `find`, `corpus`,
+`shard`, `export-index`, and the export protocols.
+
 ---
 
 ## What you can mount
@@ -290,6 +307,15 @@ live while the mount is served for uncompressed TAR and `.tar.zst`, where only
 the last zstd frame is rewritten. `--overlay-readonly`, `--overlay-quota` and
 `--sandbox` turn an overlay into a guard rail for untrusted code.
 [Writing into archives](docs/write-overlay.md) · [sandbox controls](docs/sandbox.md)
+
+| Agent workflow | Python ratarmount | Rust ratarmount |
+|---|---|---|
+| Canonical change hashes, manifests and attempt comparisons | No | `diff` |
+| Layered overlays, identity metadata, seal/verify/fsck | No | `--lower`, `overlay` |
+| Patch/overlayfs import and portable layer bundles | No | `overlay import`, `import-upperdir`, `pack`, `unpack` |
+| Operation journals and turn marks | No | `--journal`, `journal` |
+| Container attempt runner and supervisor API | No | `sandbox run`, `sandbox daemon` |
+| Deterministic Git snapshot export with mount index | No | `snapshot <git> --with-index` |
 
 **Network exports.** One process can serve the same tree over NFSv3 or
 NFSv4.1 (`--nfs`), HTTP (`--http`), WebDAV (`--webdav`), SMB 3.1.1 (`--smb`),

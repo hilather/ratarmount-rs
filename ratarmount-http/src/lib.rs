@@ -17,6 +17,8 @@ pub const INDEX_SIDECAR_PATH: &str = "/.ratarmount-control/index.sqlite";
 mod handler;
 mod request;
 mod serve;
+#[cfg(test)]
+mod test_overlay;
 mod webdav;
 
 pub use ratarmount_export_core::{

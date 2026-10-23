@@ -443,18 +443,16 @@ impl<M: Mounter> Supervisor<M> {
                 let patch = crate::diff::render_source(
                     &crate::diff::DiffArgs {
                         directory: attempt.overlay_dir.clone(),
-                        base: None,
                         git,
-                        context: 3,
-                        stat: false,
-                        name_status: false,
-                        include_git_dir: false,
+                        ..Default::default()
                     },
-                    source.source.as_ref(),
+                    source.source.clone(),
                     deleted,
                 )
                 .map_err(|e| ApiError::new("diff_failed", e))?;
-                Ok(json!({"patch": patch}))
+                let mut response = serde_json::Map::new();
+                ratarmount_compositing::overlay_changes::json_bytes(&mut response, "patch", &patch);
+                Ok(serde_json::Value::Object(response))
             }
             Operation::Stats { id } => {
                 let attempt = self.attempt(&id)?.clone();
@@ -571,7 +569,7 @@ impl<M: Mounter> Supervisor<M> {
             .cloned()
             .chain(readonly)
             .collect();
-        ratarmount_compositing::ReadOnlyGlobs::new(&readonly)
+        ratarmount_compositing::ReadOnlyGlobs::with_allow(&readonly, &base.options.allow_globs)
             .map_err(|e| invalid(e.to_string()))?;
         let ram = match overlay {
             Overlay::Disk => None,
@@ -704,6 +702,12 @@ fn verify_tmpfs(_path: &Path) -> Result<()> {
 }
 
 fn absolute_source(source: &str) -> Result<String> {
+    if ratarmount_formats_git::parse_git_url(source)
+        .map_err(|e| invalid(e.to_string()))?
+        .is_some()
+    {
+        return Ok(source.into());
+    }
     // Probe only an ASCII scheme prefix: the legacy URL detector also slices
     // its input at byte seven for restic, which need not be a UTF-8 boundary.
     let remote = source
@@ -876,4 +880,20 @@ pub fn serve(socket: &Path, root: &Path, limit: usize, timeout: Duration) -> Res
         thread::sleep(Duration::from_millis(10));
     }
     supervisor.destroy_all()
+}
+
+/// Regression: create-base must preserve Git URL aliases for the shared factory parser.
+#[test]
+fn regression_create_base_preserves_git_url_alias() {
+    for source in [
+        "git:///srv/repo%20one.git#HEAD~1",
+        "git:///srv/repo@home/.git",
+    ] {
+        assert_eq!(absolute_source(source).unwrap(), source);
+    }
+    assert!(absolute_source("git://host/repo")
+        .unwrap_err()
+        .message
+        .contains("network git URLs are not supported; clone locally"));
+    assert!(Path::new(&absolute_source("relative/repo@HEAD").unwrap()).is_absolute());
 }

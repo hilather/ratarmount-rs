@@ -832,7 +832,8 @@ mod tests {
     #[test]
     fn regression_overlay_policy_denials() {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(EmptyPolicyBase), td.path()).unwrap();
+        let mut ov =
+            crate::test_overlay::new_overlay(Arc::new(EmptyPolicyBase), td.path()).unwrap();
         ov.mkdir("/locked", 0o755).unwrap();
         ov.mkdir("/locked/empty", 0o755).unwrap();
         for path in ["/locked/file", "/outside", "/quota"] {

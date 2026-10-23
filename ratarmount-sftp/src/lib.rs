@@ -21,6 +21,8 @@
 
 mod auth;
 mod serve;
+#[cfg(test)]
+mod test_overlay;
 mod vfs;
 
 #[cfg(feature = "sftp-russh")]

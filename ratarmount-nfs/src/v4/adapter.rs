@@ -781,7 +781,7 @@ mod tests {
 
     fn overlay_policy_denials(real: bool) {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(Synth::new()), td.path()).unwrap();
+        let mut ov = crate::test_overlay::new_overlay(Arc::new(Synth::new()), td.path()).unwrap();
         ov.mkdir("/locked", 0o755).unwrap();
         ov.mkdir("/locked/empty", 0o755).unwrap();
         for path in ["/locked/file", "/outside", "/quota"] {
@@ -1364,7 +1364,8 @@ mod tests {
     fn overlay_export(base: Synth) -> (tempfile::TempDir, RatarmountNfs4) {
         let td = tempfile::tempdir().unwrap();
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, td.path()).expect("overlay"),
+            crate::test_overlay::new_overlay(Arc::new(base) as Arc<dyn MountSource>, td.path())
+                .expect("overlay"),
         );
         let nfs = RatarmountNfs4::with_overlay(
             Arc::clone(&ov) as Arc<dyn MountSource>,

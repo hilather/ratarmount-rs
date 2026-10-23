@@ -18,6 +18,9 @@ const MOUNT_DEADLINE: Duration = Duration::from_secs(10);
 /// stuck request, and cleanup (lazy unmount + SIGKILL) unblocks the thread.
 const CASES_DEADLINE: Duration = Duration::from_secs(60);
 const UNMOUNT_DEADLINE: Duration = Duration::from_secs(10);
+
+#[path = "support/unmount.rs"]
+mod unmount;
 const DAEMON_EXIT_DEADLINE: Duration = Duration::from_secs(30);
 const KILL_REAP: Duration = Duration::from_secs(5);
 
@@ -79,6 +82,77 @@ fn fuse_sandbox_readonly_and_quota() {
     );
 }
 
+/// Regression: read-only exceptions must reach FUSE for data, metadata and name
+/// operations, including creating the exception root without moving that root.
+#[test]
+fn fuse_sandbox_readonly_allow_exceptions() {
+    with_mount_options(
+        "rrs-sandbox-allow-",
+        |d, _| {
+            use std::os::unix::fs::PermissionsExt;
+            let mnt = d.parent().unwrap();
+            let agent = mnt.join("t/agent");
+            fs::create_dir(&agent).unwrap();
+            fs::create_dir(agent.join("dir")).unwrap();
+            let file = agent.join("dir/new");
+            fs::write(&file, b"allowed").unwrap();
+            File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_len(3)
+                .unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+            let name = CString::new("user.rules").unwrap();
+            let set_xattr = |path: &Path| {
+                let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+                if unsafe {
+                    libc::setxattr(path.as_ptr(), name.as_ptr(), b"x".as_ptr().cast(), 1, 0)
+                } == 0
+                {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            };
+            set_xattr(&file).unwrap();
+            let moved = agent.join("dir/moved");
+            fs::rename(&file, &moved).unwrap();
+            assert_eq!(fs::read(&moved).unwrap(), b"all");
+            for result in [
+                fs::write(mnt.join("t/new"), b"denied"),
+                fs::write(mnt.join("t/seed"), b"denied"),
+                fs::create_dir(mnt.join("t/newdir")),
+                fs::remove_file(mnt.join("t/seed")),
+                fs::rename(mnt.join("t"), mnt.join("moved-t")),
+                fs::rename(&agent, mnt.join("moved-agent")),
+                fs::rename(&moved, mnt.join("t/moved")),
+                fs::set_permissions(mnt.join("t/seed"), fs::Permissions::from_mode(0o600)),
+                set_xattr(&mnt.join("t/seed")),
+            ] {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EROFS));
+            }
+            fs::remove_file(&moved).unwrap();
+            fs::remove_dir(agent.join("dir")).unwrap();
+            let status = fs::read_to_string(mnt.join(".ratarmount-control/status")).unwrap();
+            let denied: u64 = status
+                .lines()
+                .find_map(|line| line.strip_prefix("erofs_denied "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(denied >= 9, "{status}");
+        },
+        &[
+            "--overlay-readonly",
+            "t/**",
+            "--overlay-allow",
+            "t/agent/**",
+            "--control-interface",
+        ],
+    );
+}
+
 /// Regression: uid/gid/umask mapping must reach stat(2) for archive and overlay files.
 #[test]
 fn fuse_sandbox_mapped_owners() {
@@ -103,6 +177,82 @@ fn fuse_sandbox_mapped_owners() {
             assert_eq!(metadata.mode() & 0o027, 0);
         },
         &["-o", "uid=12345,gid=23456,umask=027"],
+    );
+}
+
+/// Regression (Ilya #2): writes into the virtual `/.ratarmount-control/` folder
+/// landed in the overlay (create, mkdir, symlink, rename into it, xattr, chmod).
+/// With `--control-interface` the name is reserved at the mount root only.
+#[test]
+fn fuse_control_folder_name_is_reserved() {
+    with_mount_options(
+        "rrs-ctl-reserved-",
+        |d, ov| {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let mnt = d.parent().unwrap();
+            let ctl = mnt.join(".ratarmount-control");
+            let denied = |what: &str, r: io::Result<()>| {
+                let e = r.expect_err(what);
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{what}: {e}");
+            };
+            denied("create", fs::write(ctl.join("x"), b"x"));
+            denied("mkdir", fs::create_dir(ctl.join("dir")));
+            denied("symlink", symlink("a1", ctl.join("link")));
+            denied("rename into", fs::rename(d.join("a1"), ctl.join("moved")));
+            denied(
+                "chmod status",
+                fs::set_permissions(ctl.join("status"), fs::Permissions::from_mode(0o600)),
+            );
+            assert!(
+                !ov.join(".ratarmount-control").exists(),
+                "landed in overlay"
+            );
+            // Guard: the folder still works and ordinary names are untouched.
+            assert!(fs::read_to_string(ctl.join("status"))
+                .unwrap()
+                .starts_with("mounted"));
+            assert!(list(mnt).contains(&".ratarmount-control".to_string()));
+            fs::create_dir(mnt.join("sub")).unwrap();
+            fs::create_dir(mnt.join("sub/.ratarmount-control")).unwrap();
+            fs::write(mnt.join("sub/.ratarmount-control/x"), b"ok").unwrap();
+            fs::write(mnt.join(".ratarmount-controlx"), b"ok").unwrap();
+        },
+        &["--control-interface"],
+    );
+}
+
+/// Regression (Keystone (a)): `--control-socket-only` keeps the socket but not
+/// the in-FS folder (host pid, memory stats, `unmount` file). The name is then
+/// an ordinary one.
+#[test]
+fn regression_control_socket_only_hides_folder() {
+    with_mount_options(
+        "rrs-ctl-socket-only-",
+        |d, ov| {
+            use std::io::{Read, Write};
+            let mnt = d.parent().unwrap();
+            assert!(!list(mnt).contains(&".ratarmount-control".to_string()));
+            assert_enoent(mnt, ".ratarmount-control/status");
+            fs::write(mnt.join(".ratarmount-control-x"), b"ok").unwrap();
+            fs::create_dir(mnt.join(".ratarmount-control")).unwrap();
+            fs::write(mnt.join(".ratarmount-control/x"), b"ordinary").unwrap();
+            assert_eq!(
+                fs::read(ov.join(".ratarmount-control/x")).unwrap(),
+                b"ordinary"
+            );
+            let log = fs::read_to_string(ov.parent().unwrap().join("daemon.log")).unwrap();
+            let socket = log
+                .lines()
+                .find_map(|l| l.strip_prefix("control interface: "))
+                .expect("control interface line in daemon log");
+            let mut stream = std::os::unix::net::UnixStream::connect(socket.trim()).unwrap();
+            stream.write_all(b"status\n").unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            assert!(reply.starts_with("mounted "), "{reply}");
+            assert!(!reply.lines().any(|l| l.starts_with("pid")), "{reply}");
+        },
+        &["--control-interface", "--control-socket-only"],
     );
 }
 
@@ -585,7 +735,10 @@ impl MountGuard {
     }
 
     fn graceful_unmount(&mut self) -> Result<(), String> {
+        // Bounded EBUSY retry (desktop probers of the new mount); a mount that
+        // stays busy fails the test with its holders logged.
         if let Err(e) = graceful_fusermount_u(&self.mnt) {
+            unmount::log_holders(&self.mnt);
             return Err(format!(
                 "{e} (daemon pid {})\n{}",
                 self.daemon_pid,

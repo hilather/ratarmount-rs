@@ -28,6 +28,18 @@ changes and provenance attributes, and a marker file,
 `.ratarmount-overlay.used`. Both names are hidden inside the mount and cannot
 be created, deleted or renamed through it at any depth, ignoring ASCII case;
 an archive member with one of those names is hidden too.
+The database has `files` for presence/tombstones, `overlay_metadata` for
+per-path chmod/utime, `xattrs` for extended attributes, and a separate `meta`
+key/value table for overlay identity. New overlays record format version 2,
+creation details, base and stack digests. Existing overlays without `meta`
+receive only `format_version=1` and remain legacy, without a fabricated base
+identity. See [Overlay metadata](sandbox.md#overlay-metadata) for keys, digest
+kinds, `--base-digest`, and cheap remount verification. A directory base records
+a `weak` digest (path, type, size, mtime; `base_weak_digest`, `base_weak_excludes`)
+and is never content-hashed by a mount (an archive base is hashed in the background after the mount is serving, recorded as `pending` until then; see sandbox.md); use `ratarmount overlay digest-base` for
+a strong one. `import_in_progress` is set only while `overlay import` is writing;
+a leftover row means the import was killed (`overlay fsck` reports `import_incomplete`
+and `seal` refuses).
 Copy-on-write stages each copy in a `.ratarmount.overlay.cow-*` temp next to
 its destination, hidden the same way (ASCII case ignored); `--commit-overlay`
 never picks a temp up, an archive member with that prefix is hidden but stays in
@@ -45,9 +57,33 @@ Inspect an overlay without mounting:
 
 ```bash
 ratarmount overlay-stats ./changes --json
+ratarmount overlay info ./changes --json             # identity, metadata and counts
 ratarmount diff ./changes --base archive.tar          # what changed, as a listing
 ratarmount diff ./changes --base repo.git@<sha> --git # as a Git patch
 ```
+
+## Layered overlays
+
+Internally, `ReadOnlyOverlayLayer` wraps a base `MountSource` and one existing
+overlay directory. `compose_stack` applies directories from bottom to top;
+each layer merges directory entries, hides tombstoned names, and serves its own
+host files before consulting the inner view. A later layer can recreate a
+deleted path. Wrapping the result in `WriteOverlay::open(&base, stack, top, &options)` (`base` is the classified base the stack sits on) makes
+copy-up read the composed lower bytes, including files created by a lower layer.
+
+The read-only view uses the same host metadata, metadata-only chmod/utime
+overrides, and xattr replacement/removal rules as a writable overlay. Database,
+marker, and staging names stay hidden. Host symlinks remain symlink entries and
+are never opened as their targets.
+
+Construction snapshots database rows in memory without schema changes or
+repairs. `Immutability::Immutable` opens SQLite with `mode=ro&immutable=1` for
+caller-guaranteed sealed layers; `Shared` uses ordinary read-only access and
+reports a busy writer. Shared rows do not refresh automatically, and host files
+are read directly, so this mode does not promise a consistent live snapshot.
+`serving_layer` reports `base` or `lower:N` (1-based, bottom to top); an entry
+with metadata-only or xattr changes belongs to the layer making those changes.
+Seal checks and mount flags are handled by the caller.
 
 ## Committing offline
 
@@ -63,6 +99,11 @@ ratarmount --commit-overlay --yes -w ./changes --commit-manifest archive.tar.zst
 | `.tar.zst` (multi-frame or seek table) | Spliced from the first affected frame to the end, including deletes in earlier frames |
 | `.zip` | Fully rebuilt (encrypted and multi-part ZIPs are not supported) |
 | Remote URLs (`s3://`, `hf://`, ...) | Not offline; exits 2. Use the live commits below |
+
+Successful local commits refresh the overlay's base size, mtime and digest,
+update its stack digest, and record `meta.base_committed_at`. Strong digests
+require one full read of the resulting archive and update its writable index
+cache. The overlay can then be reopened without `--force-base-mismatch`.
 
 `--commit-overlay-mode copy|append|auto` chooses between the safe copy
 (default), a journaled in-place append for eligible add-only commits to TAR
@@ -116,6 +157,8 @@ members survive a commit that moves their offsets. These guarantees are
 tested on every change; see the regression catalog in `AGENTS.md`.
 
 ## Known limits
+
+- File names must be UTF-8 on writable FUSE mounts; invalid names are refused with `EILSEQ`.
 
 - ZIP commits rebuild the whole archive; encrypted and multi-part ZIPs cannot be committed.
 - Gzip, bzip2 and xz TARs commit offline only, through GNU tar, and are rewritten in full.

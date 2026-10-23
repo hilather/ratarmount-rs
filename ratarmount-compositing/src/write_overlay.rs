@@ -16,9 +16,8 @@ use flate2::write::GzEncoder;
 use flate2::Compression as GzCompression;
 use ratarmount_compress::{
     body_looks_like_tar, decode_zstd_frames_to, detect_compression, export_zstd_blocks,
-    materialize, open_seekable_zstd, open_seekable_zstd_with_threads, scan_zstd_frames_path,
-    splice_zstd_last_frames_append, splice_zstd_last_frames_replace, CompressionFormat,
-    SpliceStats, ZstdFrameMap, DEFAULT_MEMORY_CAP,
+    materialize_open, open_seekable_zstd, open_seekable_zstd_with_threads, scan_zstd_frames_path,
+    CompressionFormat, SpliceStats, ZstdFrameMap, DEFAULT_MEMORY_CAP,
 };
 use ratarmount_core::{
     create_root_file_info, metadata_gid, metadata_mode, metadata_mtime_secs, metadata_uid,
@@ -72,6 +71,7 @@ fn has_ascii_prefix(name: &str, prefix: &str) -> bool {
 fn is_overlay_internal_name(name: &str) -> bool {
     has_ascii_prefix(name, HIDDEN_DB)
         || has_ascii_prefix(name, COW_STAGING_PREFIX)
+        || name.eq_ignore_ascii_case(".ratarmount-sealed")
         || name.eq_ignore_ascii_case(OVERLAY_MARKER)
 }
 
@@ -81,6 +81,21 @@ fn is_overlay_internal_name(name: &str) -> bool {
 /// full-path frontend (SMB, SFTP) cannot `create_dir_all` one into being.
 pub fn is_overlay_internal_path(path: &str) -> bool {
     path.split('/').any(is_overlay_internal_name)
+}
+
+/// The virtual control folder served by `--control-interface`. Matches the
+/// normalized path (`./`, `//`, `..` collapsed): the folder itself and
+/// everything under it, at the mount root only.
+pub fn is_control_reserved_path(path: &str) -> bool {
+    let n = normpath(path);
+    n == "/.ratarmount-control" || n.starts_with("/.ratarmount-control/")
+}
+
+fn control_name_refused(path: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{path} is the reserved control folder (--control-interface)"),
+    )
 }
 
 /// Refusal for a mount-side create/delete/rename/write of an internal name.
@@ -130,12 +145,48 @@ fn discard_hint(paths: &[&Path]) -> String {
     )
 }
 
-/// The database path exists but is a directory (Robo-Ilya, #96 review).
-fn db_is_directory_error(db_path: &Path) -> OverlayError {
-    OverlayError::Msg(format!(
-        "overlay database path {} is a directory, not a database file; move it aside",
-        db_path.display()
-    ))
+/// Nothing at all is at `dir`'s overlay database path (R7-E2): only an
+/// `lstat` that reports a missing entry is "no database". A symlink (dangling
+/// or not), a directory, a FIFO, or an entry that cannot be statted is an
+/// existing database, so the caller takes the database path, which opens it
+/// (a symlink to a regular file is followed) and refuses or defers anything
+/// that is not a readable regular file. Never `exists()`, `is_file()` or
+/// `metadata()`: they follow a dangling symlink to "missing".
+pub fn overlay_db_absent(dir: &Path) -> bool {
+    db_entry_absent(&dir.join(HIDDEN_DB))
+}
+
+/// [`overlay_db_absent`] for the database path itself.
+pub(crate) fn db_entry_absent(db: &Path) -> bool {
+    matches!(fs::symlink_metadata(db), Err(e) if e.kind() == io::ErrorKind::NotFound)
+}
+
+/// The overlay database at `db_path` as `Connection::open` would see it:
+/// `None` when nothing is there ([`db_entry_absent`]), else the metadata of
+/// the regular file it is (or a symlink points to). A directory, a dangling
+/// symlink or any other non-regular file is refused. `marked`: the overlay
+/// was used before (#96); a dangling symlink then reads as a missing database,
+/// which the caller refuses with the #96 wording.
+fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(db_path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(OverlayError::Io(e)),
+        Ok(_) => {}
+    }
+    match fs::metadata(db_path) {
+        Ok(m) if m.is_file() => Ok(Some(m)),
+        // A directory or any other non-regular file: the shared open's text.
+        Ok(m) => Err(OverlayError::Msg(crate::overlay_db::not_regular_message(
+            db_path, &m,
+        ))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound && marked => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(OverlayError::Msg(format!(
+            "overlay database {} is a symlink to a file that does not exist; it is not \
+             created through the symlink: restore its target or remove the symlink",
+            db_path.display()
+        ))),
+        Err(e) => Err(OverlayError::Io(e)),
+    }
 }
 
 /// Overlay-relative names with this prefix are not commit members.
@@ -163,6 +214,10 @@ CREATE TABLE IF NOT EXISTS xattrs (
     name TEXT NOT NULL,
     value BLOB,
     PRIMARY KEY (path, name)
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 "#;
 
@@ -200,7 +255,7 @@ pub fn overlay_atime(fi: &FileInfo) -> f64 {
         .unwrap_or(fi.mtime)
 }
 
-fn set_info_atime(fi: &mut FileInfo, atime: f64) {
+pub(crate) fn set_info_atime(fi: &mut FileInfo, atime: f64) {
     fi.userdata
         .retain(|data| !matches!(data, UserData::Other(s) if s.starts_with("overlay-atime:")));
     let index = fi.userdata.len().saturating_sub(1);
@@ -216,6 +271,16 @@ pub enum OverlayError {
     Sqlite(#[from] rusqlite::Error),
     #[error("{0}")]
     Msg(String),
+    /// A journaled append wrote the new bytes but its journal is still
+    /// pending (the baseline rows could not be updated). Never answered with
+    /// a copy fallback: the archive already holds the commit.
+    #[error("{0}")]
+    Committed(String),
+    /// A journaled append failed and its journal (old or torn bytes) is still
+    /// on disk where recovery must find it. Never answered with a copy: the
+    /// mount must be recovered (remounted) first.
+    #[error("{0}")]
+    JournalPending(String),
 }
 
 pub type Result<T> = std::result::Result<T, OverlayError>;
@@ -652,6 +717,11 @@ pub struct WriteOverlay {
     #[cfg(test)]
     cow_before_persist_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     base: Arc<dyn MountSource>,
+    /// The classified base this overlay was opened with (`None` for the
+    /// legacy constructors). A commit re-points it at the archive it wrote.
+    identity: Mutex<Option<crate::ClassifiedBase>>,
+    /// `--force-base-mismatch`: a commit over a changed base proceeds.
+    force_base_mismatch: bool,
     rolling: Option<Arc<crate::RollingMountSource>>,
     /// After a live TAR commit, the reopened archive.
     replacement: RwLock<Option<Arc<dyn MountSource>>>,
@@ -691,6 +761,9 @@ pub struct WriteOverlay {
     write_fds: Mutex<HashMap<i32, String>>,
     /// TAR member-name encoding (`-e`); live `.tar.zst` persist. Default utf-8.
     encoding: String,
+    /// `--control-interface` is serving a virtual `/.ratarmount-control`:
+    /// the name is reserved and every mutation of it is refused.
+    control_reserved: bool,
     /// Last successful persist window for incremental sidecar patch (F-2).
     last_patch_window: Mutex<Option<IndexPatchWindow>>,
     /// Live commit coordinator (V-4). Separate from `commit_gate` (writers vs
@@ -785,7 +858,22 @@ impl WriteOverlay {
             .map(|_| self.policy_gate.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// Reserved control name (only while the control folder is served).
+    fn is_control_path(&self, path: &str) -> bool {
+        self.control_reserved && is_control_reserved_path(path)
+    }
+
+    fn refuse_control_path(&self, path: &str) -> io::Result<()> {
+        if self.is_control_path(path) {
+            return Err(control_name_refused(path));
+        }
+        Ok(())
+    }
+
     fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()> {
+        for p in paths {
+            self.refuse_control_path(p)?;
+        }
         if let Some(policy) = &self.policy {
             let paths: Vec<String> = paths.iter().map(|p| normpath(p)).collect();
             let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
@@ -958,8 +1046,52 @@ impl WriteOverlay {
         Ok(())
     }
 
-    pub fn new(base: Arc<dyn MountSource>, overlay: impl AsRef<Path>) -> Result<Self> {
-        let root = overlay.as_ref().to_path_buf();
+    /// In-crate tests only: an overlay that records no base at all. A real
+    /// overlay is opened with [`Self::open`] over a classified base.
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(
+        base: Arc<dyn MountSource>,
+        overlay: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::open_with_create_info(base, overlay.as_ref(), None, None)
+    }
+
+    /// Open (or create) the overlay over a classified base. `composed` is the
+    /// view that is served (lower layers over `base.source()`); the token is
+    /// what was opened and is compared with what the overlay recorded.
+    pub fn open(
+        base: &crate::ClassifiedBase,
+        composed: Arc<dyn MountSource>,
+        overlay: impl AsRef<Path>,
+        options: &crate::CreateOptions,
+    ) -> Result<Self> {
+        let info = base.actual().create_info(options);
+        Self::open_with_create_info(composed, overlay.as_ref(), Some(&info), Some(base))
+    }
+
+    /// In-crate tests only: open with a hand-built creation record.
+    #[cfg(test)]
+    pub(crate) fn new_with_create_info_for_tests(
+        base: Arc<dyn MountSource>,
+        overlay: impl AsRef<Path>,
+        info: &crate::overlay_meta::OverlayCreateInfo,
+    ) -> Result<Self> {
+        Self::open_with_create_info(base, overlay.as_ref(), Some(info), None)
+    }
+
+    fn open_with_create_info(
+        base: Arc<dyn MountSource>,
+        overlay: &Path,
+        info: Option<&crate::overlay_meta::OverlayCreateInfo>,
+        identity: Option<&crate::ClassifiedBase>,
+    ) -> Result<Self> {
+        // Before the directory is created: the topmost-new exclusion rule
+        // depends on which parents of the overlay exist right now.
+        let exclude_plan = info
+            .map(|info| crate::overlay_meta::plan_excludes(info, overlay))
+            .transpose()?
+            .flatten();
+        let root = overlay.to_path_buf();
         if root.exists() {
             if !root.is_dir() {
                 return Err(OverlayError::Msg(format!(
@@ -976,13 +1108,9 @@ impl WriteOverlay {
         let found_marker = overlay_marker(&root)?;
         let marker = found_marker.is_some();
         let marker_path = found_marker.unwrap_or_else(|| root.join(OVERLAY_MARKER));
-        // Follows a symlinked database exactly like `Connection::open` does.
-        let db_len = match fs::metadata(&db_path) {
-            Ok(m) if m.is_dir() => return Err(db_is_directory_error(&db_path)),
-            Ok(m) => Some(m.len()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(OverlayError::Io(e)),
-        };
+        // Follows a symlinked database exactly like `Connection::open` does,
+        // but never reads a dangling symlink as "no database" (R7-E2).
+        let db_len = overlay_db_regular(&db_path, marker)?.map(|m| m.len());
         if marker && db_len.unwrap_or(0) == 0 {
             return Err(OverlayError::Msg(format!(
                 "write overlay {} was used before but its database {} is missing or empty; \
@@ -998,7 +1126,7 @@ impl WriteOverlay {
                 )
             )));
         }
-        let mut conn = Connection::open(&db_path)?;
+        let mut conn = crate::open_overlay_db(&db_path, OpenFlags::default(), crate::DbName::Path)?;
         let had_files = conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'",
@@ -1072,11 +1200,29 @@ impl WriteOverlay {
                 }
             }
         }
-        let opened = conn
-            .execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")
-            .and_then(|_| conn.execute_batch(SCHEMA))
-            .and_then(|_| tombstone_set_from_conn(&conn))
-            .map_err(OverlayError::from);
+        let opened = (|| -> Result<HashSet<String>> {
+            conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
+            let transaction = conn.transaction()?;
+            transaction.execute_batch(SCHEMA)?;
+            if crate::OverlayMeta::from_connection(&transaction)?
+                .as_ref()
+                .is_some_and(crate::OverlayMeta::layer_sealed)
+            {
+                return Err(OverlayError::Msg(
+                    "overlay is sealed; mount it with --lower, or `overlay unseal`".into(),
+                ));
+            }
+            crate::overlay_meta::initialize(
+                &transaction,
+                had_files,
+                info,
+                exclude_plan.as_ref(),
+                identity,
+            )?;
+            let tombstones = tombstone_set_from_conn(&transaction)?;
+            transaction.commit()?;
+            Ok(tombstones)
+        })();
         let mut tombstones = match opened {
             Ok(t) => t,
             Err(e) => {
@@ -1153,6 +1299,8 @@ impl WriteOverlay {
             #[cfg(test)]
             cow_before_persist_hook: Mutex::new(None),
             base,
+            identity: Mutex::new(identity.cloned()),
+            force_base_mismatch: info.is_some_and(|info| info.force_base_mismatch),
             rolling: None,
             replacement: RwLock::new(None),
             root,
@@ -1164,6 +1312,7 @@ impl WriteOverlay {
             commit_generation: std::sync::atomic::AtomicU64::new(0),
             write_fds: Mutex::new(HashMap::new()),
             encoding: "utf-8".into(),
+            control_reserved: false,
             last_patch_window: Mutex::new(None),
             commit_mode: CommitMode::Copy,
             manifest_hashes: None,
@@ -1287,6 +1436,12 @@ impl WriteOverlay {
     /// Defaults to `"utf-8"` inside [`Self::new`]; fuse/nfs tests need not call this.
     pub fn set_encoding(&mut self, encoding: &str) {
         self.encoding = encoding.to_string();
+    }
+
+    /// Reserve `/.ratarmount-control` (call when the virtual control folder is
+    /// mounted, before sharing the overlay). Off: the name is ordinary.
+    pub fn set_control_reserved(&mut self, on: bool) {
+        self.control_reserved = on;
     }
 
     /// True after persist-ok + reopen-err; further interval ticks must remount.
@@ -1994,6 +2149,7 @@ impl WriteOverlay {
         if is_overlay_internal_path(path) {
             return Err(internal_name_refused(path));
         }
+        self.refuse_control_path(path)?;
         self.check_mutation(OverlayMutation::Create, &[path])?;
         #[cfg(not(unix))]
         {
@@ -2057,6 +2213,7 @@ impl WriteOverlay {
             let _gate = self.commit_gate.read().expect("overlay commit gate");
             let _policy = self.policy_lock();
             if flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0 {
+                self.refuse_control_path(path)?;
                 self.check_mutation(OverlayMutation::OpenWrite, &[path])?;
             }
             drop(_policy);
@@ -2874,6 +3031,71 @@ impl WriteOverlay {
         Ok(())
     }
 
+    /// Read overlay-level metadata through the held connection, including on a mounted overlay.
+    pub fn meta_value(&self, key: &str) -> Result<Option<String>> {
+        let db = self.db.lock().expect("overlay db");
+        Ok(crate::overlay_meta::OverlayMeta::from_connection(&db)?
+            .and_then(|meta| meta.get(key).map(str::to_owned)))
+    }
+
+    /// Provenance in the composed base, before this writable layer.
+    pub fn base_serving_layer(&self, path: &str) -> Option<crate::LayerIndex> {
+        crate::serving_layer(self.current_base().as_ref(), path)
+    }
+
+    /// The archive base whose digest is still `pending`, if any.
+    pub fn pending_base(&self) -> Result<Option<crate::PendingBase>> {
+        let db = self.db.lock().expect("overlay db");
+        match crate::OverlayMeta::from_connection(&db)? {
+            Some(meta) => crate::PendingBase::from_meta(&meta),
+            None => Ok(None),
+        }
+    }
+
+    /// Record a lazily computed base digest through the mount's own connection
+    /// (a live mount holds it exclusively). Compare-and-set: `false` when the
+    /// digest is no longer `pending` for `pending`'s stamp.
+    pub fn record_base_digest(&self, pending: &crate::PendingBase, digest: &str) -> Result<bool> {
+        let db = self.db.lock().expect("overlay db");
+        crate::record_base_digest(&db, pending, digest)
+    }
+
+    /// Record one overlay-level `meta` key (for example `readonly_rules`).
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let db = self.db.lock().expect("overlay db");
+        crate::overlay_meta::OverlayMeta::set(&db, key, value)
+    }
+
+    /// Remove one overlay-level `meta` key (no error when absent).
+    pub fn clear_meta(&self, key: &str) -> Result<()> {
+        let db = self.db.lock().expect("overlay db");
+        crate::overlay_meta::OverlayMeta::remove(&db, key)
+    }
+
+    /// Test seam (`test-hooks` feature or unit tests): when
+    /// `RATARMOUNT_TEST_JOURNAL_HOLD` names a file, open a write transaction
+    /// that dirties more pages than the page cache holds (so SQLite writes
+    /// the rollback journal and the database), create that file as the ready
+    /// signal and block holding the transaction. The test then SIGKILLs the
+    /// process, which leaves a hot `-journal`. No-op in release builds.
+    pub fn test_hold_open_transaction(&self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(ready) = std::env::var_os("RATARMOUNT_TEST_JOURNAL_HOLD") {
+            let db = self.db.lock().expect("overlay db");
+            db.execute_batch(
+                "BEGIN IMMEDIATE; \
+                 INSERT OR REPLACE INTO meta(key, value) VALUES('test_scratch', hex(randomblob(6000000)));",
+            )
+            .expect("hold transaction");
+            std::fs::write(ready, b"ready").expect("ready file");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _ = db.execute_batch("ROLLBACK");
+        }
+    }
+
     /// Change metadata through the same policy gate as data writes. Archive-only
     /// members retain their original read cookie and never copy payload data.
     pub fn set_metadata(&self, path: &str, attrs: &OverlayMetadata) -> Result<()> {
@@ -3021,6 +3243,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let _policy = self.policy_lock();
         let path = normpath(path);
+        self.refuse_control_path(&path)?;
         self.check_mutation(OverlayMutation::Write, &[&path])?;
         if self.rolling.is_some() && !self.has_file(&path) {
             self.refuse_sealed_delete(&path)?;
@@ -3200,7 +3423,7 @@ impl WriteOverlay {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
-        ratarmount_compress::commit_journal::recover(archive)?;
+        self.recover_journal(archive)?;
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
         if self.interval_disabled() {
@@ -3215,6 +3438,10 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
+        // After `recover` on purpose: recovery only rolls a torn earlier append
+        // back to the archive the rows describe, and the identity check then
+        // judges that restored file; nothing of this commit is written before it.
+        self.check_commit_identity(archive, false)?;
         let target = self.rolling_commit_target(archive, &plan)?;
         let archive = target.as_path();
         let persist_plan = self.rolling_persist_plan(&plan);
@@ -3837,9 +4064,10 @@ impl WriteOverlay {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
-        if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
+        self.gate_pending_journal(archive)?;
+        if let Err(e) = self.recover_journal_after_gate(archive) {
             self.refuse_base_after_commit_failure();
-            return Err(e.into());
+            return Err(e);
         }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
@@ -3867,6 +4095,10 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
+        // After `recover` on purpose: recovery only rolls a torn earlier append
+        // back to the archive the rows describe, and the identity check then
+        // judges that restored file; nothing of this commit is written before it.
+        self.check_commit_identity(archive, false)?;
         let target = self.rolling_commit_target(archive, &plan)?;
         let archive = target.as_path();
         let persist_plan = self.rolling_persist_plan(&plan);
@@ -4037,7 +4269,10 @@ impl WriteOverlay {
         format: CompressionFormat,
         plan: &OverlayCommitPlan,
     ) -> Result<IndexPatchWindow> {
-        ratarmount_compress::commit_journal::recover(archive)?;
+        self.recover_journal(archive)?;
+        // The one snapshot every write of this commit compares against: the
+        // file the gate accepted (after recovery), never a later stat.
+        let original = self.check_commit_identity(archive, true)?;
         self.persist_count.fetch_add(1, Ordering::SeqCst);
         let mut manifest_plan = if self.manifest_hashes.is_some() && !self.remote_enabled() {
             let mut snapshot = plan.clone();
@@ -4049,32 +4284,61 @@ impl WriteOverlay {
         let hash_payloads =
             manifest_plan.is_some() && self.manifest_hashes.as_deref() != Some("none");
         let (window, prefix) = if plan.has_metadata_changes() || hash_payloads {
-            (
-                persist_provenance_plan(
-                    archive,
-                    &self.root,
-                    plan,
-                    &self.encoding,
-                    self.commit_mode,
-                    if hash_payloads {
-                        manifest_plan.as_mut().map(|p| &mut p.written_hashes)
-                    } else {
-                        None
-                    },
-                )?,
-                0,
-            )
+            let window = persist_provenance_plan(
+                archive,
+                &self.root,
+                plan,
+                &self.encoding,
+                self.commit_mode,
+                if hash_payloads {
+                    manifest_plan.as_mut().map(|p| &mut p.written_hashes)
+                } else {
+                    None
+                },
+                &self.commit_rows(),
+                &original,
+            );
+            // Exactly the ordinary append branches: a splice that landed but
+            // could not finish, or left its journal, refuses the stale frame
+            // map and stops intervals; any other error wrote nothing.
+            match window {
+                Ok(window) => (window, 0),
+                Err(e @ (OverlayError::Committed(_) | OverlayError::JournalPending(_))) => {
+                    self.refuse_base_after_commit_failure();
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             match format {
                 CompressionFormat::Zstd => {
-                    let (window, stats) = self.persist_tar_zst_plan(archive, plan)?;
+                    let (window, stats) = self.persist_tar_zst_plan(archive, plan, &original)?;
                     (window, stats.prefix_compressed_bytes)
                 }
                 // Uncompressed TAR stores 0.
-                _ => (self.persist_uncompressed_tar_plan(archive, plan)?, 0),
+                _ => (
+                    self.persist_uncompressed_tar_plan(archive, plan, &original)?,
+                    0,
+                ),
             }
         };
         if !self.remote_enabled() {
+            let identity = self.identity.lock().expect("overlay identity").clone();
+            match crate::overlay_meta::refresh_committed_base(
+                &self.db.lock().expect("overlay db"),
+                identity.as_ref(),
+                archive,
+            ) {
+                // The next commit starts from the re-pointed token.
+                Ok(Some(moved)) => *self.identity.lock().expect("overlay identity") = Some(moved),
+                Ok(None) => {}
+                Err(error) => {
+                    self.refuse_base_after_commit_failure();
+                    return Err(OverlayError::Msg(format!(
+                        "archive committed; baseline refresh failed (remount required): {error}"
+                    )));
+                }
+            }
             if let Some(hashes) = &self.manifest_hashes {
                 if let Err(e) = write_commit_manifest(
                     archive,
@@ -4095,6 +4359,166 @@ impl WriteOverlay {
         Ok(window)
     }
 
+    #[cfg(test)]
+    pub(crate) fn meta_for_tests(&self) -> crate::OverlayMeta {
+        crate::OverlayMeta::from_connection(&self.db.lock().expect("overlay db"))
+            .expect("read meta")
+            .expect("meta table")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity_for_tests(&self) -> Option<crate::ClassifiedBase> {
+        self.identity.lock().expect("overlay identity").clone()
+    }
+
+    /// Refuse THIS commit, before it writes anything, when the archive is no
+    /// longer the base the last create, commit or refresh recorded (under the
+    /// commit gate). The mount keeps serving and the interval stays on: unlike
+    /// a failed commit, nothing was written. `--force-base-mismatch` commits
+    /// anyway (the refresh after the write records the new baseline).
+    ///
+    /// Returns the gate's one snapshot of the archive (or, when the gate judged
+    /// no local archive or was forced, one stat taken right after it): every
+    /// write of the commit compares against it. `quiet`: a repeated check that
+    /// does not log the forced refusal again.
+    fn check_commit_identity(&self, archive: &Path, quiet: bool) -> Result<fs::Metadata> {
+        if self.remote_enabled() {
+            return Ok(fs::metadata(archive)?);
+        }
+        let Some(base) = self.identity.lock().expect("overlay identity").clone() else {
+            return Ok(fs::metadata(archive)?);
+        };
+        let checked = crate::overlay_gate::check_commit_base(
+            &self.db.lock().expect("overlay db"),
+            &base,
+            archive,
+        );
+        match checked {
+            Ok(Some(snapshot)) => Ok(snapshot),
+            Ok(None) => Ok(fs::metadata(archive)?),
+            Err(refusal) if self.force_base_mismatch => {
+                if !quiet {
+                    log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
+                }
+                Ok(fs::metadata(archive)?)
+            }
+            Err(refusal) => Err(OverlayError::Msg(refusal.0)),
+        }
+    }
+
+    /// Before recovery touches the archive: a pending commit journal may only be
+    /// rolled back when the archive is still the base this overlay recorded.
+    /// A foreign archive that carries its own interrupted journal (a replacement
+    /// moved over the mounted base) is refused here, byte-identical, instead of
+    /// being restored or truncated and only then rejected. Recovery still runs
+    /// first for the overlay's own torn append: its journal describes the
+    /// recorded state. `--force-base-mismatch` accepts the foreign archive.
+    fn gate_pending_journal(&self, archive: &Path) -> Result<()> {
+        match ratarmount_compress::commit_journal::pending(archive) {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) | Err(_) => self.check_commit_identity(archive, false).map(drop),
+        }
+    }
+
+    /// The one recovery entry for this overlay: the gate first (for its
+    /// message), then recovery whose authorizer re-takes the same decision on
+    /// the LOCKED file. A complete journal is rolled forward and the rows
+    /// restamped (a strong digest `pending`) BEFORE the journal is unlinked.
+    /// Recover `archive`'s pending journal AFTER every gate accepted the mount
+    /// (a member whose journal the mount-time classifier deferred). Runs
+    /// through this overlay's own connection: it holds its database exclusively.
+    pub fn recover_member_journal(&self, archive: &Path) -> Result<()> {
+        self.recover_journal(archive).map(|_| ())
+    }
+
+    fn recover_journal(
+        &self,
+        archive: &Path,
+    ) -> Result<Option<ratarmount_compress::commit_journal::Applied>> {
+        self.gate_pending_journal(archive)?;
+        self.recover_journal_after_gate(archive)
+    }
+
+    /// Where a fresh replacement restamps the recorded base before it unlinks
+    /// its journal: this mount's own connection.
+    fn commit_rows(&self) -> crate::journal_recovery::Rows<'_> {
+        if self.remote_enabled() {
+            crate::journal_recovery::Rows::None
+        } else {
+            crate::journal_recovery::Rows::Shared(&self.db)
+        }
+    }
+
+    fn recover_journal_raw(
+        &self,
+        archive: &Path,
+    ) -> std::result::Result<
+        Option<ratarmount_compress::commit_journal::Applied>,
+        ratarmount_compress::commit_journal::RecoverError,
+    > {
+        use crate::journal_recovery::{Owner, Record};
+        let identity = if self.remote_enabled() {
+            None
+        } else {
+            self.identity.lock().expect("overlay identity").clone()
+        };
+        let owner = match &identity {
+            _ if self.force_base_mismatch => Owner::Forced,
+            Some(base) => Owner::Recorded {
+                base,
+                archive,
+                record: Record::Live(&self.db),
+            },
+            None => Owner::Inode,
+        };
+        crate::journal_recovery::recover_journal(archive, self.commit_rows(), owner)
+    }
+
+    fn recover_journal_after_gate(
+        &self,
+        archive: &Path,
+    ) -> Result<Option<ratarmount_compress::commit_journal::Applied>> {
+        use ratarmount_compress::commit_journal::RecoverError;
+        self.recover_journal_raw(archive)
+            .map_err(|error| match error {
+                RecoverError::Committed(e) => {
+                    self.refuse_base_after_commit_failure();
+                    OverlayError::Msg(format!(
+                        "{e}; the archive holds the committed bytes but the recorded baseline \
+                     could not be updated (remount required)"
+                    ))
+                }
+                other => OverlayError::Io(other.into_io()),
+            })
+    }
+
+    /// The recorded base digest kind and digest, read through the mount's own
+    /// connection.
+    #[cfg(test)]
+    pub(crate) fn recorded_digest_for_tests(&self) -> (Option<String>, Option<String>) {
+        let conn = self.db.lock().expect("overlay db");
+        let meta = crate::OverlayMeta::from_connection(&conn)
+            .expect("overlay meta")
+            .expect("overlay meta present");
+        (
+            meta.base_digest_kind().map(str::to_owned),
+            meta.base_digest().map(str::to_owned),
+        )
+    }
+
+    /// The recorded base stamp rows, read through the mount's own connection.
+    #[cfg(test)]
+    pub(crate) fn recorded_stamp_for_tests(&self) -> (Option<String>, Option<String>) {
+        let conn = self.db.lock().expect("overlay db");
+        let meta = crate::OverlayMeta::from_connection(&conn)
+            .expect("overlay meta")
+            .expect("overlay meta present");
+        (
+            meta.get("base_size").map(str::to_owned),
+            meta.get("base_mtime_ns").map(str::to_owned),
+        )
+    }
+
     fn refuse_base_after_commit_failure(&self) {
         self.interval_disabled.store(true, Ordering::SeqCst);
         *self.replacement.write().expect("overlay replacement") =
@@ -4102,15 +4526,27 @@ impl WriteOverlay {
         self.commit_generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn recover_failed_append(&self, archive: &Path, error: &dyn std::fmt::Display) -> Result<()> {
-        if let Err(recovery) = ratarmount_compress::commit_journal::recover(archive) {
+    /// The one reaction to a failed journaled replacement on a live mount.
+    /// `Ok(from)`: nothing of the attempt remains and the mode allows a copy,
+    /// which the caller then reads by the rule `from` names and publishes
+    /// through the copy guard. Committed bytes or a pending journal stop
+    /// interval commits until a remount.
+    fn after_failed_replace(
+        &self,
+        failed: crate::journal_recovery::FailedReplace,
+    ) -> Result<crate::journal_recovery::CopyFrom> {
+        if failed.base_unusable {
             self.refuse_base_after_commit_failure();
-            return Err(OverlayError::Msg(format!(
-                "{error}; {recovery}; remount required"
-            )));
+            return Err(failed.error);
         }
-        log::warn!("commit: append failed: {error}; retrying on the next interval or using copy in auto mode");
-        Ok(())
+        if failed.may_copy && self.commit_mode == CommitMode::Auto {
+            log::warn!(
+                "commit: append failed: {}; falling back to copy",
+                failed.error
+            );
+            return Ok(failed.copy_from());
+        }
+        Err(failed.error)
     }
 
     /// Last-N zstd frame rewrite. Never calls GNU tar (K3).
@@ -4121,6 +4557,7 @@ impl WriteOverlay {
         &self,
         archive: &Path,
         plan: &OverlayCommitPlan,
+        original: &fs::Metadata,
     ) -> Result<(IndexPatchWindow, SpliceStats)> {
         let map = scan_zstd_frames_path(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
         let (from_idx, rewrite_window_start_uncomp) =
@@ -4163,21 +4600,29 @@ impl WriteOverlay {
             rewrite_tar_suffix(&mut suffix, stream_offset, &opts, &mut out).map(|_| ())
         };
         let stats = if append && last_window_deletes.is_empty() {
-            match splice_zstd_last_frames_append(archive, from_idx, transform) {
+            match crate::journal_recovery::splice_append_committing(
+                archive,
+                from_idx,
+                transform,
+                original,
+                &self.commit_rows(),
+            ) {
                 Ok(stats) => stats,
-                Err(e) => {
-                    self.recover_failed_append(archive, &e)?;
-                    if self.commit_mode == CommitMode::Auto {
-                        splice_zstd_last_frames_replace(archive, from_idx, transform)
-                            .map_err(|e| OverlayError::Msg(e.to_string()))?
-                    } else {
-                        return Err(OverlayError::Msg(e.to_string()));
-                    }
+                Err(failed) => {
+                    let from = self.after_failed_replace(failed)?;
+                    crate::journal_recovery::splice_replace_over(
+                        archive, from_idx, transform, original, &from,
+                    )?
                 }
             }
         } else {
-            splice_zstd_last_frames_replace(archive, from_idx, transform)
-                .map_err(|e| OverlayError::Msg(e.to_string()))?
+            crate::journal_recovery::splice_replace_over(
+                archive,
+                from_idx,
+                transform,
+                original,
+                &crate::journal_recovery::CopyFrom::Gate,
+            )?
         };
         Ok((
             IndexPatchWindow {
@@ -4218,17 +4663,21 @@ impl WriteOverlay {
         &self,
         archive: &Path,
         plan: &OverlayCommitPlan,
+        original: &fs::Metadata,
     ) -> Result<IndexPatchWindow> {
+        let mut copy_from = crate::journal_recovery::CopyFrom::Gate;
         if self.commit_mode.may_append(archive)? {
-            match append_uncompressed_tar_plan(archive, &self.root, plan, &self.encoding) {
+            match append_uncompressed_tar_plan(
+                archive,
+                &self.root,
+                plan,
+                &self.encoding,
+                &self.commit_rows(),
+                original,
+            ) {
                 Ok(Some(window)) => return Ok(window),
                 Ok(None) => {}
-                Err(e) => {
-                    self.recover_failed_append(archive, &e)?;
-                    if self.commit_mode != CommitMode::Auto {
-                        return Err(e);
-                    }
-                }
+                Err(failed) => copy_from = self.after_failed_replace(failed)?,
             }
         }
         ensure_gnu_tar()?;
@@ -4244,9 +4693,10 @@ impl WriteOverlay {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let mut src = File::open(archive)?;
+        let (mut src, source) =
+            crate::journal_recovery::open_copy_source(archive, original, &copy_from)?;
         let (tmp, method) = ratarmount_compress::fastcopy::copy_to_temp(&mut src, parent)?;
-        ratarmount_compress::fastcopy::log_commit_copy(src.metadata()?.len(), method);
+        ratarmount_compress::fastcopy::log_commit_copy(source.len(), method);
         tmp.as_file().sync_all()?;
         let work_tar = tmp.path().to_path_buf();
         let list_dir = tempfile::tempdir()?;
@@ -4302,11 +4752,13 @@ impl WriteOverlay {
             }
         }
         tmp.as_file().sync_all()?;
-        tmp.persist(archive).map_err(|e| {
+        crate::journal_recovery::publish_over(archive, &source, || {
+            tmp.persist(archive).map(drop).map_err(|e| e.error)
+        })
+        .map_err(|e| {
             OverlayError::Msg(format!(
-                "Failed to replace '{}' after live TAR commit: {}",
+                "Failed to replace '{}' after live TAR commit: {e}",
                 archive.display(),
-                e.error
             ))
         })?;
         Ok(window)
@@ -4369,7 +4821,12 @@ impl WriteOverlay {
         let real = self.realpath(path);
         // symlink_metadata so a dangling overlay symlink is still visible.
         let meta = fs::symlink_metadata(&real).ok()?;
-        Some(file_info_from_overlay_meta(path, &real, &meta))
+        let mut fi = file_info_from_overlay_meta(path, &real, &meta);
+        // Seal preserves visible permissions here before chmod removes host write bits.
+        if let Some(mode) = self.metadata_for_path(path).and_then(|m| m.mode) {
+            fi.mode = (fi.mode & !0o7777) | (mode & 0o7777);
+        }
+        Some(fi)
     }
 }
 
@@ -4485,7 +4942,11 @@ fn set_host_metadata_file(file: &File, attrs: &OverlayMetadata) -> io::Result<()
     Ok(())
 }
 
-fn file_info_from_overlay_meta(path: &str, host: &Path, meta: &fs::Metadata) -> FileInfo {
+pub(crate) fn file_info_from_overlay_meta(
+    path: &str,
+    host: &Path,
+    meta: &fs::Metadata,
+) -> FileInfo {
     let linkname = if meta.file_type().is_symlink() {
         fs::read_link(host)
             .map(|p| p.to_string_lossy().into_owned())
@@ -5146,7 +5607,7 @@ fn write_commit_manifest(
     }
     let source = provenance_base(archive, encoding)?;
     let mut name = archive.as_os_str().to_os_string();
-    name.push(".manifest.jsonl");
+    name.push(crate::base_sidecars::MANIFEST_SIDECAR_SUFFIX);
     let dest = PathBuf::from(name);
     let parent = dest
         .parent()
@@ -5317,6 +5778,7 @@ fn provenance_base(archive: &Path, encoding: &str) -> Result<SqliteIndexedTar> {
 
 /// Shared replacement path for metadata-only changes. Payload copies live only
 /// for the commit, never in the writable overlay. Unchanged TAR records remain raw.
+#[allow(clippy::too_many_arguments)]
 fn persist_provenance_plan(
     archive: &Path,
     root: &Path,
@@ -5324,6 +5786,8 @@ fn persist_provenance_plan(
     encoding: &str,
     mode: CommitMode,
     hash_output: Option<&mut BTreeMap<String, String>>,
+    rows: &crate::journal_recovery::Rows<'_>,
+    original: &fs::Metadata,
 ) -> Result<IndexPatchWindow> {
     live_commit_is_supported(archive)?;
     let base = provenance_base(archive, encoding)?;
@@ -5470,6 +5934,8 @@ fn persist_provenance_plan(
         encoding,
     };
     let persist = || -> Result<IndexPatchWindow> {
+        #[cfg(test)]
+        append_prepare_seams(archive, original)?;
         let format = detect_compression(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
         if format == CompressionFormat::Zstd {
             let map =
@@ -5484,18 +5950,22 @@ fn persist_provenance_plan(
                 rewrite_tar_suffix(&mut input, offset, &rewrite, &mut out).map(|_| ())
             };
             if deleted.is_empty() && map.seek_table.is_some() && mode.may_append(archive)? {
-                if let Err(e) = splice_zstd_last_frames_append(archive, from, transform) {
-                    ratarmount_compress::commit_journal::recover(archive)?;
-                    if mode == CommitMode::Auto {
-                        splice_zstd_last_frames_replace(archive, from, transform)
-                            .map_err(|e| OverlayError::Msg(e.to_string()))?;
-                    } else {
-                        return Err(OverlayError::Msg(e.to_string()));
-                    }
+                if let Err(failed) = crate::journal_recovery::splice_append_committing(
+                    archive, from, transform, original, rows,
+                ) {
+                    let copy_from = copy_after_failed_replace(failed, mode)?;
+                    crate::journal_recovery::splice_replace_over(
+                        archive, from, transform, original, &copy_from,
+                    )?;
                 }
             } else {
-                splice_zstd_last_frames_replace(archive, from, transform)
-                    .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                crate::journal_recovery::splice_replace_over(
+                    archive,
+                    from,
+                    transform,
+                    original,
+                    &crate::journal_recovery::CopyFrom::Gate,
+                )?;
             }
             return Ok(IndexPatchWindow {
                 window_start: map.frames[from].uncompressed_offset,
@@ -5508,7 +5978,13 @@ fn persist_provenance_plan(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-        let mut src = File::open(archive)?;
+        // The stamp checked against the gate is the one the copy publishes
+        // with (R7-E1): another writer's change after this open refuses it.
+        let (mut src, opened) = crate::journal_recovery::open_copy_source(
+            archive,
+            original,
+            &crate::journal_recovery::CopyFrom::Gate,
+        )?;
         let append_offset = if deleted.is_empty() && mode.may_append(archive)? {
             uncompressed_append_offset(archive, plan, encoding)?
         } else {
@@ -5517,24 +5993,31 @@ fn persist_provenance_plan(
         if let Some(offset) = append_offset {
             ratarmount_formats_tar::write_ustar_members(tmp.as_file_mut(), &members)?;
             ratarmount_formats_tar::write_tar_eof(tmp.as_file_mut())?;
-            let original = src.metadata()?;
-            if let Err(e) = ratarmount_compress::commit_journal::replace_suffix_if_unchanged(
+            if let Err(failed) = crate::journal_recovery::replace_committing(
                 archive,
                 offset,
                 tmp.as_file_mut(),
-                &original,
+                original,
+                rows,
             ) {
-                ratarmount_compress::commit_journal::recover(archive)?;
-                if mode != CommitMode::Auto {
-                    return Err(e.into());
-                }
+                let copy_from = copy_after_failed_replace(failed, mode)?;
+                // The stamp after the attempt (a rollback left a new ctime),
+                // read from the very file the copy reads; it must still be
+                // exactly the stamp the failure names.
+                ratarmount_compress::commit_journal::fault::point("copy source open")?;
+                let source = crate::journal_recovery::recheck_copy_source(
+                    archive, &src, original, &copy_from,
+                )?;
+                ratarmount_compress::commit_journal::fault::point("copy source opened")?;
                 tmp.as_file_mut().set_len(0)?;
                 tmp.as_file_mut().rewind()?;
                 src.rewind()?;
                 rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
                 tmp.as_file().sync_all()?;
-                tmp.persist(archive)
-                    .map_err(|e| OverlayError::Io(e.error))?;
+                crate::journal_recovery::publish_over(archive, &source, || {
+                    tmp.persist(archive).map(drop).map_err(|e| e.error)
+                })
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
                 return Ok(IndexPatchWindow {
                     window_start: 0,
                     from_frame: None,
@@ -5547,10 +6030,13 @@ fn persist_provenance_plan(
                 offsets_shifted: false,
             })
         } else {
+            let source = opened;
             rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
             tmp.as_file().sync_all()?;
-            tmp.persist(archive)
-                .map_err(|e| OverlayError::Io(e.error))?;
+            crate::journal_recovery::publish_over(archive, &source, || {
+                tmp.persist(archive).map(drop).map_err(|e| e.error)
+            })
+            .map_err(|e| OverlayError::Msg(e.to_string()))?;
             Ok(IndexPatchWindow {
                 window_start: 0,
                 from_frame: None,
@@ -5836,7 +6322,7 @@ fn create_overlay_marker(path: &Path) -> io::Result<bool> {
 }
 
 /// WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no equivalent bit.
-fn open_options_nofollow() -> FsOpenOptions {
+pub(crate) fn open_options_nofollow() -> FsOpenOptions {
     let mut opts = FsOpenOptions::new();
     #[cfg(unix)]
     {
@@ -6102,6 +6588,76 @@ fn uncompressed_append_offset(
 #[cfg(test)]
 thread_local! {
     static APPEND_PREPARE_TOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Run by an offline commit after the caller's gate, right before it
+    /// picks the recovery owner (the overlay or the archive changes there).
+    pub(crate) static BEFORE_OFFLINE_RECOVERY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// When set, renamed over the archive after the suffix is staged (another
+    /// file takes the name between preparation and the journaled replacement).
+    pub(crate) static APPEND_PREPARE_SWAP: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The test seams of an append, run before the commit reads the archive: a
+/// touch (the archive is no longer the gate's snapshot) or a swap (another
+/// file takes the name).
+#[cfg(test)]
+fn append_prepare_seams(archive: &Path, original: &fs::Metadata) -> io::Result<()> {
+    if APPEND_PREPARE_TOUCH.replace(false) {
+        File::options().write(true).open(archive)?.set_times(
+            fs::FileTimes::new().set_modified(original.modified()? + Duration::from_secs(2)),
+        )?;
+    }
+    if let Some(other) = APPEND_PREPARE_SWAP.take() {
+        fs::rename(other, archive)?;
+    }
+    Ok(())
+}
+
+/// The reaction to a failed journaled replacement without a live mount (and
+/// inside the provenance persist): `Ok(from)` when a copy may run, reading
+/// its source by the rule `from` names.
+fn copy_after_failed_replace(
+    failed: crate::journal_recovery::FailedReplace,
+    mode: CommitMode,
+) -> Result<crate::journal_recovery::CopyFrom> {
+    if failed.may_copy && mode == CommitMode::Auto {
+        log::warn!(
+            "commit: append failed: {}; falling back to copy",
+            failed.error
+        );
+        return Ok(failed.copy_from());
+    }
+    Err(failed.error)
+}
+
+/// A failed journaled replacement: `Committed` keeps its own variant so no
+/// caller answers it with a copy fallback.
+fn recover_error_to_overlay(
+    error: ratarmount_compress::commit_journal::RecoverError,
+) -> OverlayError {
+    use ratarmount_compress::commit_journal::RecoverError;
+    match error {
+        RecoverError::Committed(e) => OverlayError::Committed(format!(
+            "{e}; the archive holds the committed bytes but the recorded baseline could not be \
+             updated (remount required)"
+        )),
+        other => OverlayError::Io(other.into_io()),
+    }
+}
+
+/// Offline recovery before a commit: restamps the overlay database beside
+/// `root` (when it exists) from the locked descriptor before the journal is
+/// unlinked. `authorize` decides under the archive lock. The only offline
+/// recovery: a failed replacement cleans up after itself.
+fn recover_offline(
+    archive: &Path,
+    root: &Path,
+    owner: crate::journal_recovery::Owner<'_>,
+) -> Result<()> {
+    crate::journal_recovery::recover_journal_at(archive, Some(&root.join(HIDDEN_DB)), owner)
+        .map(|_| ())
+        .map_err(recover_error_to_overlay)
 }
 
 fn append_uncompressed_tar_plan(
@@ -6109,8 +6665,11 @@ fn append_uncompressed_tar_plan(
     root: &Path,
     plan: &OverlayCommitPlan,
     encoding: &str,
-) -> Result<Option<IndexPatchWindow>> {
-    let original = fs::metadata(archive)?;
+    rows: &crate::journal_recovery::Rows<'_>,
+    original: &fs::Metadata,
+) -> std::result::Result<Option<IndexPatchWindow>, crate::journal_recovery::FailedReplace> {
+    #[cfg(test)]
+    append_prepare_seams(archive, original)?;
     let Some(offset) = uncompressed_append_offset(archive, plan, encoding)? else {
         return Ok(None);
     };
@@ -6124,17 +6683,12 @@ fn append_uncompressed_tar_plan(
     let mut tail = tempfile::NamedTempFile::new_in(parent)?;
     ratarmount_formats_tar::write_ustar_members(tail.as_file_mut(), &members)?;
     ratarmount_formats_tar::write_tar_eof(tail.as_file_mut())?;
-    #[cfg(test)]
-    if APPEND_PREPARE_TOUCH.replace(false) {
-        File::options().write(true).open(archive)?.set_times(
-            fs::FileTimes::new().set_modified(original.modified()? + Duration::from_secs(2)),
-        )?;
-    }
-    ratarmount_compress::commit_journal::replace_suffix_if_unchanged(
+    crate::journal_recovery::replace_committing(
         archive,
         offset,
         tail.as_file_mut(),
-        &original,
+        original,
+        rows,
     )?;
     log::info!(
         "commit: prefix {:.1} GiB retained via append",
@@ -6203,6 +6757,9 @@ pub struct CommitOverlayOptions {
     /// classification, and sidecar patch always walk past per-frame TAR EOF
     /// so later concatenated members survive even when this is false.
     pub ignore_zeros: bool,
+    /// `--force-base-mismatch`: commit although the archive is no longer the
+    /// base the overlay recorded.
+    pub force_base_mismatch: bool,
 }
 
 impl Default for CommitOverlayOptions {
@@ -6214,6 +6771,7 @@ impl Default for CommitOverlayOptions {
             debug: 1,
             encoding: "utf-8".into(),
             ignore_zeros: false,
+            force_base_mismatch: false,
         }
     }
 }
@@ -6240,14 +6798,83 @@ impl Default for CommitOverlayOptions {
 /// Offline prefix-rewrite escape hatch (including earlier-frame `.tar.zst`
 /// delete). **Not** a V-4 live-queue job — do not route this through
 /// [`WriteOverlay::enqueue_commit`].
+///
+/// The overlay has a database: the archive about to be
+/// rewritten must still be the base the last create, commit or refresh
+/// recorded (checked with `stat` only, before anything is written; the
+/// classified base is the opener's report for `archive_file`). The refresh
+/// afterwards re-points the recorded location at the committed archive.
+/// `--force-base-mismatch` (`opts`) commits anyway.
 pub fn commit_overlay(
     write_overlay: impl AsRef<Path>,
     archive_file: impl AsRef<Path>,
+    base: &crate::ClassifiedBase,
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
     let write_overlay = write_overlay.as_ref();
     let archive_file = archive_file.as_ref();
+    if overlay_db_absent(write_overlay) {
+        return Err(OverlayError::Msg(format!(
+            "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
+            write_overlay.display()
+        )));
+    }
+    if let Err(refusal) =
+        crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
+    {
+        if !opts.force_base_mismatch {
+            return Err(OverlayError::Msg(refusal.0));
+        }
+        log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
+    }
+    commit_overlay_inner(write_overlay, archive_file, Some(base), opts)
+}
 
+/// What [`commit_overlay_raw_dir`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawDirCommit {
+    pub committed: bool,
+    /// Always `false`: a raw overlay directory records no base identity, so
+    /// none was checked. The CLI says so.
+    pub identity_checked: bool,
+}
+
+/// Commit a raw overlay DIRECTORY of files (no database) to an archive. It
+/// takes no token and checks no identity; it refuses once the directory has
+/// an overlay database, because then the base identity must be checked
+/// through [`commit_overlay`].
+pub fn commit_overlay_raw_dir(
+    write_overlay: impl AsRef<Path>,
+    archive_file: impl AsRef<Path>,
+    opts: &CommitOverlayOptions,
+) -> Result<RawDirCommit> {
+    let write_overlay = write_overlay.as_ref();
+    let db = write_overlay.join(HIDDEN_DB);
+    if !db_entry_absent(&db) {
+        return Err(OverlayError::Msg(format!(
+            "overlay database {} exists (or something else is at its path); its base \
+             identity must be checked, so commit it with a classified base \
+             (commit_overlay), not as a raw directory",
+            db.display()
+        )));
+    }
+    if !opts.force_base_mismatch {
+        crate::overlay_gate::ensure_journal_is_for_archive(archive_file.as_ref())
+            .map_err(OverlayError::Msg)?;
+    }
+    let committed = commit_overlay_inner(write_overlay, archive_file.as_ref(), None, opts)?;
+    Ok(RawDirCommit {
+        committed,
+        identity_checked: false,
+    })
+}
+
+fn commit_overlay_inner(
+    write_overlay: &Path,
+    archive_file: &Path,
+    identity: Option<&crate::ClassifiedBase>,
+    opts: &CommitOverlayOptions,
+) -> Result<bool> {
     if !write_overlay.is_dir() {
         return Err(OverlayError::Msg(
             "Need an existing write overlay folder for committing changes.".into(),
@@ -6260,7 +6887,42 @@ pub fn commit_overlay(
         )));
     }
 
-    ratarmount_compress::commit_journal::recover(archive_file)?;
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_OFFLINE_RECOVERY.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+    {
+        use crate::journal_recovery::{Owner, Record};
+        // The gate ran before this call (unlocked); the owner re-takes the
+        // decision on the LOCKED file, and recovery restamps the rows from it.
+        // A recorded identity stays `Recorded` even if the database vanished
+        // since the gate: the missing record refuses, it never downgrades to
+        // the inode rule (R7-F2).
+        let owner = match identity {
+            _ if opts.force_base_mismatch => Owner::Forced,
+            Some(base) => Owner::Recorded {
+                base,
+                archive: archive_file,
+                record: Record::Offline(write_overlay),
+            },
+            _ => Owner::Inode,
+        };
+        recover_offline(archive_file, write_overlay, owner)?;
+    }
+    // The one snapshot every write of this commit compares against: the file
+    // the gate accepts after recovery (one stat when no identity applies).
+    let original = match identity {
+        Some(base) => {
+            match crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
+            {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => fs::metadata(archive_file)?,
+                Err(_) if opts.force_base_mismatch => fs::metadata(archive_file)?,
+                Err(refusal) => return Err(OverlayError::Msg(refusal.0)),
+            }
+        }
+        _ => fs::metadata(archive_file)?,
+    };
     let mut plan = collect_overlay_commit_plan(write_overlay)?;
     if opts.manifest_hashes.is_some() {
         plan.known_hashes = known_manifest_hashes(archive_file)?;
@@ -6281,6 +6943,7 @@ pub fn commit_overlay(
             return Ok(false);
         }
         let mut written_hashes = BTreeMap::new();
+        let db = write_overlay.join(HIDDEN_DB);
         let window = persist_provenance_plan(
             archive_file,
             write_overlay,
@@ -6288,7 +6951,10 @@ pub fn commit_overlay(
             &opts.encoding,
             opts.mode,
             hash_payloads.then_some(&mut written_hashes),
+            &crate::journal_recovery::Rows::Path(&db),
+            &original,
         )?;
+        crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
         plan.written_hashes = written_hashes;
         let patch_opts = OpenOptions {
             encoding: opts.encoding.clone(),
@@ -6302,12 +6968,13 @@ pub fn commit_overlay(
         }
         return Ok(true);
     }
-    if is_zip_archive(archive_file)? {
-        return commit_overlay_zip(write_overlay, archive_file, opts);
-    }
-
-    let committed = commit_overlay_tar(write_overlay, archive_file, opts)?;
+    let committed = if is_zip_archive(archive_file)? {
+        commit_overlay_zip(write_overlay, archive_file, opts, &original)?
+    } else {
+        commit_overlay_tar(write_overlay, archive_file, opts, &original)?
+    };
     if committed {
+        crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
         if let Some(hashes) = &opts.manifest_hashes {
             write_commit_manifest(archive_file, &plan, &opts.encoding, hashes)?;
         }
@@ -6355,28 +7022,25 @@ impl OverlayCommitPlan {
 /// see rows that never reached the database. An unsaved queue is logged on
 /// unmount: an offline `--commit-overlay` will publish those archive members.
 fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan> {
-    let db_path = write_overlay.join(HIDDEN_DB);
+    // Canonical paths in every refusal, same as the mount's.
+    let canon = write_overlay
+        .canonicalize()
+        .unwrap_or_else(|_| write_overlay.to_path_buf());
+    let db_path = canon.join(HIDDEN_DB);
     let markers = overlay_markers(write_overlay)?;
     let marker = markers.first().cloned();
-    let db_regular = match fs::metadata(&db_path) {
-        Ok(m) if m.is_dir() => {
-            let canon = write_overlay
-                .canonicalize()
-                .unwrap_or_else(|_| write_overlay.to_path_buf());
-            return Err(db_is_directory_error(&canon.join(HIDDEN_DB)));
-        }
+    // Only a missing entry is "no database" (R7-E2): a dangling symlink in an
+    // unmarked folder is refused, never planned without its tombstones; a
+    // directory or another non-regular file is refused with the shared text.
+    let db_regular = match overlay_db_regular(&db_path, marker.is_some())? {
         // A 0-byte file in a marked folder is as gone as a missing one.
-        Ok(m) => m.is_file() && (marker.is_none() || m.len() > 0),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        Err(e) => return Err(OverlayError::Io(e)),
+        Some(m) => marker.is_none() || m.len() > 0,
+        None => false,
     };
     if marker.is_some() && !db_regular {
         // #96: committing without the tombstones would write the unlinked
         // members back into the archive. Same wording and canonical paths as
         // the mount refusal.
-        let canon = write_overlay
-            .canonicalize()
-            .unwrap_or_else(|_| write_overlay.to_path_buf());
         let canon_markers: Vec<PathBuf> = markers
             .iter()
             .map(|m| canon.join(m.file_name().unwrap_or_default()))
@@ -6395,9 +7059,10 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
         )));
     }
     let conn = if db_regular {
-        Some(Connection::open_with_flags(
+        Some(crate::open_overlay_db(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            crate::DbName::Path,
         )?)
     } else {
         None
@@ -6992,6 +7657,7 @@ fn commit_overlay_zip(
     write_overlay: &Path,
     zip_file: &Path,
     opts: &CommitOverlayOptions,
+    original: &fs::Metadata,
 ) -> Result<bool> {
     let plan = collect_overlay_commit_plan(write_overlay)?;
 
@@ -7046,7 +7712,7 @@ fn commit_overlay_zip(
         return Ok(false);
     }
 
-    rebuild_zip_with_overlay(write_overlay, zip_file, &plan)?;
+    rebuild_zip_with_overlay(write_overlay, zip_file, &plan, original)?;
 
     if opts.debug >= 1 {
         println!(
@@ -7061,8 +7727,16 @@ fn rebuild_zip_with_overlay(
     write_overlay: &Path,
     zip_file: &Path,
     plan: &OverlayCommitPlan,
+    original: &fs::Metadata,
 ) -> Result<()> {
-    let src = File::open(zip_file).map_err(|e| {
+    // Read the descriptor checked against the gate; publish only over that
+    // stamp, under the copy guard (R7-E1).
+    let (src, source) = crate::journal_recovery::open_copy_source(
+        zip_file,
+        original,
+        &crate::journal_recovery::CopyFrom::Gate,
+    )
+    .map_err(|e| {
         OverlayError::Msg(format!(
             "Failed to open ZIP '{}' for commit: {e}",
             zip_file.display()
@@ -7148,11 +7822,13 @@ fn rebuild_zip_with_overlay(
     }
     tmp.as_file().sync_all()?;
 
-    tmp.persist(zip_file).map_err(|e| {
+    crate::journal_recovery::publish_over(zip_file, &source, || {
+        tmp.persist(zip_file).map(drop).map_err(|e| e.error)
+    })
+    .map_err(|e| {
         OverlayError::Msg(format!(
-            "Failed to replace '{}' with rebuilt ZIP: {}",
+            "Failed to replace '{}' with rebuilt ZIP: {e}",
             zip_file.display(),
-            e.error
         ))
     })?;
     Ok(())
@@ -7163,6 +7839,7 @@ fn commit_overlay_tar(
     write_overlay: &Path,
     tar_file: &Path,
     opts: &CommitOverlayOptions,
+    original: &fs::Metadata,
 ) -> Result<bool> {
     let format = detect_compression(tar_file).map_err(|e| {
         OverlayError::Msg(format!(
@@ -7179,9 +7856,10 @@ fn commit_overlay_tar(
                     .into(),
             ));
         }
-        return commit_overlay_tar_zst(write_overlay, tar_file, opts);
+        return commit_overlay_tar_zst(write_overlay, tar_file, opts, original);
     }
 
+    let mut copy_from = crate::journal_recovery::CopyFrom::Gate;
     if format == CompressionFormat::None && opts.mode.may_append(tar_file)? {
         let plan = collect_overlay_commit_plan(write_overlay)?;
         if plan.is_empty() {
@@ -7193,7 +7871,10 @@ fn commit_overlay_tar(
             ..OpenOptions::default()
         };
         let mut canceled = false;
-        let attempt = (|| -> Result<Option<IndexPatchWindow>> {
+        let attempt = (|| -> std::result::Result<
+            Option<IndexPatchWindow>,
+            crate::journal_recovery::FailedReplace,
+        > {
             if uncompressed_append_offset(tar_file, &plan, &opts.encoding)?.is_none() {
                 return Ok(None);
             }
@@ -7212,9 +7893,15 @@ fn commit_overlay_tar(
                 return Ok(None);
             }
             invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
-            let window =
-                append_uncompressed_tar_plan(tar_file, write_overlay, &plan, &opts.encoding)?;
-            Ok(window)
+            let db = write_overlay.join(HIDDEN_DB);
+            append_uncompressed_tar_plan(
+                tar_file,
+                write_overlay,
+                &plan,
+                &opts.encoding,
+                &crate::journal_recovery::Rows::Path(&db),
+                original,
+            )
         })();
         if canceled {
             return Ok(false);
@@ -7225,19 +7912,15 @@ fn commit_overlay_tar(
                 return Ok(true);
             }
             Ok(None) => {}
-            Err(e) => {
-                ratarmount_compress::commit_journal::recover(tar_file)?;
-                if opts.mode != CommitMode::Auto {
-                    return Err(e);
-                }
-                log::warn!("commit: append failed: {e}; falling back to copy");
-            }
+            Err(failed) => copy_from = copy_after_failed_replace(failed, opts.mode)?,
         }
     }
     ensure_gnu_tar()?;
 
     // Keep work temp alive through delete/append (and recompress for compressed).
     // Uncompressed offline matches live: sibling copy; replace only on success.
+    // The stamp checked against the gate; the publish compares exactly it.
+    let copy_source: fs::Metadata;
     let (work_tar, work_holder): (PathBuf, Option<tempfile::NamedTempFile>) = match format {
         CompressionFormat::None => {
             if !is_uncompressed_tar(tar_file)? {
@@ -7251,15 +7934,22 @@ fn commit_overlay_tar(
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
-            let mut src = File::open(tar_file)?;
+            let (mut src, source) =
+                crate::journal_recovery::open_copy_source(tar_file, original, &copy_from)?;
             let (tmp, method) = ratarmount_compress::fastcopy::copy_to_temp(&mut src, parent)?;
-            ratarmount_compress::fastcopy::log_commit_copy(src.metadata()?.len(), method);
+            ratarmount_compress::fastcopy::log_commit_copy(source.len(), method);
+            copy_source = source;
             tmp.as_file().sync_all()?;
             let path = tmp.path().to_path_buf();
             (path, Some(tmp))
         }
         CompressionFormat::Gzip | CompressionFormat::Bzip2 | CompressionFormat::Xz => {
-            let (tmp, _) = materialize(tar_file, format).map_err(|e| {
+            // Decompress the descriptor checked against the gate; the
+            // recompressed copy publishes only over that stamp (R7-E1).
+            let (src, source) =
+                crate::journal_recovery::open_copy_source(tar_file, original, &copy_from)?;
+            copy_source = source;
+            let (tmp, _) = materialize_open(src, tar_file, format).map_err(|e| {
                 OverlayError::Msg(format!(
                     "Failed to decompress '{}' for commit: {e}",
                     tar_file.display()
@@ -7389,7 +8079,7 @@ fn commit_overlay_tar(
     }
 
     if format != CompressionFormat::None {
-        recompress_replace(&work_tar, tar_file, format)?;
+        recompress_replace(&work_tar, tar_file, format, &copy_source)?;
         // Keep materialized temp alive until recompress finishes.
         drop(work_holder);
     } else {
@@ -7399,11 +8089,13 @@ fn commit_overlay_tar(
             )
         })?;
         tmp.as_file().sync_all()?;
-        tmp.persist(tar_file).map_err(|e| {
+        crate::journal_recovery::publish_over(tar_file, &copy_source, || {
+            tmp.persist(tar_file).map(drop).map_err(|e| e.error)
+        })
+        .map_err(|e| {
             OverlayError::Msg(format!(
-                "Failed to replace '{}' after offline TAR commit: {}",
+                "Failed to replace '{}' after offline TAR commit: {e}",
                 tar_file.display(),
-                e.error
             ))
         })?;
     }
@@ -7423,6 +8115,7 @@ fn commit_overlay_tar_zst(
     write_overlay: &Path,
     tar_file: &Path,
     opts: &CommitOverlayOptions,
+    original: &fs::Metadata,
 ) -> Result<bool> {
     let plan = collect_overlay_commit_plan(write_overlay)?;
     if plan.is_empty() {
@@ -7521,18 +8214,28 @@ fn commit_overlay_tar_zst(
     };
     invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
     if append {
-        match splice_zstd_last_frames_append(tar_file, from_idx, transform) {
-            Err(e) if opts.mode == CommitMode::Auto => {
-                ratarmount_compress::commit_journal::recover(tar_file)?;
-                log::warn!("commit: append failed: {e}; falling back to copy");
-                splice_zstd_last_frames_replace(tar_file, from_idx, transform)
+        let db = write_overlay.join(HIDDEN_DB);
+        let rows = crate::journal_recovery::Rows::Path(&db);
+        match crate::journal_recovery::splice_append_committing(
+            tar_file, from_idx, transform, original, &rows,
+        ) {
+            Ok(stats) => stats,
+            Err(failed) => {
+                let copy_from = copy_after_failed_replace(failed, opts.mode)?;
+                crate::journal_recovery::splice_replace_over(
+                    tar_file, from_idx, transform, original, &copy_from,
+                )?
             }
-            result => result,
         }
     } else {
-        splice_zstd_last_frames_replace(tar_file, from_idx, transform)
-    }
-    .map_err(|e| OverlayError::Msg(e.to_string()))?;
+        crate::journal_recovery::splice_replace_over(
+            tar_file,
+            from_idx,
+            transform,
+            original,
+            &crate::journal_recovery::CopyFrom::Gate,
+        )?
+    };
 
     let window = IndexPatchWindow {
         window_start: map.frames[from_idx].uncompressed_offset,
@@ -7556,8 +8259,15 @@ fn commit_overlay_tar_zst(
     Ok(true)
 }
 
-/// Compress `plain` with `format` and atomically replace `dest`.
-fn recompress_replace(plain: &Path, dest: &Path, format: CompressionFormat) -> Result<()> {
+/// Compress `plain` with `format` and atomically replace `dest`, only while
+/// `dest` is still exactly `source` (the stamp checked against the gate),
+/// under the copy guard.
+fn recompress_replace(
+    plain: &Path,
+    dest: &Path,
+    format: CompressionFormat,
+    source: &fs::Metadata,
+) -> Result<()> {
     let parent = dest
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -7594,11 +8304,13 @@ fn recompress_replace(plain: &Path, dest: &Path, format: CompressionFormat) -> R
     tmp.as_file().sync_all()?;
 
     // Atomic replace on the same filesystem (parent chosen to match dest).
-    tmp.persist(dest).map_err(|e| {
+    crate::journal_recovery::publish_over(dest, source, || {
+        tmp.persist(dest).map(drop).map_err(|e| e.error)
+    })
+    .map_err(|e| {
         OverlayError::Msg(format!(
-            "Failed to replace '{}' with recompressed archive: {}",
+            "Failed to replace '{}' with recompressed archive: {e}",
             dest.display(),
-            e.error
         ))
     })?;
     Ok(())
@@ -8226,8 +8938,20 @@ fn walkdir_files_and_empty_dirs(root: &Path) -> Result<Vec<WalkEntry>> {
 }
 
 #[cfg(test)]
-mod tests {
+#[allow(clippy::disallowed_methods)]
+pub(crate) mod tests {
     use super::*;
+
+    /// Offline commit without a classified base: the in-crate fixtures open
+    /// overlays with `new_for_tests`, which record no base to check.
+    fn commit_overlay(
+        write_overlay: impl AsRef<Path>,
+        archive_file: impl AsRef<Path>,
+        opts: &CommitOverlayOptions,
+    ) -> Result<bool> {
+        commit_overlay_inner(write_overlay.as_ref(), archive_file.as_ref(), None, opts)
+    }
+
     use ratarmount_compress::{open_seekable_bzip2, open_seekable_xz};
     use std::process::Command as StdCommand;
     use zip::write::SimpleFileOptions;
@@ -8250,7 +8974,7 @@ mod tests {
             }
         }
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(MemBase::with(&[])), td.path()).unwrap();
+        let mut ov = WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), td.path()).unwrap();
         ov.set_policy(Some(Arc::new(PanicOnce(AtomicBool::new(true)))));
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             || ov.mkdir("/first", 0o755)
@@ -8568,7 +9292,7 @@ mod tests {
             }
         }
         let td = tempfile::tempdir().unwrap();
-        let ov = WriteOverlay::new(Arc::new(ShortBase), td.path()).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(ShortBase), td.path()).unwrap();
         let host = td.path().join("short");
         let err = ov.ensure_modifiable("/short");
         let bytes = fs::read(&host).ok();
@@ -8716,7 +9440,7 @@ mod tests {
             }
         }
 
-        let ov = WriteOverlay::new(
+        let ov = WriteOverlay::new_for_tests(
             Arc::new(CrashBase {
                 overlay: overlay.clone(),
                 big: original.to_vec(),
@@ -8774,7 +9498,8 @@ mod tests {
         }
 
         let ov =
-            WriteOverlay::new(open_uncompressed_tar_base(&mount_tar, false), &overlay).unwrap();
+            WriteOverlay::new_for_tests(open_uncompressed_tar_base(&mount_tar, false), &overlay)
+                .unwrap();
         assert!(!overlay.join(".ratarmount.overlay.cow-Ab12Cd").exists());
         assert!(!overlay
             .join("sub")
@@ -8806,7 +9531,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        drop(WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).unwrap());
+        drop(WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), &overlay).unwrap());
         let locked = overlay.join("locked");
         fs::create_dir(&locked).unwrap();
         fs::write(
@@ -8830,7 +9555,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         }
-        let err = WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).err();
+        let err = WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), &overlay).err();
         assert!(
             err.is_none(),
             "unreadable dir must not fail reopen: {err:?}"
@@ -8846,11 +9571,11 @@ mod tests {
     fn regression_cow_v3_second_open_keeps_staging() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        drop(WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).unwrap());
-        let first = WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay).unwrap();
+        drop(WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), &overlay).unwrap());
+        let first = WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), &overlay).unwrap();
         let staging = overlay.join(format!("{COW_STAGING_PREFIX}Ab12Cd"));
         fs::write(&staging, b"in-progress").unwrap();
-        match WriteOverlay::new(Arc::new(MemBase::with(&[])), &overlay) {
+        match WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), &overlay) {
             Ok(_) => panic!("second open must be refused while the first holds the lock"),
             Err(e) => {
                 let msg = e.to_string().to_lowercase();
@@ -8965,7 +9690,7 @@ mod tests {
     #[test]
     fn regression_overlay_policy_read_open_still_allowed() {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(Arc::new(MemBase::with(&[])), td.path()).unwrap();
+        let mut ov = WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), td.path()).unwrap();
         ov.mkdir("/locked", 0o755).unwrap();
         let file = policy_file(&ov, "/locked/file");
         ov.write_at(&file, "/locked/file", 0, b"base").unwrap();
@@ -9060,7 +9785,7 @@ mod tests {
         limit: u64,
     ) -> (tempfile::TempDir, WriteOverlay, Arc<CountingPolicy>) {
         let td = tempfile::tempdir().unwrap();
-        let mut ov = WriteOverlay::new(base, td.path()).unwrap();
+        let mut ov = WriteOverlay::new_for_tests(base, td.path()).unwrap();
         let policy = Arc::new(CountingPolicy::new(limit));
         ov.set_policy(Some(policy.clone()));
         (td, ov, policy)
@@ -9336,6 +10061,168 @@ mod tests {
         zw.finish().unwrap();
     }
 
+    fn assert_committed_baseline(
+        overlay: &Path,
+        archive: &Path,
+        info: &crate::overlay_meta::OverlayCreateInfo,
+    ) {
+        let meta = crate::OverlayMeta::read(overlay).unwrap().unwrap();
+        let stamp = ratarmount_index::ArchiveDigestStamp::read(archive).unwrap();
+        let digest = format!(
+            "sha256:{}",
+            ratarmount_index::sha256_hex(&fs::read(archive).unwrap())
+        );
+        assert_eq!(meta.base_digest(), Some(digest.as_str()));
+        assert_eq!(meta.base_digest_kind(), Some("strong"));
+        assert_eq!(meta.get("base_size"), Some(stamp.size.to_string().as_str()));
+        assert_eq!(
+            meta.get("base_mtime_ns"),
+            Some(stamp.mtime_ns.to_string().as_str())
+        );
+        assert_eq!(
+            meta.stack_digest(),
+            Some(crate::overlay_meta::stack_digest(&digest, &[]).as_str())
+        );
+        assert!(meta.get("base_committed_at").is_some());
+        assert!(meta.get("base_mismatch_forced_at").is_none());
+        let conn = Connection::open(info.index_path.as_ref().unwrap()).unwrap();
+        let cached: (String, String, String, String) = conn
+            .query_row(
+                "SELECT size, mtime_ns, inode, sha256 FROM overlay_base_digests",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            cached,
+            (
+                stamp.size.to_string(),
+                stamp.mtime_ns.to_string(),
+                stamp.inode.to_string(),
+                digest[7..].to_owned()
+            )
+        );
+        // Use the same default creation context as mount startup, with no override.
+        drop(
+            WriteOverlay::new_with_create_info_for_tests(Arc::new(NullBase), overlay, info)
+                .unwrap(),
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(archive)
+            .unwrap()
+            .write_all(b"external change")
+            .unwrap();
+        let error = WriteOverlay::new_with_create_info_for_tests(Arc::new(NullBase), overlay, info)
+            .err()
+            .expect("external archive change must be refused");
+        assert!(error.to_string().contains("base mismatch"), "{error}");
+    }
+
+    fn commit_baseline_case(
+        extension: &str,
+        mode: CommitMode,
+        live: bool,
+        atomic: bool,
+        manifest: bool,
+    ) {
+        if extension == "tar" && mode == CommitMode::Copy {
+            if let Err(error) = ensure_gnu_tar() {
+                eprintln!("skip: {error}");
+                return;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join(format!("base.{extension}"));
+        let members = [ustar_file("old", b"original")];
+        match extension {
+            "zip" => write_sample_zip(&archive, &[("old", b"original", CompressionMethod::Stored)]),
+            "tar.zst" => {
+                fs::write(&archive, concat_zstd_frames(&[&pack_tar(&members)], true)).unwrap()
+            }
+            _ => fs::write(&archive, pack_tar(&members)).unwrap(),
+        }
+        let overlay = dir.path().join("overlay");
+        let index = dir.path().join("custom-index.sqlite");
+        Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT);")
+            .unwrap();
+        let info = crate::overlay_meta::OverlayCreateInfo {
+            base_url: archive.to_str().unwrap().to_owned(),
+            index_path: Some(index),
+            ..Default::default()
+        };
+        let base = match extension {
+            "tar" => open_uncompressed_tar_base(&archive, false),
+            "tar.zst" => open_tar_zst_base(&archive, false),
+            _ => Arc::new(NullBase) as Arc<dyn MountSource>,
+        };
+        let mut ov = WriteOverlay::new_with_create_info_for_tests(base, &overlay, &info).unwrap();
+        ov.set_commit_mode(mode);
+        fs::write(overlay.join("new"), b"new payload").unwrap();
+        if live {
+            assert!(ov
+                .commit_live_idle(&archive, Duration::ZERO, |path| {
+                    Ok(if extension == "tar" {
+                        open_uncompressed_tar_base(path, false)
+                    } else {
+                        open_tar_zst_base(path, false)
+                    })
+                })
+                .unwrap());
+            assert!(!overlay.join("new").exists());
+        } else if atomic {
+            assert!(ov.commit_atomic(&archive).unwrap());
+        } else {
+            drop(ov);
+            let opts = CommitOverlayOptions {
+                mode,
+                manifest_hashes: manifest.then(|| "all".to_owned()),
+                ..yes_commit_opts()
+            };
+            assert!(commit_overlay(&overlay, &archive, &opts).unwrap());
+            assert_committed_baseline(&overlay, &archive, &info);
+            return;
+        }
+        drop(ov);
+        assert_committed_baseline(&overlay, &archive, &info);
+    }
+
+    /// Regression: offline TAR commits left the overlay bound to the old archive bytes.
+    #[test]
+    fn regression_commit_overlay_tar_refreshes_baseline() {
+        for mode in [CommitMode::Copy, CommitMode::Append] {
+            commit_baseline_case("tar", mode, false, false, false);
+        }
+        commit_baseline_case("tar", CommitMode::Copy, false, false, true);
+    }
+
+    /// Regression: zstd splice and append commits caused a mismatch on remount.
+    #[test]
+    fn regression_commit_overlay_tar_zst_refreshes_baseline() {
+        for mode in [CommitMode::Copy, CommitMode::Append] {
+            commit_baseline_case("tar.zst", mode, false, false, false);
+        }
+    }
+
+    /// Regression: rebuilding ZIP left its recorded digest and size stale.
+    #[test]
+    fn regression_commit_overlay_zip_refreshes_baseline() {
+        commit_baseline_case("zip", CommitMode::Copy, false, false, false);
+    }
+
+    /// Regression: interval and on-exit commits required force-base-mismatch afterward.
+    #[test]
+    fn regression_live_commit_refreshes_baseline() {
+        for extension in ["tar", "tar.zst"] {
+            for mode in [CommitMode::Copy, CommitMode::Append] {
+                commit_baseline_case(extension, mode, true, false, false);
+                commit_baseline_case(extension, mode, false, true, false);
+            }
+        }
+    }
+
     /// Re-run test `name` in a child whose cwd is `cwd` and whose `TMPDIR` does
     /// not exist, so any scratch allocation in `$TMPDIR` fails (or, on a real
     /// host, would land on another filesystem). `vars` carry absolute inputs.
@@ -9379,7 +10266,10 @@ mod tests {
                 ("t.tar.gz", CompressionFormat::Gzip),
                 ("t.tar.bz2", CompressionFormat::Bzip2),
             ] {
-                recompress_replace(&plain, Path::new(dest), fmt)
+                // The replace is gated on the stamp of an existing `dest`.
+                fs::write(dest, b"old").unwrap();
+                let source = fs::metadata(dest).unwrap();
+                recompress_replace(&plain, Path::new(dest), fmt, &source)
                     .unwrap_or_else(|e| panic!("{dest}: {e}"));
                 assert!(fs::metadata(dest).unwrap().len() > 0);
             }
@@ -9422,7 +10312,7 @@ mod tests {
         fs::create_dir_all(&overlay).unwrap();
         {
             let base = Arc::new(NullBase) as Arc<dyn MountSource>;
-            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            let _ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             fs::write(overlay.join("new.txt"), b"hello bare zip\n").unwrap();
         }
         run_bare_name_child(
@@ -9458,7 +10348,7 @@ mod tests {
         fs::create_dir_all(&overlay).unwrap();
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
         {
-            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            let _ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             fs::write(overlay.join("new.txt"), b"hello zip commit\n").unwrap();
         }
 
@@ -9541,7 +10431,7 @@ mod tests {
         fs::create_dir_all(&overlay).unwrap();
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
         {
-            let ov = WriteOverlay::new(base, &overlay).unwrap();
+            let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             // Replace mut.txt via overlay file (also marks delete+append on commit walk)
             fs::write(overlay.join("mut.txt"), b"new mut\n").unwrap();
             // Delete gone.txt in overlay DB (base would have had it)
@@ -9628,7 +10518,7 @@ mod tests {
         // Create hidden DB so schema exists (optional for append-only)
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
         {
-            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            let _ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             fs::write(overlay.join("new.txt"), b"hello commit\n").unwrap();
             // Drop overlay so exclusive SQLite lock is released before commit.
         }
@@ -9682,7 +10572,7 @@ mod tests {
         fs::create_dir_all(&overlay).unwrap();
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
         {
-            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            let _ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             fs::write(overlay.join("new.txt"), b"hello gzip commit\n").unwrap();
         }
 
@@ -9803,7 +10693,7 @@ mod tests {
                 open_uncompressed_tar_base(&archive, false)
             };
             let old = base.lookup("/last", 0).unwrap();
-            let mut ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+            let mut ov = WriteOverlay::new_for_tests(base, dir.path().join("ov")).unwrap();
             ov.set_commit_mode(CommitMode::Append);
             fs::write(ov.root().join("new"), b"new").unwrap();
             assert!(ov
@@ -9816,6 +10706,36 @@ mod tests {
         }
     }
 
+    /// Regression (R7-B3): a `--commit-manifest` (provenance) append whose
+    /// baseline restamp fails after the splice returned `Committed` without the
+    /// ordinary append branches' handling: the interval stayed on and the
+    /// mounted source kept serving the pre-splice frame map over the new bytes.
+    #[cfg(unix)]
+    #[test]
+    fn regression_provenance_append_committed_refuses_stale_frame_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.zst");
+        append_fixture(&archive, true);
+        let base = open_tar_zst_base(&archive, false);
+        let old = base.lookup("/last", 0).unwrap();
+        let mut ov = WriteOverlay::new_for_tests(base, dir.path().join("ov")).unwrap();
+        ov.set_commit_mode(CommitMode::Append);
+        ov.set_manifest_hashes(Some("new".into()));
+        fs::write(ov.root().join("new"), b"new").unwrap();
+        // An open transaction on the mount's connection makes the restamp's
+        // BEGIN IMMEDIATE fail after the splice.
+        ov.db.lock().unwrap().execute_batch("BEGIN").unwrap();
+        let err = ov
+            .commit_live(&archive, |_| panic!("a committed splice must not reopen"))
+            .unwrap_err();
+        assert!(matches!(err, OverlayError::Committed(_)), "{err}");
+        assert!(ov.interval_disabled(), "interval commits stay enabled");
+        assert!(
+            ov.open(&old, 0).is_err(),
+            "stale pre-splice frame map still served"
+        );
+    }
+
     /// Regression: recovery of a failed append keeps the old live index readable.
     #[cfg(unix)]
     #[test]
@@ -9824,7 +10744,7 @@ mod tests {
         let archive = dir.path().join("a.tar");
         let (_, last) = append_fixture(&archive, false);
         let base = open_uncompressed_tar_base(&archive, false);
-        let ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, dir.path().join("ov")).unwrap();
         let offset = fs::metadata(&archive).unwrap().len() - 1024;
         let mut suffix = tempfile::tempfile().unwrap();
         suffix.write_all(b"partial new member").unwrap();
@@ -9843,7 +10763,7 @@ mod tests {
             )
             .is_err()
         );
-        ov.recover_failed_append(&archive, &"ENOSPC").unwrap();
+        ov.recover_member_journal(&archive).unwrap();
         assert!(!ov.interval_disabled());
         assert_eq!(read_member(&ov, "/last"), last);
     }
@@ -9857,7 +10777,7 @@ mod tests {
         append_fixture(&archive, false);
         let base = open_uncompressed_tar_base(&archive, false);
         let old = base.lookup("/last", 0).unwrap();
-        let ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, dir.path().join("ov")).unwrap();
         let mut suffix = tempfile::tempfile().unwrap();
         suffix.write_all(b"new").unwrap();
         assert!(
@@ -9888,21 +10808,20 @@ mod tests {
         assert!(ov.open(&old, 0).is_err());
     }
 
-    /// Regression: a touch during suffix staging must retry, or fall back to copy in auto.
+    /// Regression: a touch during suffix staging must refuse and retry, in
+    /// `append` and in `auto` alike. R7-D1: `auto` used to copy the touched
+    /// file, a file the commit gate never judged; the archive changed since
+    /// the gate, so no copy runs and the next commit appends in place.
     #[cfg(unix)]
     #[test]
-    fn live_commit_append_stale_preparation_retries_and_auto_copies() {
+    fn live_commit_append_stale_preparation_retries_without_a_copy() {
         use std::os::unix::fs::MetadataExt;
         for mode in [CommitMode::Append, CommitMode::Auto] {
-            if mode == CommitMode::Auto && ensure_gnu_tar().is_err() {
-                eprintln!("skip: GNU tar unavailable for auto copy fallback");
-                continue;
-            }
             let dir = tempfile::tempdir().unwrap();
             let archive = dir.path().join("a.tar");
             append_fixture(&archive, false);
             let before = fs::metadata(&archive).unwrap().ino();
-            let mut ov = WriteOverlay::new(
+            let mut ov = WriteOverlay::new_for_tests(
                 open_uncompressed_tar_base(&archive, false),
                 dir.path().join("ov"),
             )
@@ -9911,17 +10830,13 @@ mod tests {
             fs::write(ov.root().join("new"), b"new").unwrap();
             APPEND_PREPARE_TOUCH.set(true);
             let result = ov.commit_live(&archive, |p| Ok(open_uncompressed_tar_base(p, false)));
-            assert!(!ov.interval_disabled());
-            if mode == CommitMode::Append {
-                assert!(result.is_err());
-                assert!(ov
-                    .commit_live(&archive, |p| Ok(open_uncompressed_tar_base(p, false)))
-                    .unwrap());
-                assert_eq!(before, fs::metadata(&archive).unwrap().ino());
-            } else {
-                assert!(result.unwrap());
-                assert_ne!(before, fs::metadata(&archive).unwrap().ino());
-            }
+            assert!(!ov.interval_disabled(), "{mode:?}");
+            assert!(result.is_err(), "{mode:?}");
+            assert_eq!(before, fs::metadata(&archive).unwrap().ino(), "{mode:?}");
+            assert!(ov
+                .commit_live(&archive, |p| Ok(open_uncompressed_tar_base(p, false)))
+                .unwrap());
+            assert_eq!(before, fs::metadata(&archive).unwrap().ino(), "{mode:?}");
             assert_eq!(read_member(&ov, "/new"), b"new");
         }
     }
@@ -9933,7 +10848,7 @@ mod tests {
         let archive = dir.path().join("a.tar");
         append_fixture(&archive, false);
         let good = fs::read(&archive).unwrap();
-        let mut ov = WriteOverlay::new(
+        let mut ov = WriteOverlay::new_for_tests(
             open_uncompressed_tar_base(&archive, false),
             dir.path().join("ov"),
         )
@@ -11165,7 +12080,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(OneFile) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         assert!(!ov.is_deleted("/keep.txt"));
         assert!(ov.lookup("/keep.txt", 0).is_some());
         for _ in 0..64 {
@@ -11181,7 +12096,7 @@ mod tests {
         );
         drop(ov);
 
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert!(
             ov.is_deleted("/keep.txt"),
             "reopen must load tombstones from the overlay database"
@@ -11251,7 +12166,8 @@ mod tests {
     fn overlay_with_keep_tombstone() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(KeepBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(KeepBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         ov.unlink("/keep.txt").unwrap();
         assert!(ov.lookup("/keep.txt", 0).is_none());
         drop(ov);
@@ -11259,7 +12175,7 @@ mod tests {
     }
 
     fn reopen_keep_overlay(overlay: &Path) -> Result<WriteOverlay> {
-        WriteOverlay::new(Arc::new(KeepBase) as Arc<dyn MountSource>, overlay)
+        WriteOverlay::new_for_tests(Arc::new(KeepBase) as Arc<dyn MountSource>, overlay)
     }
 
     /// Remove the overlay database by exact name (plus SQLite sidecars), never
@@ -11520,7 +12436,7 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let ov2 = WriteOverlay::new(Arc::new(DbNamedBase), dir.path().join("o")).unwrap();
+        let ov2 = WriteOverlay::new_for_tests(Arc::new(DbNamedBase), dir.path().join("o")).unwrap();
         // Remove the host DB so only the base member could answer.
         fs::remove_file(dir.path().join("o").join(HIDDEN_DB)).unwrap();
         assert!(ov2.lookup("/.ratarmount.overlay.sqlite", 0).is_none());
@@ -11734,6 +12650,41 @@ mod tests {
         assert!(msg_of(reopen_keep_overlay(&overlay)).contains("is missing"));
     }
 
+    /// Regression (r17 skeptic #2, R7-E2): a dangling symlink at the
+    /// database path was read as "no database" by `fs::metadata`. B8: a first
+    /// open (no marker yet) created a fresh database THROUGH the symlink,
+    /// outside the overlay. B7: the offline commit plan was built without the
+    /// tombstones. Both refuse; nothing is created at the target. A symlink
+    /// to a regular file stays supported (see the test below).
+    #[cfg(unix)]
+    #[test]
+    fn regression_dangling_db_symlink_is_not_an_absent_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut failed = Vec::new();
+        for site in ["B8 WriteOverlay::open", "B7 collect_overlay_commit_plan"] {
+            let overlay = dir.path().join(site.split(' ').next().unwrap());
+            fs::create_dir(&overlay).unwrap();
+            let target = dir.path().join(format!(
+                "{}-nowhere.sqlite",
+                site.split(' ').next().unwrap()
+            ));
+            std::os::unix::fs::symlink(&target, overlay.join(HIDDEN_DB)).unwrap();
+            let refused = if site.starts_with("B8") {
+                WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+                    .is_err()
+            } else {
+                collect_overlay_commit_plan(&overlay).is_err()
+            };
+            if !refused || target.exists() {
+                failed.push(format!(
+                    "{site}: refused={refused} created={}",
+                    target.exists()
+                ));
+            }
+        }
+        assert!(failed.is_empty(), "failed rows: {failed:?}");
+    }
+
     /// Regression: the marker must not be created through a planted symlink.
     #[test]
     fn overlay_marker_symlink_is_refused_and_not_followed() {
@@ -11745,7 +12696,8 @@ mod tests {
             let overlay = dir.path().join(name);
             fs::create_dir(&overlay).unwrap();
             std::os::unix::fs::symlink(target, overlay.join(OVERLAY_MARKER)).unwrap();
-            let r = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay);
+            let r =
+                WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay);
             assert!(r.is_err(), "symlinked marker must be refused");
         }
         assert_eq!(fs::read(&outside).unwrap(), b"secret");
@@ -11848,7 +12800,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
 
         let sub = ov.root.join("sub");
         fs::create_dir_all(sub.join("nested")).unwrap();
@@ -11949,7 +12901,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, overlay.join("outdir")).unwrap();
 
         let base = Arc::new(NullBase) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
 
         // create_file through file symlink must fail and not clobber outside content.
         let err = ov.create_file("/escape", 0o644);
@@ -12077,8 +13029,9 @@ mod tests {
         let (dir, counted, _a, b) = zip_counted_base();
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(Arc::clone(&counted) as Arc<dyn MountSource>, &overlay)
-            .expect("overlay");
+        let ov =
+            WriteOverlay::new_for_tests(Arc::clone(&counted) as Arc<dyn MountSource>, &overlay)
+                .expect("overlay");
 
         ov.unlink("/a.txt").expect("delete base a.txt");
         let fd = ov.create_file("/c.txt", 0o644).expect("overlay create");
@@ -12115,8 +13068,9 @@ mod tests {
         let (dir, counted, a, _b) = zip_counted_base();
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(Arc::clone(&counted) as Arc<dyn MountSource>, &overlay)
-            .expect("overlay");
+        let ov =
+            WriteOverlay::new_for_tests(Arc::clone(&counted) as Arc<dyn MountSource>, &overlay)
+                .expect("overlay");
 
         assert!(
             !a.is_empty(),
@@ -12256,7 +13210,8 @@ mod tests {
         let stacked = crate::FileVersionLayer::new(Arc::new(WithGeneratedReg {
             inner: Arc::new(tar) as Arc<dyn MountSource>,
         }));
-        let ov = WriteOverlay::new(Arc::new(stacked) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(stacked) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         let z_fi = ov.current_base().lookup("/z.txt", 0).expect("z.txt");
         assert!(
             matches!(z_fi.userdata.last(), Some(UserData::Other(s)) if s == "versionlayer:file"),
@@ -12351,7 +13306,8 @@ mod tests {
 
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(Arc::new(tar) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(tar) as Arc<dyn MountSource>, &overlay).unwrap();
         overlay_write_bytes(&ov, "/new.txt", b"overlay-create\n");
         let ov_names = overlay_only_names(&ov);
         assert_eq!(ov_names, vec!["/new.txt".to_string()]);
@@ -12422,7 +13378,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         let fd = ov.create_file("/src.txt", 0o644).unwrap();
         unsafe {
             libc::close(fd);
@@ -12457,7 +13414,8 @@ mod tests {
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
         let base = crate::folder::FolderMountSource::new(&base_dir).unwrap();
-        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
 
         ov.rename("/link", "/link2").expect("rename symlink");
         let meta = fs::symlink_metadata(overlay.join("link2")).expect("overlay link2");
@@ -12491,7 +13449,8 @@ mod tests {
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
         let base = crate::folder::FolderMountSource::new(&base_dir).unwrap();
-        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
 
         let err = ov.rmdir("/full").expect_err("non-empty base dir");
         assert!(
@@ -12560,7 +13519,8 @@ mod tests {
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
         let ov =
-            WriteOverlay::new(Arc::new(FailOpenBase) as Arc<dyn MountSource>, &overlay).unwrap();
+            WriteOverlay::new_for_tests(Arc::new(FailOpenBase) as Arc<dyn MountSource>, &overlay)
+                .unwrap();
         let fd = ov.create_file("/dst", 0o644).unwrap();
         unsafe {
             libc::close(fd);
@@ -12616,7 +13576,8 @@ mod tests {
             &mut materialised,
         )
         .expect("index tar");
-        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
         fs::write(overlay.join("new.txt"), fs::read(&new_payload).unwrap()).unwrap();
         fs::write(overlay.join("keep.txt"), b"replaced-body\n").unwrap();
         ov.unlink("/gone.txt").expect("mark gone deleted");
@@ -13087,7 +14048,8 @@ mod tests {
             &mut materialised,
         )
         .expect("index tar");
-        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
         fs::write(overlay.join("new.txt"), b"appended\n").unwrap();
         match ov.commit_atomic(&tar) {
             Ok(true) => {}
@@ -13135,7 +14097,7 @@ mod tests {
         );
     }
 
-    fn generated_payload(tag: &str) -> Vec<u8> {
+    pub(crate) fn generated_payload(tag: &str) -> Vec<u8> {
         format!("p-{tag}-{}\n", std::process::id()).into_bytes()
     }
 
@@ -13164,9 +14126,11 @@ mod tests {
                 .unwrap();
             }
             let root = dir.path().join("ov");
-            let ov =
-                WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-                    .unwrap();
+            let ov = WriteOverlay::new_for_tests(
+                Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+                &root,
+            )
+            .unwrap();
             let fd = ov.create_file("/new", 0o644).unwrap();
             ov.close_overlay_fd(fd);
             fs::write(root.join("new"), b"new payload").unwrap();
@@ -13233,7 +14197,7 @@ mod tests {
                     });
                     append_fixture(&archive, compressed);
                     let root = alias.join("ov");
-                    let ov = WriteOverlay::new(
+                    let ov = WriteOverlay::new_for_tests(
                         Arc::new(provenance_base(&archive, "utf-8").unwrap()),
                         &root,
                     )
@@ -13280,7 +14244,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("base.tar");
         provenance_fixture(&archive, false);
-        let ov = WriteOverlay::new(
+        let ov = WriteOverlay::new_for_tests(
             Arc::new(provenance_base(&archive, "utf-8").unwrap()),
             dir.path().join("ov"),
         )
@@ -13306,8 +14270,11 @@ mod tests {
         let archive = dir.path().join("base.tar");
         fs::write(&archive, pack_tar(&[ustar_file("old", b"old")])).unwrap();
         let root = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-            .unwrap();
+        let ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         put_overlay_bytes(&ov, "/new", b"new payload");
         drop(ov);
         let mut plan = collect_overlay_commit_plan(&root).unwrap();
@@ -13320,6 +14287,8 @@ mod tests {
             "utf-8",
             CommitMode::Copy,
             Some(&mut hashes),
+            &crate::journal_recovery::Rows::None,
+            &fs::metadata(&archive).unwrap(),
         )
         .unwrap();
         let expected = ratarmount_index::sha256_hex_stream(&mut &b"new payload"[..]).unwrap();
@@ -13328,9 +14297,11 @@ mod tests {
         write_commit_manifest(&archive, &plan, "utf-8", "new").unwrap();
         let manifest = fs::read_to_string(format!("{}.manifest.jsonl", archive.display())).unwrap();
         assert!(manifest.contains(&expected));
-        let reopened =
-            WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-                .unwrap();
+        let reopened = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         reopened.set_xattr("/new", "user.empty", b"", 1).unwrap();
         assert_eq!(reopened.xattrs_for_path("/new").unwrap()["user.empty"], b"");
     }
@@ -13363,7 +14334,7 @@ mod tests {
             provenance_fixture(&archive, compressed);
             let root = dir.path().join("overlay");
             let base = Arc::new(provenance_base(&archive, "utf-8").unwrap());
-            let ov = WriteOverlay::new(base.clone(), &root).unwrap();
+            let ov = WriteOverlay::new_for_tests(base.clone(), &root).unwrap();
             let fd = ov.create_file("/built", 0o600).unwrap();
             ov.close_overlay_fd(fd);
             let attrs = OverlayMetadata {
@@ -13389,7 +14360,7 @@ mod tests {
                 .collect();
             assert_eq!(modes, [0o751, 0o751]);
             drop(ov);
-            let ov = WriteOverlay::new(base, &root).unwrap();
+            let ov = WriteOverlay::new_for_tests(base, &root).unwrap();
             assert_eq!(ov.lookup("/trace", 0).unwrap().mode & 0o7777, 0o751);
             assert_eq!(overlay_atime(&ov.lookup("/trace", 0).unwrap()), 1234.25);
             // Omitted timestamps are unchanged by a later chmod.
@@ -13422,8 +14393,11 @@ mod tests {
         let archive = dir.path().join("base.tar");
         fs::write(&archive, pack_tar(&[ustar_file("sub/script", b"payload")])).unwrap();
         let root = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-            .unwrap();
+        let ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         ov.set_metadata(
             "/sub/script",
             &OverlayMetadata {
@@ -13484,8 +14458,11 @@ mod tests {
         )
         .unwrap();
         let root = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-            .unwrap();
+        let ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         ov.set_metadata(
             "/archive-link",
             &OverlayMetadata {
@@ -13542,8 +14519,11 @@ mod tests {
         let archive = dir.path().join("base.tar");
         provenance_fixture(&archive, false);
         let root = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-            .unwrap();
+        let ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         ov.set_metadata(
             "/trace",
             &OverlayMetadata {
@@ -13582,9 +14562,11 @@ mod tests {
             let archive = dir.path().join("base.tar");
             provenance_fixture(&archive, false);
             let root = dir.path().join("ov");
-            let mut ov =
-                WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-                    .unwrap();
+            let mut ov = WriteOverlay::new_for_tests(
+                Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+                &root,
+            )
+            .unwrap();
             if policy {
                 ov.set_policy(Some(Arc::new(CountingPolicy::new(u64::MAX))));
             }
@@ -13629,7 +14611,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("base.tar");
         provenance_fixture(&archive, false);
-        let mut ov = WriteOverlay::new(
+        let mut ov = WriteOverlay::new_for_tests(
             Arc::new(provenance_base(&archive, "utf-8").unwrap()),
             dir.path().join("ov"),
         )
@@ -13687,7 +14669,7 @@ mod tests {
         let archive = dir.path().join("base.tar");
         provenance_fixture(&archive, false);
         let base = Arc::new(provenance_base(&archive, "utf-8").unwrap());
-        let mut ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+        let mut ov = WriteOverlay::new_for_tests(base, dir.path().join("ov")).unwrap();
         let error = |r: Result<()>| match r.unwrap_err() {
             OverlayError::Io(e) => e.raw_os_error().unwrap_or_else(|| {
                 assert_eq!(e.kind(), io::ErrorKind::ReadOnlyFilesystem);
@@ -13758,22 +14740,25 @@ mod tests {
         let root = dir.path().join("ov");
         let base = Arc::new(provenance_base(&archive, "utf-8").unwrap());
         {
-            let ov = WriteOverlay::new(base.clone(), &root).unwrap();
+            let ov = WriteOverlay::new_for_tests(base.clone(), &root).unwrap();
             ov.unlink("/trace").unwrap();
         }
         {
             let db = Connection::open(root.join(HIDDEN_DB)).unwrap();
             db.execute("DROP TABLE xattrs", []).unwrap();
         }
-        let ov = WriteOverlay::new(base, &root).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &root).unwrap();
         assert!(ov.lookup("/trace", 0).is_none());
         assert!(root.join(OVERLAY_MARKER).exists());
         let fd = ov.create_file("/new", 0o644).unwrap();
         ov.close_overlay_fd(fd);
         ov.set_xattr("/new", "user.test", b"yes", 0).unwrap();
         drop(ov);
-        let ov = WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-            .unwrap();
+        let ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         assert_eq!(ov.xattrs_for_path("/new").unwrap()["user.test"], b"yes");
         assert!(ov.is_deleted("/trace"));
     }
@@ -13793,9 +14778,11 @@ mod tests {
                 provenance_fixture(&archive, compressed);
                 let sidecar = append_index(&archive, compressed);
                 let root = dir.path().join("ov");
-                let ov =
-                    WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-                        .unwrap();
+                let ov = WriteOverlay::new_for_tests(
+                    Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+                    &root,
+                )
+                .unwrap();
                 ov.set_xattr("/trace", "user.train_ok", b"false", 0)
                     .unwrap();
                 ov.remove_xattr("/trace", "user.teacher").unwrap();
@@ -13862,9 +14849,11 @@ mod tests {
         let archive = dir.path().join("base.tar.zst");
         provenance_fixture(&archive, true);
         let root = dir.path().join("ov");
-        let mut ov =
-            WriteOverlay::new(Arc::new(provenance_base(&archive, "utf-8").unwrap()), &root)
-                .unwrap();
+        let mut ov = WriteOverlay::new_for_tests(
+            Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+            &root,
+        )
+        .unwrap();
         ov.set_manifest_hashes(Some("new".into()));
         ov.set_xattr("/trace", "user.train_ok", b"false", 0)
             .unwrap();
@@ -13894,7 +14883,7 @@ mod tests {
         assert!(ov.xattrs_for_path("/moved").unwrap().is_empty());
     }
 
-    fn ustar_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
+    pub(crate) fn ustar_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
             xattrs: &[],
             path,
@@ -13931,7 +14920,7 @@ mod tests {
         buf
     }
 
-    fn concat_zstd_frames(plains: &[&[u8]], with_seek_table: bool) -> Vec<u8> {
+    pub(crate) fn concat_zstd_frames(plains: &[&[u8]], with_seek_table: bool) -> Vec<u8> {
         let mut out = Vec::new();
         let mut entries = Vec::new();
         for p in plains {
@@ -13946,7 +14935,7 @@ mod tests {
     }
 
     /// One uncompressed TAR split across two zstd frames (EOF only in the last frame).
-    fn write_split_tar_zst(
+    pub(crate) fn write_split_tar_zst(
         path: &Path,
         first: &[UstarMember<'_>],
         last: &[UstarMember<'_>],
@@ -13968,7 +14957,7 @@ mod tests {
         fs::write(path, concat_zstd_frames(&refs, false)).unwrap();
     }
 
-    fn reopen_tar_zst(
+    pub(crate) fn reopen_tar_zst(
         path: &Path,
         ignore_zeros: bool,
     ) -> std::result::Result<Arc<dyn MountSource>, OverlayError> {
@@ -14074,7 +15063,7 @@ mod tests {
 
     fn overlay_with_base(base: Arc<dyn MountSource>, overlay: &Path) -> WriteOverlay {
         fs::create_dir_all(overlay).unwrap();
-        WriteOverlay::new(base, overlay).unwrap()
+        WriteOverlay::new_for_tests(base, overlay).unwrap()
     }
 
     fn seek_table_footer_present(bytes: &[u8]) -> bool {
@@ -15690,7 +16679,8 @@ mod tests {
         let tar = make_tiny_tar(dir.path(), &[("old.txt", b"keep\n")]);
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(open_uncompressed_tar_base(&tar, false), &overlay).unwrap();
+        let ov =
+            WriteOverlay::new_for_tests(open_uncompressed_tar_base(&tar, false), &overlay).unwrap();
         fs::write(overlay.join("new.txt"), b"appended\n").unwrap();
         match ov.commit_atomic(&tar) {
             Ok(true) => {}
@@ -16639,7 +17629,8 @@ mod tests {
     fn rename_over_overlay_archive_and_tombstone() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/final", b"old-dest");
         put_overlay_bytes(&ov, "/swap", b"new-src");
         let parked = ov
@@ -16678,7 +17669,7 @@ mod tests {
             ("/src", b"archive-src"),
             ("/final", b"archive-final"),
         ])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         assert!(!is_overlay_fi(&ov.lookup("/final", 0).unwrap()));
         let parked = ov.rename_parked("/src", "/final").expect("archive rename");
         assert!(parked.is_none(), "archive-only target has no host inode");
@@ -16693,7 +17684,7 @@ mod tests {
         assert_eq!(deleted_flag(&ov, "/src"), Some(1));
         assert_eq!(deleted_flag(&ov, "/final"), Some(0));
         drop(ov);
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert!(
             ov.is_deleted("/src"),
             "persisted tombstone hides the archive source"
@@ -16704,7 +17695,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/final", b"archived")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.unlink("/final").unwrap();
         assert!(ov.lookup("/final", 0).is_none());
         assert!(ov.is_deleted("/final"));
@@ -16746,7 +17737,8 @@ mod tests {
     fn rename_visible_lookup_never_none() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/final", b"seed");
         let nones = AtomicU64::new(0);
         let samples = AtomicU64::new(0);
@@ -16806,7 +17798,7 @@ mod tests {
     fn rename_tombstone_lookup_none_to_some_once() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(
+        let ov = WriteOverlay::new_for_tests(
             Arc::new(MemBase::with(&[("/final", b"archived")])) as Arc<dyn MountSource>,
             &overlay,
         )
@@ -16881,7 +17873,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/src", b"archive-src")])) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+        let ov = Arc::new(WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap());
         put_overlay_bytes(&ov, "/dst", b"old-dest");
         let probe = Arc::downgrade(&ov);
         let host = overlay.clone();
@@ -16916,7 +17908,7 @@ mod tests {
         );
         assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"archive-src");
         drop(ov);
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         let src = ov
             .lookup("/src", 0)
             .expect("duplicate archive member accepted");
@@ -16928,7 +17920,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+                .unwrap(),
         );
         put_overlay_bytes(&ov, "/dst", b"old-dest");
         put_overlay_bytes(&ov, "/src", b"new-src");
@@ -16952,7 +17945,8 @@ mod tests {
         assert_eq!(deleted_flag(&ov, "/src"), Some(0), "stale present row kept");
         assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new-src");
         drop(ov);
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         assert!(ov.lookup("/src", 0).is_none());
         assert_eq!(deleted_flag(&ov, "/src"), Some(0));
         assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new-src");
@@ -16961,7 +17955,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/dst", b"archived")])) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+        let ov = Arc::new(WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap());
         ov.unlink("/dst").unwrap();
         put_overlay_bytes(&ov, "/src", b"replacement");
         let probe = Arc::downgrade(&ov);
@@ -16982,7 +17976,7 @@ mod tests {
         assert!(is_overlay_fi(&ov.lookup("/dst", 0).unwrap()));
         assert_eq!(deleted_flag(&ov, "/dst"), Some(1), "db row still deleted");
         drop(ov);
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert!(!ov.is_deleted("/dst"), "open clears the tombstone");
         assert_eq!(deleted_flag(&ov, "/dst"), Some(0));
         assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"replacement");
@@ -17000,7 +17994,7 @@ mod tests {
             ("/keep.txt", b"archived-keep"),
             ("/other.txt", b"archived-other"),
         ])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         ov.unlink("/keep.txt").unwrap();
         ov.unlink("/other.txt").unwrap();
         assert!(ov.is_deleted("/keep.txt"));
@@ -17008,7 +18002,7 @@ mod tests {
         fs::write(overlay.join("keep.txt"), b"hidden-but-committed").unwrap();
         drop(ov);
 
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         assert!(!ov.is_deleted("/keep.txt"));
         assert!(is_overlay_fi(&ov.lookup("/keep.txt", 0).expect("visible")));
         assert_eq!(
@@ -17023,7 +18017,7 @@ mod tests {
         assert!(overlay.join(OVERLAY_MARKER).is_file());
         drop(ov);
 
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert!(!ov.is_deleted("/keep.txt"), "clear was persisted");
         assert!(ov.is_deleted("/other.txt"));
         assert_eq!(
@@ -17045,7 +18039,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with_dir("/sub")) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         ov.rmdir("/sub").expect("tombstone the archive directory");
         assert!(ov.is_deleted("/sub"));
         assert_eq!(deleted_flag(&ov, "/sub"), Some(1));
@@ -17053,7 +18047,7 @@ mod tests {
         fs::create_dir(overlay.join("sub")).unwrap();
         drop(ov);
 
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert!(
             overlay.join("sub").is_dir(),
             "open must not delete the host directory"
@@ -17073,7 +18067,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/src", b"archive-src")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.set_rename_tx_failures(1);
         ov.rename_parked("/src", "/dst")
             .expect("a single transient failure is retried");
@@ -17093,7 +18087,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/src", b"archive-src")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/src", "/dst").expect("rename returns success");
         assert_eq!(ov.pending_row_count(), 1);
@@ -17214,7 +18208,7 @@ mod tests {
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
             as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         // First rename's direct attempts, then the second rename's replay.
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
         ov.rename("/a", "/x").expect("a->x returns success");
@@ -17236,7 +18230,7 @@ mod tests {
 
         ov.set_rename_tx_failures(0);
         drop(ov);
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert_eq!(deleted_flag(&ov, "/a"), Some(1));
         assert_eq!(deleted_flag(&ov, "/x"), Some(1), "/x must stay deleted");
         assert_eq!(deleted_flag(&ov, "/y"), Some(0));
@@ -17259,7 +18253,7 @@ mod tests {
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
             as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(base, &overlay).unwrap());
+        let ov = Arc::new(WriteOverlay::new_for_tests(base, &overlay).unwrap());
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/a", "/x").expect("a->x queued");
         assert_eq!(ov.pending_row_count(), 1);
@@ -17337,7 +18331,7 @@ mod tests {
         let overlay = dir.path().join("ov");
         let base =
             Arc::new(MemBase::with(&[("/a", b"from-a"), ("/z", b"zzz")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/a", "/b").expect("queued");
         assert_eq!(ov.pending_row_count(), 1);
@@ -17363,7 +18357,7 @@ mod tests {
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
             as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap();
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
         ov.rename("/a", "/x").expect("queued");
         ov.unlink("/x").expect("unlink returns success");
@@ -17376,7 +18370,7 @@ mod tests {
         assert!(ov.lookup("/x", 0).is_none(), "memory already hides x");
         ov.set_rename_tx_failures(0);
         drop(ov);
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert_eq!(ov.pending_row_count(), 0);
         assert_eq!(deleted_flag(&ov, "/a"), Some(1));
         assert_eq!(deleted_flag(&ov, "/x"), Some(1));
@@ -17398,7 +18392,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/a", "/b").expect("queued");
         assert_eq!(ov.pending_row_count(), 1);
@@ -17539,7 +18533,7 @@ mod tests {
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
             as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         // Direct attempts plus Drop's three replay attempts.
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
         ov.rename("/a", "/x").expect("queued");
@@ -17587,7 +18581,7 @@ mod tests {
             let overlay = dir.path().join("ov");
             let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
                 as Arc<dyn MountSource>;
-            let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+            let ov = Arc::new(WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap());
             let entered = Arc::new(AtomicBool::new(false));
             let sampled = Arc::new(AtomicBool::new(false));
             let lock_was_held = Arc::new(AtomicBool::new(false));
@@ -17656,7 +18650,7 @@ mod tests {
             );
             assert_eq!(deleted_flag(&ov, "/y"), Some(0), "trial {trial}");
             drop(ov);
-            let ov = WriteOverlay::new(base, &overlay).unwrap();
+            let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
             assert_eq!(deleted_flag(&ov, "/a"), Some(1), "trial {trial}");
             assert_eq!(
                 deleted_flag(&ov, "/x"),
@@ -17681,7 +18675,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"from-a")])) as Arc<dyn MountSource>;
-        let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+        let ov = Arc::new(WriteOverlay::new_for_tests(Arc::clone(&base), &overlay).unwrap());
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/a", "/b").expect("queued");
         assert_eq!(ov.pending_row_count(), 1);
@@ -17710,7 +18704,7 @@ mod tests {
         let ov = Arc::try_unwrap(ov).unwrap_or_else(|_| panic!("only the test holds the overlay"));
         let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(ov)));
         assert!(dropped.is_ok(), "drop panicked on a poisoned overlay lock");
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         assert_eq!(deleted_flag(&ov, "/a"), Some(1), "drop replay must land");
         assert_eq!(deleted_flag(&ov, "/b"), Some(0));
         assert!(ov.lookup("/a", 0).is_none());
@@ -17723,7 +18717,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let base = Arc::new(MemBase::with(&[("/a", b"archive-a")])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
         ov.rename("/a", "/b").expect("queued");
         assert_eq!(ov.pending_row_count(), 1);
@@ -17763,7 +18757,7 @@ mod tests {
             ("/still-hidden", b"stay"),
             ("/reexposed", b"old"),
         ])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         put_overlay_bytes(&ov, "/fresh", b"new-bytes");
         ov.set_rename_tx_failures(20);
         ov.unlink("/still-hidden").expect("queue still-hidden");
@@ -17795,7 +18789,7 @@ mod tests {
             ("/already", b"gone"),
             ("/still-hidden", b"stay"),
         ])) as Arc<dyn MountSource>;
-        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
         ov.unlink("/already").expect("sql tombstone");
         assert_eq!(deleted_flag(&ov, "/already"), Some(1));
         ov.set_rename_tx_failures(20);
@@ -17819,7 +18813,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/dst", b"old-mode");
         fs::set_permissions(overlay.join("dst"), fs::Permissions::from_mode(0o000)).unwrap();
         let old_ino = host_ino(&overlay.join("dst"));
@@ -17862,7 +18857,8 @@ mod tests {
     fn park_fstat_old_inode() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/dst", b"old-inode");
         put_overlay_bytes(&ov, "/src", b"new-inode");
         let old_ino = host_ino(&overlay.join("dst"));
@@ -17880,7 +18876,8 @@ mod tests {
     fn park_symlink_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         ov.create_symlink("/link", "old-target").unwrap();
         put_overlay_bytes(&ov, "/src", b"file");
         let parked = ov
@@ -17903,7 +18900,8 @@ mod tests {
     fn plain_rename_and_unlink_do_not_park() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/dst", b"old-dst");
         put_overlay_bytes(&ov, "/src", b"new-src");
         let hook_calls = Arc::new(AtomicU64::new(0));
@@ -17936,7 +18934,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let overlay = dir.path().join("ov");
             let ov =
-                WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+                WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+                    .unwrap();
             put_overlay_bytes(&ov, "/dst", b"keep-dst");
             put_overlay_bytes(&ov, "/src", b"keep-src");
             ov.set_park_open_hook(Some(Box::new(move || {
@@ -17978,7 +18977,8 @@ mod tests {
     fn rename_before_tx_hook_is_one_shot() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/dst", b"old");
         put_overlay_bytes(&ov, "/src", b"new");
         let calls = Arc::new(AtomicU64::new(0));
@@ -18036,7 +19036,8 @@ mod tests {
     fn park_open_eacces_is_metadata_only() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
-        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+            .unwrap();
         put_overlay_bytes(&ov, "/dst", b"old-dst");
         put_overlay_bytes(&ov, "/src", b"new-src");
         let dst_before = ov.lookup("/dst", 0).expect("dst metadata");
@@ -18082,7 +19083,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+            WriteOverlay::new_for_tests(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay)
+                .unwrap(),
         );
         put_overlay_bytes(&ov, "/dst", b"old");
         put_overlay_bytes(&ov, "/src", b"new");
@@ -18108,5 +19110,148 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+    #[test]
+    fn regression_oplog_meta_value_reads_the_exclusively_held_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay =
+            WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[("/base", b"data")])), dir.path())
+                .unwrap();
+        assert!(overlay.meta_value("journal_path").unwrap().is_none());
+        overlay.set_meta("journal_path", "/trace.jsonl").unwrap();
+        assert_eq!(
+            overlay.meta_value("journal_path").unwrap().as_deref(),
+            Some("/trace.jsonl")
+        );
+        assert_eq!(
+            overlay.base_serving_layer("/base"),
+            Some(crate::LayerIndex::Base)
+        );
+        assert_eq!(overlay.base_serving_layer("/missing"), None);
+    }
+
+    /// Regression (Ilya #2): writes under the virtual `/.ratarmount-control`
+    /// folder landed in the overlay. Reserved only while the control folder is
+    /// served; every entry point refuses with `PermissionDenied`.
+    #[cfg(unix)]
+    #[test]
+    fn regression_control_name_reserved_at_every_entry_point() {
+        type Op = fn(&WriteOverlay, &str) -> io::Result<()>;
+        let ops: Vec<(&str, Op)> = vec![
+            ("create_file", |o, p| {
+                o.create_file(p, 0o644).map(close_fd).map_err(into_io)
+            }),
+            ("open O_CREAT", |o, p| {
+                o.open_overlay_fd_with_mode(p, libc::O_CREAT | libc::O_WRONLY, 0o644)
+                    .map(close_fd)
+                    .map_err(into_io)
+            }),
+            ("open O_TRUNC", |o, p| {
+                o.open_overlay_fd_with_mode(p, libc::O_TRUNC | libc::O_WRONLY, 0o644)
+                    .map(close_fd)
+                    .map_err(into_io)
+            }),
+            ("mkdir", |o, p| o.mkdir(p, 0o755).map_err(into_io)),
+            ("symlink", |o, p| o.create_symlink(p, "t").map_err(into_io)),
+            ("unlink", |o, p| o.unlink(p).map_err(into_io)),
+            ("rmdir", |o, p| o.rmdir(p).map_err(into_io)),
+            ("truncate", |o, p| o.truncate(p, 0).map_err(into_io)),
+            ("rename source", |o, p| {
+                o.rename(p, "/dest").map_err(into_io)
+            }),
+            ("rename dest", |o, p| o.rename("/a", p).map_err(into_io)),
+            ("set_xattr", |o, p| {
+                o.set_xattr(p, "user.k", b"v", 0).map_err(into_io)
+            }),
+            ("remove_xattr", |o, p| {
+                o.remove_xattr(p, "user.k").map_err(into_io)
+            }),
+            ("chmod", |o, p| {
+                let m = OverlayMetadata {
+                    mode: Some(0o600),
+                    ..Default::default()
+                };
+                o.set_attributes(p, None, &m).map_err(into_io)
+            }),
+            ("utimens", |o, p| {
+                let m = OverlayMetadata {
+                    mtime: Some(5.0),
+                    ..Default::default()
+                };
+                o.set_attributes(p, None, &m).map_err(into_io)
+            }),
+            ("set_metadata", |o, p| {
+                let m = OverlayMetadata {
+                    mode: Some(0o600),
+                    ..Default::default()
+                };
+                o.set_metadata(p, &m).map_err(into_io)
+            }),
+            ("set_attributes size", |o, p| {
+                o.set_attributes(p, Some(0), &OverlayMetadata::default())
+                    .map_err(into_io)
+            }),
+        ];
+        fn close_fd(fd: i32) {
+            unsafe { libc::close(fd) };
+        }
+        fn into_io(e: OverlayError) -> io::Error {
+            match e {
+                OverlayError::Io(e) => e,
+                other => io::Error::other(other.to_string()),
+            }
+        }
+        let spellings = [
+            "/.ratarmount-control/x",
+            "./.ratarmount-control/x",
+            "//.ratarmount-control/x",
+            "/a/../.ratarmount-control/x",
+            "/.ratarmount-control",
+        ];
+        // The base already holds the reserved name, for unlink/xattr/chmod/rename-from.
+        let base = || {
+            Arc::new(MemBase::with(&[
+                ("/a", b"a"),
+                ("/.ratarmount-control/x", b"x"),
+                ("/sub/.ratarmount-control/x", b"x"),
+            ])) as Arc<dyn MountSource>
+        };
+        let td = tempfile::tempdir().unwrap();
+        let mut on = WriteOverlay::new_for_tests(base(), td.path()).unwrap();
+        on.set_control_reserved(true);
+        for (name, op) in &ops {
+            for path in spellings {
+                let err = op(&on, path).expect_err(&format!("{name} {path}"));
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::PermissionDenied,
+                    "{name} {path}: {err}"
+                );
+            }
+            // Names that only look similar stay ordinary (the error, if any, is not the refusal).
+            for path in ["/sub/.ratarmount-control/x", "/.ratarmount-controlx"] {
+                if let Err(e) = op(&on, path) {
+                    assert!(
+                        !e.to_string().contains("reserved control folder"),
+                        "{name} {path}: {e}"
+                    );
+                }
+            }
+        }
+        assert!(!td.path().join(".ratarmount-control").exists());
+        // Off (no --control-interface, or --control-socket-only): ordinary names.
+        let td = tempfile::tempdir().unwrap();
+        let off = WriteOverlay::new_for_tests(base(), td.path()).unwrap();
+        off.create_file("/.ratarmount-control/new", 0o644)
+            .map(close_fd)
+            .unwrap();
+        off.mkdir("/.ratarmount-control/d", 0o755).unwrap();
+        off.set_xattr("/.ratarmount-control/x", "user.k", b"v", 0)
+            .unwrap();
+        for path in spellings {
+            assert!(is_control_reserved_path(path), "{path}");
+        }
+        assert!(!is_control_reserved_path("/sub/.ratarmount-control/x"));
+        assert!(!is_control_reserved_path("/.ratarmount-controlx"));
     }
 }

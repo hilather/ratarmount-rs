@@ -4,6 +4,8 @@
 //! does not depend on `ratarmount-formats-tar`. The decoded last-N is
 //! materialized as [`SeekRead`] so the caller does not recopy the suffix.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -125,11 +127,18 @@ where
 
 /// Sibling [`NamedTempFile`] in `path.parent()`, splice, sync, persist.
 ///
-/// On failure before persist the original inode is untouched.
+/// The copy is read only from the file still exactly at `reference` (device,
+/// inode, length, mtime, ctime): the caller's gate snapshot, or the stamp its
+/// own rolled-back attempt left under the lock
+/// ([`crate::commit_journal::ReplaceError::RolledBack`]). It is published only
+/// while the archive is still exactly that stamp with no journal pending,
+/// under its lock ([`crate::commit_journal::guard_copy`]). On failure before
+/// persist the original inode is untouched.
 pub fn splice_zstd_last_frames_replace<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
+    reference: &std::fs::Metadata,
 ) -> Result<SpliceStats>
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
@@ -139,7 +148,17 @@ where
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
+    crate::commit_journal::fault::point("copy source open")?;
     let mut src = File::open(path)?;
+    let source = src.metadata()?;
+    if !crate::commit_journal::same_stamp(reference, &source) {
+        return Err(CompressError::Msg(format!(
+            "{} changed before the copy fallback (it is no longer the file the commit gate \
+             accepted); nothing was published, retry",
+            path.display()
+        )));
+    }
+    crate::commit_journal::fault::point("copy source opened")?;
     let map = scan_zstd_frames(&mut src)?;
     let prefix = map
         .frames
@@ -155,6 +174,8 @@ where
     crate::fastcopy::log_commit_copy(prefix, method);
     let stats = write_zstd_splice_suffix(&mut src, &map, from_idx, transform, tmp.as_file_mut())?;
     tmp.as_file().sync_all()?;
+    let _guard = crate::commit_journal::guard_copy(path, &source)
+        .map_err(|e| CompressError::Msg(e.to_string()))?;
     tmp.persist(path).map_err(|e| {
         CompressError::Msg(format!(
             "Failed to replace '{}' after zstd splice: {}",
@@ -170,12 +191,38 @@ pub fn splice_zstd_last_frames_append<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
+    original: &std::fs::Metadata,
 ) -> Result<SpliceStats>
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
+    splice_zstd_last_frames_append_with(path, from_idx, transform, original, &mut |_| Ok(()))
+}
+
+/// [`splice_zstd_last_frames_append`] with a `before_unlink` hook that runs
+/// under the archive lock with the final stamp, before the journal is
+/// unlinked. `original` is the caller's snapshot of the archive (the file
+/// its gate judged): the source opened here must still be exactly that file,
+/// and the replacement compares it again under the archive lock. A failure
+/// of the journaled replacement is [`CompressError::Replace`].
+pub fn splice_zstd_last_frames_append_with<F>(
+    path: &Path,
+    from_idx: usize,
+    transform: F,
+    original: &std::fs::Metadata,
+    before_unlink: crate::commit_journal::BeforeUnlink,
+) -> Result<SpliceStats>
+where
+    F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
+{
+    crate::commit_journal::fault::check("before splice scan")?;
     let mut src = File::open(path)?;
-    let original = src.metadata()?;
+    let source = src.metadata()?;
+    if !crate::commit_journal::same_stamp(original, &source) {
+        return Err(CompressError::Msg(
+            "archive changed while preparing append; retry with a fresh plan".into(),
+        ));
+    }
     let map = scan_zstd_frames(&mut src)?;
     if map.seek_table.is_none() {
         return Err(CompressError::Msg(
@@ -203,15 +250,21 @@ where
         tail.as_file_mut().rewind()?;
         io::copy(tail.as_file_mut(), tmp.as_file_mut())?;
         tmp.as_file().sync_all()?;
+        // Published only over the file the copy was read from, unchanged and
+        // with no journal pending, under its lock.
+        let _guard = crate::commit_journal::guard_copy(path, &source)
+            .map_err(|e| CompressError::Msg(e.to_string()))?;
         tmp.persist(path).map_err(|e| e.error)?;
         return Ok(stats);
     }
-    crate::commit_journal::replace_suffix_if_unchanged(
+    crate::commit_journal::replace_suffix_if_unchanged_with(
         path,
         stats.prefix_compressed_bytes,
         tail.as_file_mut(),
-        &original,
-    )?;
+        original,
+        before_unlink,
+    )
+    .map_err(CompressError::Replace)?;
     log::info!(
         "commit: prefix {:.1} GiB retained via append",
         stats.prefix_compressed_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -739,8 +792,13 @@ mod tests {
 
         let map = scan_zstd_frames_path(&path).unwrap();
         let from_idx = 1;
-        let stats =
-            splice_zstd_last_frames_replace(&path, from_idx, append_extra(extra.clone())).unwrap();
+        let stats = splice_zstd_last_frames_replace(
+            &path,
+            from_idx,
+            append_extra(extra.clone()),
+            &std::fs::metadata(&path).unwrap(),
+        )
+        .unwrap();
         assert!(stats.wrote_seek_table);
         assert_eq!(
             stats.prefix_compressed_bytes,
@@ -763,7 +821,13 @@ mod tests {
 
         // Bad from_idx must not touch the inode.
         let before_fail = std::fs::read(&path).unwrap();
-        let err = splice_zstd_last_frames_replace(&path, 99, append_extra(extra)).unwrap_err();
+        let err = splice_zstd_last_frames_replace(
+            &path,
+            99,
+            append_extra(extra),
+            &std::fs::metadata(&path).unwrap(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("from_idx"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), before_fail);
     }
@@ -778,15 +842,16 @@ mod tests {
         let path = dir.path().join("transform-err.zst");
         std::fs::write(&path, &src_bytes).unwrap();
 
-        let err = splice_zstd_last_frames_replace(&path, 1, |suffix, _off, _out| {
+        let original = std::fs::metadata(&path).unwrap();
+        let transform = |suffix: &mut dyn SeekRead, _off: u64, _out: &mut dyn Write| {
             let n = io::copy(suffix, &mut io::sink())?;
             assert!(n > 0, "transform must see a non-empty decoded suffix");
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "transform failed after suffix",
             ))
-        })
-        .unwrap_err();
+        };
+        let err = splice_zstd_last_frames_replace(&path, 1, transform, &original).unwrap_err();
         assert!(
             err.to_string().contains("transform failed after suffix"),
             "{err}"

@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ratarmount_compositing::OciImageMountSource;
+use ratarmount_compositing::{OciImageMountSource, ServedKind};
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_index::{
     cache_identity, check_tarstats_matches_remote, hash_hex, invalidate_meta_cache_file,
@@ -18,13 +18,42 @@ use ratarmount_index::{
     TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
 };
 
-use super::{open_from_live_range, open_path};
+use super::{
+    open_from_live_range, open_path, open_path_impl, IndexUsed, LiveRangeOpened, PathOpened,
+};
 
 /// K12: explicit `--index-file` / local folder candidates (including `oci:{digest}`
 /// cache) then GET `{url}.index.ptr` + immutable blob, HTTP `Link` on archive HEAD,
 /// http(s) well-known sibling GET, S3/GCS/Azure well-known sibling GET, OCI
 /// referrer on local miss. Fail-open. Pointer/blob/tarstats failure continues.
 fn apply_remote_index_discovery(
+    input: &str,
+    opts: &mut OpenOptions,
+    recreate: bool,
+    archive_size: u64,
+    oci: Option<(
+        &ratarmount_remote::OciLocation,
+        &ratarmount_remote::OciLayer,
+    )>,
+) -> Result<(), String> {
+    let before = opts.index_file_path.clone();
+    let result = apply_remote_index_discovery_inner(input, opts, recreate, archive_size, oci);
+    // A sidecar installed by discovery changes the index this open uses; the
+    // base-identity token records where it was fetched from (redacted when the
+    // token is minted).
+    if result.is_ok() && opts.index_file_path.is_some() && opts.index_file_path != before {
+        DISCOVERED_INDEX.with(|cell| *cell.borrow_mut() = Some(input.to_owned()));
+    }
+    result
+}
+
+thread_local! {
+    /// The URL a sidecar was discovered from during the current remote open.
+    static DISCOVERED_INDEX: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn apply_remote_index_discovery_inner(
     input: &str,
     opts: &mut OpenOptions,
     recreate: bool,
@@ -67,7 +96,10 @@ fn apply_remote_index_discovery(
                 if drop_stale_local_cache(p, input, archive_size, layer, opts.read_only_index)? {
                     // deleted; continue discovery
                 } else {
-                    log::debug!("local index cache hit; skip remote discovery ({input})");
+                    log::debug!(
+                        "local index cache hit; skip remote discovery ({})",
+                        ratarmount_core::redact_base_url(input)
+                    );
                     return Ok(());
                 }
             }
@@ -110,7 +142,10 @@ fn apply_remote_index_discovery(
                     log::debug!("index sibling unusable: {}", redact_remote_url(&cand));
                 }
             }
-            Err(e) => log::debug!("archive HEAD for index discovery failed: {e}"),
+            Err(e) => log::debug!(
+                "archive HEAD for index discovery failed: {}",
+                redact_err(&e)
+            ),
         }
         return Ok(());
     }
@@ -155,7 +190,7 @@ fn apply_remote_index_discovery(
                 );
             }
             Ok(None) => {}
-            Err(e) => log::debug!("OCI referrer miss: {e}"),
+            Err(e) => log::debug!("OCI referrer miss: {}", redact_err(&e)),
         }
     }
     Ok(())
@@ -308,20 +343,15 @@ enum PointerErr {
     Invalid(String),
 }
 
+/// Same redaction as everything else that prints a remote URL: userinfo,
+/// query (`?sig=`, `X-Amz-Signature`, SAS tokens, passkeys) and fragment go.
 fn redact_remote_url(s: &str) -> String {
-    let Some((scheme, rest)) = s.split_once("://") else {
-        return s.to_string();
-    };
-    let Some(at) = rest.find('@') else {
-        return s.to_string();
-    };
-    let userinfo = &rest[..at];
-    let hostpart = &rest[at + 1..];
-    if let Some((user, _)) = userinfo.split_once(':') {
-        format!("{scheme}://{user}:***@{hostpart}")
-    } else {
-        s.to_string()
-    }
+    ratarmount_core::redact_base_url(s)
+}
+
+/// An error text that may quote a URL (reqwest and HTTP clients do).
+fn redact_err(e: &dyn std::fmt::Display) -> String {
+    ratarmount_core::redact_urls_in_text(&e.to_string())
 }
 
 fn pointer_err_is_miss(msg: &str) -> bool {
@@ -332,15 +362,33 @@ fn pointer_err_is_miss(msg: &str) -> bool {
         || l.contains("empty pointer")
 }
 
-fn log_pointer_err(url: &str, err: PointerErr) {
+/// Level (true = warn) and text of a pointer GET failure; secrets removed.
+fn pointer_err_log(url: &str, err: &PointerErr) -> (bool, String) {
     let url = redact_remote_url(url);
     match err {
-        PointerErr::Miss(e) => {
-            log::debug!("index pointer GET {url}: {e}; continue discovery");
-        }
-        PointerErr::Invalid(e) => {
-            log::warn!("index pointer GET {url}: {e}; continue discovery");
-        }
+        PointerErr::Miss(e) => (
+            false,
+            format!(
+                "index pointer GET {url}: {}; continue discovery",
+                redact_err(e)
+            ),
+        ),
+        PointerErr::Invalid(e) => (
+            true,
+            format!(
+                "index pointer GET {url}: {}; continue discovery",
+                redact_err(e)
+            ),
+        ),
+    }
+}
+
+fn log_pointer_err(url: &str, err: PointerErr) {
+    let (warn, text) = pointer_err_log(url, &err);
+    if warn {
+        log::warn!("{text}");
+    } else {
+        log::debug!("{text}");
     }
 }
 
@@ -517,14 +565,22 @@ fn try_fetch_http_index(
     let wire = match cache.get_or_fetch_path(&identity, None, || fetch_http_index_wire(index_url)) {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
+            log::debug!(
+                "index fetch {}: {}",
+                redact_remote_url(index_url),
+                redact_err(&e)
+            );
             return false;
         }
     };
     let path = match materialize_index_file(&wire) {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
+            log::debug!(
+                "index fetch {}: {}",
+                redact_remote_url(index_url),
+                redact_err(&e)
+            );
             invalidate_meta_cache_identity("http", index_url);
             if !is_meta_cache_path(&wire) {
                 let _ = std::fs::remove_file(&wire);
@@ -576,14 +632,22 @@ fn try_fetch_object_store_index(
     }) {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
+            log::debug!(
+                "index fetch {}: {}",
+                redact_remote_url(index_url),
+                redact_err(&e)
+            );
             return false;
         }
     };
     let path = match materialize_fetched_index(fetched.clone()) {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("index materialize {}: {e}", redact_remote_url(index_url));
+            log::debug!(
+                "index materialize {}: {}",
+                redact_remote_url(index_url),
+                redact_err(&e)
+            );
             invalidate_meta_cache_identity("object-store", index_url);
             return false;
         }
@@ -631,13 +695,16 @@ fn try_install_remote_index(
             return false;
         }
         Err(e) => {
-            log::debug!("remote index open failed: {e}");
+            log::debug!("remote index open failed: {}", redact_err(&e));
             drop_fetched_sidecar(&fetched);
             return false;
         }
     };
     if let Err(e) = check_tarstats_matches_remote(&stored, archive_size, prefix, suffix, full) {
-        log::warn!("remote archive fingerprint mismatch ({e}); cold index");
+        log::warn!(
+            "remote archive fingerprint mismatch ({}); cold index",
+            redact_err(&e)
+        );
         drop_fetched_sidecar(&fetched);
         return false;
     }
@@ -844,8 +911,58 @@ fn smb_live_range_kind(kind: &str) -> bool {
 
 fn smb_unsupported_range_error(input: &str) -> String {
     format!(
-        "SMB Range format unsupported for {input}; 7z, ISO, SquashFS, and pre-ustar tar are not read here (set RATARMOUNT_SMB_USE_SMBCLIENT=1)"
+        "SMB Range format unsupported for {}; 7z, ISO, SquashFS, and pre-ustar tar are not read here (set RATARMOUNT_SMB_USE_SMBCLIENT=1)",
+        ratarmount_core::redact_base_url(input)
     )
+}
+
+/// What a remote open served, for the base-identity token. Every `return Ok`
+/// in this file builds one, so each arm names the kind it served.
+pub(super) struct RemoteOpened {
+    pub path: PathBuf,
+    pub source: Arc<dyn MountSource>,
+    pub kind: ServedKind,
+    /// The source is a plain local path (`file://`), not a fetched copy or a
+    /// remote object.
+    pub local: bool,
+    /// The body was downloaded to a temporary local copy.
+    pub fetched: bool,
+    pub index: IndexUsed,
+}
+
+impl RemoteOpened {
+    fn folder(path: PathBuf, source: Arc<dyn MountSource>) -> Self {
+        Self {
+            path,
+            source,
+            kind: ServedKind::Folder,
+            local: false,
+            fetched: false,
+            index: IndexUsed {
+                location: ratarmount_index::IndexLocation::Memory,
+                discovered_from: None,
+                sidecar_candidate: None,
+            },
+        }
+    }
+
+    fn archive((path, source): LiveRangeOpened) -> Self {
+        Self {
+            kind: ServedKind::Archive,
+            ..Self::folder(path, source)
+        }
+    }
+
+    fn from_path(path: PathBuf, opened: PathOpened, local: bool) -> Self {
+        Self {
+            path,
+            source: opened.source,
+            kind: opened.kind,
+            local,
+            fetched: !local,
+            index: opened.index,
+        }
+    }
 }
 
 /// Materialize a remote URL to a local path and open it.
@@ -854,12 +971,13 @@ pub(super) fn materialize_remote_input(
     opts: &OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+) -> Result<RemoteOpened, String> {
     let remote = ratarmount_remote::resolve_to_local(input).map_err(|e| e.to_string())?;
     let path = remote.path().to_path_buf();
+    let local = matches!(remote, ratarmount_remote::RemoteLocal::Local(_));
     remotes.push(remote);
-    let src = open_path(&path, opts, recreate)?;
-    Ok((path, src))
+    let opened = open_path_impl(&path, opts, recreate, true, &mut false)?;
+    Ok(RemoteOpened::from_path(path, opened, local))
 }
 
 /// Resolve once before probing folder/file shape. All subsequent URLs include the SHA.
@@ -869,9 +987,13 @@ fn open_hf_input(
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
     nested: &mut Option<ratarmount_compositing::OpenNestedReaderFn>,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+) -> Result<RemoteOpened, String> {
     let repo = ratarmount_remote::HfRepo::resolve(input).map_err(|e| e.to_string())?;
-    eprintln!("hf: {input} commit {}", repo.commit);
+    eprintln!(
+        "hf: {} commit {}",
+        ratarmount_core::redact_base_url(input),
+        repo.commit
+    );
     let label = repo.resolve_url(&repo.location.path);
     if let Some(source) = repo.folder().map_err(|e| e.to_string())? {
         *nested = Some(folder_nested_reader_fn(
@@ -879,7 +1001,7 @@ fn open_hf_input(
             opts.clone(),
             recreate,
         ));
-        return Ok((PathBuf::from(label), source));
+        return Ok(RemoteOpened::folder(PathBuf::from(label), source));
     }
     open_hf_file(&repo, opts, recreate, remotes)
 }
@@ -889,7 +1011,7 @@ fn open_hf_file(
     opts: &mut OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+) -> Result<RemoteOpened, String> {
     let label = repo.resolve_url(&repo.location.path);
     let range = repo
         .open_file(&repo.location.path)
@@ -949,13 +1071,13 @@ fn open_hf_file(
             opts.index_file_path = Some(path);
         }
     }
-    Ok((
+    Ok(RemoteOpened::archive((
         path,
         Arc::new(ratarmount_remote::HfMountSource::new(
             source,
             repo.commit.clone(),
         )),
-    ))
+    )))
 }
 
 /// Reuse the HTTP sibling convention and index validation with Hub-only credentials.
@@ -1052,6 +1174,7 @@ pub(super) fn open_remote_input(
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
     open_remote_input_with_nested(input, opts, recreate, remotes, &mut None)
+        .map(|opened| (opened.path, opened.source))
 }
 
 pub(super) fn open_remote_input_with_nested(
@@ -1060,7 +1183,26 @@ pub(super) fn open_remote_input_with_nested(
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
     nested: &mut Option<ratarmount_compositing::OpenNestedReaderFn>,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+) -> Result<RemoteOpened, String> {
+    DISCOVERED_INDEX.with(|cell| *cell.borrow_mut() = None);
+    let mut opened = open_remote_input_inner(input, opts, recreate, remotes, nested)?;
+    // The index this open selected (a local cache or a discovered sidecar).
+    if !opts.index_in_memory && opened.index.location.is_memory() {
+        if let Some(path) = opts.index_file_path.clone() {
+            opened.index.location = ratarmount_index::IndexLocation::Path(path);
+            opened.index.discovered_from = DISCOVERED_INDEX.with(|cell| cell.borrow_mut().take());
+        }
+    }
+    Ok(opened)
+}
+
+fn open_remote_input_inner(
+    input: &str,
+    opts: &mut OpenOptions,
+    recreate: bool,
+    remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
+    nested: &mut Option<ratarmount_compositing::OpenNestedReaderFn>,
+) -> Result<RemoteOpened, String> {
     use ratarmount_remote::{
         open_azure_range, open_ftp_range, open_gcs_range, open_ipfs, open_rclone, open_s3_range,
         resolve_access, RemoteAccess, RemoteHttp,
@@ -1091,7 +1233,7 @@ pub(super) fn open_remote_input_with_nested(
                 },
             )
             .map_err(|e| e.to_string())?;
-            return Ok((
+            return Ok(RemoteOpened::folder(
                 PathBuf::from(format!("torrent:{}", source.infohash())),
                 Arc::new(source),
             ));
@@ -1103,7 +1245,7 @@ pub(super) fn open_remote_input_with_nested(
     if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf-cache") {
         let source =
             ratarmount_remote::HfCacheMountSource::open(input).map_err(|e| e.to_string())?;
-        return Ok((PathBuf::from(input), Arc::new(source)));
+        return Ok(RemoteOpened::folder(PathBuf::from(input), Arc::new(source)));
     }
 
     if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("hf") {
@@ -1125,7 +1267,7 @@ pub(super) fn open_remote_input_with_nested(
                 recreate,
             ));
         }
-        return Ok((PathBuf::from(input), ms));
+        return Ok(RemoteOpened::folder(PathBuf::from(input), ms));
     }
 
     if is_oci_scheme(input) {
@@ -1204,11 +1346,14 @@ pub(super) fn open_remote_input_with_nested(
         if let Some(ms) =
             ratarmount_remote::try_open_smb_folder(input).map_err(|e| e.to_string())?
         {
-            return Ok((PathBuf::from(input), ms));
+            return Ok(RemoteOpened::folder(PathBuf::from(input), ms));
         }
         let mut range = ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())?;
         if !range.uses_ranges() {
-            return Err(format!("SMB Range unavailable for {input}"));
+            return Err(format!(
+                "SMB Range unavailable for {}",
+                ratarmount_core::redact_base_url(input)
+            ));
         }
         let len = range.len();
         // Peek before open_from_live_range. Its unsupported arm logs
@@ -1223,6 +1368,7 @@ pub(super) fn open_remote_input_with_nested(
         return open_from_live_range(range, len, input, opts, recreate, "SMB Range", || {
             ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())
         })?
+        .map(RemoteOpened::archive)
         .ok_or_else(|| smb_unsupported_range_error(input));
     }
 
@@ -1230,7 +1376,10 @@ pub(super) fn open_remote_input_with_nested(
         match open_rclone(input) {
             Ok(handle) => {
                 let len = handle.len();
-                eprintln!("rclone: {input} ({len} bytes, materialized cat)");
+                eprintln!(
+                    "rclone: {} ({len} bytes, materialized cat)",
+                    ratarmount_core::redact_base_url(input)
+                );
                 let input_owned = input.to_string();
                 match open_from_live_range(
                     handle,
@@ -1241,15 +1390,21 @@ pub(super) fn open_remote_input_with_nested(
                     "rclone",
                     move || open_rclone(&input_owned).map_err(|e| e.to_string()),
                 )? {
-                    Some(opened) => return Ok(opened),
+                    Some(opened) => return Ok(RemoteOpened::archive(opened)),
                     None => {
-                        eprintln!("info: rclone format unsupported for {input}; materializing");
+                        eprintln!(
+                            "info: rclone format unsupported for {}; materializing",
+                            ratarmount_core::redact_base_url(input)
+                        );
                         return materialize_remote_input(input, opts, recreate, remotes);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("info: rclone open failed for {input}: {e}; materializing");
+                eprintln!(
+                    "info: rclone open failed for {}: {e}; materializing",
+                    ratarmount_core::redact_base_url(input)
+                );
                 return materialize_remote_input(input, opts, recreate, remotes);
             }
         }
@@ -1265,7 +1420,7 @@ pub(super) fn open_remote_input_with_nested(
                 // Buffered fallback is still Read+Seek-usable for rebuild.
                 ratarmount_remote::open_http_range(&input_owned).map_err(|e| e.to_string())
             })? {
-                Some(opened) => Ok(opened),
+                Some(opened) => Ok(RemoteOpened::archive(opened)),
                 None => materialize_remote_input(input, opts, recreate, remotes),
             }
         }
@@ -1274,14 +1429,15 @@ pub(super) fn open_remote_input_with_nested(
             let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             apply_remote_index_discovery(input, opts, recreate, len, None)?;
             remotes.push(remote);
-            let src = open_path(&path, opts, recreate)?;
-            Ok((path, src))
+            let opened = open_path_impl(&path, opts, recreate, true, &mut false)?;
+            Ok(RemoteOpened::from_path(path, opened, false))
         }
         RemoteAccess::Path(remote) => {
             let path = remote.path().to_path_buf();
+            let local = matches!(remote, ratarmount_remote::RemoteLocal::Local(_));
             remotes.push(remote);
-            let src = open_path(&path, opts, recreate)?;
-            Ok((path, src))
+            let opened = open_path_impl(&path, opts, recreate, true, &mut false)?;
+            Ok(RemoteOpened::from_path(path, opened, local))
         }
     }
 }
@@ -1295,7 +1451,7 @@ fn open_s3_like<R, Reopen>(
     transport: &str,
     opened: ratarmount_remote::Result<R>,
     reopen: Reopen,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String>
+) -> Result<RemoteOpened, String>
 where
     R: Read + Seek + Send + 'static + LiveRange,
     Reopen: FnOnce() -> ratarmount_remote::Result<R>,
@@ -1303,14 +1459,20 @@ where
     match opened {
         Ok(range) if range.live_ranges() => {
             let len = range.body_len();
-            eprintln!("{transport}: {input} ({len} bytes, live Range)");
+            eprintln!(
+                "{transport}: {} ({len} bytes, live Range)",
+                ratarmount_core::redact_base_url(input)
+            );
             apply_remote_index_discovery(input, opts, recreate, len, None)?;
             match open_from_live_range(range, len, input, opts, recreate, transport, || {
                 reopen().map_err(|e| e.to_string())
             })? {
-                Some(opened) => Ok(opened),
+                Some(opened) => Ok(RemoteOpened::archive(opened)),
                 None => {
-                    eprintln!("info: {transport} format unsupported for {input}; materializing");
+                    eprintln!(
+                        "info: {transport} format unsupported for {}; materializing",
+                        ratarmount_core::redact_base_url(input)
+                    );
                     materialize_remote_input(input, opts, recreate, remotes)
                 }
             }
@@ -1318,14 +1480,18 @@ where
         Ok(range) => {
             let len = range.body_len();
             eprintln!(
-                "info: {transport} unavailable for {input} (full body buffered); materializing"
+                "info: {transport} unavailable for {} (full body buffered); materializing",
+                ratarmount_core::redact_base_url(input)
             );
             apply_remote_index_discovery(input, opts, recreate, len, None)?;
             drop(range);
             materialize_remote_input(input, opts, recreate, remotes)
         }
         Err(e) => {
-            eprintln!("info: {transport} open failed for {input}: {e}; materializing");
+            eprintln!(
+                "info: {transport} open failed for {}: {e}; materializing",
+                ratarmount_core::redact_base_url(input)
+            );
             materialize_remote_input(input, opts, recreate, remotes)
         }
     }
@@ -1356,11 +1522,11 @@ impl_live_range!(ratarmount_remote::FtpRangeFile);
 impl_live_range!(ratarmount_remote::IpfsHandle);
 impl_live_range!(ratarmount_remote::SmbRangeFile);
 
-fn open_restic_repo(input: &str) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+fn open_restic_repo(input: &str) -> Result<RemoteOpened, String> {
     let path = ratarmount_formats_restic::parse_restic_url(input).map_err(|e| e.to_string())?;
     let src =
         ratarmount_formats_restic::ResticMountSource::open(&path).map_err(|e| e.to_string())?;
-    Ok((path, Arc::new(src)))
+    Ok(RemoteOpened::folder(path, Arc::new(src)))
 }
 
 fn is_oci_scheme(input: &str) -> bool {
@@ -1371,14 +1537,13 @@ fn is_oci_scheme(input: &str) -> bool {
 }
 
 /// Fetch OCI manifests and open each layer via live Range + overlayfs union.
-fn open_oci_image(
-    input: &str,
-    opts: &OpenOptions,
-    recreate: bool,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+fn open_oci_image(input: &str, opts: &OpenOptions, recreate: bool) -> Result<RemoteOpened, String> {
     let image = ratarmount_remote::fetch_oci_image(input).map_err(|e| e.to_string())?;
     if image.layers.is_empty() {
-        return Err(format!("oci image {input} has no layers"));
+        return Err(format!(
+            "oci image {} has no layers",
+            ratarmount_core::redact_base_url(input)
+        ));
     }
     let mut layers: Vec<Arc<dyn MountSource>> = Vec::with_capacity(image.layers.len());
     for layer in &image.layers {
@@ -1416,7 +1581,7 @@ fn open_oci_image(
         }
     }
     let src = OciImageMountSource::new(layers);
-    Ok((PathBuf::from(input), Arc::new(src)))
+    Ok(RemoteOpened::folder(PathBuf::from(input), Arc::new(src)))
 }
 
 /// F-1 (`s3` / `ssh` / `webdav` / `http`) plus later-scheme folder openers
@@ -1517,12 +1682,16 @@ fn folder_nested_reader_fn(
             }
         };
         match opened {
-            Ok((_, source)) if remotes.is_empty() => Ok(source),
+            Ok(opened) if remotes.is_empty() => Ok(opened.source),
             // Formats requiring materialization retain the normal AutoMount
             // spool owner, whose lifetime is tied to the nested mount.
             Ok(_) => fallback(reader, label, ctx),
             Err(error) => {
-                log::debug!("remote nested opener for {}: {error}", label.display());
+                log::debug!(
+                    "remote nested opener for {}: {}",
+                    label.display(),
+                    redact_err(&error)
+                );
                 fallback(reader, label, ctx)
             }
         }
@@ -2063,6 +2232,203 @@ mod tests {
                 "{requests} requests for {size} bytes"
             );
         }
+    }
+
+    /// R6-1: the HTTP arms report an `Archive` at the typed remote location;
+    /// a body downloaded to a temporary copy is still `Remote` (never the
+    /// temp path) and is flagged as fetched.
+    #[test]
+    fn regression_served_kind_table_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("a.tar");
+        {
+            let members = [ratarmount_formats_tar::UstarMember {
+                path: "f",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: &[],
+            }];
+            ratarmount_formats_tar::write_ustar_members(
+                &mut fs::File::create(&tar_path).unwrap(),
+                &members,
+            )
+            .unwrap();
+        }
+        let bytes = fs::read(&tar_path).unwrap();
+        let http = spawn_index_http("/a.tar", bytes.clone(), Default::default(), None, None);
+        let url = format!("http://{}/a.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_in_memory: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let bundle =
+            super::super::build_mount_source(&[PathBuf::from(&url)], &mut opts, true, false)
+                .unwrap();
+        let served = bundle.served.expect("live Range");
+        assert_eq!(served.kind, ServedKind::Archive);
+        assert_eq!(
+            served.location,
+            Some(ratarmount_compositing::ServedLocation::Remote(url.clone()))
+        );
+        assert!(!served.fetched, "a live Range open fetches no copy");
+
+        // A downloaded body is `Remote(typed)`, never the temp path.
+        let mut remotes = Vec::new();
+        let opened = materialize_remote_input(&url, &opts, true, &mut remotes).unwrap();
+        assert_eq!(opened.kind, ServedKind::Archive);
+        assert!(!opened.local && opened.fetched);
+        assert_eq!(remotes.len(), 1);
+        // `file://` is a plain local path: not fetched.
+        let file_url = url::Url::from_file_path(&tar_path).unwrap().to_string();
+        let opened = materialize_remote_input(&file_url, &opts, true, &mut remotes).unwrap();
+        assert!(opened.local && !opened.fetched);
+    }
+
+    /// R6-J9 (audit nit): the WebDAV row goes through the real opener, not a
+    /// hand-made `RemoteOpened`. A `webdav://` URL against a server that
+    /// answers GET is fetched to a temporary copy and recorded as `Remote` at
+    /// the TYPED URL (never the temp path). (ssh / scp / sftp need an sshd, which
+    /// no test host can assume; those rows stay table-driven in
+    /// `regression_served_kind_table_fetched_and_torrent`.)
+    #[test]
+    fn regression_served_kind_webdav_through_the_real_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = small_tar(&dir.path().join("a.tar"), "f");
+        let http = spawn_index_http("/a.tar", bytes, Default::default(), None, None);
+        let url = format!("webdav://{}/a.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_in_memory: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let bundle =
+            super::super::build_mount_source(&[PathBuf::from(&url)], &mut opts, true, false)
+                .unwrap();
+        let served = bundle
+            .served
+            .expect("an opened input reports what it served");
+        assert_eq!(served.kind, ServedKind::Archive);
+        assert_eq!(
+            served.location,
+            Some(ratarmount_compositing::ServedLocation::Remote(url))
+        );
+        assert!(
+            served.fetched,
+            "a WebDAV body is fetched to a temporary copy"
+        );
+    }
+
+    fn small_tar(path: &Path, member: &str) -> Vec<u8> {
+        let members = [ratarmount_formats_tar::UstarMember {
+            path: member,
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            xattrs: &[],
+        }];
+        let mut file = fs::File::create(path).unwrap();
+        ratarmount_formats_tar::write_ustar_members(&mut file, &members).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut file).unwrap();
+        drop(file);
+        fs::read(path).unwrap()
+    }
+
+    /// R6-6: a sidecar discovered from the archive's `Link: describedby` is
+    /// reported with the URL it came from (redacted when the token is minted);
+    /// the open's selected index is the installed file.
+    #[test]
+    fn regression_discovered_index_from_is_reported() {
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.tar");
+        let bytes = small_tar(&archive, "f");
+        let index_bytes = make_sidecar_for(&archive);
+        let folders = empty_index_folders(dir.path());
+        let link = format!(
+            "</archive.tar.index.sqlite>; rel=\"{INDEX_LINK_REL}\"; type=\"{INDEX_MEDIA_TYPE}\""
+        );
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("/archive.tar.index.sqlite".into(), index_bytes);
+        let http = spawn_index_http("/archive.tar", bytes, objects, Some(link), None);
+        let url = format!("http://{}/archive.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        let mut remotes = Vec::new();
+        let opened =
+            open_remote_input_with_nested(&url, &mut opts, false, &mut remotes, &mut None).unwrap();
+        assert_eq!(opened.index.discovered_from.as_deref(), Some(url.as_str()));
+        assert_eq!(
+            opened.index.location.as_path(),
+            opts.index_file_path.as_deref()
+        );
+        assert!(opened.index.location.as_path().is_some_and(Path::is_file));
+        // A second open of something that discovers nothing reports nothing.
+        let local = dir.path().join("plain.tar");
+        small_tar(&local, "g");
+        let mut opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let opened = open_remote_input_with_nested(
+            url::Url::from_file_path(&local).unwrap().as_str(),
+            &mut opts,
+            false,
+            &mut remotes,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(opened.index.discovered_from, None);
+    }
+
+    /// R6-6: the index reported for a composite is the FIRST element's own,
+    /// never one a later source installed (`options.index_file_path` is copied
+    /// back for interval commits only).
+    #[test]
+    fn regression_composite_second_source_index_not_inherited() {
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let first = root.join("first.tar");
+        small_tar(&first, "f");
+        let second = root.join("second.tar");
+        let second_bytes = small_tar(&second, "g");
+        let folder = root.join("idx");
+        fs::create_dir(&folder).unwrap();
+        let http = spawn_index_http("/second.tar", second_bytes, Default::default(), None, None);
+        let url = format!("http://{}/second.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_folders: vec![folder.clone()],
+            write_index: true,
+            index_minimum_file_count: 0,
+            ..OpenOptions::default()
+        };
+        let bundle = super::super::build_mount_source(
+            &[first.clone(), PathBuf::from(&url)],
+            &mut opts,
+            false,
+            false,
+        )
+        .unwrap();
+        let expected = ratarmount_index::possible_index_paths(&first, &[folder])[0].clone();
+        let served = bundle.served.expect("first element");
+        assert_eq!(
+            served.index,
+            ratarmount_compositing::IndexProvenance::Local(expected)
+        );
+        assert_eq!(
+            served.location,
+            Some(ratarmount_compositing::ServedLocation::Local(first))
+        );
     }
 
     /// Regression: repo mounts scanned shards and ignored published sibling indexes.
@@ -3371,7 +3737,7 @@ mod tests {
     /// fetches the sidecar when local folder candidates miss (pointer 404 continues).
     #[test]
     fn apply_remote_index_discovery_follows_archive_link() {
-        let _env = EnvGuard::acquire(&[]);
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
 
         let dir = tempfile::tempdir().unwrap();
@@ -3418,7 +3784,7 @@ mod tests {
     /// Regression: pointer + blob + tarstats success skips well-known GET.
     #[test]
     fn apply_remote_index_discovery_pointer_blob_skips_well_known() {
-        let _env = EnvGuard::acquire(&[]);
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("archive.tar");
         let archive_bytes = vec![b'B'; 1024];
@@ -3463,7 +3829,7 @@ mod tests {
     /// Regression: pointer 404 still finds describedby.
     #[test]
     fn apply_remote_index_discovery_pointer_404_falls_back_describedby() {
-        let _env = EnvGuard::acquire(&[]);
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
 
         let dir = tempfile::tempdir().unwrap();
@@ -3592,7 +3958,7 @@ mod tests {
     /// Regression: pointer blob sha256 ≠ index_id continues to well-known.
     #[test]
     fn apply_remote_index_discovery_pointer_blob_id_mismatch_falls_back_well_known() {
-        let _env = EnvGuard::acquire(&[]);
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         let dir = tempfile::tempdir().unwrap();
         let good = dir.path().join("good.tar");
         let other = dir.path().join("other.tar");
@@ -3630,15 +3996,58 @@ mod tests {
         assert_eq!(fs::metadata(got).unwrap().len(), good_idx.len() as u64);
     }
 
+    /// Regression (I2): `redact_remote_url` masked only the password, so a
+    /// user name, `?sig=` / SAS / presigned query and fragment reached the logs.
     #[test]
-    fn redact_remote_url_strips_userinfo_password() {
-        assert_eq!(
-            redact_remote_url("https://user:secret@host/a.tar.index.ptr"),
-            "https://user:***@host/a.tar.index.ptr"
-        );
-        assert_eq!(
-            redact_remote_url("s3://bucket/key.index.ptr"),
-            "s3://bucket/key.index.ptr"
+    fn regression_redact_remote_url_strips_userinfo_and_query_secrets() {
+        for (input, want) in [
+            (
+                "https://user:secret@host/a.tar.index.ptr",
+                "https://host/a.tar.index.ptr",
+            ),
+            ("https://tok@host/a", "https://host/a"),
+            ("s3://bucket/key.index.ptr", "s3://bucket/key.index.ptr"),
+        ] {
+            assert_eq!(redact_remote_url(input), want);
+        }
+        for secret in [
+            "sig=SECRETSIG",
+            "signature=SECRETSIG",
+            "token=SECRETSIG",
+            "access_token=SECRETSIG",
+            "X-Amz-Signature=SECRETSIG",
+            "X-Amz-Credential=SECRETSIG",
+            "X-Goog-Signature=SECRETSIG",
+            "Signature=SECRETSIG&Policy=P&Key-Pair-Id=K",
+            "se=2030&sp=r&sv=2020&sr=b&sig=SECRETSIG",
+            "passkey=SECRETSIG",
+        ] {
+            let url = format!("https://user:pw@host.example/a.tar.index.ptr?{secret}#frag");
+            let got = redact_remote_url(&url);
+            assert_eq!(got, "https://host.example/a.tar.index.ptr", "{secret}");
+            assert!(!got.contains("SECRETSIG") && !got.contains("pw"), "{got}");
+        }
+    }
+
+    /// Regression (I2): the index-pointer WARN carried the `?sig=` URL and
+    /// an error text that quotes it.
+    #[test]
+    fn regression_pointer_warn_text_has_no_secret() {
+        let url = "https://svc:hunter2@host.example/a.tar.index.ptr?sig=SECRETSIG&se=2030";
+        let err = PointerErr::Invalid(format!(
+            "bad pointer from {url}: https://other.example/x?X-Amz-Signature=SECRETSIG"
+        ));
+        let (warn, text) = pointer_err_log(url, &err);
+        assert!(warn);
+        for secret in ["SECRETSIG", "hunter2", "svc", "2030"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(text.contains("host.example/a.tar.index.ptr"), "{text}");
+        let (warn, text) = pointer_err_log(url, &PointerErr::Miss(format!("404 for {url}")));
+        assert!(!warn);
+        assert!(
+            !text.contains("SECRETSIG") && !text.contains("hunter2"),
+            "{text}"
         );
     }
 

@@ -1169,8 +1169,18 @@ writers ignoring the advisory inode lock remain unsupported.
 5. Atomically set and fsync the locator in **complete** state: this is the
    commit point. Atomic xattr replacement exposes either the old or new state;
    a CRC rejects corrupt locators. There is no mutable journal completion byte.
-   Remove the journal, fsync its directory, remove the locator, and fsync the
-   archive. A cleanup failure after completion must not retry the append.
+   Run the `before_unlink` hook (it restamps the overlay rows), then set the
+   locator to **done** (`D`: only the unlink is owed). Remove the journal, fsync
+   its directory, remove the locator, and fsync the archive. A cleanup failure
+   after completion must not retry the append. A failed unlink or directory
+   sync is never reported as success: the attempt retries it under its own lock
+   and otherwise returns `Committed` with the journal and locator kept. Once
+   the journal is durably unlinked, a failure to remove the locator only warns
+   and the commit returns `Ok`: the archive and the rows already agree, and the
+   stale `D` locator makes later commits refuse with a message that names the
+   manual escape (verify the archive, then `setfattr -x` /
+   `xattr -d` its `user.ratarmount.commit-journal` xattr; see
+   `docs/sandbox.md`).
 6. Patch the existing F-2 sidecar, reopen/swap the mounted source, advance its
    generation, and clean up committed overlay entries. Offline commits validate
    the sidecar against the archive **before** mutation; stale/missing-tarstats
@@ -1180,7 +1190,8 @@ Every CLI/local factory open and `Session::open` checks recovery before probing
 archive bytes or trusting an index, including read-only opens. Recovery needs
 write access; otherwise opening refuses with the journal path and instructions.
 Direct users of format-crate constructors must still call
-`ratarmount_compress::commit_journal::recover` before constructing their source.
+`ratarmount_compositing::recover_journal_at(path, None, Owner::Inode)` before
+constructing their source.
 
 Preparing without a published journal means no mutation occurred. An active
 locator without its journal refuses recovery. With a journal, validate its CRC,
@@ -1198,11 +1209,29 @@ old/new bytes. After restoring the old tail/length and mtime, fsync, mark the
 locator preparing, and remove/fsync the journal and locator. EPERM restoring
 mtime is tolerated for non-owner writers: normal tarstats validation rebuilds
 an index whose mtime no longer matches. Other failures retain the journal.
-Ordinary append errors run recovery immediately while the live commit gate is
-held. If recovery fails, or persistence succeeds but reopen fails, the mount
-refuses base reads and disables intervals until remount. Harmless preparation
-errors keep intervals enabled: `append` logs and retries next tick; `auto`
-tries copy for that commit. Fault tests cover every persistence boundary,
+An ordinary append error is cleaned up by the attempt itself, under the
+archive lock it still holds and from its own record (`ReplaceError`): it never
+re-derives its state from the path and never adopts another file's journal.
+A `Pending` (its journal is still on disk) or `Committed` result, or a reopen
+failure after persistence, makes the mount refuse base reads and disables
+intervals until remount. `Refused` and `RolledBack` keep intervals enabled:
+`append` logs and retries next tick; `auto` tries a copy for that commit, read
+from the file the commit gate accepted and published only while that file is
+unchanged and has no journal pending. The copy source must be exactly the
+gate's snapshot (device, inode, length, mtime, ctime): a refusal because the
+archive changed after the gate (or any other writer between the gate and the
+copy) never copies, since the copy would publish a file the gate never
+judged. After the attempt's own `RolledBack` the source must be exactly the
+stamp the attempt's locked descriptor had after its cleanup (`RolledBack`
+carries it; the rollback moved the ctime), so another commit that took the
+lock after the rollback refuses the copy too. Every copy publishes with the
+stamp it checked, never with one it took later. `copy` mode, the zstd copy
+splice, the offline gzip/bzip2/xz recompress and the offline ZIP rebuild use
+the same rule and the same copy guard. Crash recovery finds a journal through
+the locator or beside the archive's current name; a `C` locator whose journal
+cannot be found is refused and a `D` locator without a journal is kept (only a
+`P` one is cleared), so a journal that moved with a renamed directory is never
+mistaken for a torn one. Fault tests cover every persistence boundary,
 partial writes, repeated rollback, aliases, external changes and corrupt CRCs.
 
 The journal format is `RMCJ0002`. Earlier experimental `RMCJ0001` journals lack

@@ -152,6 +152,27 @@ pub fn spawn_signal_fuse_unmount(mp: PathBuf) {
         .expect("fuse signal unmount thread");
 }
 
+/// Logs a failure once per distinct message. A commit refused because the
+/// base changed is retried on every tick; the same refusal every second would
+/// flood the log, while a new observed stamp is new information.
+#[derive(Default)]
+struct RepeatedFailure(Option<String>);
+
+impl RepeatedFailure {
+    /// `true` when `message` differs from the previous failure.
+    fn is_new(&mut self, message: &str) -> bool {
+        let new = self.0.as_deref() != Some(message);
+        if new {
+            self.0 = Some(message.to_owned());
+        }
+        new
+    }
+
+    fn clear(&mut self) {
+        self.0 = None;
+    }
+}
+
 /// Snapshot of the termination flags.
 struct TermState {
     count: usize,
@@ -283,47 +304,60 @@ pub fn spawn_interval_commits(
     let remote_url = archive.to_string_lossy().into_owned();
     thread::Builder::new()
         .name("ratarmount-overlay-commit".into())
-        .spawn(move || loop {
-            let start = Instant::now();
-            while start.elapsed() < poll {
+        .spawn(move || {
+            let mut failures = RepeatedFailure::default();
+            loop {
+                let start = Instant::now();
+                while start.elapsed() < poll {
+                    if term_requested() || stop.as_ref().is_some_and(|s| s.is_stopped()) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
                 if term_requested() || stop.as_ref().is_some_and(|s| s.is_stopped()) {
                     return;
                 }
-                thread::sleep(Duration::from_millis(50));
-            }
-            if term_requested() || stop.as_ref().is_some_and(|s| s.is_stopped()) {
-                return;
-            }
-            let ov = Arc::clone(&overlay);
-            match overlay.enqueue_commit(&archive, CommitKind::IntervalIdle(interval), |p| {
-                match remote_kind {
-                    // Reopen is the URL only. Patch ran inside publish.
-                    LiveRemote::S3 => reopen_s3_mount(&remote_url, &opts),
-                    LiveRemote::Gcs => reopen_gcs_mount(&remote_url, &opts),
-                    LiveRemote::Azure => reopen_azure_mount(&remote_url, &opts),
-                    LiveRemote::Hf => ov.reopen_remote_live_commit(),
-                    LiveRemote::Local => {
-                        if let Some(window) = ov.last_patch_window() {
-                            patch_sidecar_if_present(p, &window, &opts)?;
+                let ov = Arc::clone(&overlay);
+                match overlay.enqueue_commit(&archive, CommitKind::IntervalIdle(interval), |p| {
+                    match remote_kind {
+                        // Reopen is the URL only. Patch ran inside publish.
+                        LiveRemote::S3 => reopen_s3_mount(&remote_url, &opts),
+                        LiveRemote::Gcs => reopen_gcs_mount(&remote_url, &opts),
+                        LiveRemote::Azure => reopen_azure_mount(&remote_url, &opts),
+                        LiveRemote::Hf => ov.reopen_remote_live_commit(),
+                        LiveRemote::Local => {
+                            if let Some(window) = ov.last_patch_window() {
+                                patch_sidecar_if_present(p, &window, &opts)?;
+                            }
+                            reopen_live_archive(p, &opts).map_err(OverlayError::Msg)
                         }
-                        reopen_live_archive(p, &opts).map_err(OverlayError::Msg)
+                    }
+                }) {
+                    Ok(CommitOutcome::DidWork) => {
+                        failures.clear();
+                        log::info!(
+                            "interval overlay commit wrote idle files into {}",
+                            overlay.commit_archive_path(&archive).display()
+                        )
+                    }
+                    Ok(CommitOutcome::Nothing) => {
+                        log::debug!("interval overlay commit: nothing idle to do")
+                    }
+                    Ok(CommitOutcome::Coalesced) => {
+                        log::debug!("interval overlay commit coalesced (persist already in flight)")
+                    }
+                    Ok(CommitOutcome::Disabled) => {
+                        log::debug!("interval overlay commit skipped (remount required)")
+                    }
+                    Err(e) => {
+                        let message = e.to_string();
+                        if failures.is_new(&message) {
+                            log::error!("interval overlay commit failed: {message}");
+                        } else {
+                            log::debug!("interval overlay commit failed again: {message}");
+                        }
                     }
                 }
-            }) {
-                Ok(CommitOutcome::DidWork) => log::info!(
-                    "interval overlay commit wrote idle files into {}",
-                    overlay.commit_archive_path(&archive).display()
-                ),
-                Ok(CommitOutcome::Nothing) => {
-                    log::debug!("interval overlay commit: nothing idle to do")
-                }
-                Ok(CommitOutcome::Coalesced) => {
-                    log::debug!("interval overlay commit coalesced (persist already in flight)")
-                }
-                Ok(CommitOutcome::Disabled) => {
-                    log::debug!("interval overlay commit skipped (remount required)")
-                }
-                Err(e) => log::error!("interval overlay commit failed: {e}"),
             }
         })
         .expect("interval commit thread")
@@ -371,9 +405,17 @@ pub fn open_rolling_series(
     opts: &OpenOptions,
 ) -> Result<Arc<ratarmount_compositing::RollingMountSource>, String> {
     let opts = opts.clone();
-    ratarmount_compositing::RollingMountSource::open(base, policy, move |path| {
-        ratarmount_session::factory::open_path(path, &opts, false).map_err(OverlayError::Msg)
-    })
+    // The mount classified and recovered every generation first (see main), so
+    // the opener does not recover them before the identity gates decided.
+    let recover = opts.recover_journals;
+    ratarmount_compositing::RollingMountSource::open_with_recovery(
+        base,
+        policy,
+        move |path| {
+            ratarmount_session::factory::open_path(path, &opts, false).map_err(OverlayError::Msg)
+        },
+        recover,
+    )
     .map(Arc::new)
     .map_err(|e| e.to_string())
 }
@@ -486,7 +528,9 @@ pub fn maybe_create_missing_write_base(
     path: &Path,
     ctx: CreateMissingContext,
 ) -> Result<EmptyCreateOutcome, String> {
-    if ratarmount_remote::is_remote_url(&path.to_string_lossy()) {
+    if path.to_string_lossy().starts_with("git://")
+        || ratarmount_remote::is_remote_url(&path.to_string_lossy())
+    {
         return Ok(EmptyCreateOutcome::Unchanged);
     }
     if matches!(ctx, CreateMissingContext::OfflineCommit)
@@ -1591,6 +1635,19 @@ pub(crate) fn term_flag_test_lock() -> &'static std::sync::Mutex<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A refused interval commit is retried every tick; it logs once per
+    /// distinct message (a new observed stamp is new information) and again
+    /// after a success.
+    #[test]
+    fn regression_interval_refusal_logs_once_per_distinct_message() {
+        let mut failures = RepeatedFailure::default();
+        assert!(failures.is_new("base mismatch: size=1"));
+        assert!(!failures.is_new("base mismatch: size=1"));
+        assert!(failures.is_new("base mismatch: size=2"));
+        failures.clear();
+        assert!(failures.is_new("base mismatch: size=2"));
+    }
+
     use super::*;
 
     /// Regression: hf commit URLs must not be stat-ed as local filenames.
@@ -1624,7 +1681,7 @@ mod tests {
             ..Default::default()
         };
         let base = reopen_hf_mount(&repo, &opts).unwrap();
-        let overlay = WriteOverlay::new(base, root).unwrap();
+        let overlay = crate::base_identity::fixtures::new_overlay(base, root).unwrap();
         install_object_store_live_commit(&overlay, Path::new(url), &opts, create_pr).unwrap();
         overlay
     }
@@ -1837,7 +1894,9 @@ mod tests {
                     ..Default::default()
                 };
                 let base = reopen_hf_mount(&repo, &opts).unwrap();
-                let overlay = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+                let overlay =
+                    crate::base_identity::fixtures::new_overlay(base, dir.path().join("ov"))
+                        .unwrap();
                 server.state.lock().unwrap().head = "f".repeat(40);
                 install_object_store_live_commit(&overlay, Path::new(url), &opts, false).unwrap();
                 overlay
@@ -2496,7 +2555,11 @@ mod tests {
             OpenOptions::default(),
         )
         .expect("warm base");
-        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay_dir).unwrap();
+        let ov = crate::base_identity::fixtures::new_overlay(
+            Arc::new(base) as Arc<dyn MountSource>,
+            &overlay_dir,
+        )
+        .unwrap();
         std::fs::write(overlay_dir.join("new.bin"), extra).unwrap();
 
         let opts = OpenOptions {
@@ -2561,7 +2624,11 @@ mod tests {
         )
         .expect("index");
         let ov = Arc::new(
-            WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay_dir).unwrap(),
+            crate::base_identity::fixtures::new_overlay(
+                Arc::new(base) as Arc<dyn MountSource>,
+                &overlay_dir,
+            )
+            .unwrap(),
         );
         std::fs::write(overlay_dir.join("new.bin"), extra).unwrap();
         // Backdate so the interval idle filter includes the new file.
@@ -2714,6 +2781,26 @@ mod tests {
         let got = validate_live_commit_args(Some(&ov), std::slice::from_ref(&zst))
             .expect("accept created .tar.zst");
         assert_eq!(got, zst);
+    }
+
+    /// Regression: Git URLs ending in archive suffixes must reach the Git parser unchanged.
+    #[test]
+    fn regression_git_url_write_base_is_never_created_as_archive() {
+        for url in [
+            "git:///srv/repo.tar",
+            "git:///srv/repo#branch.tar.zst",
+            "git://host/repo.tar",
+        ] {
+            for context in [
+                CreateMissingContext::Mount,
+                CreateMissingContext::OfflineCommit,
+            ] {
+                assert_eq!(
+                    maybe_create_missing_write_base(Path::new(url), context).unwrap(),
+                    EmptyCreateOutcome::Unchanged
+                );
+            }
+        }
     }
 
     #[test]
@@ -3117,8 +3204,11 @@ mod rolling_tests {
             let series =
                 open_rolling_series(&base, "1B".parse::<RollPolicy>().unwrap(), &opts).unwrap();
             let original = series.active_path();
-            let mut overlay =
-                WriteOverlay::new(series.clone(), dir.path().join("overlay")).unwrap();
+            let mut overlay = crate::base_identity::fixtures::new_overlay(
+                series.clone(),
+                dir.path().join("overlay"),
+            )
+            .unwrap();
             overlay.set_rolling(series.clone());
             overlay.set_commit_mode(CommitMode::Append);
             overlay.set_manifest_hashes(Some("new".into()));

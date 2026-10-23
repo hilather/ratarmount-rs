@@ -43,6 +43,9 @@ jobs:
       - name: portable deps allowlist self-test
         run: bash packaging/test-portable-deps-selftest.sh
 
+      - name: canonical hash reference self-test
+        run: python3 -I test-harness/canonical-hash/reference.py --self-test
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -160,6 +163,9 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release -p ratarmount
+
+      - name: No test-only env seams in the release binary
+        run: ./packaging/test-no-test-hooks-in-release.sh target/release/ratarmount
 
       - name: Enforce rust-gates.json (cold index hard gate)
         env:

@@ -24,6 +24,8 @@
 
 mod serve;
 mod smb2;
+#[cfg(test)]
+mod test_overlay;
 mod vfs;
 
 pub use ratarmount_compositing::WriteOverlay;

@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use ratarmount_compositing::{
     parse_recursive_extensions, AutoMountLayer, AutoMountOptions, FileVersionLayer,
-    FolderMountSource, NestedOpenContext, OpenNestedFn, OpenNestedReaderFn, PrefixMountSource,
-    RecursiveExtSet, SourceBind, TransformMountSource, UnionMountOptions, UnionMountSource,
+    FolderMountSource, IndexProvenance, NestedOpenContext, OpenNestedFn, OpenNestedReaderFn,
+    PrefixMountSource, RecursiveExtSet, ServedKind, ServedLocation, SourceBind,
+    TransformMountSource, UnionMountOptions, UnionMountSource,
 };
 use ratarmount_compress::{
     body_looks_like_tar, check_for_split_file_in_folder, detect_compression, export_bzip2_blocks,
@@ -1323,7 +1324,8 @@ fn try_load_nested_durable(
     if !path.is_file() {
         return None;
     }
-    let idx = match SqliteIndex::open_read_only(path) {
+    // A pure lookup: nothing is created beside the outer index.
+    let idx = match SqliteIndex::open_lookup(path) {
         Ok(i) => i,
         Err(e) => {
             log::debug!(
@@ -2153,7 +2155,7 @@ fn open_split_set(
     }
 
     // Archive/compressed stream: open without re-running split detection; keep temp alive.
-    let inner = open_path_impl(&tmp_path, &opts, recreate, false, &mut false)?;
+    let inner = open_path_impl(&tmp_path, &opts, recreate, false, &mut false)?.source;
     Ok(Arc::new(KeepAliveMount { inner, _tmp: tmp }))
 }
 
@@ -2210,7 +2212,49 @@ pub fn open_path(
     options: &OpenOptions,
     recreate: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
-    open_path_impl(path, options, recreate, true, &mut false)
+    open_path_impl(path, options, recreate, true, &mut false).map(|opened| opened.source)
+}
+
+/// The index an open selected, for the base-identity peek. The selected
+/// location is always filled; `discovered_from` (the URL a remote index was
+/// fetched from) and `sidecar_candidate` (the sidecar path an in-memory open
+/// would have used) are filled by the callers that know them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IndexUsed {
+    pub location: IndexLocation,
+    pub discovered_from: Option<String>,
+    pub sidecar_candidate: Option<PathBuf>,
+}
+
+impl IndexUsed {
+    fn none() -> Self {
+        Self {
+            location: IndexLocation::Memory,
+            discovered_from: None,
+            sidecar_candidate: None,
+        }
+    }
+}
+
+/// What [`open_path_impl`] opened: the source and, for the base-identity
+/// token, what kind of source it is and where it was opened.
+pub(crate) struct PathOpened {
+    pub source: Arc<dyn MountSource>,
+    pub kind: ServedKind,
+    /// The path actually opened (the repository path for Git).
+    pub location: PathBuf,
+    pub index: IndexUsed,
+}
+
+impl PathOpened {
+    fn archive(source: Arc<dyn MountSource>, location: &Path, index: IndexUsed) -> Self {
+        Self {
+            source,
+            kind: ServedKind::Archive,
+            location: location.to_path_buf(),
+            index,
+        }
+    }
 }
 
 fn open_path_impl(
@@ -2219,33 +2263,41 @@ fn open_path_impl(
     recreate: bool,
     allow_split: bool,
     plain_tar: &mut bool,
-) -> Result<Arc<dyn MountSource>, String> {
+) -> Result<PathOpened, String> {
     // Resolve inline refs before the normal filesystem existence check.
     #[cfg(feature = "git")]
     {
-        let inline = ratarmount_formats_git::split_inline_reference(path);
-        let git_path = inline.as_ref().map_or(path, |(p, _)| p.as_path());
-        let is_bare = git_path.join("HEAD").is_file()
-            && git_path.join("objects").is_dir()
-            && git_path.join("refs").is_dir()
-            && !git_path.join(".git").exists();
-        let force = options.git
-            || options.git_ref.is_some()
-            || inline.is_some()
-            || (git_path.is_dir()
-                && looks_like_git(git_path)
-                && std::env::var_os("RATARMOUNT_FORCE_GIT").is_some());
-        if is_bare || force {
+        let url = ratarmount_formats_git::parse_git_url(&path.to_string_lossy())
+            .map_err(|e| e.to_string())?;
+        let inline = if url.is_none() {
+            ratarmount_formats_git::split_inline_reference(path)
+        } else {
+            None
+        };
+        let git_path = url.as_ref().map_or_else(
+            || inline.as_ref().map_or(path, |(p, _)| p.as_path()),
+            |(p, _)| p.as_path(),
+        );
+        let explicit =
+            options.git || options.git_ref.is_some() || inline.is_some() || url.is_some();
+        if serves_as_git(
+            git_path,
+            explicit,
+            std::env::var_os("RATARMOUNT_FORCE_GIT").is_some(),
+        ) {
             if !looks_like_git(git_path) {
                 return Err(format!("{} is not a git repository", git_path.display()));
             }
-            if inline.is_some() && options.git_ref.is_some() {
+            if (inline.is_some() || url.as_ref().is_some_and(|(_, r)| r.is_some()))
+                && options.git_ref.is_some()
+            {
                 return Err("use either repo@REV or --git-ref, not both".into());
             }
             let reference = options
                 .git_ref
                 .as_deref()
-                .or_else(|| inline.as_ref().map(|(_, r)| r.as_str()));
+                .or_else(|| inline.as_ref().map(|(_, r)| r.as_str()))
+                .or_else(|| url.as_ref().map(|(_, r)| r.as_deref().unwrap_or("HEAD")));
             let mut git = GitMountSource::open(git_path, reference).map_err(|e| e.to_string())?;
             if let Some(prefix) = &options.git_prefix {
                 git = git.with_prefix(prefix).map_err(|e| e.to_string())?;
@@ -2258,11 +2310,23 @@ fn open_path_impl(
                 let cache = cache.join("git-synthetic-v1");
                 git = git.with_synthetic_head(&cache).map_err(|e| e.to_string())?;
             }
-            return Ok(Arc::new(git));
+            // The tree after any subtree selection: what is actually served.
+            let tree = git.tree_id();
+            return Ok(PathOpened {
+                source: Arc::new(git),
+                kind: ServedKind::Git { tree },
+                location: git_path.to_path_buf(),
+                index: IndexUsed::none(),
+            });
         }
     }
-    if !ratarmount_index::looks_like_url_archive(path) {
-        ratarmount_compress::commit_journal::recover(path).map_err(|e| e.to_string())?;
+    if options.recover_journals && !ratarmount_index::looks_like_url_archive(path) {
+        ratarmount_compositing::recover_journal_at(
+            path,
+            None,
+            ratarmount_compositing::Owner::Inode,
+        )
+        .map_err(|e| e.to_string())?;
     }
     if options.git_synthetic_head || options.git_prefix.is_some() {
         return Err("--git-synthetic-head and --git-prefix require Git mode (--git, --git-ref, repo@REV, a bare repo, or RATARMOUNT_FORCE_GIT)".into());
@@ -2273,7 +2337,12 @@ fn open_path_impl(
     }
     if path.is_dir() {
         return FolderMountSource::new(path)
-            .map(|f| Arc::new(f) as Arc<dyn MountSource>)
+            .map(|f| PathOpened {
+                source: Arc::new(f) as Arc<dyn MountSource>,
+                kind: ServedKind::Folder,
+                location: path.to_path_buf(),
+                index: IndexUsed::none(),
+            })
             .map_err(|e| e.to_string());
     }
     if !path.exists() {
@@ -2283,12 +2352,15 @@ fn open_path_impl(
     // Multi-volume split files (Python check_for_split_file_in_folder + JoinedFile).
     if allow_split {
         if let Some(split) = check_for_split_file_in_folder(path) {
-            return open_split_set(&split.paths, options, recreate);
+            return open_split_set(&split.paths, options, recreate)
+                .map(|source| PathOpened::archive(source, path, IndexUsed::none()));
         }
     }
 
     let compression = detect_compression(path).map_err(|e| e.to_string())?;
     let index_loc = resolved_index(path, options, recreate);
+    // Before the clone below drops an explicit index in the in-memory case.
+    let candidate = sidecar_candidate(path, options, &index_loc);
     // Propagate memory flag so format open() does not fall back to a disk path.
     let mut options = options.clone();
     if index_loc.is_memory() {
@@ -2357,7 +2429,44 @@ fn open_path_impl(
     // After create + optional compression side-table writes: drop small indexes (B-119).
     maybe_discard_index_below_minimum(index_path, &options);
 
-    Ok(source)
+    Ok(PathOpened::archive(
+        source,
+        path,
+        IndexUsed {
+            sidecar_candidate: candidate,
+            location: index_loc,
+            discovered_from: None,
+        },
+    ))
+}
+
+/// The sidecar an in-memory open would have used, for a read-only peek at a
+/// cached digest. A pure path computation: no index is created, written,
+/// fetched or materialized. `None` when the open selected an on-disk index
+/// itself (that path is the answer) or no existing sidecar is named.
+fn sidecar_candidate(
+    path: &Path,
+    options: &OpenOptions,
+    selected: &IndexLocation,
+) -> Option<PathBuf> {
+    if !selected.is_memory() {
+        return None;
+    }
+    if let Some(explicit) = options.index_file_path.as_ref() {
+        let text = explicit.to_string_lossy();
+        if text == ratarmount_index::MEMORY_INDEX || ratarmount_index::is_index_url(&text) {
+            return None;
+        }
+        return ratarmount_index::path_is_usable_existing_index(explicit).then(|| explicit.clone());
+    }
+    let folders = if options.index_folders.is_empty() {
+        ratarmount_index::default_index_folders()
+    } else {
+        options.index_folders.clone()
+    };
+    ratarmount_index::possible_index_paths(path, &folders)
+        .into_iter()
+        .find(|candidate| ratarmount_index::path_is_usable_existing_index(candidate))
 }
 
 /// Open lrzip: prefer external `lrzip`/`lrunzip` materialize (then format probe);
@@ -2526,12 +2635,10 @@ fn try_load_gzip_index_blob(
     if !meta_ok {
         return None;
     }
-    // Prefer open_writable so we do not emit the RO "Successfully loaded…" banner
-    // (TAR will open RO itself). Fall back to open_read_only if the file is not writable.
-    let idx = match SqliteIndex::open_writable(ip) {
-        Ok(i) => i,
-        Err(_) => SqliteIndex::open_read_only(ip).ok()?,
-    };
+    // Read-only catalog open: no banner (TAR opens the index itself), no file
+    // table in memory, and a sidecar that fails validation is never opened
+    // writable here.
+    let idx = SqliteIndex::open_lookup(ip).ok()?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: gzip RGZI skipped (index fingerprint: {e})");
@@ -3062,10 +3169,11 @@ fn try_load_zstd_blocks(
     if !meta_ok {
         return None;
     }
-    let idx = match SqliteIndex::open_writable(ip) {
-        Ok(i) => i,
-        Err(_) => SqliteIndex::open_read_only(ip).ok()?,
-    };
+    // Reading only, and only the catalog (no file table in memory, no
+    // banner): a sidecar that is merely consulted must not gain WAL files or
+    // schema changes, and one that does not validate read-only is refused,
+    // never retried writable.
+    let idx = SqliteIndex::open_lookup(ip).ok()?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: zstdblocks skipped (index fingerprint: {e})");
@@ -3277,10 +3385,11 @@ fn try_load_bzip2_blocks(
     if !meta_ok {
         return None;
     }
-    let idx = match SqliteIndex::open_writable(ip) {
-        Ok(i) => i,
-        Err(_) => SqliteIndex::open_read_only(ip).ok()?,
-    };
+    // Reading only, and only the catalog (no file table in memory, no
+    // banner): a sidecar that is merely consulted must not gain WAL files or
+    // schema changes, and one that does not validate read-only is refused,
+    // never retried writable.
+    let idx = SqliteIndex::open_lookup(ip).ok()?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: bzip2blocks skipped (index fingerprint: {e})");
@@ -3984,14 +4093,146 @@ fn open_tar_body(
         .map_err(|e| e.to_string())
 }
 
+/// THE sniff: does the factory serve this local path as Git? Called by the
+/// mount dispatch (`open_path_impl`, with the explicit selectors `--git`,
+/// `--git-ref`, `repo@REV`, `git://`) and by the offline commit classifier
+/// (`served_without_indexing`, with none), so the two cannot drift. A bare
+/// repository is always Git; an explicit selector forces Git; a repository
+/// directory is Git under `RATARMOUNT_FORCE_GIT` (`force_env`).
+#[cfg(feature = "git")]
+fn serves_as_git(path: &Path, explicit: bool, force_env: bool) -> bool {
+    let is_bare = path.join("HEAD").is_file()
+        && path.join("objects").is_dir()
+        && path.join("refs").is_dir()
+        && !path.join(".git").exists();
+    is_bare || explicit || (path.is_dir() && looks_like_git(path) && force_env)
+}
+
+/// The Git kind the factory serves for a directory without any flag: a bare
+/// repository (or any repository under `RATARMOUNT_FORCE_GIT`), with the tree
+/// id of `HEAD`. Reads the repository's refs and one tree object; no index.
+#[cfg(feature = "git")]
+fn git_served_kind(path: &Path) -> Result<Option<ServedKind>, String> {
+    git_served_kind_with(path, std::env::var_os("RATARMOUNT_FORCE_GIT").is_some())
+}
+
+/// [`git_served_kind`] with `RATARMOUNT_FORCE_GIT` passed in.
+#[cfg(feature = "git")]
+fn git_served_kind_with(path: &Path, force_git: bool) -> Result<Option<ServedKind>, String> {
+    if !serves_as_git(path, false, force_git) {
+        return Ok(None);
+    }
+    let git = GitMountSource::open(path, None).map_err(|e| e.to_string())?;
+    Ok(Some(ServedKind::Git {
+        tree: git.tree_id(),
+    }))
+}
+
+#[cfg(not(feature = "git"))]
+fn git_served_kind(_path: &Path) -> Result<Option<ServedKind>, String> {
+    Ok(None)
+}
+
+/// What the first factory-opened source served: the kind and location the
+/// base-identity token records. `None` location only for a declared source
+/// with no location (a corpus).
+#[derive(Clone, Debug)]
+pub struct Served {
+    pub kind: ServedKind,
+    pub location: Option<ServedLocation>,
+    pub index: IndexProvenance,
+    /// Sidecar path an in-memory open would have used (read-only peek target).
+    pub sidecar_candidate: Option<PathBuf>,
+    /// The first source was fetched to a temporary local copy.
+    pub fetched: bool,
+}
+
+/// What the factory would serve for `path`, answered without opening it: no
+/// index is built or loaded, no sidecar read or written, no commit journal
+/// recovered. It asks the same questions the mount dispatch asks, in the same
+/// order: a remote input (a local `*.torrent` under `--features bittorrent`
+/// is a remote folder; a `file://` URL is the local path; anything else is
+/// not a local base), then a bare Git repository (or any repository under
+/// `RATARMOUNT_FORCE_GIT`) is Git, any other directory a folder, a file an
+/// archive.
+///
+/// For a verb that only needs to know what it is about to rewrite
+/// (`--commit-overlay`): indexing a large archive to learn that it is an
+/// archive is the cost this avoids. `sidecar_candidate` is the existing sidecar
+/// a cold open would have used, for a read-only digest peek.
+pub fn served_without_indexing(path: &Path, index_folders: &[PathBuf]) -> Result<Served, String> {
+    let typed = path.to_string_lossy();
+    let mut local = path.to_path_buf();
+    if ratarmount_remote::is_remote_url(&typed) {
+        if ratarmount_remote::is_torrent_input(&typed) {
+            // A torrent mounts as a lazy remote tree even when the metainfo
+            // file is local (`open_remote_input_inner`).
+            return Ok(Served {
+                kind: ServedKind::Folder,
+                location: Some(ServedLocation::Remote(typed.into_owned())),
+                index: IndexProvenance::None,
+                sidecar_candidate: None,
+                fetched: false,
+            });
+        }
+        if ratarmount_remote::remote_url_scheme(&typed).as_deref() != Some("file") {
+            return Err(format!(
+                "{typed} is not a local archive or directory; an offline commit needs a local base"
+            ));
+        }
+        let resolved = ratarmount_remote::resolve_to_local(&typed).map_err(|e| e.to_string())?;
+        match &resolved {
+            ratarmount_remote::RemoteLocal::Local(path) => local = path.clone(),
+            _ => return Err(format!("{typed} is not a local archive or directory")),
+        }
+    }
+    let path = local.as_path();
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let kind = if meta.is_dir() {
+        git_served_kind(path)?.unwrap_or(ServedKind::Folder)
+    } else if meta.is_file() {
+        ServedKind::Archive
+    } else {
+        return Err(format!(
+            "{} is neither a file nor a directory",
+            path.display()
+        ));
+    };
+    let sidecar_candidate = (kind == ServedKind::Archive)
+        .then(|| {
+            ratarmount_index::possible_index_paths(path, index_folders)
+                .into_iter()
+                .find(|p| p.is_file())
+        })
+        .flatten();
+    Ok(Served {
+        kind,
+        location: Some(ServedLocation::Local(path.to_path_buf())),
+        index: IndexProvenance::None,
+        sidecar_candidate,
+        fetched: false,
+    })
+}
+
 /// Holds remote downloads for process lifetime (deleted on drop).
 pub struct MountBundle {
     pub source: Arc<dyn MountSource>,
+    /// What the first element in factory order served (`inputs[0]`, else the
+    /// first declared source). `None` only when nothing was opened.
+    pub served: Option<Served>,
     /// Provenance from the successful local TAR probe, before compositing.
     /// No remote, split, compressed, recursive, or path-transforming source.
     pub(crate) plain_tar_file: Option<PathBuf>,
     /// Fetched HTTP bodies etc. must outlive `source`.
     _remotes: Vec<ratarmount_remote::RemoteLocal>,
+}
+
+impl MountBundle {
+    /// The private downloads that must outlive the source, and nothing else:
+    /// never the bundle itself, whose source a live commit replaces.
+    pub fn into_keep_alive(self) -> Box<dyn std::any::Any + Send + Sync> {
+        Box::new(self._remotes)
+    }
 }
 
 /// Extra compositing options beyond [`OpenOptions`].
@@ -4118,7 +4359,7 @@ fn remote_index_setup(
 }
 
 /// Result of a successful live-Range open (label path + mount source).
-type LiveRangeOpened = (PathBuf, Arc<dyn MountSource>);
+pub(crate) type LiveRangeOpened = (PathBuf, Arc<dyn MountSource>);
 
 /// Open TAR/ZIP/gzip/bzip2/xz/zstd from a live Range-capable `Read+Seek` body.
 ///
@@ -4149,7 +4390,10 @@ where
 
     match kind {
         "tar" => {
-            eprintln!("{transport} TAR: {input} ({range_len} bytes, live Range)");
+            eprintln!(
+                "{transport} TAR: {} ({range_len} bytes, live Range)",
+                ratarmount_core::redact_base_url(input)
+            );
             if !recreate && !o.clear_index_cache {
                 if let Some(path) = ip.filter(|p| p.is_file()) {
                     match SqliteIndexedTar::open_with_existing_index_from_reader(
@@ -4177,7 +4421,10 @@ where
             Ok(Some((label, Arc::new(src))))
         }
         "zip" => {
-            eprintln!("{transport} ZIP: {input} ({range_len} bytes, live Range)");
+            eprintln!(
+                "{transport} ZIP: {} ({range_len} bytes, live Range)",
+                ratarmount_core::redact_base_url(input)
+            );
             let src = ZipMountSource::open_from_reader(range, &label, ip, &o, VERSION)
                 .map_err(|e| e.to_string())?;
             Ok(Some((label, Arc::new(src))))
@@ -4547,6 +4794,9 @@ pub fn build_mount_source_ex(
 fn input_is_git(path: &Path, options: &OpenOptions) -> bool {
     #[cfg(feature = "git")]
     {
+        if path.to_string_lossy().starts_with("git://") {
+            return true;
+        }
         if ratarmount_remote::is_remote_url(&path.to_string_lossy()) {
             return false;
         }
@@ -4574,7 +4824,19 @@ pub struct SourceBindings {
     /// Applied after positional inputs, in this order (later sources win).
     pub binds: Vec<SourceBind>,
     /// Already opened root sources, e.g. a lazy corpus. They precede positional inputs.
-    pub sources: Vec<Arc<dyn MountSource>>,
+    pub sources: Vec<DeclaredSource>,
+}
+
+/// An already opened root source and what its caller says it is. A declared
+/// source has no opener to ask: the caller built it and names what it built
+/// (a small, stated exception to "the factory reports the kind").
+pub struct DeclaredSource {
+    pub src: Arc<dyn MountSource>,
+    pub kind: ServedKind,
+    /// `None` for a corpus, which has no single location.
+    pub location: Option<ServedLocation>,
+    /// Human label (the rolling series' active generation).
+    pub label: String,
 }
 
 /// Build a union with per-source mount paths. Explicit binds take precedence
@@ -4653,7 +4915,20 @@ pub fn build_mount_source_with_bindings(
         ext_set
     };
     let mut sources = Vec::new();
-    for src in bindings.sources {
+    // `inputs[0]` wins over a declared source when both exist.
+    let mut served: Option<Served> = if inputs.is_empty() {
+        bindings.sources.first().map(|declared| Served {
+            kind: declared.kind.clone(),
+            location: declared.location.clone(),
+            index: IndexProvenance::None,
+            sidecar_candidate: None,
+            fetched: false,
+        })
+    } else {
+        None
+    };
+    for declared in bindings.sources {
+        let src = declared.src;
         sources.push(apply_compositing(
             src,
             options,
@@ -4672,7 +4947,7 @@ pub fn build_mount_source_with_bindings(
     // onto `options` (the value `spawn_interval_commits` clones). Do not inject
     // one input's sidecar into the next input's clone.
     let cli_opts = options.clone();
-    for ((p, mount_path), is_git) in inputs.iter().zip(git_inputs) {
+    for (position, ((p, mount_path), is_git)) in inputs.iter().zip(git_inputs).enumerate() {
         let input = p.to_string_lossy();
         // Do not force a default index path here — `open_path` resolves via folders / :memory:.
         let mut opts = cli_opts.clone();
@@ -4695,6 +4970,15 @@ pub fn build_mount_source_with_bindings(
 
         // Dropbox folders: browse via API (list + download-on-open). Files fall through.
         if let Some(ms) = remote_open::try_open_dropbox_folder(input.as_ref())? {
+            if position == 0 {
+                served = Some(Served {
+                    kind: ServedKind::Folder,
+                    location: Some(ServedLocation::Remote(input.to_string())),
+                    index: IndexProvenance::None,
+                    sidecar_candidate: None,
+                    fetched: false,
+                });
+            }
             let src = apply_compositing(
                 ms,
                 &opts,
@@ -4716,18 +5000,28 @@ pub fn build_mount_source_with_bindings(
 
         let remote = ratarmount_remote::is_remote_url(&input);
         let mut folder_opener = None;
-        let (local_path, mut src) = if remote {
-            remote_open::open_remote_input_with_nested(
+        let (local_path, mut src, input_served) = if remote {
+            let opened = remote_open::open_remote_input_with_nested(
                 input.as_ref(),
                 &mut opts,
                 recreate_src,
                 &mut remotes,
                 &mut folder_opener,
-            )?
+            )?;
+            let served = served_from_remote(&input, &opened);
+            (opened.path, opened.source, served)
         } else {
             let local_path = p.clone();
             let mut plain_tar = false;
-            let src = open_path_impl(&local_path, &opts, recreate_src, true, &mut plain_tar)?;
+            let opened = open_path_impl(&local_path, &opts, recreate_src, true, &mut plain_tar)?;
+            let input_served = Served {
+                kind: opened.kind,
+                location: Some(ServedLocation::Local(opened.location)),
+                index: index_provenance(&opened.index),
+                sidecar_candidate: opened.index.sidecar_candidate.clone(),
+                fetched: false,
+            };
+            let src = opened.source;
             if plain_tar
                 && source_count == 1
                 && mount_path.is_none()
@@ -4737,8 +5031,11 @@ pub fn build_mount_source_with_bindings(
             {
                 plain_tar_file = std::fs::canonicalize(&local_path).ok();
             }
-            (local_path, src)
+            (local_path, src, input_served)
         };
+        if position == 0 {
+            served = Some(input_served);
+        }
         if remote && options.index_file_path.is_none() {
             if let Some(path) = opts.index_file_path.clone() {
                 options.index_file_path = Some(path);
@@ -4782,9 +5079,41 @@ pub fn build_mount_source_with_bindings(
     }
     Ok(MountBundle {
         source,
+        served,
         plain_tar_file,
         _remotes: remotes,
     })
+}
+
+/// The index an open selected, as the token records it.
+/// What a remote open served, for the base-identity token. A body that is a
+/// plain local path (`file://`) is `Local`; everything else, including a body
+/// downloaded to a temporary copy (ssh, webdav, smb, ftp, ...) and a torrent
+/// whose "path" is `torrent:<infohash>`, is `Remote` at the typed location.
+fn served_from_remote(input: &str, opened: &remote_open::RemoteOpened) -> Served {
+    let location = if opened.local {
+        ServedLocation::Local(opened.path.clone())
+    } else {
+        ServedLocation::Remote(input.to_string())
+    };
+    Served {
+        kind: opened.kind.clone(),
+        location: Some(location),
+        index: index_provenance(&opened.index),
+        sidecar_candidate: opened.index.sidecar_candidate.clone(),
+        fetched: opened.fetched,
+    }
+}
+
+fn index_provenance(used: &IndexUsed) -> IndexProvenance {
+    match (used.location.as_path(), &used.discovered_from) {
+        (Some(path), Some(from)) => IndexProvenance::Discovered {
+            path: path.to_path_buf(),
+            from: from.clone(),
+        },
+        (Some(path), None) => IndexProvenance::Local(path.to_path_buf()),
+        (None, _) => IndexProvenance::None,
+    }
 }
 
 fn strip_source_name(name: &str) -> String {
@@ -5677,6 +6006,138 @@ mod tests {
         assert_eq!(blocks2, stored, "warm import must not clobber side table");
         // recreate=true must ignore side table for body build (persist may rewrite).
         assert!(try_load_zstd_blocks(Some(&index), Some(&archive), true).is_none());
+    }
+
+    /// Regression (R6-G5, #6): consulting a sidecar's `zstdblocks` /
+    /// `bzip2blocks` opened it writable, so a DELETE-journal sidecar gained
+    /// WAL files and schema changes from a lookup that only reads.
+    #[test]
+    fn regression_try_load_blocks_never_writes_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_tar_zst(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: zstd CLI unavailable");
+            return;
+        }
+        let index = dir.path().join("tiny.zst.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            ..Default::default()
+        };
+        drop(open_path(&archive, &opts, true).expect("cold open"));
+        {
+            let conn = rusqlite::Connection::open(&index).unwrap();
+            conn.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(()))
+                .unwrap();
+        }
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        let names = || {
+            let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, bytes) = (names(), std::fs::read(&index).unwrap());
+        assert!(try_load_zstd_blocks(Some(&index), Some(&archive), false).is_some());
+        let _ = try_load_bzip2_blocks(Some(&index), Some(&archive), false);
+        assert_eq!(names(), listing, "a lookup created files");
+        assert!(std::fs::read(&index).unwrap() == bytes, "sidecar rewritten");
+    }
+
+    /// Regression (R6-J4, audit D2-D4): the zstd, bzip2 and gzip block loaders
+    /// opened a published WAL sidecar read-only and left `-wal` / `-shm`
+    /// beside the archive. (The R6-G5 test above forces DELETE mode.)
+    #[test]
+    fn regression_blocks_loaders_of_a_wal_sidecar_create_no_side_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        {
+            let members = [ratarmount_formats_tar::UstarMember {
+                path: "f",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: &[],
+            }];
+            let mut file = std::fs::File::create(&archive).unwrap();
+            ratarmount_formats_tar::write_ustar_members(&mut file, &members).unwrap();
+            ratarmount_formats_tar::write_tar_eof(&mut file).unwrap();
+        }
+        let index = dir.path().join("a.tar.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            ..Default::default()
+        };
+        drop(open_path(&archive, &opts, true).expect("cold open"));
+        let mode: String = rusqlite::Connection::open(&index)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "the published sidecar is a WAL database");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        let names = || {
+            let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, bytes) = (names(), std::fs::read(&index).unwrap());
+        let _ = try_load_zstd_blocks(Some(&index), Some(&archive), false);
+        assert_eq!(names(), listing, "the zstd loader created files");
+        let _ = try_load_bzip2_blocks(Some(&index), Some(&archive), false);
+        assert_eq!(names(), listing, "the bzip2 loader created files");
+        let _ = try_load_gzip_index_blob(Some(&index), Some(&archive), false);
+        assert_eq!(names(), listing, "the gzip loader created files");
+        assert!(std::fs::read(&index).unwrap() == bytes, "sidecar rewritten");
+    }
+
+    /// Regression (R6-H2, B2): a sidecar that cannot be opened and validated
+    /// read-only (here an incomplete DELETE-journal database with no index
+    /// tables) fell back to a WRITABLE open in the zstd and bzip2 loaders, and
+    /// the gzip RGZI loader opened writable first; the writable open switched
+    /// the journal mode and created tables before anything was validated. A
+    /// lookup that only reads now refuses without touching the file: no bytes
+    /// change and no `-wal` / `-shm` / `-journal` file appears.
+    #[test]
+    fn regression_blocks_loaders_never_write_an_incomplete_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.bin");
+        std::fs::write(&archive, b"archive bytes").unwrap();
+        let index = dir.path().join("a.bin.index.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&index).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=DELETE; CREATE TABLE unrelated(x INTEGER); INSERT INTO unrelated VALUES (1);",
+            )
+            .unwrap();
+        }
+        let names = || {
+            let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, bytes) = (names(), std::fs::read(&index).unwrap());
+        assert!(try_load_zstd_blocks(Some(&index), Some(&archive), false).is_none());
+        assert!(try_load_bzip2_blocks(Some(&index), Some(&archive), false).is_none());
+        assert!(try_load_gzip_index_blob(Some(&index), Some(&archive), false).is_none());
+        assert_eq!(names(), listing, "a lookup created files");
+        assert!(
+            std::fs::read(&index).unwrap() == bytes,
+            "the sidecar was modified"
+        );
     }
 
     /// Regression: FR-9 plain `.zst` also auto-wires `zstdblocks` on open.
@@ -8035,6 +8496,84 @@ mod tests {
         );
     }
 
+    /// Regression (R6-K8, r11 review nit 6): the warm load of a nested file
+    /// table opened the outer index with `open_read_only`, which made SQLite
+    /// create `-wal` / `-shm` beside a WAL sidecar it was only asked to read.
+    #[test]
+    fn nested_durable_warm_load_creates_no_side_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("tar-data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("payload.txt"), b"tar-durable-payload\n").unwrap();
+        let tar_path = dir.path().join("inner-durable.tar");
+        assert!(std::process::Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&data)
+            .arg("payload.txt")
+            .status()
+            .unwrap()
+            .success());
+        let tar_bytes = std::fs::read(&tar_path).unwrap();
+        let body_size = tar_bytes.len() as u64;
+        let outer_idx = dir.path().join("outer-tar-nested.index.sqlite");
+        {
+            let mut idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            idx.ensure_nested_indexes_table().unwrap();
+            idx.publish_tmp().unwrap();
+        }
+        let opener = open_nested_reader_fn(OpenOptions::default());
+        let ctx = NestedOpenContext {
+            member_size: body_size,
+            offsetheader: Some(0),
+            member_path: "inner-durable.tar".into(),
+            outer_index_path: Some(outer_idx.clone()),
+            write_nested_index: true,
+            parent_is_root: false,
+            body_seek_is_cheap: true,
+        };
+        drop(
+            opener(
+                Box::new(std::io::Cursor::new(tar_bytes.clone())),
+                Path::new("inner-durable.tar"),
+                ctx.clone(),
+            )
+            .expect("cold nested TAR"),
+        );
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", outer_idx.display()));
+        }
+        let names = || {
+            let mut all: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            all.sort();
+            all
+        };
+        let (listing, bytes) = (names(), std::fs::read(&outer_idx).unwrap());
+        let warm = opener(
+            Box::new(std::io::Cursor::new(tar_bytes)),
+            Path::new("inner-durable.tar"),
+            NestedOpenContext {
+                write_nested_index: false,
+                ..ctx
+            },
+        )
+        .expect("warm nested TAR");
+        assert_eq!(
+            read_all(warm.as_ref(), "/payload.txt"),
+            b"tar-durable-payload\n"
+        );
+        drop(warm);
+        assert_eq!(names(), listing, "the warm load created files");
+        assert!(
+            std::fs::read(&outer_idx).unwrap() == bytes,
+            "sidecar rewritten"
+        );
+    }
+
     /// Regression: fingerprint mismatch must not reuse stale nested index.
     #[test]
     fn nested_durable_zip_invalidates_on_body_change() {
@@ -8664,9 +9203,124 @@ mod tests {
 #[path = "factory_tensors_tests.rs"]
 mod tensors_tests;
 
+#[cfg(test)]
+#[path = "factory_served_tests.rs"]
+mod served_tests;
+
 #[cfg(all(test, feature = "git", unix))]
 mod git_tests {
     use super::*;
+
+    /// Regression: local Git URL aliases must force Git mode throughout composition.
+    #[test]
+    fn regression_git_url_alias_forces_pinned_local_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        for bare in [false, true] {
+            let path = temp.path().join(if bare {
+                "bare @repo.git"
+            } else {
+                "working @repo"
+            });
+            let repo = if bare {
+                git2::Repository::init_bare(&path)
+            } else {
+                git2::Repository::init(&path)
+            }
+            .unwrap();
+            let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+            let mut builder = repo.treebuilder(None).unwrap();
+            builder
+                .insert("file", repo.blob(b"original").unwrap(), 0o100644)
+                .unwrap();
+            let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+            let first = repo
+                .commit(Some("HEAD"), &signature, &signature, "first", &tree, &[])
+                .unwrap();
+            builder
+                .insert("file", repo.blob(b"later").unwrap(), 0o100644)
+                .unwrap();
+            let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "later",
+                &tree,
+                &[&repo.find_commit(first).unwrap()],
+            )
+            .unwrap();
+            for path in [&path, &repo.path().to_owned()] {
+                let encoded = path
+                    .to_str()
+                    .unwrap()
+                    .replace('%', "%25")
+                    .replace(' ', "%20")
+                    .replace('@', "%40");
+                let url = PathBuf::from(format!("git://{encoded}#{first}"));
+                assert!(input_is_git(&url, &OpenOptions::default()));
+                let bundle = build_mount_source_ex(
+                    std::slice::from_ref(&url),
+                    &mut OpenOptions::default(),
+                    false,
+                    CompositingOptions::default(),
+                )
+                .unwrap();
+                let info = bundle.source.lookup("/file", 0).unwrap();
+                assert_eq!(bundle.source.read(&info, 99, 0).unwrap(), b"original");
+                assert!(bundle.source.lookup("/.git", 0).is_none());
+                assert!(open_path(
+                    &url,
+                    &OpenOptions {
+                        git_ref: Some("HEAD".into()),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .is_err());
+                let head = open_path(
+                    Path::new(&format!("git://{encoded}")),
+                    &OpenOptions::default(),
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    head.read(&head.lookup("file", 0).unwrap(), 99, 0).unwrap(),
+                    b"later"
+                );
+                let explicit = open_path(
+                    Path::new(&format!("git://{encoded}")),
+                    &OpenOptions {
+                        git_ref: Some(first.to_string()),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    explicit
+                        .read(&explicit.lookup("file", 0).unwrap(), 99, 0)
+                        .unwrap(),
+                    b"original"
+                );
+            }
+            repo.reference("refs/heads/master", first, true, "fixture fallback")
+                .unwrap();
+            repo.set_head("refs/heads/missing").unwrap();
+            let head_url = format!("git://{}", path.display());
+            assert!(
+                open_path(Path::new(&head_url), &OpenOptions::default(), false)
+                    .err()
+                    .unwrap()
+                    .contains("cannot resolve git ref \"HEAD\"")
+            );
+        }
+        assert!(
+            open_path(Path::new("git://host/repo"), &OpenOptions::default(), false)
+                .err()
+                .unwrap()
+                .contains("network git URLs are not supported; clone locally")
+        );
+    }
 
     /// Regression: the factory ignored explicit refs and mounted the future fix at HEAD.
     #[test]
@@ -8910,13 +9564,14 @@ mod git_tests {
         });
         assert!(session.is_ok(), "{}", session.err().unwrap());
         let mut remotes = Vec::new();
-        let (_, source) = remote_open::materialize_remote_input(
+        let source = remote_open::materialize_remote_input(
             url::Url::from_file_path(tar).unwrap().as_str(),
             &options,
             false,
             &mut remotes,
         )
-        .unwrap();
+        .unwrap()
+        .source;
         assert!(source.lookup("/before", 0).is_some());
     }
 
@@ -9227,7 +9882,12 @@ mod source_bind_tests {
             false,
             CompositingOptions::default(),
             SourceBindings {
-                sources: vec![image],
+                sources: vec![DeclaredSource {
+                    src: image,
+                    kind: ServedKind::Folder,
+                    location: None,
+                    label: "image".into(),
+                }],
                 binds: vec![SourceBind {
                     mount_path: "/repo".into(),
                     source: repo.to_string_lossy().into(),

@@ -335,7 +335,7 @@ fn tsv_paths(tsv: &str) -> Vec<&str> {
 #[test]
 fn search_cheap_overlay_create_visible() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(
+    let ov = WriteOverlay::new_for_tests(
         Arc::new(CheapBase::fits()) as Arc<dyn MountSource>,
         dir.path(),
     )
@@ -353,7 +353,7 @@ fn search_cheap_overlay_create_visible() {
 #[test]
 fn search_cheap_overlay_tombstone_hidden() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(
+    let ov = WriteOverlay::new_for_tests(
         Arc::new(CheapBase::fits()) as Arc<dyn MountSource>,
         dir.path(),
     )
@@ -369,7 +369,7 @@ fn search_cheap_overlay_tombstone_hidden() {
 #[test]
 fn search_cheap_overlay_cow_replace_no_duplicate() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(
+    let ov = WriteOverlay::new_for_tests(
         Arc::new(CheapBase::fits()) as Arc<dyn MountSource>,
         dir.path(),
     )
@@ -386,7 +386,7 @@ fn search_cheap_overlay_cow_replace_no_duplicate() {
 #[test]
 fn search_cheap_overlay_keeps_two_offsetheader_when_empty() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(
+    let ov = WriteOverlay::new_for_tests(
         Arc::new(CheapBase::two_offsetheader()) as Arc<dyn MountSource>,
         dir.path(),
     )
@@ -406,7 +406,7 @@ fn search_cheap_overlay_keeps_two_offsetheader_when_empty() {
 #[test]
 fn search_cheap_overlay_cow_collapses_two_offsetheader() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(
+    let ov = WriteOverlay::new_for_tests(
         Arc::new(CheapBase::two_offsetheader()) as Arc<dyn MountSource>,
         dir.path(),
     )
@@ -423,7 +423,8 @@ fn search_cheap_overlay_cow_collapses_two_offsetheader() {
 #[test]
 fn search_cheap_overlay_base_none_is_none() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(Arc::new(NoneBase) as Arc<dyn MountSource>, dir.path()).unwrap();
+    let ov = WriteOverlay::new_for_tests(Arc::new(NoneBase) as Arc<dyn MountSource>, dir.path())
+        .unwrap();
     overlay_write(&ov, "/only.fits", b"x");
     assert!(
         ov.search_cheap("*.fits").is_none(),
@@ -436,7 +437,8 @@ fn search_cheap_overlay_base_none_is_none() {
 #[test]
 fn search_cheap_base_none_control_file_sidecar_ok() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(Arc::new(NoneBase) as Arc<dyn MountSource>, dir.path()).unwrap();
+    let ov = WriteOverlay::new_for_tests(Arc::new(NoneBase) as Arc<dyn MountSource>, dir.path())
+        .unwrap();
     overlay_write(&ov, "/only.fits", b"hello!");
     let tsv = live_search_tsv(&ov, Some(&ov), "*.fits", sidecar_ok(vec![]));
     assert!(
@@ -449,7 +451,8 @@ fn search_cheap_base_none_control_file_sidecar_ok() {
 #[test]
 fn search_cheap_sidecar_err_skips_overlay_merge() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(Arc::new(NoneBase) as Arc<dyn MountSource>, dir.path()).unwrap();
+    let ov = WriteOverlay::new_for_tests(Arc::new(NoneBase) as Arc<dyn MountSource>, dir.path())
+        .unwrap();
     overlay_write(&ov, "/only.fits", b"x");
     let tsv = live_search_tsv(&ov, Some(&ov), "*.fits", sidecar_err());
     assert!(tsv.starts_with("error:"), "{tsv}");
@@ -460,7 +463,7 @@ fn search_cheap_sidecar_err_skips_overlay_merge() {
 #[test]
 fn search_cheap_replace_base() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(
+    let ov = WriteOverlay::new_for_tests(
         Arc::new(CheapBase::fits()) as Arc<dyn MountSource>,
         dir.path(),
     )
@@ -501,7 +504,7 @@ fn search_cheap_fts_never_calls_scan() {
 #[test]
 fn search_cheap_control_file_eq_socket_cow() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(
+    let ov = WriteOverlay::new_for_tests(
         Arc::new(CheapBase::fits()) as Arc<dyn MountSource>,
         dir.path(),
     )
@@ -539,7 +542,8 @@ fn search_cheap_control_file_eq_socket_cow() {
 #[test]
 fn search_cheap_control_file_eq_socket_none_create() {
     let dir = tempfile::tempdir().unwrap();
-    let ov = WriteOverlay::new(Arc::new(NoneBase) as Arc<dyn MountSource>, dir.path()).unwrap();
+    let ov = WriteOverlay::new_for_tests(Arc::new(NoneBase) as Arc<dyn MountSource>, dir.path())
+        .unwrap();
     overlay_write(&ov, "/only.fits", b"hello!");
     let ov = Arc::new(ov);
     let source: Arc<dyn MountSource> = Arc::clone(&ov) as Arc<dyn MountSource>;

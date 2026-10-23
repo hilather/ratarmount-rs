@@ -26,6 +26,9 @@ static MOUNT_LOCK: Mutex<()> = Mutex::new(());
 
 const MOUNT_DEADLINE: Duration = Duration::from_secs(10);
 const UNMOUNT_DEADLINE: Duration = Duration::from_secs(10);
+
+#[path = "../../ratarmount/tests/support/unmount.rs"]
+mod unmount;
 const DAEMON_EXIT_DEADLINE: Duration = Duration::from_secs(30);
 const KILL_REAP: Duration = Duration::from_secs(5);
 /// Post-reply notifier batch. Same wait as `fuse_rename.rs`.
@@ -791,7 +794,10 @@ impl MountGuard {
     }
 
     fn graceful_unmount(&mut self) -> Result<(), String> {
+        // Bounded EBUSY retry (desktop probers of the new mount); a mount that
+        // stays busy fails the test with its holders logged.
         if let Err(e) = graceful_fusermount_u(&self.mnt) {
+            unmount::log_holders(&self.mnt);
             return Err(format!(
                 "{e} (daemon pid {})\n{}",
                 self.daemon_pid,
