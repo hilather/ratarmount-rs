@@ -1250,6 +1250,62 @@ mod sidecar_s7 {
             .unwrap_or(0)
     }
 
+    /// Descriptors of this process that the server on `port` owns: sockets
+    /// on that port (listener and accepted connections, from
+    /// /proc/net/tcp{,6}) plus descriptors on `path` (Linux only). Other
+    /// tests of this binary run concurrently, so the whole-process count is
+    /// no oracle; this one is.
+    fn server_fds(port: u16, path: &Path) -> usize {
+        let mut inodes = std::collections::HashSet::new();
+        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            let Ok(text) = std::fs::read_to_string(table) else {
+                continue;
+            };
+            for line in text.lines().skip(1) {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                let port_of = |c: &str| {
+                    c.rsplit(':')
+                        .next()
+                        .and_then(|p| u16::from_str_radix(p, 16).ok())
+                };
+                if cols.len() > 9
+                    && (port_of(cols[1]) == Some(port) || port_of(cols[2]) == Some(port))
+                {
+                    inodes.insert(format!("socket:[{}]", cols[9]));
+                }
+            }
+        }
+        let sockets = std::fs::read_dir("/proc/self/fd")
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| {
+                        std::fs::read_link(e.path())
+                            .ok()
+                            .is_some_and(|l| inodes.contains(&*l.to_string_lossy()))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        sockets + fds_on(path)
+    }
+
+    /// Wait until [`server_fds`] is back to `want` (descriptors close on the
+    /// server threads after the client saw its reply).
+    fn settle(port: u16, path: &Path, want: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let got = server_fds(port, path);
+            if got <= want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "server descriptors never settled: {got} > {want}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn tempdir() -> (tempfile::TempDir, PathBuf) {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().canonicalize().unwrap();
@@ -1425,6 +1481,8 @@ mod sidecar_s7 {
             }),
         );
         let linux = cfg!(target_os = "linux");
+        // The listener plus the session's descriptors on the index.
+        let settled = server_fds(srv.addr.port(), &idx);
         for wave in 0..3 {
             gate.set(false);
             gate.acquired.store(0, Ordering::SeqCst);
@@ -1512,6 +1570,15 @@ mod sidecar_s7 {
         }
         if linux {
             assert!(fds_on(&idx) <= base + INDEX_SIDECAR_READERS);
+            // Every connection closed and every reader parked or reused:
+            // the server's descriptors are back where they started, apart
+            // from the (at most eight) parked index descriptors.
+            settle(srv.addr.port(), &idx, settled + INDEX_SIDECAR_READERS);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while server_fds(srv.addr.port(), &idx) - fds_on(&idx) > settled - base {
+                assert!(Instant::now() < deadline, "a socket was left behind");
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         assert!(other_process_sees_lock(&idx), "lock held throughout");
         drop(srv);
@@ -1534,19 +1601,32 @@ mod sidecar_s7 {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let (_d, dir) = tempdir();
         let idx = dir.join("big.index.sqlite");
-        // Larger than the loopback socket buffers.
-        let block: Vec<u8> = (0..1 << 20).map(|i| (i % 251) as u8).collect();
-        {
-            let mut f = std::fs::File::create(&idx).unwrap();
-            for _ in 0..32 {
-                f.write_all(&block).unwrap();
-            }
-        }
+        // A WAL index larger than the loopback socket buffers, whose
+        // main-file lock a session holds throughout.
+        let bytes = Arc::new(wal_index(&idx, 320));
+        let h = holder(&idx);
+        assert!(other_process_sees_lock(&idx));
+        let gate = Arc::new(Gate {
+            open: Mutex::new(true),
+            cv: Condvar::new(),
+            acquired: AtomicUsize::new(0),
+            fail_chunks: AtomicBool::new(false),
+        });
+        let g2 = Arc::clone(&gate);
         let srv = serve(
             &idx,
             SidecarAdmission {
                 write_timeout: Duration::from_millis(300),
-                ..SidecarAdmission::default()
+                ..admission(move |s| {
+                    if s == SidecarStage::Acquired {
+                        g2.acquired.fetch_add(1, Ordering::SeqCst);
+                        let mut open = g2.open.lock().unwrap();
+                        while !*open {
+                            open = g2.cv.wait(open).unwrap();
+                        }
+                    }
+                    Ok(())
+                })
             },
         );
         let stalled: Vec<TcpStream> = (0..INDEX_SIDECAR_READERS)
@@ -1556,18 +1636,42 @@ mod sidecar_s7 {
                 s
             })
             .collect();
-        std::thread::sleep(Duration::from_millis(100));
+        gate.wait_acquired(INDEX_SIDECAR_READERS);
         let saturated = status(&exchange(srv.addr, HEAD));
         assert_eq!(saturated, 503, "eight stalled readers hold every permit");
+        // Every permit comes back while the stalled sockets are still open:
+        // eight readers are admitted at once, and a ninth is refused.
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let raw = exchange(srv.addr, HEAD);
-            if status(&raw) == 200 {
+            gate.set(false);
+            gate.acquired.store(0, Ordering::SeqCst);
+            let clients: Vec<_> = (0..INDEX_SIDECAR_READERS)
+                .map(|_| {
+                    let addr = srv.addr;
+                    std::thread::spawn(move || status(&exchange(addr, HEAD)))
+                })
+                .collect();
+            std::thread::sleep(Duration::from_millis(300));
+            let got = gate.acquired.load(Ordering::SeqCst);
+            let ninth = (got == INDEX_SIDECAR_READERS).then(|| status(&exchange(srv.addr, HEAD)));
+            gate.set(true);
+            let codes: Vec<u16> = clients.into_iter().map(|c| c.join().unwrap()).collect();
+            if got == INDEX_SIDECAR_READERS && codes.iter().all(|&c| c == 200) {
+                assert_eq!(ninth, Some(503), "only eight permits");
                 break;
             }
-            assert!(Instant::now() < deadline, "stalled readers never timed out");
+            assert!(
+                Instant::now() < deadline,
+                "stalled readers never released every permit: {got} admitted, {codes:?}"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
+        // A full read still works and the session's lock was never released.
+        assert_eq!(split_head_body(&exchange(srv.addr, GET)).1, &bytes[..]);
+        assert!(other_process_sees_lock(&idx), "lock held throughout");
         drop(stalled);
+        drop(srv);
+        drop(h);
+        assert!(!other_process_sees_lock(&idx));
     }
 }

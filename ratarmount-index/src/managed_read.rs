@@ -93,6 +93,7 @@ impl ManagedReadCursor {
 
     /// `fsync` the file (through the owner; no reopen).
     pub fn sync_all(&self) -> io::Result<()> {
+        seams::fire(Seam::BeforeSync)?;
         self.lock().sync()
     }
 
@@ -324,6 +325,7 @@ pub fn copy_create_or_truncate(src: &Path, dest: &Path) -> io::Result<u64> {
         opts.mode(meta.permissions().mode() & 0o7777);
     }
     let mut file = opts.open(dest)?;
+    seams::fire(Seam::BeforePermissions)?;
     file.set_permissions(meta.permissions())?;
     seams::fire(Seam::BeforeFirstWrite)?;
     let len = copy_cursor(&mut c, &mut file, None)?;
@@ -353,6 +355,8 @@ pub enum Seam {
     AfterOpen,
     /// Before each read.
     BeforeRead,
+    /// Before the owner's `fsync` (`xSync`); an error stands for its failure.
+    BeforeSync,
     /// Before the owner is closed (`xClose`).
     BeforeClose,
     /// After the owner was closed.

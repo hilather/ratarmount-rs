@@ -5204,6 +5204,7 @@ mod tests {
     #[test]
     fn regression_internal_copy_destination_failures_remote_final_name() {
         use ratarmount_index::managed_read::{seams, Seam};
+        use std::os::unix::fs::PermissionsExt;
         let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
@@ -5244,6 +5245,55 @@ mod tests {
         let partial = fs::metadata(&dest).expect("the final name stays").len();
         assert!(partial < bytes.len() as u64, "partial destination");
         assert_eq!(mode_of(&dest), 0o600);
+
+        // Destination-permission failures: the source's mode cannot be
+        // applied (injected), or the existing final name is not writable
+        // (mode 000). Both fall back to the fetched path, write nothing
+        // and leave the final name as it was.
+        for case in ["chmod", "unwritable"] {
+            let _ = fs::remove_file(&dest);
+            fs::write(&dest, b"").unwrap();
+            let mode = if case == "unwritable" { 0o000 } else { 0o644 };
+            fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).unwrap();
+            if case == "unwritable" && fs::OpenOptions::new().write(true).open(&dest).is_ok() {
+                eprintln!("skip: running as root, a mode-000 file is writable");
+                continue;
+            }
+            let mut opts = OpenOptions::default();
+            let ok = seams::with(
+                move |s| {
+                    if case == "chmod" && s == Seam::BeforePermissions {
+                        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                    }
+                    Ok(())
+                },
+                || {
+                    let (p, x, f) = s7_fingerprints();
+                    try_install_remote_index(
+                        &mut opts,
+                        blob.clone(),
+                        1024,
+                        Some(&p),
+                        Some(&x),
+                        Some(&f),
+                        Some(&dest),
+                    )
+                },
+            );
+            assert!(ok, "{case}");
+            assert_eq!(
+                opts.index_file_path.as_deref(),
+                Some(blob.as_path()),
+                "{case}: fetched-path fallback"
+            );
+            assert_eq!(
+                fs::metadata(&dest).unwrap().len(),
+                0,
+                "{case}: nothing written"
+            );
+            assert_eq!(mode_of(&dest), mode, "{case}: final name untouched");
+        }
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
 

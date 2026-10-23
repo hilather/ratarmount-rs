@@ -263,15 +263,43 @@ fn regression_meta_cache_install_keeps_source_index_lock() {
     );
     assert!(other_process_sees_lock(&fetched), "install kept the lock");
     drop(h);
-    // src == dest: the installed blob is re-hashed through a managed cursor.
+    // src == dest (the same key's own blob): it is re-hashed through a
+    // managed cursor, not copied.
+    assert_eq!(cache.blob_path_for(url), blob);
     let h = holder(&blob);
-    let again = cache
-        .get_or_fetch_path_with_etag::<io::Error, _>("http|other", None, || {
-            Ok((blob.clone(), None))
+    // (The byte comparisons read through managed reads: a raw read would
+    // release the holder's lock.)
+    let again = cache.install_for(url, &blob).unwrap();
+    assert_eq!(again, blob);
+    assert_eq!(
+        crate::managed_read::read(&blob).unwrap(),
+        bytes,
+        "not rewritten"
+    );
+    assert!(other_process_sees_lock(&blob), "re-hash kept the lock");
+    // A failed re-hash is an error that keeps the blob and its entry.
+    // (Eviction reads headers first: fail only the blob's own reads.)
+    let b2 = blob.clone();
+    let fail_blob = move |s| {
+        if s == Seam::BeforeRead && seams::opened_path().as_deref() == Some(b2.as_path()) {
+            return Err(io::Error::other("injected blob read failure"));
+        }
+        Ok(())
+    };
+    let got = seams::with(fail_blob, || cache.install_for(url, &blob));
+    assert!(got.unwrap_err().to_string().contains("injected"));
+    assert_eq!(
+        crate::managed_read::read(&blob).unwrap(),
+        bytes,
+        "blob kept"
+    );
+    assert!(other_process_sees_lock(&blob));
+    let hit = cache
+        .get_or_fetch_path_with_etag::<io::Error, _>(url, None, || {
+            panic!("the entry must still be a hit")
         })
         .unwrap();
-    assert!(again.exists());
-    assert!(other_process_sees_lock(&blob));
+    assert_eq!(hit, blob);
     negative_control(&blob);
     drop(h);
 }
@@ -576,9 +604,27 @@ fn regression_index_publish_sync_keeps_aliased_database_lock() {
 
     let dest = dir.join("b.index.sqlite");
     let mut idx = content_index(Some(&dest));
-    let e = seams::with(fail_open(1), || idx.publish_tmp());
-    assert!(e.is_err(), "sync failure fails the publish");
-    assert!(!dest.exists(), "nothing published");
+    // The managed open succeeds; its fsync fails.
+    let (opened, synced) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let (o2, s2) = (Rc::clone(&opened), Rc::clone(&synced));
+    let e = seams::with(
+        move |s| {
+            match s {
+                Seam::AfterOpen => o2.set(o2.get() + 1),
+                Seam::BeforeSync => {
+                    s2.set(s2.get() + 1);
+                    return Err(io::Error::other("injected fsync failure"));
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+        || idx.publish_tmp(),
+    );
+    let e = e.expect_err("sync failure fails the publish");
+    assert!(e.to_string().contains("injected fsync failure"), "{e}");
+    assert_eq!((opened.get(), synced.get()), (1, 1), "failed at the sync");
+    assert!(!dest.exists(), "nothing published (no rename)");
 }
 
 /// Regression: a failed mandatory read never yields a successful result:
