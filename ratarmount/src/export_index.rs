@@ -1,7 +1,7 @@
 //! Streaming index export; no FUSE or payload reads are required for sidecars.
 
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
@@ -98,7 +98,9 @@ fn inputs(args: &ExportArgs) -> Result<Vec<Input>> {
     let mut result = Vec::new();
     for path in &args.inputs {
         if path.file_name().is_some_and(|s| s == "shards.json") {
-            let manifest: Manifest = serde_json::from_reader(File::open(path)?)?;
+            // Managed (#151): every internal input of export-index.
+            let manifest: Manifest =
+                serde_json::from_slice(&ratarmount_index::managed_read::read(path)?)?;
             if manifest.format != "ratarmount-shards-v1" {
                 return Err("unsupported shard manifest format".into());
             }
@@ -116,9 +118,8 @@ fn inputs(args: &ExportArgs) -> Result<Vec<Input>> {
             }
         } else {
             // Accept named or anonymous SQLite sidecars; do not rely on suffixes.
-            let mut magic = [0; 16];
-            let mut file = File::open(path)?;
-            let sqlite = file.read(&mut magic)? == magic.len() && &magic == b"SQLite format 3\0";
+            let magic = ratarmount_index::managed_read::read_prefix(path, 16)?;
+            let sqlite = magic.as_slice() == b"SQLite format 3\0";
             let sidecar = if sqlite {
                 let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
                 conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='files')", [], |r| r.get::<_, bool>(0))?
@@ -202,8 +203,8 @@ fn frame_map(index: &SqliteIndex, archive: Option<&Path>) -> Result<Vec<ZstdFram
         }
     }
     if let Some(archive) = archive {
-        let mut magic = [0; 4];
-        if File::open(archive)?.read(&mut magic)? == 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+        let magic = ratarmount_index::managed_read::read_prefix(archive, 4)?;
+        if magic.as_slice() == [0x28, 0xb5, 0x2f, 0xfd] {
             return Ok(scan_zstd_frames_path(archive)?.frames);
         }
     }
@@ -819,5 +820,62 @@ mod tests {
         let archive = output.join(&manifest.shards[0].name);
         assert!(run(&args(&[archive], &index, "jsonl")).is_err());
         assert_eq!(fs::read(&index).unwrap(), bytes);
+    }
+
+    /// Regression (R11-S7, #151): export-index read its internal inputs (the
+    /// shards.json manifest, the SQLite magic of each sidecar, the zstd magic
+    /// of each archive) with raw `File`s; the index a session holds open lost
+    /// its lock. Every managed close keeps a lock taken on the file.
+    #[cfg(unix)]
+    #[test]
+    fn regression_export_index_input_reads_keep_index_lock() {
+        use ratarmount_index::managed_read::{
+            lock_probe::other_process_sees_lock, with_close_probes,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        fs::create_dir(&input).unwrap();
+        shard::tests::dataset(&input);
+        let output = temp.path().join("shards");
+        let manifest = shard::run(&shard::tests::args(&input, &output, &[])).unwrap();
+        let index_path = output.join(manifest.shards[0].index.as_ref().unwrap());
+        let holder = Connection::open(&index_path).unwrap();
+        holder.execute_batch("BEGIN").unwrap();
+        let _: i64 = holder
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert!(other_process_sees_lock(&index_path));
+        let target = temp.path().join("rows.jsonl");
+        let (got, probes) = with_close_probes(
+            |_| true,
+            || {
+                run(&args(
+                    &[output.join("shards.json"), index_path.clone()],
+                    &target,
+                    "jsonl",
+                ))
+            },
+        );
+        got.unwrap();
+        assert!(!probes.is_empty());
+        assert!(probes.iter().all(|(_, kept)| *kept), "{probes:?}");
+        for what in ["shards.json", ".index.sqlite"] {
+            assert!(
+                probes
+                    .iter()
+                    .any(|(p, _)| p.to_string_lossy().ends_with(what)),
+                "{what} read through a managed reader: {probes:?}"
+            );
+        }
+        assert!(other_process_sees_lock(&index_path), "session lock kept");
+        drop(holder);
+        // The frame map's zstd magic probe (an index without zstd blocks);
+        // the frame scan after it is a residual format reader (#196).
+        let archive = output.join(&manifest.shards[0].name);
+        let empty = SqliteIndex::create_writable(None).unwrap();
+        let (frames, probes) = with_close_probes(|_| true, || frame_map(&empty, Some(&archive)));
+        assert!(!frames.unwrap().is_empty());
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        assert!(probes[0].1, "magic probe kept the lock: {probes:?}");
     }
 }

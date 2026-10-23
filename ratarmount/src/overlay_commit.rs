@@ -932,7 +932,9 @@ fn publish_hf(
     let pointer = IndexPointer::for_blob(&sidecar, Some(&req.staged))
         .map_err(|e| retryable(e.to_string()))?;
     let json = index_pointer_to_json(&pointer).map_err(|e| retryable(e.to_string()))?;
-    let blob = std::fs::read(&sidecar).map_err(|e| retryable(e.to_string()))?;
+    // Managed (#151): the sidecar is the mount's own index.
+    let blob =
+        ratarmount_index::managed_read::read(&sidecar).map_err(|e| retryable(e.to_string()))?;
     let blob_path = format!(
         "{}.index.{}.sqlite",
         state.repo.location.path, pointer.index_id
@@ -1122,7 +1124,8 @@ fn publish_s3(
             etag.unwrap_or("-")
         );
         let put = if len <= S3_PUT_SINGLE_MAX {
-            let body = std::fs::read(&req.staged)
+            // Managed (#151): the staged archive may be a database open here.
+            let body = ratarmount_index::managed_read::read(&req.staged)
                 .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
             ratarmount_remote::put_s3_object(&loc, &body, etag, Some("application/octet-stream"))
         } else {
@@ -1308,7 +1311,8 @@ fn publish_gcs(
             return Ok(());
         }
     };
-    let blob = match std::fs::read(&sidecar) {
+    // Managed (#151): the sidecar is the mount's own index.
+    let blob = match ratarmount_index::managed_read::read(&sidecar) {
         Ok(b) => b,
         Err(e) => {
             log::warn!("gcs index blob read failed after object replace: {e}");
@@ -3182,6 +3186,164 @@ mod tests {
             "PutObject HTTP 500: body mentions HTTP 412".into(),
         ));
         assert!(matches!(retry, RemotePublishError::Retryable(_)), "{retry}");
+    }
+
+    // ---------------------------------------------------------------------
+    // R11-S7 (#151): live-commit publication reads index and archive bytes
+    // through managed readers.
+    // ---------------------------------------------------------------------
+
+    type Publish = fn(&str, &OpenOptions, &RemotePublishRequest) -> Result<(), RemotePublishError>;
+
+    /// Publish `a.tar` to `{scheme}://bucket/a.tar`; every managed read of the
+    /// mount's index and the staged archive keeps a lock taken on the file it
+    /// reads (a session's read transaction held across the publish would
+    /// block the sidecar patch, so the lock is taken at each managed open).
+    #[cfg(unix)]
+    fn s7_object_store_publish(scheme: &str, publish: Publish) {
+        use crate::publish_index::tests::{publish_tar, PublishEnv, PublishServer};
+        use ratarmount_index::managed_read::with_close_probes;
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("a.tar");
+        std::fs::write(&tar, publish_tar()).unwrap();
+        let sidecar = dir.path().join("index.sqlite");
+        let mut build = OpenOptions {
+            index_file_path: Some(sidecar.clone()),
+            ..Default::default()
+        };
+        drop(
+            crate::factory::build_mount_source(
+                std::slice::from_ref(&tar),
+                &mut build,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let server = PublishServer::new(publish_tar(), false, false);
+        let _env = PublishEnv::new(&[
+            ("AWS_ACCESS_KEY_ID", "test"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_ENDPOINT_URL", &server.url),
+            ("AWS_REGION", "us-east-1"),
+            ("RATARMOUNT_S3_ANONYMOUS", "0"),
+            ("AWS_ANONYMOUS", "0"),
+            ("RATARMOUNT_GCS_ENDPOINT", &server.url),
+            ("GOOGLE_OAUTH_ACCESS_TOKEN", "test"),
+            ("RATARMOUNT_GCS_ANONYMOUS", "0"),
+            ("AZURE_STORAGE_ACCOUNT", "test"),
+            ("AZURE_STORAGE_KEY", "c2VjcmV0"),
+            ("AZURE_STORAGE_ENDPOINT", &server.url),
+            ("RATARMOUNT_AZURE_ANONYMOUS", "0"),
+        ]);
+        let stats = ratarmount_index::tar_stats_from_path(&tar).unwrap();
+        let req = RemotePublishRequest {
+            staged: tar.clone(),
+            prefix_compressed_bytes: 0,
+            etag_at_download: None,
+            window: ratarmount_compositing::IndexPatchWindow {
+                window_start: 0,
+                from_frame: None,
+                offsets_shifted: false,
+            },
+            skip_object_put: false,
+            presplice_len: stats.st_size,
+            presplice_sha256: stats.full_sha256.clone().unwrap(),
+            presplice_prefix512_sha256: stats.prefix512_sha256.clone().unwrap(),
+            presplice_suffix512_sha256: stats.suffix512_sha256.clone().unwrap(),
+            commit_generation: 1,
+        };
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar.clone()),
+            index_in_memory: false,
+            ..Default::default()
+        };
+        let url = format!("{scheme}://bucket/a.tar");
+        let (got, probes) = with_close_probes(|_| true, || publish(&url, &opts, &req));
+        got.unwrap_or_else(|e| panic!("{scheme}: {e}"));
+        assert!(
+            probes
+                .iter()
+                .any(|(p, _)| *p == sidecar.canonicalize().unwrap()),
+            "{scheme}: the index was read through a managed reader: {probes:?}"
+        );
+        assert!(
+            probes
+                .iter()
+                .any(|(p, _)| *p == tar.canonicalize().unwrap()),
+            "{scheme}: the staged archive was read through a managed reader: {probes:?}"
+        );
+        assert!(probes.iter().all(|(_, kept)| *kept), "{scheme}: {probes:?}");
+        let puts = server
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(m, _, _)| m == "PUT")
+            .count();
+        assert!(puts >= 2, "{scheme}: archive and pointer were put");
+    }
+
+    /// Regression (R11-S7, #151): the S3 live commit read the staged archive
+    /// (single PutObject body) and the mount's index (pointer hash, sibling
+    /// body) through raw `File`s.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_s3_reads_keep_index_lock() {
+        s7_object_store_publish("s3", publish_s3);
+    }
+
+    /// Regression (R11-S7, #151): the GCS live commit read the staged archive
+    /// (MD5 + body) and the index blob through raw `File`s.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_gcs_reads_keep_index_lock() {
+        s7_object_store_publish("gs", publish_gcs);
+    }
+
+    /// Regression (R11-S7, #151): the Azure live commit read the staged archive
+    /// and the index (pointer hash, sibling body) through raw `File`s.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_azure_reads_keep_index_lock() {
+        s7_object_store_publish("az", publish_azure);
+    }
+
+    /// Regression (R11-S7, #151): the Hub live commit read the fresh sidecar's
+    /// body and the staged archive (pointer tarstats, LFS upload) through raw
+    /// `File`s; every managed read keeps a lock taken on the file it reads.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_hf_reads_keep_index_lock() {
+        use crate::publish_index::tests::{PublishEnv, PublishServer};
+        use ratarmount_index::managed_read::with_close_probes;
+        let dir = tempfile::tempdir().unwrap();
+        let server = PublishServer::live(hf_test_archive(true));
+        let _env = PublishEnv::new(&[
+            ("HF_ENDPOINT", &server.url),
+            ("HF_TOKEN", "hf-test"),
+            ("HF_HUB_OFFLINE", "0"),
+            ("RATARMOUNT_HF_SHARE_CACHE", "0"),
+            ("RATARMOUNT_PAYLOAD_CACHE_BYTES", "0"),
+            ("XDG_CACHE_HOME", dir.path().join("cache").to_str().unwrap()),
+            (
+                "RATARMOUNT_HF_TREE_CACHE",
+                dir.path().join("trees").to_str().unwrap(),
+            ),
+        ]);
+        let url = "hf://datasets/org/data@main/a.tar.zst";
+        let overlay = hf_test_overlay(url, &dir.path().join("ov"), false);
+        std::fs::write(overlay.root().join("hello.txt"), b"new bytes").unwrap();
+        let (got, probes) = with_close_probes(|_| true, || hf_test_tick(&overlay, url));
+        assert_eq!(got.unwrap(), CommitOutcome::DidWork);
+        assert!(
+            probes
+                .iter()
+                .any(|(p, _)| p.file_name().unwrap() == "index.sqlite"),
+            "the sidecar body was read through a managed reader: {probes:?}"
+        );
+        assert!(probes.iter().all(|(_, kept)| *kept), "{probes:?}");
     }
 }
 

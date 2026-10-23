@@ -54,6 +54,9 @@ pub struct ManagedReadCursor {
 
 struct Owner {
     file: std::mem::ManuallyDrop<Mutex<imp::ByteFile>>,
+    /// The path as given (for test seams at close).
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+    path: std::path::PathBuf,
 }
 
 impl ManagedReadCursor {
@@ -64,6 +67,7 @@ impl ManagedReadCursor {
         Ok(Self {
             owner: Arc::new(Owner {
                 file: std::mem::ManuallyDrop::new(Mutex::new(file)),
+                path: seams::opened_path_or(path),
             }),
             pos: 0,
         })
@@ -157,9 +161,11 @@ impl Seek for ManagedReadCursor {
 
 impl Drop for Owner {
     fn drop(&mut self) {
+        seams::set_path(&self.path);
         let _ = seams::fire(Seam::BeforeClose);
         // SAFETY: dropped exactly once, here.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.file) };
+        seams::set_path(&self.path);
         let _ = seams::fire(Seam::AfterClose);
     }
 }
@@ -387,6 +393,11 @@ pub mod seams {
         PATH.with(|p| *p.borrow_mut() = Some(path.to_path_buf()));
     }
 
+    /// The resolved path of the open just done (else `path`).
+    pub(crate) fn opened_path_or(path: &std::path::Path) -> std::path::PathBuf {
+        opened_path().unwrap_or_else(|| path.to_path_buf())
+    }
+
     /// Run `f` with `hook` installed on this thread.
     pub fn with<R>(hook: impl FnMut(Seam) -> io::Result<()> + 'static, f: impl FnOnce() -> R) -> R {
         struct Reset;
@@ -422,6 +433,10 @@ mod seams {
     use super::Seam;
     #[inline(always)]
     pub(crate) fn set_path(_: &std::path::Path) {}
+    #[inline(always)]
+    pub(crate) fn opened_path_or(_: &std::path::Path) -> std::path::PathBuf {
+        std::path::PathBuf::new()
+    }
     #[inline(always)]
     pub(crate) fn fire(_: Seam) -> std::io::Result<()> {
         Ok(())
@@ -852,6 +867,54 @@ pub mod lock_probe {
             }
         }
     }
+}
+
+/// Run `f`; for every managed read on this thread of a path `want` accepts,
+/// hold a SHARED lock of this SQLite instance on that file from the open to
+/// the close, and record whether another process still sees it right after
+/// the managed close (the close must not release it). Tests only.
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
+pub fn with_close_probes<R>(
+    want: impl Fn(&Path) -> bool + 'static,
+    f: impl FnOnce() -> R,
+) -> (R, Vec<(std::path::PathBuf, bool)>) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let held: Rc<RefCell<Vec<(std::path::PathBuf, VfsLockHolder)>>> = Rc::default();
+    let seen: Rc<RefCell<Vec<(std::path::PathBuf, bool)>>> = Rc::default();
+    let (h2, s2) = (Rc::clone(&held), Rc::clone(&seen));
+    let r = seams::with(
+        move |s| {
+            let Some(path) = seams::opened_path() else {
+                return Ok(());
+            };
+            if !want(&path) {
+                return Ok(());
+            }
+            match s {
+                Seam::AfterOpen => {
+                    if let Ok(lock) = VfsLockHolder::shared(&path) {
+                        h2.borrow_mut().push((path, lock));
+                    }
+                }
+                Seam::AfterClose => {
+                    let mut held = h2.borrow_mut();
+                    if let Some(i) = held.iter().rposition(|(p, _)| *p == path) {
+                        let (p, lock) = held.remove(i);
+                        let kept = lock_probe::other_process_sees_lock(&p);
+                        s2.borrow_mut().push((p, kept));
+                        drop(lock);
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+        f,
+    );
+    held.borrow_mut().clear();
+    let seen = seen.borrow().clone();
+    (r, seen)
 }
 
 /// Holds a SHARED lock on any file through this SQLite instance's own VFS

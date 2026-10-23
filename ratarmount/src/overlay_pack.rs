@@ -249,13 +249,22 @@ fn append_host<W: Write>(
             )
         }
         0o100000 => {
-            let mut file = match replacement {
-                Some(copy) => File::open(copy)?,
-                None => File::from(openat_admitted(&fd, name.as_str(), regular_flags())?),
-            };
             h.set_entry_type(tar::EntryType::Regular);
-            h.set_size(file.metadata()?.len());
-            tar.append_data(&mut h, archive_path, &mut file)
+            match replacement {
+                // The layer database's SQLite snapshot, read through a managed
+                // reader (#151): its close keeps this process's locks.
+                Some(copy) => {
+                    let mut file = ratarmount_index::managed_read::ManagedReadCursor::open(copy)?;
+                    h.set_size(file.len()?);
+                    tar.append_data(&mut h, archive_path, &mut file)
+                }
+                None => {
+                    let mut file =
+                        File::from(openat_admitted(&fd, name.as_str(), regular_flags())?);
+                    h.set_size(file.metadata()?.len());
+                    tar.append_data(&mut h, archive_path, &mut file)
+                }
+            }
         }
         _ => Err(invalid(format!("unsupported layer entry {path}"))),
     }
@@ -340,7 +349,8 @@ pub fn pack(
                     // not copy without a raw read of the live files.
                     let copy = staging.path().canonicalize()?.join("index.sqlite");
                     ratarmount_index::snapshot_index_into(&index, &copy)?;
-                    let file = File::open(&copy)?;
+                    // Its bytes through a managed reader (#151).
+                    let file = ratarmount_index::managed_read::ManagedReadCursor::open(&copy)?;
                     let name = format!(
                         "index/{}",
                         index
@@ -348,7 +358,7 @@ pub fn pack(
                             .ok_or_else(|| invalid("index name"))?
                             .to_string_lossy()
                     );
-                    let mut h = header(0o444, 0, file.metadata()?.len(), tar::EntryType::Regular);
+                    let mut h = header(0o444, 0, file.len()?, tar::EntryType::Regular);
                     tar.append_data(&mut h, name, file)?;
                 }
             }
@@ -4135,5 +4145,60 @@ pub(crate) mod tests {
             Err("stop".into())
         });
         assert!(reached.get(), "a local recorded base must be classified");
+    }
+
+    /// Regression (R11-S7, #151): the bundle's database member (the layer
+    /// database's `VACUUM INTO` copy) and the `--include-index` member (the
+    /// index's checked snapshot) were read through raw `File`s; a lock taken
+    /// on those output inodes before the read was released by its close.
+    /// Here a lock of this SQLite instance is taken on each snapshot output at
+    /// the managed open (the consumption seam) and checked right after the
+    /// managed close.
+    #[cfg(unix)]
+    #[test]
+    fn regression_pack_snapshot_output_readers_keep_database_lock() {
+        use ratarmount_index::managed_read::with_close_probes;
+        let f = Fixture::new(true);
+        let base = f.tmp.path().join("base.tar");
+        let mut tar = tar::Builder::new(File::create(&base).unwrap());
+        append_bytes(&mut tar, "hello", b"base").unwrap();
+        tar.finish().unwrap();
+        let index = ratarmount_index::default_index_path(&base);
+        ratarmount_session::IndexJob::run(
+            crate::shard::index_request(&base, &index),
+            Default::default(),
+        )
+        .unwrap();
+        let bundle = f.tmp.path().join("snap.tar.zst");
+        let staging = |p: &Path| {
+            let name = p.file_name().unwrap_or_default();
+            name == HIDDEN_DB || name == "index.sqlite"
+        };
+        let (got, probes) = with_close_probes(staging, || {
+            pack(
+                &f.dir,
+                &bundle,
+                f.base.clone(),
+                &PackOptions {
+                    include_index: true,
+                    base: Some(base.clone()),
+                    ..Default::default()
+                },
+            )
+        });
+        got.unwrap();
+        assert!(
+            probes
+                .iter()
+                .any(|(p, _)| p.file_name().unwrap() == HIDDEN_DB),
+            "database snapshot read through a managed reader: {probes:?}"
+        );
+        assert!(
+            probes
+                .iter()
+                .any(|(p, _)| p.file_name().unwrap() == "index.sqlite"),
+            "included index snapshot read through a managed reader: {probes:?}"
+        );
+        assert!(probes.iter().all(|(_, kept)| *kept), "{probes:?}");
     }
 }
