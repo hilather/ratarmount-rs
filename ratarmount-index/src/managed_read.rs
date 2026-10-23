@@ -175,6 +175,35 @@ impl Drop for Owner {
 // Whole-file helpers.
 // --------------------------------------------------------------------------
 
+/// The error payload of a managed open refused because the path is not a
+/// regular file (a directory, FIFO, socket or device). Callers that treat
+/// such a name as absent tell it apart with [`is_not_regular_file`]; any
+/// other `InvalidInput` (an `EINVAL` from a read) is a real I/O error.
+#[derive(Debug)]
+struct NotRegularFile(String);
+
+impl std::fmt::Display for NotRegularFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is not a regular file", self.0)
+    }
+}
+
+impl std::error::Error for NotRegularFile {}
+
+fn not_regular_file(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        NotRegularFile(path.display().to_string()),
+    )
+}
+
+/// Whether `e` is a managed open's refusal of a path that is not a regular
+/// file (not any other `InvalidInput`).
+pub fn is_not_regular_file(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<NotRegularFile>().is_some())
+}
+
 /// Read the whole file. The buffer is reserved fallibly: a file larger than
 /// the memory this process may allocate is an `OutOfMemory` error, not an
 /// abort.
@@ -584,10 +613,7 @@ mod imp {
             let real = std::fs::canonicalize(path)?;
             // Only regular files (a FIFO would block in `open`).
             if !std::fs::metadata(&real)?.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{} is not a regular file", real.display()),
-                ));
+                return Err(super::not_regular_file(&real));
             }
             if crate::checked_open::thread_is_acquiring() {
                 return Err(io::Error::new(
@@ -828,10 +854,7 @@ mod imp {
             super::XOPEN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let file = File::open(path)?;
             if !file.metadata()?.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{} is not a regular file", path.display()),
-                ));
+                return Err(super::not_regular_file(path));
             }
             super::seams::fire(super::Seam::AfterOpen)?;
             Ok(Self { file })

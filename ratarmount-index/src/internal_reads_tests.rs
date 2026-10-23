@@ -369,6 +369,79 @@ fn regression_meta_cache_read_error_preserves_blob() {
     assert!(got.1, "an evicted blob is refetched");
 }
 
+/// Regression (R11-S7-FIX10): any `InvalidInput` from a managed read was a
+/// cache miss, so an `EINVAL` while reading a valid header or blob deleted
+/// both files and refetched. Only a refused non-regular file (or a missing
+/// one) is a miss; an `EINVAL` read error propagates and keeps the entry.
+#[test]
+fn regression_meta_cache_einval_read_keeps_entry_non_regular_is_miss() {
+    let (_d, dir) = tempdir();
+    let cache = meta_cache(&dir);
+    let fetched = dir.join("fetched.sqlite");
+    database(&fetched, false);
+    let url = "http|https://example.invalid/einval.index.sqlite";
+    let blob = cache
+        .get_or_fetch_path_with_etag::<io::Error, _>(url, None, || Ok((fetched.clone(), None)))
+        .unwrap();
+    let hdr = PathBuf::from(format!("{}.hdr", blob.display()));
+    let (bytes, hdr_bytes) = (std::fs::read(&blob).unwrap(), std::fs::read(&hdr).unwrap());
+    for target in [hdr.clone(), blob.clone()] {
+        let t = target.clone();
+        let einval = move |s| {
+            if s == Seam::BeforeRead && seams::opened_path().as_deref() == Some(t.as_path()) {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            Ok(())
+        };
+        let got = seams::with(einval, || {
+            cache.get_or_fetch_path_with_etag::<io::Error, _>(url, None, || {
+                panic!("an EINVAL read of {} must not refetch", target.display())
+            })
+        });
+        let err = got.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(!crate::managed_read::is_not_regular_file(&err), "{err}");
+        assert_eq!(std::fs::read(&blob).unwrap(), bytes, "blob kept");
+        assert_eq!(std::fs::read(&hdr).unwrap(), hdr_bytes, "header kept");
+    }
+    // Still a hit afterwards.
+    let hit = cache
+        .get_or_fetch_path_with_etag::<io::Error, _>(url, None, || panic!("must hit"))
+        .unwrap();
+    assert_eq!(hit, blob);
+
+    // The managed open's refusal of a non-regular name is told apart from
+    // other `InvalidInput` (a directory and a FIFO).
+    let fifo = dir.join("fifo");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: plain C call with a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    for p in [dir.clone(), fifo] {
+        let e = crate::managed_read::read(&p).unwrap_err();
+        assert!(crate::managed_read::is_not_regular_file(&e), "{e}");
+    }
+
+    // A header that is a directory (refused as non-regular by the managed
+    // open) is a miss: invalidate and refetch.
+    let url2 = "http|https://example.invalid/einval2.index.sqlite";
+    let fetched3 = dir.join("fetched3.sqlite");
+    database(&fetched3, false);
+    let blob2 = cache
+        .get_or_fetch_path_with_etag::<io::Error, _>(url2, None, || Ok((fetched3.clone(), None)))
+        .unwrap();
+    let hdr2 = PathBuf::from(format!("{}.hdr", blob2.display()));
+    std::fs::remove_file(&hdr2).unwrap();
+    std::fs::create_dir(&hdr2).unwrap();
+    let fetched4 = dir.join("fetched4.sqlite");
+    database(&fetched4, false);
+    let refetched = Cell::new(false);
+    let _ = cache.get_or_fetch_path_with_etag::<io::Error, _>(url2, None, || {
+        refetched.set(true);
+        Ok((fetched4.clone(), None))
+    });
+    assert!(refetched.get(), "a non-regular header is a miss");
+}
+
 /// Regression: a read, hash or permission failure while installing left a
 /// torn or invalidated cache entry; the existing blob stays unchanged, no
 /// staging file is left, and through `get_or_fetch` the store failure falls

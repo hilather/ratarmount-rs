@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::debug;
 use serde::{Deserialize, Serialize};
 
-use crate::managed_read::{self, CopyDigest, CopySourcePermissions};
+use crate::managed_read::{self, is_not_regular_file, CopyDigest, CopySourcePermissions};
 use crate::sha256_hex;
 
 /// Whole-sidecar blob cap (bytes). Larger downloads stay tempfiles.
@@ -162,15 +162,9 @@ impl MetaCache {
         let hdr = match self.read_header(key) {
             Ok(h) => h,
             // A missing header, or something that is no regular file at its
-            // name, is a miss like a malformed one; other I/O propagates.
-            Err(HeaderError::Io(e))
-                if !matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
-                ) =>
-            {
-                return Err(e)
-            }
+            // name, is a miss like a malformed one; other I/O (an `EINVAL`
+            // from a read included) propagates and keeps the entry.
+            Err(HeaderError::Io(e)) if !is_cache_miss(&e) => return Err(e),
             Err(_) => {
                 self.invalidate_key(key);
                 return Ok(None);
@@ -197,12 +191,7 @@ impl MetaCache {
             }
             // Evicted by another process after the metadata check: the
             // existing missing-entry path (invalidate, refetch).
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
-                ) =>
-            {
+            Err(e) if is_cache_miss(&e) => {
                 self.invalidate_key(key);
                 return Ok(None);
             }
@@ -433,6 +422,13 @@ pub fn invalidate_meta_cache_identity(backend: &str, url: &str) {
     let identity = cache_identity(backend, url);
     let key = sha256_hex(identity.as_bytes());
     MetaCache::from_env().invalidate_key(&key);
+}
+
+/// A managed-read error that means the entry is gone: the name is missing or
+/// holds no regular file. Any other error (an injected or real `EINVAL`
+/// while reading included) is I/O that must propagate and keep the entry.
+fn is_cache_miss(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound || is_not_regular_file(e)
 }
 
 fn blob_sha256(path: &Path) -> io::Result<String> {
