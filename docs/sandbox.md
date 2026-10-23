@@ -1993,17 +1993,27 @@ the stale `errno` SQLite leaves behind (a metadata-cache entry is kept, not
 dropped and refetched as if it had been evicted). A whole-file managed read
 reserves its buffer fallibly: a file larger than the process may allocate is
 an out-of-memory error, not an abort. A managed read accepts only a regular
-file: a FIFO, a block or character device, a socket or a directory at an
-internal-read name is refused (where an ordinary read blocked on a FIFO or
-read the device). The managed `fsync` of a publication asks SQLite for a full
-sync, which is `F_FULLFSYNC` on macOS as before.
+file, checked before opening: a FIFO, a block or character device, a socket
+or a directory at an internal-read name is refused (where an ordinary read
+blocked on a FIFO or read the device); a FIFO swapped in between the check
+and the open still blocks in `open`. The metadata cache treats only that
+refusal and a missing file as an evicted entry; any other read error (an
+`EINVAL` included) propagates and keeps the entry. The managed `fsync` of a
+publication asks SQLite for a full sync, which is `F_FULLFSYNC` on macOS as
+before.
 
 The inventory also follows a module alias through a later import
 (`use std::fs as disk; use disk::read as read_index;`), calls with explicit
 generic arguments (`std::fs::read::<_>(p)`, `<File>::open(p)`), helpers
 imported through nested braces or a module glob, and `TempDir` /
 `NamedTempFile` `with_prefix` / `with_suffix` constructors; whitespace inside
-a string literal is part of an entry's fingerprint.
+a string literal is part of an entry's fingerprint. A free-function call
+with explicit generic arguments (`helper::<T>(p)`) is followed by the
+mandatory-helper walk. An `unchanged-from-<baseline>` claim must match a
+baseline operation with the same file, function, operation and fingerprint,
+and each baseline operation backs at most one entry: an identical create
+copied into another function, or a second copy in the same function, is not
+a baseline create.
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE

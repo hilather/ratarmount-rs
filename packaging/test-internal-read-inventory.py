@@ -956,8 +956,9 @@ def entry_errors(e, o, where):
 
 
 # Free-function calls only (`helper(..)`, `crate::module::helper(..)`), not
-# methods or associated functions.
-CALL_RE = re.compile(r"(?<![\w.:])((?:[a-z_]\w*::)*)([a-z_]\w*)\s*\(")
+# methods or associated functions; explicit generic arguments
+# (`helper::<T>(..)`, `m::helper::<Vec<u8>>(..)`) are calls too.
+CALL_RE = re.compile(r"(?<![\w.:])((?:[a-z_]\w*::)*)([a-z_]\w*)\s*(?:::\s*<[^;{}]*?>\s*)?\(")
 
 
 def stem(rel):
@@ -1114,10 +1115,11 @@ def write(root, path, baseline_dir=None):
     """Rewrite the manifest. `baseline_dir` (a checkout of the baseline) is
     the only way a `baseline_fingerprint` is refreshed: an
     `unchanged-from-<baseline>` create gets its current fingerprint as its
-    baseline one only when the baseline has the same (file, fingerprint)."""
-    at_base = None
+    baseline one only when the baseline has an unclaimed operation with the
+    same file, function, operation and fingerprint."""
+    avail = None
     if baseline_dir is not None:
-        at_base = {(o["file"], o["fingerprint"]) for o in scan(baseline_dir)[0]}
+        avail = baseline_ops(baseline_dir)
     try:
         manifest = load(path)
     except FileNotFoundError:
@@ -1129,8 +1131,15 @@ def write(root, path, baseline_dir=None):
         e = dict(old.get(key(o)) or {"disposition": "UNCLASSIFIED"})
         for f in ("file", "function", "op", "ordinal", "line", "fingerprint"):
             e[f] = o[f]
-        if at_base is not None and e.get("mode_policy") == UNCHANGED and (o["file"], o["fingerprint"]) in at_base:
-            e["baseline_fingerprint"] = o["fingerprint"]
+        if avail is not None:
+            # Refreshed from the baseline only: each baseline operation backs
+            # at most one entry with the same identity (a second copy of a
+            # baseline create in the same function gets none).
+            e.pop("baseline_fingerprint", None)
+            ident = base_ident(o, o["fingerprint"])
+            if e.get("mode_policy") == UNCHANGED and avail.get(ident, 0) > 0:
+                avail[ident] -= 1
+                e["baseline_fingerprint"] = o["fingerprint"]
         out.append(order(e))
     manifest["entries"] = out
     with open(path, "w", encoding="utf-8") as fh:
@@ -1141,11 +1150,36 @@ def write(root, path, baseline_dir=None):
 
 def verify_baseline(baseline_dir, manifest):
     """The `unchanged-from-<baseline>` entries whose (file,
-    baseline_fingerprint) the baseline checkout does not have."""
-    at_base = {(o["file"], o["fingerprint"]) for o in scan(baseline_dir)[0]}
-    return [e for e in manifest["entries"]
-            if e.get("mode_policy") == UNCHANGED
-            and (e["file"], e.get("baseline_fingerprint")) not in at_base]
+    baseline_fingerprint) the baseline checkout does not have, matched by
+    operation identity and multiplicity (see `baseline_claims`)."""
+    avail = baseline_ops(baseline_dir)
+    bad = []
+    for e in manifest["entries"]:
+        if e.get("mode_policy") != UNCHANGED:
+            continue
+        ident = base_ident(e, e.get("baseline_fingerprint"))
+        if avail.get(ident, 0) > 0:
+            avail[ident] -= 1
+        else:
+            bad.append(e)
+    return bad
+
+
+def base_ident(o, fingerprint):
+    """A create's identity across the baseline: file, function, operation and
+    fingerprint (not the ordinal, which shifts when another operation is
+    added before it). A copy of a baseline statement into another function
+    is a different operation."""
+    return (o["file"], o["function"], o["op"], fingerprint)
+
+
+def baseline_ops(baseline_dir):
+    """How many operations of each identity the baseline checkout has."""
+    avail = {}
+    for o in scan(baseline_dir)[0]:
+        ident = base_ident(o, o["fingerprint"])
+        avail[ident] = avail.get(ident, 0) + 1
+    return avail
 
 
 FIELD_ORDER = ("file", "function", "op", "ordinal", "line", "fingerprint", "baseline_fingerprint",
@@ -1649,6 +1683,54 @@ def regression_inventory_tempdir_builders_are_creates():
     ops, _, _ = scan(root)
     got = sorted((o["function"], o["op"], o["creates"], o["exclusive"]) for o in ops)
     expect(got == [("a", "tempdir", True, True)] * 2 + [("b", "tempfile", True, True)] * 2, got)
+
+
+def regression_inventory_generic_helper_calls_are_followed():
+    """Regression (R11-S7-FIX10): the helper walk missed a call with explicit
+    generic arguments (`load::<Config>(p)`, `util::load::<Vec<u8>>(p)`), so a
+    managed function reaching a raw-reading helper that way passed with an
+    unchanged manifest while the non-generic call failed."""
+    for call in ("load::<Config>(p)", "util::load::<Vec<u8>>(p)", "load :: < Config > (p)"):
+        root = fake({
+            "c/src/lib.rs": ("mod util;\nuse crate::util::load;\n"
+                             "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; let _ = %s; }\n" % call),
+            "c/src/util.rs": "pub fn load<T>(p: &Path) -> T { let _ = std::fs::read(p); todo!() }\n",
+        })
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF})
+        errs = check(root, m)
+        expect(any("reaches helper load" in e for e in errs), (call, errs))
+
+
+def regression_inventory_baseline_claims_match_identity_and_multiplicity():
+    """Regression (R11-S7-FIX10): `unchanged-from-<baseline>` was matched on
+    (file, fingerprint) only, so an identical create copied into a new
+    function (or a second copy in the same function) inherited the baseline
+    exemption from `--write --baseline` and passed `--verify-baseline`."""
+    stmt = "let _ = std::fs::File::create(p);"
+    base = fake({"c/src/lib.rs": "fn a(p: &Path) {\n    %s\n}\n" % stmt})
+    cur = fake({"c/src/lib.rs": "fn a(p: &Path) {\n    %s\n    %s\n}\nfn b(p: &Path) {\n    %s\n}\n"
+                                % (stmt, stmt, stmt)})
+    path = os.path.join(cur, "manifest.json")
+    unchanged = {"disposition": "output-owner", "mode_policy": UNCHANGED}
+    m = classify(cur, {("a", "File::create"): unchanged, ("b", "File::create"): unchanged})
+    expect(len({e["fingerprint"] for e in m["entries"]}) == 1 and len(m["entries"]) == 3, m["entries"])
+    with open(path, "w") as fh:
+        json.dump(m, fh)
+    write(cur, path, base)
+    m = load(path)
+    have = sorted((e["function"], e["ordinal"], e.get("baseline_fingerprint") is not None) for e in m["entries"])
+    expect(have == [("a", 1, True), ("a", 2, False), ("b", 1, False)], have)
+    errs = check(cur, m)
+    expect(len(errs) == 2 and all("valid only for an unchanged baseline" in e for e in errs), errs)
+    # A hand-copied claim on every entry: `--verify-baseline` rejects the
+    # copies beyond the baseline's one operation.
+    for e in m["entries"]:
+        e["baseline_fingerprint"] = e["fingerprint"]
+    bad = sorted((e["function"], e["ordinal"]) for e in verify_baseline(base, m))
+    expect(bad == [("a", 2), ("b", 1)], bad)
+    # The baseline's own operation still verifies.
+    m["entries"] = [e for e in m["entries"] if (e["function"], e["ordinal"]) == ("a", 1)]
+    expect(verify_baseline(base, m) == [], verify_baseline(base, m))
 
 
 def self_test():
