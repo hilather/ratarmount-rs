@@ -1,6 +1,5 @@
 //! One request per connection: GET/HEAD Range, optional WebDAV.
 
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -34,6 +33,99 @@ pub(crate) struct HttpState {
     pub basic: Option<(String, String)>,
     /// On-disk SQLite sidecar. HTTP-only; not a FUSE control file.
     pub index_sidecar: Option<PathBuf>,
+    /// Admission of sidecar readers (GET, Range and HEAD).
+    pub sidecar: SidecarAdmission,
+}
+
+/// At most this many sidecar requests hold a managed reader at once; more
+/// get 503 without opening anything (#151).
+pub(crate) const INDEX_SIDECAR_READERS: usize = 8;
+
+/// The sidecar endpoint's reader admission: a nonblocking count of active
+/// readers, the body write timeout (a stalled client must not hold a reader
+/// forever), and test hooks.
+pub(crate) struct SidecarAdmission {
+    pub(crate) active: std::sync::atomic::AtomicUsize,
+    pub write_timeout: Duration,
+    #[cfg(test)]
+    pub hook: Option<Arc<dyn Fn(SidecarStage) -> io::Result<()> + Send + Sync>>,
+}
+
+impl Default for SidecarAdmission {
+    fn default() -> Self {
+        Self {
+            active: std::sync::atomic::AtomicUsize::new(0),
+            // As long as a request may take to arrive (`read_request`).
+            write_timeout: Duration::from_secs(30),
+            #[cfg(test)]
+            hook: None,
+        }
+    }
+}
+
+/// Points of a sidecar request a test may observe or fail.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidecarStage {
+    /// A permit was taken; nothing is open yet.
+    Admitted,
+    /// The managed reader is open and its length known.
+    Acquired,
+    /// Before each body chunk is read.
+    BeforeChunk,
+}
+
+impl SidecarAdmission {
+    fn try_admit(&self) -> Option<SidecarPermit<'_>> {
+        use std::sync::atomic::Ordering;
+        ratarmount_core::try_update_usize(&self.active, Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < INDEX_SIDECAR_READERS).then_some(n + 1)
+        })
+        .ok()
+        .map(|_| SidecarPermit(&self.active))
+    }
+
+    #[cfg(test)]
+    fn stage(&self, stage: SidecarStage) -> io::Result<()> {
+        match &self.hook {
+            Some(h) => h(stage),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn stage(&self, _: ()) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct SidecarPermit<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for SidecarPermit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// A managed reader and its permit. Fields drop in declaration order: the
+/// reader is closed (`xClose`) before the permit is returned.
+struct SidecarReader<'a> {
+    cursor: ratarmount_index::managed_read::ManagedReadCursor,
+    _permit: SidecarPermit<'a>,
+}
+
+#[cfg(test)]
+macro_rules! sidecar_stage {
+    ($state:expr, $stage:ident) => {
+        $state.sidecar.stage(SidecarStage::$stage)
+    };
+}
+#[cfg(not(test))]
+macro_rules! sidecar_stage {
+    ($state:expr, $stage:ident) => {
+        $state.sidecar.stage(())
+    };
 }
 
 impl std::fmt::Debug for HttpState {
@@ -1321,21 +1413,74 @@ fn handle_index_sidecar(
             &[],
         );
     };
-    let meta = match std::fs::metadata(path) {
-        Ok(m) if m.is_file() && m.len() > 0 => m,
-        _ => {
+    let not_found = |stream: &mut TcpStream| {
+        write_response(
+            stream,
+            404,
+            "Not Found",
+            "text/plain; charset=utf-8",
+            b"not found\n",
+            send_body,
+            &[],
+        )
+    };
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() > 0 => {}
+        _ => return not_found(stream),
+    }
+    // Admission before any open (#151): the sidecar is read through a
+    // managed reader (SQLite's VFS), so its close keeps the locks of a
+    // connection of this process on the same index; at most
+    // INDEX_SIDECAR_READERS requests (HEAD too) hold one at a time.
+    let Some(permit) = state.sidecar.try_admit() else {
+        return write_response(
+            stream,
+            503,
+            "Service Unavailable",
+            "text/plain; charset=utf-8",
+            b"too many index sidecar readers\n",
+            send_body,
+            &[("Retry-After", "1")],
+        );
+    };
+    sidecar_stage!(state, Admitted)?;
+    let cursor = match ratarmount_index::managed_read::ManagedReadCursor::open(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return not_found(stream),
+        Err(e) => {
+            log::warn!("index sidecar {}: {e}", path.display());
             return write_response(
                 stream,
-                404,
-                "Not Found",
+                500,
+                "Internal Server Error",
                 "text/plain; charset=utf-8",
-                b"not found\n",
+                b"cannot read index sidecar\n",
                 send_body,
                 &[],
             );
         }
     };
-    let size = meta.len();
+    let mut reader = SidecarReader {
+        cursor,
+        _permit: permit,
+    };
+    let size = match reader.cursor.len() {
+        Ok(0) => return not_found(stream),
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("index sidecar {}: {e}", path.display());
+            return write_response(
+                stream,
+                500,
+                "Internal Server Error",
+                "text/plain; charset=utf-8",
+                b"cannot read index sidecar\n",
+                send_body,
+                &[],
+            );
+        }
+    };
+    sidecar_stage!(state, Acquired)?;
     let resolved = resolve_range(range_header, size);
     let (status, reason, start, content_len, content_range) = match resolved {
         ResolvedRange::Full => (200u16, "OK", 0u64, size, None),
@@ -1376,22 +1521,27 @@ fn handle_index_sidecar(
     }
     let mut head_bytes = lines.join("\r\n");
     head_bytes.push_str("\r\n\r\n");
+    // A client that stops reading must not hold a reader forever.
+    stream.set_write_timeout(Some(state.sidecar.write_timeout))?;
     stream.write_all(head_bytes.as_bytes())?;
     if head || content_len == 0 {
         return Ok(());
     }
-    let mut file = File::open(path)?;
-    if start > 0 {
-        file.seek(SeekFrom::Start(start))?;
-    }
+    reader.cursor.seek(SeekFrom::Start(start))?;
     let mut remaining = content_len;
     let chunk = state.chunk.max(1);
     let mut buf = vec![0u8; chunk];
     while remaining > 0 {
+        sidecar_stage!(state, BeforeChunk)?;
         let want = (remaining as usize).min(buf.len());
-        let n = fill_read(&mut file, &mut buf[..want])?;
+        let n = fill_read(&mut reader.cursor, &mut buf[..want])?;
         if n == 0 {
-            break;
+            // Fewer bytes than advertised: an error closes the connection
+            // short of Content-Length, never a complete response.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("index sidecar shorter than advertised ({remaining} bytes missing)"),
+            ));
         }
         stream.write_all(&buf[..n])?;
         remaining -= n as u64;

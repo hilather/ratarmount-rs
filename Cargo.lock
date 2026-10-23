@@ -5478,10 +5478,13 @@ dependencies = [
 name = "ratarmount-http"
 version = "0.1.35"
 dependencies = [
+ "libc",
  "log",
  "ratarmount-compositing",
  "ratarmount-core",
  "ratarmount-export-core",
+ "ratarmount-index",
+ "rusqlite",
  "tempfile",
 ]
 

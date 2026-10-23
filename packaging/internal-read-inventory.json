@@ -4258,10 +4258,10 @@
   {
    "file": "ratarmount-http/src/handler.rs",
    "function": "handle_index_sidecar",
-   "op": "File::open",
+   "op": "ManagedReadCursor::open",
    "ordinal": 1,
-   "line": 1383,
-   "fingerprint": "795d09ac73bd6c6f",
+   "line": 1447,
+   "fingerprint": "0f1127f3b5c68012",
    "disposition": "managed-read",
    "regression": "regression_http_index_sidecar_get_keeps_index_lock"
   },
