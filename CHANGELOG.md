@@ -4,6 +4,7 @@
 
 ### Changes
 
+- The internal-read inventory helper walk resolves chained `use` aliases (`use crate::util as u; use u::load as read_index`) and reports alias cycles instead of missing raw helpers (#198).
 - Checked overlay SQLite acquisition validates SQLite's acquired inode and refuses substitutions, lost required records, caller-built URIs, and replaced VFS hooks. Installation is load-time or private-extension prepublication, with native export audits and Linux aarch64 CI (#151, supersedes #199).
 - A daemonized mount still holds no kernel lock on its overlay database after it forks (#183); use foreground `-f` when another process may open it.
 - Required-record observations now latch for the held/retry operation: deleting markers cannot weaken gates, recovery rows, seal/verify/pack metadata checks, or pending-base digest updates.

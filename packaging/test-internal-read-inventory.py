@@ -40,10 +40,12 @@ plus every later statement that configures a bound builder. An
 literal `false` is a create (it needs a mode policy). A test-only match arm
 ends at its block or block-like body (`unsafe`, `loop`, `match`, `if`/`else`).
 The helper walk follows same-crate free-function calls transitively, through
-`use .. as` renames of a function or a module, `crate::`/`super::`/`self::`
+`use .. as` renames of a function or a module, including a chain
+(`use crate::util as u; use u::load as read_index`), `crate::`/`super::`/`self::`
 paths (any same-crate definition) and calls of the caller's own name in
-another module. Generic argument lists (`::<..>`) are matched balanced; an
-unbalanced one is reported. Descriptor duplication and ownership conversion
+another module. An alias cycle (`use a as b; use b as a`) is reported.
+Generic argument lists (`::<..>`) are matched balanced; an unbalanced one is
+reported. Descriptor duplication and ownership conversion
 (`try_clone_to_owned`, `dup`/`dup2`/`dup3`, `F_DUPFD[_CLOEXEC]`, `File::from`)
 are operations.
 Pathname opens inside foreign libraries (libgit2 `Repository::open`,
@@ -1138,17 +1140,49 @@ def renamed_imports(text, crate, free):
     """`use .. as` renames in one file: `{alias: (name, module or None)}` for
     an imported same-crate free function (`use crate::m::read_index as
     legacy_read`), and `{alias: module}` for a renamed module
-    (`use crate::util as u`)."""
-    fns, mods = {}, {}
+    (`use crate::util as u`). A later import through that alias is rewritten
+    to the module it names, to a fixed point (`use u::load as read_index`,
+    `use u as v; v::load`). `use self as s` has an empty path. A cycle (the
+    chain never leaves the alias set) is returned as unresolved aliases so
+    the walk fails closed instead of skipping the helper (#198)."""
+    raw = {}
+    leaves = []
     for path, alias, _ in use_leaves(text):
-        if alias == "*" or not path or alias == path[-1]:
+        if alias == "*":
             continue
-        hint = path[-2] if len(path) >= 2 and path[-2] not in ("crate", "self", "super") else None
-        if (crate, path[-1]) in free:
-            fns[alias] = (path[-1], hint)
-        if path[-1] not in ("crate", "self", "super"):
-            mods[alias] = path[-1]
-    return fns, mods
+        # `use self as s` contributes no segment; `use self;` is not a rename.
+        target = "self" if not path else path[-1]
+        if alias == target:
+            continue
+        raw[alias] = target
+        leaves.append((path, alias))
+
+    def bottom(name):
+        seen = set()
+        while name in raw and name not in seen:
+            seen.add(name)
+            name = raw[name]
+        return name, name in raw
+
+    mods, bad = {}, []
+    for alias in raw:
+        name, cyc = bottom(alias)
+        if cyc:
+            bad.append(alias)
+        else:
+            mods[alias] = name
+    fns = {}
+    for path, alias in leaves:
+        if not path or (crate, path[-1]) not in free:
+            continue
+        hint = None
+        if len(path) >= 2 and path[-2] not in ("crate", "self", "super"):
+            parent = mods[path[-2]] if path[-2] in mods else path[-2]
+            # An alias of `self` / `super` / `crate` names no module: any
+            # same-crate definition (over-reporting is safe).
+            hint = "" if parent in ("self", "super", "crate") else parent
+        fns[alias] = (path[-1], hint)
+    return fns, mods, bad
 
 
 def inline_mods(text):
@@ -1160,14 +1194,21 @@ def inline_mods(text):
 def resolves(rel, text, prefix, callee, target, hint=None, mods=None, owners=()):
     """Whether a call `prefix callee(` in `rel` may name `callee` in `target`:
     the same file for a bare call (or a file whose module the caller imports
-    the name from), the named module for a qualified call (through a renamed
-    module import too); `hint` is the module a renamed function import names.
+    the name from, through an alias chain: `use u::load` where `u` is
+    `util`), the named module for a qualified call (through a renamed
+    module import too, `use u as v; v::load`); `hint` is the module a
+    renamed function import names, after that chain is resolved.
     `owners` are the inline modules (`mod util { .. }`) around the definition:
     each is a module name of it as well as the file's (R11-S7-FIX14)."""
     names = {stem(target)} | set(owners)
+    mods = mods or {}
     segs = [p for p in prefix.split("::") if p]
     if segs and segs[-1] not in ("self", "super", "crate"):
-        return (mods or {}).get(segs[-1], segs[-1]) in names
+        mod = mods.get(segs[-1], segs[-1])
+        # `use self as s; s::load(p)`: the alias names no module.
+        if mod in ("self", "super", "crate") and segs[-1] in mods:
+            return True
+        return mod in names
     if segs:
         # `crate::helper(p)`, `super::helper(p)`, `self::helper(p)`: no module
         # is named, so any same-crate definition (over-reporting is safe).
@@ -1177,12 +1218,22 @@ def resolves(rel, text, prefix, callee, target, hint=None, mods=None, owners=())
     if target == rel:
         return True
     # Any import form: `use crate::m::leaf;`, nested braces
-    # (`use crate::{m::leaf, ..}`), or a glob of the module (`use crate::m::*;`).
+    # (`use crate::{m::leaf, ..}`), or a glob of the module (`use crate::m::*;`),
+    # including one whose module is itself an alias (`use u::load;`, `use u::*;`).
     for path, alias, _ in use_leaves(text):
-        if alias == "*" and path and path[-1] in names:
-            return True
-        if len(path) >= 2 and path[-1] == callee and path[-2] in names:
-            return True
+        if not path:
+            continue
+        if alias == "*":
+            leaf = mods.get(path[-1], path[-1])
+            if leaf in names or (path[-1] in mods and leaf in ("self", "super", "crate")):
+                return True
+        elif len(path) >= 2 and path[-1] == callee:
+            parent = path[-2]
+            aliased = parent in mods
+            if aliased:
+                parent = mods[parent]
+            if parent in names or (aliased and parent in ("self", "super", "crate")):
+                return True
     return False
 
 
@@ -1192,8 +1243,10 @@ def helper_errors(entries, scanned, texts, fns):
     and must not hold a raw descriptor except around a classified
     non-managed operation on the same line. A helper's entry may excuse a
     caller by listing, in `non_mandatory_callers`, the managed root or the
-    function that calls the helper directly. Limits: methods and associated
-    functions are not followed, nor calls across crates."""
+    function that calls the helper directly. A `use` alias is followed
+    through later aliases (`use crate::util as u; use u::load as read_index`);
+    a cycle is reported. Limits: methods and associated functions are not
+    followed, nor calls across crates."""
     errs = []
     by_key = {key(e): e for e in entries}
     managed_fns = {}
@@ -1218,13 +1271,24 @@ def helper_errors(entries, scanned, texts, fns):
                 owners[(rel, a)] = tuple(n for n, o, c in inl if o < a < c)
 
     renames = {}
+    alias_errors = []
+
+    def aliases_of(rel):
+        if rel not in renames:
+            fn_alias, mod_alias, bad = renamed_imports(texts[rel], crate_of(rel), free)
+            renames[rel] = (fn_alias, mod_alias)
+            for alias in bad:
+                alias_errors.append("unresolved use-alias chain (fail closed): %s `%s`" % (rel, alias))
+        return renames[rel]
+
+    for rel in fns:
+        if rel in texts:
+            aliases_of(rel)
 
     def callees(rel, a, b):
         text = texts[rel]
         body = text[a:b]
-        if rel not in renames:
-            renames[rel] = renamed_imports(text, crate_of(rel), free)
-        fn_alias, mod_alias = renames[rel]
+        fn_alias, mod_alias = aliases_of(rel)
         out = []
         for m in CALL_RE.finditer(body):
             prefix, callee = m.group(1), m.group(2)
@@ -1288,6 +1352,7 @@ def helper_errors(entries, scanned, texts, fns):
                                 % (qual, rel, callee, chain, o["file"], o["op"], o["ordinal"]))
                 for nxt in callees(target, ta, tb):
                     queue.append((callee,) + nxt)
+    errs.extend(alias_errors)
     return sorted(set(errs))
 
 
@@ -2202,6 +2267,51 @@ def regression_inventory_helper_walk_visits_same_named_helpers_by_definition():
     m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
                         ("leaf", "fs::read"): dict(OOF, non_mandatory_callers=["bridge"])})
     expect(check(root, m) == [], check(root, m))
+
+
+def regression_inventory_helper_walk_resolves_chained_use_aliases():
+    """Regression: (#198): a raw helper reached only through a chain of `use`
+    aliases (`use crate::util as u; use u::load as read_index`, call
+    `read_index(p)`) was not a callee, so the mandatory-helper check passed.
+    An alias cycle is reported instead of skipped."""
+    leaf = "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n"
+    body = "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; %s; }\n"
+    cases = (
+        ("mod util;\nuse crate::util as u;\nuse u::load as read_index;\n", "read_index(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse u::{load as read_index};\n", "read_index(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse u as v;\nuse v::load as read_index;\n", "read_index(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse u::load;\n", "load(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse u::*;\n", "load(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse u as v;\n", "v::load(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse self::u::load as read_index;\n", "read_index(p)", True),
+        ("mod util {\n    pub fn load(p: &Path) { let _ = std::fs::read(p); }\n}\n"
+         "use self::util as u;\nuse u::load as read_index;\n", "read_index(p)", False),
+        ("pub fn load(p: &Path) { let _ = std::fs::read(p); }\nuse self as s;\nuse s::load as read_index;\n",
+         "read_index(p)", False),
+        ("pub fn load(p: &Path) { let _ = std::fs::read(p); }\nuse self as s;\n", "s::load(p)", False),
+    )
+    for imp, call, separate in cases:
+        files = {"c/src/lib.rs": imp + body % call}
+        if separate:
+            files["c/src/util.rs"] = leaf
+        root = fake(files)
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF})
+        errs = check(root, m)
+        expect(any("reaches helper load" in e for e in errs), (imp, call, errs))
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                            ("load", "fs::read"): dict(OOF, non_mandatory_callers=["hash"])})
+        expect(check(root, m) == [], (imp, call, check(root, m)))
+    # A chain that names another module is not this helper.
+    root = fake({"c/src/lib.rs": "mod util;\nmod other;\nuse crate::other as o;\nuse o::load as read_index;\n"
+                                 + body % "read_index(p)",
+                 "c/src/util.rs": leaf, "c/src/other.rs": "pub fn load(p: &Path) {}\n"})
+    m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF})
+    expect(check(root, m) == [], check(root, m))
+    # A cycle never names a module. The previous scanner reported nothing.
+    root = fake({"c/src/lib.rs": "mod util;\nuse a as b;\nuse b as a;\n" + body % "b::load(p)",
+                 "c/src/util.rs": leaf})
+    errs = check(root, classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF}))
+    expect(any("unresolved use-alias chain" in e for e in errs), errs)
 
 
 def self_test():

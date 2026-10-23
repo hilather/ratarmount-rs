@@ -2007,9 +2007,11 @@ and so does a form the scanner cannot follow: an import from `std::fs` or
 that escapes its function. Any `.create(..)` or `.create_new(..)` argument other
 than a literal `false` counts as a create that needs a mode policy; a managed
 read reaching a raw helper is found through `use .. as` renames of the helper or
-its module; and the pathname opens done inside libgit2 (`Repository::open`),
-libarchive (`archive_read_open_filename`) and lopdf (`Document::load`) are
-recorded as #196 residuals (those libraries own their descriptors).
+its module, including a chain of aliases (`use crate::util as u; use u::load as
+read_index`); an alias cycle is reported. The pathname opens done inside
+libgit2 (`Repository::open`), libarchive (`archive_read_open_filename`) and
+lopdf (`Document::load`) are recorded as #196 residuals (those libraries own
+their descriptors).
 `--verify-baseline DIR` (run in CI) checks that every create recorded as
 unchanged from the baseline still exists unchanged there.
 
