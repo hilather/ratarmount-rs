@@ -608,3 +608,123 @@ fn regression_index_input_read_failure_is_not_success() {
     std::fs::write(&pin, b"stale").unwrap();
     assert!(seams::with(fail_read(1), || snapshot_index_id(&archive, &db, &id)).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// macOS connection policy (S7 §6): ordinary connections keep SQLite's default
+// "unix" VFS (auto locking on macOS); the checked index snapshot keeps
+// "unix-posix" on macOS ("unix" elsewhere).
+// ---------------------------------------------------------------------------
+
+use crate::managed_read::connection_vfs_name;
+
+/// The default VFS of ordinary connections: "unix" on every Unix target (on
+/// macOS it picks the locking style per filesystem).
+const AUTO: &str = "unix";
+
+/// Regression: ordinary index connections must keep the default "unix" VFS
+/// (no silent switch to "unix-posix" on macOS): cold creation, publication
+/// and reopen, writable and read-only opens, and the three lookup shapes
+/// (immutable, live WAL, private snapshot).
+#[test]
+fn regression_macos_index_connections_keep_auto_vfs() {
+    let (_d, dir) = tempdir();
+    let path = dir.join("a.index.sqlite");
+    let mut idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+    assert_eq!(
+        idx.with_conn(|c| Ok(connection_vfs_name(c))).unwrap(),
+        AUTO,
+        "cold creation"
+    );
+    idx.publish_tmp().unwrap();
+    assert_eq!(
+        idx.with_conn(|c| Ok(connection_vfs_name(c))).unwrap(),
+        AUTO,
+        "publish reopen"
+    );
+    drop(idx);
+    let w = SqliteIndex::open_writable(&path).unwrap();
+    assert_eq!(
+        w.with_conn(|c| Ok(connection_vfs_name(c))).unwrap(),
+        AUTO,
+        "writable"
+    );
+    drop(w);
+    let r = SqliteIndex::open_read_only(&path).unwrap();
+    assert_eq!(
+        r.with_conn(|c| Ok(connection_vfs_name(c))).unwrap(),
+        AUTO,
+        "read-only"
+    );
+    drop(r);
+    // Lookups: no companions (immutable), live WAL, hot journal (snapshot).
+    let none = dir.join("plain.sqlite");
+    database(&none, false);
+    assert_eq!(
+        connection_vfs_name(&crate::open_lookup_connection(&none).unwrap()),
+        AUTO
+    );
+    let wal = dir.join("wal.sqlite");
+    database(&wal, true);
+    let live = Connection::open(&wal).unwrap();
+    live.execute_batch("INSERT INTO t VALUES (1)").unwrap();
+    assert_eq!(
+        connection_vfs_name(&crate::open_lookup_connection(&wal).unwrap()),
+        AUTO
+    );
+    drop(live);
+    let hot = dir.join("hot.sqlite");
+    database(&hot, false);
+    let w = Connection::open(&hot).unwrap();
+    w.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (zeroblob(5));")
+        .unwrap();
+    assert_eq!(
+        connection_vfs_name(&crate::open_lookup_connection(&hot).unwrap()),
+        AUTO
+    );
+    w.execute_batch("ROLLBACK").unwrap();
+}
+
+/// Regression: the digest cache's writable and read-only connections keep
+/// the default "unix" VFS.
+#[test]
+fn regression_macos_digest_cache_keeps_auto_vfs() {
+    let (_d, dir) = tempdir();
+    let path = dir.join("a.index.sqlite");
+    let mut idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+    idx.publish_tmp().unwrap();
+    drop(idx);
+    let (rw, ro) = crate::digest_cache::cache_vfs_names(&path);
+    assert_eq!(rw.as_deref(), Some(AUTO), "writable cache");
+    assert_eq!(ro.as_deref(), Some(AUTO), "read-only peek");
+}
+
+/// Regression (Matt 2026-10-22 19:22 ET): the existing checked
+/// `snapshot_index_into` acquisition keeps "unix-posix" on macOS ("unix"
+/// elsewhere), with and without WAL companions.
+#[test]
+fn regression_macos_checked_index_snapshot_keeps_posix_vfs() {
+    let want = if cfg!(target_os = "macos") {
+        "unix-posix"
+    } else {
+        "unix"
+    };
+    if !crate::checked_open::VERIFIED_TARGET {
+        eprintln!("skip: checked acquisition is unavailable on this target");
+        return;
+    }
+    let (_d, dir) = tempdir();
+    for wal in [false, true] {
+        let path = dir.join(format!("i{wal}.sqlite"));
+        database(&path, wal);
+        let live = wal.then(|| {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("INSERT INTO t VALUES (1)").unwrap();
+            c
+        });
+        crate::SNAPSHOT_VFS.with(|v| v.borrow_mut().take());
+        crate::snapshot_index_into(&path, &dir.join(format!("copy{wal}.sqlite"))).unwrap();
+        let got = crate::SNAPSHOT_VFS.with(|v| v.borrow_mut().take());
+        assert_eq!(got.as_deref(), Some(want), "wal={wal}");
+        drop(live);
+    }
+}

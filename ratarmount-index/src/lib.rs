@@ -846,6 +846,9 @@ pub fn snapshot_index_into(path: &Path, dest: &Path) -> std::io::Result<()> {
         }
         _ => io::Error::other(format!("index {}: {refusal}", resolved.display())),
     })?;
+    #[cfg(test)]
+    SNAPSHOT_VFS
+        .with(|v| *v.borrow_mut() = Some(managed_read::connection_vfs_name(&acquired.conn)));
     vacuum_into(&acquired.conn, dest)
         .map_err(|e| io::Error::other(format!("cannot copy index {}: {e}", resolved.display())))
 }
@@ -872,6 +875,20 @@ pub fn vacuum_into(conn: &Connection, dest: &Path) -> rusqlite::Result<()> {
     let name = ToSqlOutput::Borrowed(ValueRef::Text(dest.as_os_str().as_encoded_bytes()));
     conn.execute("VACUUM INTO ?1", [name])?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// The private lookup copies' names and modes, before they are opened.
+    pub(crate) static SNAPSHOT_COPY_MODES: std::cell::RefCell<Vec<(String, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The VFS of the last checked connection [`snapshot_index_into`] opened.
+    pub(crate) static SNAPSHOT_VFS: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -924,6 +941,23 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
             Err(e) => return Err(io(e)),
         }
     }
+    #[cfg(all(test, unix))]
+    SNAPSHOT_COPY_MODES.with(|m| {
+        use std::os::unix::fs::PermissionsExt;
+        *m.borrow_mut() = std::fs::read_dir(dir.path())
+            .map(|it| {
+                it.flatten()
+                    .map(|e| {
+                        let mode = e.metadata().map(|m| m.permissions().mode() & 0o7777);
+                        (
+                            e.file_name().to_string_lossy().into_owned(),
+                            mode.unwrap_or(0),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    });
     let conn = Connection::open_with_flags(
         &copy,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,

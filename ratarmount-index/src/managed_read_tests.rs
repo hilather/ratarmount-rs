@@ -378,6 +378,18 @@ fn child_row(row: &str, dir: &Path) -> String {
         drop(h);
         return format!("xopen={} kept={kept} err={refused}", after - before);
     }
+    if let Some(umask) = row.strip_prefix("copymodes:") {
+        let umask = u32::from_str_radix(umask, 8).unwrap();
+        // SAFETY: a single-threaded child.
+        unsafe { libc::umask(umask as libc::mode_t) };
+        return copy_mode_rows(dir, umask);
+    }
+    if let Some(umask) = row.strip_prefix("companions:") {
+        let umask = u32::from_str_radix(umask, 8).unwrap();
+        // SAFETY: a single-threaded child.
+        unsafe { libc::umask(umask as libc::mode_t) };
+        return companion_rows(dir, umask);
+    }
     if let Some(umask) = row.strip_prefix("umask:") {
         let umask = u32::from_str_radix(umask, 8).unwrap();
         // SAFETY: a single-threaded child.
@@ -594,4 +606,107 @@ fn regression_internal_copy_destination_failures() {
     .unwrap_err();
     assert!(e.to_string().contains("changed while it was copied"), "{e}");
     assert!(!dest.exists());
+}
+
+/// The private lookup snapshot (main and companions) and the meta-v3 blob:
+/// exact source modes under the child's umask; an existing `.part` is left
+/// untouched.
+#[cfg(unix)]
+fn copy_mode_rows(dir: &Path, umask: u32) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mut out = Vec::new();
+    for src_mode in [0o600u32, 0o640, 0o664] {
+        // A hot rollback journal forces the private snapshot copy.
+        let db = dir.join(format!("hot-{src_mode:o}.sqlite"));
+        database(&db, false);
+        let w = Connection::open(&db).unwrap();
+        w.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (zeroblob(5));")
+            .unwrap();
+        let journal = PathBuf::from(format!("{}-journal", db.display()));
+        for p in [&db, &journal] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(src_mode)).unwrap();
+        }
+        drop(crate::open_lookup_connection(&db).unwrap());
+        let modes = crate::SNAPSHOT_COPY_MODES.with(|m| m.borrow_mut().split_off(0));
+        assert!(modes.len() >= 2, "{modes:?}");
+        for (name, mode) in &modes {
+            assert_eq!(*mode, src_mode, "umask {umask:o}: {name}");
+        }
+        w.execute_batch("ROLLBACK").unwrap();
+
+        // meta-v3: the installed blob keeps the source's exact mode.
+        let cache = crate::meta_cache::MetaCache::with_dir(dir.join("meta-v3"), 64 << 20);
+        let src = dir.join(format!("fetched-{src_mode:o}.sqlite"));
+        database(&src, false);
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(src_mode)).unwrap();
+        let url = format!("http|https://example.invalid/{src_mode:o}");
+        let blob = cache.install_for(&url, &src).unwrap();
+        assert_eq!(
+            std::fs::metadata(&blob).unwrap().permissions().mode() & 0o7777,
+            src_mode,
+            "umask {umask:o}: meta-v3 blob"
+        );
+        out.push(format!("{src_mode:o}"));
+    }
+    out.join(",")
+}
+
+/// SQLite's journal and WAL companions get the database's actual mode (no
+/// second umask reduction).
+#[cfg(unix)]
+fn companion_rows(dir: &Path, umask: u32) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    let mut out = Vec::new();
+    for db_mode in [0o600u32, 0o640, 0o666] {
+        let db = dir.join(format!("c-{db_mode:o}.sqlite"));
+        database(&db, false);
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(db_mode)).unwrap();
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (1);")
+            .unwrap();
+        assert_eq!(
+            mode_of(Path::new(&format!("{}-journal", db.display()))),
+            db_mode
+        );
+        c.execute_batch("COMMIT").unwrap();
+        c.pragma_update(None, "journal_mode", "WAL").unwrap();
+        c.execute_batch("INSERT INTO t VALUES (2)").unwrap();
+        for side in ["-wal", "-shm"] {
+            assert_eq!(
+                mode_of(Path::new(&format!("{}{side}", db.display()))),
+                db_mode,
+                "umask {umask:o}: {side}"
+            );
+        }
+        out.push(format!("{db_mode:o}"));
+    }
+    out.join(",")
+}
+
+/// Regression: the private lookup copies and the meta-v3 blob must keep the
+/// source's exact mode (never a umask-derived one); an occupied exclusive
+/// destination is untouched (the helper rows of
+/// `regression_exclusive_create_mode_table`). Umasks 002, 022, 077 in fresh
+/// children.
+#[cfg(unix)]
+#[test]
+fn regression_internal_copy_preserves_source_mode() {
+    for umask in ["002", "022", "077"] {
+        let (_d, dir) = tempdir();
+        let got = run_child(&format!("copymodes:{umask}"), &dir);
+        assert_eq!(got.trim(), "ok 600,640,664", "umask {umask}");
+    }
+}
+
+/// Regression: SQLite's `-journal`, `-wal` and `-shm` take the database's
+/// actual mode, not `0644 & !umask` again. Umasks 002, 022, 077.
+#[cfg(unix)]
+#[test]
+fn regression_sqlite_companions_inherit_database_mode() {
+    for umask in ["002", "022", "077"] {
+        let (_d, dir) = tempdir();
+        let got = run_child(&format!("companions:{umask}"), &dir);
+        assert_eq!(got.trim(), "ok 600,640,666", "umask {umask}");
+    }
 }

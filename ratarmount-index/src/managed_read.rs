@@ -917,6 +917,29 @@ pub fn with_close_probes<R>(
     (r, seen)
 }
 
+/// The VFS SQLite actually opened `conn`'s main database with
+/// (`SQLITE_FCNTL_VFSNAME`). Tests only.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn connection_vfs_name(conn: &rusqlite::Connection) -> String {
+    use rusqlite::ffi;
+    let mut name: *mut std::os::raw::c_char = std::ptr::null_mut();
+    // SAFETY: SQLITE_FCNTL_VFSNAME writes a sqlite3_malloc'd string.
+    unsafe {
+        let rc = ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_VFSNAME,
+            (&mut name as *mut *mut std::os::raw::c_char).cast(),
+        );
+        assert_eq!(rc, ffi::SQLITE_OK, "SQLITE_FCNTL_VFSNAME");
+        let s = std::ffi::CStr::from_ptr(name)
+            .to_string_lossy()
+            .into_owned();
+        ffi::sqlite3_free(name.cast());
+        s
+    }
+}
+
 /// Holds a SHARED lock on any file through this SQLite instance's own VFS
 /// (a stand-in for a connection on a file that is not a database, e.g. a
 /// compressed index or an archive). Tests only.

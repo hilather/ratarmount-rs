@@ -3787,4 +3787,102 @@ mod tests {
         assert!(other_process_sees_lock(&archive), "refresh kept the lock");
         drop(h);
     }
+
+    /// Set by the creation-mode test for its child.
+    #[cfg(unix)]
+    const S7_MODE_CHILD_ENV: &str = "RATARMOUNT_TEST_S7_MODE_CHILD";
+
+    /// The child half of the creation-mode test (a no-op unless spawned):
+    /// under the given umask, a real overlay creation and an index build and
+    /// publication; reports every mode.
+    #[cfg(unix)]
+    #[test]
+    fn s7_mode_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(arg) = std::env::var_os(S7_MODE_CHILD_ENV) else {
+            return;
+        };
+        let arg = arg.to_string_lossy().into_owned();
+        let (umask, dir) = arg.split_once(':').unwrap();
+        let umask = u32::from_str_radix(umask, 8).unwrap();
+        // SAFETY: a single-threaded child.
+        unsafe { libc::umask(umask as libc::mode_t) };
+        let dir = PathBuf::from(dir);
+        let mode_of = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let want = 0o644 & !umask;
+        let mut report = Vec::new();
+        // Overlay creation (SQLite creates the database).
+        let archive = dir.join("a.tar");
+        fs::write(&archive, b"abc").unwrap();
+        let overlay = dir.join("overlay");
+        let ov =
+            WriteOverlay::new_with_create_info_for_tests(base(&dir), &overlay, &info(&archive))
+                .unwrap();
+        let db = overlay.join(HIDDEN_DB);
+        assert_eq!(mode_of(&db), want, "overlay database");
+        for side in ["-wal", "-shm", "-journal"] {
+            let p = PathBuf::from(format!("{}{side}", db.display()));
+            if p.exists() {
+                assert_eq!(mode_of(&p), mode_of(&db), "overlay {side}");
+                report.push(side.to_owned());
+            }
+        }
+        drop(ov);
+        // Cold index: temporary database, publication, companions.
+        let dest = dir.join("idx").join("a.tar.index.sqlite");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let mut idx = ratarmount_index::SqliteIndex::create_writable(Some(&dest)).unwrap();
+        let tmp = fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p != &dest && p.is_file() && !p.to_string_lossy().ends_with("-journal"))
+            .expect("temporary index");
+        assert_eq!(mode_of(&tmp), want, "temporary index");
+        idx.publish_tmp().unwrap();
+        assert_eq!(
+            mode_of(&dest),
+            want,
+            "published index (rename keeps the mode)"
+        );
+        for side in ["-wal", "-shm"] {
+            let p = PathBuf::from(format!("{}{side}", dest.display()));
+            if p.exists() {
+                assert_eq!(mode_of(&p), want, "index {side}");
+                report.push(format!("index{side}"));
+            }
+        }
+        drop(idx);
+        fs::write(dir.join("result"), format!("ok {}", report.join(","))).unwrap();
+    }
+
+    /// Regression (R11-S7 §7): the overlay database and the cold index keep
+    /// SQLite's `0644 & !umask` creation mode; publication's rename keeps the
+    /// temporary database's mode; companions take the database's mode.
+    /// Umasks 002, 022, 077, each in a fresh child.
+    #[cfg(unix)]
+    #[test]
+    fn regression_exclusive_create_preserves_overlay_and_published_index_modes() {
+        for umask in ["002", "022", "077"] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().canonicalize().unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "overlay_meta::tests::s7_mode_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(S7_MODE_CHILD_ENV, format!("{umask}:{}", dir.display()))
+                .output()
+                .unwrap();
+            let got = fs::read_to_string(dir.join("result")).unwrap_or_default();
+            assert!(
+                out.status.success() && got.starts_with("ok"),
+                "umask {umask}: {got:?}\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 }

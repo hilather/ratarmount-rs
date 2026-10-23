@@ -1287,4 +1287,42 @@ mod tests {
         assert!(!other_process_sees_lock(&path), "oracle check");
         drop(h);
     }
+
+    /// Regression (R11-S7 §6): SQLAR connections keep SQLite's default
+    /// "unix" VFS (auto locking on macOS; no switch to "unix-posix"), plain
+    /// and (with the `sqlcipher` feature) encrypted.
+    #[cfg(unix)]
+    #[test]
+    fn regression_macos_sqlar_connections_keep_auto_vfs() {
+        use ratarmount_index::managed_read::connection_vfs_name;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.sqlar");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB);
+             INSERT INTO sqlar VALUES ('hello.txt', 33188, 0, 5, 'hello');",
+        )
+        .unwrap();
+        drop(c);
+        let m = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
+        assert_eq!(connection_vfs_name(&m.conn.lock().unwrap()), "unix");
+        #[cfg(feature = "sqlcipher")]
+        {
+            let enc = dir.path().join("enc.sqlar");
+            let c = Connection::open(&enc).unwrap();
+            c.execute_batch(
+                "PRAGMA key = 'foo';
+                 CREATE TABLE sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB);
+                 INSERT INTO sqlar VALUES ('hello.txt', 33188, 0, 5, 'hello');",
+            )
+            .unwrap();
+            drop(c);
+            let opts = OpenOptions {
+                passwords: vec!["foo".into()],
+                ..OpenOptions::default()
+            };
+            let m = SqlarMountSource::open(&enc, &opts).expect("decrypt");
+            assert_eq!(connection_vfs_name(&m.conn.lock().unwrap()), "unix");
+        }
+    }
 }
