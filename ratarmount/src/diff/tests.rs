@@ -444,8 +444,15 @@ fn regression_diff_database_errors_never_create_or_repair() {
     assert!(tombstones(tmp.path(), false).is_err());
     assert_eq!(fs::read(tmp.path().join(HIDDEN_DB)).unwrap(), b"corrupt");
     fs::remove_file(tmp.path().join(HIDDEN_DB)).unwrap();
-    let conn = Connection::open(tmp.path().join(HIDDEN_DB)).unwrap();
+    // The corrupt open above succeeded, so R11-S8 latches this name for the
+    // process: a direct create here is refused. Plant the row elsewhere and
+    // rename it into place (rename is not an `open` create).
+    assert!(Connection::open(tmp.path().join(HIDDEN_DB)).is_err());
+    let planted = tmp.path().join("planted-invalid.sqlite");
+    let conn = Connection::open(&planted).unwrap();
     conn.execute_batch("CREATE TABLE files(path TEXT, name TEXT, deleted INTEGER); INSERT INTO files VALUES('/../', 'outside', 1);").unwrap();
+    drop(conn);
+    fs::rename(planted, tmp.path().join(HIDDEN_DB)).unwrap();
     assert!(tombstones(tmp.path(), false)
         .unwrap_err()
         .contains("invalid overlay path"));

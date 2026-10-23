@@ -38,7 +38,11 @@ struct Entry {
     #[allow(dead_code)]
     id: Option<DbId>,
     db: Vec<u8>,
+    /// Matched by the Unix `open` hook. Unused where that hook is not compiled.
+    #[cfg_attr(not(unix), allow(dead_code))]
     wal: Vec<u8>,
+    /// Matched by the Unix `open` hook. Unused where that hook is not compiled.
+    #[cfg_attr(not(unix), allow(dead_code))]
     shm: Vec<u8>,
     /// Recorded so the latch key names the companion. DELETE mode may still
     /// create this file; see the module docs.
