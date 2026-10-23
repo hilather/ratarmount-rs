@@ -27,7 +27,8 @@
 //!   process ([`quarantined`] counts them). Further generic opens of that
 //!   inode, including after its registration is dropped and created again,
 //!   are refused before `open` once the external-alias epoch cap (one) is reached
-//!   and quarantine nothing. An unidentified descriptor is still quarantined
+//!   and quarantine nothing. `O_CREAT|O_EXCL` over an existing name is
+//!   `EEXIST` and does not open, including after the cap. An unidentified descriptor is still quarantined
 //!   and does not count. Two opens that both pass the pre-check before either
 //!   is recorded can each quarantine one descriptor. The registry and epoch
 //!   locks are never held across `open`. Descriptors are not pooled: pooling
@@ -396,6 +397,9 @@ mod unix {
     /// Open without `O_TRUNC`, check the descriptor obtained, quarantine a
     /// refused one, truncate only an admitted file. A registered inode whose
     /// external-alias epoch is already spent is refused before this open.
+    /// `O_CREAT|O_EXCL` over an existing name is `EEXIST` and does not open,
+    /// including after the cap: `open(2)` fails that way before it returns a
+    /// descriptor.
     fn generic(
         dir: RawFd,
         c: &CString,
@@ -403,6 +407,13 @@ mod unix {
         flags: libc::c_int,
         mode: u32,
     ) -> io::Result<Option<OwnedFd>> {
+        if (flags & (libc::O_CREAT | libc::O_EXCL)) == (libc::O_CREAT | libc::O_EXCL) {
+            match fstatat_name(dir, c, flags) {
+                Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
         if let Some(error) = refuse_capped_alias(dir, c, name, flags) {
             return Err(error);
         }
@@ -624,7 +635,8 @@ mod tests {
     /// Regression (#196): on the generic path the first open of a registered
     /// overlay-database inode is quarantined. The next open, and an open after
     /// the registration is dropped and created again, is refused before `open`
-    /// (external-alias epoch cap) and quarantines nothing. Between
+    /// (external-alias epoch cap) and quarantines nothing. `O_CREAT|O_EXCL`
+    /// over the existing alias stays `EEXIST`. Between
     /// registrations the name is not a database and opens normally. On Linux
     /// the `O_PATH` refusal that runs first quarantines nothing and does not
     /// spend the epoch.
@@ -687,6 +699,14 @@ mod tests {
         );
         assert_eq!(quarantined(), before + 1, "the cap opens nothing");
         assert_eq!(fs::metadata(&db).unwrap().len(), 14, "nothing truncated");
+
+        // Exclusive create over the existing alias: `EEXIST`, even after the
+        // cap (macOS always takes this path). Nothing is opened.
+        let excl =
+            open_admitted(&alias, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o644).unwrap_err();
+        assert_eq!(excl.kind(), io::ErrorKind::AlreadyExists, "{excl}");
+        assert_eq!(quarantined(), before + 1);
+        assert_eq!(fs::metadata(&db).unwrap().len(), 14);
 
         drop(registration);
         open_admitted(&alias, libc::O_RDONLY, 0).expect("unregistered name opens");

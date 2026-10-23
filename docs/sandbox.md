@@ -1789,7 +1789,9 @@ create mode apply only after the check. Elsewhere (macOS, or Linux without
 not be read, is kept open for the life of the process. Further opens of that
 inode are refused before `open` once the external-alias epoch cap (one
 descriptor) is reached, including after the database registration is dropped
-and created again; those refusals keep no further descriptor. Two opens that
+and created again; those refusals keep no further descriptor. An exclusive
+create (`O_CREAT` with `O_EXCL`) over an existing name is `EEXIST` and does
+not open, including after the cap. Two opens that
 both pass the check before either is recorded can each keep one descriptor.
 An unidentified descriptor is still kept and does not count toward the cap.
 Linux `O_PATH` refusals do not count. Descriptors are not pooled. Remove the
