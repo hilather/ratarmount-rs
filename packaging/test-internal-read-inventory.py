@@ -154,17 +154,22 @@ ESCAPES = ("into_raw_fd", "as_raw_fd", "try_clone", "from_raw_fd", "File::from")
 # --------------------------------------------------------------------------
 
 
-def mask(src, strings=True):
+def mask(src, strings=True, lit_fill=None):
     """Return `src` with comments and (unless `strings` is false) string/char
-    literal contents blanked. Offsets and newlines are kept."""
+    literal contents blanked. Offsets and newlines are kept. With `lit_fill`
+    literal contents (newlines included) are filled with that character
+    instead, so a caller can tell them from code."""
     out = list(src)
     keep_strings = not strings
     i, n = 0, len(src)
 
-    def blank(a, b):
+    def blank(a, b, fill=" "):
         for k in range(a, b):
-            if out[k] != "\n":
-                out[k] = " "
+            if fill != " " or out[k] != "\n":
+                out[k] = fill
+
+    def blank_lit(a, b):
+        blank(a, b, lit_fill or " ")
 
     while i < n:
         c = src[i]
@@ -192,7 +197,7 @@ def mask(src, strings=True):
             if keep_strings:
                 i = j
                 continue
-            blank(i + m.end(), j - len(close))
+            blank_lit(i + m.end(), j - len(close))
             i = j
         elif c == '"' or (c == "b" and src.startswith('b"', i) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_"))):
             j = i + (2 if c == "b" else 1)
@@ -202,18 +207,18 @@ def mask(src, strings=True):
             if keep_strings:
                 i = j + 1
                 continue
-            blank(start, min(j, n))
+            blank_lit(start, min(j, n))
             i = j + 1
         elif c == "'":
             if i + 1 < n and src[i + 1] == "\\":
                 j = src.find("'", i + 2)
                 j = n if j < 0 else j
                 if not keep_strings:
-                    blank(i + 1, j)
+                    blank_lit(i + 1, j)
                 i = j + 1
             elif i + 2 < n and src[i + 2] == "'":
                 if not keep_strings:
-                    blank(i + 1, i + 2)
+                    blank_lit(i + 1, i + 2)
                 i += 3
             else:
                 i += 1
@@ -535,6 +540,38 @@ TEMPFILE_ITEMS = frozenset({"NamedTempFile", "TempDir", "Builder", "tempfile", "
                             "spooled_tempfile", "env"})
 
 
+# Modules whose local renames are followed through later imports
+# (`use std::fs as disk; use disk::read as read_index;`).
+CHAIN_ROOTS = (["std"], ["tokio"], ["std", "fs"], ["tokio", "fs"], ["rustix"], ["rustix", "fs"], ["tempfile"])
+
+
+def resolve_chained(leaves):
+    """`leaves` with each path that starts with a local name of one of
+    `CHAIN_ROOTS` rewritten to the full path, to a fixed point: an aliased
+    module used as the first segment of a later import names that module."""
+    leaves = list(leaves)
+    for _ in range(8):
+        roots = {}
+        for path, alias, _ in leaves:
+            if alias != "*" and path in CHAIN_ROOTS and alias != path[0]:
+                roots[alias] = path
+        changed = False
+        out = []
+        for path, alias, at in leaves:
+            if path and path[0] in roots and len(path) > 1:
+                path = roots[path[0]] + path[1:]
+                changed = True
+            elif path and path[0] in roots and path[0] != alias:
+                # `use disk;` is a re-import of the alias itself.
+                path = roots[path[0]]
+                changed = True
+            out.append((path, alias, at))
+        leaves = out
+        if not changed:
+            break
+    return leaves
+
+
 def aliases(text):
     """Local names for `std::fs::File`, `std::fs::OpenOptions`, `std::fs`,
     bare fs functions and rustix's fs module, plus every import this scanner
@@ -543,7 +580,7 @@ def aliases(text):
     file_names, fs_names, bare, oo_names = {"File"}, {"fs"}, set(), {"OpenOptions"}
     rustix, rustix_bare, tempfile_bare, unsupported = {"rustix::fs"}, set(), set(), []
     oo_imported = False
-    for path, alias, at in use_leaves(text):
+    for path, alias, at in resolve_chained(use_leaves(text)):
         if len(path) >= 2 and path[0] in ("std", "tokio") and path[1] == "fs":
             rest = path[2:]
             if alias == "*":
@@ -603,7 +640,7 @@ def op_patterns(text, factories=()):
     fss = "|".join(sorted(re.escape(n) for n in names["fs"]))
     oos = "|".join(sorted(re.escape(n) for n in names["oo"]))
     pats = [
-        (r"(?<![\w.])(?:(?:std|tokio)::fs::)?(?:%s)::(open|create|create_new)\s*\(" % files, "File::{0}"),
+        (r"(?<![\w.])(?:(?:std|tokio)::fs::)?(?:%s)>?::(open|create|create_new)\s*\(" % files, "File::{0}"),
         (r"(?<![\w.])(?:(?:std|tokio)::)?(?:%s)::(read|read_to_string|copy|write)\s*\(" % fss, "fs::{0}"),
         (r"(?<![\w.])(?:(?:std|tokio)::fs::|(?:%s)::)?(?:%s)::new\s*\(|(?<![\w.])(?:(?:std|tokio)::)?(?:fs::)?(?:%s)::options\s*\(" % (fss, oos, files), "OpenOptions"),
         (r"(?<![\w.])(?<!fn )(?:ratarmount_core::db_inodes::)?(open_admitted|openat_admitted)\s*\(", "{0}"),
@@ -614,8 +651,8 @@ def op_patterns(text, factories=()):
         (r"\b(from_raw_fd|into_raw_fd|from_raw_handle|into_raw_handle)\s*\(", "{0}"),
         (r"(?<![\w.])(?:libc::)(open|openat|open64)\s*\(", "libc::{0}"),
         (r"(?<![\w.:])(?:%s)::(open|openat|openat2)\s*\(" % rx, "rustix::{0}"),
-        (r"(?<![\w])NamedTempFile::(?:new|new_in)\s*\(|\.tempfile(?:_in)?\s*\(|(?<![\w.])tempfile::tempfile(?:_in)?\s*\(", "tempfile"),
-        (r"(?<![\w.])(?:tempfile::)?(?:tempdir|tempdir_in)\s*\(|\.tempdir(?:_in)?\s*\(|(?<![\w.])TempDir::new(?:_in)?\s*\(", "tempdir"),
+        (r"(?<![\w])NamedTempFile::(?:new|new_in|with_prefix|with_prefix_in|with_suffix|with_suffix_in)\s*\(|\.tempfile(?:_in)?\s*\(|(?<![\w.])tempfile::tempfile(?:_in)?\s*\(", "tempfile"),
+        (r"(?<![\w.])(?:tempfile::)?(?:tempdir|tempdir_in)\s*\(|\.tempdir(?:_in)?\s*\(|(?<![\w.])(?:tempfile::)?TempDir::(?:new|with_prefix|with_suffix)(?:_in)?\s*\(", "tempdir"),
         (r"(?<![\w.])ManagedReadCursor::open\s*\(", "ManagedReadCursor::open"),
         # Foreign libraries that open a pathname themselves (#196 residuals:
         # their descriptors are outside this process's Rust code).
@@ -632,7 +669,10 @@ def op_patterns(text, factories=()):
         pats.append((r"(?<![\w.:])(?<!fn )%s(?:_in)?\s*\(" % re.escape(alias), "tempfile"))
     for name in sorted(factories):
         pats.append((r"(?<![\w.])(?<!fn )(?:[a-z_]\w*::)*%s\s*\(" % re.escape(name), "OpenOptions"))
-    return [(re.compile(p), label) for p, label in pats]
+    # A call may carry explicit generic arguments (`std::fs::read::<_>(p)`,
+    # `File::open::<&Path>(p)`).
+    turbofish = r"\s*(?:::\s*<[^;{}]*?>\s*)?\("
+    return [(re.compile(p.replace(r"\s*\(", turbofish)), label) for p, label in pats]
 
 
 def extent(text, pos):
@@ -663,10 +703,16 @@ def extent(text, pos):
     return start, end
 
 
-def statement(ctext, spans):
+def statement(ctext, spans, lits=None):
     """The normalized text of `spans` in the comment-masked source: literal
-    values are kept, so a changed path or mode changes the fingerprint."""
-    return "\n".join(re.sub(r"\s+", "", ctext[a:b]) for a, b in spans)
+    values are kept, so a changed path or mode changes the fingerprint.
+    Whitespace is dropped outside literals only (`lits`: `ctext` with
+    literal contents filled with NUL, from `mask(.., lit_fill="\\0")`), so
+    `"cache index.sqlite"` -> `"cacheindex.sqlite"` changes it too."""
+    if lits is None:
+        return "\n".join(re.sub(r"\s+", "", ctext[a:b]) for a, b in spans)
+    return "\n".join("".join(ch for k, ch in enumerate(ctext[a:b], a) if lits[k] == "\0" or not ch.isspace())
+                     for a, b in spans)
 
 
 def builder_spans(text, pos, first, fn_end, factory):
@@ -740,12 +786,13 @@ def scan(root, problems=None):
     appended to `problems` when given."""
     problems = [] if problems is None else problems
     files = rust_files(root)
-    texts, raws, ctexts, test_files = {}, {}, {}, set()
+    texts, raws, ctexts, lits, test_files = {}, {}, {}, {}, set()
     for rel in files:
         with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
             raws[rel] = fh.read()
             texts[rel] = mask(raws[rel])
             ctexts[rel] = mask(raws[rel], strings=False)
+            lits[rel] = mask(raws[rel], lit_fill="\0")
     # Files that are test-only modules (and everything below them).
     changed = True
     while changed:
@@ -803,7 +850,7 @@ def scan(root, problems=None):
                 if problem:
                     problems.append("unsupported OpenOptions builder: %s:%d %s: %s"
                                     % (rel, text.count("\n", 0, pos) + 1, fn, problem))
-            stmt = statement(ctext, parts)
+            stmt = statement(ctext, parts, lits[rel])
             ops.append({
                 "file": rel,
                 "function": fn,
@@ -948,7 +995,14 @@ def resolves(rel, text, prefix, callee, target, hint=None, mods=None):
     if target == rel:
         return True
     mod = stem(target)
-    return re.search(r"use\s+[\w:]*\b%s::(?:\{[^}]*\b%s\b[^}]*\}|%s\s*;)" % (re.escape(mod), re.escape(callee), re.escape(callee)), text) is not None
+    # Any import form: `use crate::m::leaf;`, nested braces
+    # (`use crate::{m::leaf, ..}`), or a glob of the module (`use crate::m::*;`).
+    for path, alias, _ in use_leaves(text):
+        if alias == "*" and path and path[-1] == mod:
+            return True
+        if len(path) >= 2 and path[-2:] == [mod, callee]:
+            return True
+    return False
 
 
 def helper_errors(entries, scanned, texts, fns):
@@ -1514,6 +1568,87 @@ def regression_inventory_records_foreign_library_openers():
                    ("l", "libarchive::archive_read_open_filename")], got)
     errs = check(root, classify(root, {}))
     expect(sum("unclassified" in e for e in errs) == 4, errs)
+
+
+def regression_inventory_chained_aliases_resolve():
+    """Regression (R11-S7-FIX9): `use std::fs as disk; use disk::read as
+    read_index;` (an import through an aliased module) hid `read_index(p)`:
+    zero operations, an empty manifest passed."""
+    root = fake({"c/src/lib.rs": (
+        "use std::fs as disk;\nuse disk::read as read_index;\nuse disk::{File as Raw};\n"
+        "use std as s;\nuse s::fs::read_to_string as rts;\n"
+        "fn a(p: &Path) { let _ = read_index(p); }\n"
+        "fn b(p: &Path) { let _ = Raw::open(p); }\n"
+        "fn c(p: &Path) { let _ = rts(p); }\n"
+    )})
+    errs = []
+    ops, _, _ = scan(root, errs)
+    got = sorted((o["function"], o["op"]) for o in ops)
+    expect(got == [("a", "fs::read"), ("b", "File::open"), ("c", "fs::read_to_string")], got)
+    expect(errs == [], errs)
+    errs = check(root, {"entries": []})
+    expect(sum("new operation" in e for e in errs) == 3, errs)
+    root = fake({"c/src/lib.rs": "use std::fs as disk;\nuse disk::*;\nfn a() {}\n"})
+    expect(any("unsupported import" in e for e in check(root, {"entries": []})), "glob through an alias")
+
+
+def regression_inventory_generic_arguments_are_calls():
+    """Regression (R11-S7-FIX9): explicit generic arguments
+    (`std::fs::read::<_>(p)`, `File::open::<_>(p)`) and the qualified form
+    `<File>::open(p)` hid the call."""
+    root = fake({"c/src/lib.rs": (
+        "fn a(p: &Path) { let _ = std::fs::read::<_>(p); }\n"
+        "fn b(p: &Path) { let _ = File::open::<&Path>(p); }\n"
+        "fn c(p: &Path) { let _ = <std::fs::File>::open(p); let _ = <File>::create(p); }\n"
+        "fn d(p: &Path) { let _ = fs::read_to_string::<Vec<u8>>(p); }\n"
+    )})
+    ops, _, _ = scan(root)
+    got = sorted((o["function"], o["op"]) for o in ops)
+    expect(got == [("a", "fs::read"), ("b", "File::open"), ("c", "File::create"), ("c", "File::open"),
+                   ("d", "fs::read_to_string")], got)
+
+
+def regression_inventory_fingerprint_keeps_literal_whitespace():
+    """Regression (R11-S7-FIX9): fingerprints dropped whitespace inside
+    string literals, so `"cache index.sqlite"` -> `"cacheindex.sqlite"` kept
+    the entry; whitespace outside literals (rustfmt) still does not count."""
+    src = "fn a(p: &Path) { let _ = std::fs::read(p.join(\"cache index.sqlite\")); }\n"
+    root = fake({"c/src/lib.rs": src})
+    m = classify(root, {("a", "fs::read"): OOF})
+    for changed in (src.replace("cache index", "cacheindex"), src.replace("cache index", "cache\tindex")):
+        with open(os.path.join(root, "c/src/lib.rs"), "w") as fh:
+            fh.write(changed)
+        expect(any("changed operation" in e for e in check(root, m)), changed)
+    with open(os.path.join(root, "c/src/lib.rs"), "w") as fh:
+        fh.write(src.replace("read(p.join(", "read(  p.join( "))
+    expect(check(root, m) == [], check(root, m))
+
+
+def regression_inventory_helper_walk_follows_braced_and_glob_imports():
+    """Regression (R11-S7-FIX9): a managed function reaching a raw helper
+    imported through nested braces (`use crate::{util::leaf, ..}`) or a glob
+    (`use crate::util::*;`) was not reported."""
+    for imp in ("use crate::{util::leaf, other};\n", "use crate::util::*;\n", "use crate::{util::{leaf}};\n"):
+        root = fake({
+            "c/src/lib.rs": "mod util;\n" + imp + "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; leaf(p); }\n",
+            "c/src/util.rs": "pub fn leaf(p: &Path) { let _ = std::fs::read(p); }\n",
+        })
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("leaf", "fs::read"): OOF})
+        errs = check(root, m)
+        expect(any("reaches helper leaf" in e for e in errs), (imp, errs))
+
+
+def regression_inventory_tempdir_builders_are_creates():
+    """Regression (R11-S7-FIX9): `TempDir::with_prefix(..)` (and the
+    `NamedTempFile`/`TempDir` `with_prefix`/`with_suffix` constructors) had no
+    inventory entry."""
+    root = fake({"c/src/lib.rs": (
+        "fn a() { let _ = tempfile::TempDir::with_prefix(\"x\"); let _ = TempDir::with_prefix_in(\"x\", \"/d\"); }\n"
+        "fn b() { let _ = NamedTempFile::with_prefix(\"y\"); let _ = NamedTempFile::with_suffix_in(\"y\", \"/d\"); }\n"
+    )})
+    ops, _, _ = scan(root)
+    got = sorted((o["function"], o["op"], o["creates"], o["exclusive"]) for o in ops)
+    expect(got == [("a", "tempdir", True, True)] * 2 + [("b", "tempfile", True, True)] * 2, got)
 
 
 def self_test():

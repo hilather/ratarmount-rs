@@ -904,3 +904,23 @@ fn oom_row(dir: &Path) -> String {
 fn regression_managed_sync_requests_full_fsync() {
     assert_eq!(imp::SYNC_FLAGS, rusqlite::ffi::SQLITE_SYNC_FULL);
 }
+
+/// Regression (R11-S7-FIX9, documented behaviour change): a managed read
+/// accepts only a regular file. A FIFO at an internal-read name is refused
+/// before any `open` (an ordinary read blocked in `open(2)` until a writer
+/// came), and a device (`/dev/null` here; block devices take the same
+/// check) is refused instead of read.
+#[cfg(unix)]
+#[test]
+fn regression_managed_read_refuses_fifo_and_devices() {
+    let (_d, dir) = tempdir();
+    let fifo = dir.join("pipe");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    for p in [fifo.as_path(), Path::new("/dev/null")] {
+        let err = read(p).expect_err("not a regular file");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{p:?}: {err}");
+        assert!(ManagedReadCursor::open(p).is_err(), "{p:?}");
+    }
+}

@@ -73,6 +73,9 @@ pub(crate) enum SidecarStage {
     Acquired,
     /// Before each body chunk is read.
     BeforeChunk,
+    /// The handler returned (with the error kind it returned, if any),
+    /// before the connection is closed.
+    Finished(Option<io::ErrorKind>),
 }
 
 impl SidecarAdmission {
@@ -270,13 +273,18 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: &HttpState) -> io:
     match req.method {
         Method::Get | Method::Head => {
             if is_index_sidecar_path(&path) {
-                return handle_index_sidecar(
+                let res = handle_index_sidecar(
                     &mut stream,
                     state,
                     req.method == Method::Head,
                     req.range.as_deref(),
                     send_body,
                 );
+                #[cfg(test)]
+                let _ = state.sidecar.stage(SidecarStage::Finished(
+                    res.as_ref().err().map(io::Error::kind),
+                ));
+                return res;
             }
             let Some(fi) = state.source.lookup(&path, 0) else {
                 return write_response(

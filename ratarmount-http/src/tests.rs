@@ -1362,11 +1362,18 @@ mod sidecar_s7 {
         let (_d, dir) = tempdir();
         let idx = dir.join("a.index.sqlite");
         let bytes = wal_index(&idx, 3);
-        // Shrunk after the length was taken: short body, never complete.
+        // Shrunk after the length was taken: short body, never complete,
+        // and the handler itself returns `UnexpectedEof` (a successful
+        // `break` would also close the connection short).
         let i2 = idx.clone();
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let f2 = Arc::clone(&finished);
         let srv = serve(
             &idx,
             admission(move |s| {
+                if let SidecarStage::Finished(kind) = s {
+                    f2.lock().unwrap().push(kind);
+                }
                 if s == SidecarStage::Acquired {
                     std::fs::OpenOptions::new()
                         .write(true)
@@ -1386,6 +1393,11 @@ mod sidecar_s7 {
         assert_eq!(advertised, bytes.len());
         assert!(body.len() < advertised, "short body is not complete");
         drop(srv);
+        assert_eq!(
+            *finished.lock().unwrap(),
+            vec![Some(io::ErrorKind::UnexpectedEof)],
+            "the handler reports the short sidecar"
+        );
         // A read error mid-body.
         std::fs::write(&idx, &bytes).unwrap();
         let n = Arc::new(AtomicUsize::new(0));

@@ -901,7 +901,7 @@ thread_local! {
 
 /// Copy the index and its existing companions into a private temporary
 /// directory and open the copy (read-write there: recovery of a hot journal
-/// and creation of `-shm` happen on the copy).
+/// and of the WAL happen on the copy).
 fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
     let io = |e: std::io::Error| {
         rusqlite::Error::SqliteFailure(
@@ -930,6 +930,9 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
         let mut to = copy.as_os_str().to_owned();
         to.push(suffix);
         let from = PathBuf::from(from);
+        // `-shm` is copied with `-wal` only so the pair the classifier saw
+        // stays a pair; the first connection to the copy rebuilds its
+        // wal-index from `-wal` (no other connection shares it).
         // A missing SOURCE companion is fine; a destination collision is not.
         match std::fs::symlink_metadata(&from) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
