@@ -807,7 +807,11 @@ pub fn directory_digest_excluding(root: &Path, excludes: &BaseExcludes) -> Resul
         let (size, content) = if meta.is_dir() {
             (0, String::new())
         } else if meta.is_file() {
-            (meta.len(), sha256_hex_stream(&mut fs::File::open(&path)?)?)
+            // Managed (#151): a base file may be a database open here.
+            (
+                meta.len(),
+                ratarmount_index::managed_read::sha256_hex(&path)?,
+            )
         } else if meta.is_symlink() {
             let target = fs::read_link(&path)?;
             let bytes = target.as_os_str().as_encoded_bytes();
@@ -909,7 +913,9 @@ impl PendingBase {
                     }
                 }
                 test_hash_seam(path);
-                sha256_hex_stream(&mut Checked(fs::File::open(path)?, check))
+                // Managed (#151): the archive may be a database open here.
+                let cursor = ratarmount_index::managed_read::ManagedReadCursor::open(path)?;
+                sha256_hex_stream(&mut Checked(cursor, check))
             })
             .map_err(|e| {
                 OverlayError::Msg(format!("cannot hash base {}: {e}", self.path.display()))
@@ -1500,7 +1506,8 @@ pub(crate) fn verify_base_path(dir: &Path, base: &Path) -> BaseCheck {
         }
     } else if base_meta.is_file() {
         match kind {
-            Some("strong") => fs::File::open(base)
+            // Managed (#151): the base may be a database open here.
+            Some("strong") => ratarmount_index::managed_read::ManagedReadCursor::open(base)
                 .and_then(|mut f| {
                     test_hash_seam(base);
                     sha256_hex_stream(&mut f)
@@ -3612,5 +3619,172 @@ mod tests {
             Err(OverlayError::Msg(msg)) => assert_eq!(msg, NO_FILES_TABLE),
             other => panic!("a required table-less record must refuse: {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // R11-S7 (#151): base hashing reads through managed readers.
+    // ---------------------------------------------------------------------
+
+    #[cfg(unix)]
+    use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+
+    /// An SQLite database (an SQLAR or an index) at `path`; its bytes.
+    #[cfg(unix)]
+    fn s7_database(path: &Path) -> Vec<u8> {
+        let c = Connection::open(path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB);
+             INSERT INTO sqlar VALUES ('a', 33188, 0, 3, randomblob(150000));",
+        )
+        .unwrap();
+        drop(c);
+        fs::read(path).unwrap()
+    }
+
+    /// A connection of this process holding SHARED on `path`.
+    #[cfg(unix)]
+    fn s7_holder(path: &Path) -> Connection {
+        let c = Connection::open(path).unwrap();
+        c.execute_batch("BEGIN").unwrap();
+        let _: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert!(other_process_sees_lock(path));
+        c
+    }
+
+    /// A file base with a supplied strong digest of `bytes`.
+    #[cfg(unix)]
+    fn s7_strong_overlay(root: &Path, archive: &Path, bytes: &[u8]) -> PathBuf {
+        let overlay = root.join("strong-overlay");
+        let mut request = info(archive);
+        request.base_digest =
+            BaseDigestRequest::Supplied(format!("sha256:{:x}", Sha256::digest(bytes)));
+        drop(WriteOverlay::new_with_create_info_for_tests(base(root), &overlay, &request).unwrap());
+        overlay
+    }
+
+    /// Regression: the strong directory digest hashed every file with a raw
+    /// `File`, releasing the lock of a connection of this process on an SQLAR
+    /// inside the base directory.
+    #[cfg(unix)]
+    #[test]
+    fn regression_directory_strong_digest_keeps_sqlar_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().canonicalize().unwrap().join("base");
+        fs::create_dir(&basedir).unwrap();
+        let db = basedir.join("a.sqlar");
+        s7_database(&db);
+        let h = s7_holder(&db);
+        directory_digest(&basedir).unwrap();
+        assert!(other_process_sees_lock(&db), "lock kept");
+        drop(fs::File::open(&db).unwrap());
+        assert!(!other_process_sees_lock(&db), "oracle check");
+        drop(h);
+    }
+
+    /// Regression: resolving a pending archive digest (the mount's background
+    /// hasher and `resolve_pending_base_digest`) hashed the archive raw while
+    /// a connection of this process had it open (the archive here is an
+    /// ordinary index with a `files` table).
+    #[cfg(unix)]
+    #[test]
+    fn regression_pending_base_hash_keeps_index_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let archive = root.join("a.tar");
+        {
+            let mut idx = ratarmount_index::SqliteIndex::create_writable(Some(&archive)).unwrap();
+            idx.publish_tmp().unwrap();
+        }
+        let (overlay, pending) = pending_overlay(&root, &archive, "overlay");
+        let h = {
+            let c = Connection::open(&archive).unwrap();
+            c.execute_batch("BEGIN").unwrap();
+            let _: i64 = c
+                .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+                .unwrap();
+            c
+        };
+        assert!(other_process_sees_lock(&archive));
+        let digest = pending.hash(&|| Ok(())).unwrap();
+        assert!(digest.starts_with("sha256:"));
+        assert!(
+            other_process_sees_lock(&archive),
+            "PendingBase::hash kept it"
+        );
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        resolve_pending_base_digest(&conn).unwrap();
+        assert!(other_process_sees_lock(&archive), "resolution kept it");
+        drop(h);
+    }
+
+    /// Regression: `overlay verify`'s strong base check hashed the base raw
+    /// (an SQLAR another connection of this process has open).
+    #[cfg(unix)]
+    #[test]
+    fn regression_strong_base_verification_keeps_sqlar_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let archive = root.join("a.sqlar");
+        let bytes = s7_database(&archive);
+        let overlay = s7_strong_overlay(&root, &archive, &bytes);
+        let h = s7_holder(&archive);
+        assert!(matches!(
+            verify_base_path(&overlay, &archive),
+            BaseCheck::Matches {
+                strength: BaseStrength::Strong,
+                ..
+            }
+        ));
+        assert!(other_process_sees_lock(&archive), "lock kept");
+        drop(h);
+    }
+
+    /// Regression: a failed strong base hash must stay `Skipped` (the CLI
+    /// keeps its exit status and reports `base_ok: null`), never `Matches`.
+    #[cfg(unix)]
+    #[test]
+    fn regression_verify_base_hash_failure_stays_skipped() {
+        use ratarmount_index::managed_read::{seams, Seam};
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let archive = root.join("a.sqlar");
+        let bytes = s7_database(&archive);
+        let overlay = s7_strong_overlay(&root, &archive, &bytes);
+        for seam in [Seam::AfterOpen, Seam::BeforeRead] {
+            let got = seams::with(
+                move |s| {
+                    if s == seam {
+                        Err(io::Error::other("injected"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || verify_base_path(&overlay, &archive),
+            );
+            match got {
+                BaseCheck::Skipped { reason } => assert!(reason.contains("injected"), "{reason}"),
+                other => panic!("{seam:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Regression (live caller of the digest refresh, `refresh_archive_digest`
+    /// through `refresh_committed_base`): refreshing the committed base's
+    /// digest hashed an archive that is an SQLAR open in this process raw.
+    #[cfg(unix)]
+    #[test]
+    fn regression_archive_digest_and_refresh_keep_sqlar_lock_live_caller() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let archive = root.join("a.sqlar");
+        let bytes = s7_database(&archive);
+        let overlay = s7_strong_overlay(&root, &archive, &bytes);
+        let h = s7_holder(&archive);
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        refresh_committed_base(&conn, None, &archive).unwrap();
+        assert!(other_process_sees_lock(&archive), "refresh kept the lock");
+        drop(h);
     }
 }

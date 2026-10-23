@@ -8583,8 +8583,9 @@ fn remote_on_exit_timeout_err() -> OverlayError {
 const REMOTE_ON_EXIT_EXTRA_DEFAULT: Duration = Duration::from_secs(120);
 
 fn file_sha256(path: &Path) -> Result<String> {
-    let mut f = File::open(path)?;
-    ratarmount_index::sha256_hex_stream(&mut f).map_err(|e| OverlayError::Msg(e.to_string()))
+    // Managed (#151): a remote spool may be another name of a database open
+    // in this process.
+    ratarmount_index::managed_read::sha256_hex(path).map_err(|e| OverlayError::Msg(e.to_string()))
 }
 
 /// Bytes of the downloaded object before `persist_by_format`.
@@ -19517,5 +19518,37 @@ pub(crate) mod tests {
         }
         assert!(!is_control_reserved_path("/sub/.ratarmount-control/x"));
         assert!(!is_control_reserved_path("/.ratarmount-controlx"));
+    }
+
+    /// Regression (R11-S7, #151): the remote spool fingerprint and comparison
+    /// (`file_sha256`, `presplice_fingerprint`, both operands of
+    /// `files_same_len_and_hash`) hashed with raw `File`s; a spool that is
+    /// another name of a database open in this process lost its lock.
+    #[cfg(unix)]
+    #[test]
+    fn regression_remote_spool_hash_keeps_aliased_database_lock() {
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let db = dir.join("spool.sqlite");
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch("CREATE TABLE t(x BLOB); INSERT INTO t VALUES (randomblob(100000));")
+            .unwrap();
+        drop(c);
+        let alias = dir.join("alias");
+        fs::hard_link(&db, &alias).unwrap();
+        let h = Connection::open(&db).unwrap();
+        h.execute_batch("BEGIN").unwrap();
+        let _: i64 = h
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert!(other_process_sees_lock(&db));
+        let fp = presplice_fingerprint(&alias).unwrap();
+        assert_eq!(fp.sha256, file_sha256(&db).unwrap());
+        assert!(files_same_len_and_hash(&db, &alias).unwrap());
+        assert!(other_process_sees_lock(&db), "lock kept");
+        drop(fs::File::open(&alias).unwrap());
+        assert!(!other_process_sees_lock(&db), "oracle check");
+        drop(h);
     }
 }
