@@ -302,6 +302,8 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     /// Regression: crashes accumulated staging trees and lock files indefinitely.
+    /// Regression (#184): the unheld-lock phase flaked when a spawned git child
+    /// still shared the released lock's open file description.
     #[test]
     fn regression_synthetic_cache_reclaims_only_abandoned_owned_staging_and_unheld_locks() {
         let temp = tempfile::tempdir().unwrap();
@@ -341,8 +343,15 @@ mod tests {
             assert!(temp.path().join(name).exists(), "{name}");
         }
         assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"outside");
+        // flock belongs to the open file description, which a concurrently
+        // spawned child (git in synthetic_tests) shares until exec, so a bare
+        // drop may leave it locked (#184). The unlock is what releases it; the
+        // duplicate stands in for that child's copy.
+        let child_copy = held.try_clone().unwrap();
+        held.unlock().unwrap();
         drop(held);
         root.reclaim(now).unwrap();
         assert!(!temp.path().join("held.lock").exists());
+        drop(child_copy);
     }
 }

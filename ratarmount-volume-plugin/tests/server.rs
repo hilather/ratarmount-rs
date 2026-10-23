@@ -212,3 +212,34 @@ fn regression_server_socket_activation_and_environment_only_credentials() {
         }
     }
 }
+
+/// Regression #185: an over-long `--socket` exits 1 before creating any directory:
+/// neither the socket's missing parents nor a fresh `--state-dir`, including a
+/// state dir that shares the socket's missing ancestor.
+#[test]
+fn regression_185_too_long_socket_creates_no_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent");
+    let socket = absent.join("n1").join("n2").join("s".repeat(120));
+    for state in [dir.path().join("state"), absent.join("state")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ratarmount-volume-plugin"))
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("--ratarmount")
+            .arg("/bin/false")
+            .stdout(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("107-byte sun_path limit"), "{stderr}");
+        assert!(!state.exists(), "state dir created: {}", state.display());
+        assert!(
+            !absent.exists(),
+            "parent dirs left behind: {}",
+            absent.display()
+        );
+    }
+}
