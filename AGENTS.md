@@ -12,7 +12,13 @@ Before every commit (including worktree subagent commits):
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings   # or -p <crate> when scoped
 cargo test --workspace                                    # or -p <crate> when scoped
+python3 -I packaging/test-internal-read-inventory.py      # when production file opens changed
 ```
+
+The internal-read inventory (#151) fails CI on a new or changed production
+pathname read, copy, create or descriptor conversion until its entry in
+`packaging/internal-read-inventory.json` is reviewed and updated (`--write`
+refreshes fingerprints and adds new sites as `UNCLASSIFIED`).
 
 Do **not** push code that fails `cargo fmt --check`.
 

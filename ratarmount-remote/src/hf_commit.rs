@@ -1036,6 +1036,9 @@ mod tests {
     /// Regression (R11-S7, #151): the staged archive was opened with a raw
     /// `File` (sampled, hashed, rewound, uploaded); its close released this
     /// process's lock on it. Basic and multipart LFS, and a failing upload.
+    /// The lock is a VFS-level SHARED lock of this SQLite instance (the same
+    /// per-inode bookkeeping a connection uses; the file need not be a
+    /// database).
     #[cfg(unix)]
     #[test]
     fn regression_hf_archive_upload_keeps_index_lock() {

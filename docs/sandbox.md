@@ -1840,6 +1840,12 @@ wrappers could be installed:
 | Windows library builds | None | The path is checked to be a regular file (no symlink under `SQLITE_OPEN_NOFOLLOW`) before and after SQLite's open; no file identity, so no swap-back detection. Commit-journal recovery needs Linux or macOS |
 | Any other Unix ABI (musl, 32-bit, big-endian, BSD) | None | Refused (`UnsupportedAbi` / `UnsupportedPlatform`): every `-w` mount and overlay verb that opens an overlay database fails, rather than falling back to pathname checks |
 
+Ordinary index, SQLAR, digest-cache and publication connections are not checked
+opens: they keep SQLite's default `"unix"` VFS (auto locking on macOS). The
+checked `overlay pack --include-index` snapshot uses the checked family above
+(`"unix-posix"` on macOS). Managed byte readers are not connections; see
+[Internal reads of index and database files](#internal-reads-of-index-and-database-files).
+
 The optional `sqlcipher` feature links SQLCipher's SQLite (older than 3.46.0),
 which is checked the same way. One difference: when its read-write open is
 refused, its read-only retry calls `open` again instead of reusing a parked

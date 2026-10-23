@@ -4166,7 +4166,9 @@ mod tests {
     #[cfg(unix)]
     use ratarmount_index::managed_read::{lock_probe::other_process_sees_lock, VfsLockHolder};
 
-    /// A staged file of `len` bytes held by this SQLite instance's lock.
+    /// A staged file of `len` bytes held by this SQLite instance's lock (a
+    /// VFS-level SHARED lock: the same per-inode bookkeeping a connection
+    /// uses; the staged file need not be a database).
     #[cfg(unix)]
     fn held_staged(len: u64) -> (NamedTempFile, Vec<u8>, VfsLockHolder) {
         let staged = NamedTempFile::new().unwrap();

@@ -3026,6 +3026,9 @@ mod tests {
     /// Regression (R11-S7, #151): Put Blob and every Put Block opened the
     /// file with a raw `File`; each close released this process's lock on
     /// it. One managed owner, independent cursors.
+    /// The lock is a VFS-level SHARED lock of this SQLite instance (the same
+    /// per-inode bookkeeping a connection uses; the file need not be a
+    /// database).
     #[cfg(unix)]
     #[test]
     fn regression_azure_single_and_block_uploads_keep_index_lock() {

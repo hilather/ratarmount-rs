@@ -3068,6 +3068,9 @@ c8kyOVCJusup7SdkiG+QF64=
     /// Regression (R11-S7, #151): the MD5 pass and the PUT body opened the
     /// staged file with raw `File`s; their closes released this process's
     /// lock on it. Both are independent cursors of one managed owner.
+    /// The lock is a VFS-level SHARED lock of this SQLite instance (the same
+    /// per-inode bookkeeping a connection uses; the file need not be a
+    /// database).
     #[cfg(unix)]
     #[test]
     fn regression_gcs_hash_and_upload_keep_index_lock() {

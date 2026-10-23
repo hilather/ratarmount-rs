@@ -3200,10 +3200,12 @@
    "ordinal": 1,
    "line": 120,
    "fingerprint": "838c2197d67a058c",
+   "baseline_fingerprint": "838c2197d67a058c",
    "disposition": "residual",
    "family": "foreign-library-or-caller-owned",
    "issue": "#196",
-   "reason": "git object cache directory walk (secure_cache) feeding libgit2-backed reads"
+   "reason": "git object cache directory walk (secure_cache) feeding libgit2-backed reads",
+   "mode_policy": "unchanged-from-e6ca64e"
   },
   {
    "file": "ratarmount-formats-git/src/secure_cache.rs",

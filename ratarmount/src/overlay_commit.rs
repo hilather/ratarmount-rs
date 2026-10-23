@@ -3195,14 +3195,18 @@ mod tests {
 
     type Publish = fn(&str, &OpenOptions, &RemotePublishRequest) -> Result<(), RemotePublishError>;
 
-    /// Publish `a.tar` to `{scheme}://bucket/a.tar`; every managed read of the
-    /// mount's index and the staged archive keeps a lock taken on the file it
-    /// reads (a session's read transaction held across the publish would
-    /// block the sidecar patch, so the lock is taken at each managed open).
+    /// Publish `a.tar` to `{scheme}://bucket/a.tar` while session A keeps the
+    /// mount's WAL index open (an idle connection: WAL keeps its main-file
+    /// SHARED lock for the connection's life; an open read transaction would
+    /// block the sidecar patch's checkpoint). The session's lock survives the
+    /// publish, and every managed read of the index and the staged archive
+    /// keeps a lock taken on the file it reads.
     #[cfg(unix)]
     fn s7_object_store_publish(scheme: &str, publish: Publish) {
         use crate::publish_index::tests::{publish_tar, PublishEnv, PublishServer};
-        use ratarmount_index::managed_read::with_close_probes;
+        use ratarmount_index::managed_read::{
+            lock_probe::other_process_sees_lock, with_close_probes,
+        };
         let dir = tempfile::tempdir().unwrap();
         let tar = dir.path().join("a.tar");
         std::fs::write(&tar, publish_tar()).unwrap();
@@ -3236,6 +3240,14 @@ mod tests {
             ("AZURE_STORAGE_ENDPOINT", &server.url),
             ("RATARMOUNT_AZURE_ANONYMOUS", "0"),
         ]);
+        let session = rusqlite::Connection::open(&sidecar).unwrap();
+        let _: i64 = session
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            other_process_sees_lock(&sidecar),
+            "an idle WAL connection keeps its main-file lock"
+        );
         let stats = ratarmount_index::tar_stats_from_path(&tar).unwrap();
         let req = RemotePublishRequest {
             staged: tar.clone(),
@@ -3283,6 +3295,11 @@ mod tests {
             .filter(|(m, _, _)| m == "PUT")
             .count();
         assert!(puts >= 2, "{scheme}: archive and pointer were put");
+        assert!(
+            other_process_sees_lock(&sidecar),
+            "{scheme}: session A's lock on the index survived the publish"
+        );
+        drop(session);
     }
 
     /// Regression (R11-S7, #151): the S3 live commit read the staged archive

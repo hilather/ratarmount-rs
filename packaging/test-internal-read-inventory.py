@@ -115,6 +115,11 @@ MANAGED_OPS = frozenset({
     "managed_read::copy_create_or_truncate",
     "managed_read::copy_into",
 })
+# Raw opens whose flags may create (`O_CREAT` / `OFlags::CREATE`).
+RAW_OPENS = frozenset({
+    "libc::open", "libc::openat", "libc::open64", "rustix::open", "rustix::openat",
+    "open_admitted", "openat_admitted",
+})
 ESCAPES = ("into_raw_fd", "as_raw_fd", "try_clone", "from_raw_fd", "File::from")
 
 
@@ -502,9 +507,10 @@ def scan(root):
                 "line": text.count("\n", 0, pos) + 1,
                 "fingerprint": fingerprint(stmt),
                 "creates": op in CREATE_OPS and (op != "OpenOptions" or re.search(r"\.(create|create_new)\(true\)", stmt) is not None)
-                or op == "rustix::openat" and "CREATE" in stmt,
+                or (op in RAW_OPENS and re.search(r"O_CREAT|CREATE", stmt) is not None),
                 "exclusive": op in ("File::create_new", "tempfile", "tempdir", "managed_read::copy_exclusive_new")
-                or (op == "OpenOptions" and ".create_new(true)" in stmt),
+                or (op == "OpenOptions" and ".create_new(true)" in stmt)
+                or (op in RAW_OPENS and re.search(r"O_EXCL|EXCL", stmt) is not None),
             })
     return ops, texts, fns_by_file(texts, files, test_files)
 
@@ -893,6 +899,16 @@ def regression_exclusive_create_requires_mode_policy():
     expect(any("mode policy" in e for e in check(root, m)), check(root, m))
     m = classify(root, {("a", "OpenOptions"): {"disposition": "output-owner", "mode_policy": "0666 & !umask"}})
     expect(check(root, m) == [], check(root, m))
+    # Raw exclusive creates (`O_CREAT | O_EXCL`, rustix `CREATE | EXCL`).
+    root = fake({"c/src/lib.rs": (
+        "fn b(p: &CStr) { let _ = unsafe { libc::open(p.as_ptr(), libc::O_CREAT | libc::O_EXCL, 0o600) }; }\n"
+        "fn c(d: &OwnedFd) { let _ = rustix::fs::openat(d, \"x\", OFlags::CREATE | OFlags::EXCL, Mode::empty()); }\n"
+    )})
+    ops, _, _ = scan(root)
+    expect(all(o["exclusive"] for o in ops) and len(ops) == 2, ops)
+    m = classify(root, {("b", "libc::open"): {"disposition": "output-owner"},
+                        ("c", "rustix::openat"): {"disposition": "output-owner"}})
+    expect(sum("mode policy" in e for e in check(root, m)) == 2, check(root, m))
 
 
 def self_test():
