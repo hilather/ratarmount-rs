@@ -45,7 +45,10 @@ paths (any same-crate definition) and calls of the caller's own name in
 another module. Generic argument lists (`::<..>`) are matched balanced; an
 unbalanced one is reported. Descriptor duplication and ownership conversion
 (`try_clone_to_owned`, `dup`/`dup2`/`dup3`, `F_DUPFD[_CLOEXEC]`, `File::from`)
-are operations.
+are operations. A production module whose file lies under `tests`,
+`benches` or `examples` (`#[path = "tests/reader.rs"]`) is scanned; the
+directory walk still skips those directories, so an integration test no
+production module names stays out.
 Pathname opens inside foreign libraries (libgit2 `Repository::open`,
 libarchive `archive_read_open_filename`, lopdf `Document::load`) are
 operations of their own.
@@ -862,11 +865,23 @@ def fingerprint(stmt):
     return hashlib.sha256(stmt.encode()).hexdigest()[:16]
 
 
+def skipped_module_dir(rel):
+    """A `tests` / `benches` / `examples` path component. The directory walk
+    does not enter those directories (integration tests, benches, examples).
+    A production `mod` whose file is there is still loaded (#197)."""
+    return any(p in ("tests", "benches", "examples") for p in rel.split("/"))
+
+
+def in_workspace(rel):
+    """`rel` stays inside the tree after `#[path]` normalization."""
+    return rel not in ("", ".") and not rel.startswith("/") and ".." not in rel.split("/")
+
+
 def is_test_path(rel):
     parts = rel.split("/")
     if parts[0] in ("target", "vendor", "test-harness", "clients", "benchmarks"):
         return True
-    if any(p in ("tests", "benches", "examples") for p in parts):
+    if skipped_module_dir(rel):
         return True
     return parts[-1] == "build.rs"
 
@@ -919,18 +934,26 @@ def scan(root, problems=None):
     problems = [] if problems is None else problems
     files = rust_files(root)
     texts, raws, ctexts, lits, test_files, generic_errs = {}, {}, {}, {}, set(), {}
-    for rel in files:
+
+    def load_source(rel):
         with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
             raws[rel] = fh.read()
-            texts[rel], generic_errs[rel] = blank_generics(mask(raws[rel]))
-            ctexts[rel] = mask(raws[rel], strings=False)
-            lits[rel] = mask(raws[rel], lit_fill="\0")
+        texts[rel], generic_errs[rel] = blank_generics(mask(raws[rel]))
+        ctexts[rel] = mask(raws[rel], strings=False)
+        lits[rel] = mask(raws[rel], lit_fill="\0")
+
+    for rel in files:
+        load_source(rel)
     # Files that are test-only modules (and everything below them). A file
     # that a production `mod` declaration also names is production code
     # (`#[cfg(test)] #[path = "util.rs"] mod t; mod util;`, R11-S7-FIX15).
     # Declarations inside inline modules resolve below them (`mod outer {
     # pub mod util; }` is `outer/util.rs`), and a production declaration
-    # that resolves to no file fails closed (R11-S7-FIX16).
+    # that resolves to no file fails closed (R11-S7-FIX16). A production
+    # target under `tests` / `benches` / `examples` is loaded here: the
+    # walk skips those directories before declarations are resolved, so
+    # `#[path = "tests/reader.rs"] mod reader;` would otherwise drop out
+    # (#197).
     def mod_target(rel, name, chain):
         if isinstance(name, tuple):
             d = os.path.dirname(rel)
@@ -950,8 +973,20 @@ def scan(root, problems=None):
             if rel in test_files:
                 continue
             for at, name, chain in decls[rel]:
-                if not any(a <= at <= b for a, b in spans_of[rel]):
-                    prod.add(mod_target(rel, name, chain))
+                if any(a <= at <= b for a, b in spans_of[rel]):
+                    continue
+                mf = mod_target(rel, name, chain)
+                prod.add(mf)
+                # The walk never opened this file. It is production code
+                # because this declaration is, so load it and keep resolving
+                # (a `mod` inside it may name another skipped file).
+                if (mf and mf not in texts and skipped_module_dir(mf) and in_workspace(mf)
+                        and os.path.isfile(os.path.join(root, mf))):
+                    load_source(mf)
+                    spans_of[mf] = test_spans(texts[mf], raws[mf])[0]
+                    decls[mf] = mod_decls(texts[mf], raws[mf])
+                    files.append(mf)
+                    changed = True
         for rel in files:
             for at, name, chain in decls[rel]:
                 if rel in test_files or any(a <= at <= b for a, b in spans_of[rel]):
@@ -2185,6 +2220,78 @@ def regression_inventory_modules_inside_inline_modules_resolve_below_them():
     root = fake({"c/src/lib.rs": "mod outer {\n    pub mod util;\n}\n" + alias, "c/src/util.rs": read})
     errs = check(root, classify(root, {}))
     expect(any("unresolved production module (no file for `mod util;`" in e for e in errs), errs)
+
+
+def regression_inventory_production_module_under_skipped_dir_is_scanned():
+    """Regression (#197): the walk skipped `tests` / `benches` / `examples`
+    before resolving module targets, so a production
+    `#[path = "tests/reader.rs"] mod reader;` that contains `std::fs::read`
+    dropped out (zero operations, an empty manifest passed). The resolved
+    file is scanned, including a module it declares and a `#[path]` inside
+    an inline module. A test-only declaration, a file nobody declares, and
+    a test-only child stay out; a missing file still fails closed."""
+    read = "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n"
+    hidden = ("#[cfg(test)]\nmod tests {\n    fn t(p: &Path) { let _ = std::fs::read(p); }\n}\n")
+    for dirname in ("tests", "benches", "examples"):
+        rel = "c/src/%s/reader.rs" % dirname
+        root = fake({
+            "c/src/lib.rs": '#[path = "%s/reader.rs"]\nmod reader;\n' % dirname,
+            rel: read + hidden,
+        })
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"], o["op"]) for o in ops] == [(rel, "load", "fs::read")],
+               (dirname, ops, problems))
+        expect(problems == [], (dirname, problems))
+        expect(check(root, {"baseline": BASELINE, "entries": []}) != [], dirname)
+    # A module declared from the skipped file, and `mod.rs`.
+    root = fake({
+        "c/src/lib.rs": '#[path = "tests/reader/mod.rs"]\nmod reader;\n',
+        "c/src/tests/reader/mod.rs": "mod helper;\n" + hidden,
+        "c/src/tests/reader/helper.rs": read,
+    })
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect([(o["file"], o["function"]) for o in ops] == [("c/src/tests/reader/helper.rs", "load")],
+           (ops, problems))
+    expect(problems == [], problems)
+    expect(check(root, {"entries": []}) != [], ops)
+    # `#[path]` inside an inline module, and a path that leaves `src/`.
+    for files, util in (
+            ({"c/src/lib.rs": 'mod outer {\n    #[path = "tests/reader.rs"]\n    pub mod reader;\n}\n',
+              "c/src/outer/tests/reader.rs": read}, "c/src/outer/tests/reader.rs"),
+            ({"c/src/lib.rs": '#[path = "../benches/reader.rs"]\nmod reader;\n',
+              "c/benches/reader.rs": read}, "c/benches/reader.rs"),
+            ({"c/src/lib.rs": ('#[cfg(test)]\n#[path = "examples/reader.rs"]\nmod test_reader;\n'
+                               '#[path = "examples/reader.rs"]\nmod reader;\n'),
+              "c/src/examples/reader.rs": read}, "c/src/examples/reader.rs")):
+        root = fake(files)
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"]) for o in ops] == [(util, "load")], (files, ops, problems))
+        expect(problems == [], (files, problems))
+        expect(check(root, {"entries": []}) != [], files)
+    # A test-only child file under the skipped directory is not scanned.
+    root = fake({
+        "c/src/lib.rs": '#[path = "tests/reader.rs"]\nmod reader;\n',
+        "c/src/tests/reader.rs": "#[cfg(test)]\nmod helper;\n" + read,
+        "c/src/tests/reader/helper.rs": "pub fn extra(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    ops, _, _ = scan(root)
+    expect([(o["file"], o["function"]) for o in ops] == [("c/src/tests/reader.rs", "load")], ops)
+    # Controls: test-only `#[path]`, an undeclared file, a missing file.
+    root = fake({"c/src/lib.rs": '#[cfg(test)]\n#[path = "tests/reader.rs"]\nmod reader;\n',
+                 "c/src/tests/reader.rs": read})
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect(ops == [] and problems == [], (ops, problems))
+    expect(check(root, {"entries": []}) == [], check(root, {"entries": []}))
+    root = fake({"c/src/lib.rs": "fn a() {}\n", "c/src/tests/reader.rs": read,
+                 "c/benches/other.rs": read, "c/examples/other.rs": read})
+    expect(scan(root)[0] == [], scan(root)[0])
+    root = fake({"c/src/lib.rs": '#[path = "tests/missing.rs"]\nmod reader;\n'})
+    errs = check(root, {"entries": []})
+    expect(any("unresolved production module (no file for `mod tests/missing.rs;`" in e for e in errs), errs)
 
 
 def regression_inventory_helper_walk_visits_same_named_helpers_by_definition():

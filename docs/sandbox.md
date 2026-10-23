@@ -1986,8 +1986,13 @@ locking style per filesystem (auto). Managed byte readers use `"unix"`
 copy, create or descriptor conversion fails the check until it is classified,
 and so does a form the scanner cannot follow: an import from `std::fs` or
 `tokio::fs` it cannot resolve, or an `OpenOptions` builder bound to a variable
-that escapes its function. Any `.create(..)` or `.create_new(..)` argument other
-than a literal `false` counts as a create that needs a mode policy; a managed
+that escapes its function. A production module whose source is under a
+`tests`, `benches` or `examples` directory (`#[path = "tests/reader.rs"]`,
+and a module that file declares) is scanned with the rest of the crate. The
+directory walk still skips those directories, so an integration test, bench
+or example that no production module names stays out of the inventory. Any
+`.create(..)` or `.create_new(..)` argument other than a literal `false`
+counts as a create that needs a mode policy; a managed
 read reaching a raw helper is found through `use .. as` renames of the helper or
 its module; and the pathname opens done inside libgit2 (`Repository::open`),
 libarchive (`archive_read_open_filename`) and lopdf (`Document::load`) are
