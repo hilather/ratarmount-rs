@@ -20,10 +20,19 @@
 //!   it. On Linux the check runs on an `O_PATH` descriptor (closing one does
 //!   not release fcntl locks) and the file is then reopened through
 //!   `/proc/self/fd` with the caller's flags, so the refused path leaks
-//!   nothing and `O_TRUNC` only ever applies to an admitted inode. Elsewhere
-//!   (or without `/proc`) the file is opened without `O_TRUNC`, checked, and a
-//!   refused descriptor is quarantined: kept open for the life of the process
-//!   (one descriptor per refused open; [`quarantined`] counts them).
+//!   nothing and `O_TRUNC` only ever applies to an admitted inode. That path
+//!   does not count an external-alias epoch. Elsewhere (or without `/proc`)
+//!   the file is opened without `O_TRUNC`, checked, and the first refused
+//!   descriptor of an inode is quarantined: kept open for the life of the
+//!   process ([`quarantined`] counts them). Further generic opens of that
+//!   inode, including after its registration is dropped and created again,
+//!   are refused before `open` once the external-alias epoch cap (one) is reached
+//!   and quarantine nothing. `O_CREAT|O_EXCL` over an existing name is
+//!   `EEXIST` and does not open, including after the cap. An unidentified descriptor is still quarantined
+//!   and does not count. Two opens that both pass the pre-check before either
+//!   is recorded can each quarantine one descriptor. The registry and epoch
+//!   locks are never held across `open`. Descriptors are not pooled: pooling
+//!   would change what a later open is allowed to do with the file.
 //!
 //! The registry lock is only ever held to look up, insert or remove an entry:
 //! never across `open(2)`, `fstat(2)` or a SQLite open, so a payload FIFO that
@@ -140,6 +149,79 @@ mod unix {
     /// Descriptors of open databases obtained by a refused open where no
     /// lock-safe close exists: never closed (see the module docs).
     static QUARANTINE: Mutex<Vec<OwnedFd>> = Mutex::new(Vec::new());
+
+    /// Generic-path opens that obtained a descriptor of one registered
+    /// overlay-database inode. Never reset when the registration is dropped:
+    /// ordinary unmount/remount churn must not start a new quarantine.
+    ///
+    /// #196's addendum did not give a number. One is the bound that refuses
+    /// the next open without pooling the quarantined descriptor.
+    pub(super) const EXTERNAL_ALIAS_EPOCH_CAP: u32 = 1;
+
+    static ALIAS_EPOCHS: Mutex<std::collections::BTreeMap<(u64, u64), u32>> =
+        Mutex::new(std::collections::BTreeMap::new());
+
+    fn alias_epochs(id: (u64, u64)) -> u32 {
+        ALIAS_EPOCHS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn note_alias_epoch(id: (u64, u64)) {
+        let mut epochs = ALIAS_EPOCHS.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = epochs.entry(id).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    /// `fstatat` with the same final-component follow rule as the open that
+    /// would follow. Does not take the registry lock.
+    fn fstatat_name(dir: RawFd, name: &CString, flags: libc::c_int) -> io::Result<libc::stat> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let at_flags = if flags & libc::O_NOFOLLOW != 0 {
+            libc::AT_SYMLINK_NOFOLLOW
+        } else {
+            0
+        };
+        // Safety: `name` is NUL-terminated and outlives the call; `st` is a
+        // valid out pointer.
+        if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, at_flags) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(st)
+    }
+
+    /// The epoch is already spent and the name is still a registered database.
+    /// No descriptor is opened. A missing name, a non-regular file, or an
+    /// unregistered inode returns `None` so the open proceeds.
+    fn refuse_capped_alias(
+        dir: RawFd,
+        c: &CString,
+        name: &Path,
+        flags: libc::c_int,
+    ) -> Option<io::Error> {
+        let st = fstatat_name(dir, c, flags).ok()?;
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return None;
+        }
+        let id = id(&st);
+        if alias_epochs(id) < EXTERNAL_ALIAS_EPOCH_CAP {
+            return None;
+        }
+        let db = super::open_db_named(id, name)?;
+        Some(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is another name (a hard link) of the open overlay database {}; further \
+                 opens are refused before open (external-alias epoch cap \
+                 {EXTERNAL_ALIAS_EPOCH_CAP} reached). Remove the extra link",
+                name.display(),
+                db.display()
+            ),
+        ))
+    }
 
     /// How many descriptors refused opens have quarantined so far.
     pub fn quarantined() -> usize {
@@ -318,6 +400,11 @@ mod unix {
     /// only a new inode may skip the writable reopen a read-only `O_TRUNC`
     /// needs; an existing file (an empty one included) may not, so its
     /// write permission is still checked.
+    /// A registered inode whose external-alias epoch is already spent is
+    /// refused before this open.
+    /// `O_CREAT|O_EXCL` over an existing name is `EEXIST` and does not open,
+    /// including after the cap: `open(2)` fails that way before it returns a
+    /// descriptor.
     fn generic(
         dir: RawFd,
         c: &CString,
@@ -325,6 +412,16 @@ mod unix {
         flags: libc::c_int,
         mode: u32,
     ) -> io::Result<Option<OwnedFd>> {
+        if (flags & (libc::O_CREAT | libc::O_EXCL)) == (libc::O_CREAT | libc::O_EXCL) {
+            match fstatat_name(dir, c, flags) {
+                Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(error) = refuse_capped_alias(dir, c, name, flags) {
+            return Err(error);
+        }
         let mut created = false;
         let fd = if flags & libc::O_CREAT != 0 {
             match openat_raw(dir, c, (flags | libc::O_EXCL) & !libc::O_TRUNC, mode) {
@@ -353,6 +450,9 @@ mod unix {
             }
         };
         if let Some(db) = super::open_db_named(id(&st), name) {
+            // Count only a descriptor proved to be a registered database.
+            // An unidentified `fstat` above is quarantined and is not an epoch.
+            note_alias_epoch(id(&st));
             quarantine(fd);
             return Err(super::refused(name, &db));
         }
@@ -381,6 +481,7 @@ mod unix {
                 };
                 if id(&wst) != id(&st) {
                     if let Some(db) = super::open_db_named(id(&wst), name) {
+                        note_alias_epoch(id(&wst));
                         quarantine(writer);
                         return Err(super::refused(name, &db));
                     }
@@ -689,5 +790,99 @@ mod tests {
             ctime_ns(&before_w),
             ctime_ns(&after_w)
         );
+    }
+
+    /// Regression (#196): on the generic path the first open of a registered
+    /// overlay-database inode is quarantined. The next open, and an open after
+    /// the registration is dropped and created again, is refused before `open`
+    /// (external-alias epoch cap) and quarantines nothing. `O_CREAT|O_EXCL`
+    /// over the existing alias stays `EEXIST`. Between
+    /// registrations the name is not a database and opens normally. On Linux
+    /// the `O_PATH` refusal that runs first quarantines nothing and does not
+    /// spend the epoch.
+    #[test]
+    fn regression_external_alias_epoch_cap_refuses_reopen_churn() {
+        use super::unix::FORCE_GENERIC;
+        struct ForceGeneric;
+        impl ForceGeneric {
+            fn arm() -> Self {
+                FORCE_GENERIC.with(|f| f.set(true));
+                Self
+            }
+        }
+        impl Drop for ForceGeneric {
+            fn drop(&mut self) {
+                FORCE_GENERIC.with(|f| f.set(false));
+            }
+        }
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("db.sqlite");
+        fs::write(&db, b"database bytes").unwrap();
+        let alias = tmp.path().join("payload");
+        fs::hard_link(&db, &alias).unwrap();
+        let before = quarantined();
+        let registration = register_db_inode(id_of(&db), &db);
+
+        // Linux checks on an `O_PATH` descriptor and drops it. That refusal
+        // must not spend the epoch, or the first generic open below would
+        // already be the cap.
+        #[cfg(target_os = "linux")]
+        {
+            let opath = open_admitted(&alias, libc::O_RDONLY, 0).unwrap_err();
+            assert_eq!(opath.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                !opath.to_string().contains("epoch cap"),
+                "O_PATH does not count an epoch: {opath}"
+            );
+            assert_eq!(quarantined(), before, "O_PATH refusals quarantine nothing");
+        }
+
+        let _force = ForceGeneric::arm();
+        let first = open_admitted(&alias, libc::O_RDONLY, 0).unwrap_err();
+        assert_eq!(first.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            first.to_string().contains(&db.display().to_string()),
+            "{first}"
+        );
+        assert!(
+            !first.to_string().contains("epoch cap"),
+            "the first refusal quarantines: {first}"
+        );
+        assert_eq!(quarantined(), before + 1);
+
+        let second = open_admitted(&alias, libc::O_WRONLY | libc::O_TRUNC, 0).unwrap_err();
+        assert_eq!(second.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            second.to_string().contains("external-alias epoch cap"),
+            "{second}"
+        );
+        assert_eq!(quarantined(), before + 1, "the cap opens nothing");
+        assert_eq!(fs::metadata(&db).unwrap().len(), 14, "nothing truncated");
+
+        // Exclusive create over the existing alias: `EEXIST`, even after the
+        // cap (macOS always takes this path). Nothing is opened.
+        let excl =
+            open_admitted(&alias, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o644).unwrap_err();
+        assert_eq!(excl.kind(), io::ErrorKind::AlreadyExists, "{excl}");
+        assert_eq!(quarantined(), before + 1);
+        assert_eq!(fs::metadata(&db).unwrap().len(), 14);
+
+        drop(registration);
+        open_admitted(&alias, libc::O_RDONLY, 0).expect("unregistered name opens");
+        assert_eq!(quarantined(), before + 1);
+
+        let _again = register_db_inode(id_of(&db), &db);
+        let remount = open_admitted(&alias, libc::O_RDONLY, 0).unwrap_err();
+        assert!(
+            remount.to_string().contains("external-alias epoch cap"),
+            "{remount}"
+        );
+        assert_eq!(
+            quarantined(),
+            before + 1,
+            "ordinary reopen churn does not quarantine another descriptor"
+        );
+        assert_eq!(fs::metadata(&db).unwrap().len(), 14);
     }
 }
