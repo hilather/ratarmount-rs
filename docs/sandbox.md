@@ -2034,6 +2034,10 @@ close; a test-only statement or arm whose span still holds a second top-level
 test-only form instead of hiding what follows. A qualified call
 (`util::load(p)`) also resolves to a definition inside an inline
 `mod util { .. }`.
+A file that a test-only `mod` declaration names is skipped only when no
+production `mod` declaration names it too (`#[cfg(test)] #[path = "util.rs"]
+mod t; mod util;` scans `util.rs`), and the helper walk tells two helpers of
+one name in one file apart (`first::bridge`, `second::bridge`).
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE

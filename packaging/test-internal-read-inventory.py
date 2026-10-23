@@ -896,6 +896,16 @@ def module_file(rel, name, root):
     return None
 
 
+def mod_decls(text, raw):
+    """[(offset, name)] for every `mod name;` declaration; `name` is
+    `("path", file)` when a `#[path = ".."]` attribute names its file."""
+    out = []
+    for m in re.finditer(r"(?:^|\n|;|\}|\{)\s*((?:#\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", text):
+        pm = re.search(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]', raw[m.start(1):m.end(1)])
+        out.append((m.start(2), ("path", pm.group(1)) if pm else m.group(2)))
+    return out
+
+
 def scan(root, problems=None):
     """Every production operation: list of dicts (key fields + evidence).
     Unsupported forms (an unresolvable import, an escaping builder) are
@@ -909,21 +919,34 @@ def scan(root, problems=None):
             texts[rel], generic_errs[rel] = blank_generics(mask(raws[rel]))
             ctexts[rel] = mask(raws[rel], strings=False)
             lits[rel] = mask(raws[rel], lit_fill="\0")
-    # Files that are test-only modules (and everything below them).
+    # Files that are test-only modules (and everything below them). A file
+    # that a production `mod` declaration also names is production code
+    # (`#[cfg(test)] #[path = "util.rs"] mod t; mod util;`, R11-S7-FIX15).
+    def mod_target(rel, name):
+        if isinstance(name, tuple):
+            return os.path.normpath(os.path.join(os.path.dirname(rel), name[1])).replace(os.sep, "/")
+        return module_file(rel, name, root)
+    spans_mods = {rel: test_spans(texts[rel], raws[rel]) for rel in files}
     changed = True
     while changed:
         changed = False
+        prod = set()
         for rel in files:
-            _, mods = test_spans(texts[rel], raws[rel])
+            if rel in test_files:
+                continue
+            spans = spans_mods[rel][0]
+            for name in mod_decls(texts[rel], raws[rel]):
+                at, name = name
+                if not any(a <= at <= b for a, b in spans):
+                    prod.add(mod_target(rel, name))
+        for rel in files:
+            mods = spans_mods[rel][1]
             nested = []
             if rel in test_files:
-                nested = re.findall(r"(?:^|\n)\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", texts[rel])
+                nested = [name for _, name in mod_decls(texts[rel], raws[rel])]
             for name in list(mods) + nested:
-                if isinstance(name, tuple):
-                    mf = os.path.normpath(os.path.join(os.path.dirname(rel), name[1])).replace(os.sep, "/")
-                else:
-                    mf = module_file(rel, name, root)
-                if mf and mf not in test_files:
+                mf = mod_target(rel, name)
+                if mf and mf not in test_files and mf not in prod:
                     test_files.add(mf)
                     changed = True
     factories = {}
@@ -1224,9 +1247,12 @@ def helper_errors(entries, scanned, texts, fns):
             visited = set()
             while queue:
                 via, callee, target, ta, tb = queue.pop(0)
-                if (target, callee) in visited:
+                # A definition is its file and offset: two `bridge`s in one
+                # file (`first::bridge`, `second::bridge`) are both walked
+                # (R11-S7-FIX15).
+                if (target, ta) in visited:
                     continue
-                visited.add((target, callee))
+                visited.add((target, ta))
                 for o in raw_by_fn.get((crate_of(rel), callee), []):
                     if o["file"] != target:
                         continue
@@ -2092,6 +2118,41 @@ def regression_inventory_helper_walk_follows_inline_modules():
                  "c/src/other.rs": "pub fn load(p: &Path) {}\n"})
     m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF})
     expect(check(root, m) == [], check(root, m))
+
+def regression_inventory_production_module_shared_with_test_module_is_scanned():
+    """Regression (R11-S7-FIX15): every file a test-only `mod` declaration
+    names was excluded, so `#[cfg(test)] #[path = "util.rs"] mod test_util;
+    mod util;` hid the production reads in `util.rs` (zero operations, an
+    empty manifest passed)."""
+    util = {"c/src/util.rs": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n"}
+    for lib in ('#[cfg(test)]\n#[path = "util.rs"]\nmod test_util;\nmod util;\n',
+                'mod util;\n#[cfg(test)]\n#[path = "util.rs"]\nmod test_util;\n',
+                '#[cfg(test)]\nmod util;\n#[path = "util.rs"]\nmod prod_util;\n'):
+        root = fake(dict(util, **{"c/src/lib.rs": lib}))
+        ops, _, _ = scan(root)
+        expect([(o["file"], o["function"]) for o in ops] == [("c/src/util.rs", "load")], (lib, ops))
+        expect(check(root, {"baseline": BASELINE, "entries": []}) != [], lib)
+    # Control: a file named only by test-only declarations stays excluded.
+    root = fake(dict(util, **{"c/src/lib.rs": '#[cfg(test)]\n#[path = "util.rs"]\nmod test_util;\n'}))
+    expect(scan(root)[0] == [], scan(root)[0])
+
+
+def regression_inventory_helper_walk_visits_same_named_helpers_by_definition():
+    """Regression (R11-S7-FIX15): the helper walk marked a function visited by
+    file and name, so visiting an empty `first::bridge` skipped
+    `second::bridge` in the same file, which reaches a raw-reading helper."""
+    root = fake({"c/src/lib.rs": (
+        "mod first {\n    pub fn bridge(p: &Path) {}\n}\n"
+        "mod second {\n    pub fn bridge(p: &Path) { crate::leaf(p); }\n}\n"
+        "pub fn leaf(p: &Path) { let _ = std::fs::read(p); }\n"
+        "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; first::bridge(p); second::bridge(p); }\n")})
+    m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("leaf", "fs::read"): OOF})
+    errs = check(root, m)
+    expect(any("reaches helper leaf via bridge" in e for e in errs), errs)
+    m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                        ("leaf", "fs::read"): dict(OOF, non_mandatory_callers=["bridge"])})
+    expect(check(root, m) == [], check(root, m))
+
 
 def self_test():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("regression_") and callable(v)]
