@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 use std::os::fd::FromRawFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use clap::Args;
@@ -320,11 +320,16 @@ fn apply(
                 .map_err(|e| format!("{path}: {e}"))?;
         }
         Kind::File => {
-            let mut input = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&entry.host)
-                .map_err(|e| format!("{path}: {e}"))?;
+            // Admitted (R10-FIX3): an upperdir file that is another name of
+            // an open overlay database (the destination's) is refused without
+            // a descriptor of it being closed.
+            let mut input = ratarmount_core::db_inodes::open_admitted(
+                &entry.host,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                0,
+            )
+            .map(fs::File::from)
+            .map_err(|e| format!("{path}: {e}"))?;
             let current = input.metadata().map_err(|e| e.to_string())?;
             if !current.is_file()
                 || (current.dev(), current.ino()) != (entry.meta.dev(), entry.meta.ino())
@@ -465,6 +470,38 @@ mod tests {
             .unwrap();
         // WriteOverlay drops tombstones of nonexistent targets ("absent").
         assert_eq!(deleted, 4);
+    }
+
+    /// Regression (R10-FIX3, r10 review): an upperdir file that is a hard
+    /// link of an overlay database open in this process was read through a
+    /// plain open and closed, releasing the holder's locks. The admitted
+    /// open refuses it: the import fails naming the database, and another
+    /// process is still busy on the holder's lock.
+    #[test]
+    fn regression_upperdir_input_refuses_a_db_alias() {
+        let f = Fixture::new();
+        let db = f.root.path().join("held.sqlite");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (x)")
+            .unwrap();
+        fs::hard_link(&db, f.upper.join("payload")).unwrap();
+        let holder = ratarmount_compositing::open_overlay_db(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            ratarmount_compositing::DbName::Path,
+        )
+        .unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = run(&f.args(), &Default::default()).unwrap_err();
+        assert!(error.contains("open overlay database"), "{error}");
+        assert!(
+            crate::overlay_pack::tests::pack_db_lock_busy_in_child(&db),
+            "the import released the holder's lock"
+        );
+        holder
+            .execute_batch("INSERT INTO files VALUES (1); COMMIT")
+            .unwrap();
     }
 
     /// Regression: an opaque parent must also suppress lower grandchildren under retained directories.

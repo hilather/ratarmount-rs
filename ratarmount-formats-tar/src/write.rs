@@ -1019,16 +1019,18 @@ fn write_file_on_disk<W: Write>(
     size: u64,
     sha256: Option<&std::sync::Mutex<Option<String>>>,
 ) -> io::Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
     // WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no nofollow bit
     // (no WinFsp). Persist still opens the path the caller already confined.
+    // On Unix the open is admitted (R10-C): another name (a hard link) of an
+    // open overlay database is refused without closing a descriptor of it.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let f = opts.open(path)?;
+    let f = std::fs::File::from(ratarmount_core::db_inodes::open_admitted(
+        path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?);
+    #[cfg(not(unix))]
+    let f = std::fs::OpenOptions::new().read(true).open(path)?;
     let (n, digest) = if sha256.is_some() {
         let mut tee = HashingCopy {
             input: f.take(size),
@@ -1874,5 +1876,29 @@ mod tests {
             err.to_string().contains("seek failed"),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod db_alias_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// Regression (R10-C, #148): a commit's TAR payload reader refuses a hard
+    /// link of an open overlay database instead of opening (and closing) a
+    /// descriptor of it.
+    #[test]
+    fn regression_tar_payload_reader_refuses_db_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("db.sqlite");
+        std::fs::write(&db, b"database").unwrap();
+        let alias = tmp.path().join("payload");
+        std::fs::hard_link(&db, &alias).unwrap();
+        let m = std::fs::metadata(&db).unwrap();
+        let _open = ratarmount_core::db_inodes::register_db_inode((m.dev(), m.ino()), &db);
+        let mut out = Vec::new();
+        let error = write_file_on_disk(&mut out, &alias, 8, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(out.is_empty());
     }
 }

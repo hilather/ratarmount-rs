@@ -111,6 +111,52 @@ pub enum DbName<'a> {
     Uri(&'a str),
 }
 
+/// A connection [`open_overlay_db`] validated. Dereferences to the
+/// [`Connection`], so callers use it as one. While it lives, its database
+/// inode is registered as open (R10-C,
+/// [`ratarmount_core::db_inodes`]): payload opens of another name of that
+/// inode are refused, so they can never close a descriptor of it.
+#[derive(Debug)]
+pub struct OverlayDb {
+    // Declared first: the connection closes before the registration drops.
+    conn: Connection,
+    id: Option<(u64, u64)>,
+    registration: Option<ratarmount_core::db_inodes::DbInodeRegistration>,
+}
+
+impl OverlayDb {
+    /// `(dev, ino)` of the database file, from the post-open path stat (see
+    /// the module docs: the file at the path right after SQLite's open, not
+    /// SQLite's own descriptor). `None` off Unix.
+    pub fn id(&self) -> Option<(u64, u64)> {
+        self.id
+    }
+
+    /// The connection and its registration, for a caller that keeps them in
+    /// its own structure (drop the connection first).
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Connection,
+        Option<ratarmount_core::db_inodes::DbInodeRegistration>,
+    ) {
+        (self.conn, self.registration)
+    }
+}
+
+impl std::ops::Deref for OverlayDb {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for OverlayDb {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+}
+
 /// Open the overlay database at `db` with `flags`; see the module docs.
 /// `SQLITE_OPEN_NOFOLLOW` also makes the type checks refuse a symlink at
 /// `db`; SQLite then refuses a symlink in any component, so the directory is
@@ -119,7 +165,7 @@ pub fn open_overlay_db(
     db: &Path,
     flags: OpenFlags,
     name: DbName<'_>,
-) -> Result<Connection, OverlayDbError> {
+) -> Result<OverlayDb, OverlayDbError> {
     let nofollow = flags.contains(OpenFlags::SQLITE_OPEN_NOFOLLOW);
     let resolved;
     let db = if nofollow || name == DbName::Immutable {
@@ -183,19 +229,68 @@ pub fn open_overlay_db(
             db.display()
         )));
     }
-    Ok(conn)
+    // Registered from this post-open path stat, never from an fstat of
+    // SQLite's descriptor (rusqlite does not expose it; see the module docs).
+    // Only after SQLite's open: the registry lock is never held across an
+    // open (R10-D).
+    let id = file_id(&opened);
+    let registration = id.map(|id| ratarmount_core::db_inodes::register_db_inode(id, db));
+    Ok(OverlayDb {
+        conn,
+        id,
+        registration,
+    })
 }
 
-#[cfg(unix)]
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    (a.dev(), a.ino()) == (b.dev(), b.ino())
+/// `(dev, ino)` of `metadata` (`None` off Unix).
+pub(crate) fn file_id(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 /// Without `(dev, ino)` the type checks are all there is.
-#[cfg(not(unix))]
-fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
-    true
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    file_id(a) == file_id(b)
+}
+
+/// Set by [`lock_probe_is_busy`] for the child it spawns.
+#[cfg(all(test, unix))]
+pub(crate) const BEGIN_IMMEDIATE_PROBE_ENV: &str = "RATARMOUNT_TEST_BEGIN_IMMEDIATE_PROBE";
+
+/// Does ANOTHER process see this process's lock on `db`? A child of this test
+/// binary runs `BEGIN IMMEDIATE` as its own statement (busy timeout 0): `true`
+/// when that statement itself reports busy. The child must exit successfully.
+#[cfg(all(test, unix))]
+pub(crate) fn lock_probe_is_busy(db: &Path) -> bool {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "overlay_db::tests::begin_immediate_probe_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(BEGIN_IMMEDIATE_PROBE_ENV, db)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "probe child failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if stdout.contains("PROBE:busy") {
+        return true;
+    }
+    assert!(stdout.contains("PROBE:acquired"), "probe child: {stdout}");
+    false
 }
 
 #[cfg(all(test, unix))]
@@ -294,6 +389,32 @@ mod tests {
                 println!("PROBE:busy")
             }
             Err(e) => println!("PROBE:error {e}"),
+        }
+    }
+
+    /// The child half of [`lock_probe_is_busy`]: `BEGIN IMMEDIATE` alone, so
+    /// a busy result is the lock statement's own. A no-op unless spawned.
+    #[test]
+    fn begin_immediate_probe_child() {
+        let Some(db) = std::env::var_os(BEGIN_IMMEDIATE_PROBE_ENV) else {
+            return;
+        };
+        let conn = Connection::open(db).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match conn.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => {
+                conn.execute_batch("ROLLBACK").unwrap();
+                println!("PROBE:acquired")
+            }
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                println!("PROBE:busy")
+            }
+            Err(e) => panic!("probe: {e}"),
         }
     }
 

@@ -65,6 +65,18 @@ fn regular_flags() -> OFlags {
     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
 }
 
+/// `openat(dir, name, flags)` that refuses another name of an open overlay
+/// database without closing a descriptor of it (R10-C).
+fn openat_admitted(dir: &OwnedFd, name: &str, flags: OFlags) -> io::Result<OwnedFd> {
+    use std::os::fd::AsFd;
+    ratarmount_core::db_inodes::openat_admitted(
+        Some(dir.as_fd()),
+        Path::new(name),
+        flags.bits() as libc::c_int,
+        0,
+    )
+}
+
 // Each component is opened relative to the previous directory, never via a
 // host path that can traverse a symlink. Used for both packing and extraction.
 fn parent(root: &OwnedFd, path: &str, create: bool) -> io::Result<(OwnedFd, String)> {
@@ -230,10 +242,9 @@ fn append_host<W: Write>(
             )
         }
         0o100000 => {
-            let file = host::openat(&fd, name.as_str(), regular_flags(), Mode::empty())?;
             let mut file = match replacement {
                 Some(copy) => File::open(copy)?,
-                None => File::from(file),
+                None => File::from(openat_admitted(&fd, name.as_str(), regular_flags())?),
             };
             h.set_entry_type(tar::EntryType::Regular);
             h.set_size(file.metadata()?.len());
@@ -542,8 +553,11 @@ fn checked_meta(directory: &Path) -> io::Result<OverlayMeta> {
 
 fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
     let root = open_root(directory)?;
-    let db = host::openat(&root, HIDDEN_DB, regular_flags(), Mode::empty())?;
-    if !File::from(db).metadata()?.is_file() {
+    // A stat, never an open: closing a descriptor of the database would
+    // release this process's fcntl locks on it (R7-H1, R10-FIX9).
+    let stat =
+        ratarmount_compositing::host_stat::statat(&root, HIDDEN_DB, AtFlags::SYMLINK_NOFOLLOW)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(invalid("layer database is not a regular file"));
     }
     // URL encoding prevents SQLite URI syntax in a host filename from changing
@@ -570,10 +584,12 @@ fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
 
 fn sentinel_matches(directory: &Path, digest: &str) -> io::Result<bool> {
     let root = open_root(directory)?;
-    let fd = match host::openat(&root, SENTINEL, regular_flags(), Mode::empty()) {
+    let fd = match openat_admitted(&root, SENTINEL, regular_flags()) {
         Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(false),
-        Err(e) => return Err(e.into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) => {
+            return Ok(false)
+        }
+        Err(e) => return Err(e),
     };
     let mut file = File::from(fd);
     if !file.metadata()?.is_file() {
@@ -824,7 +840,14 @@ fn sweep_pack_temps_in(dir: &OwnedFd) {
         if !old_enough {
             continue;
         }
-        let Ok(fd) = host::openat(dir, name, regular_flags(), Mode::empty()) else {
+        // Admitted (R10-FIX3): an old temp name that is a hard link of an open
+        // overlay database is skipped without a descriptor of it being
+        // opened and closed (its flock says nothing about SQLite's locks).
+        let Ok(fd) = name
+            .to_str()
+            .map_err(io::Error::other)
+            .and_then(|name| openat_admitted(dir, name, regular_flags()))
+        else {
             continue;
         };
         let file = File::from(fd);
@@ -966,7 +989,7 @@ fn stat_age(stat: &rustix::fs::Stat) -> std::time::Duration {
 /// never following a symlink planted under the name.
 fn open_lock_at(dir: &OwnedFd, name: &str) -> io::Result<File> {
     let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    Ok(File::from(host::openat(dir, name, flags, Mode::empty())?))
+    Ok(File::from(openat_admitted(dir, name, flags)?))
 }
 
 /// Delete everything below `fd` through descriptors only: each child is opened
@@ -1652,7 +1675,7 @@ pub(crate) fn cached_lower_in(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ratarmount_compositing::FolderMountSource;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2410,6 +2433,143 @@ mod tests {
         for dir in foreign {
             assert!(dir.join("precious").exists(), "{dir:?} was swept");
         }
+    }
+
+    /// Set by [`pack_db_lock_busy_in_child`] for the child it spawns.
+    const PACK_DB_PROBE_ENV: &str = "RATARMOUNT_TEST_PACK_DB_PROBE";
+
+    /// The child half of [`pack_db_lock_busy_in_child`]: `BEGIN IMMEDIATE`
+    /// alone, busy timeout 0.
+    #[test]
+    fn pack_db_lock_probe_child() {
+        let Some(db) = std::env::var_os(PACK_DB_PROBE_ENV) else {
+            return;
+        };
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match conn.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => println!("PROBE:acquired"),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                println!("PROBE:busy")
+            }
+            Err(e) => panic!("probe: {e}"),
+        }
+    }
+
+    /// Another process's `BEGIN IMMEDIATE` on `db` is busy (the child must
+    /// exit successfully).
+    pub(crate) fn pack_db_lock_busy_in_child(db: &Path) -> bool {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "overlay_pack::tests::pack_db_lock_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PACK_DB_PROBE_ENV, db)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "probe child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if stdout.contains("PROBE:busy") {
+            return true;
+        }
+        assert!(stdout.contains("PROBE:acquired"), "probe child: {stdout}");
+        false
+    }
+
+    /// Regression (R10-FIX3, r10 skeptic #3): an old pack-temp name that is a
+    /// hard link of an open overlay database. The sweeper opened it, took a
+    /// flock and closed it, releasing every fcntl lock this process held on
+    /// the database (another process's `BEGIN IMMEDIATE` then succeeded
+    /// while the holder still wrote). The admitted open skips it: the name
+    /// stays, the child is still busy and the holder still commits.
+    /// Regression (R10-FIX9, r10 review N1): `immutable_meta` opened the
+    /// layer database by its own name to check its type and closed that
+    /// descriptor, which released every fcntl lock this process held on the
+    /// database (another process's `BEGIN IMMEDIATE` then succeeded while
+    /// the holder still wrote). It stats the name now.
+    #[test]
+    fn regression_immutable_meta_keeps_the_holders_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let db = dir.join(HIDDEN_DB);
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (x)")
+            .unwrap();
+        let holder = ratarmount_compositing::open_overlay_db(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            ratarmount_compositing::DbName::Path,
+        )
+        .unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(pack_db_lock_busy_in_child(&db), "the holder's lock");
+        let error = immutable_meta(&dir).expect_err("not a sealed layer");
+        assert!(error.to_string().contains("not sealed"), "{error}");
+        assert!(
+            pack_db_lock_busy_in_child(&db),
+            "immutable_meta released the holder's lock"
+        );
+        holder
+            .execute_batch("INSERT INTO files VALUES (1); COMMIT")
+            .unwrap();
+        drop(holder);
+        assert!(!pack_db_lock_busy_in_child(&db), "probe control");
+        // A database entry that is not a regular file is still refused.
+        fs::remove_file(&db).unwrap();
+        fs::create_dir(&db).unwrap();
+        let error = immutable_meta(&dir).expect_err("a directory");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn regression_pack_temp_sweep_skips_a_db_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let db = dir.join(".ratarmount.overlay.sqlite");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (x)")
+            .unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        File::options()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let alias = dir.join(".ratarmount-pack-Ab3xY9.tmp");
+        fs::hard_link(&db, &alias).unwrap();
+        let holder = ratarmount_compositing::open_overlay_db(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            ratarmount_compositing::DbName::Path,
+        )
+        .unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(pack_db_lock_busy_in_child(&db), "the holder's lock");
+        sweep_pack_temps_in(&open_root(&dir).unwrap());
+        assert!(alias.exists(), "a database alias is never swept");
+        assert!(
+            pack_db_lock_busy_in_child(&db),
+            "the sweep released the holder's lock"
+        );
+        holder
+            .execute_batch("INSERT INTO files VALUES (1); COMMIT")
+            .unwrap();
+        drop(holder);
+        assert!(!pack_db_lock_busy_in_child(&db), "probe control");
     }
 
     /// Regression (R4-S5): the pack-temp sweep unlinked through the parent

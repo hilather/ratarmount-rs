@@ -203,6 +203,12 @@ pub type Authorize<'a> = &'a mut dyn FnMut(&PendingJournal, &fs::Metadata) -> io
 /// so the next recovery runs the hook again (it must be idempotent).
 pub type BeforeUnlink<'a> = &'a mut dyn FnMut(&Applied) -> io::Result<()>;
 
+/// Runs under the archive lock, after the locator was re-read there, before
+/// the FIRST write of a recovery: before a stale `P` locator is cleared and
+/// before a journal is rolled back or forward. `Err` refuses the recovery
+/// ([`RecoverError::Refused`]) with nothing written, the locator included.
+pub type BeforeWrite<'a> = &'a mut dyn FnMut() -> io::Result<()>;
+
 /// Ownership only: the journal was started for the very file locked.
 pub fn authorize_owned(journal: &PendingJournal, file: &fs::Metadata) -> io::Result<()> {
     #[cfg(unix)]
@@ -276,13 +282,27 @@ pub fn recover_with(
     authorize: Authorize,
     before_unlink: BeforeUnlink,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
+    recover_guarded(archive, &mut || Ok(()), authorize, before_unlink)
+}
+
+/// [`recover_with`] with a `before_write` guard (R10-B): it runs under the
+/// lock inside the stale-`P` branch (before the parent sync and the locator
+/// clear) and immediately before the rollback, never on the paths that write
+/// nothing (`None`, `D`) or that refuse a missing complete journal (`C`), so
+/// their outcomes keep their error variants.
+pub fn recover_guarded(
+    archive: &Path,
+    before_write: BeforeWrite,
+    authorize: Authorize,
+    before_unlink: BeforeUnlink,
+) -> std::result::Result<Option<Applied>, RecoverError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        unix::recover(archive, authorize, before_unlink)
+        unix::recover(archive, before_write, authorize, before_unlink)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (authorize, before_unlink);
+        let _ = (before_write, authorize, before_unlink);
         if journal_path(archive)
             .try_exists()
             .map_err(RecoverError::Journal)?
@@ -504,7 +524,7 @@ mod unix {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;
     use std::time::{Duration, UNIX_EPOCH};
 
     const MAGIC: &[u8; 8] = b"RMCJ0002";
@@ -1030,6 +1050,7 @@ mod unix {
 
     pub(super) fn recover(
         archive: &Path,
+        before_write: BeforeWrite,
         authorize: Authorize,
         before_unlink: BeforeUnlink,
     ) -> std::result::Result<Option<Applied>, RecoverError> {
@@ -1092,6 +1113,7 @@ mod unix {
                 // No byte changed (or a rollback was made durable): clear it
                 // once an unsynced unlink can no longer resurrect a journal.
                 Some(b'P') => {
+                    before_write().map_err(RecoverError::Refused)?;
                     fault::instead("stale marker directory sync", || {
                         sync_parent_if_present(&path)
                     })
@@ -1135,6 +1157,7 @@ mod unix {
                 }
             }
         }
+        before_write().map_err(RecoverError::Refused)?;
         rollback(
             &path,
             &mut file,
@@ -1175,11 +1198,7 @@ mod unix {
         if !present {
             return Ok(None);
         }
-        let mut journal = match fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-        {
+        let mut journal = match open_journal(&path) {
             Ok(f) if f.metadata()?.is_file() => f,
             Ok(_) => return Ok(None),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1220,11 +1239,7 @@ mod unix {
     /// A regular file at `path` whose journal header names inode `ino` (the
     /// device is a hint only, as in [`validate`]).
     fn header_names(path: &Path, ino: u64) -> bool {
-        let Ok(mut journal) = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-        else {
+        let Ok(mut journal) = open_journal(path) else {
             return false;
         };
         if !journal.metadata().is_ok_and(|m| m.is_file()) {
@@ -1235,6 +1250,20 @@ mod unix {
             return false;
         }
         parse_pending(&header, false).ino == ino
+    }
+
+    /// Open a journal for reading through the admitted open (R10-FIX3): a
+    /// journal name that is another name (a hard link) of an open overlay
+    /// database is refused (`PermissionDenied`) without opening, and so
+    /// without closing, a descriptor of the database, which would release
+    /// this process's SQLite locks on it.
+    fn open_journal(path: &Path) -> io::Result<File> {
+        ratarmount_core::db_inodes::open_admitted(
+            path,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0,
+        )
+        .map(File::from)
     }
 
     fn parse_pending(header: &[u8; HEADER_LEN as usize], complete: bool) -> PendingJournal {
@@ -1310,10 +1339,7 @@ mod unix {
         if !fs::symlink_metadata(path)?.is_file() {
             return Err(io::Error::other("commit journal is not a regular file"));
         }
-        let mut journal = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
+        let mut journal = open_journal(path)?;
         if let Some(expected) = expected {
             let opened = journal.metadata()?;
             if (opened.dev(), opened.ino()) != expected {
@@ -2224,6 +2250,80 @@ mod tests {
         let error = recover_with(&path, &mut authorize_forced, &mut |_| Ok(())).unwrap_err();
         assert!(matches!(error, RecoverError::Journal(_)), "{error:?}");
         assert!(error.to_string().contains("missing or moved"), "{error}");
+    }
+
+    /// Regression (R10-B, #150): the `before_write` guard runs under the lock
+    /// before the stale-`P` locator is cleared and before a rollback; a refusal
+    /// writes nothing (locator, archive and journal stay). It never runs on the
+    /// write-free `D` path or the `C` refusal, so `C` stays `Committed`.
+    #[test]
+    fn regression_recover_guard_runs_before_stale_clear_and_rollback() {
+        let refuse = || io::Error::other("lost record");
+        // Stale `P` without a journal: kept on a refusal, cleared after an Ok.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        interrupted(&path, "locator prepare");
+        let _ = fs::remove_file(journal_path(&path));
+        let before = fs::read(&path).unwrap();
+        let mut calls = 0;
+        let error = recover_guarded(
+            &path,
+            &mut || {
+                calls += 1;
+                Err(refuse())
+            },
+            &mut authorize_owned,
+            &mut |_| panic!("nothing to restamp"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RecoverError::Refused(_)), "{error:?}");
+        assert_eq!(calls, 1);
+        assert_eq!(marker_state(&path), Some(b'P'), "stale locator kept");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        recover_guarded(&path, &mut || Ok(()), &mut authorize_owned, &mut |_| {
+            panic!("nothing to restamp")
+        })
+        .unwrap();
+        assert_eq!(marker_state(&path), None);
+        // A torn journal: the guard refuses before the rollback.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        interrupted(&path, "locator active");
+        let before = fs::read(&path).unwrap();
+        let journal = fs::read(journal_path(&path)).unwrap();
+        let error = recover_guarded(
+            &path,
+            &mut || Err(refuse()),
+            &mut |_, _| panic!("authorize runs after the guard"),
+            &mut |_| panic!("nothing applied"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RecoverError::Refused(_)), "{error:?}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(journal_path(&path)).unwrap(), journal);
+        assert_eq!(marker_state(&path), Some(b'A'));
+        // A missing complete journal stays `Committed`; a `D` locator without
+        // a journal writes nothing: neither consults the guard.
+        for (step, expect_committed) in [("locator complete", true), ("journal unlink", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("archive");
+            interrupted(&path, step);
+            let _ = fs::remove_file(journal_path(&path));
+            let result = recover_guarded(
+                &path,
+                &mut || panic!("{step}: no write, no guard"),
+                &mut authorize_owned,
+                &mut |_| Ok(()),
+            );
+            if expect_committed {
+                assert!(
+                    matches!(result, Err(RecoverError::Committed(_))),
+                    "{result:?}"
+                );
+            } else {
+                assert!(matches!(result, Ok(None)), "{step}: {result:?}");
+            }
+        }
     }
 
     /// The locator state on `path`'s inode (`None` without a marker).

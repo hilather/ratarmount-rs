@@ -108,7 +108,7 @@ fn internal_name_refused(path: &str) -> OverlayError {
 
 /// Every regular overlay marker present (current name first, then legacy).
 /// A non-regular entry under either marker name fails closed.
-fn overlay_markers(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn overlay_markers(root: &Path) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut bad: Option<PathBuf> = None;
     for name in [OVERLAY_MARKER, LEGACY_OVERLAY_MARKER] {
@@ -119,7 +119,7 @@ fn overlay_markers(root: &Path) -> Result<Vec<PathBuf>> {
                 bad.get_or_insert(p);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(OverlayError::Io(e)),
+            Err(e) => return Err(io_with_path(e, "cannot stat the overlay marker", &p)),
         }
     }
     if let Some(p) = bad {
@@ -145,35 +145,115 @@ fn discard_hint(paths: &[&Path]) -> String {
     )
 }
 
-/// Nothing at all is at `dir`'s overlay database path (R7-E2): only an
-/// `lstat` that reports a missing entry is "no database". A symlink (dangling
-/// or not), a directory, a FIFO, or an entry that cannot be statted is an
-/// existing database, so the caller takes the database path, which opens it
-/// (a symlink to a regular file is followed) and refuses or defers anything
-/// that is not a readable regular file. Never `exists()`, `is_file()` or
-/// `metadata()`: they follow a dangling symlink to "missing".
-pub fn overlay_db_absent(dir: &Path) -> bool {
-    db_entry_absent(&dir.join(HIDDEN_DB))
+/// What is at an overlay directory's database path (R10-B, #150).
+///
+/// One classifier for every caller that must tell "no record" from "a lost
+/// record" from "a record to open". It never opens anything: `lstat` of the
+/// entry, `stat` through it (the way `Connection::open` follows a symlink),
+/// `lstat` of the two marker names.
+#[derive(Debug)]
+pub enum DbEntry {
+    /// Nothing at the database path and no marker: a raw directory, or an
+    /// overlay about to be created. The only "no record".
+    Absent,
+    /// A marker remains (the overlay was used) but the database is gone:
+    /// missing, a dangling symlink, or (`empty`) a 0-byte file. A LOST
+    /// record, never "no record".
+    Lost { markers: Vec<PathBuf>, empty: bool },
+    /// A regular file (directly or through a symlink) that may be a record;
+    /// `metadata` is the followed `stat` (`is_file()` always holds, so its
+    /// `(dev, ino)` is the file SQLite would open). It does not certify the
+    /// contents or that the file is readable: the validated open decides.
+    Present {
+        marked: bool,
+        metadata: fs::Metadata,
+    },
 }
 
-/// [`overlay_db_absent`] for the database path itself.
-pub(crate) fn db_entry_absent(db: &Path) -> bool {
-    matches!(fs::symlink_metadata(db), Err(e) if e.kind() == io::ErrorKind::NotFound)
+/// Classify `dir`'s overlay database entry; see [`DbEntry`]. Errors: a marker
+/// that is not a regular file; a database entry that is a directory, FIFO,
+/// device or socket (directly or through a symlink); an unmarked dangling
+/// symlink; and EVERY other `lstat` or followed-`stat` error (`ENOTDIR`,
+/// `EACCES`, `ELOOP`, `EIO`, ...), which is never read as "present" or
+/// "absent": an unresolved target proves nothing about the record.
+pub fn overlay_db_entry(dir: &Path) -> Result<DbEntry> {
+    let markers = overlay_markers(dir)?;
+    let marked = !markers.is_empty();
+    Ok(match overlay_db_regular(&dir.join(HIDDEN_DB), marked)? {
+        None if marked => DbEntry::Lost {
+            markers,
+            empty: false,
+        },
+        None => DbEntry::Absent,
+        Some(metadata) if marked && metadata.len() == 0 => DbEntry::Lost {
+            markers,
+            empty: true,
+        },
+        Some(metadata) => DbEntry::Present { marked, metadata },
+    })
+}
+
+/// Nothing at all is at `dir`'s overlay database path and no marker says the
+/// overlay was used ([`DbEntry::Absent`]). A symlink (dangling or not), a
+/// directory, a FIFO, an entry that cannot be statted (R7-E2, R10-B) or a lost
+/// record is not absent, so the caller takes the database path, which opens
+/// it or refuses. Never `exists()`, `is_file()` or `metadata()`: they follow a
+/// dangling symlink to "missing".
+pub fn overlay_db_absent(dir: &Path) -> bool {
+    matches!(overlay_db_entry(dir), Ok(DbEntry::Absent))
+}
+
+/// The #96 refusal for a [`DbEntry::Lost`] record in `dir`.
+pub fn lost_record_error(dir: &Path, markers: &[PathBuf]) -> OverlayError {
+    OverlayError::Msg(format!(
+        "write overlay {} was used before but its database {} is missing or empty; \
+         its deletions would be lost (unlinked archive members reappear). \
+         Restore the database, or use a new empty folder{}",
+        dir.display(),
+        dir.join(HIDDEN_DB).display(),
+        discard_hint(&markers.iter().map(|p| p.as_path()).collect::<Vec<_>>())
+    ))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (R10-B): while set, every followed `stat` of an overlay
+    /// database in [`overlay_db_regular`] on this thread fails with this errno.
+    pub(crate) static FOLLOWED_STAT_ERRNO: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The `stat` through the database entry ([`FOLLOWED_STAT_ERRNO`] in tests).
+fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
+    #[cfg(test)]
+    if let Some(errno) = FOLLOWED_STAT_ERRNO.with(|seam| seam.get()) {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    fs::metadata(db_path)
+}
+
+/// `e` (its kind kept) with what failed on which path in its text.
+fn io_with_path(e: io::Error, what: &str, path: &Path) -> OverlayError {
+    OverlayError::Io(io::Error::new(
+        e.kind(),
+        format!("{what} {}: {e}", path.display()),
+    ))
 }
 
 /// The overlay database at `db_path` as `Connection::open` would see it:
-/// `None` when nothing is there ([`db_entry_absent`]), else the metadata of
+/// `None` when nothing is there (an `lstat` NotFound), else the metadata of
 /// the regular file it is (or a symlink points to). A directory, a dangling
-/// symlink or any other non-regular file is refused. `marked`: the overlay
+/// symlink or any other non-regular file is refused; any other error of the
+/// followed `stat` propagates with the path (R10-B). `marked`: the overlay
 /// was used before (#96); a dangling symlink then reads as a missing database,
 /// which the caller refuses with the #96 wording.
 fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(db_path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(OverlayError::Io(e)),
+        Err(e) => return Err(io_with_path(e, "cannot stat the overlay database", db_path)),
         Ok(_) => {}
     }
-    match fs::metadata(db_path) {
+    match followed_db_stat(db_path) {
         Ok(m) if m.is_file() => Ok(Some(m)),
         // A directory or any other non-regular file: the shared open's text.
         Ok(m) => Err(OverlayError::Msg(crate::overlay_db::not_regular_message(
@@ -185,7 +265,14 @@ fn overlay_db_regular(db_path: &Path, marked: bool) -> Result<Option<fs::Metadat
              created through the symlink: restore its target or remove the symlink",
             db_path.display()
         ))),
-        Err(e) => Err(OverlayError::Io(e)),
+        Err(e) => Err(OverlayError::Io(io::Error::new(
+            e.kind(),
+            format!(
+                "cannot resolve the overlay database {} (it is neither proved present nor \
+                 missing): {e}",
+                db_path.display()
+            ),
+        ))),
     }
 }
 
@@ -727,6 +814,13 @@ pub struct WriteOverlay {
     replacement: RwLock<Option<Arc<dyn MountSource>>>,
     root: PathBuf,
     db: Mutex<Connection>,
+    /// `(dev, ino)` of the database file this mount opened (the validated
+    /// open's post-open path stat). Recovery refuses when the database path
+    /// no longer names it (R10-B).
+    db_id: Option<(u64, u64)>,
+    /// The database inode stays registered as open while the mount lives
+    /// (R10-C). After `db`: dropped once the connection is closed.
+    _db_registration: Option<ratarmount_core::db_inodes::DbInodeRegistration>,
     /// Mount paths with `deleted = 1` (for example `/dir/file`).
     ///
     /// `is_deleted` checks this set. The `files` table remains the durable
@@ -1109,24 +1203,16 @@ impl WriteOverlay {
         let marker = found_marker.is_some();
         let marker_path = found_marker.unwrap_or_else(|| root.join(OVERLAY_MARKER));
         // Follows a symlinked database exactly like `Connection::open` does,
-        // but never reads a dangling symlink as "no database" (R7-E2).
-        let db_len = overlay_db_regular(&db_path, marker)?.map(|m| m.len());
-        if marker && db_len.unwrap_or(0) == 0 {
-            return Err(OverlayError::Msg(format!(
-                "write overlay {} was used before but its database {} is missing or empty; \
-                 its deletions would be lost (unlinked archive members reappear). \
-                 Restore the database, or use a new empty folder{}",
-                root.display(),
-                db_path.display(),
-                discard_hint(
-                    &overlay_markers(&root)?
-                        .iter()
-                        .map(|p| p.as_path())
-                        .collect::<Vec<_>>()
-                )
-            )));
-        }
-        let mut conn = crate::open_overlay_db(&db_path, OpenFlags::default(), crate::DbName::Path)?;
+        // but never reads a dangling symlink as "no database" (R7-E2), nor an
+        // unresolvable one as anything (R10-B).
+        let db_len = match overlay_db_entry(&root)? {
+            DbEntry::Absent => None,
+            DbEntry::Lost { markers, .. } => return Err(lost_record_error(&root, &markers)),
+            DbEntry::Present { metadata, .. } => Some(metadata.len()),
+        };
+        let opened = crate::open_overlay_db(&db_path, OpenFlags::default(), crate::DbName::Path)?;
+        let db_id = opened.id();
+        let (mut conn, db_registration) = opened.into_parts();
         let had_files = conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'",
@@ -1305,6 +1391,8 @@ impl WriteOverlay {
             replacement: RwLock::new(None),
             root,
             db: Mutex::new(conn),
+            db_id,
+            _db_registration: db_registration,
             tombstones: Mutex::new(tombstones),
             pending_rows: Mutex::new(Vec::new()),
             commit_gate: RwLock::new(()),
@@ -2128,7 +2216,7 @@ impl WriteOverlay {
         let guard = self.write_fds.lock().expect("overlay write fds");
         #[cfg(not(unix))]
         {
-            let _ = guard;
+            drop(guard);
             return Some(HashSet::new());
         }
         #[cfg(unix)]
@@ -2165,12 +2253,6 @@ impl WriteOverlay {
                 self.ensure_under_root(parent)?;
                 fs::create_dir_all(parent)?;
             }
-            let mut opts = open_options_nofollow();
-            opts.read(true).write(true).create(true).truncate(true);
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(mode & 0o7777);
-            }
             if let Some(policy) = &self.policy {
                 policy.check_write(
                     &normpath(path),
@@ -2180,7 +2262,13 @@ impl WriteOverlay {
                 )?;
             }
             let _account = self.account_path(path);
-            let f = opts.open(&real)?;
+            // Admitted before `O_TRUNC` and the chmod (R10-C): never a
+            // descriptor of an open overlay database.
+            let f = open_admitted_file(
+                &real,
+                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
+                mode & 0o7777,
+            )?;
             {
                 use std::os::unix::fs::PermissionsExt;
                 f.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
@@ -2263,13 +2351,15 @@ impl WriteOverlay {
             }
             // Keep O_TRUNC on open: Linux permits it with O_RDONLY, and open
             // must perform permission and O_EXCL checks before changing data.
+            // The admitted open applies it only to an inode that is not an
+            // open overlay database (R10-C): another name of one is refused
+            // without closing a descriptor of it.
             let fd = {
+                use std::os::unix::io::IntoRawFd;
                 let _account = self.account_path(path);
-                unsafe { libc::open(c_path(&real)?.as_ptr(), flags, mode & 0o7777) }
+                ratarmount_core::db_inodes::open_admitted(&real, flags, mode & 0o7777)?
+                    .into_raw_fd()
             };
-            if fd < 0 {
-                return Err(OverlayError::Io(io::Error::last_os_error()));
-            }
             // Double-check the opened path still resolves under the overlay root.
             if let Ok(canon) = fs::canonicalize(&real) {
                 if !path_is_under(&self.root, &canon) {
@@ -2424,9 +2514,10 @@ impl WriteOverlay {
         let _policy = self.policy_lock();
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
-        let mut opts = open_options_nofollow();
-        opts.write(true);
-        let f = opts.open(&real)?;
+        #[cfg(unix)]
+        let f = open_admitted_file(&real, libc::O_WRONLY | libc::O_NOFOLLOW, 0)?;
+        #[cfg(not(unix))]
+        let f = open_options_nofollow().write(true).open(&real)?;
         self.truncate_file_inner(&f, path, size)?;
         Ok(())
     }
@@ -4445,7 +4536,11 @@ impl WriteOverlay {
         if self.remote_enabled() {
             crate::journal_recovery::Rows::None
         } else {
-            crate::journal_recovery::Rows::Shared(&self.db)
+            crate::journal_recovery::Rows::Shared {
+                db: &self.db,
+                dir: &self.root,
+                id: self.db_id,
+            }
         }
     }
 
@@ -5468,9 +5563,11 @@ impl MountSource for WriteOverlay {
             if let Some(path) = s.strip_prefix("overlay:") {
                 let real = self.realpath(path);
                 self.ensure_under_root(&real)?;
-                let mut opts = open_options_nofollow();
-                opts.read(true);
-                match opts.open(&real) {
+                #[cfg(unix)]
+                let opened = open_admitted_file(&real, libc::O_RDONLY | libc::O_NOFOLLOW, 0);
+                #[cfg(not(unix))]
+                let opened = open_options_nofollow().read(true).open(&real);
+                match opened {
                     Ok(f) => return Ok(Box::new(f)),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
                         // Live commit wiped the overlay file; serve from the new base.
@@ -5617,7 +5714,13 @@ fn write_commit_manifest(
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_micros() as u64;
-    let previous = match File::open(&dest) {
+    // Admitted (R10-FIX3): a manifest name that is a hard link of an open
+    // overlay database is refused without a descriptor of it being closed.
+    #[cfg(unix)]
+    let opened = open_admitted_file(&dest, libc::O_RDONLY | libc::O_NONBLOCK, 0);
+    #[cfg(not(unix))]
+    let opened = File::open(&dest);
+    let previous = match opened {
         Ok(file) => {
             use std::io::BufRead;
             let line = BufReader::new(file).lines().next().transpose()?;
@@ -6245,15 +6348,25 @@ fn is_fd_exhaustion(err: &io::Error) -> bool {
 /// `commit_gate`, and that helper would take the lock again.
 #[cfg(unix)]
 fn open_park_fd(host: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
-    use std::os::unix::io::{FromRawFd, OwnedFd};
-    let c = c_path(host)?;
-    // Safety: `c` is NUL-terminated. Flags never include `O_CREAT`.
-    let fd = unsafe { libc::open(c.as_ptr(), park_open_flags(), 0) };
-    if fd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        // Safety: `fd` is a new descriptor owned by this process.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    // Linux parks an `O_PATH` descriptor: closing it releases no fcntl lock.
+    // Elsewhere the parked descriptor is readable, so it is admitted first
+    // (R10-C): another name of an open overlay database is never parked.
+    #[cfg(not(target_os = "linux"))]
+    {
+        ratarmount_core::db_inodes::open_admitted(host, park_open_flags(), 0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::{FromRawFd, OwnedFd};
+        let c = c_path(host)?;
+        // Safety: `c` is NUL-terminated. Flags never include `O_CREAT`.
+        let fd = unsafe { libc::open(c.as_ptr(), park_open_flags(), 0) };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // Safety: `fd` is a new descriptor owned by this process.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
     }
 }
 
@@ -6319,6 +6432,14 @@ fn create_overlay_marker(path: &Path) -> io::Result<bool> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// `open(2)` of a payload, sentinel or commit source that never returns (and
+/// never closes) a descriptor of an open overlay database (R10-C, see
+/// [`ratarmount_core::db_inodes`]); `O_CLOEXEC` is added.
+#[cfg(unix)]
+pub(crate) fn open_admitted_file(path: &Path, flags: libc::c_int, mode: u32) -> io::Result<File> {
+    ratarmount_core::db_inodes::open_admitted(path, flags | libc::O_CLOEXEC, mode).map(File::from)
 }
 
 /// WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no equivalent bit.
@@ -6813,11 +6934,15 @@ pub fn commit_overlay(
 ) -> Result<bool> {
     let write_overlay = write_overlay.as_ref();
     let archive_file = archive_file.as_ref();
-    if overlay_db_absent(write_overlay) {
-        return Err(OverlayError::Msg(format!(
-            "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
-            write_overlay.display()
-        )));
+    match overlay_db_entry(write_overlay)? {
+        DbEntry::Absent => {
+            return Err(OverlayError::Msg(format!(
+                "overlay {} has no database; use commit_overlay_raw_dir for a raw directory",
+                write_overlay.display()
+            )))
+        }
+        DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
+        DbEntry::Present { .. } => {}
     }
     if let Err(refusal) =
         crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
@@ -6850,7 +6975,10 @@ pub fn commit_overlay_raw_dir(
 ) -> Result<RawDirCommit> {
     let write_overlay = write_overlay.as_ref();
     let db = write_overlay.join(HIDDEN_DB);
-    if !db_entry_absent(&db) {
+    if let DbEntry::Lost { markers, .. } = overlay_db_entry(write_overlay)? {
+        return Err(lost_record_error(write_overlay, &markers));
+    }
+    if !overlay_db_absent(write_overlay) {
         return Err(OverlayError::Msg(format!(
             "overlay database {} exists (or something else is at its path); its base \
              identity must be checked, so commit it with a classified base \
@@ -6951,7 +7079,7 @@ fn commit_overlay_inner(
             &opts.encoding,
             opts.mode,
             hash_payloads.then_some(&mut written_hashes),
-            &crate::journal_recovery::Rows::Path(&db),
+            &crate::journal_recovery::Rows::path(&db),
             &original,
         )?;
         crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
@@ -7059,15 +7187,25 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
         )));
     }
     let conn = if db_regular {
-        Some(crate::open_overlay_db(
+        let conn = crate::open_overlay_db(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             crate::DbName::Path,
-        )?)
+        )?;
+        // A used overlay's database without its `files` table is a lost
+        // record (R10-B): refuse with its path, never plan without deletions.
+        if marker.is_some() && !crate::overlay_meta::has_files_table(&conn)? {
+            return Err(OverlayError::Msg(format!(
+                "{}: {}; refusing to commit without its deletions",
+                db_path.display(),
+                crate::overlay_meta::NO_FILES_TABLE
+            )));
+        }
+        Some(conn)
     } else {
         None
     };
-    collect_overlay_commit_plan_from_conn(write_overlay, conn.as_ref(), None, &HashSet::new())
+    collect_overlay_commit_plan_from_conn(write_overlay, conn.as_deref(), None, &HashSet::new())
 }
 
 fn collect_overlay_commit_plan_from_conn(
@@ -7796,7 +7934,11 @@ fn rebuild_zip_with_overlay(
                 })?;
             } else {
                 let src_path = write_overlay.join(rel);
-                let mut src_file = File::open(&src_path).map_err(|e| {
+                #[cfg(unix)]
+                let opened = open_admitted_file(&src_path, libc::O_RDONLY, 0);
+                #[cfg(not(unix))]
+                let opened = File::open(&src_path);
+                let mut src_file = opened.map_err(|e| {
                     OverlayError::Msg(format!(
                         "Failed to open overlay file '{}': {e}",
                         src_path.display()
@@ -7899,7 +8041,7 @@ fn commit_overlay_tar(
                 write_overlay,
                 &plan,
                 &opts.encoding,
-                &crate::journal_recovery::Rows::Path(&db),
+                &crate::journal_recovery::Rows::path(&db),
                 original,
             )
         })();
@@ -8215,7 +8357,7 @@ fn commit_overlay_tar_zst(
     invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
     if append {
         let db = write_overlay.join(HIDDEN_DB);
-        let rows = crate::journal_recovery::Rows::Path(&db);
+        let rows = crate::journal_recovery::Rows::path(&db);
         match crate::journal_recovery::splice_append_committing(
             tar_file, from_idx, transform, original, &rows,
         ) {
