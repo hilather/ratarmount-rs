@@ -66,6 +66,11 @@ pub enum NameMode {
 }
 
 /// The evidence an [`Acquired`] rests on.
+///
+/// [`Verification::LegacyUnverified`] is a label, not an outcome of
+/// [`open_checked`]. Checked overlay opens never return it: on an unsupported
+/// Unix ABI they refuse ([`DiskOpenState::Refused`]), and elsewhere they are
+/// [`UnixDescriptor`], [`UnixReuse`] or [`WindowsPathTypeOnly`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verification {
     /// SQLite's own fresh descriptor was `fstat`ed before SQLite used it.
@@ -75,6 +80,86 @@ pub enum Verification {
     UnixReuse,
     /// Windows: pathname type checks only, no identity (design §9).
     WindowsPathTypeOnly,
+    /// Ordinary open of a non-overlay disk database on an unsupported Unix
+    /// ABI (musl, 32-bit, big-endian, BSD). No descriptor check, no reuse
+    /// check, and no pathname type check. Overlay databases on that host are
+    /// refused instead of carrying this label (#196).
+    LegacyUnverified,
+}
+
+/// Which host [`disk_open_state`] is evaluated on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostVerification {
+    /// 64-bit little-endian x86_64/aarch64, Linux glibc or macOS.
+    VerifiedUnix,
+    /// Pathname type checks only.
+    Windows,
+    /// musl, 32-bit, big-endian, BSD, and every other Unix ABI.
+    UnsupportedUnix,
+}
+
+/// Overlay databases go through [`open_checked`]. Index, SQLAR, digest-cache
+/// and publication connections do not (#193 is a separate change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskDbClass {
+    Overlay,
+    NonOverlay,
+}
+
+/// What a disk-database open is on `host` (#196).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskOpenState {
+    /// [`Verification::UnixDescriptor`] or [`Verification::UnixReuse`] at open time.
+    CheckedUnix,
+    /// [`Verification::WindowsPathTypeOnly`].
+    WindowsPathTypeOnly,
+    /// SQLite's default VFS. Not [`Verification::LegacyUnverified`].
+    OrdinaryDefaultVfs,
+    /// Unsupported-Unix non-overlay disk DB: an ordinary open, labeled unverified.
+    LegacyUnverified,
+    /// [`AcquireError::Unavailable`] (`UnsupportedAbi` / `UnsupportedPlatform`).
+    Refused,
+}
+
+impl DiskOpenState {
+    /// The single [`Verification`] this state names. Checked Unix opens choose
+    /// between descriptor and reuse at open time, so they have no single label.
+    /// An ordinary default-VFS open and a refusal are not
+    /// [`Verification::LegacyUnverified`].
+    pub fn verification_label(self) -> Option<Verification> {
+        match self {
+            Self::CheckedUnix | Self::OrdinaryDefaultVfs | Self::Refused => None,
+            Self::WindowsPathTypeOnly => Some(Verification::WindowsPathTypeOnly),
+            Self::LegacyUnverified => Some(Verification::LegacyUnverified),
+        }
+    }
+}
+
+/// #196 state table.
+pub fn disk_open_state(host: HostVerification, class: DiskDbClass) -> DiskOpenState {
+    match (host, class) {
+        (HostVerification::VerifiedUnix, DiskDbClass::Overlay) => DiskOpenState::CheckedUnix,
+        (HostVerification::VerifiedUnix, DiskDbClass::NonOverlay) => {
+            DiskOpenState::OrdinaryDefaultVfs
+        }
+        (HostVerification::Windows, DiskDbClass::Overlay) => DiskOpenState::WindowsPathTypeOnly,
+        (HostVerification::Windows, DiskDbClass::NonOverlay) => DiskOpenState::OrdinaryDefaultVfs,
+        (HostVerification::UnsupportedUnix, DiskDbClass::Overlay) => DiskOpenState::Refused,
+        (HostVerification::UnsupportedUnix, DiskDbClass::NonOverlay) => {
+            DiskOpenState::LegacyUnverified
+        }
+    }
+}
+
+/// The row of [`disk_open_state`] for the target this binary was built for.
+pub fn this_host() -> HostVerification {
+    if cfg!(windows) {
+        HostVerification::Windows
+    } else if super::install::VERIFIED_TARGET {
+        HostVerification::VerifiedUnix
+    } else {
+        HostVerification::UnsupportedUnix
+    }
 }
 
 #[derive(Debug)]
@@ -1135,3 +1220,63 @@ mod imp {
 ))]
 #[path = "acquire_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod disk_open_state_tests {
+    use super::{
+        disk_open_state, this_host, DiskDbClass, DiskOpenState, HostVerification, Verification,
+    };
+
+    /// Regression (#196): unsupported-Unix non-overlay disk databases stay
+    /// ordinary opens labeled [`Verification::LegacyUnverified`]. Overlay
+    /// opens on that host stay refused. Verified Unix and Windows non-overlay
+    /// opens are ordinary default-VFS opens and are not that label.
+    #[test]
+    fn regression_disk_open_state_labels_unsupported_unix_non_overlay() {
+        use DiskDbClass::{NonOverlay, Overlay};
+        use DiskOpenState::{
+            CheckedUnix, LegacyUnverified, OrdinaryDefaultVfs, Refused, WindowsPathTypeOnly,
+        };
+        use HostVerification::{UnsupportedUnix, VerifiedUnix, Windows};
+        let rows = [
+            (VerifiedUnix, Overlay, CheckedUnix),
+            (VerifiedUnix, NonOverlay, OrdinaryDefaultVfs),
+            (Windows, Overlay, WindowsPathTypeOnly),
+            (Windows, NonOverlay, OrdinaryDefaultVfs),
+            (UnsupportedUnix, Overlay, Refused),
+            (UnsupportedUnix, NonOverlay, LegacyUnverified),
+        ];
+        for (host, class, want) in rows {
+            assert_eq!(disk_open_state(host, class), want, "{host:?} {class:?}");
+        }
+        assert_eq!(
+            disk_open_state(UnsupportedUnix, NonOverlay).verification_label(),
+            Some(Verification::LegacyUnverified)
+        );
+        assert_eq!(
+            disk_open_state(Windows, Overlay).verification_label(),
+            Some(Verification::WindowsPathTypeOnly)
+        );
+        assert_eq!(
+            disk_open_state(VerifiedUnix, NonOverlay).verification_label(),
+            None,
+            "a verified-Unix non-overlay open is not LegacyUnverified"
+        );
+        assert_eq!(
+            disk_open_state(VerifiedUnix, Overlay).verification_label(),
+            None,
+            "descriptor vs reuse is chosen at open time"
+        );
+        let host = this_host();
+        if cfg!(windows) {
+            assert_eq!(host, Windows);
+        } else if super::super::install::VERIFIED_TARGET {
+            assert_eq!(host, VerifiedUnix);
+            assert_eq!(disk_open_state(host, NonOverlay), OrdinaryDefaultVfs);
+        } else {
+            assert_eq!(host, UnsupportedUnix);
+            assert_eq!(disk_open_state(host, NonOverlay), LegacyUnverified);
+            assert_eq!(disk_open_state(host, Overlay), Refused);
+        }
+    }
+}

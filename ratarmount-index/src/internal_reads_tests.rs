@@ -835,6 +835,53 @@ fn regression_macos_index_connections_keep_auto_vfs() {
     w.execute_batch("ROLLBACK").unwrap();
 }
 
+/// Regression (#196): a lookup snapshot of a WAL index whose `-shm` is missing
+/// is not `sqlite3_backup_step(-1)`. The copy's first statement creates `-wal`
+/// and `-shm` in the staging directory before any `journal_mode=DELETE`. Those
+/// files are expected there and must not appear beside the source.
+#[test]
+fn regression_lookup_snapshot_wal_sidecars_stay_in_staging() {
+    let (_d, dir) = tempdir();
+    let db = dir.join("hot.sqlite");
+    // Closing checkpoints and deletes `-wal` unless checkpoint-on-close is
+    // off. `-shm` still goes away with the last connection, so the companion
+    // set is incomplete and the lookup takes the snapshot path.
+    {
+        let c = Connection::open(&db).unwrap();
+        c.pragma_update(None, "journal_mode", "WAL").unwrap();
+        c.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .unwrap();
+        c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+    }
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    let shm = PathBuf::from(format!("{}-shm", db.display()));
+    assert!(wal.is_file(), "WAL source");
+    let _ = std::fs::remove_file(&shm);
+    assert!(!shm.exists(), "incomplete companion set forces a snapshot");
+    let conn = crate::open_lookup_connection(&db).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert!(n >= 1, "the snapshot is readable");
+    let staging = crate::SNAPSHOT_STAGING_AFTER_STATEMENT.with(|m| m.borrow().clone());
+    assert!(
+        staging.iter().any(|name| name.ends_with("-wal")),
+        "staging -wal is expected: {staging:?}"
+    );
+    assert!(
+        staging.iter().any(|name| name.ends_with("-shm")),
+        "staging -shm is expected: {staging:?}"
+    );
+    assert!(!shm.exists(), "the source directory gained -shm");
+    assert!(wal.is_file(), "the source -wal is untouched");
+    drop(conn);
+    assert!(!shm.exists());
+}
+
 /// Regression: the digest cache's writable and read-only connections keep
 /// the default "unix" VFS.
 #[test]

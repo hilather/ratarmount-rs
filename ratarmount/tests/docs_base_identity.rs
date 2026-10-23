@@ -132,6 +132,8 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
         "A daemonized ratarmount (the default without `-f`, for a FUSE mount and for an export server alike) currently holds no kernel lock on its overlay database at all",
         "(#183). Until that is fixed, run with `-f` when another process may open the same overlay.",
         "| Platform / host | Installation | Checked open |",
+        "labeled `LegacyUnverified`",
+        "external-alias epoch cap",
         "opening one database file through both at once in one process is unsupported (#154",
     ] {
         assert!(text.contains(sentence), "docs/sandbox.md lost: {sentence}");
