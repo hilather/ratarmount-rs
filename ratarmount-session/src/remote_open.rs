@@ -4948,7 +4948,10 @@ mod tests {
     // R11-S7 (#151): managed reads of fetched / meta-v3 index blobs.
     // ---------------------------------------------------------------------
 
-    /// The meta-v3 blob files (not headers or staging) under `XDG_CACHE_HOME`.
+    /// The meta-v3 blob files (not headers or staging) under `XDG_CACHE_HOME`,
+    /// canonicalized: `managed_read::seams::opened_path()` reports the
+    /// canonical path, and on macOS the temp dir sits under the `/var` symlink
+    /// (Regression R11-CI, #199: the seams never matched there).
     #[cfg(unix)]
     fn meta_v3_blobs() -> Vec<PathBuf> {
         let dir = PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap())
@@ -4962,6 +4965,7 @@ mod tests {
                         let n = p.file_name().unwrap().to_string_lossy();
                         n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit())
                     })
+                    .map(|p| p.canonicalize().unwrap())
                     .collect()
             })
             .unwrap_or_default();

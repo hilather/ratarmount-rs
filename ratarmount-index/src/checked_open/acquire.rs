@@ -592,18 +592,23 @@ mod path_type_only_tests {
         }
     }
 
+    /// Regression (R11-CI, #199): on macOS the temp dir sits under the `/var`
+    /// symlink, so SQLite's NOFOLLOW path check refused it
+    /// (`SQLITE_CANTOPEN_SYMLINK`) before the hook ran. Only the final
+    /// component is under test: the directory is canonical.
     #[test]
     fn regression_path_type_only_open_honours_nofollow() {
         let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a.sqlite");
-        let other = dir.path().join("other.sqlite");
+        let base = dir.path().canonicalize().unwrap();
+        let a = base.join("a.sqlite");
+        let other = base.join("other.sqlite");
         for p in [&a, &other] {
             Connection::open(p)
                 .unwrap()
                 .execute_batch("CREATE TABLE t(x)")
                 .unwrap();
         }
-        let link = dir.path().join("link.sqlite");
+        let link = base.join("link.sqlite");
         std::os::unix::fs::symlink(&other, &link).unwrap();
 
         // A symlink at the name: refused before the open under NOFOLLOW,

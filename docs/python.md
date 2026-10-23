@@ -37,7 +37,13 @@ workspace. The Python wheels workflow builds abi3 wheels for manylinux_2_28
 x86_64/aarch64 and macOS 14+ arm64, plus an sdist, and tests installed wheels in
 fresh venvs on Linux x86_64 and aarch64 and macOS arm64. Linux wheels require glibc 2.28+;
 linked libraries such as libarchive are bundled by maturin on Linux and
-delocate on macOS. Library reads need no FUSE; optional mounting uses a separate CLI.
+delocate on macOS. Library reads need no FUSE; optional mounting uses a separate CLI. On aarch64 (Linux and
+macOS), builds with the `extension-module` feature (the wheels and `maturin
+develop`/`build` source installs) compute BLAKE3 without NEON: the portable
+code gives the same digests, more slowly (canonical hashing of overlay change
+sets in the Python module; not measured). NEON's C kernel needs a `#[no_mangle]`
+FFI shim that a Python extension would export; the CLI, default and
+`embedding` builds keep NEON.
 The workflow uploads build artifacts only; PyPI publishing is not enabled, so
 `pip install ratarmount-rs` is not yet the installation path.
 The Python crate is outside the workspace's default build members and no

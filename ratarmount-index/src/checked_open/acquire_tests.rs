@@ -1645,6 +1645,14 @@ fn regression_snapshot_index_refuses_partial_companions_and_keeps_locks() {
 /// final component without following it and judges SQLite's own descriptor
 /// against the classified file: both substitutions are refused and nothing
 /// is written.
+///
+/// Regression (R11-CI, #199): the other database was substituted by deleting
+/// the index and then copying a new file to its name, and on Linux CI the
+/// copy received the freed `(dev, ino)` and was accepted as the same file.
+/// The substitute is now created while the index still exists (so it is a
+/// different inode, asserted below) and renamed over it. A delete-then-create
+/// substitute that gets the same `(dev, ino)` cannot be told apart from the
+/// original; `snapshot_index_into` documents that limit.
 #[test]
 fn regression_snapshot_index_refuses_substitution_after_classification() {
     let (_dir, dir) = tempdir();
@@ -1653,15 +1661,26 @@ fn regression_snapshot_index_refuses_substitution_after_classification() {
     for kind in ["symlink", "other"] {
         let db = dir.join(format!("{kind}.index.sqlite"));
         make_db(&db, 1);
+        let classified = {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::symlink_metadata(&db).unwrap();
+            (meta.dev(), meta.ino())
+        };
         let (hook_db, hook_other) = (db.clone(), other.clone());
+        let substitute = dir.join("substitute.tmp");
         let kind_owned = kind.to_owned();
         crate::SNAPSHOT_AFTER_CLASSIFY.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
-                std::fs::remove_file(&hook_db).unwrap();
                 if kind_owned == "symlink" {
+                    std::fs::remove_file(&hook_db).unwrap();
                     std::os::unix::fs::symlink(&hook_other, &hook_db).unwrap();
                 } else {
-                    std::fs::copy(&hook_other, &hook_db).unwrap();
+                    // Created while the index exists: a different inode.
+                    use std::os::unix::fs::MetadataExt;
+                    std::fs::copy(&hook_other, &substitute).unwrap();
+                    let meta = std::fs::symlink_metadata(&substitute).unwrap();
+                    assert_ne!((meta.dev(), meta.ino()), classified);
+                    std::fs::rename(&substitute, &hook_db).unwrap();
                 }
             }))
         });

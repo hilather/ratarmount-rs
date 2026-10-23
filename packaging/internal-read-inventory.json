@@ -3299,6 +3299,17 @@
    "reason": "directory handle opened only to fsync a directory entry"
   },
   {
+   "file": "ratarmount-csi/src/linux.rs",
+   "function": "bind_staged",
+   "op": "OpenOptions",
+   "ordinal": 1,
+   "line": 124,
+   "fingerprint": "9fd2721e91f0f881",
+   "disposition": "out-of-family",
+   "category": "directory-handle-or-durability",
+   "reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"
+  },
+  {
    "file": "ratarmount-csi/src/process.rs",
    "function": "ProcessMounter::mounted",
    "op": "fs::read",
@@ -6299,10 +6310,21 @@
   },
   {
    "file": "ratarmount-volume-plugin/src/main.rs",
+   "function": "bind_staged",
+   "op": "OpenOptions",
+   "ordinal": 1,
+   "line": 145,
+   "fingerprint": "9fd2721e91f0f881",
+   "disposition": "out-of-family",
+   "category": "directory-handle-or-durability",
+   "reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"
+  },
+  {
+   "file": "ratarmount-volume-plugin/src/main.rs",
    "function": "listener",
    "op": "from_raw_fd",
    "ordinal": 1,
-   "line": 146,
+   "line": 237,
    "fingerprint": "e432702cc9c49b48",
    "disposition": "out-of-family",
    "category": "runtime-resource-or-descriptor-handoff",

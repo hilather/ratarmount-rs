@@ -5535,6 +5535,7 @@ dependencies = [
 name = "ratarmount-python"
 version = "0.1.35"
 dependencies = [
+ "blake3",
  "pyo3",
  "ratarmount-formats-tar",
  "ratarmount-index",

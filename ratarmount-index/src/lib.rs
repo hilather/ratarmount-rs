@@ -774,8 +774,13 @@ pub(crate) fn open_lookup_connection(path: &Path) -> rusqlite::Result<Connection
 /// Only SQLite opens the index, through the checked acquisition
 /// ([`checked_open::open_checked`]): the final component is never followed
 /// (`SQLITE_OPEN_NOFOLLOW`), and SQLite's own descriptor must be the regular
-/// file classified here, so a symlink or another file substituted between the
-/// classification and the open is refused. Unlike a lookup
+/// file classified here. On Unix the identity is `(device, inode)`: a symlink
+/// or another file substituted between the classification and the open is
+/// refused, except a file that replaces the index after it was deleted and
+/// gets the same inode number from the filesystem, which counts as the same
+/// file and is copied. On Windows there is no identity: the final component
+/// is checked only for type (a regular file, not a symlink), so any regular
+/// file substituted at the name is copied. Unlike a lookup
 /// ([`open_lookup_connection`]) there is no snapshot fallback, which copies
 /// the live files raw: the index is opened `immutable=1` when it has no
 /// companions, normally when it has both `-wal` and `-shm` (a live writer),
