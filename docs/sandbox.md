@@ -2022,8 +2022,8 @@ reported. A test-only match arm ends at its block-like body (`unsafe { .. }`,
 `loop`, `match`, an `if`/`else` chain) as well as at a bare block. Descriptor
 duplication and ownership conversion are operations of their own:
 `try_clone_to_owned`, `libc::dup`/`dup2`/`dup3`, `fcntl(.., F_DUPFD[_CLOEXEC],
-..)` and `File::from(OwnedFd)` (closing a duplicate releases this process's
-locks on the file like any other close).
+..)` and any `File::from(..)` (an `OwnedFd` included; closing a duplicate
+releases this process's locks on the file like any other close).
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE
