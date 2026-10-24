@@ -1925,9 +1925,14 @@ mod tests {
         let bundle_hex =
             ratarmount_index::sha256_hex_stream(&mut File::open(&bundle).unwrap()).unwrap();
         assert_eq!(first.file_name().unwrap().to_str().unwrap(), bundle_hex);
-        let (_, view) =
-            crate::MountLowerStack::open(f.base.clone(), None, std::slice::from_ref(&first), false)
-                .unwrap();
+        let (_, view) = crate::MountLowerStack::open(
+            f.base.clone(),
+            None,
+            std::slice::from_ref(&first),
+            false,
+            &crate::lower_stack_services(),
+        )
+        .unwrap();
         assert!(view.lookup("/deleted", 0).is_none());
         assert!(view.lookup("/sub/file", 0).is_some());
         fs::rename(f.tmp.path().join("base"), f.tmp.path().join("base-away")).unwrap();
@@ -2996,6 +3001,7 @@ mod tests {
                 &args.lower,
                 false,
                 Some(&cache),
+                &crate::lower_stack_services(),
             )
             .unwrap();
             verify_calls() - before
@@ -3222,6 +3228,7 @@ mod tests {
                 &paths,
                 true,
                 Some(&cache),
+                &crate::lower_stack_services(),
             )
             .unwrap();
         }
@@ -3239,6 +3246,7 @@ mod tests {
             &paths,
             true,
             Some(&cache),
+            &crate::lower_stack_services(),
         )
         .err()
         .expect("edited unsealed lower must fail closed");
@@ -3285,6 +3293,7 @@ mod tests {
                 &paths,
                 false,
                 Some(&cache),
+                &crate::lower_stack_services(),
             )
             .unwrap();
         }
@@ -3304,6 +3313,7 @@ mod tests {
             &paths,
             false,
             Some(&cache),
+            &crate::lower_stack_services(),
         )
         .err()
         .expect("edited base must fail closed");

@@ -112,8 +112,13 @@ impl ImportStack {
         // Import opens the base the way the user would mount it: a working
         // tree with a `.git` entry is Git.
         let classified = classify_offline(Path::new(base), GitIntent::Auto, context)?;
-        let (lowers, view) =
-            super::MountLowerStack::open(classified.source(), None, lower, allow_unsealed_lower)?;
+        let (lowers, view) = super::MountLowerStack::open(
+            classified.source(),
+            None,
+            lower,
+            allow_unsealed_lower,
+            &super::lower_stack_services(),
+        )?;
         Ok(Self {
             base: classified,
             view,
