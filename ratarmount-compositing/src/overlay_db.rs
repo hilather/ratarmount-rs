@@ -23,12 +23,14 @@
 //!    SQLite or closed;
 //! 3. that acquired `(dev, ino)` is registered as an open database inode
 //!    ([`ratarmount_core::db_inodes`]) for the connection's life, and the
-//!    database path plus its `-wal` / `-shm` / `-journal` names are latched
-//!    for the rest of the process ([`ratarmount_index::checked_open::latch_overlay_nocreate`],
-//!    R11-S8): a later checked open of that path cannot create the file, and
-//!    on a verified Unix host neither can an `open` of a missing `-wal` or
-//!    `-shm`. `-journal` stays creatable (DELETE journal mode). Index and
-//!    other checked opens are not latched.
+//!    database is latched for the rest of the process
+//!    ([`ratarmount_index::checked_open::latch_overlay_nocreate`], R11-S8):
+//!    the parent directory's `(st_dev, st_ino)` plus the file name, and the
+//!    absolute and canonical path spellings. A later checked open cannot
+//!    create the file, including after that directory is renamed, and on a
+//!    verified Unix host neither can an `open` of a missing `-wal` or `-shm`.
+//!    `-journal` stays creatable (DELETE journal mode; deliberate carve-out).
+//!    Index and other checked opens are not latched.
 //!
 //! Nothing here opens a descriptor of its own (R7-H1): on POSIX, closing ANY
 //! descriptor of an inode releases every fcntl lock this process holds on
@@ -308,7 +310,7 @@ pub(crate) fn open_overlay_db_required(
     // registry lock is never held across an open (R10-D). The no-create
     // latch is the same moment: the open has succeeded, and the hook is not
     // on the stack (it must not run while this lock is held).
-    checked_open::latch_overlay_nocreate(acquired.id, db);
+    checked_open::latch_overlay_nocreate(db);
     let registration = acquired
         .id
         .map(|id| ratarmount_core::db_inodes::register_db_inode(id, db));

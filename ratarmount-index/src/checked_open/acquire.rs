@@ -445,7 +445,8 @@ pub(crate) fn request(
     let mut flags = (flags - OpenFlags::SQLITE_OPEN_URI) | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
     // An existing file that vanished must not be created anew (and then
     // refused and retained as a 0-byte file). A latched overlay database
-    // (R11-S8) is the same refusal for a later `Expect::Fresh`.
+    // (R11-S8) is the same refusal for a later `Expect::Fresh`, including
+    // after its directory is renamed (parent inode plus the file name).
     if matches!(expect, Expect::Existing { .. }) || super::nocreate::db_path_is_latched(&path) {
         flags -= OpenFlags::SQLITE_OPEN_CREATE;
     }

@@ -1813,7 +1813,7 @@ fn regression_latched_delete_to_wal_cannot_create_shm() {
     let db = dir.join("ov.sqlite");
     let got = open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap();
     let id = got.id.expect("inode");
-    crate::checked_open::latch_overlay_nocreate(Some(id), &db);
+    crate::checked_open::latch_overlay_nocreate(&db);
     got.conn
         .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
         .unwrap();
@@ -1859,7 +1859,7 @@ fn regression_latched_shm_create_fails_closed() {
     let (_t, dir) = tempdir();
     let db = dir.join("ov.sqlite");
     let got = open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap();
-    crate::checked_open::latch_overlay_nocreate(got.id, &db);
+    crate::checked_open::latch_overlay_nocreate(&db);
     drop(got);
     let shm = sibling(&db, "-shm");
     let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
@@ -1890,7 +1890,7 @@ fn regression_latched_shm_create_fails_closed_via_symlink_dir() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let db = link.join("ov.sqlite");
     let got = open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap();
-    crate::checked_open::latch_overlay_nocreate(got.id, &db);
+    crate::checked_open::latch_overlay_nocreate(&db);
     drop(got);
     let canonical = std::fs::canonicalize(link.join("ov.sqlite")).unwrap();
     assert_ne!(canonical, std::path::absolute(&db).unwrap());
@@ -1903,6 +1903,70 @@ fn regression_latched_shm_create_fails_closed_via_symlink_dir() {
     assert!(fd < 0, "canonical -shm create returned {fd}");
     assert_eq!(err, libc::EACCES, "errno {err}");
     assert!(!shm.exists(), "refused create still left -shm");
+}
+
+/// Regression (R11-S8, Keystone B1): the latch is the parent directory's
+/// `(st_dev, st_ino)` plus the database file name, not only the path bytes
+/// stored at latch time. Renaming that directory and removing the database
+/// must still refuse a later `Expect::Fresh` open, and must leave no
+/// database, `-wal` or `-shm`. A different file name in the renamed directory
+/// is not the latched database and can still be created.
+#[test]
+fn regression_latched_rename_dir_fresh_open_refuses() {
+    let (_t, dir) = tempdir();
+    let overlay = dir.join("overlay");
+    std::fs::create_dir(&overlay).unwrap();
+    let db = overlay.join("ov.sqlite");
+    let got = open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap();
+    crate::checked_open::latch_overlay_nocreate(&db);
+    drop(got);
+    let moved = dir.join("moved");
+    std::fs::rename(&overlay, &moved).unwrap();
+    let db = moved.join("ov.sqlite");
+    std::fs::remove_file(&db).unwrap();
+    let again = open_checked(&db, RWC, NameMode::Path, Expect::Fresh);
+    assert!(
+        again.is_err(),
+        "Fresh open recreated a latched database after its directory was renamed: {again:?}"
+    );
+    assert!(!db.exists(), "renamed Fresh open left the database");
+    assert!(
+        !sibling(&db, "-wal").exists(),
+        "renamed Fresh open left -wal"
+    );
+    assert!(
+        !sibling(&db, "-shm").exists(),
+        "renamed Fresh open left -shm"
+    );
+
+    let shm = sibling(&db, "-shm");
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
+    let (fd, err) = hooked_open(&shm, flags);
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+    assert!(fd < 0, "renamed -shm create returned {fd}");
+    assert_eq!(err, libc::EACCES, "errno {err}");
+    assert!(
+        !shm.exists(),
+        "refused renamed -shm create still left a file"
+    );
+
+    let other = moved.join("other.sqlite");
+    drop(open_checked(&other, RWC, NameMode::Path, Expect::Fresh).unwrap());
+    assert!(
+        other.is_file(),
+        "a different name in the renamed directory was refused"
+    );
+
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let same_name = elsewhere.join("ov.sqlite");
+    drop(open_checked(&same_name, RWC, NameMode::Path, Expect::Fresh).unwrap());
+    assert!(
+        same_name.is_file(),
+        "the same file name in a different directory was refused"
+    );
 }
 
 /// Regression (R11-S8): a checked open that nobody latched can still create

@@ -1884,21 +1884,29 @@ syscall hook) after the installation remains unsupported.
 
 After a checked overlay-database open succeeds, this process latches that
 database for the rest of the process, not for the life of the connection
-(#151, R11-S8). The latch is the inode SQLite acquired (`st_dev`, `st_ino`)
-together with the database path and its `-wal`, `-shm` and `-journal` names.
-The first `-w` open (`Expect::Fresh`) may still create the database once.
-The latch is taken as soon as that open succeeds.
+(#151, R11-S8). The latch is the parent directory's `(st_dev, st_ino)`
+(`lstat` of the directory, not of the database file) plus the database file
+name, together with the absolute and canonical path spellings and the
+`-wal`, `-shm` and `-journal` names. Renaming the directory keeps that
+inode, so removing the database and opening it at the new path does not
+create it again. The database file's own inode is not the key: it disappears
+with the file. The first `-w` open (`Expect::Fresh`) may still create the
+database once. The latch is taken as soon as that open succeeds.
 
-A later checked open of the same path, including another `Expect::Fresh`
-after the file is removed, has `SQLITE_OPEN_CREATE` stripped. `Expect::Existing`
-already had it stripped: a database that vanishes between classification and
-SQLite's open is not recreated as a new 0-byte file beside the marker.
+A later checked open of a latched database, including another `Expect::Fresh`
+after the file is removed or the directory is renamed, has
+`SQLITE_OPEN_CREATE` stripped. `Expect::Existing` already had it stripped: a
+database that vanishes between classification and SQLite's open is not
+recreated as a new 0-byte file beside the marker.
 
 On a verified Unix host the installed `open` slot also refuses an `O_CREAT`
 that would create the database, `-wal` or `-shm` when that name is missing.
 The latch stores both the absolute path given to SQLite and, when it differs,
 the canonical path SQLite uses after resolving a symlink in the directory
-(`/tmp` → `/private/tmp`).
+(`/tmp` → `/private/tmp`). The hook also matches `lstat` of the parent
+directory plus the file name, so a renamed directory is still refused.
+That directory is held open for the rest of the process, so removing it
+does not let the filesystem reuse its inode for a different directory.
 That is the path SQLite uses for WAL shared memory: `unixOpenSharedMemory`
 calls `robust_open`, which calls the `open` syscall and does not go through
 VFS `xOpen`. The slot is the one the installer published; nothing installs a
@@ -1910,10 +1918,17 @@ DELETE to WAL records WAL in the database header (the pragma answers `wal`)
 and the following write fails closed: neither `-wal` nor `-shm` is created.
 
 `-journal` is part of the latch, and opens of it go through the same slot, but
-creating it stays allowed. Overlay databases use SQLite's DELETE journal mode,
-which creates and removes `-journal` on every transaction, including the schema
-write that follows the first open and every later overlay write. Refusing that
-create would make the overlay unwritable.
+creating it stays allowed. This is a deliberate carve-out. Overlay databases
+use SQLite's DELETE journal mode, which creates and removes `-journal` on
+every transaction, including the schema write that follows the first open and
+every later overlay write. Refusing that create would make the overlay
+unwritable.
+
+The latch mutex is registered with `pthread_atfork` on the first latch. The
+prepare handler locks it and the parent and child handlers unlock it, so a
+child does not inherit the mutex held by another thread. Inheriting it held
+would deadlock the child's `open`. The forking thread must not already hold
+that mutex; the latch code does not fork while it holds the lock.
 
 This bundled SQLite (3.46) has no `openat` system call. If the slot exists it
 is hooked in the same installation as `open`. If it was absent at installation
@@ -1922,9 +1937,9 @@ the new slot is mediated. `openat` with a relative name is not matched to an
 absolute companion path; this SQLite does not open overlay files that way.
 
 Windows and any Unix ABI without the syscall hooks keep the pathname type
-check only. A latched path still has `SQLITE_OPEN_CREATE` stripped on the
-checked open of the database file itself. There is no guarantee there about
-`-wal`, `-shm` or `-journal`.
+check only. A latched path spelling still has `SQLITE_OPEN_CREATE` stripped
+on the checked open of the database file itself. There is no directory-inode
+match and no guarantee there about `-wal`, `-shm` or `-journal`.
 
 Index, SQLAR, digest-cache and other readers are not latched. A checked open
 that is not an overlay database can still create its file.
