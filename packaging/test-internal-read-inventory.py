@@ -45,7 +45,48 @@ paths (any same-crate definition) and calls of the caller's own name in
 another module. Generic argument lists (`::<..>`) are matched balanced; an
 unbalanced one is reported. Descriptor duplication and ownership conversion
 (`try_clone_to_owned`, `dup`/`dup2`/`dup3`, `F_DUPFD[_CLOEXEC]`, `File::from`)
-are operations.
+are operations. The directory walk (`is_test_path`) does not enter:
+* `target` — Cargo's build output, not this repo's sources;
+* `vendor` — vendored third-party crates;
+* `test-harness` — CI fixtures and scripts, not crate modules;
+* `clients` — language bindings, not these Rust sources;
+* `benchmarks` — benchmark programs and their data;
+* a directory named `tests`, `benches` or `examples` — integration tests,
+  benches and examples;
+* every `build.rs` — a build script.
+A production `mod` whose file exists and whose real path stays inside
+the workspace is loaded wherever it lives (`#[path =
+"../../benchmarks/r.rs"]`, `#[path = "../build.rs"]`, `vendor/`), and so
+is a module that file declares. A `#[path]` file's own submodules are
+resolved beside that path, the way rustc does: the file stem is not
+inserted (`mod helper;` in `benchmarks/r.rs` is `benchmarks/helper.rs`,
+not `benchmarks/r/helper.rs`), and a symlink is not retargeted (children
+stay beside `alias.rs`, not beside the file it points at). The path may
+be a raw string (`r"..."`, `r#"..."#`), may contain comments, and may
+come from `#[cfg_attr(PRED, path = "...")]` when PRED is on in a
+non-test build (`not(test)`, `all()`). `#[cfg_attr(test, ...)]` and
+`#[cfg_attr(any(), ...)]` are not applied. The `path` meta may follow
+other metas (`allow`, `doc = "]"`) and may be nested
+(`cfg_attr(not(test), cfg_attr(all(), path = "..."))`). A `cfg_attr`
+path whose predicate is unknown (`unix`, `feature = "x"`) is reported;
+a path that is known is still loaded beside it. A `path` value that is
+not a string literal is reported and not followed. A cooked string
+decodes `\\n` `\\r` `\\t` `\\\\` `\\"` `\\'` `\\0`, an escaped newline,
+`\\xHH` and `\\u{...}`; a raw string does not, and an unknown or truncated
+escape is reported and not followed. A `#[path]` file the walk already
+loaded is resolved again once that declaration is seen, so a file that
+sorts first is not left on the stem path. A nested file named `lib.rs`
+or `main.rs` inserts the stem (`benchmarks/main.rs` →
+`benchmarks/main/helper.rs`); only `src/lib.rs`, `src/main.rs`, a
+top-level `lib.rs` or `main.rs`, and `src/bin/*.rs` are crate roots
+(no stem). A target that
+leaves the workspace (an absolute path, a `realpath` that leaves the
+tree, including `..` after a directory symlink, or a symlink to an
+outside file) is reported and not opened. The walk does not open those
+paths either, nor a non-regular file (a fifo would block in `read`). A
+production `include!` is unsupported and reported: generated code such
+as `include!(concat!(env!("OUT_DIR"), ...))` is not scanned (nothing in
+the tree uses `include!` today).
 Pathname opens inside foreign libraries (libgit2 `Repository::open`,
 libarchive `archive_read_open_filename`, lopdf `Document::load`) are
 operations of their own.
@@ -53,7 +94,8 @@ operations of their own.
 Known limits: a renamed crate root (`use std as s`), a glob import of a local
 module that re-exports an fs function, a `pub use .. as` re-export called
 through its new path, openers of other crates (`nix`) and foreign openers not
-listed above, method and cross-crate calls in the helper walk.
+listed above, method and cross-crate calls in the helper walk, and the body
+of a production `include!` (the `include!` itself is reported).
 
 Usage:
   test-internal-read-inventory.py            check the workspace (exit 0/1)
@@ -80,6 +122,8 @@ import hashlib
 import json
 import os
 import re
+import signal
+import stat
 import sys
 import tempfile
 
@@ -862,11 +906,72 @@ def fingerprint(stmt):
     return hashlib.sha256(stmt.encode()).hexdigest()[:16]
 
 
+def skipped_module_dir(rel):
+    """A `tests` / `benches` / `examples` path component. The directory walk
+    does not enter those directories (integration tests, benches, examples).
+    A production `mod` whose file is there is still loaded (#197)."""
+    return any(p in ("tests", "benches", "examples") for p in rel.split("/"))
+
+
+def in_workspace(rel):
+    """`rel` stays inside the tree after `#[path]` normalization."""
+    return rel not in ("", ".") and not rel.startswith("/") and ".." not in rel.split("/")
+
+
+def _realpath_inside(root, full):
+    """`('in', real)` when `realpath(full)` stays inside `root`, else
+    `('out', None)`. `OSError` (a symlink loop the call cannot finish) is
+    outside: the file is not opened."""
+    try:
+        real_root = os.path.realpath(root)
+        real = os.path.realpath(full)
+    except OSError:
+        return ("out", None)
+    if real == real_root or real.startswith(real_root + os.sep):
+        return ("in", real)
+    return ("out", None)
+
+
+def source_kind(root, full):
+    """What opening `full` would do, without opening it.
+    `'file'` a regular file whose real path stays inside `root`;
+    `'outside'` the real path leaves the workspace (or realpath failed);
+    `'missing'` nothing is there;
+    `'notfile'` a fifo, directory, device or symlink loop inside the tree
+    (opening a fifo blocks)."""
+    where, real = _realpath_inside(root, full)
+    if where != "in":
+        return "outside"
+    try:
+        mode = os.stat(real).st_mode
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "notfile"
+    if not stat.S_ISREG(mode):
+        return "notfile"
+    return "file"
+
+
+def relative_real(root, full):
+    """Workspace-relative path of `full` after `realpath`, or None when
+    that path would leave the workspace or is not a regular file."""
+    if source_kind(root, full) != "file":
+        return None
+    where, real = _realpath_inside(root, full)
+    if where != "in":
+        return None
+    loc = os.path.relpath(real, os.path.realpath(root)).replace(os.sep, "/")
+    return loc if in_workspace(loc) else None
+
+
 def is_test_path(rel):
+    """Skipped by the directory walk. Reasons are in the module docstring.
+    A production `mod` that names a file here is loaded by `scan`."""
     parts = rel.split("/")
     if parts[0] in ("target", "vendor", "test-harness", "clients", "benchmarks"):
         return True
-    if any(p in ("tests", "benches", "examples") for p in parts):
+    if skipped_module_dir(rel):
         return True
     return parts[-1] == "build.rs"
 
@@ -880,35 +985,481 @@ def rust_files(root):
         for f in sorted(filenames):
             if f.endswith(".rs"):
                 rel = (rel_dir + "/" + f).lstrip("/")
-                if not is_test_path(rel):
+                # A symlink out of the tree, or a fifo, is not opened here.
+                # A production `mod` that names it is reported below.
+                if not is_test_path(rel) and source_kind(root, os.path.join(root, rel)) == "file":
                     out.append(rel)
     return out
 
 
-def module_file(rel, name, root, chain=()):
+def same_open(root, a, b):
+    """True when `open(a)` and `open(b)` would read the same file inside `root`."""
+    wa, ra = _realpath_inside(root, a)
+    wb, rb = _realpath_inside(root, b)
+    return wa == "in" and wb == "in" and ra == rb
+
+
+def module_rel(root, rel):
+    """Workspace-relative key for a module path. Collapse `.` / `..` only
+    when that names the same file `open` would (`c/src/../../benchmarks/r.rs`
+    becomes `benchmarks/r.rs`). `link/../x.rs` through a directory symlink
+    stays `link/../x.rs`, because lexical `normpath` would name a different
+    file."""
+    rel = rel.replace(os.sep, "/")
+    norm = os.path.normpath(rel).replace(os.sep, "/")
+    full = rel if os.path.isabs(rel) else os.path.join(root, rel)
+    norm_full = norm if os.path.isabs(norm) else os.path.join(root, norm)
+    if in_workspace(norm) and same_open(root, full, norm_full):
+        return norm
+    return rel
+
+
+def skip_noise(s, i):
+    """Index after whitespace and comments (comments nest, as in `mask`)."""
+    n = len(s)
+    while i < n:
+        if s[i].isspace():
+            i += 1
+        elif s.startswith("//", i):
+            nl = s.find("\n", i)
+            i = n if nl < 0 else nl + 1
+        elif s.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if s.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif s.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            i = j
+        else:
+            break
+    return i
+
+
+def string_literal_at(s, i):
+    """`(value, end)` of a Rust string literal at `i` (`"..."`, `r"..."`,
+    `r#"..."#`), or None. Byte strings are not path values."""
+    if i >= len(s) or s[i] == "b":
+        return None
+    hashes = 0
+    if s[i] == "r":
+        j = i + 1
+        while j < len(s) and s[j] == "#":
+            hashes += 1
+            j += 1
+        if j >= len(s) or s[j] != '"':
+            return None
+        start = j + 1
+        close = '"' + ("#" * hashes)
+        end = s.find(close, start)
+        if end < 0:
+            return None
+        return s[start:end], end + len(close)
+    if s[i] != '"':
+        return None
+    # Cooked escapes. `\u` / `\x` are not the characters `u` / `x`: rustc
+    # decodes them, and a file at the undecoded spelling must not count as
+    # the module. An unknown or truncated escape is `("bad", end)` so the
+    # declaration does not fall through to a different file. The end index
+    # is still past the closing quote (`_skip_lit_or_comment` uses it).
+    simple = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"', "'": "'", "0": "\0"}
+    hexdigits = "0123456789abcdefABCDEF"
+    j, out, bad = i + 1, [], False
+    while j < len(s):
+        if s[j] == "\\":
+            if j + 1 >= len(s):
+                return None
+            esc = s[j + 1]
+            if esc in simple:
+                out.append(simple[esc])
+                j += 2
+                continue
+            if esc in "\n\r":
+                # `\` + newline drops that newline and the next line's leading
+                # spaces and tabs (`"bench\\\n    marks"` is `benchmarks`).
+                j += 2
+                if esc == "\r" and j < len(s) and s[j] == "\n":
+                    j += 1
+                while j < len(s) and s[j] in " \t":
+                    j += 1
+                continue
+            if esc == "x" and j + 3 < len(s) and s[j + 2] in hexdigits and s[j + 3] in hexdigits:
+                out.append(chr(int(s[j + 2:j + 4], 16)))
+                j += 4
+                continue
+            if esc == "u" and j + 2 < len(s) and s[j + 2] == "{":
+                k, hexes = j + 3, []
+                while k < len(s) and len(hexes) < 6 and s[k] in hexdigits:
+                    hexes.append(s[k])
+                    k += 1
+                if hexes and k < len(s) and s[k] == "}" and int("".join(hexes), 16) <= 0x10FFFF:
+                    out.append(chr(int("".join(hexes), 16)))
+                    j = k + 1
+                    continue
+            bad = True
+            j += 2
+            continue
+        if s[j] == '"':
+            if bad:
+                return ("bad", j + 1)
+            return "".join(out), j + 1
+        out.append(s[j])
+        j += 1
+    return None
+
+
+def _skip_lit_or_comment(s, i):
+    """Index after a comment or string starting at `i`, else None."""
+    if s.startswith("//", i) or s.startswith("/*", i):
+        nxt = skip_noise(s, i)
+        return nxt if nxt != i else None
+    if i < len(s) and s[i] == "b" and i + 1 < len(s) and s[i + 1] in "r\"":
+        # A byte string is not a path, but it must not end the attribute.
+        lit = string_literal_at(s, i + 1) if s[i + 1] == "r" else None
+        if s[i + 1] == '"':
+            j = i + 2
+            while j < len(s) and s[j] != '"':
+                j += 2 if s[j] == "\\" else 1
+            return j + 1 if j < len(s) else None
+        if lit:
+            return lit[1]
+        return None
+    if i < len(s) and s[i] in "r\"":
+        lit = string_literal_at(s, i)
+        if lit:
+            return lit[1]
+    return None
+
+
+def match_bracket(s, open_at):
+    """Index of the `]` matching `s[open_at] == '['`, skipping comments and
+    strings, or None."""
+    if open_at >= len(s) or s[open_at] != "[":
+        return None
+    j, depth = open_at + 1, 1
+    while j < len(s) and depth:
+        nxt = _skip_lit_or_comment(s, j)
+        if nxt is not None:
+            j = nxt
+            continue
+        if s[j] == "[":
+            depth += 1
+        elif s[j] == "]":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return None
+
+
+def attr_bodies(raw):
+    """Bodies of the `#[...]` attributes in `raw` (no surrounding brackets)."""
+    bodies, i = [], 0
+    while i < len(raw):
+        i = skip_noise(raw, i)
+        if not raw.startswith("#[", i):
+            break
+        close = match_bracket(raw, i + 1)
+        if close is None:
+            break
+        bodies.append(raw[i + 2:close])
+        i = close + 1
+    return bodies
+
+
+def path_eq_literal(s, i):
+    """`(value, end)` of `path = "..."`, or `("bad", end)` when `path =` is
+    followed by something that is not a string literal, or None."""
+    i = skip_noise(s, i)
+    if not s.startswith("path", i):
+        return None
+    if i + 4 < len(s) and (s[i + 4].isalnum() or s[i + 4] == "_"):
+        return None
+    i = skip_noise(s, i + 4)
+    if i >= len(s) or s[i] != "=":
+        return None
+    i = skip_noise(s, i + 1)
+    lit = string_literal_at(s, i)
+    if lit:
+        return lit
+    if i < len(s) and not s[i].isspace() and s[i] != "]":
+        return ("bad", i)
+    return None
+
+
+def _split_top_comma(s):
+    """Split `s` on the first comma at parenthesis depth 0."""
+    j, depth = 0, 0
+    while j < len(s):
+        nxt = _skip_lit_or_comment(s, j)
+        if nxt is not None:
+            j = nxt
+            continue
+        if s[j] == "(":
+            depth += 1
+        elif s[j] == ")":
+            depth -= 1
+        elif s[j] == "," and depth == 0:
+            return s[:j], s[j + 1:]
+        j += 1
+    return s, ""
+
+
+def _split_top_items(s):
+    """Split `s` on commas at parenthesis and bracket depth 0.
+    Strings and comments are skipped, so `doc = "]"` stays one item."""
+    items, j, depth, start = [], 0, 0, 0
+    while j < len(s):
+        nxt = _skip_lit_or_comment(s, j)
+        if nxt is not None:
+            j = nxt
+            continue
+        if s[j] in "([":
+            depth += 1
+        elif s[j] in ")]":
+            if depth:
+                depth -= 1
+        elif s[j] == "," and depth == 0:
+            items.append(s[start:j])
+            start = j + 1
+        j += 1
+    items.append(s[start:])
+    return items
+
+
+def _cfg_attr_inner(s, i):
+    """`(args, end)` when `s[i]` is `cfg_attr(...)`, else None.
+    `end` is the index after the closing parenthesis."""
+    i = skip_noise(s, i)
+    if not s.startswith("cfg_attr", i):
+        return None
+    after = i + len("cfg_attr")
+    if after < len(s) and (s[after].isalnum() or s[after] == "_"):
+        return None
+    after = skip_noise(s, after)
+    if after >= len(s) or s[after] != "(":
+        return None
+    depth, j = 0, after
+    while j < len(s):
+        nxt = _skip_lit_or_comment(s, j)
+        if nxt is not None:
+            j = nxt
+            continue
+        if s[j] == "(":
+            depth += 1
+        elif s[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return s[after + 1:j], j + 1
+        j += 1
+    return None
+
+
+def cfg_production(pred):
+    """Whether `pred` is enabled when `test` is off. True (`not(test)`,
+    `all()`), False (`test`, `any()`, `feature = "test-hooks"`), or None
+    when an atom is unknown (`unix`, `feature = "x"`)."""
+    s, i = pred, [0]
+
+    def skip():
+        i[0] = skip_noise(s, i[0])
+
+    def parse():
+        skip()
+        start = i[0]
+        if start >= len(s) or not (s[start].isalpha() or s[start] == "_"):
+            return None
+        while i[0] < len(s) and (s[i[0]].isalnum() or s[i[0]] == "_"):
+            i[0] += 1
+        name = s[start:i[0]]
+        skip()
+        if i[0] < len(s) and s[i[0]] == "(" and name in ("all", "any", "not"):
+            i[0] += 1
+            args = []
+            while True:
+                skip()
+                if i[0] < len(s) and s[i[0]] == ")":
+                    i[0] += 1
+                    break
+                args.append(parse())
+                skip()
+                if i[0] < len(s) and s[i[0]] == ",":
+                    i[0] += 1
+                    continue
+                if i[0] >= len(s) or s[i[0]] == ")":
+                    if i[0] < len(s) and s[i[0]] == ")":
+                        i[0] += 1
+                    break
+            if name == "not":
+                v = args[0] if args else None
+                return None if v is None else (not v)
+            if name == "all":
+                if any(a is False for a in args):
+                    return False
+                if any(a is None for a in args):
+                    return None
+                return True
+            if any(a is True for a in args):
+                return True
+            if any(a is None for a in args):
+                return None
+            return False
+        if i[0] < len(s) and s[i[0]] == "=":
+            i[0] += 1
+            skip()
+            lit = string_literal_at(s, i[0])
+            if not lit:
+                return None
+            i[0] = lit[1]
+            if name == "feature" and lit[0] == "test-hooks":
+                return False
+            return None
+        if name == "test":
+            return False
+        return None
+
+    try:
+        return parse()
+    except IndexError:
+        return None
+
+
+def _metas_set_path(meta):
+    """True when some top-level meta is `path = ...` or a nested `cfg_attr`
+    that itself sets a path. The predicate is not consulted: an unknown
+    outer predicate cannot tell which branch rustc would keep."""
+    for item in _split_top_items(meta):
+        if path_eq_literal(item, 0):
+            return True
+        inner = _cfg_attr_inner(item, 0)
+        if inner and _metas_set_path(_split_top_comma(inner[0])[1]):
+            return True
+    return False
+
+
+def _take_enabled_metas(meta, state):
+    """Record `path` metas in `meta`. The predicate is already production-true.
+    A meta that is not `path` (`allow`, `doc`) is ignored. A nested
+    `cfg_attr` is unfolded. The first `path` wins, as rustc does."""
+    for item in _split_top_items(meta):
+        got = path_eq_literal(item, 0)
+        if got:
+            if got[0] == "bad":
+                state["bad"] = True
+            elif state["path"] is None:
+                state["path"] = got[0]
+            continue
+        inner = _cfg_attr_inner(item, 0)
+        if not inner:
+            continue
+        pred, rest = _split_top_comma(inner[0])
+        enabled = cfg_production(pred)
+        if enabled is None:
+            if _metas_set_path(rest):
+                state["unknown"] = True
+            continue
+        if enabled is True:
+            _take_enabled_metas(rest, state)
+
+
+def production_path_attr(raw_attrs):
+    """`(path or None, unknown, bad)` for attributes before one `mod`.
+    `path` is a direct `#[path]` or a `cfg_attr` whose predicate is on in a
+    non-test build (`not(test)`, `all()`), including when `path` follows
+    another meta or sits inside a nested `cfg_attr`. `unknown` is a
+    `cfg_attr` path whose predicate is not known (`unix`, `feature = "x"`):
+    the caller still loads `path` when there is one, and reports `unknown`
+    so the other file is not silently skipped. `bad` means `path =` is not
+    a string literal (or the string's escapes do not decode).
+    `cfg_attr(test)` and `cfg_attr(any())` do not apply."""
+    direct = None
+    state = {"path": None, "unknown": False, "bad": False}
+    for body in attr_bodies(raw_attrs):
+        lit = path_eq_literal(body, 0)
+        if lit:
+            if lit[0] == "bad":
+                state["bad"] = True
+            elif direct is None:
+                direct = lit[0]
+            continue
+        inner = _cfg_attr_inner(body, 0)
+        if not inner:
+            continue
+        pred, rest = _split_top_comma(inner[0])
+        enabled = cfg_production(pred)
+        if enabled is None:
+            if _metas_set_path(rest):
+                state["unknown"] = True
+            continue
+        if enabled is True:
+            _take_enabled_metas(rest, state)
+    path = direct if direct is not None else state["path"]
+    return (path, state["unknown"], state["bad"] and path is None)
+
+
+def crate_root_file(rel):
+    """A Cargo crate root. Its modules sit beside the file, not under the
+    stem: `src/lib.rs`, `src/main.rs`, a top-level `lib.rs` or `main.rs`,
+    and every `src/bin/*.rs`. A nested `lib.rs` or `main.rs` is an ordinary
+    file (`benchmarks/main.rs` → `benchmarks/main/helper.rs`)."""
+    parts = rel.split("/")
+    base = parts[-1]
+    parent = parts[-2] if len(parts) >= 2 else ""
+    if base in ("lib.rs", "main.rs") and parent in ("", "src"):
+        return True
+    return parent == "bin" and len(parts) >= 3 and parts[-3] == "src" and base.endswith(".rs")
+
+
+def module_inserts_stem(rel, flat):
+    """rustc inserts the file stem for an ordinary module file. A `#[path]`
+    file (`flat`), `mod.rs`, and a crate root do not."""
+    if flat or os.path.basename(rel) == "mod.rs" or crate_root_file(rel):
+        return False
+    return True
+
+
+def module_file(rel, name, root, chain=(), flat=False):
     """File of `mod name;` in `rel`, inside the inline modules `chain`
-    (`mod outer { mod name; }` is `outer/name.rs`, R11-S7-FIX16)."""
+    (`mod outer { mod name; }` is `outer/name.rs`, R11-S7-FIX16).
+    `flat` is a file loaded by `#[path]`: rustc looks beside that path
+    and does not insert the file stem (`r.rs` → `helper.rs`, not
+    `r/helper.rs`). An ordinary `name.rs` module still uses the stem."""
     d = os.path.dirname(rel)
     base = os.path.basename(rel)
-    if base not in ("lib.rs", "main.rs", "mod.rs"):
+    if module_inserts_stem(rel, flat):
         d = os.path.join(d, base[:-3])
-    d = os.path.join(d, *chain)
+    if chain:
+        d = os.path.join(d, *chain)
     for cand in (os.path.join(d, name + ".rs"), os.path.join(d, name, "mod.rs")):
-        if os.path.exists(os.path.join(root, cand)):
-            return os.path.normpath(cand).replace(os.sep, "/")
+        full = cand if os.path.isabs(cand) else os.path.join(root, cand)
+        if os.path.lexists(full):
+            return module_rel(root, cand.replace(os.sep, "/"))
     return None
 
 
 def mod_decls(text, raw):
     """[(offset, name, chain)] for every `mod name;` declaration; `name` is
-    `("path", file)` when a `#[path = ".."]` attribute names its file, and
-    `chain` the names of the inline modules around it, outermost first."""
+    `("path", file)` when a production `#[path]` / `#[cfg_attr(..., path)]`
+    names its file, `("unknown", None)` or `("bad", None)` when that
+    attribute cannot be followed, and `chain` the names of the inline
+    modules around it, outermost first."""
     out = []
     inl = inline_mods(text)
     for m in re.finditer(r"(?:^|\n|;|\}|\{)\s*((?:#\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", text):
-        pm = re.search(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]', raw[m.start(1):m.end(1)])
+        path, unknown, bad = production_path_attr(raw[m.start(1):m.end(1)])
         chain = tuple(n for n, a, b in sorted(inl, key=lambda x: x[1]) if a < m.start(2) <= b)
-        out.append((m.start(2), ("path", pm.group(1)) if pm else m.group(2), chain))
+        if path is not None:
+            out.append((m.start(2), ("path", path), chain))
+        elif bad:
+            out.append((m.start(2), ("bad", None), chain))
+        elif not unknown:
+            out.append((m.start(2), m.group(2), chain))
+        # An unknown `cfg_attr` path is its own declaration even when another
+        # path was loaded: that other file is not a reason to skip it.
+        if unknown:
+            out.append((m.start(2), ("unknown", None), chain))
     return out
 
 
@@ -919,27 +1470,74 @@ def scan(root, problems=None):
     problems = [] if problems is None else problems
     files = rust_files(root)
     texts, raws, ctexts, lits, test_files, generic_errs = {}, {}, {}, {}, set(), {}
-    for rel in files:
+
+    def load_source(rel):
         with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
             raws[rel] = fh.read()
-            texts[rel], generic_errs[rel] = blank_generics(mask(raws[rel]))
-            ctexts[rel] = mask(raws[rel], strings=False)
-            lits[rel] = mask(raws[rel], lit_fill="\0")
+        texts[rel], generic_errs[rel] = blank_generics(mask(raws[rel]))
+        ctexts[rel] = mask(raws[rel], strings=False)
+        lits[rel] = mask(raws[rel], lit_fill="\0")
+
+    for rel in files:
+        load_source(rel)
     # Files that are test-only modules (and everything below them). A file
     # that a production `mod` declaration also names is production code
     # (`#[cfg(test)] #[path = "util.rs"] mod t; mod util;`, R11-S7-FIX15).
     # Declarations inside inline modules resolve below them (`mod outer {
     # pub mod util; }` is `outer/util.rs`), and a production declaration
-    # that resolves to no file fails closed (R11-S7-FIX16).
-    def mod_target(rel, name, chain):
+    # that resolves to no file fails closed (R11-S7-FIX16). Any production
+    # target that exists inside the workspace is loaded here, including
+    # one the walk skipped (`tests` / `benchmarks` / `build.rs` / ...):
+    # the walk drops those paths before declarations are resolved, so
+    # `#[path = "tests/reader.rs"]` or `#[path = "../../benchmarks/r.rs"]`
+    # would otherwise drop out (#197). A target outside the workspace is
+    # not opened; the loop below reports it. `flat_files` are modules
+    # loaded by `#[path]`: their children are resolved beside that path
+    # (no file stem, and not from the symlink target's directory).
+    flat_files = set()
+
+    def mod_resolution(rel, name, chain):
+        """`(kind, loc)` for one declaration. `kind` is `file` / `outside` /
+        `missing` / `notfile` / `unknown` / `badpath`. `loc` for `file` is
+        the path rustc uses for the module (the `#[path]` location, not the
+        file a symlink points at), collapsed with `normpath` only when that
+        is the same file `open` would read. Other kinds carry a path to
+        print. The file is not opened."""
         if isinstance(name, tuple):
+            if name[0] == "unknown":
+                return ("unknown", "")
+            if name[0] == "bad":
+                return ("badpath", "")
             d = os.path.dirname(rel)
             if chain:
-                if os.path.basename(rel) not in ("lib.rs", "main.rs", "mod.rs"):
+                if module_inserts_stem(rel, rel in flat_files):
                     d = os.path.join(d, os.path.basename(rel)[:-3])
                 d = os.path.join(d, *chain)
-            return os.path.normpath(os.path.join(d, name[1])).replace(os.sep, "/")
-        return module_file(rel, name, root, chain)
+            attr = name[1]
+            if os.path.isabs(attr):
+                full, display = attr, attr.replace(os.sep, "/")
+            else:
+                joined = os.path.join(d, attr)
+                full, display = os.path.join(root, joined), joined.replace(os.sep, "/")
+            kind = source_kind(root, full)
+            if kind == "file":
+                if os.path.isabs(attr):
+                    logical = os.path.relpath(attr, os.path.realpath(root)).replace(os.sep, "/")
+                    if in_workspace(logical) and same_open(root, full, os.path.join(root, logical)):
+                        return ("file", module_rel(root, logical))
+                    loc = relative_real(root, full)
+                    return ("file", loc) if loc else ("outside", display)
+                return ("file", module_rel(root, display))
+            if kind == "missing":
+                return ("missing", attr)
+            return (kind, display)
+        mf = module_file(rel, name, root, chain, flat=rel in flat_files)
+        if not mf:
+            return ("missing", name)
+        kind = source_kind(root, os.path.join(root, mf))
+        if kind == "file":
+            return ("file", mf)
+        return (kind, mf)
     spans_of = {rel: test_spans(texts[rel], raws[rel])[0] for rel in files}
     decls = {rel: mod_decls(texts[rel], raws[rel]) for rel in files}
     changed = True
@@ -950,24 +1548,64 @@ def scan(root, problems=None):
             if rel in test_files:
                 continue
             for at, name, chain in decls[rel]:
-                if not any(a <= at <= b for a, b in spans_of[rel]):
-                    prod.add(mod_target(rel, name, chain))
+                if any(a <= at <= b for a, b in spans_of[rel]):
+                    continue
+                kind, loc = mod_resolution(rel, name, chain)
+                # Record the #[path] file before its own `mod` lines are
+                # resolved: rustc looks beside that path, not under its stem.
+                # A file the walk already parsed (it sorts before the file
+                # that declares it) was resolved with a stem. Marking it
+                # flat has to run another pass or that resolution sticks
+                # and the real file is never loaded.
+                if isinstance(name, tuple) and name[0] == "path" and kind == "file":
+                    if loc not in flat_files:
+                        flat_files.add(loc)
+                        if loc in texts:
+                            changed = True
+                if kind != "file":
+                    continue
+                prod.add(loc)
+                # The walk may never have opened this file. It is production
+                # code because this declaration is, so load it wherever it
+                # sits and keep resolving (a `mod` inside it may name another
+                # skipped file). `mod_resolution` has already refused anything
+                # that is not a regular file inside the workspace.
+                if loc not in texts:
+                    load_source(loc)
+                    spans_of[loc] = test_spans(texts[loc], raws[loc])[0]
+                    decls[loc] = mod_decls(texts[loc], raws[loc])
+                    files.append(loc)
+                    changed = True
         for rel in files:
             for at, name, chain in decls[rel]:
                 if rel in test_files or any(a <= at <= b for a, b in spans_of[rel]):
-                    mf = mod_target(rel, name, chain)
-                    if mf and mf not in test_files and mf not in prod:
-                        test_files.add(mf)
+                    kind, loc = mod_resolution(rel, name, chain)
+                    if kind == "file" and loc not in test_files and loc not in prod:
+                        test_files.add(loc)
                         changed = True
     for rel in files:
         if rel in test_files:
             continue
         for at, name, chain in decls[rel]:
-            mf = mod_target(rel, name, chain)
-            if not any(a <= at <= b for a, b in spans_of[rel]) and (mf is None or not os.path.isfile(os.path.join(root, mf))):
+            if any(a <= at <= b for a, b in spans_of[rel]):
+                continue
+            kind, loc = mod_resolution(rel, name, chain)
+            line = texts[rel].count("\n", 0, at) + 1
+            if kind == "outside":
+                problems.append("production module target is outside the workspace (`%s`; not opened): %s:%d"
+                                % (loc, rel, line))
+            elif kind == "notfile":
+                problems.append("production module target is not a regular file (`%s`; not opened): %s:%d"
+                                % (loc, rel, line))
+            elif kind == "missing":
                 problems.append("unresolved production module (no file for `mod %s;`; the scanner cannot tell "
-                                "which file it names): %s:%d"
-                                % (name[1] if isinstance(name, tuple) else name, rel, texts[rel].count("\n", 0, at) + 1))
+                                "which file it names): %s:%d" % (loc, rel, line))
+            elif kind == "unknown":
+                problems.append("unsupported cfg_attr path (the predicate is not known for a production "
+                                "build; the target is not scanned): %s:%d" % (rel, line))
+            elif kind == "badpath":
+                problems.append("unsupported path attribute (not a string literal; the target is not "
+                                "scanned): %s:%d" % (rel, line))
     factories = {}
     for rel in files:
         if rel not in test_files:
@@ -992,6 +1630,17 @@ def scan(root, problems=None):
             if not any(a <= at <= b for a, b in spans):
                 problems.append("unsupported generic arguments (unbalanced ::<..>): %s:%d"
                                 % (rel, text.count("\n", 0, at) + 1))
+        # Generated code pulled in by include! is invisible. Report the
+        # macro; do not try to find its file (OUT_DIR does not exist here).
+        # Search the comment-stripped source, not `text`: `blank_generics`
+        # erases `foo::<include!(...)>`. `!` alone is not the macro
+        # (`include != 0`). A delimiter is.
+        masked = mask(raws[rel])
+        for m in re.finditer(r"(?<![\w])include\s*!\s*[({[]", masked):
+            if not any(a <= m.start() <= b for a, b in spans):
+                problems.append("unsupported include! (generated code such as "
+                                "include!(concat!(env!(\"OUT_DIR\"), ...)) is not scanned): %s:%d"
+                                % (rel, text.count("\n", 0, m.start()) + 1))
         fns = [f for f in fn_spans(text) if not any(a <= f[0] <= b for a, b in spans)]
         for a, b, name in fns:
             fn_index.setdefault(crate_of(rel), {}).setdefault(name.split("::")[-1], []).append((rel, name))
@@ -2185,6 +2834,526 @@ def regression_inventory_modules_inside_inline_modules_resolve_below_them():
     root = fake({"c/src/lib.rs": "mod outer {\n    pub mod util;\n}\n" + alias, "c/src/util.rs": read})
     errs = check(root, classify(root, {}))
     expect(any("unresolved production module (no file for `mod util;`" in e for e in errs), errs)
+
+
+def regression_inventory_production_module_under_skipped_dir_is_scanned():
+    """Regression (#197): the walk skipped `tests` / `benches` / `examples`,
+    and also top-level `target` / `vendor` / `test-harness` / `clients` /
+    `benchmarks` and every `build.rs`, before resolving module targets. A
+    production `#[path = "tests/reader.rs"]`, `#[path = "../../benchmarks/r.rs"]`
+    or `#[path = "../build.rs"]` that contains `std::fs::read` dropped out
+    (zero operations, an empty manifest passed). The resolved file is
+    scanned wherever it lives. A `#[path]` file's submodule is the sibling
+    rustc compiles (`vendor/helper.rs`), not the stem file
+    (`vendor/r/helper.rs`); a symlink keeps that directory. Raw-string,
+    comment and `#[cfg_attr(not(test), path)]` attributes name the file,
+    including when `path` follows another meta or is nested in `cfg_attr`.
+    Cooked `\\u{...}` / `\\xHH` escapes are decoded; a raw string is not.
+    A `#[path]` file the walk already loaded is resolved again once it is
+    known to be flat. A nested `main.rs` or `lib.rs` inserts the stem.
+    A target outside the workspace is reported and not opened. A test-only
+    declaration, a file nobody declares, and a test-only child stay out;
+    a missing in-workspace file still fails closed. A production `include!`
+    is reported and its target is not scanned."""
+    read = "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n"
+    hidden = ("#[cfg(test)]\nmod tests {\n    fn t(p: &Path) { let _ = std::fs::read(p); }\n}\n")
+    for dirname in ("tests", "benches", "examples"):
+        rel = "c/src/%s/reader.rs" % dirname
+        root = fake({
+            "c/src/lib.rs": '#[path = "%s/reader.rs"]\nmod reader;\n' % dirname,
+            rel: read + hidden,
+        })
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"], o["op"]) for o in ops] == [(rel, "load", "fs::read")],
+               (dirname, ops, problems))
+        expect(problems == [], (dirname, problems))
+        expect(check(root, {"baseline": BASELINE, "entries": []}) != [], dirname)
+    # `mod.rs` keeps its directory. A sibling of the parent is not that module.
+    root = fake({
+        "c/src/lib.rs": '#[path = "tests/reader/mod.rs"]\nmod reader;\n',
+        "c/src/tests/reader/mod.rs": "mod helper;\n" + hidden,
+        "c/src/tests/reader/helper.rs": read,
+        "c/src/tests/helper.rs": "pub fn decoy(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect([(o["file"], o["function"]) for o in ops] == [("c/src/tests/reader/helper.rs", "load")],
+           (ops, problems))
+    expect(problems == [], problems)
+    expect(check(root, {"entries": []}) != [], ops)
+    # A `#[path]` file that is not `mod.rs`: rustc looks beside it, not under
+    # its stem. The stem file is a decoy with its own read.
+    root = fake({
+        "c/src/lib.rs": '#[path = "tests/reader.rs"]\nmod reader;\n',
+        "c/src/tests/reader.rs": "mod helper;\n" + read,
+        "c/src/tests/helper.rs": "pub fn nest(p: &Path) { let _ = std::fs::read(p); }\n",
+        "c/src/tests/reader/helper.rs": "pub fn decoy(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect([(o["file"], o["function"]) for o in ops]
+           == [("c/src/tests/reader.rs", "load"), ("c/src/tests/helper.rs", "nest")],
+           (ops, problems))
+    expect(problems == [], problems)
+    # `#[path]` inside an inline module, and a path that leaves `src/`.
+    for files, util in (
+            ({"c/src/lib.rs": 'mod outer {\n    #[path = "tests/reader.rs"]\n    pub mod reader;\n}\n',
+              "c/src/outer/tests/reader.rs": read}, "c/src/outer/tests/reader.rs"),
+            ({"c/src/lib.rs": '#[path = "../benches/reader.rs"]\nmod reader;\n',
+              "c/benches/reader.rs": read}, "c/benches/reader.rs"),
+            ({"c/src/lib.rs": ('#[cfg(test)]\n#[path = "examples/reader.rs"]\nmod test_reader;\n'
+                               '#[path = "examples/reader.rs"]\nmod reader;\n'),
+              "c/src/examples/reader.rs": read}, "c/src/examples/reader.rs")):
+        root = fake(files)
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"]) for o in ops] == [(util, "load")], (files, ops, problems))
+        expect(problems == [], (files, problems))
+        expect(check(root, {"entries": []}) != [], files)
+    # A test-only child file under the skipped directory is not scanned.
+    root = fake({
+        "c/src/lib.rs": '#[path = "tests/reader.rs"]\nmod reader;\n',
+        "c/src/tests/reader.rs": "#[cfg(test)]\nmod helper;\n" + read,
+        "c/src/tests/reader/helper.rs": "pub fn extra(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    ops, _, _ = scan(root)
+    expect([(o["file"], o["function"]) for o in ops] == [("c/src/tests/reader.rs", "load")], ops)
+    # Controls: test-only `#[path]`, an undeclared file, a missing file.
+    root = fake({"c/src/lib.rs": '#[cfg(test)]\n#[path = "tests/reader.rs"]\nmod reader;\n',
+                 "c/src/tests/reader.rs": read})
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect(ops == [] and problems == [], (ops, problems))
+    expect(check(root, {"entries": []}) == [], check(root, {"entries": []}))
+    root = fake({"c/src/lib.rs": "fn a() {}\n", "c/src/tests/reader.rs": read,
+                 "c/benches/other.rs": read, "c/examples/other.rs": read})
+    expect(scan(root)[0] == [], scan(root)[0])
+    root = fake({"c/src/lib.rs": '#[path = "tests/missing.rs"]\nmod reader;\n'})
+    errs = check(root, {"entries": []})
+    expect(any("unresolved production module (no file for `mod tests/missing.rs;`" in e for e in errs), errs)
+    # The walk's other exclusions: a production #[path] into each of them is
+    # scanned. `../../X/r.rs` from `c/src/lib.rs` is `X/r.rs`; `../build.rs`
+    # is `c/build.rs`.
+    for rel, attr in (
+            ("benchmarks/r.rs", "../../benchmarks/r.rs"),
+            ("vendor/r.rs", "../../vendor/r.rs"),
+            ("target/r.rs", "../../target/r.rs"),
+            ("test-harness/r.rs", "../../test-harness/r.rs"),
+            ("clients/r.rs", "../../clients/r.rs"),
+            ("c/build.rs", "../build.rs")):
+        root = fake({"c/src/lib.rs": '#[path = "%s"]\nmod r;\n' % attr, rel: read + hidden})
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"], o["op"]) for o in ops] == [(rel, "load", "fs::read")],
+               (rel, ops, problems))
+        expect(problems == [], (rel, problems))
+        expect(check(root, {"baseline": BASELINE, "entries": []}) != [], rel)
+    # A module declared from the #[path] file (the walk never enters vendor/).
+    # The stem path `vendor/r/helper.rs` is what the old resolver loaded;
+    # rustc compiles the sibling.
+    root = fake({
+        "c/src/lib.rs": '#[path = "../../vendor/r.rs"]\nmod r;\n',
+        "vendor/r.rs": "mod helper;\n" + hidden,
+        "vendor/helper.rs": read,
+        "vendor/r/helper.rs": "pub fn decoy(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect([(o["file"], o["function"]) for o in ops] == [("vendor/helper.rs", "load")], (ops, problems))
+    expect(problems == [], problems)
+    expect(check(root, {"entries": []}) != [], ops)
+    # `build.rs` is not `mod.rs`, so its submodule is beside it (`c/helper.rs`),
+    # not `c/build/helper.rs`. The stem file is absent: the old resolver
+    # reports the module unresolved (the walk still sees `c/helper.rs`).
+    root = fake({
+        "c/src/lib.rs": '#[path = "../build.rs"]\nmod r;\n',
+        "c/build.rs": "mod helper;\n" + read,
+        "c/helper.rs": "pub fn nest(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect(sorted((o["file"], o["function"]) for o in ops)
+           == [("c/build.rs", "load"), ("c/helper.rs", "nest")], (ops, problems))
+    expect(problems == [], problems)
+    # A test-only child of a production build.rs is not scanned, even at the
+    # sibling path rustc would use.
+    root = fake({
+        "c/src/lib.rs": '#[path = "../build.rs"]\nmod r;\n',
+        "c/build.rs": "#[cfg(test)]\nmod helper;\n" + read,
+        "c/helper.rs": "pub fn extra(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    ops, _, _ = scan(root)
+    expect([(o["file"], o["function"]) for o in ops] == [("c/build.rs", "load")], ops)
+    # `#[path]` inside an inline module of a #[path] file stays beside that
+    # file (`benchmarks/mid/x.rs`), not under the stem.
+    root = fake({
+        "c/src/lib.rs": '#[path = "../../benchmarks/r.rs"]\nmod r;\n',
+        "benchmarks/r.rs": 'mod mid {\n    #[path = "x.rs"]\n    pub mod util;\n}\n',
+        "benchmarks/mid/x.rs": read,
+        "benchmarks/r/mid/x.rs": "pub fn decoy(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect([(o["file"], o["function"]) for o in ops] == [("benchmarks/mid/x.rs", "load")],
+           (ops, problems))
+    expect(problems == [], problems)
+    # Nobody declared these, so the walk's skip list still applies.
+    root = fake({"c/src/lib.rs": "fn a() {}\n", "c/build.rs": read, "benchmarks/r.rs": read,
+                 "vendor/r.rs": read, "target/r.rs": read, "clients/r.rs": read,
+                 "test-harness/r.rs": read})
+    expect(scan(root)[0] == [], scan(root)[0])
+    root = fake({"c/src/lib.rs": '#[cfg(test)]\n#[path = "../../benchmarks/r.rs"]\nmod r;\n',
+                 "benchmarks/r.rs": read})
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect(ops == [] and problems == [], (ops, problems))
+    expect(check(root, {"entries": []}) == [], check(root, {"entries": []}))
+    # Forms rustc accepts and the old `"..."` regex dropped, so a clean
+    # `c/src/r.rs` made the declaration a plain `mod r` and the benchmarks
+    # read disappeared. The decoy has no read; only the path file does.
+    decoy = "fn decoy() {}\n"
+    for lib in (
+            '#[path = r"../../benchmarks/r.rs"]\nmod r;\n',
+            '#[path = r#"../../benchmarks/r.rs"#]\nmod r;\n',
+            '#[path = r##"../../benchmarks/r.rs"##]\nmod r;\n',
+            '#[path = /* decoy */ "../../benchmarks/r.rs"]\nmod r;\n',
+            '#[path = /* ] */ "../../benchmarks/r.rs"]\nmod r;\n',
+            '#[path =\n    "../../benchmarks/r.rs"]\nmod r;\n',
+            '#[cfg_attr(not(test), path = "../../benchmarks/r.rs")]\nmod r;\n',
+            '#[cfg_attr(not(test), path = r"../../benchmarks/r.rs")]\nmod r;\n',
+            '#[cfg_attr(all(), path = "../../benchmarks/r.rs")]\nmod r;\n',
+            '#[cfg_attr(test, path = "nope.rs")]\n#[cfg_attr(not(test), path = "../../benchmarks/r.rs")]\nmod r;\n'):
+        root = fake({"c/src/lib.rs": lib, "c/src/r.rs": decoy, "benchmarks/r.rs": read})
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"]) for o in ops] == [("benchmarks/r.rs", "load")],
+               (lib, ops, problems))
+        expect(problems == [], (lib, problems))
+        expect(check(root, {"entries": []}) != [], lib)
+    # These predicates are off in a production build, so the implicit module
+    # is the one rustc compiles. The benchmarks file stays out.
+    for lib in (
+            '#[cfg_attr(test, path = "../../benchmarks/r.rs")]\nmod r;\n',
+            '#[cfg_attr(any(), path = "../../benchmarks/r.rs")]\nmod r;\n'):
+        root = fake({"c/src/lib.rs": lib, "c/src/r.rs": read,
+                     "benchmarks/r.rs": "pub fn hidden(p: &Path) { let _ = std::fs::read(p); }\n"})
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"]) for o in ops] == [("c/src/r.rs", "load")],
+               (lib, ops, problems))
+        expect(problems == [], (lib, problems))
+    # An unknown predicate (`unix`) might be on. Following either file would
+    # hide the other; report it and scan neither.
+    root = fake({"c/src/lib.rs": '#[cfg_attr(unix, path = "../../benchmarks/r.rs")]\nmod r;\n',
+                 "c/src/r.rs": decoy,
+                 "benchmarks/r.rs": read})
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect(ops == [], ops)
+    expect(any("unsupported cfg_attr path" in p for p in problems), problems)
+    expect(check(root, {"entries": []}) != [], check(root, {"entries": []}))
+    # A known path is still loaded when another cfg_attr path is unknown.
+    # The unknown file is not scanned; the check still fails.
+    root = fake({
+        "c/src/lib.rs": ('#[cfg_attr(windows, path = "../../benchmarks/evil.rs")]\n'
+                         '#[cfg_attr(not(test), path = "../../benchmarks/r.rs")]\nmod r;\n'),
+        "c/src/r.rs": decoy,
+        "benchmarks/r.rs": read,
+        "benchmarks/evil.rs": "pub fn hidden(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect([(o["file"], o["function"]) for o in ops] == [("benchmarks/r.rs", "load")], (ops, problems))
+    expect(any("unsupported cfg_attr path" in p for p in problems), problems)
+    expect(check(root, {"entries": []}) != [], ops)
+    # `a.rs` sorts before `lib.rs`, so the walk parses it before the
+    # `#[path]` that makes it flat. `mod tests` is `c/src/tests/mod.rs`
+    # (the file rustc compiles), not the missing stem `c/src/a/tests/mod.rs`.
+    # Leaving the first resolution in place reports nothing and never loads
+    # the read.
+    root = fake({
+        "c/src/lib.rs": '#[path = "a.rs"]\nmod m;\n',
+        "c/src/a.rs": "mod tests;\n",
+        "c/src/tests/mod.rs": read,
+    })
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect([(o["file"], o["function"]) for o in ops] == [("c/src/tests/mod.rs", "load")],
+           (ops, problems))
+    expect(problems == [], problems)
+    expect(check(root, {"entries": []}) != [], ops)
+    # Same ordering. The inline `#[path]` from the already-loaded file is
+    # `c/src/outer/../../build.rs` (`c/build.rs`). Inserting `a`'s stem
+    # looks for `c/src/build.rs`, which is not there, and the real read
+    # drops out.
+    root = fake({
+        "c/src/lib.rs": '#[path = "a.rs"]\nmod m;\n',
+        "c/src/a.rs": 'mod outer {\n    #[path = "../../build.rs"]\n    pub mod b;\n}\n',
+        "c/build.rs": read,
+    })
+    os.makedirs(os.path.join(root, "c", "src", "outer"))
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect([(o["file"], o["function"]) for o in ops] == [("c/build.rs", "load")],
+           (ops, problems))
+    expect(problems == [], problems)
+    expect(check(root, {"entries": []}) != [], ops)
+    # `path` is not the first meta, and a nested cfg_attr still applies.
+    # A quiet `c/src/r.rs` would satisfy a plain `mod r` and hide the read.
+    for lib in (
+            '#[cfg_attr(not(test), allow(dead_code), path = "../../benchmarks/r.rs")]\nmod r;\n',
+            '#[cfg_attr(not(test), doc = "]", path = "../../benchmarks/r.rs")]\nmod r;\n',
+            '#[cfg_attr(not(test), cfg_attr(all(), path = "../../benchmarks/r.rs"))]\nmod r;\n'):
+        root = fake({"c/src/lib.rs": lib, "c/src/r.rs": decoy, "benchmarks/r.rs": read})
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"]) for o in ops] == [("benchmarks/r.rs", "load")],
+               (lib, ops, problems))
+        expect(problems == [], (lib, problems))
+        expect(check(root, {"entries": []}) != [], lib)
+    # Cooked escapes. The old decoder turned `\u` / `\x` into the characters
+    # `u` / `x`, found the quiet file at that spelling, and never opened the
+    # file rustc compiles. A raw string is not decoded.
+    for lib, spelled in (
+            ('#[path = "\\u{2e}\\u{2e}/\\u{2e}\\u{2e}/benchmarks/r.rs"]\nmod r;\n',
+             "c/src/u{2e}u{2e}/u{2e}u{2e}/benchmarks/r.rs"),
+            ('#[path = "\\x2e\\x2e/\\x2e\\x2e/benchmarks/r.rs"]\nmod r;\n',
+             "c/src/x2ex2e/x2ex2e/benchmarks/r.rs"),
+            ('#[cfg_attr(not(test), path = "\\u{2e}\\u{2e}/\\u{2e}\\u{2e}/benchmarks/r.rs")]\nmod r;\n',
+             "c/src/u{2e}u{2e}/u{2e}u{2e}/benchmarks/r.rs")):
+        root = fake({"c/src/lib.rs": lib, spelled: decoy, "benchmarks/r.rs": read})
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"]) for o in ops] == [("benchmarks/r.rs", "load")],
+               (lib, ops, problems))
+        expect(problems == [], (lib, problems))
+        expect(check(root, {"entries": []}) != [], lib)
+    root = fake({
+        "c/src/lib.rs": '#[path = r"\\u{2e}\\u{2e}/\\u{2e}\\u{2e}/benchmarks/rawu.rs"]\nmod r;\n',
+        "benchmarks/rawu.rs": read,
+    })
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect(ops == [], ops)
+    expect(any("unresolved production module" in p for p in problems), problems)
+    expect(check(root, {"entries": []}) != [], ops)
+    # An unknown escape is not a path. Decoding `\q` as `q` reports the
+    # module unresolved (or loads `q.rs`) instead of refusing the attribute.
+    # The read stays under `benchmarks/`, which the walk does not enter.
+    root = fake({"c/src/lib.rs": '#[path = "\\q.rs"]\nmod r;\n',
+                 "benchmarks/q.rs": read})
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect(ops == [], ops)
+    expect(any("not a string literal" in p for p in problems), problems)
+    expect(all("unresolved production module" not in p for p in problems), problems)
+    expect(check(root, {"entries": []}) != [], ops)
+    # A backslash-newline is a line continuation, including the indent.
+    root = fake({
+        "c/src/lib.rs": '#[path = "../../bench\\\n    marks/r.rs"]\nmod r;\n',
+        "benchmarks/r.rs": read,
+    })
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect([(o["file"], o["function"]) for o in ops] == [("benchmarks/r.rs", "load")],
+           (ops, problems))
+    expect(problems == [], problems)
+    # A nested `main.rs` / `lib.rs` is an ordinary file: rustc inserts the
+    # stem. Treating every `main.rs` like a crate root loads the quiet
+    # sibling and drops `main/helper.rs`. `src/lib.rs` stays a crate root
+    # (the cases above). `mod.rs` is unchanged.
+    for mid in ("main", "lib"):
+        child = "benchmarks/%s/helper.rs" % mid
+        root = fake({
+            "c/src/lib.rs": '#[path = "../../benchmarks/nested.rs"]\nmod nested;\n',
+            "benchmarks/nested.rs": "mod %s;\n" % mid,
+            "benchmarks/%s.rs" % mid: "mod helper;\n",
+            "benchmarks/helper.rs": decoy,
+            child: read,
+        })
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"]) for o in ops] == [(child, "load")],
+               (mid, ops, problems))
+        expect(problems == [], (mid, problems))
+        expect(check(root, {"entries": []}) != [], mid)
+    root = fake({"c/src/lib.rs": '#[path = b"../../benchmarks/r.rs"]\nmod r;\n',
+                 "c/src/r.rs": decoy, "benchmarks/r.rs": read})
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect(ops == [], ops)
+    expect(any("not a string literal" in p for p in problems), problems)
+    # A symlink's children stay beside the #[path] path, not beside the
+    # target (body.rs or mod.rs) and not under a stem of either name.
+    for target in ("real/body.rs", "real/mod.rs"):
+        root = fake({
+            "c/src/lib.rs": '#[path = "../../benchmarks/alias.rs"]\nmod r;\n',
+            "benchmarks/" + target: "mod helper;\n",
+            "benchmarks/helper.rs": read,
+            "benchmarks/real/helper.rs": "pub fn decoy(p: &Path) { let _ = std::fs::read(p); }\n",
+            "benchmarks/alias/helper.rs": "pub fn decoy(p: &Path) { let _ = std::fs::read(p); }\n",
+            "benchmarks/real/body/helper.rs": "pub fn decoy(p: &Path) { let _ = std::fs::read(p); }\n",
+        })
+        os.symlink(target, os.path.join(root, "benchmarks", "alias.rs"))
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect([(o["file"], o["function"]) for o in ops] == [("benchmarks/helper.rs", "load")],
+               (target, ops, problems))
+        expect(problems == [], (target, problems))
+        expect(check(root, {"entries": []}) != [], target)
+    # An ordinary `mod r` whose file is a symlink still uses the stem of the
+    # name rustc searched (`r.rs` → `r/helper.rs`), not the target's directory.
+    # The target lives under `benchmarks/` so the walk does not parse it; a
+    # resolver that followed the symlink would load the decoy there.
+    root = fake({
+        "c/src/lib.rs": "mod r;\n",
+        "benchmarks/real/body.rs": "mod helper;\n",
+        "c/src/r/helper.rs": read,
+        "benchmarks/real/helper.rs": "pub fn decoy(p: &Path) { let _ = std::fs::read(p); }\n",
+        "benchmarks/real/body/helper.rs": "pub fn decoy(p: &Path) { let _ = std::fs::read(p); }\n",
+        "benchmarks/helper.rs": "pub fn decoy(p: &Path) { let _ = std::fs::read(p); }\n",
+    })
+    os.symlink("../../benchmarks/real/body.rs", os.path.join(root, "c", "src", "r.rs"))
+    problems = []
+    ops, _, _ = scan(root, problems)
+    expect([(o["file"], o["function"]) for o in ops] == [("c/src/r/helper.rs", "load")],
+           (ops, problems))
+    expect(problems == [], problems)
+    # A target outside the workspace is reported and not opened, even when
+    # the file exists (the old scanner stat'ed it, saw it, and skipped it).
+    root = fake({"c/src/lib.rs": "fn a() {}\n"})
+    outside = os.path.join(os.path.dirname(root), "inv-outside-%s.rs" % os.path.basename(root))
+    outside_dir = os.path.join(os.path.dirname(root), "inv-outdir-%s" % os.path.basename(root))
+    try:
+        with open(outside, "w", encoding="utf-8") as fh:
+            fh.write("pub fn escaped(p: &Path) { let _ = std::fs::read(p); }\n")
+        os.makedirs(outside_dir)
+        with open(os.path.join(outside_dir, "evil.rs"), "w", encoding="utf-8") as fh:
+            fh.write("pub fn escaped(p: &Path) { let _ = std::fs::read(p); }\n")
+        rel_out = os.path.relpath(outside, os.path.join(root, "c", "src")).replace(os.sep, "/")
+        with open(os.path.join(root, "c", "src", "lib.rs"), "w", encoding="utf-8") as fh:
+            fh.write('#[path = "%s"]\nmod r;\n#[path = "%s"]\nmod s;\n' % (rel_out, outside))
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect(ops == [], ops)
+        expect(len(problems) == 2, problems)
+        expect(all("outside the workspace" in p and "not opened" in p for p in problems), problems)
+        expect(all("unresolved production module" not in p for p in problems), problems)
+        expect(check(root, {"entries": []}) != [], check(root, {"entries": []}))
+        # A symlink inside a skipped directory, pointing at that same file.
+        os.makedirs(os.path.join(root, "benchmarks"))
+        os.symlink(outside, os.path.join(root, "benchmarks", "r.rs"))
+        with open(os.path.join(root, "c", "src", "lib.rs"), "w", encoding="utf-8") as fh:
+            fh.write('#[path = "../../benchmarks/r.rs"]\nmod r;\n')
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect(ops == [], ops)
+        expect(any("outside the workspace" in p and "benchmarks/r.rs" in p and "not opened" in p
+                   for p in problems), problems)
+        # An intermediate directory symlink: normpath keeps `link/evil.rs`
+        # (no `..`), and realpath leaves the workspace. Not opened.
+        os.symlink(outside_dir, os.path.join(root, "c", "src", "link"))
+        with open(os.path.join(root, "c", "src", "lib.rs"), "w", encoding="utf-8") as fh:
+            fh.write('#[path = "link/evil.rs"]\nmod r;\n')
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect(ops == [], ops)
+        expect(any("outside the workspace (`c/src/link/evil.rs`" in p for p in problems), problems)
+        # `..` after that directory symlink. Lexical normpath would land on
+        # the in-tree decoy and report nothing; realpath follows the symlink
+        # and the file `open` would read is outside.
+        phys = os.path.join(os.path.dirname(root), "inv-phys-%s.rs" % os.path.basename(root))
+        phys_name = os.path.basename(phys)
+        with open(phys, "w", encoding="utf-8") as fh:
+            fh.write("pub fn escaped(p: &Path) { let _ = std::fs::read(p); }\n")
+        with open(os.path.join(root, "c", "src", phys_name), "w", encoding="utf-8") as fh:
+            fh.write("fn decoy() {}\n")
+        with open(os.path.join(root, "c", "src", "lib.rs"), "w", encoding="utf-8") as fh:
+            fh.write('#[path = "link/../%s"]\nmod r;\n' % phys_name)
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect(ops == [], ops)
+        expect(any("outside the workspace" in p and "not opened" in p for p in problems), problems)
+        expect(all("unresolved" not in p for p in problems), problems)
+        # A missing path that is already outside is not "unresolved".
+        with open(os.path.join(root, "c", "src", "lib.rs"), "w", encoding="utf-8") as fh:
+            fh.write('#[path = "../../../missing.rs"]\nmod r;\n')
+        problems = []
+        scan(root, problems)
+        expect(len(problems) == 1 and "outside the workspace" in problems[0]
+               and "unresolved" not in problems[0], problems)
+        # Test-only #[path] outside the workspace reports nothing.
+        with open(os.path.join(root, "c", "src", "lib.rs"), "w", encoding="utf-8") as fh:
+            fh.write('#[cfg(test)]\n#[path = "%s"]\nmod r;\n' % rel_out)
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect(ops == [] and problems == [], (ops, problems))
+        expect(check(root, {"entries": []}) == [], check(root, {"entries": []}))
+        # The walk used to read this symlink before the outside check.
+        root_walk = fake({"c/src/lib.rs": "mod r;\n"})
+        os.symlink(outside, os.path.join(root_walk, "c", "src", "r.rs"))
+        problems = []
+        ops, _, _ = scan(root_walk, problems)
+        expect(ops == [], ops)
+        expect(any("outside the workspace (`c/src/r.rs`" in p and "not opened" in p for p in problems), problems)
+        # An undeclared symlink is not a module target and is not opened.
+        root_notes = fake({"c/src/lib.rs": "fn a() {}\n"})
+        os.symlink(outside, os.path.join(root_notes, "c", "src", "notes.rs"))
+        problems = []
+        ops, _, _ = scan(root_notes, problems)
+        expect(ops == [] and problems == [], (ops, problems))
+    finally:
+        if os.path.lexists(outside):
+            os.remove(outside)
+        phys_left = os.path.join(os.path.dirname(root), "inv-phys-%s.rs" % os.path.basename(root))
+        if os.path.lexists(phys_left):
+            os.remove(phys_left)
+        if os.path.isdir(outside_dir):
+            os.remove(os.path.join(outside_dir, "evil.rs"))
+            os.rmdir(outside_dir)
+    # A fifo named like a module blocks `open`+`read`. It is reported and not opened.
+    root = fake({"c/src/lib.rs": "mod pipe;\n"})
+    os.mkfifo(os.path.join(root, "c", "src", "pipe.rs"))
+
+    def _fifo_alarm(_signum, _frame):
+        raise AssertionError("opening a fifo blocked")
+
+    signal.signal(signal.SIGALRM, _fifo_alarm)
+    signal.alarm(3)
+    try:
+        problems = []
+        ops, _, _ = scan(root, problems)
+    finally:
+        signal.alarm(0)
+    expect(ops == [], ops)
+    expect(any("not a regular file (`c/src/pipe.rs`" in p and "not opened" in p for p in problems), problems)
+    # Production include! is reported; its target is not scanned. A
+    # test-only include!, and one that is only a comment or a string, is not.
+    # The decoy sits where the walk does not enter. Following the include!
+    # would still not load it (the macro's path is not a `mod` target);
+    # scanning it would mean the walk or the include! loader entered benchmarks/.
+    generated = "pub fn generated(p: &Path) { let _ = std::fs::read(p); }\n"
+    for lib in (
+            'fn a() { include!(concat!(env!("OUT_DIR"), "/x.rs")); }\n',
+            'fn a() { include ! (concat!(env!("OUT_DIR"), "/x.rs")); }\n',
+            'fn a() { let _ = foo::<include!(concat!(env!("OUT_DIR"), "/x.rs"))>(); }\n'):
+        root = fake({"c/src/lib.rs": lib, "benchmarks/x.rs": generated})
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect(ops == [], (lib, ops))
+        expect(any("unsupported include!" in p and "OUT_DIR" in p for p in problems), (lib, problems))
+        expect(check(root, {"entries": []}) != [], (lib, check(root, {"entries": []})))
+    for lib in (
+            '#[cfg(test)]\nfn t() { include!(concat!(env!("OUT_DIR"), "/x.rs")); }\nfn a() {}\n',
+            'fn a() { let include = 1; if include != 0 {} }\n',
+            'fn a() {}\n// include!(concat!(env!("OUT_DIR"), "/x.rs"))\n',
+            'fn a() { let _ = "include!(concat!(env!("OUT_DIR"), "/x.rs"))"; }\n',
+            'fn a() { let _ = r#"include!(concat!(env!("OUT_DIR"), "/x.rs"))"#; }\n'):
+        root = fake({"c/src/lib.rs": lib, "benchmarks/x.rs": generated})
+        problems = []
+        ops, _, _ = scan(root, problems)
+        expect(problems == [] and ops == [], (lib, problems, ops))
 
 
 def regression_inventory_helper_walk_visits_same_named_helpers_by_definition():
