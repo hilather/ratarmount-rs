@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, setsid, ForkResult};
 use ratarmount_compositing::{
     maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource, ControlFolderOptions,
@@ -3701,9 +3702,11 @@ fn spawn_interval_if(
 /// [`overlay_commit::request_shutdown`]. `commit` (on-exit persist) runs
 /// while this process still holds the overlay.
 ///
-/// The forked parent must not call this. The child owns the SQLite
-/// connection; dropping here would replay into that connection. The parent's
-/// `process::exit` skips Drop on purpose.
+/// The forked parent must not call this. Its connection is the in-memory
+/// placeholder left by [`WriteOverlay::release_db_before_fork`]; dropping
+/// here would replay a pending queue into that placeholder. The parent's
+/// `process::exit` skips Drop on purpose. The serving child has its own
+/// connection, opened after the fork (#183).
 fn finish_overlay_serve(
     overlay: Option<Arc<WriteOverlay>>,
     source: Option<Arc<dyn MountSource>>,
@@ -3881,18 +3884,22 @@ fn run_exports(
                 finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
                 std::process::exit(1);
             }
+            if !release_overlay_lock_for_fork(overlay_arc.as_deref()) {
+                finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
+                std::process::exit(1);
+            }
             match unsafe { fork() } {
                 Ok(ForkResult::Parent { child }) => {
                     relinquish_temp_overlay();
-                    // The child owns the overlay database. Dropping it here
-                    // would replay pending rows into the child's connection.
-                    // process::exit skips Drop on purpose. The interval thread
+                    // The real overlay connection was closed before the fork.
+                    // This process only has an in-memory placeholder.
+                    // process::exit skips Drop so a pending queue is not
+                    // replayed into that placeholder (it is empty at the
+                    // fork). The serving child opens the database and takes
+                    // EXCLUSIVE after the fork (#183). The interval thread
                     // starts in the child, not in this process.
-                    if !wait_until_mounted(&mp, Duration::from_secs(30)) {
-                        eprintln!(
-                            "error: timed out waiting for mount at {} (child pid {child})",
-                            mp.display()
-                        );
+                    if let Err(e) = wait_until_mounted(&mp, child, Duration::from_secs(30)) {
+                        eprintln!("error: {e} (child pid {child})");
                         let _ = unmount(&mp);
                         std::process::exit(1);
                     }
@@ -3900,6 +3907,9 @@ fn run_exports(
                 }
                 Ok(ForkResult::Child) => {
                     let _ = setsid();
+                    if !acquire_overlay_lock_after_fork(overlay_arc.as_deref()) {
+                        std::process::exit(1);
+                    }
                     if !has_log_file {
                         let _ = redirect_stdio_to_null();
                     }
@@ -3953,6 +3963,7 @@ fn run_exports(
                 }
                 Err(e) => {
                     eprintln!("error: fork failed: {e}");
+                    restore_overlay_lock_after_failed_fork(overlay_arc.as_deref());
                     finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
                     std::process::exit(1);
                 }
@@ -4117,17 +4128,21 @@ fn run_fuse_and_nfs(
         finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
         std::process::exit(1);
     }
+    if !release_overlay_lock_for_fork(overlay_arc.as_deref()) {
+        finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
+        std::process::exit(1);
+    }
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
             relinquish_temp_overlay();
-            // The child owns the overlay database. Dropping it here would
-            // replay pending rows into the child's connection. process::exit
-            // skips Drop on purpose. The interval thread starts in the child.
-            if !wait_until_mounted(&mp, Duration::from_secs(30)) {
-                eprintln!(
-                    "error: timed out waiting for mount at {} (child pid {child})",
-                    mp.display()
-                );
+            // The real overlay connection was closed before the fork. This
+            // process only has an in-memory placeholder. process::exit skips
+            // Drop so a pending queue is not replayed into that placeholder
+            // (it is empty at the fork). The serving child opens the database
+            // and takes EXCLUSIVE after the fork (#183). The interval thread
+            // starts in the child.
+            if let Err(e) = wait_until_mounted(&mp, child, Duration::from_secs(30)) {
+                eprintln!("error: {e} (child pid {child})");
                 let _ = unmount(&mp);
                 std::process::exit(1);
             }
@@ -4135,6 +4150,9 @@ fn run_fuse_and_nfs(
         }
         Ok(ForkResult::Child) => {
             let _ = setsid();
+            if !acquire_overlay_lock_after_fork(overlay_arc.as_deref()) {
+                std::process::exit(1);
+            }
             if !has_log_file {
                 let _ = redirect_stdio_to_null();
             }
@@ -4188,6 +4206,7 @@ fn run_fuse_and_nfs(
         }
         Err(e) => {
             eprintln!("error: fork failed: {e}");
+            restore_overlay_lock_after_failed_fork(overlay_arc.as_deref());
             finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
             std::process::exit(1);
         }
@@ -4253,17 +4272,21 @@ fn run_fuse_only(
         return;
     }
 
+    if !release_overlay_lock_for_fork(overlay_arc.as_deref()) {
+        finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
+        std::process::exit(1);
+    }
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
             relinquish_temp_overlay();
-            // The child owns the overlay database. Dropping it here would
-            // replay pending rows into the child's connection. process::exit
-            // skips Drop on purpose. The interval thread starts in the child.
-            if !wait_until_mounted(&mp, Duration::from_secs(30)) {
-                eprintln!(
-                    "error: timed out waiting for mount at {} (child pid {child})",
-                    mp.display()
-                );
+            // The real overlay connection was closed before the fork. This
+            // process only has an in-memory placeholder. process::exit skips
+            // Drop so a pending queue is not replayed into that placeholder
+            // (it is empty at the fork). The serving child opens the database
+            // and takes EXCLUSIVE after the fork (#183). The interval thread
+            // starts in the child.
+            if let Err(e) = wait_until_mounted(&mp, child, Duration::from_secs(30)) {
+                eprintln!("error: {e} (child pid {child})");
                 let _ = unmount(&mp);
                 std::process::exit(1);
             }
@@ -4271,6 +4294,9 @@ fn run_fuse_only(
         }
         Ok(ForkResult::Child) => {
             let _ = setsid();
+            if !acquire_overlay_lock_after_fork(overlay_arc.as_deref()) {
+                std::process::exit(1);
+            }
             if !has_log_file {
                 let _ = redirect_stdio_to_null();
             }
@@ -4308,6 +4334,7 @@ fn run_fuse_only(
         }
         Err(e) => {
             eprintln!("error: fork failed: {e}");
+            restore_overlay_lock_after_failed_fork(overlay_arc.as_deref());
             finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
             std::process::exit(1);
         }
@@ -4851,15 +4878,90 @@ fn no_unmount(_: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn wait_until_mounted(path: &Path, timeout: Duration) -> bool {
+/// Close the overlay database before `fork` (#183).
+///
+/// POSIX record locks are not inherited. The parent used to take the
+/// exclusive lock and then exit, which released it, while the child kept a
+/// connection that still believed it held the lock. The connection has to be
+/// gone before the fork: a parent that still held it would make the child's
+/// `BEGIN EXCLUSIVE` return `SQLITE_BUSY`, and this wait would never finish.
+/// On failure the caller drops the overlay (the real connection is still
+/// open) and exits.
+fn release_overlay_lock_for_fork(overlay: Option<&WriteOverlay>) -> bool {
+    let Some(ov) = overlay else {
+        return true;
+    };
+    match ov.release_db_before_fork() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("{}", overlay_open_error(ov.root(), &e));
+            false
+        }
+    }
+}
+
+/// Open the overlay database in the serving child and take the exclusive
+/// lock (#183). The error is printed before stdio is redirected. The caller
+/// exits without [`finish_overlay_serve`]: the only connection in this
+/// process is the in-memory placeholder inherited across `fork`.
+fn acquire_overlay_lock_after_fork(overlay: Option<&WriteOverlay>) -> bool {
+    let Some(ov) = overlay else {
+        return true;
+    };
+    match ov.acquire_exclusive_after_fork() {
+        Ok(()) => true,
+        Err(e) => {
+            let msg = overlay_open_error(ov.root(), &e);
+            eprintln!("{msg}");
+            let _ = std::fs::write(
+                "/tmp/ratarmount-rs-fuse-error.log",
+                format!("overlay lock: {msg}\n"),
+            );
+            false
+        }
+    }
+}
+
+/// `fork` failed, so this process never split. Put the exclusive connection
+/// back before the overlay is dropped.
+fn restore_overlay_lock_after_failed_fork(overlay: Option<&WriteOverlay>) {
+    let Some(ov) = overlay else {
+        return;
+    };
+    if let Err(e) = ov.restore_db_after_failed_fork() {
+        eprintln!("{}", overlay_open_error(ov.root(), &e));
+    }
+}
+
+fn wait_until_mounted(
+    path: &Path,
+    child: nix::unistd::Pid,
+    timeout: Duration,
+) -> Result<(), String> {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if is_fuse_mount(path) {
-            return true;
+            return Ok(());
+        }
+        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {}
+            Ok(status) => {
+                return Err(format!(
+                    "serving process {child} is not running ({status:?}); the mount at {} did not appear",
+                    path.display()
+                ));
+            }
+            Err(nix::errno::Errno::ECHILD) => {
+                return Err(format!(
+                    "serving process {child} is gone; the mount at {} did not appear",
+                    path.display()
+                ));
+            }
+            Err(_) => {}
         }
         thread::sleep(Duration::from_millis(50));
     }
-    false
+    Err(format!("timed out waiting for mount at {}", path.display()))
 }
 
 /// True when `path` appears to be a live FUSE (or FUSE-T) mount.
