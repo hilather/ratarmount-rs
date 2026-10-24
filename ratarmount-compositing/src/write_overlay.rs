@@ -960,17 +960,26 @@ impl OverlayError {
         )
     }
 
-    /// SQLITE_READONLY / SQLITE_CANTOPEN / SQLITE_PERM: an access problem,
-    /// not a corrupt database.
+    /// SQLITE_READONLY / SQLITE_CANTOPEN / SQLITE_PERM, or an `io::Error`
+    /// of permission denied / read-only filesystem: an access problem, not
+    /// a corrupt database. A first open creates its staging file before
+    /// SQLite runs, so a mode-0555 overlay folder fails here with EACCES
+    /// and never reaches SQLITE_CANTOPEN (#194).
     pub fn is_access_error(&self) -> bool {
-        matches!(
-            self.sqlite_code(),
-            Some(
-                rusqlite::ErrorCode::ReadOnly
-                    | rusqlite::ErrorCode::CannotOpen
-                    | rusqlite::ErrorCode::PermissionDenied
-            )
-        )
+        match self {
+            OverlayError::Io(err) => matches!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            ),
+            _ => matches!(
+                self.sqlite_code(),
+                Some(
+                    rusqlite::ErrorCode::ReadOnly
+                        | rusqlite::ErrorCode::CannotOpen
+                        | rusqlite::ErrorCode::PermissionDenied
+                )
+            ),
+        }
     }
 }
 
@@ -13013,6 +13022,33 @@ pub(crate) mod tests {
                     || n.starts_with(OVERLAY_DB_STAGING_PREFIX)
             })
             .collect()
+    }
+
+    /// Regression (#194): a read-only overlay folder fails in
+    /// `reserve_staging_path` with `PermissionDenied` (or `ReadOnlyFilesystem`)
+    /// before SQLite opens. That is still an access error, so the CLI keeps
+    /// the "readable and writable" hint. A missing path and a plain message
+    /// are not.
+    #[test]
+    fn regression_io_permission_denied_is_an_access_error() {
+        let denied = OverlayError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Permission denied",
+        ));
+        assert!(denied.is_access_error());
+        let erofs = OverlayError::Io(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "Read-only file system",
+        ));
+        assert!(erofs.is_access_error());
+        let missing = OverlayError::Io(io::Error::new(io::ErrorKind::NotFound, "missing"));
+        assert!(!missing.is_access_error());
+        assert!(!OverlayError::Msg("overlay path must be a folder".into()).is_access_error());
+        let cantopen = OverlayError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some("unable to open database file".into()),
+        ));
+        assert!(cantopen.is_access_error());
     }
 
     /// Regression (#194): a first open that fails must not leave the folder

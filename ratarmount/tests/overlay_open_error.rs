@@ -94,8 +94,8 @@ fn unopenable_overlay_db_suggests_checking_access() {
     std::fs::create_dir(&src).unwrap();
     let ov = tmp.path().join("ov");
     std::fs::create_dir(&ov).unwrap();
-    // A read-only overlay folder: SQLite cannot create the database
-    // (SQLITE_CANTOPEN).
+    // A read-only overlay folder. Staging-file creation fails with EACCES
+    // before SQLite opens (#194); the CLI still names it as an access error.
     std::fs::set_permissions(&ov, std::fs::Permissions::from_mode(0o555)).unwrap();
     if std::fs::write(ov.join("probe"), b"").is_ok() {
         eprintln!("skip: read-only folder is writable (running as root?)");
