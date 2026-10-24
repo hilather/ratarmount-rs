@@ -39,7 +39,7 @@ this SHA. Workspace members are in `Cargo.toml:4`; the binary is
 
 | Building block | Verified location and behavior |
 |---|---|
-| CLI | `ratarmount/src/main.rs:519` has one `write_overlay`; `:523` has repeatable lowers; `:527` permits unsealed lowers. `:90`–`:96` is foreground (the doc comment through the field). Mount CLI has no `--top` or `--mount`; `sandbox/run.rs:31` has an unrelated one-directory `--top`. |
+| CLI | `ratarmount/src/main.rs:519`–`:520` has one `write_overlay`; `:523`–`:524` has repeatable lowers; `:527`–`:528` permits unsealed lowers. `:90`–`:96` is foreground (the doc comment through the field). Mount CLI has no `--top` or `--mount`; `sandbox/run.rs:31` has an unrelated one-directory `--top`. |
 | Stack opener | Binary-private `MountLowerStack`, `main.rs:1412`; `compose` at `:1487`, `open` at `:1503`, `open_in` at `:1513`, `open_with` at `:1531`, full `check_top` at `:1671`. |
 | Composition | `ratarmount-compositing/src/overlay_layer.rs:577` composes bottom-up; `ratarmount-core/src/lib.rs:706` requires `MountSource: Send + Sync`. |
 | Lower snapshots | `Immutability::Immutable`/`Shared`, `overlay_layer.rs:20`; rows are a construction-time snapshot, transaction committed at `:177`; host bytes remain independently opened (`:45`–`:47`). |
@@ -133,7 +133,7 @@ session. There are no per-top forms of those flags.
 For each mountpoint, compare it against every served directory, bind-source
 directory, every top directory and every *other* mountpoint. Use the same
 three checks as `mount_guard::relation`: lexical (`mount_guard.rs:572`),
-`/proc/self/mountinfo` views (`:577`) and same-view inode identity (`:595`).
+`/proc/self/mountinfo` views (`:577`) and same-view inode identity (`:595`–`:597`).
 These catch bind aliases, hidden binds, and existing case/Unicode aliases;
 `canonicalize` or prefix checks alone do not implement the contract.
 
@@ -151,8 +151,8 @@ exclusions affect identity hashing only. With base `/repo`, top A
 independent, but B can list and read A's host file as `/runs/a/x` through the
 live folder base. The reverse path `/runs/b/x` behaves symmetrically. The
 folder source directly joins virtual paths onto its host root
-(`folder.rs:31`–`:37`, `:189`, `:236`); overlay lookup/open fall through to it
-(`write_overlay.rs:5451`, `:5486`). This includes other host entries in those
+(`folder.rs:31`–`:37`, `:189`, `:237`); overlay lookup/open fall through to it
+(`write_overlay.rs:5451`–`:5452`, `:5486`–`:5487`). This includes other host entries in those
 top directories, subject to existing source visibility rules. V1 adds no
 source filtering or security boundary for inside-base tops. Consumers needing
 namespace separation must place tops outside the served directory base.
@@ -386,8 +386,8 @@ The exact snapshot carriers are:
    accessor). `open_with`'s bottom-layer call (`main.rs:1597`) reaches
    `mounted_base_identity`, which supplies that vector to
    `overlay_gate::BaseProbe.extra_excludes` (`main.rs:1434`–`:1439`).
-   `overlay_gate::content_probe` (`:187`–`:201`) forwards it into
-   `overlay_meta::compare_content`'s directory walk (`:1515`–`:1523`), unioned
+   `overlay_gate::content_probe` (`overlay_gate.rs:187`–`:201`) forwards it into
+   `overlay_meta::compare_content`'s directory walk (`overlay_meta.rs:1515`–`:1523`), unioned
    with the bottom lower's recorded exclusions. This is how the **same
    pre-factory set reaches the hasher after factory/top/mountpoint mkdirs**.
    Binding does not recapture it. Do not substitute
@@ -995,9 +995,9 @@ commands that already pass on this SHA.
 Listings are decisive because FUSE uses `source.list_dirents`
 (`ratarmount-fuse/src/lib.rs:1228`), and `WriteOverlay::list_dirents` merges
 host dirty names (`write_overlay.rs:5364`–`:5413`). Create can succeed even if
-`source.lookup` misses (`lib.rs:1613`–`:1634`). Reopen of a created file instead
-uses `overlay.has_file` → `OverlayFd` (`:2339`–`:2367`), then `pread`
-(`:1517`–`:1520`); it can pass with the wrong shared-stack source. Cross-lookup and a
+`source.lookup` misses (`ratarmount-fuse/src/lib.rs:1613`–`:1634`). Reopen of a created file instead
+uses `overlay.has_file` → `OverlayFd` (`ratarmount-fuse/src/lib.rs:2339`–`:2367`), then `pread`
+(`ratarmount-fuse/src/lib.rs:1517`–`:1520`); it can pass with the wrong shared-stack source. Cross-lookup and a
 base read also pass in that broken wiring. Do not label them, or post-unmount
 seal/diff, as the source proof.
 
