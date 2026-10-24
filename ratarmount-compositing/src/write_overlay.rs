@@ -1426,7 +1426,23 @@ impl WriteOverlay {
         // shared lock and a second open could delete this process's staging
         // file. COMMIT does not drop the lock while locking mode is exclusive.
         // A failed open above returns before this, including SQLITE_BUSY.
-        conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        //
+        // A fresh publish (#194) did the schema write on the staging
+        // connection, which is already closed. Exclusive mode keeps the
+        // rollback journal open after the first write on *this* connection.
+        // Without a page write here, that journal descriptor appears on the
+        // first user write and stays until close. Schema creation used to be
+        // that write; touch `sqlite_master` the same way and leave no table.
+        if published_fresh {
+            conn.execute_batch(
+                "BEGIN EXCLUSIVE;
+                 CREATE TABLE ratarmount_open_touch(x);
+                 DROP TABLE ratarmount_open_touch;
+                 COMMIT;",
+            )?;
+        } else {
+            conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        }
         // Best-effort. An unreadable directory must not fail the open.
         sweep_cow_staging(&root);
         Ok(Self {
@@ -13167,6 +13183,20 @@ pub(crate) mod tests {
             drop(o);
             assert!(ov.join(OVERLAY_MARKER).is_file(), "{}", ov.display());
             assert!(has_files_table(&ov.join(HIDDEN_DB)));
+            // The fresh-publish lock write creates and drops this table in
+            // one transaction. It must not remain in the committed schema.
+            let c =
+                Connection::open_with_flags(ov.join(HIDDEN_DB), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            let touch = c
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'ratarmount_open_touch'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap();
+            assert!(touch.is_none(), "{}", ov.display());
         }
     }
 
