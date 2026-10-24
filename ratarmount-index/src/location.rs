@@ -1072,7 +1072,7 @@ fn detect_index_compression(path: &Path, header: &[u8]) -> Option<IndexCompressi
 }
 
 fn decompress_index_to_temp(path: &Path, fmt: IndexCompression) -> Result<PathBuf> {
-    let input = File::open(path).map_err(|e| {
+    let input = ratarmount_core::fork_n::open_admitted(path).map_err(|e| {
         IndexError::Invalid(format!(
             "cannot open {}-compressed index {}: {e}",
             fmt.name(),

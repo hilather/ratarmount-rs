@@ -172,6 +172,8 @@ ratarmount snapshot repo@HEAD base.tar.zst --with-index --json
 ratarmount overlay import --no-seal prepared.patch prepared base.tar.zst
 ratarmount overlay seal prepared
 ratarmount --lower prepared -w attempt base.tar.zst mnt/
+# Two independent writable tops, one process. Commits stay refused.
+ratarmount --top A=attempt-a --mount A=mnt-a --top B=attempt-b --mount B=mnt-b --lower prepared base.tar.zst
 # Run the agent and its edits through mnt/ before unmounting.
 ratarmount -u mnt/
 ratarmount overlay fsck attempt --repair

@@ -88,10 +88,22 @@ pub(crate) struct ExcludePlan {
 
 /// Resolve the exclusion set for a directory base. Must run before the
 /// overlay directory is created: the topmost-new rule depends on what exists.
+static PLAN_EXCLUDES_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times [`plan_excludes`] has run in this process.
+pub fn plan_excludes_calls() -> u64 {
+    PLAN_EXCLUDES_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn reset_plan_excludes_calls() {
+    PLAN_EXCLUDES_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn plan_excludes(
     info: &OverlayCreateInfo,
     overlay: &Path,
 ) -> Result<Option<ExcludePlan>> {
+    PLAN_EXCLUDES_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if info.git_tree.is_some() {
         return Ok(None);
     }
@@ -111,6 +123,32 @@ pub(crate) fn plan_excludes(
         base,
         excludes,
         overlay: own.paths().first().cloned(),
+    }))
+}
+
+/// Build an exclude plan from a set captured before the factory. Does not call
+/// [`plan_excludes`]. `None` means this base has no directory excludes.
+pub(crate) fn frozen_exclude_plan(
+    info: Option<&OverlayCreateInfo>,
+    overlay: &Path,
+    excludes: Option<&BaseExcludes>,
+) -> Result<Option<ExcludePlan>> {
+    let Some(info) = info else {
+        return Ok(None);
+    };
+    if info.git_tree.is_some() {
+        return Ok(None);
+    }
+    let Some(path) = info.path().filter(|p| p.is_dir()) else {
+        return Ok(None);
+    };
+    let Some(excludes) = excludes else {
+        return Ok(None);
+    };
+    Ok(Some(ExcludePlan {
+        base: path.to_path_buf(),
+        excludes: excludes.clone(),
+        overlay: Some(overlay.to_path_buf()),
     }))
 }
 
@@ -1823,6 +1861,222 @@ fn verify(
     Ok(false)
 }
 
+/// How a captured path becomes an exclusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExcludeRole {
+    /// Tops, mountpoints, lowers, and cache or index destinations. Present or
+    /// missing, they stay in the frozen set.
+    Artifact,
+    /// A caller journal. Eligible only when the entry was missing at capture.
+    /// An existing file or a dangling symlink stays base content.
+    Journal,
+}
+
+/// One path observed before the factory creates directories.
+#[derive(Clone, Debug)]
+pub struct ObservedComponent {
+    pub given: PathBuf,
+    pub role: ExcludeRole,
+    /// Longest existing ancestor, canonicalized.
+    pub anchor: PathBuf,
+    pub anchor_dev: u64,
+    pub anchor_ino: u64,
+    /// Lexical remainder after `anchor`.
+    pub suffix: PathBuf,
+    /// The entry itself was missing. A dangling symlink is not missing.
+    pub missing: bool,
+    /// First missing component, relative to `anchor` (just that one component).
+    pub first_missing: Option<PathBuf>,
+}
+
+/// Paths captured with lstat before any mkdir. Bind freezes the first-missing
+/// prefix and does not look again.
+#[derive(Clone, Debug)]
+pub struct ObservedBaseExcludes {
+    pub entries: Vec<ObservedComponent>,
+}
+
+impl ObservedBaseExcludes {
+    /// Every path is a [`ExcludeRole::Journal`]. Missing entries still freeze
+    /// their first-missing component; an existing journal does not.
+    pub fn capture(paths: &[PathBuf]) -> std::io::Result<Self> {
+        let tagged: Vec<(PathBuf, ExcludeRole)> = paths
+            .iter()
+            .cloned()
+            .map(|path| (path, ExcludeRole::Journal))
+            .collect();
+        Self::capture_with_roles(&tagged)
+    }
+
+    pub fn capture_with_roles(paths: &[(PathBuf, ExcludeRole)]) -> std::io::Result<Self> {
+        let mut entries = Vec::with_capacity(paths.len());
+        for (given, role) in paths {
+            entries.push(observe_component(given, *role)?);
+        }
+        Ok(Self { entries })
+    }
+
+    pub fn bind(self) -> FrozenBaseExcludes {
+        let mut aggregate = Vec::new();
+        for entry in &self.entries {
+            let key = if entry.missing {
+                entry.first_missing.clone()
+            } else if entry.role == ExcludeRole::Artifact {
+                // Existing tops and lower/cache artifacts are not dropped.
+                Some(entry.anchor.clone())
+            } else {
+                None
+            };
+            if let Some(prefix) = key {
+                if !aggregate.iter().any(|have| have == &prefix) {
+                    aggregate.push(prefix);
+                }
+            }
+        }
+        FrozenBaseExcludes {
+            entries: self.entries,
+            aggregate,
+        }
+    }
+}
+
+/// The saved first-missing prefixes. Later mkdirs do not change them.
+#[derive(Clone, Debug)]
+pub struct FrozenBaseExcludes {
+    entries: Vec<ObservedComponent>,
+    aggregate: Vec<PathBuf>,
+}
+
+impl FrozenBaseExcludes {
+    pub fn aggregate(&self) -> &[PathBuf] {
+        &self.aggregate
+    }
+
+    pub fn entries(&self) -> &[ObservedComponent] {
+        &self.entries
+    }
+
+    pub fn as_excludes(&self) -> BaseExcludes {
+        BaseExcludes::new(self.aggregate.iter().cloned())
+    }
+
+    /// Base-relative excludes from the saved observation. Does not stat again,
+    /// so a mkdir after capture cannot change a frozen first-missing prefix.
+    /// An existing artifact under `base` contributes its full relative path.
+    /// A caller journal contributes a prefix only when it was missing.
+    pub fn excludes_for_base(&self, base: &Path) -> Vec<PathBuf> {
+        let Ok(base) = base.canonicalize() else {
+            return self.aggregate.clone();
+        };
+        let mut out = Vec::new();
+        for entry in &self.entries {
+            if entry.role == ExcludeRole::Journal && !entry.missing {
+                continue;
+            }
+            let Ok(anchor_rel) = entry.anchor.strip_prefix(&base) else {
+                continue;
+            };
+            let mut rel = anchor_rel.to_path_buf();
+            if entry.missing {
+                let Some(first) = &entry.first_missing else {
+                    continue;
+                };
+                rel.push(first);
+            }
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            if !out.iter().any(|have| have == &rel) {
+                out.push(rel);
+            }
+        }
+        out
+    }
+
+    /// Refuse when an anchor's identity changed or a new symlink appeared on
+    /// the saved suffix. Does not recompute the first-missing prefix.
+    pub fn recheck(&self) -> std::io::Result<()> {
+        for entry in &self.entries {
+            let now = observe_component(&entry.given, entry.role)?;
+            if now.anchor_dev != entry.anchor_dev
+                || now.anchor_ino != entry.anchor_ino
+                || now.suffix != entry.suffix
+            {
+                return Err(std::io::Error::other(format!(
+                    "fork-n refuses {}: exclude anchor changed",
+                    entry.given.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `Frozen(None)` is an archive, Git, remote, or composite token: callers must
+/// not call [`plan_excludes`].
+pub enum ExcludeMode {
+    Frozen(Option<FrozenBaseExcludes>),
+}
+
+fn observe_component(given: &Path, role: ExcludeRole) -> std::io::Result<ObservedComponent> {
+    let mut missing_names = Vec::new();
+    let mut cur = given.to_path_buf();
+    let anchor = loop {
+        match fs::symlink_metadata(&cur) {
+            Ok(_) => break cur,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = cur.parent() else {
+                    return Err(std::io::Error::other(format!(
+                        "fork-n cannot observe {}",
+                        given.display()
+                    )));
+                };
+                if parent.as_os_str().is_empty() || parent == cur {
+                    return Err(std::io::Error::other(format!(
+                        "fork-n cannot observe {}",
+                        given.display()
+                    )));
+                }
+                if let Some(name) = cur.file_name() {
+                    missing_names.push(name.to_os_string());
+                }
+                cur = parent.to_path_buf();
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    let meta = fs::symlink_metadata(&anchor)?;
+    #[cfg(unix)]
+    let (anchor_dev, anchor_ino) = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino())
+    };
+    #[cfg(not(unix))]
+    let (anchor_dev, anchor_ino) = (0u64, 0u64);
+    let resolved = if meta.file_type().is_symlink() {
+        // A dangling symlink is an existing entry, not a missing one.
+        anchor.clone()
+    } else {
+        anchor.canonicalize().unwrap_or(anchor.clone())
+    };
+    let mut suffix = PathBuf::new();
+    for name in missing_names.iter().rev() {
+        suffix.push(name);
+    }
+    let missing = !suffix.as_os_str().is_empty();
+    let first_missing = missing_names.last().map(PathBuf::from);
+    Ok(ObservedComponent {
+        given: given.to_path_buf(),
+        role,
+        anchor: resolved,
+        anchor_dev,
+        anchor_ino,
+        suffix,
+        missing,
+        first_missing,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
@@ -3438,5 +3692,125 @@ mod tests {
         let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
         assert_eq!(meta.format_version().unwrap(), Some(2));
         assert_eq!(meta.get("import_in_progress"), Some("1:2"));
+    }
+
+    /// Regression: a missing `runs/indexes` (and both tops under `runs`) freeze
+    /// the first missing component `runs`, not `runs/a`.
+    #[test]
+    fn fork_n_excludes_first_missing_prefix_is_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let indexes = repo.join("runs/indexes");
+        let top_a = repo.join("runs/a");
+        let top_b = repo.join("runs/b");
+        let observed = ObservedBaseExcludes::capture(&[indexes, top_a, top_b]).unwrap();
+        let frozen = observed.bind();
+        assert_eq!(frozen.aggregate(), &[PathBuf::from("runs")]);
+        assert!(frozen.entries().iter().all(|entry| {
+            entry.missing && entry.first_missing.as_deref() == Some(Path::new("runs"))
+        }));
+    }
+
+    /// Regression: an existing top is an exclusion. Existence does not drop it.
+    #[test]
+    fn fork_n_excludes_existing_artifact_stays_in_the_aggregate() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let top = repo.join("runs/a");
+        fs::create_dir_all(&top).unwrap();
+        let observed =
+            ObservedBaseExcludes::capture_with_roles(&[(top.clone(), ExcludeRole::Artifact)])
+                .unwrap();
+        let frozen = observed.bind();
+        assert!(
+            frozen
+                .aggregate()
+                .iter()
+                .any(|path| path.ends_with("runs/a")),
+            "existing artifact dropped: {:?}",
+            frozen.aggregate()
+        );
+        let rel = frozen.excludes_for_base(&repo);
+        assert_eq!(rel, vec![PathBuf::from("runs/a")], "{rel:?}");
+    }
+
+    /// Regression: `Frozen(None)` does not call `plan_excludes`.
+    #[test]
+    fn fork_n_excludes_frozen_none_skips_plan_excludes() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        fs::create_dir(&base).unwrap();
+        let info = OverlayCreateInfo {
+            base_url: base.to_str().unwrap().into(),
+            ..OverlayCreateInfo::default()
+        };
+        reset_plan_excludes_calls();
+        let _ = plan_excludes(&info, &root.path().join("overlay")).unwrap();
+        let after_plan = plan_excludes_calls();
+        assert!(after_plan >= 1);
+        let _ = frozen_exclude_plan(Some(&info), &root.path().join("top"), None).unwrap();
+        assert_eq!(plan_excludes_calls(), after_plan);
+    }
+
+    /// Regression: an existing caller journal is not an exclusion. A missing
+    /// journal keeps its first-missing component. A dangling symlink is present.
+    #[test]
+    fn fork_n_journal_eligibility() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let existing = repo.join("new.log");
+        fs::write(&existing, b"already").unwrap();
+        let dangling = repo.join("gone.log");
+        std::os::unix::fs::symlink(repo.join("no-such-target"), &dangling).unwrap();
+        let observed =
+            ObservedBaseExcludes::capture(&[existing.clone(), dangling.clone()]).unwrap();
+        let frozen = observed.bind();
+        assert!(
+            frozen.aggregate().is_empty(),
+            "existing and dangling journals are not exclusions: {:?}",
+            frozen.aggregate()
+        );
+        let existing_entry = frozen
+            .entries()
+            .iter()
+            .find(|entry| entry.given == existing)
+            .unwrap();
+        assert!(!existing_entry.missing);
+        let dangling_entry = frozen
+            .entries()
+            .iter()
+            .find(|entry| entry.given == dangling)
+            .unwrap();
+        assert!(!dangling_entry.missing, "a dangling symlink is not missing");
+
+        let absent_parent = repo.join("missing-dir/journal.log");
+        let missing_only = ObservedBaseExcludes::capture(&[absent_parent]).unwrap();
+        let frozen = missing_only.bind();
+        assert_eq!(frozen.aggregate(), &[PathBuf::from("missing-dir")]);
+
+        let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let euid = status.lines().find_map(|line| {
+            let rest = line.strip_prefix("Uid:")?;
+            rest.split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u32>().ok())
+        });
+        if euid == Some(0) {
+            eprintln!("skip: permission observation as root");
+        } else {
+            let blocked = root.path().join("blocked");
+            fs::create_dir(&blocked).unwrap();
+            let hidden = blocked.join("secret.log");
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&blocked).unwrap().permissions();
+            perms.set_mode(0o0);
+            fs::set_permissions(&blocked, perms).unwrap();
+            let observed = ObservedBaseExcludes::capture(&[hidden]);
+            let _ = fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755));
+            let err = observed.expect_err("an unreadable component refuses");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        }
     }
 }

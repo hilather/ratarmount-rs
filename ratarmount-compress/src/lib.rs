@@ -296,7 +296,7 @@ fn materialize_from_reader(
 
 /// Decompress gzip into a persistent temp file; returns size.
 pub fn materialize_gzip(path: &Path) -> Result<(NamedTempFile, u64)> {
-    let input = File::open(path)?;
+    let input = ratarmount_core::fork_n::open_admitted(path)?;
     let decoder = MultiGzDecoder::new(BufReader::new(input));
     materialize_from_reader(decoder, "gzip", path)
 }
@@ -308,7 +308,7 @@ pub fn materialize_gzip(path: &Path) -> Result<(NamedTempFile, u64)> {
 /// which made `--commit-overlay` rewrite only the first TAR and drop later
 /// members.
 pub fn materialize_bzip2(path: &Path) -> Result<(NamedTempFile, u64)> {
-    let input = File::open(path)?;
+    let input = ratarmount_core::fork_n::open_admitted(path)?;
     let decoder = MultiBzDecoder::new(BufReader::new(input));
     materialize_from_reader(decoder, "bzip2", path)
 }
@@ -319,7 +319,7 @@ pub fn materialize_bzip2(path: &Path) -> Result<(NamedTempFile, u64)> {
 /// (`cat a.xz b.xz`) are fully decoded. `XzDecoder::new` stops after the
 /// first stream footer, which made `--commit-overlay` drop later TAR members.
 pub fn materialize_xz(path: &Path) -> Result<(NamedTempFile, u64)> {
-    let input = File::open(path)?;
+        let input = ratarmount_core::fork_n::open_admitted(path)?;
     let decoder = XzDecoder::new_multi_decoder(BufReader::new(input));
     materialize_from_reader(decoder, "xz", path)
 }
@@ -351,7 +351,7 @@ pub fn materialize_open(
 
 /// Decompress zstd into a persistent temp file.
 pub fn materialize_zstd(path: &Path) -> Result<(NamedTempFile, u64)> {
-    let input = File::open(path)?;
+    let input = ratarmount_core::fork_n::open_admitted(path)?;
     let decoder = zstd::stream::read::Decoder::new(BufReader::new(input))?;
     materialize_from_reader(decoder, "zstd", path)
 }

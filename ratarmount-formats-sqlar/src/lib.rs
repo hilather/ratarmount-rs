@@ -164,6 +164,9 @@ impl SqlarMountSource {
                 path.display()
             )));
         }
+        if let Some(message) = take_probe_refusal() {
+            return Err(SqlarError::Msg(message));
+        }
 
         let header = read_header(&path)?;
         let conn = match open_plain(&path) {
@@ -315,7 +318,7 @@ impl SqlarMountSource {
 }
 
 fn read_header(path: &Path) -> Result<Vec<u8>> {
-    let mut f = std::fs::File::open(path)?;
+    let mut f = ratarmount_core::fork_n::open_admitted(path)?;
     let mut buf = [0u8; 16];
     let n = f.read(&mut buf)?;
     Ok(buf[..n].to_vec())
@@ -584,11 +587,30 @@ fn build_name_map(conn: &Connection) -> Result<Option<BTreeMap<String, String>>>
     Ok(Some(map))
 }
 
+std::thread_local! {
+    static PROBE_REFUSAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A fork-n refusal from the last [`looks_like_sqlar`] on this thread.
+/// Returning `false` would let the factory try another backend.
+pub fn take_probe_refusal() -> Option<String> {
+    PROBE_REFUSAL.with(|slot| slot.borrow_mut().take())
+}
+
 /// True if path is a plausible SQLAR: SQLite magic + `sqlar` table, or `.sqlar` extension
 /// (encrypted sqlcipher archives omit the magic and store salt in the first 16 bytes).
 pub fn looks_like_sqlar(path: &Path) -> bool {
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
+    PROBE_REFUSAL.with(|slot| *slot.borrow_mut() = None);
+    let mut f = match ratarmount_core::fork_n::open_admitted(path) {
+        Ok(file) => file,
+        Err(err) => {
+            let message = err.to_string();
+            if message.starts_with("fork-n ") {
+                PROBE_REFUSAL.with(|slot| *slot.borrow_mut() = Some(message));
+                return true;
+            }
+            return false;
+        }
     };
     let mut magic = [0u8; 16];
     let Ok(n) = std::io::Read::read(&mut f, &mut magic) else {
@@ -1255,5 +1277,46 @@ mod tests {
         assert_eq!(src.lookup("/subdir/nested.bin", 0).unwrap().mode, n.mode);
 
         assert!(src.list_dirents("/hello.txt").is_none());
+    }
+}
+
+/// Regression: a fork-n refusal from the SQLAR probe is not turned into
+/// "not an SQLAR", which would let the factory try another backend.
+#[cfg(test)]
+mod fork_n_storage_sqlar {
+    use super::{looks_like_sqlar, take_probe_refusal, SqlarMountSource};
+    use ratarmount_core::OpenOptions;
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    struct Uninstall;
+    impl Drop for Uninstall {
+        fn drop(&mut self) {
+            ratarmount_core::fork_n::uninstall();
+        }
+    }
+
+    #[test]
+    fn fork_n_storage_sqlar_probe_does_not_swallow_refusal() {
+        let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _uninstall = Uninstall;
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("mnt");
+        std::fs::create_dir(&mount).unwrap();
+        let image = mount.join("disk.sqlar");
+        std::fs::write(&image, b"not-a-real-sqlar-but-long-enough").unwrap();
+        ratarmount_core::fork_n::test_reset_spies();
+        ratarmount_core::fork_n::install(Vec::new(), vec![mount.canonicalize().unwrap()]);
+        assert!(looks_like_sqlar(&image));
+        let parked = take_probe_refusal().unwrap_or_default();
+        assert!(parked.starts_with("fork-n "), "{parked}");
+        let err = match SqlarMountSource::open(&image, &OpenOptions::default()) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("image under a mountpoint must be refused"),
+        };
+        assert!(err.contains("fork-n "), "{err}");
+        assert_eq!(ratarmount_core::fork_n::test_open_count(), 0);
+        ratarmount_core::fork_n::uninstall();
     }
 }

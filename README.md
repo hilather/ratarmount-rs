@@ -306,12 +306,16 @@ overlay until you commit them: offline into gzip, bzip2, xz TAR and ZIP, or
 live while the mount is served for uncompressed TAR and `.tar.zst`, where only
 the last zstd frame is rewritten. `--overlay-readonly`, `--overlay-quota` and
 `--sandbox` turn an overlay into a guard rail for untrusted code.
+`--top NAME=DIR` and `--mount NAME=PATH` serve N writable tops on N FUSE
+mountpoints in one process; commits of that layered stack are refused until
+the stack is flattened.
 [Writing into archives](docs/write-overlay.md) · [sandbox controls](docs/sandbox.md)
 
 | Agent workflow | Python ratarmount | Rust ratarmount |
 |---|---|---|
 | Canonical change hashes, manifests and attempt comparisons | No | `diff` |
 | Layered overlays, identity metadata, seal/verify/fsck | No | `--lower`, `overlay` |
+| N writable tops, one process (`--top` / `--mount`) | No | FUSE-only; commits refused |
 | Patch/overlayfs import and portable layer bundles | No | `overlay import`, `import-upperdir`, `pack`, `unpack` |
 | Operation journals and turn marks | No | `--journal`, `journal` |
 | Container attempt runner and supervisor API | No | `sandbox run`, `sandbox daemon` |

@@ -379,6 +379,191 @@ pub(crate) fn recover_journal(
     })
 }
 
+/// Recover one archive and restamp every top database before the journal is
+/// unlinked. An incomplete header, or an Own that the under-lock recheck
+/// classifies as Deferred, refuses with no recovery write (the authorizer
+/// returns before `recover_with` applies the journal). A restamp error keeps
+/// the journal.
+pub fn recover_journal_cohort(
+    archive: &Path,
+    tops: &[std::path::PathBuf],
+    records: &MountRecords,
+) -> std::result::Result<Option<Applied>, RecoverError> {
+    // A dangling symlink or other non-file is not an absent database. Refuse
+    // before `recover_with` so the journal is not applied.
+    refuse_nonregular_top_dbs(archive, tops).map_err(RecoverError::Refused)?;
+    let conns = open_regular_top_dbs(tops).map_err(RecoverError::Refused)?;
+    let mut authorize = |header: &PendingJournal, locked: &fs::Metadata| {
+        if !header.complete {
+            return Err(io::Error::other(format!(
+                "fork-n refuses {}: commit journal changed while the mount classified it, retry",
+                archive.display()
+            )));
+        }
+        let canonical = archive.canonicalize()?;
+        let current = current_identity(locked);
+        // Every top votes on this pass. Deferred under the lock aborts the
+        // run (the error does not start with `fork-n defers journal`, so the
+        // caller does not queue this member for step 6).
+        for top in tops {
+            let one = MountRecords {
+                top: Some(top.clone()),
+                lowers: records.lowers.clone(),
+                bundles: records.bundles,
+            };
+            match decide(&one, &canonical, header, current)? {
+                MountJournal::None | MountJournal::Own => {}
+                MountJournal::Deferred { .. } => {
+                    return Err(io::Error::other(format!(
+                        "fork-n refuses {}: commit journal changed while the mount classified it, retry",
+                        archive.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    };
+    commit_journal::recover_with(archive, &mut authorize, &mut |applied| {
+        for conn in &conns {
+            restamp_rows(conn, archive, applied, Restamp::Recovery)?;
+        }
+        Ok(())
+    })
+}
+
+/// Locator rules for a member classified [`MountJournal::None`], and the same
+/// cohort authorization if a journal appears before the lock. A journal that
+/// is Deferred and complete is not applied here: the error text starts with
+/// `fork-n defers journal` and the caller queues it for the post-open pass.
+/// An incomplete journal refuses with no write.
+pub fn recover_journal_locator(
+    archive: &Path,
+    tops: &[std::path::PathBuf],
+    records: &MountRecords,
+) -> std::result::Result<Option<Applied>, RecoverError> {
+    let mut owner = Owner::Mount {
+        records,
+        member: archive,
+    };
+    let mut authorize = |header: &PendingJournal, locked: &fs::Metadata| {
+        if !header.complete {
+            return Err(io::Error::other(format!(
+                "fork-n refuses {}: commit journal changed while the mount classified it, retry",
+                archive.display()
+            )));
+        }
+        let canonical = archive.canonicalize()?;
+        match decide(records, &canonical, header, current_identity(locked))? {
+            MountJournal::Deferred { complete: true, .. } => Err(io::Error::other(format!(
+                "fork-n defers journal {}",
+                archive.display()
+            ))),
+            MountJournal::Deferred { .. } => Err(io::Error::other(format!(
+                "fork-n refuses {}: commit journal is incomplete; recover it on a single mount or with --no-mount",
+                archive.display()
+            ))),
+            MountJournal::None | MountJournal::Own => owner.authorize(header, locked),
+        }
+    };
+    commit_journal::recover_with(archive, &mut authorize, &mut |applied| {
+        restamp_cohort_dbs(archive, tops, applied)
+    })
+}
+
+/// Post-open Deferred recovery. Every top votes under the archive lock.
+/// Incomplete, or an Own that became Deferred-incomplete, refuses with no
+/// write. `restamp` is the live overlay connections; this function does not
+/// open a second database.
+pub fn recover_journal_deferred(
+    archive: &Path,
+    tops: &[std::path::PathBuf],
+    lowers: &[std::path::PathBuf],
+    bundles: bool,
+    restamp: &mut dyn FnMut(&Applied) -> io::Result<()>,
+) -> std::result::Result<Option<Applied>, RecoverError> {
+    let mut authorize = |header: &PendingJournal, locked: &fs::Metadata| {
+        if !header.complete {
+            return Err(io::Error::other(format!(
+                "fork-n refuses {}: commit journal changed while the mount classified it, retry",
+                archive.display()
+            )));
+        }
+        let canonical = archive.canonicalize()?;
+        let current = current_identity(locked);
+        for top in tops {
+            let records = MountRecords {
+                top: Some(top.clone()),
+                lowers: lowers.to_vec(),
+                bundles,
+            };
+            match decide(&records, &canonical, header, current)? {
+                MountJournal::None | MountJournal::Own => {}
+                MountJournal::Deferred { complete: true, .. } => {}
+                MountJournal::Deferred { why, .. } => {
+                    return Err(io::Error::other(format!(
+                        "{} {why}; its commit journal changed while the mount classified it, retry",
+                        archive.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    };
+    commit_journal::recover_with(archive, &mut authorize, restamp)
+}
+
+fn refuse_nonregular_top_dbs(archive: &Path, tops: &[std::path::PathBuf]) -> io::Result<()> {
+    for top in tops {
+        let db = top.join(crate::HIDDEN_DB);
+        match fs::symlink_metadata(&db) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "fork-n refuses {}: top database {} is not a regular file",
+                    archive.display(),
+                    db.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_regular_top_dbs(tops: &[std::path::PathBuf]) -> io::Result<Vec<rusqlite::Connection>> {
+    let mut conns = Vec::new();
+    for top in tops {
+        let db = top.join(crate::HIDDEN_DB);
+        match fs::symlink_metadata(&db) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+            Ok(meta) if !meta.is_file() => continue,
+            Ok(_) => {}
+        }
+        let conn = crate::open_overlay_db(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            crate::DbName::Path,
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+        conns.push(conn);
+    }
+    Ok(conns)
+}
+
+fn restamp_cohort_dbs(
+    archive: &Path,
+    tops: &[std::path::PathBuf],
+    applied: &Applied,
+) -> io::Result<()> {
+    refuse_nonregular_top_dbs(archive, tops)?;
+    for conn in open_regular_top_dbs(tops)? {
+        restamp_rows(&conn, archive, applied, Restamp::Recovery)?;
+    }
+    Ok(())
+}
+
 /// [`recover_journal`] for callers that hold no overlay: the library and mount
 /// openers, offline commits. `overlay_db`, when it exists, is opened read-write
 /// (it is never created) BEFORE recovery starts; a database that cannot be
@@ -890,4 +1075,32 @@ where
         from.reference(original),
     )
     .map_err(|e| OverlayError::Msg(e.to_string()))
+}
+
+#[cfg(test)]
+mod fork_n_journal_tests {
+    use super::{recover_journal_cohort, MountRecords};
+    use std::os::unix::fs::symlink;
+
+    /// Regression: a dangling top database is not treated as absent, and
+    /// recovery does not start.
+    #[test]
+    fn fork_n_journal_dangling_top_db_refuses_before_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, b"not a journal").unwrap();
+        let top = dir.path().join("top");
+        std::fs::create_dir(&top).unwrap();
+        symlink("/no/such/overlay-db", top.join(crate::HIDDEN_DB)).unwrap();
+        let records = MountRecords {
+            top: Some(top.clone()),
+            lowers: Vec::new(),
+            bundles: false,
+        };
+        let err = recover_journal_cohort(&archive, std::slice::from_ref(&top), &records)
+            .expect_err("dangling database");
+        let text = err.to_string();
+        assert!(text.contains("not a regular file"), "{text}");
+        assert_eq!(std::fs::read(&archive).unwrap(), b"not a journal");
+    }
 }

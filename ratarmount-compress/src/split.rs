@@ -199,7 +199,7 @@ pub fn materialize_joined_parts(parts: &[PathBuf]) -> io::Result<(NamedTempFile,
     let mut tmp = NamedTempFile::new()?;
     let mut total = 0u64;
     for p in parts {
-        let mut f = File::open(p)?;
+        let mut f = ratarmount_core::fork_n::open_admitted(p)?;
         let n = io::copy(&mut f, &mut tmp)?;
         total += n;
     }
@@ -263,7 +263,7 @@ impl Read for JoinedFile {
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "joined eof"))?;
         // Reopen if needed
         if !matches!(&self.open, Some((i, _)) if *i == idx) {
-            let f = File::open(&self.parts[idx].0)?;
+            let f = ratarmount_core::fork_n::open_admitted(&self.parts[idx].0)?;
             self.open = Some((idx, f));
         }
         let file = &mut self.open.as_mut().unwrap().1;

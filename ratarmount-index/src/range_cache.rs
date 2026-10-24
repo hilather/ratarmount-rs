@@ -699,6 +699,7 @@ fn check_cache_dirs(root: &Path, fan: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
+    ratarmount_core::fork_n::admit(path, false, None)?;
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(io::Error::other("cache entry is not a regular file"));
     }

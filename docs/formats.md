@@ -250,6 +250,13 @@ The complete status against the Python original is in the
    check: a bind created later, mount propagation from another namespace or an ancestor
    rename after mounting are not caught, mount propagation flags are not read (a private
    bind is refused too), and `--corpus` members are not checked.
+7. **Fork-N (`--top` / `--mount`).** FUSE only. A regular file with more than one
+   hard link, a dependency that canonicalizes under a mountpoint or another top,
+   and an occupied or non-empty mountpoint are refused. Daemon mode refuses torrent
+   inputs. Constructors without storage coverage, in-memory SQLite, compact-shell
+   SQLite, and SQLAR refuse daemon Fork-N; foreground of those constructors refuses
+   on missing storage coverage. A top inside the directory base stays visible on the
+   other top's path. Commits of the layered stack are refused.
 
 Remote, export and platform limits are listed with their own guides:
 [Remote inputs](phase10-remote.md#not-yet) · [NFS](nfs-export.md) · [other exports](export.md) · [macOS](macos.md).

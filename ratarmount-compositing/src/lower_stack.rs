@@ -42,13 +42,13 @@ pub struct LowerStackServices<'a> {
 
 /// One `--lower` stack, bottom-up, and the identity recorded for its bottom layer.
 pub struct MountLowerStack {
-    pub layers: Vec<(PathBuf, Immutability)>,
-    pub records: Vec<LowerLayerRecord>,
+    layers: Vec<(PathBuf, Immutability)>,
+    records: Vec<LowerLayerRecord>,
     /// Identity of the base this stack is mounted on. The mount callback's
     /// value when the opener enforced one (empty when unknown), otherwise the
     /// digest recorded by the bottom lower. `None` means that lower recorded
     /// no digest; `Some("")` means it recorded an empty one.
-    pub base_digest: Option<String>,
+    base_digest: Option<String>,
 }
 
 enum Bottom<'a> {
@@ -57,6 +57,21 @@ enum Bottom<'a> {
 }
 
 impl MountLowerStack {
+    /// Layers this stack opened, bottom-up.
+    pub fn layers(&self) -> &[(PathBuf, Immutability)] {
+        &self.layers
+    }
+
+    /// Records written into a top's `lower_layers` metadata.
+    pub fn records(&self) -> &[LowerLayerRecord] {
+        &self.records
+    }
+
+    /// Identity of the base this stack is mounted on.
+    pub fn base_digest(&self) -> Option<&str> {
+        self.base_digest.as_deref()
+    }
+
     /// Open the same sealed lower stack used by the mount CLI for offline consumers.
     pub fn compose(
         base: Arc<dyn MountSource>,
@@ -263,6 +278,7 @@ impl MountLowerStack {
         metadata
     }
 
+    /// Refuse a sealed top. A lower_layers mismatch is refused unless force records stack_mismatch_forced_at; force does not rewrite lower_layers.
     pub fn check_top(&self, dir: &Path, force: bool) -> Result<(), String> {
         // A missing, unreadable, corrupt or locked database is left to
         // `WriteOverlay::new`, whose errors name the file and the way out

@@ -648,6 +648,10 @@ pub trait OverlayPolicy: Send + Sync {
     fn bytes_changed(&self, _path: &str, _added: u64, _removed: u64) {}
     fn file_created(&self, _path: &str) {}
     fn file_removed(&self, _path: &str) {}
+    /// Rebuild counters from the overlay directory. The default is a no-op.
+    fn rescan(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 // Snapshot around a host mutation, including failed/partial operations. This
@@ -850,6 +854,65 @@ impl WriteOverlay {
     /// Install before sharing the overlay with frontends. `None` disables hooks.
     pub fn set_policy(&mut self, policy: Option<Arc<dyn OverlayPolicy>>) {
         self.policy = policy;
+    }
+
+    /// Rebuild the installed quota from the overlay directory.
+    pub fn rescan_quota(&self) -> Result<()> {
+        if let Some(policy) = &self.policy {
+            policy.rescan().map_err(OverlayError::Io)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the on-disk SQLite connection so a later `fork` does not inherit it.
+    /// Lock order: `pending_rows`, then `db`.
+    pub fn release_connection(&self) -> Result<()> {
+        let _pending = self.pending_rows.lock().unwrap_or_else(|e| e.into_inner());
+        let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        *db = Connection::open_in_memory()?;
+        Ok(())
+    }
+
+    /// Open a fresh connection, take `LOCKING_MODE=EXCLUSIVE`, then
+    /// `BEGIN EXCLUSIVE; COMMIT;`, and reload tombstones.
+    /// Lock order: `pending_rows`, then `db`, then `tombstones`.
+    pub fn reacquire_exclusive(&self) -> Result<()> {
+        let _pending = self.pending_rows.lock().unwrap_or_else(|e| e.into_inner());
+        let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        let path = self.root.join(HIDDEN_DB);
+        let conn = crate::open_overlay_db(&path, OpenFlags::default(), crate::DbName::Path)?;
+        conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
+        conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        // Re-read seal, stack, and tombstones from this connection. A cached
+        // view from the parent is not the child's record.
+        let meta = crate::OverlayMeta::from_connection(&conn)?.unwrap_or_default();
+        let _seal = meta.layer_sealed();
+        let _stack = meta.stack_digest().map(str::to_string);
+        let _layers = meta.lower_layers()?;
+        let tombs = tombstone_set_from_conn(&conn)?;
+        *db = conn;
+        drop(db);
+        *self.tombstones.lock().unwrap_or_else(|e| e.into_inner()) = tombs;
+        Ok(())
+    }
+
+    /// Restamp this overlay's live connection from a recovery that already
+    /// holds the archive lock. Does not open a second database.
+    pub fn restamp_committed(
+        &self,
+        archive: &Path,
+        applied: &ratarmount_compress::commit_journal::Applied,
+    ) -> Result<()> {
+        let _pending = self.pending_rows.lock().unwrap_or_else(|e| e.into_inner());
+        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::journal_recovery::restamp_rows(
+            &db,
+            archive,
+            applied,
+            crate::journal_recovery::Restamp::Recovery,
+        )
+        .map_err(OverlayError::Io)?;
+        Ok(())
     }
 
     fn policy_lock(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
@@ -1069,6 +1132,26 @@ impl WriteOverlay {
         Self::open_with_create_info(composed, overlay.as_ref(), Some(&info), Some(base))
     }
 
+    /// Open one top using excludes captured before the factory. `None` is
+    /// [`crate::overlay_meta::ExcludeMode::Frozen`] with no directory set
+    /// (archive, Git, remote, composite): `plan_excludes` is not called.
+    pub fn open_with_frozen_excludes(
+        base: &crate::ClassifiedBase,
+        composed: Arc<dyn MountSource>,
+        overlay: impl AsRef<Path>,
+        options: &crate::CreateOptions,
+        frozen: Option<&crate::BaseExcludes>,
+    ) -> Result<Self> {
+        let info = base.actual().create_info(options);
+        Self::open_with_excludes(
+            composed,
+            overlay.as_ref(),
+            Some(&info),
+            Some(base),
+            Some(frozen),
+        )
+    }
+
     /// In-crate tests only: open with a hand-built creation record.
     #[cfg(test)]
     pub(crate) fn new_with_create_info_for_tests(
@@ -1085,12 +1168,27 @@ impl WriteOverlay {
         info: Option<&crate::overlay_meta::OverlayCreateInfo>,
         identity: Option<&crate::ClassifiedBase>,
     ) -> Result<Self> {
+        Self::open_with_excludes(base, overlay, info, identity, None)
+    }
+
+    /// `frozen == None` plans excludes the way a single `-w` open does.
+    /// `Some` is a pre-factory capture: `plan_excludes` is not called.
+    fn open_with_excludes(
+        base: Arc<dyn MountSource>,
+        overlay: &Path,
+        info: Option<&crate::overlay_meta::OverlayCreateInfo>,
+        identity: Option<&crate::ClassifiedBase>,
+        frozen: Option<Option<&crate::BaseExcludes>>,
+    ) -> Result<Self> {
         // Before the directory is created: the topmost-new exclusion rule
         // depends on which parents of the overlay exist right now.
-        let exclude_plan = info
-            .map(|info| crate::overlay_meta::plan_excludes(info, overlay))
-            .transpose()?
-            .flatten();
+        let exclude_plan = match frozen {
+            None => info
+                .map(|info| crate::overlay_meta::plan_excludes(info, overlay))
+                .transpose()?
+                .flatten(),
+            Some(excludes) => crate::overlay_meta::frozen_exclude_plan(info, overlay, excludes)?,
+        };
         let root = overlay.to_path_buf();
         if root.exists() {
             if !root.is_dir() {

@@ -41,6 +41,8 @@ mod corpus;
 mod diff;
 mod export_index;
 mod find;
+mod fork_n;
+mod fork_n_serve;
 mod journal_cmd;
 mod mount_guard;
 mod overlay_cmd;
@@ -79,7 +81,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   Datasets: ratarmount shard INPUT -o OUTPUT; ratarmount export-index ARCHIVE --format parquet|jsonl|csv.\n\
                   Snapshots: ratarmount snapshot add DIR --repo REPO [--init]; ratarmount snapshot list --repo REPO."
 )]
-#[command(group(clap::ArgGroup::new("overlay_target").args(["write_overlay", "overlay_tmpfs", "sandbox"]).multiple(true)))]
+#[command(group(clap::ArgGroup::new("overlay_target").args(["write_overlay", "overlay_tmpfs", "sandbox", "top", "mount"]).multiple(true)))]
 struct Args {
     /// Unmount the given mountpoint(s)
     ///
@@ -520,6 +522,14 @@ struct Args {
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
 
+    /// Writable top for Fork-N, `NAME=DIR` (repeatable). Pair with `--mount` of the same name.
+    #[arg(long = "top", value_name = "NAME=DIR", action = ArgAction::Append)]
+    top: Vec<String>,
+
+    /// Host mountpoint for a Fork-N top, `NAME=PATH` (repeatable). Pair with `--top` of the same name.
+    #[arg(long = "mount", value_name = "NAME=PATH", action = ArgAction::Append)]
+    mount: Vec<String>,
+
     /// Read-only overlay layer (repeatable, bottom to top).
     #[arg(long, value_name = "DIR", action = ArgAction::Append)]
     lower: Vec<PathBuf>,
@@ -621,7 +631,7 @@ struct Args {
     /// Roll a numbered .tar/.tar.zst series before a commit reaches a new UTC
     /// time bucket or after its active archive reaches SIZE (1d, 6h, 20G, 1d,20G).
     /// Implies --commit-overlay-on-exit; use --commit-overlay-interval for live rolls.
-    #[arg(long, value_name = "DURATION|SIZE", value_parser = clap::value_parser!(ratarmount_compositing::RollPolicy), requires = "write_overlay", conflicts_with_all = ["commit_overlay", "repack_seekable", "publish_index", "publish_index_to", "index_id", "disable_union_mount"])]
+    #[arg(long, value_name = "DURATION|SIZE", value_parser = clap::value_parser!(ratarmount_compositing::RollPolicy), conflicts_with_all = ["commit_overlay", "repack_seekable", "publish_index", "publish_index_to", "index_id", "disable_union_mount"])]
     roll_every: Option<ratarmount_compositing::RollPolicy>,
 
     /// Write an atomic <archive>.manifest.jsonl after a successful TAR commit.
@@ -745,7 +755,11 @@ struct Args {
 /// `--base-digest` and `--force-stack-mismatch` apply to a write overlay or to a
 /// read-only `--lower` stack; clap's `requires` cannot express that OR.
 fn base_flag_needs_target_or_lower(args: &Args) -> Result<(), clap::Error> {
-    let target = args.write_overlay.is_some() || args.overlay_tmpfs.is_some() || args.sandbox;
+    let target = args.write_overlay.is_some()
+        || args.overlay_tmpfs.is_some()
+        || args.sandbox
+        || !args.top.is_empty()
+        || !args.mount.is_empty();
     for (given, flag) in [
         (args.base_digest.is_some(), "--base-digest"),
         (args.force_stack_mismatch, "--force-stack-mismatch"),
@@ -782,6 +796,102 @@ fn parse_torrent_lsd(value: &str) -> Result<bool, String> {
 /// `find`, then parse the existing CLI. A clap `Subcommand` is hostile here:
 /// flags after the verb are unknown unless every `Args` field is `global = true`,
 /// which would also treat a later positional `serve`/`find` as the subcommand.
+fn fork_n_commit_requested(args: &Args) -> bool {
+    args.commit_overlay
+        || args.commit_overlay_on_exit
+        || args.commit_overlay_interval != "0"
+        || args.roll_every.is_some()
+}
+
+/// `NAME=PATH`, split on the first `=`. Empty name or path is an error.
+fn split_fork_assign(flag: &str, raw: &str) -> Result<(String, PathBuf), clap::Error> {
+    let Some((name, path)) = raw.split_once('=') else {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            format!("fork-n {flag} requires NAME=PATH, got {raw:?}"),
+        ));
+    };
+    if name.is_empty() || path.is_empty() {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            format!("fork-n {flag} requires a non-empty name and path, got {raw:?}"),
+        ));
+    }
+    Ok((name.to_string(), PathBuf::from(path)))
+}
+
+fn validate_fork_n(args: &Args, find: bool) -> Result<(), clap::Error> {
+    let mut tops = Vec::new();
+    let mut mounts = Vec::new();
+    for raw in &args.top {
+        let (name, path) = split_fork_assign("--top", raw)?;
+        if tops.iter().any(|(n, _)| n == &name) {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!("fork-n --top name {name:?} is repeated"),
+            ));
+        }
+        tops.push((name, path));
+    }
+    for raw in &args.mount {
+        let (name, path) = split_fork_assign("--mount", raw)?;
+        if mounts.iter().any(|(n, _)| n == &name) {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!("fork-n --mount name {name:?} is repeated"),
+            ));
+        }
+        mounts.push((name, path));
+    }
+    if tops.is_empty() || mounts.is_empty() || tops.len() != mounts.len() {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "fork-n requires --top and --mount with the same names",
+        ));
+    }
+    let mut top_names: Vec<&str> = tops.iter().map(|(n, _)| n.as_str()).collect();
+    let mut mount_names: Vec<&str> = mounts.iter().map(|(n, _)| n.as_str()).collect();
+    top_names.sort_unstable();
+    mount_names.sort_unstable();
+    if top_names != mount_names {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "fork-n --top and --mount name sets differ",
+        ));
+    }
+    let conflicts: &[(&str, bool)] = &[
+        ("-w/--write-overlay", args.write_overlay.is_some()),
+        ("--overlay-tmpfs", args.overlay_tmpfs.is_some()),
+        ("--sandbox", args.sandbox),
+        ("--no-mount", args.no_mount),
+        ("--nfs", args.nfs),
+        ("--http", args.http),
+        ("--webdav", args.webdav),
+        ("--smb", args.smb),
+        ("--ninep", args.ninep),
+        ("--sftp", args.sftp),
+        ("--sftp-subsystem", args.sftp_subsystem),
+        ("--control-interface", args.control_interface),
+        ("--journal", args.journal.is_some()),
+        ("find", find),
+        ("--unmount", args.unmount),
+        ("--repack-seekable", args.repack_seekable),
+        (
+            "--publish-index",
+            args.publish_index || args.publish_index_to.is_some(),
+        ),
+    ];
+    for (flag, set) in conflicts {
+        if *set {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!("fork-n cannot be combined with {flag}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_args_from<I, T>(iter: I) -> Result<Args, clap::Error>
 where
     I: IntoIterator<Item = T>,
@@ -859,6 +969,12 @@ where
     if raw.get(1).is_some_and(|s| s == "corpus") {
         let argv = std::iter::once(raw[0].clone()).chain(raw.iter().skip(2).cloned());
         let mut args = Args::try_parse_from(argv)?;
+        if !args.top.is_empty() || !args.mount.is_empty() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "corpus cannot be combined with --top or --mount",
+            ));
+        }
         if args.paths.len() != 2
             || args.no_mount
             || args.write_overlay.is_some()
@@ -875,6 +991,13 @@ where
         {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
                 "corpus requires LIST-FILE MOUNTPOINT; it is read-only and cannot combine with --no-mount, --bind or Git selectors"));
+        }
+        // Fork-N already returned above, so this does not run for --top/--mount.
+        if args.roll_every.is_some() && args.write_overlay.is_none() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--roll-every requires --write-overlay",
+            ));
         }
         args.corpus_list = Some(args.paths[0].clone());
         args.lazy = true;
@@ -906,6 +1029,26 @@ where
         return Err(clap::Error::raw(
             clap::error::ErrorKind::ArgumentConflict,
             "--seed requires a build with --features bittorrent",
+        ));
+    }
+    let fork_n = !args.top.is_empty() || !args.mount.is_empty();
+    if fork_n {
+        validate_fork_n(&args, find)?;
+    }
+    // Non-Fork-N only. Fork-N with --roll-every and no -w is the flatten refusal below.
+    if !fork_n && args.roll_every.is_some() && args.write_overlay.is_none() {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--roll-every requires --write-overlay",
+        ));
+    }
+    // Flatten is before the find/bind check. Fork-N + --roll-every + --bind still
+    // gets this sentence. One commit flag per test: --commit-overlay conflicts
+    // with --roll-every in clap and never reaches here together.
+    if fork_n && fork_n_commit_requested(&args) {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "commit of a layered stack is not supported; flatten first",
         ));
     }
     if args.roll_every.is_some() {
@@ -1405,8 +1548,9 @@ struct MountedBase {
 /// recorded identity. Offline commands use [`MountLowerStack::open`] /
 /// [`MountLowerStack::open_in`], which read the recorded digest and do not
 /// take this policy.
-enum BaseIdentity {
-    Enforce { base: MountedBase, force: bool },
+struct BaseIdentity {
+    base: MountedBase,
+    force: bool,
 }
 
 /// Compare the mounted base with what the bottom lower recorded, using
@@ -1476,8 +1620,8 @@ fn mounted_base_identity(
 fn bottom_identity<'a>(
     identity: &'a BaseIdentity,
 ) -> impl Fn(&Path, Option<&ratarmount_compositing::OverlayMeta>) -> Result<String, String> + 'a {
-    let BaseIdentity::Enforce { base, force } = identity;
-    let force = *force;
+    let base = &identity.base;
+    let force = identity.force;
     move |path, meta| mounted_base_identity(path, meta, base, force)
 }
 
@@ -1786,6 +1930,10 @@ fn main() {
         std::process::exit(2);
     }
 
+    if !args.top.is_empty() || !args.mount.is_empty() {
+        fork_n::run(&args);
+    }
+
     let (source_paths, mountpoint) = split_bound_inputs_mountpoint(&args);
     // Metadata labels also include bound sources; factory gets positional paths
     // separately so every explicit bind is opened exactly once.
@@ -2075,7 +2223,10 @@ fn main() {
     }
     // A `-w` or `--lower` mount classifies its base: the kind and place the
     // factory actually served are what the overlay records and compares.
-    let wants_identity = args.write_overlay.is_some() || !args.lower.is_empty();
+    let wants_identity = args.write_overlay.is_some()
+        || !args.lower.is_empty()
+        || !args.top.is_empty()
+        || !args.mount.is_empty();
     let factory_paths: Vec<PathBuf> = if args.corpus_list.is_some() || rolling.is_some() {
         Vec::new()
     } else {
@@ -2293,7 +2444,7 @@ fn main() {
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
     let lower_key = lower_key_for(&args, rolling.is_some(), &inputs, index_sidecar.as_deref());
-    let lower_identity = BaseIdentity::Enforce {
+    let lower_identity = BaseIdentity {
         base: MountedBase {
             extra_excludes: lower_extra_excludes(
                 inputs.first().map(PathBuf::as_path),
@@ -2348,7 +2499,7 @@ fn main() {
         let create_options = ratarmount_compositing::CreateOptions {
             base_digest: args.base_digest.clone().unwrap_or_default(),
             force_base_mismatch: args.force_base_mismatch,
-            lower_layers: lower_stack.records.clone(),
+            lower_layers: lower_stack.records().to_vec(),
             index_writable: !open_opts.read_only_index,
             // Journal and lower layers inside a directory base stay out of its
             // digest. A mount point inside it is refused by `mount_guard`.
@@ -2356,7 +2507,7 @@ fn main() {
                 .journal
                 .iter()
                 .cloned()
-                .chain(lower_stack.records.iter().map(|r| r.path.clone()))
+                .chain(lower_stack.records().iter().map(|r| r.path.clone()))
                 .collect(),
             remote_token: None,
         };
@@ -4800,6 +4951,11 @@ fn redirect_stdio_to_null() -> std::io::Result<()> {
 }
 
 fn split_bound_inputs_mountpoint(args: &Args) -> (Vec<PathBuf>, Option<PathBuf>) {
+    // Fork-N mountpoints come from --mount. Every positional stays a source,
+    // including --bind plus one directory (that directory is not stolen).
+    if !args.top.is_empty() || !args.mount.is_empty() {
+        return (args.paths.clone(), None);
+    }
     // With binds and one local positional, use that positional as the explicit
     // mountpoint. Export-only commands keep their positional source as before.
     if !args.source_binds.is_empty()
@@ -8544,7 +8700,27 @@ mod rolling_cli_tests {
             argv.extend(extra);
             assert!(parse_args_from(argv).is_err());
         }
-        assert!(Args::try_parse_from(["ratarmount", "--roll-every", "1d", "traces.tar"]).is_err());
+        let no_w = parse_args_from(["ratarmount", "--roll-every", "1d", "traces.tar"]).unwrap_err();
+        assert!(
+            no_w.to_string()
+                .contains("--roll-every requires --write-overlay"),
+            "{no_w}"
+        );
+        let corpus_roll = parse_args_from([
+            "ratarmount",
+            "corpus",
+            "LIST",
+            "MOUNT",
+            "--roll-every",
+            "1d",
+        ])
+        .unwrap_err();
+        assert!(
+            corpus_roll
+                .to_string()
+                .contains("--roll-every requires --write-overlay"),
+            "{corpus_roll}"
+        );
         assert!(Args::try_parse_from([
             "ratarmount",
             "-w",
@@ -8819,8 +8995,8 @@ mod lower_stack_tests {
         };
         assert!(open(false).err().unwrap().contains("unsealed"));
         let stack = open(true).unwrap();
-        assert_eq!(stack.layers[0].1, Immutability::Shared);
-        assert!(stack.records[0].layer_digest.is_empty());
+        assert_eq!(stack.layers()[0].1, Immutability::Shared);
+        assert!(stack.records()[0].layer_digest.is_empty());
         let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
         conn.execute_batch("DROP TABLE meta").unwrap();
         drop(conn);
@@ -8831,7 +9007,7 @@ mod lower_stack_tests {
             .unwrap();
         OverlayMeta::set(&conn, "sealed_at", "2026-10-17T00:00:00Z").unwrap();
         drop(conn);
-        assert_eq!(open(false).unwrap().layers[0].1, Immutability::Immutable);
+        assert_eq!(open(false).unwrap().layers()[0].1, Immutability::Immutable);
     }
 
     /// A sealed lower over `base` whose recorded identity is `meta`.
@@ -8860,7 +9036,7 @@ mod lower_stack_tests {
     }
 
     fn enforce(base: &Path, force: bool) -> BaseIdentity {
-        BaseIdentity::Enforce {
+        BaseIdentity {
             base: MountedBase {
                 classified: Some(base_identity::fixtures::classify(base)),
                 ..Default::default()

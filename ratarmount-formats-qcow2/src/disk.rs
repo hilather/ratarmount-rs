@@ -1,7 +1,6 @@
 //! QCOW2 v2/v3 header parse and guest-cluster mapping (`Read + Seek` of the
 //! virtual disk). Partitioning is the block crate's job.
 
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -142,7 +141,7 @@ impl Qcow2VirtualDisk {
 
     /// Open a QCOW2 image from a host path (resolves relative backing files).
     pub fn open_path(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
+        let file = ratarmount_core::fork_n::open_admitted(path)?;
         Self::open_from_reader(file, path, path.parent())
     }
 
@@ -576,7 +575,7 @@ fn open_backing(name: &str, backing_dir: Option<&Path>, depth: u32) -> Result<Ba
             path.display()
         )));
     }
-    let mut file = File::open(&path)?;
+    let mut file = ratarmount_core::fork_n::open_admitted(&path)?;
     match qcow_magic_version(&mut file) {
         Some(2 | 3) => {
             file.seek(SeekFrom::Start(0))?;
@@ -732,13 +731,33 @@ pub fn parse_qcow2_header<R: Read + Seek>(reader: &mut R) -> Result<Qcow2Header>
     })
 }
 
+std::thread_local! {
+    static PROBE_REFUSAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A fork-n refusal from the last [`looks_like_qcow2`] on this thread.
+/// Returning `false` from the probe would let the factory try another backend
+/// and swallow the refusal, so the probe returns `true` and parks the error
+/// for [`crate::Qcow2MountSource::open`].
+pub(crate) fn take_probe_refusal() -> Option<String> {
+    PROBE_REFUSAL.with(|slot| slot.borrow_mut().take())
+}
+
 /// Detect QCOW2 (`QFI\xfb` + version 2 or 3). No extension fallback.
 pub fn looks_like_qcow2(path: &Path) -> bool {
-    let mut f = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    looks_like_qcow2_reader(&mut f)
+    PROBE_REFUSAL.with(|slot| *slot.borrow_mut() = None);
+    match ratarmount_core::fork_n::open_admitted(path) {
+        Ok(mut file) => looks_like_qcow2_reader(&mut file),
+        Err(err) => {
+            let message = err.to_string();
+            if message.starts_with("fork-n ") {
+                PROBE_REFUSAL.with(|slot| *slot.borrow_mut() = Some(message));
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 /// `Some(version)` when the first 8 bytes are `QFI\xfb` + a version word.
@@ -782,4 +801,85 @@ pub(crate) fn write_qcow2_v2_header(
         hdr.extend_from_slice(name.as_bytes());
     }
     hdr
+}
+
+#[cfg(test)]
+mod fork_n_backing {
+    use super::*;
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    /// Regression: QCOW2 `open_backing` admits after `is_file` and before any
+    /// `File::open`. A missing file still returns at `is_file` and is not the
+    /// absent-component proof.
+    #[test]
+    fn fork_n_self_reopen_backing_under_mountpoint() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let mp = dir.path().join("mnt");
+        let top = dir.path().join("top");
+        std::fs::create_dir(&mp).unwrap();
+        std::fs::create_dir(&top).unwrap();
+        let missing = mp.join("missing.raw");
+        ratarmount_core::fork_n::test_reset_spies();
+        ratarmount_core::fork_n::install(
+            vec![top.canonicalize().unwrap()],
+            vec![mp.canonicalize().unwrap()],
+        );
+        let missing_err = match open_backing(missing.to_str().unwrap(), None, 0) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("missing backing must fail at is_file"),
+        };
+        assert!(missing_err.contains("not found"), "{missing_err}");
+        assert_eq!(ratarmount_core::fork_n::test_open_count(), 0);
+        assert!(!missing.exists());
+
+        let backing = mp.join("disk.raw");
+        std::fs::write(&backing, b"raw-backing").unwrap();
+        ratarmount_core::fork_n::test_reset_spies();
+        let err = match open_backing(backing.to_str().unwrap(), None, 0) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("backing under a mountpoint must be refused"),
+        };
+        assert!(err.contains(&backing.display().to_string()), "{err}");
+        assert_eq!(
+            ratarmount_core::fork_n::test_open_count(),
+            0,
+            "admit must refuse before File::open"
+        );
+
+        let ok = dir.path().join("ok.qcow2");
+        std::fs::write(&ok, write_qcow2_v2_header(9, 512, 0, 0, None)).unwrap();
+        ratarmount_core::fork_n::test_reset_spies();
+        let opened = open_backing(ok.to_str().unwrap(), None, 0);
+        let detail = match &opened {
+            Ok(_) => "ok".to_string(),
+            Err(err) => err.to_string(),
+        };
+        assert_eq!(
+            ratarmount_core::fork_n::test_open_count(),
+            1,
+            "accepted backing is opened once by admit: {detail}"
+        );
+
+        let image = mp.join("under.qcow2");
+        std::fs::write(&image, write_qcow2_v2_header(9, 512, 0, 0, None)).unwrap();
+        ratarmount_core::fork_n::test_reset_spies();
+        assert!(
+            looks_like_qcow2(&image),
+            "a refusal must not look like a different format"
+        );
+        let refused = match crate::Qcow2MountSource::open(&image) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("image under a mountpoint must be refused"),
+        };
+        assert!(refused.contains("fork-n "), "{refused}");
+        assert_eq!(
+            ratarmount_core::fork_n::test_open_count(),
+            0,
+            "probe refusal must not File::open"
+        );
+        ratarmount_core::fork_n::uninstall();
+    }
 }

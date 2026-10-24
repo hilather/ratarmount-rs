@@ -62,6 +62,9 @@ impl Qcow2MountSource {
                 path.display()
             )));
         }
+        if let Some(message) = disk::take_probe_refusal() {
+            return Err(Qcow2Error::Msg(message));
+        }
         let disk = Qcow2VirtualDisk::open_path(path)?;
         mount_virtual_disk(disk, path)
     }

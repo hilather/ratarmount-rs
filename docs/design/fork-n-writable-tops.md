@@ -327,7 +327,7 @@ PR2 proposes a two-phase opaque compositing API:
    exclusions are retained separately below, even after the journal exists.
    This preserves `lower_extra_excludes`'s missing-versus-recorded journal
    rule (`main.rs:5066`–`:5070`, `:5082`, `:5094`) before the comparator unions
-   inputs (`overlay_meta.rs:1515`).
+   inputs (`overlay_meta.rs:1519`–`:1520`).
 2. `observed.bind(classified, digest_request)` runs after the factory returns
    its actual `ClassifiedBase` and produces `FrozenBaseExcludes`: the canonical
    eligible directory base, one aggregate `BaseExcludes`, and each top's own
@@ -387,7 +387,7 @@ The exact snapshot carriers are:
    `mounted_base_identity`, which supplies that vector to
    `overlay_gate::BaseProbe.extra_excludes` (`main.rs:1434`–`:1439`).
    `overlay_gate::content_probe` (`overlay_gate.rs:187`–`:201`) forwards it into
-   `overlay_meta::compare_content`'s directory walk (`overlay_meta.rs:1515`–`:1523`), unioned
+   `overlay_meta::compare_content`'s directory walk (`overlay_meta.rs:1519`–`:1523`), unioned
    with the bottom lower's recorded exclusions. This is how the **same
    pre-factory set reaches the hasher after factory/top/mountpoint mkdirs**.
    Binding does not recapture it. Do not substitute

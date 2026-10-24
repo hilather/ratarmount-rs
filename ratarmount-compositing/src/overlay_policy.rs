@@ -534,6 +534,16 @@ impl OverlayQuota {
         self
     }
 
+    /// Rescan the locked directory and replace the byte and file counters.
+    pub fn rescan(&self) -> io::Result<QuotaUsage> {
+        let usage = OverlayUsage::scan(&self.root)?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.bytes = usage.bytes;
+        state.files = usage.files;
+        drop(state);
+        Ok(self.usage())
+    }
+
     pub fn usage(&self) -> QuotaUsage {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         QuotaUsage {
@@ -572,6 +582,14 @@ impl OverlayQuota {
 }
 
 impl OverlayPolicy for OverlayQuota {
+    fn rescan(&self) -> io::Result<()> {
+        let usage = OverlayUsage::scan(&self.root)?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.bytes = usage.bytes;
+        state.files = usage.files;
+        Ok(())
+    }
+
     fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.cow.mutation(op, paths);
@@ -660,6 +678,12 @@ impl OverlayPolicy for CompositeOverlayPolicy {
         for policy in &self.0 {
             policy.file_removed(path);
         }
+    }
+    fn rescan(&self) -> io::Result<()> {
+        for policy in &self.0 {
+            policy.rescan()?;
+        }
+        Ok(())
     }
 }
 

@@ -467,7 +467,178 @@ struct BudgetConnection {
     inner: Arc<Mutex<Connection>>,
     memory: Arc<Mutex<Option<ratarmount_core::budget::Reservation>>>,
     bytes: u64,
-    _shrink: Option<ratarmount_core::budget::PressureHook>,
+    /// Held so [`close_disk_sqlite_for_fork`] can drop the pressure hook.
+    #[allow(dead_code)]
+    shrink: std::sync::Arc<Mutex<Option<ratarmount_core::budget::PressureHook>>>,
+    /// Counted in the Fork-N parent SQLite set while daemon preparation is on.
+    fork_tracked: bool,
+}
+
+struct ForkDiskConn {
+    inner: std::sync::Weak<Mutex<Connection>>,
+    memory: std::sync::Weak<Mutex<Option<ratarmount_core::budget::Reservation>>>,
+    shrink: std::sync::Weak<Mutex<Option<ratarmount_core::budget::PressureHook>>>,
+}
+
+static FORK_DISK_CONNS: Mutex<Vec<ForkDiskConn>> = Mutex::new(Vec::new());
+
+struct ForkReopen {
+    inner: std::sync::Weak<Mutex<Connection>>,
+    path: PathBuf,
+    /// `-wal` and `-journal` length and mtime, captured before the swap.
+    stamp: (u64, i64, u64, i64),
+}
+
+static FORK_REOPEN: Mutex<Vec<ForkReopen>> = Mutex::new(Vec::new());
+
+fn sidecar_stamp(db: &Path) -> (u64, i64, u64, i64) {
+    fn one(path: &Path) -> (u64, i64) {
+        match std::fs::symlink_metadata(path) {
+            #[cfg(unix)]
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                (meta.len(), meta.mtime())
+            }
+            #[cfg(not(unix))]
+            Ok(meta) => (meta.len(), 0),
+            Err(_) => (0, 0),
+        }
+    }
+    let wal = one(&sqlite_path_companion(db, "-wal"));
+    let journal = one(&sqlite_path_companion(db, "-journal"));
+    (wal.0, wal.1, journal.0, journal.1)
+}
+
+/// Close every disk SQLite connection opened during Fork-N preparation and
+/// drop them from the worker-free count. In-memory shells are left alone.
+/// A failed detach leaves the error with the caller and does not fork.
+/// The child puts the same connection back with [`reopen_disk_sqlite_after_fork`].
+pub fn close_disk_sqlite_for_fork() -> std::result::Result<(), String> {
+    let tracked = std::mem::take(&mut *FORK_DISK_CONNS.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut staged = Vec::new();
+    let mut detach_error = None;
+    for item in &tracked {
+        let Some(inner) = item.inner.upgrade() else {
+            continue;
+        };
+        let conn = inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(path) = conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+        else {
+            drop(conn);
+            continue;
+        };
+        drop(conn);
+        let stamp = sidecar_stamp(&path);
+        let mem = match Connection::open_in_memory() {
+            Ok(mem) => mem,
+            Err(err) => {
+                detach_error = Some(format!("fork-n cannot detach {}: {err}", path.display()));
+                break;
+            }
+        };
+        staged.push((
+            inner,
+            path,
+            stamp,
+            mem,
+            item.memory.clone(),
+            item.shrink.clone(),
+        ));
+    }
+    if let Some(err) = detach_error {
+        drop(staged);
+        // Nothing has been swapped. Put the parent connections back.
+        *FORK_DISK_CONNS.lock().unwrap_or_else(|e| e.into_inner()) = tracked;
+        return Err(err);
+    }
+    let mut reopen = Vec::new();
+    for (inner, path, stamp, mem, memory, shrink) in staged {
+        if let Some(slot) = memory.upgrade() {
+            slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+        if let Some(slot) = shrink.upgrade() {
+            slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+        *inner.lock().unwrap_or_else(|e| e.into_inner()) = mem;
+        ratarmount_core::fork_n::unregister_sqlite();
+        reopen.push(ForkReopen {
+            inner: std::sync::Arc::downgrade(&inner),
+            path,
+            stamp,
+        });
+    }
+    *FORK_REOPEN.lock().unwrap_or_else(|e| e.into_inner()) = reopen;
+    Ok(())
+}
+
+/// Reopen each disk index the parent detached. A WAL or rollback-journal
+/// change since the detach refuses, and so does a dropped hook. No session
+/// may start after `Err`.
+pub fn reopen_disk_sqlite_after_fork() -> std::result::Result<(), String> {
+    let snaps = std::mem::take(&mut *FORK_REOPEN.lock().unwrap_or_else(|e| e.into_inner()));
+    for snap in snaps {
+        let now = sidecar_stamp(&snap.path);
+        if now != snap.stamp {
+            return Err(format!(
+                "fork-n refuses {}: WAL changed before the child reopened the index",
+                snap.path.display()
+            ));
+        }
+        let Some(inner) = snap.inner.upgrade() else {
+            return Err(format!(
+                "fork-n refuses {}: source index hook was dropped before reopen",
+                snap.path.display()
+            ));
+        };
+        let conn = Connection::open_with_flags(
+            &snap.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|err| {
+            format!(
+                "fork-n refuses {}: cannot reopen index: {err}",
+                snap.path.display()
+            )
+        })?;
+        conn.execute_batch("PRAGMA query_only = ON;")
+            .map_err(|err| {
+                format!(
+                    "fork-n refuses {}: cannot reopen index: {err}",
+                    snap.path.display()
+                )
+            })?;
+        *inner.lock().unwrap_or_else(|e| e.into_inner()) = conn;
+    }
+    Ok(())
+}
+
+impl Drop for BudgetConnection {
+    fn drop(&mut self) {
+        if !self.fork_tracked {
+            return;
+        }
+        self.fork_tracked = false;
+        {
+            let mut list = FORK_DISK_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+            list.retain(|item| {
+                item.inner
+                    .upgrade()
+                    .is_some_and(|conn| !Arc::ptr_eq(&conn, &self.inner))
+            });
+        }
+        let disk = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path()
+            .is_some_and(|p| !p.is_empty());
+        if disk {
+            ratarmount_core::fork_n::unregister_sqlite();
+        }
+    }
 }
 
 impl BudgetConnection {
@@ -500,11 +671,17 @@ impl BudgetConnection {
         if pool.enabled() {
             Self::configure(&conn, bytes)?;
         }
+        let fork_tracked = ratarmount_core::fork_n::preparing()
+            && ratarmount_core::fork_n::installed()
+            && conn.path().is_some_and(|p| !p.is_empty());
         let inner = Arc::new(Mutex::new(conn));
+        if fork_tracked {
+            ratarmount_core::fork_n::register_sqlite();
+        }
         let memory = Arc::new(Mutex::new(reservation));
         let weak_conn = Arc::downgrade(&inner);
         let weak_memory = Arc::downgrade(&memory);
-        let shrink = if pool.enabled() {
+        let shrink = std::sync::Arc::new(Mutex::new(if pool.enabled() {
             Some(pool.on_pressure(move || {
                 if let (Some(conn), Some(memory)) = (weak_conn.upgrade(), weak_memory.upgrade()) {
                     if let (Ok(conn), Ok(mut memory)) = (conn.try_lock(), memory.try_lock()) {
@@ -516,12 +693,23 @@ impl BudgetConnection {
             }))
         } else {
             None
-        };
+        }));
+        if fork_tracked {
+            FORK_DISK_CONNS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ForkDiskConn {
+                    inner: Arc::downgrade(&inner),
+                    memory: Arc::downgrade(&memory),
+                    shrink: Arc::downgrade(&shrink),
+                });
+        }
         Ok(Self {
             inner,
             memory,
             bytes,
-            _shrink: shrink,
+            shrink,
+            fork_tracked,
         })
     }
     fn configure(conn: &Connection, bytes: u64) -> Result<()> {
@@ -865,6 +1053,12 @@ impl SqliteIndex {
         lookup: bool,
     ) -> Result<Self> {
         let path = path.as_ref();
+        if ratarmount_core::fork_n::installed() {
+            ratarmount_core::fork_n::admit(path, false, None)?;
+            for suffix in ["-wal", "-shm", "-journal"] {
+                ratarmount_core::fork_n::admit(&sqlite_path_companion(path, suffix), false, None)?;
+            }
+        }
         let conn = if lookup {
             open_lookup_connection(path)?
         } else {
@@ -929,13 +1123,23 @@ impl SqliteIndex {
     pub fn create_writable(path: Option<&Path>) -> Result<Self> {
         let (conn, path_buf, publish_target) = match path {
             Some(dest) => {
+                ratarmount_core::fork_n::admit_create(dest)?;
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    ratarmount_core::fork_n::admit_create(&sqlite_path_companion(dest, suffix))?;
+                }
                 if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)?;
+                    }
                 }
                 // Concurrent readers keep dest's inode; do not remove_file dest.
                 reap_stale_writable_tmps(dest);
                 let tmp = writable_tmp_path(dest);
-                (Connection::open(&tmp)?, Some(tmp), Some(dest.to_path_buf()))
+                let conn = Connection::open(&tmp)?;
+                if ratarmount_core::fork_n::installed() {
+                    ratarmount_core::fork_n::note_create();
+                }
+                (conn, Some(tmp), Some(dest.to_path_buf()))
             }
             None => (Connection::open_in_memory()?, None, None),
         };
@@ -2552,6 +2756,12 @@ impl SqliteIndex {
     /// or incomplete.
     pub fn open_writable(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        ratarmount_core::fork_n::admit(path, false, None)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            ratarmount_core::fork_n::admit(Path::new(&name), false, None)?;
+        }
         let conn = Connection::open(path)?;
         // Brief wait if a concurrent reader is finishing (mount RO + side-table write).
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
@@ -5597,5 +5807,38 @@ mod memory_budget_tests {
                 .reserved,
             1024 * 1024
         );
+    }
+
+    /// Regression: an index destination under a cohort mountpoint is not created.
+    #[test]
+    fn fork_n_self_reopen_backing_under_mountpoint_index_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp = dir.path().join("mnt");
+        std::fs::create_dir(&mp).unwrap();
+        let dest = mp.join("sidecar.sqlite");
+        ratarmount_core::fork_n::test_reset_spies();
+        ratarmount_core::fork_n::install(Vec::new(), vec![mp.canonicalize().unwrap()]);
+        let err = match SqliteIndex::create_writable(Some(&dest)) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("index under a mountpoint must be refused"),
+        };
+        assert!(
+            err.contains("mountpoint") || err.contains(&*dest.display().to_string()),
+            "{err}"
+        );
+        assert!(!dest.exists(), "refusal must leave the destination absent");
+        assert_eq!(ratarmount_core::fork_n::test_create_count(), 0);
+
+        let existing = mp.join("warm.sqlite");
+        std::fs::write(&existing, b"not a database").unwrap();
+        let opened = match SqliteIndex::open_catalog_read_only(&existing) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("read-only index under a mountpoint must be refused"),
+        };
+        assert!(
+            opened.contains("mountpoint") || opened.contains(&*existing.display().to_string()),
+            "{opened}"
+        );
+        ratarmount_core::fork_n::uninstall();
     }
 }

@@ -4982,6 +4982,7 @@ name = "ratarmount-core"
 version = "0.1.35"
 dependencies = [
  "libc",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 

@@ -1209,6 +1209,23 @@ fn open_remote_input_inner(
     };
 
     if ratarmount_remote::is_torrent_input(input) {
+        if ratarmount_core::fork_n::installed() {
+            // Top-level daemon sources are refused in `refuse_daemon_torrents`
+            // before the factory. A nested open, in either phase, must not
+            // use that sentence: it starts with `fork-n ` and the cohort
+            // treats it as a process exit.
+            if ratarmount_core::fork_n::nested_open() {
+                return Err(format!(
+                    "Unsupported: fork-n refuses nested torrent {input}"
+                ));
+            }
+            if ratarmount_core::fork_n::preparing() {
+                return Err(format!(
+                    "fork-n daemon refuses torrent input {input}; use --foreground"
+                ));
+            }
+            return Err("fork-n has no storage coverage for torrent".to_string());
+        }
         #[cfg(feature = "bittorrent")]
         {
             let source = ratarmount_remote::torrent::TorrentMountSource::open(

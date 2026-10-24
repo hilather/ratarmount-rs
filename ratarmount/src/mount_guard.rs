@@ -890,6 +890,35 @@ pub(crate) fn check_mount_point<F: FsIdentity>(
     Ok(())
 }
 
+/// Same three checks as [`check_mount_point`] (lexical, mountinfo view, same-view
+/// inode) for one subject against one other path.
+///
+/// `Ok(None)` means the paths are disjoint. [`Relation::Inside`] is a subject that
+/// lies strictly inside `other` (a top inside its directory base). [`check_mount_point`]
+/// still refuses every relation for a mountpoint subject; this function returns the
+/// relation so a top can allow `Inside` and refuse `Equal` and `Contains`.
+pub(crate) fn path_relation<F: FsIdentity>(
+    fs: &F,
+    subject: &Path,
+    other: &Path,
+) -> Result<Option<Relation>, String> {
+    let subject_t = resolve(fs, subject)
+        .map_err(|e| resolve_error_message(e, Subject::Mount, subject, false))?;
+    let other_t =
+        resolve(fs, other).map_err(|e| resolve_error_message(e, Subject::Overlay, other, false))?;
+    #[cfg(any(target_os = "linux", test))]
+    let mountinfo = fs.mountinfo_bytes().map(|b| parse_mountinfo(&b));
+    let ctx = MpCtx {
+        t: &subject_t,
+        mount_id: fs.mount_id(&subject_t.anchor),
+        #[cfg(any(target_os = "linux", test))]
+        views: mountinfo
+            .as_deref()
+            .and_then(|mi| views(fs, mi, &subject_t)),
+    };
+    Ok(relation(fs, &ctx, &other_t).map(|(rel, _)| rel))
+}
+
 #[derive(Debug)]
 pub(crate) struct MountPlan {
     pub mp: PathBuf,

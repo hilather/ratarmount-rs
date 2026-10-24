@@ -872,6 +872,7 @@ mod split_open_tests {
 
 pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
     Arc::new(move |path: &Path| {
+        let _nested = ratarmount_core::fork_n::NestedOpenGuard::enter();
         // Nested archives must not share the parent's index path.
         let mut opts = options.clone();
         opts.index_file_path = None;
@@ -913,6 +914,7 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
 /// and [`open_nested_fn`].
 pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
     Arc::new(move |mut reader, label, ctx| {
+        let _nested = ratarmount_core::fork_n::NestedOpenGuard::enter();
         use std::io::{Read, Seek, SeekFrom};
 
         let mut opts = options.clone();
@@ -2155,7 +2157,14 @@ fn open_split_set(
     }
 
     // Archive/compressed stream: open without re-running split detection; keep temp alive.
-    let inner = open_path_impl(&tmp_path, &opts, recreate, false, &mut false)?.source;
+    let inner = take_parked_fork_n(open_path_impl(
+        &tmp_path,
+        &opts,
+        recreate,
+        false,
+        &mut false,
+    ))?
+    .source;
     Ok(Arc::new(KeepAliveMount { inner, _tmp: tmp }))
 }
 
@@ -2212,7 +2221,9 @@ pub fn open_path(
     options: &OpenOptions,
     recreate: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
-    open_path_impl(path, options, recreate, true, &mut false).map(|opened| opened.source)
+    take_parked_fork_n(
+        open_path_impl(path, options, recreate, true, &mut false).map(|opened| opened.source),
+    )
 }
 
 /// The index an open selected, for the base-identity peek. The selected
@@ -2264,6 +2275,7 @@ fn open_path_impl(
     allow_split: bool,
     plain_tar: &mut bool,
 ) -> Result<PathOpened, String> {
+    ratarmount_core::fork_n::guard_constructor(path, options)?;
     // Resolve inline refs before the normal filesystem existence check.
     #[cfg(feature = "git")]
     {
@@ -2638,7 +2650,7 @@ fn try_load_gzip_index_blob(
     // Read-only catalog open: no banner (TAR opens the index itself), no file
     // table in memory, and a sidecar that fails validation is never opened
     // writable here.
-    let idx = SqliteIndex::open_lookup(ip).ok()?;
+    let idx = open_lookup_keep_refusal(ip)?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: gzip RGZI skipped (index fingerprint: {e})");
@@ -2649,6 +2661,33 @@ fn try_load_gzip_index_blob(
         Ok(blobs) => blobs.into_iter().next().filter(|b| !b.is_empty()),
         Err(_) => None,
     }
+}
+
+std::thread_local! {
+    static PARKED_FORK_N: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `.ok()` on a fork-n refusal would let the factory rebuild or switch
+/// backends. Park the sentence and return `None` so the caller's shape stays
+/// an optional load; [`take_parked_fork_n`] turns it back into the open error.
+fn open_lookup_keep_refusal(path: &Path) -> Option<ratarmount_index::SqliteIndex> {
+    match ratarmount_index::SqliteIndex::open_lookup(path) {
+        Ok(idx) => Some(idx),
+        Err(err) => {
+            let message = err.to_string();
+            if message.starts_with("fork-n ") {
+                PARKED_FORK_N.with(|slot| *slot.borrow_mut() = Some(message));
+            }
+            None
+        }
+    }
+}
+
+fn take_parked_fork_n<T>(result: Result<T, String>) -> Result<T, String> {
+    if let Some(message) = PARKED_FORK_N.with(|slot| slot.borrow_mut().take()) {
+        return Err(message);
+    }
+    result
 }
 
 /// Short format label for gzip seek-index side-table blobs (import / fail logs).
@@ -3173,7 +3212,7 @@ fn try_load_zstd_blocks(
     // banner): a sidecar that is merely consulted must not gain WAL files or
     // schema changes, and one that does not validate read-only is refused,
     // never retried writable.
-    let idx = SqliteIndex::open_lookup(ip).ok()?;
+    let idx = open_lookup_keep_refusal(ip)?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: zstdblocks skipped (index fingerprint: {e})");
@@ -3389,7 +3428,7 @@ fn try_load_bzip2_blocks(
     // banner): a sidecar that is merely consulted must not gain WAL files or
     // schema changes, and one that does not validate read-only is refused,
     // never retried writable.
-    let idx = SqliteIndex::open_lookup(ip).ok()?;
+    let idx = open_lookup_keep_refusal(ip)?;
     if let Some(ap) = archive_path {
         if let Err(e) = idx.check_tarstats_matches_archive(ap) {
             eprintln!("info: bzip2blocks skipped (index fingerprint: {e})");
@@ -5013,7 +5052,13 @@ pub fn build_mount_source_with_bindings(
         } else {
             let local_path = p.clone();
             let mut plain_tar = false;
-            let opened = open_path_impl(&local_path, &opts, recreate_src, true, &mut plain_tar)?;
+            let opened = take_parked_fork_n(open_path_impl(
+                &local_path,
+                &opts,
+                recreate_src,
+                true,
+                &mut plain_tar,
+            ))?;
             let input_served = Served {
                 kind: opened.kind,
                 location: Some(ServedLocation::Local(opened.location)),

@@ -58,7 +58,8 @@ pub use empty_archive::{
 pub use folder::FolderMountSource;
 pub use journal_recovery::{
     authorize_mount_recovery, classify_mount_journal, journal_agrees, recover_journal_at,
-    MountJournal, MountRecords, Owner, Record,
+    recover_journal_cohort, recover_journal_deferred, recover_journal_locator, MountJournal,
+    MountRecords, Owner, Record,
 };
 pub use oci_whiteout::OciImageMountSource;
 pub use overlay_db::{open_overlay_db, DbName, OverlayDbError};
@@ -77,9 +78,10 @@ pub use overlay_layer::{
 pub use overlay_meta::{
     append_base_excludes, base_digest_state, directory_digest, directory_digest_calls_this_thread,
     directory_digest_excluding, directory_weak_digest, directory_weak_walks_this_thread,
-    record_base_digest, redact_meta_values, resolve_base_excludes, resolve_pending_base_digest,
-    stack_digest, BaseCheck, BaseComparison, BaseDigestRequest, BaseExcludes, BaseStrength,
-    LowerLayerRecord, OverlayMeta, PendingBase, BASE_COMPARISON_KEYS,
+    plan_excludes_calls, record_base_digest, redact_meta_values, reset_plan_excludes_calls,
+    resolve_base_excludes, resolve_pending_base_digest, stack_digest, BaseCheck, BaseComparison,
+    BaseDigestRequest, BaseExcludes, BaseStrength, ExcludeMode, ExcludeRole, FrozenBaseExcludes,
+    LowerLayerRecord, ObservedBaseExcludes, OverlayMeta, PendingBase, BASE_COMPARISON_KEYS,
 };
 pub use overlay_policy::{
     parse_overlay_size, CompositeOverlayPolicy, OverlayQuota, OverlayStats, OverlayUsage,

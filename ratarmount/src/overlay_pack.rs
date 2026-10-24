@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -1506,11 +1506,78 @@ fn run_extract_hook(hook: &'static std::thread::LocalKey<ExtractHook>, stage: &P
     });
 }
 
+struct PreparedLowerBundle {
+    bundle: PathBuf,
+    hash: String,
+    file: File,
+}
+
+thread_local! {
+    static PREPARED_BUNDLES: std::cell::RefCell<Vec<PreparedLowerBundle>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn hash_all(file: &mut File) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let n = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Bundle preflight: open the bundle, hash those bytes, and plan the cache
+/// path. Does not extract, publish, or call [`cached_lower`].
+pub(crate) fn prepare_lower_bundle(bundle: &Path, cache: &Path) -> io::Result<PathBuf> {
+    let mut file = ratarmount_core::fork_n::open_admitted(bundle)?;
+    let hash = hash_all(&mut file)?;
+    file.seek(SeekFrom::Start(0))?;
+    let destination = cache.join(&hash);
+    ratarmount_core::fork_n::admit_create(&destination)?;
+    PREPARED_BUNDLES.with(|slot| {
+        slot.borrow_mut().push(PreparedLowerBundle {
+            bundle: bundle.to_path_buf(),
+            hash,
+            file,
+        });
+    });
+    Ok(destination)
+}
+
+fn take_prepared(bundle: &Path) -> Option<PreparedLowerBundle> {
+    PREPARED_BUNDLES.with(|slot| {
+        let mut held = slot.borrow_mut();
+        let index = held.iter().position(|item| item.bundle == bundle)?;
+        Some(held.remove(index))
+    })
+}
+
 /// Copy the bundle into a private file inside the cache while hashing it, so
 /// everything after reads exactly the hashed bytes and never the original path.
 fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempFile, String)> {
     use sha2::{Digest, Sha256};
-    let mut source = File::open(bundle)?;
+    let mut source = if let Some(prepared) = take_prepared(bundle) {
+        let mut file = prepared.file;
+        file.seek(SeekFrom::Start(0))?;
+        let now = hash_all(&mut file)?;
+        if now != prepared.hash {
+            return Err(io::Error::other(format!(
+                "fork-n refuses {}: bundle bytes changed after preflight",
+                bundle.display()
+            )));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        file
+    } else {
+        File::open(bundle)?
+    };
     let mut copy = tempfile::Builder::new()
         .prefix(COPY_PREFIX)
         .suffix(".tar.zst")
@@ -3736,5 +3803,36 @@ mod tests {
             Err("stop".into())
         });
         assert!(reached.get(), "a local recorded base must be classified");
+    }
+}
+
+/// Regression: Bundle preflight hashes the held descriptor and does not publish.
+#[cfg(test)]
+mod bundle_preflight {
+    use super::{prepare_lower_bundle, private_copy};
+    use std::io::Write;
+
+    #[test]
+    fn bundle_preflight_plans_the_cache_path_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("layer.tar.zst");
+        std::fs::write(&bundle, b"bundle-bytes").unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let planned = prepare_lower_bundle(&bundle, &cache).unwrap();
+        assert!(planned.starts_with(&cache), "{}", planned.display());
+        assert!(!planned.exists(), "preflight must not publish {}", planned.display());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&bundle)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        let err = private_copy(&bundle, &cache).unwrap_err().to_string();
+        assert!(
+            err.contains("bundle bytes changed after preflight"),
+            "{err}"
+        );
+        assert!(!planned.exists());
     }
 }

@@ -10,3 +10,6 @@ description = "MountSource trait and shared types for ratarmount-rs"
 [dependencies]
 libc.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

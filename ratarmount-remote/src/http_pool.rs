@@ -1042,6 +1042,9 @@ impl Prefetch {
     }
 
     fn fill(&mut self) -> io::Result<()> {
+        if ratarmount_core::fork_n::preparing() {
+            return Ok(());
+        }
         let horizon = self
             .position
             .saturating_add(HTTP_RANGE_CHUNK * self.parallel as u64)

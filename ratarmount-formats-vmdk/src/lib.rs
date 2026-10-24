@@ -25,7 +25,6 @@
 mod descriptor;
 mod sparse;
 
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -77,6 +76,9 @@ impl VmdkMountSource {
                 "{} is not a KDMV sparse VMDK or disk descriptor",
                 path.display()
             )));
+        }
+        if let Some(message) = take_probe_refusal() {
+            return Err(VmdkError::Msg(message));
         }
         let disk = open_disk_from_path(path)?;
         wrap_virtual_disk(disk, path)
@@ -169,7 +171,7 @@ where
 }
 
 fn open_disk_from_path(path: &Path) -> Result<sparse::VmdkDisk> {
-    let mut file = File::open(path)?;
+    let mut file = ratarmount_core::fork_n::open_admitted(path)?;
     let mut probe = [0u8; 4096];
     let n = read_prefix(&mut file, &mut probe)?;
     drop(file);
@@ -193,7 +195,7 @@ fn open_disk_from_path(path: &Path) -> Result<sparse::VmdkDisk> {
 }
 
 fn open_kdmv_path(path: &Path) -> Result<sparse::VmdkDisk> {
-    let file = File::open(path)?;
+    let file = ratarmount_core::fork_n::open_admitted(path)?;
     let backend = sparse::share_reader(file);
     let (extent, desc) = sparse::open_sparse_extent(backend)?;
     if let Some(d) = desc.as_ref() {
@@ -262,7 +264,7 @@ fn open_descriptor_path(desc_path: &Path, desc: &VmdkDescriptor) -> Result<spars
 }
 
 fn open_sparse_file(path: &Path) -> Result<sparse::DiskExtent> {
-    let file = File::open(path)?;
+    let file = ratarmount_core::fork_n::open_admitted(path)?;
     let backend = sparse::share_reader(file);
     let (extent, desc) = sparse::open_sparse_extent(backend)?;
     if let Some(d) = desc.as_ref() {
@@ -272,7 +274,7 @@ fn open_sparse_file(path: &Path) -> Result<sparse::DiskExtent> {
 }
 
 fn open_flat_file(path: &Path, ext: &DescriptorExtent) -> Result<sparse::DiskExtent> {
-    let file = File::open(path)?;
+    let file = ratarmount_core::fork_n::open_admitted(path)?;
     let backend = sparse::share_reader(file);
     let size_bytes = ext.sectors.saturating_mul(SECTOR);
     let offset_bytes = ext.offset_sectors.saturating_mul(SECTOR);
@@ -293,7 +295,7 @@ fn read_sidecar_descriptor(path: &Path) -> Result<String> {
             path.display()
         )));
     }
-    let file = File::open(path)?;
+    let file = ratarmount_core::fork_n::open_admitted(path)?;
     let mut buf = Vec::new();
     file.take(MAX_SIDECAR_DESCRIPTOR_BYTES)
         .read_to_end(&mut buf)?;
@@ -424,12 +426,30 @@ fn read_prefix<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
     Ok(n)
 }
 
+std::thread_local! {
+    static PROBE_REFUSAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A fork-n refusal from the last [`looks_like_vmdk`] on this thread.
+/// Returning `false` would let the factory try another backend.
+pub fn take_probe_refusal() -> Option<String> {
+    PROBE_REFUSAL.with(|slot| slot.borrow_mut().take())
+}
+
 /// Detect KDMV sparse magic or a text disk descriptor. COWD is **not** claimed
 /// (ESXi residual). No `.vmdk` extension fallback.
 pub fn looks_like_vmdk(path: &Path) -> bool {
-    let mut f = match File::open(path) {
+    PROBE_REFUSAL.with(|slot| *slot.borrow_mut() = None);
+    let mut f = match ratarmount_core::fork_n::open_admitted(path) {
         Ok(f) => f,
-        Err(_) => return false,
+        Err(err) => {
+            let message = err.to_string();
+            if message.starts_with("fork-n ") {
+                PROBE_REFUSAL.with(|slot| *slot.borrow_mut() = Some(message));
+                return true;
+            }
+            return false;
+        }
     };
     looks_like_vmdk_reader(&mut f)
 }
@@ -502,6 +522,7 @@ impl MountSource for VmdkMountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::{Cursor, Write};
 
     use fatfs::{FileSystem, FsOptions};
@@ -873,5 +894,47 @@ mod tests {
         let mut head = [0u8; 1];
         extent.read_at(0, &mut head).unwrap();
         assert_eq!(head[0], 0xAA);
+    }
+}
+
+/// Regression: a fork-n refusal from the VMDK probe is not turned into
+/// "not a VMDK", which would let the factory try another backend.
+#[cfg(test)]
+mod fork_n_storage_vmdk {
+    use super::{looks_like_vmdk, take_probe_refusal, VmdkMountSource};
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    struct Uninstall;
+    impl Drop for Uninstall {
+        fn drop(&mut self) {
+            ratarmount_core::fork_n::uninstall();
+        }
+    }
+
+    #[test]
+    fn fork_n_storage_vmdk_probe_does_not_swallow_refusal() {
+        let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _uninstall = Uninstall;
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("mnt");
+        std::fs::create_dir(&mount).unwrap();
+        let image = mount.join("disk.vmdk");
+        std::fs::write(&image, b"not-a-real-vmdk").unwrap();
+        ratarmount_core::fork_n::test_reset_spies();
+        ratarmount_core::fork_n::install(Vec::new(), vec![mount.canonicalize().unwrap()]);
+        assert!(looks_like_vmdk(&image));
+        let parked = take_probe_refusal().unwrap_or_default();
+        assert!(parked.starts_with("fork-n "), "{parked}");
+        // The open path consumes a fresh probe.
+        assert!(looks_like_vmdk(&image));
+        let err = match VmdkMountSource::open(&image) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("image under a mountpoint must be refused"),
+        };
+        assert!(err.contains("fork-n "), "{err}");
+        assert_eq!(ratarmount_core::fork_n::test_open_count(), 0);
+        ratarmount_core::fork_n::uninstall();
     }
 }

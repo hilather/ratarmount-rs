@@ -122,7 +122,7 @@ impl ImportStack {
         Ok(Self {
             base: classified,
             view,
-            lower_layers: lowers.records,
+            lower_layers: lowers.records().to_vec(),
             inputs: vec![PathBuf::from(base)],
         })
     }

@@ -13,6 +13,10 @@ struct Pool {
 /// Queue without waiting: saturated executors fall back to synchronous decoding.
 /// Rebuild after CLI daemonization; workers do not survive fork.
 pub(super) fn submit(threads: u32, job: Job) -> bool {
+    // Daemon Fork-N preparation must not init the pool or spawn a worker.
+    if ratarmount_core::fork_n::preparing() {
+        return false;
+    }
     static POOL: OnceLock<Mutex<Option<Pool>>> = OnceLock::new();
     let mut slot = POOL.get_or_init(|| Mutex::new(None)).lock().unwrap();
     let pid = std::process::id();
@@ -42,6 +46,7 @@ pub(super) fn submit(threads: u32, job: Job) -> bool {
             break;
         }
         pool.workers += 1;
+        ratarmount_core::fork_n::note_pool_live();
     }
     pool.workers != 0 && pool.sender.try_send(job).is_ok()
 }

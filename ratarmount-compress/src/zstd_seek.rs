@@ -1291,6 +1291,10 @@ impl ZstdFrameReader {
     }
 
     fn prefetch(&mut self, mut reusable: Vec<u8>) {
+        // Before File::open and posix_fadvise. A later return still opens the archive.
+        if ratarmount_core::fork_n::preparing() {
+            return;
+        }
         if self.cancelled.load(Ordering::Acquire) {
             self.cancel();
             return;

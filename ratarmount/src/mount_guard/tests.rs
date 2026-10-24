@@ -2013,3 +2013,61 @@ fn helper_bind_alias_verdicts() {
     let msg = check(&c.join("mnt")).unwrap_err();
     assert!(msg.contains(&format!("{}/mnt", sub.display())), "{msg}");
 }
+
+/// Regression: Fork-N mount subjects use lexical, mountinfo, and same-view
+/// inode relation. A top inside its directory base is `Inside` and is not a
+/// mount subject. Nested or equal tops are not disjoint.
+#[test]
+fn fork_n_identity_mount_subjects_and_tops_inside_base() {
+    let mut fs = FakeFs::new();
+    fs.dir("/repo/runs/a");
+    fs.dir("/repo/runs/b");
+    fs.dir("/mnt/a");
+    fs.dir("/mnt/b");
+    fs.dir("/bindsrc");
+
+    let disjoint = path_relation(&fs, Path::new("/mnt/a"), Path::new("/repo")).unwrap();
+    assert!(
+        disjoint.is_none(),
+        "mount and base are disjoint: {disjoint:?}"
+    );
+
+    let equal = path_relation(&fs, Path::new("/mnt/a"), Path::new("/mnt/a")).unwrap();
+    assert!(matches!(equal, Some(Relation::Equal)));
+
+    let mount_over_top = path_relation(&fs, Path::new("/mnt/a"), Path::new("/repo/runs/a"));
+    assert!(mount_over_top.unwrap().is_none());
+
+    let nested_mounts = path_relation(&fs, Path::new("/mnt/a"), Path::new("/mnt")).unwrap();
+    assert!(
+        matches!(nested_mounts, Some(Relation::Inside)),
+        "a mountpoint inside another mountpoint is Inside: {nested_mounts:?}"
+    );
+
+    let top_in_base = path_relation(&fs, Path::new("/repo/runs/a"), Path::new("/repo")).unwrap();
+    assert!(
+        matches!(top_in_base, Some(Relation::Inside)),
+        "a top strictly inside its directory base stays Inside: {top_in_base:?}"
+    );
+    let tops_disjoint =
+        path_relation(&fs, Path::new("/repo/runs/a"), Path::new("/repo/runs/b")).unwrap();
+    assert!(
+        tops_disjoint.is_none(),
+        "two tops inside the base are disjoint"
+    );
+
+    let nested_tops =
+        path_relation(&fs, Path::new("/repo/runs/a"), Path::new("/repo/runs")).unwrap();
+    assert!(matches!(nested_tops, Some(Relation::Inside)));
+
+    let base_inside_top =
+        path_relation(&fs, Path::new("/repo"), Path::new("/repo/runs/a")).unwrap();
+    assert!(
+        matches!(base_inside_top, Some(Relation::Contains)),
+        "reverse containment of the directory base is Contains"
+    );
+
+    fs.bind("/bindsrc", "/repo/hidden", 9);
+    let hidden = path_relation(&fs, Path::new("/mnt/a"), Path::new("/repo/hidden"));
+    assert!(hidden.is_ok());
+}
