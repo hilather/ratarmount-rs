@@ -5458,6 +5458,61 @@
    "reason": "/proc or mount-table introspection"
   },
   {
+   "file": "ratarmount-index/src/checked_open/nocreate.rs",
+   "function": "pin_parent",
+   "op": "from_raw_fd",
+   "ordinal": 1,
+   "line": 130,
+   "fingerprint": "fe8f4a7b46f2bef6",
+   "disposition": "out-of-family",
+   "category": "directory-handle-or-durability",
+   "reason": "Takes ownership of the pinned parent-directory descriptor so the overlay directory inode stays reserved for the process. No file content is read."
+  },
+  {
+   "file": "ratarmount-index/src/checked_open/nocreate.rs",
+   "function": "open_parent",
+   "op": "libc::open",
+   "ordinal": 1,
+   "line": 137,
+   "fingerprint": "412a2e089b37a085",
+   "disposition": "out-of-family",
+   "category": "directory-handle-or-durability",
+   "reason": "Opens the overlay database parent directory (Linux O_PATH, no follow) so its inode cannot be reused. No file content is read."
+  },
+  {
+   "file": "ratarmount-index/src/checked_open/nocreate.rs",
+   "function": "open_parent",
+   "op": "libc::open",
+   "ordinal": 2,
+   "line": 147,
+   "fingerprint": "992904c9859e8289",
+   "disposition": "out-of-family",
+   "category": "directory-handle-or-durability",
+   "reason": "Opens the overlay database parent directory (macOS O_DIRECTORY, no follow) so its inode cannot be reused. No file content is read."
+  },
+  {
+   "file": "ratarmount-index/src/checked_open/nocreate.rs",
+   "function": "open_parent",
+   "op": "libc::open",
+   "ordinal": 3,
+   "line": 155,
+   "fingerprint": "4764370d0a6bb1ef",
+   "disposition": "out-of-family",
+   "category": "directory-handle-or-durability",
+   "reason": "Opens a symlink parent (macOS O_SYMLINK) so fstat matches lstat and that inode stays reserved. No file content is read."
+  },
+  {
+   "file": "ratarmount-index/src/checked_open/nocreate.rs",
+   "function": "open_parent",
+   "op": "libc::open",
+   "ordinal": 4,
+   "line": 163,
+   "fingerprint": "992904c9859e8289",
+   "disposition": "out-of-family",
+   "category": "directory-handle-or-durability",
+   "reason": "Opens the overlay database parent directory on other Unix (O_DIRECTORY, no follow) so its inode cannot be reused. No file content is read."
+  },
+  {
    "file": "ratarmount-nfs/src/vfs.rs",
    "function": "RatarmountNfs::write_sync",
    "op": "from_raw_fd",
