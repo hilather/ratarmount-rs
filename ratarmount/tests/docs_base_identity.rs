@@ -132,6 +132,15 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
         "A daemonized ratarmount (the default without `-f`, for a FUSE mount and for an export server alike) currently holds no kernel lock on its overlay database at all",
         "(#183). Until that is fixed, run with `-f` when another process may open the same overlay.",
         "| Platform / host | Installation | Checked open |",
+        "| Platform | Database publish | Directory fsync |",
+        "one `renameat` with `RENAME_NOREPLACE`",
+        "hard link of the staging file onto the database name, then unlink of the staging name (not one atomic operation)",
+        "A crash between the hard link and the unlink leaves the live database under both names",
+        "The next successful open removes only the extra staging name",
+        "a failure only warns and the open still succeeds",
+        "On Windows that fsync is a no-op",
+        "The sweep does not delete by name prefix alone",
+        "A failed directory fsync only warns.",
         "opening one database file through both at once in one process is unsupported (#154",
     ] {
         assert!(text.contains(sentence), "docs/sandbox.md lost: {sentence}");

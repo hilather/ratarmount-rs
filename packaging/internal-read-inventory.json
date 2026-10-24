@@ -2107,6 +2107,17 @@
   },
   {
    "file": "ratarmount-compositing/src/write_overlay.rs",
+   "function": "staging_lock_held_by_other_process",
+   "op": "libc::open",
+   "ordinal": 1,
+   "line": 7183,
+   "fingerprint": "9c19292656ad175c",
+   "disposition": "out-of-family",
+   "category": "kernel-or-process-introspection",
+   "reason": "read-only O_NOFOLLOW open in a forked child that only F_GETLK-probes a first-open staging leftover and _exits; the parent never opens the file, so it cannot release a lock this process holds"
+  },
+  {
+   "file": "ratarmount-compositing/src/write_overlay.rs",
    "function": "create_overlay_marker",
    "op": "OpenOptions",
    "ordinal": 1,
