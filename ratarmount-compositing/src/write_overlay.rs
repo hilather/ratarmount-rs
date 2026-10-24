@@ -847,6 +847,41 @@ impl OverlayError {
 }
 
 impl WriteOverlay {
+    /// Take `LOCKING_MODE=EXCLUSIVE` and a write transaction so a later
+    /// `BEGIN IMMEDIATE` from another connection is `SQLITE_BUSY`.
+    /// Lock order: `pending_rows`, then `db`.
+    pub fn hold_exclusive(&self) -> Result<()> {
+        let _pending = self.pending_rows.lock().unwrap_or_else(|e| e.into_inner());
+        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        db.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;")?;
+        Ok(())
+    }
+
+    /// Drop the on-disk SQLite connection so a later `fork` does not inherit it.
+    /// Lock order: `pending_rows`, then `db`.
+    pub fn release_connection(&self) -> Result<()> {
+        let _pending = self.pending_rows.lock().unwrap_or_else(|e| e.into_inner());
+        let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        *db = Connection::open_in_memory()?;
+        Ok(())
+    }
+
+    /// Open a fresh connection and hold it exclusive, then reload tombstones.
+    /// Lock order: `pending_rows`, then `db`, then `tombstones` (the database
+    /// guard is dropped before tombstones are locked).
+    pub fn reacquire_exclusive(&self) -> Result<()> {
+        let _pending = self.pending_rows.lock().unwrap_or_else(|e| e.into_inner());
+        let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        let path = self.root.join(HIDDEN_DB);
+        let conn = crate::open_overlay_db(&path, OpenFlags::default(), crate::DbName::Path)?;
+        conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;")?;
+        let tombs = tombstone_set_from_conn(&conn)?;
+        *db = conn;
+        drop(db);
+        *self.tombstones.lock().unwrap_or_else(|e| e.into_inner()) = tombs;
+        Ok(())
+    }
+
     /// Install before sharing the overlay with frontends. `None` disables hooks.
     pub fn set_policy(&mut self, policy: Option<Arc<dyn OverlayPolicy>>) {
         self.policy = policy;

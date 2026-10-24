@@ -41,6 +41,8 @@ mod corpus;
 mod diff;
 mod export_index;
 mod find;
+mod fork_n;
+mod fork_n_serve;
 mod journal_cmd;
 mod mount_guard;
 mod overlay_cmd;
@@ -79,7 +81,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   Datasets: ratarmount shard INPUT -o OUTPUT; ratarmount export-index ARCHIVE --format parquet|jsonl|csv.\n\
                   Snapshots: ratarmount snapshot add DIR --repo REPO [--init]; ratarmount snapshot list --repo REPO."
 )]
-#[command(group(clap::ArgGroup::new("overlay_target").args(["write_overlay", "overlay_tmpfs", "sandbox"]).multiple(true)))]
+#[command(group(clap::ArgGroup::new("overlay_target").args(["write_overlay", "overlay_tmpfs", "sandbox", "top", "mount"]).multiple(true)))]
 struct Args {
     /// Unmount the given mountpoint(s)
     ///
@@ -520,6 +522,14 @@ struct Args {
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
 
+    /// Writable top `NAME=OVERLAY` (repeatable). Pair each name with `--mount`.
+    #[arg(long = "top", value_name = "NAME=OVERLAY", action = ArgAction::Append)]
+    top: Vec<String>,
+
+    /// Mountpoint `NAME=MOUNTPOINT` for the `--top` of the same name (repeatable).
+    #[arg(long = "mount", value_name = "NAME=MOUNTPOINT", action = ArgAction::Append)]
+    mount: Vec<String>,
+
     /// Read-only overlay layer (repeatable, bottom to top).
     #[arg(long, value_name = "DIR", action = ArgAction::Append)]
     lower: Vec<PathBuf>,
@@ -621,7 +631,7 @@ struct Args {
     /// Roll a numbered .tar/.tar.zst series before a commit reaches a new UTC
     /// time bucket or after its active archive reaches SIZE (1d, 6h, 20G, 1d,20G).
     /// Implies --commit-overlay-on-exit; use --commit-overlay-interval for live rolls.
-    #[arg(long, value_name = "DURATION|SIZE", value_parser = clap::value_parser!(ratarmount_compositing::RollPolicy), requires = "write_overlay", conflicts_with_all = ["commit_overlay", "repack_seekable", "publish_index", "publish_index_to", "index_id", "disable_union_mount"])]
+    #[arg(long, value_name = "DURATION|SIZE", value_parser = clap::value_parser!(ratarmount_compositing::RollPolicy), conflicts_with_all = ["commit_overlay", "repack_seekable", "publish_index", "publish_index_to", "index_id", "disable_union_mount"])]
     roll_every: Option<ratarmount_compositing::RollPolicy>,
 
     /// Write an atomic <archive>.manifest.jsonl after a successful TAR commit.
@@ -745,7 +755,11 @@ struct Args {
 /// `--base-digest` and `--force-stack-mismatch` apply to a write overlay or to a
 /// read-only `--lower` stack; clap's `requires` cannot express that OR.
 fn base_flag_needs_target_or_lower(args: &Args) -> Result<(), clap::Error> {
-    let target = args.write_overlay.is_some() || args.overlay_tmpfs.is_some() || args.sandbox;
+    let target = args.write_overlay.is_some()
+        || args.overlay_tmpfs.is_some()
+        || args.sandbox
+        || !args.top.is_empty()
+        || !args.mount.is_empty();
     for (given, flag) in [
         (args.base_digest.is_some(), "--base-digest"),
         (args.force_stack_mismatch, "--force-stack-mismatch"),
@@ -859,6 +873,12 @@ where
     if raw.get(1).is_some_and(|s| s == "corpus") {
         let argv = std::iter::once(raw[0].clone()).chain(raw.iter().skip(2).cloned());
         let mut args = Args::try_parse_from(argv)?;
+        if !args.top.is_empty() || !args.mount.is_empty() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "corpus cannot be combined with --top or --mount",
+            ));
+        }
         if args.paths.len() != 2
             || args.no_mount
             || args.write_overlay.is_some()
@@ -875,6 +895,12 @@ where
         {
             return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
                 "corpus requires LIST-FILE MOUNTPOINT; it is read-only and cannot combine with --no-mount, --bind or Git selectors"));
+        }
+        if args.roll_every.is_some() && args.write_overlay.is_none() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--roll-every requires --write-overlay",
+            ));
         }
         args.corpus_list = Some(args.paths[0].clone());
         args.lazy = true;
@@ -908,7 +934,25 @@ where
             "--seed requires a build with --features bittorrent",
         ));
     }
-    if args.roll_every.is_some() {
+    let fork_n_selected = !args.top.is_empty() || !args.mount.is_empty();
+    if !fork_n_selected && args.roll_every.is_some() && args.write_overlay.is_none() {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--roll-every requires --write-overlay",
+        ));
+    }
+    if fork_n_selected {
+        fork_n::validate_cli(&args, find).map_err(|message| {
+            clap::Error::raw(clap::error::ErrorKind::ArgumentConflict, message)
+        })?;
+        if fork_n::commit_requested(&args) {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "commit of a layered stack is not supported; flatten first",
+            ));
+        }
+    }
+    if args.roll_every.is_some() && !fork_n_selected {
         if find
             || !args.source_binds.is_empty()
             || args.recursive
@@ -1786,6 +1830,10 @@ fn main() {
         std::process::exit(2);
     }
 
+    if !args.top.is_empty() || !args.mount.is_empty() {
+        fork_n::run(&args);
+    }
+
     let (source_paths, mountpoint) = split_bound_inputs_mountpoint(&args);
     // Metadata labels also include bound sources; factory gets positional paths
     // separately so every explicit bind is opened exactly once.
@@ -2075,7 +2123,10 @@ fn main() {
     }
     // A `-w` or `--lower` mount classifies its base: the kind and place the
     // factory actually served are what the overlay records and compares.
-    let wants_identity = args.write_overlay.is_some() || !args.lower.is_empty();
+    let wants_identity = args.write_overlay.is_some()
+        || !args.lower.is_empty()
+        || !args.top.is_empty()
+        || !args.mount.is_empty();
     let factory_paths: Vec<PathBuf> = if args.corpus_list.is_some() || rolling.is_some() {
         Vec::new()
     } else {
@@ -4800,6 +4851,11 @@ fn redirect_stdio_to_null() -> std::io::Result<()> {
 }
 
 fn split_bound_inputs_mountpoint(args: &Args) -> (Vec<PathBuf>, Option<PathBuf>) {
+    // Fork-N mountpoints are `--mount`. Every positional stays a source, and
+    // a directory next to `--bind` is not stolen as the session mountpoint.
+    if !args.top.is_empty() || !args.mount.is_empty() {
+        return (args.paths.clone(), None);
+    }
     // With binds and one local positional, use that positional as the explicit
     // mountpoint. Export-only commands keep their positional source as before.
     if !args.source_binds.is_empty()
@@ -8544,7 +8600,25 @@ mod rolling_cli_tests {
             argv.extend(extra);
             assert!(parse_args_from(argv).is_err());
         }
-        assert!(Args::try_parse_from(["ratarmount", "--roll-every", "1d", "traces.tar"]).is_err());
+        let no_write = parse_args_from(["ratarmount", "--roll-every", "1d", "traces.tar"]);
+        let message = no_write.expect_err("roll without -w").to_string();
+        assert!(
+            message.contains("--roll-every requires --write-overlay"),
+            "{message}"
+        );
+        let corpus_roll = parse_args_from([
+            "ratarmount",
+            "corpus",
+            "LIST",
+            "MOUNT",
+            "--roll-every",
+            "1d",
+        ]);
+        let message = corpus_roll.expect_err("corpus roll without -w").to_string();
+        assert!(
+            message.contains("--roll-every requires --write-overlay"),
+            "{message}"
+        );
         assert!(Args::try_parse_from([
             "ratarmount",
             "-w",
@@ -9277,5 +9351,354 @@ mod lower_marker_key_tests {
         let d = parent.join("adir");
         std::fs::create_dir(&d).unwrap();
         d
+    }
+}
+
+#[cfg(test)]
+mod fork_n_cli_tests {
+    use super::*;
+
+    fn message(argv: &[&str]) -> String {
+        let err = parse_args_from(argv.iter().copied()).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{argv:?} -> {err}"
+        );
+        err.to_string()
+    }
+
+    fn pair() -> Vec<&'static str> {
+        vec![
+            "ratarmount",
+            "--top",
+            "A=/overlay",
+            "--mount",
+            "A=/mnt",
+            "archive.tar",
+        ]
+    }
+
+    /// Regression: `--top` / `--mount` stole a directory positional, accepted a
+    /// layered commit, or left `--roll-every` requiring `-w` on a Fork-N argv.
+    #[test]
+    fn fork_n_parse_args_from_assignments_conflicts_and_flatten() {
+        let ok = parse_args_from(pair()).expect("N=1");
+        assert_eq!(ok.top, vec!["A=/overlay".to_string()]);
+        assert_eq!(ok.mount, vec!["A=/mnt".to_string()]);
+        assert!(ok.lower.is_empty());
+        assert!(ok.write_overlay.is_none());
+
+        let many = parse_args_from([
+            "ratarmount",
+            "--mount",
+            "B=/mb",
+            "--top",
+            "A=/oa",
+            "--mount",
+            "A=/ma",
+            "--top",
+            "B=/ob",
+            "archive.tar",
+        ])
+        .expect("N>1 reordered names");
+        assert_eq!(many.top, vec!["A=/oa".to_string(), "B=/ob".to_string()]);
+        assert_eq!(many.mount, vec!["B=/mb".to_string(), "A=/ma".to_string()]);
+        let paired = fork_n::assignments(&many).expect("names pair out of order");
+        assert_eq!(paired[0].name, "A");
+        assert_eq!(paired[0].top, PathBuf::from("/oa"));
+        assert_eq!(paired[0].mountpoint, PathBuf::from("/ma"));
+        assert_eq!(paired[1].name, "B");
+        assert_eq!(paired[1].top, PathBuf::from("/ob"));
+        assert_eq!(paired[1].mountpoint, PathBuf::from("/mb"));
+
+        let digest = parse_args_from([
+            "ratarmount",
+            "--top",
+            "A=/overlay",
+            "--mount",
+            "A=/mnt",
+            "--base-digest",
+            "none",
+            "archive.tar",
+        ])
+        .expect("--base-digest none");
+        assert!(digest.lower.is_empty());
+        let force = parse_args_from([
+            "ratarmount",
+            "--top",
+            "A=/overlay",
+            "--mount",
+            "A=/mnt",
+            "--force-stack-mismatch",
+            "archive.tar",
+        ])
+        .expect("--force-stack-mismatch");
+        assert!(force.force_stack_mismatch);
+        assert!(force.lower.is_empty());
+
+        for (argv, needle) in [
+            (
+                vec![
+                    "ratarmount",
+                    "--top",
+                    "nope",
+                    "--mount",
+                    "A=/mnt",
+                    "archive.tar",
+                ],
+                "fork-n --top requires NAME=PATH",
+            ),
+            (
+                vec![
+                    "ratarmount",
+                    "--top",
+                    "=/overlay",
+                    "--mount",
+                    "A=/mnt",
+                    "archive.tar",
+                ],
+                "fork-n --top requires NAME=PATH",
+            ),
+            (
+                vec![
+                    "ratarmount",
+                    "--top",
+                    "A=",
+                    "--mount",
+                    "A=/mnt",
+                    "archive.tar",
+                ],
+                "fork-n --top requires NAME=PATH",
+            ),
+            (
+                vec![
+                    "ratarmount",
+                    "--top",
+                    "A=/overlay",
+                    "--mount",
+                    "nope",
+                    "archive.tar",
+                ],
+                "fork-n --mount requires NAME=PATH",
+            ),
+            (
+                vec![
+                    "ratarmount",
+                    "--top",
+                    "A=/a",
+                    "--top",
+                    "A=/b",
+                    "--mount",
+                    "A=/mnt",
+                    "archive.tar",
+                ],
+                "fork-n --top name \"A\" is repeated",
+            ),
+            (
+                vec![
+                    "ratarmount",
+                    "--top",
+                    "A=/a",
+                    "--mount",
+                    "A=/m",
+                    "--mount",
+                    "A=/n",
+                    "archive.tar",
+                ],
+                "fork-n --mount name \"A\" is repeated",
+            ),
+            (
+                vec!["ratarmount", "--top", "A=/overlay", "archive.tar"],
+                "fork-n requires --top and --mount with the same names",
+            ),
+            (
+                vec!["ratarmount", "--mount", "A=/mnt", "archive.tar"],
+                "fork-n requires --top and --mount with the same names",
+            ),
+            (
+                vec![
+                    "ratarmount",
+                    "--top",
+                    "A=/overlay",
+                    "--mount",
+                    "B=/mnt",
+                    "archive.tar",
+                ],
+                "fork-n --top and --mount name sets differ",
+            ),
+        ] {
+            let text = message(&argv);
+            assert!(text.contains(needle), "{argv:?} -> {text}");
+        }
+
+        let (paths, mountpoint) = split_bound_inputs_mountpoint(
+            &parse_args_from([
+                "ratarmount",
+                "--top",
+                "A=/overlay",
+                "--mount",
+                "A=/mnt",
+                "a.tar",
+                "b.tar",
+            ])
+            .unwrap(),
+        );
+        assert_eq!(paths, vec![PathBuf::from("a.tar"), PathBuf::from("b.tar")]);
+        assert!(mountpoint.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("source");
+        std::fs::create_dir(&directory).unwrap();
+        let bound = parse_args_from([
+            "ratarmount",
+            "--top",
+            "A=/overlay",
+            "--mount",
+            "A=/mnt",
+            "--bind",
+            "/missing=/no/such",
+            directory.to_str().unwrap(),
+        ])
+        .unwrap();
+        let (paths, mountpoint) = split_bound_inputs_mountpoint(&bound);
+        assert_eq!(paths, vec![directory]);
+        assert!(mountpoint.is_none());
+        assert_eq!(bound.source_binds.len(), 1);
+        assert_eq!(bound.source_binds[0].source, "/no/such");
+
+        for (flag, extra) in [
+            ("-w", vec!["-w", "overlay"]),
+            ("--overlay-tmpfs", vec!["--overlay-tmpfs"]),
+            ("--sandbox", vec!["--sandbox"]),
+            ("--no-mount", vec!["--no-mount"]),
+            ("--nfs", vec!["--nfs"]),
+            ("--http", vec!["--http"]),
+            ("--webdav", vec!["--webdav"]),
+            ("--smb", vec!["--smb"]),
+            ("--ninep", vec!["--ninep"]),
+            ("--sftp", vec!["--sftp"]),
+            ("--sftp-subsystem", vec!["--sftp-subsystem"]),
+            ("--control-interface", vec!["--control-interface"]),
+            ("--journal", vec!["--journal", "journal.jsonl"]),
+            ("unmount", vec!["-u"]),
+            ("repack", vec!["--repack-seekable"]),
+            ("publish", vec!["--publish-index"]),
+        ] {
+            let mut argv = pair();
+            argv.extend(extra);
+            let text = message(&argv);
+            assert!(
+                text.contains(&format!("fork-n cannot be combined with {flag}")),
+                "{argv:?} -> {text}"
+            );
+        }
+        let text = message(&[
+            "ratarmount",
+            "find",
+            "*.fits",
+            "archive.tar",
+            "--top",
+            "A=/overlay",
+            "--mount",
+            "A=/mnt",
+        ]);
+        assert!(
+            text.contains("fork-n cannot be combined with find"),
+            "{text}"
+        );
+
+        let flatten = "commit of a layered stack is not supported; flatten first";
+        for extra in [
+            vec!["--commit-overlay"],
+            vec!["--commit-overlay-on-exit"],
+            vec!["--commit-overlay-interval", "2s"],
+            vec!["--roll-every", "1d"],
+        ] {
+            let mut argv = pair();
+            argv.extend(extra);
+            let text = message(&argv);
+            assert!(text.contains(flatten), "{argv:?} -> {text}");
+            assert!(
+                !text.contains("--roll-every requires --write-overlay"),
+                "{text}"
+            );
+        }
+        let text = message(&[
+            "ratarmount",
+            "--top",
+            "A=/overlay",
+            "--mount",
+            "A=/mnt",
+            "--roll-every",
+            "1d",
+            "--bind",
+            "/missing=/no/such",
+            "archive.tar",
+        ]);
+        assert!(text.contains(flatten), "{text}");
+        assert!(!text.contains("untransformed archive series"), "{text}");
+
+        for argv in [
+            vec![
+                "ratarmount",
+                "corpus",
+                "LIST",
+                "MOUNT",
+                "--top",
+                "A=/overlay",
+            ],
+            vec!["ratarmount", "corpus", "LIST", "MOUNT", "--mount", "A=/mnt"],
+            vec![
+                "ratarmount",
+                "corpus",
+                "LIST",
+                "MOUNT",
+                "--top",
+                "A=/overlay",
+                "--mount",
+                "A=/mnt",
+            ],
+        ] {
+            let text = message(&argv);
+            assert!(
+                text.contains("corpus cannot be combined with --top or --mount"),
+                "{argv:?} -> {text}"
+            );
+        }
+        let corpus = parse_args_from(["ratarmount", "corpus", "LIST", "MOUNT"]).unwrap();
+        assert_eq!(corpus.corpus_list, Some(PathBuf::from("LIST")));
+        assert_eq!(
+            corpus.paths,
+            vec![PathBuf::from("LIST"), PathBuf::from("MOUNT")]
+        );
+        let source = parse_args_from(["ratarmount", "./corpus"]).unwrap();
+        assert!(source.corpus_list.is_none());
+        assert_eq!(source.paths, vec![PathBuf::from("./corpus")]);
+
+        let legacy =
+            parse_args_from(["ratarmount", "-w", "overlay", "archive.tar", "mnt"]).unwrap();
+        assert_eq!(legacy.write_overlay, Some(PathBuf::from("overlay")));
+        assert!(legacy.top.is_empty() && legacy.mount.is_empty());
+
+        let no_write = parse_args_from(["ratarmount", "--roll-every", "1d", "traces.tar"]);
+        let message = no_write.expect_err("roll without -w").to_string();
+        assert!(
+            message.contains("--roll-every requires --write-overlay"),
+            "{message}"
+        );
+        let corpus_roll = parse_args_from([
+            "ratarmount",
+            "corpus",
+            "LIST",
+            "MOUNT",
+            "--roll-every",
+            "1d",
+        ]);
+        let message = corpus_roll.expect_err("corpus roll without -w").to_string();
+        assert!(
+            message.contains("--roll-every requires --write-overlay"),
+            "{message}"
+        );
     }
 }

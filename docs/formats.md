@@ -250,6 +250,10 @@ The complete status against the Python original is in the
    check: a bind created later, mount propagation from another namespace or an ancestor
    rename after mounting are not caught, mount propagation flags are not read (a private
    bind is refused too), and `--corpus` members are not checked.
+7. **Fork-N.** `--top` and `--mount` are FUSE-only. A hardlinked regular file in
+   a top, a backing file or index whose canonical path is under a mountpoint, and
+   an already-mounted or non-empty target are exit 2. Commits of that layered
+   stack are refused until the stack is flattened.
 
 Remote, export and platform limits are listed with their own guides:
 [Remote inputs](phase10-remote.md#not-yet) · [NFS](nfs-export.md) · [other exports](export.md) · [macOS](macos.md).

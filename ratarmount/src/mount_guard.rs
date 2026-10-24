@@ -644,6 +644,28 @@ fn relation<F: FsIdentity>(fs: &F, mp: &MpCtx<'_>, base: &Target) -> Option<(Rel
     None
 }
 
+/// Compare `mount` with `other` the way [`check_mount_point`] compares a mount
+/// point with a base. `MpCtx` stays private; this builds it and calls [`relation`].
+pub(crate) fn relation_of<F: FsIdentity>(
+    fs: &F,
+    mount: &Path,
+    other: &Path,
+) -> Option<(Relation, Via)> {
+    let mount_t = resolve(fs, mount).ok()?;
+    let other_t = resolve(fs, other).ok()?;
+    #[cfg(any(target_os = "linux", test))]
+    let mountinfo = fs.mountinfo_bytes().map(|bytes| parse_mountinfo(&bytes));
+    let ctx = MpCtx {
+        t: &mount_t,
+        mount_id: fs.mount_id(&mount_t.anchor),
+        #[cfg(any(target_os = "linux", test))]
+        views: mountinfo
+            .as_deref()
+            .and_then(|info| views(fs, info, &mount_t)),
+    };
+    relation(fs, &ctx, &other_t)
+}
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------

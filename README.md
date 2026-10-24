@@ -305,7 +305,10 @@ automatically, and fetched ranges persist in a local cache.
 overlay until you commit them: offline into gzip, bzip2, xz TAR and ZIP, or
 live while the mount is served for uncompressed TAR and `.tar.zst`, where only
 the last zstd frame is rewritten. `--overlay-readonly`, `--overlay-quota` and
-`--sandbox` turn an overlay into a guard rail for untrusted code.
+`--sandbox` turn an overlay into a guard rail for untrusted code. Fork-N serves
+several writable tops at once: `--top NAME=OVERLAY --mount NAME=MOUNT` repeats
+for each name, one process, N FUSE mountpoints. Commits of that layered stack
+are refused until the stack is flattened.
 [Writing into archives](docs/write-overlay.md) · [sandbox controls](docs/sandbox.md)
 
 | Agent workflow | Python ratarmount | Rust ratarmount |
@@ -316,6 +319,7 @@ the last zstd frame is rewritten. `--overlay-readonly`, `--overlay-quota` and
 | Operation journals and turn marks | No | `--journal`, `journal` |
 | Container attempt runner and supervisor API | No | `sandbox run`, `sandbox daemon` |
 | Deterministic Git snapshot export with mount index | No | `snapshot <git> --with-index` |
+| Several writable tops, one process | No | `--top` / `--mount` |
 
 **Network exports.** One process can serve the same tree over NFSv3 or
 NFSv4.1 (`--nfs`), HTTP (`--http`), WebDAV (`--webdav`), SMB 3.1.1 (`--smb`),

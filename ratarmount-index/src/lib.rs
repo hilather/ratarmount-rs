@@ -929,13 +929,21 @@ impl SqliteIndex {
     pub fn create_writable(path: Option<&Path>) -> Result<Self> {
         let (conn, path_buf, publish_target) = match path {
             Some(dest) => {
+                ratarmount_core::fork_n::admit_create(dest)?;
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 // Concurrent readers keep dest's inode; do not remove_file dest.
                 reap_stale_writable_tmps(dest);
                 let tmp = writable_tmp_path(dest);
-                (Connection::open(&tmp)?, Some(tmp), Some(dest.to_path_buf()))
+                let existed = tmp.exists();
+                let conn = Connection::open(&tmp)?;
+                if existed {
+                    ratarmount_core::fork_n::note_truncate();
+                } else {
+                    ratarmount_core::fork_n::note_create();
+                }
+                (conn, Some(tmp), Some(dest.to_path_buf()))
             }
             None => (Connection::open_in_memory()?, None, None),
         };

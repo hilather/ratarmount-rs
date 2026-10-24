@@ -2013,3 +2013,65 @@ fn helper_bind_alias_verdicts() {
     let msg = check(&c.join("mnt")).unwrap_err();
     assert!(msg.contains(&format!("{}/mnt", sub.display())), "{msg}");
 }
+
+/// Regression: a Fork-N mount on, inside, or over its top refuses, including a
+/// case or Unicode alias that shares an inode after the directory exists.
+#[test]
+fn fork_n_identity_relation_of_on_inside_over_and_aliases() {
+    let mut fs = FakeFs::new();
+    fs.dir("/mnt/top/sub");
+    fs.dir("/other");
+    assert_eq!(
+        relation_of(&fs, Path::new("/mnt/top"), Path::new("/mnt/top")),
+        Some((Relation::Equal, Via::Path))
+    );
+    assert_eq!(
+        relation_of(&fs, Path::new("/mnt/top/sub"), Path::new("/mnt/top")),
+        Some((Relation::Inside, Via::Path))
+    );
+    assert_eq!(
+        relation_of(&fs, Path::new("/mnt"), Path::new("/mnt/top")),
+        Some((Relation::Contains, Via::Path))
+    );
+    assert_eq!(
+        relation_of(&fs, Path::new("/other"), Path::new("/mnt/top")),
+        None
+    );
+
+    fs.dir("/P/B/sub");
+    fs.bind("/P/B/sub", "/alias", 101);
+    fs.mountinfo = mi_lines(&["101 1 8:1 /P/B/sub /alias rw - ext4 /dev/sda1 rw"]);
+    match relation_of(&fs, Path::new("/alias/mnt"), Path::new("/P/B")) {
+        Some((Relation::Inside, Via::View { .. })) => {}
+        other => panic!("mountinfo view should be inside, got {other:?}"),
+    }
+
+    let mut aliased = FakeFs::new();
+    aliased.mnt_ids = false;
+    aliased.mountinfo = None;
+    aliased.dir("/mnt/phasea");
+    assert_eq!(
+        relation_of(&aliased, Path::new("/mnt/PhaseA"), Path::new("/mnt/phasea")),
+        None,
+        "case spellings pass before they share an inode"
+    );
+    aliased.alias("/mnt/PhaseA", "/mnt/phasea");
+    assert_eq!(
+        relation_of(&aliased, Path::new("/mnt/PhaseA"), Path::new("/mnt/phasea")),
+        Some((Relation::Equal, Via::Inode))
+    );
+
+    let nfc = "/mnt/caf\u{00e9}";
+    let nfd = "/mnt/cafe\u{0301}";
+    aliased.dir(nfd);
+    assert_eq!(
+        relation_of(&aliased, Path::new(nfc), Path::new(nfd)),
+        None,
+        "unicode spellings pass before they share an inode"
+    );
+    aliased.alias(nfc, nfd);
+    assert_eq!(
+        relation_of(&aliased, Path::new(nfc), Path::new(nfd)),
+        Some((Relation::Equal, Via::Inode))
+    );
+}
