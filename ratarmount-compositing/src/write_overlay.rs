@@ -59,6 +59,22 @@ pub const LEGACY_OVERLAY_MARKER: &str = ".ratarmount.overlay.sqlite.used";
 /// ignored, same as [`HIDDEN_DB`].
 const COW_STAGING_PREFIX: &str = ".ratarmount.overlay.cow-";
 
+/// First-open database staging (#194). Starts with [`HIDDEN_DB`] so it is
+/// already an internal name (hidden, not committed). Not the database.
+/// A crash, or a refused open that never identified the file, can leave
+/// this name and no marker. The next successful open sweeps it only when
+/// it is a regular file, older than that open, and not locked by a live
+/// process. Another name of the live database is unlinked without opening
+/// it. [`sweep_cow_staging`] matches only [`COW_STAGING_PREFIX`]. The sweep
+/// never deletes by prefix alone, so one open cannot remove a file another
+/// open still holds.
+const OVERLAY_DB_STAGING_PREFIX: &str = ".ratarmount.overlay.sqlite.staging-";
+
+/// Table created and dropped in one transaction so a fresh publish dirties a
+/// page and exclusive mode opens the rollback journal during the open. A
+/// database that already has this table is refused; the table is not dropped.
+const OPEN_TOUCH_TABLE: &str = "ratarmount_open_touch";
+
 fn has_ascii_prefix(name: &str, prefix: &str) -> bool {
     let n = name.as_bytes();
     let p = prefix.as_bytes();
@@ -241,11 +257,39 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
+type StagingPathHook = std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>>;
+
+#[cfg(test)]
 thread_local! {
-    /// Test seam (#160 fix round): when set, a `-w` open runs it once in its
-    /// schema step and then fails there, taking the failed-open cleanup.
+    /// Test seam (#160 fix round, #194): when set, a `-w` open runs it once
+    /// in its schema step and then fails there. A folder with no database
+    /// yet fails before anything is published; a folder that already has a
+    /// database takes the failed-open cleanup.
     pub(crate) static FAIL_SCHEMA_STEP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Runs once at the start of the no-replace publish, with the database
+    /// path, before the rename. A planted file there makes the rename lose.
+    pub(crate) static BEFORE_STAGING_RENAME: StagingPathHook =
+        const { std::cell::RefCell::new(None) };
+    /// When set, the no-replace publish fails once with this kind and does
+    /// not rename.
+    pub(crate) static STAGING_RENAME_ERROR: std::cell::Cell<Option<io::ErrorKind>> =
+        const { std::cell::Cell::new(None) };
+    /// Runs once after the published inode is captured and before the marker
+    /// is created. The removal check still uses the inode captured before.
+    pub(crate) static BEFORE_OVERLAY_MARKER: StagingPathHook =
+        const { std::cell::RefCell::new(None) };
+    /// When set, the next marker create fails once and creates nothing.
+    pub(crate) static FAIL_OVERLAY_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// When set, the staging file's mtime is moved ahead before the rename.
+// A peer's sweep then skips it as newer than that peer's open, so the
+// race reaches the published database instead of a rename `ENOENT`.
+#[cfg(all(test, unix))]
+thread_local! {
+    static STAGING_MTIME_AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The `stat` through the database entry ([`FOLLOWED_STAT_ERRNO`] in tests).
@@ -951,17 +995,26 @@ impl OverlayError {
         )
     }
 
-    /// SQLITE_READONLY / SQLITE_CANTOPEN / SQLITE_PERM: an access problem,
-    /// not a corrupt database.
+    /// SQLITE_READONLY / SQLITE_CANTOPEN / SQLITE_PERM, or an `io::Error`
+    /// of permission denied / read-only filesystem: an access problem, not
+    /// a corrupt database. A first open creates its staging file before
+    /// SQLite runs, so a mode-0555 overlay folder fails here with EACCES
+    /// and never reaches SQLITE_CANTOPEN (#194).
     pub fn is_access_error(&self) -> bool {
-        matches!(
-            self.sqlite_code(),
-            Some(
-                rusqlite::ErrorCode::ReadOnly
-                    | rusqlite::ErrorCode::CannotOpen
-                    | rusqlite::ErrorCode::PermissionDenied
-            )
-        )
+        match self {
+            OverlayError::Io(err) => matches!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            ),
+            _ => matches!(
+                self.sqlite_code(),
+                Some(
+                    rusqlite::ErrorCode::ReadOnly
+                        | rusqlite::ErrorCode::CannotOpen
+                        | rusqlite::ErrorCode::PermissionDenied
+                )
+            ),
+        }
     }
 }
 
@@ -1204,6 +1257,9 @@ impl WriteOverlay {
         info: Option<&crate::overlay_meta::OverlayCreateInfo>,
         identity: Option<&crate::ClassifiedBase>,
     ) -> Result<Self> {
+        // Staging leftovers older than this are eligible for the sweep at
+        // the end of a successful open. A file this attempt creates is not.
+        let attempt_started = SystemTime::now();
         // Before the directory is created: the topmost-new exclusion rule
         // depends on which parents of the overlay exist right now.
         let exclude_plan = info
@@ -1224,6 +1280,21 @@ impl WriteOverlay {
         // Canonical root so confinement checks use a stable absolute prefix.
         let root = root.canonicalize().map_err(OverlayError::Io)?;
         let db_path = root.join(HIDDEN_DB);
+        // #194: nothing at the database path and no marker. The schema,
+        // including the base walk, runs in a staging file. The database is
+        // renamed into place only after that commit, and the marker is
+        // created only after the rename. A failure of an identified staging
+        // file deletes that file and leaves the folder unmarked. A crash, or
+        // a refusal before the file is identified, can leave the staging
+        // name; the sweep at the end of the next successful open removes it
+        // when it is safe to. A database that already exists (0 bytes
+        // included) stays on the in-place path below (#160).
+        let published_fresh = if overlay_db_absent(&root) {
+            publish_fresh_overlay_database(&root, &db_path, info, exclude_plan.as_ref(), identity)?
+                == FreshDatabase::Published
+        } else {
+            false
+        };
         let found_marker = overlay_marker(&root)?;
         let marker = found_marker.is_some();
         let marker_path = found_marker.unwrap_or_else(|| root.join(OVERLAY_MARKER));
@@ -1269,9 +1340,11 @@ impl WriteOverlay {
                 )
             )));
         }
-        // Marker before SCHEMA: a brand-new overlay whose marker cannot be
-        // written must not leave a `files` table behind (the next open would
-        // take the backfill path and run unmarked).
+        // Marker before SCHEMA when a database file is already here: failing
+        // to write the marker must not leave a `files` table behind (the next
+        // open would take the backfill path and run unmarked). A folder with
+        // no database yet never reaches this; its marker is created only
+        // after the staging file is published (#194).
         // Remove a database file that was absent before this call (a stat
         // before SQLite's open; an empty file planted between that stat and
         // the open is indistinguishable, see `Expect::Fresh`), so a failed
@@ -1322,34 +1395,16 @@ impl WriteOverlay {
                 }
             }
         }
-        let opened = (|| -> Result<HashSet<String>> {
-            #[cfg(test)]
-            if let Some(hook) = FAIL_SCHEMA_STEP.with(|seam| seam.borrow_mut().take()) {
-                hook();
-                return Err(OverlayError::Msg("test: schema step failed".into()));
-            }
-            conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
-            let transaction = conn.transaction()?;
-            transaction.execute_batch(SCHEMA)?;
-            if crate::OverlayMeta::from_connection(&transaction)?
-                .as_ref()
-                .is_some_and(crate::OverlayMeta::layer_sealed)
-            {
-                return Err(OverlayError::Msg(
-                    "overlay is sealed; mount it with --lower, or `overlay unseal`".into(),
-                ));
-            }
-            crate::overlay_meta::initialize(
-                &transaction,
-                had_files,
-                info,
-                exclude_plan.as_ref(),
-                identity,
-            )?;
-            let tombstones = tombstone_set_from_conn(&transaction)?;
-            transaction.commit()?;
-            Ok(tombstones)
-        })();
+        // The staging publish already committed the schema and the base
+        // identity. Running it again would hash a directory base twice.
+        let opened = commit_overlay_schema(
+            &mut conn,
+            had_files,
+            info,
+            exclude_plan.as_ref(),
+            identity,
+            !(published_fresh && had_files),
+        );
         let mut tombstones = match opened {
             Ok(t) => t,
             Err(e) => {
@@ -1411,9 +1466,21 @@ impl WriteOverlay {
         // shared lock and a second open could delete this process's staging
         // file. COMMIT does not drop the lock while locking mode is exclusive.
         // A failed open above returns before this, including SQLITE_BUSY.
-        conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        //
+        // A fresh publish (#194) did the schema write on the staging
+        // connection, which is already closed. Exclusive mode keeps the
+        // rollback journal open after the first write on *this* connection.
+        // Without a page write here, that journal descriptor appears on the
+        // first user write and stays until close. Schema creation used to be
+        // that write. [`OPEN_TOUCH_TABLE`] is created and dropped in this
+        // transaction; a database that already has the table is refused
+        // instead of dropping it.
+        take_exclusive_lock_for_open(&conn, published_fresh)?;
         // Best-effort. An unreadable directory must not fail the open.
+        // The copy-on-write sweep matches only [`COW_STAGING_PREFIX`].
+        // First-open leftovers use the staging sweep, which checks the file.
         sweep_cow_staging(&root);
+        sweep_overlay_db_staging(&root, attempt_started);
         Ok(Self {
             policy: None,
             policy_gate: Mutex::new(()),
@@ -6451,10 +6518,327 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
+/// What [`publish_fresh_overlay_database`] did with a folder that had no database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshDatabase {
+    /// This open published the database and then the marker.
+    Published,
+    /// The database name appeared while this open was initializing. The
+    /// staging file was removed; the name was not.
+    Raced,
+}
+
+/// `path` with `suf` appended to the file name (`db` + `-journal`).
+fn with_suffix(path: &Path, suf: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suf);
+    PathBuf::from(name)
+}
+
+/// Remove regular-file SQLite sidecars of `path`. A missing sidecar, a
+/// symlink or a directory is left alone. Called only after the main file
+/// was identified as ours, or for the staging name this open still holds
+/// before it is renamed.
+fn remove_sqlite_sidecars(path: &Path) {
+    for suf in ["-journal", "-shm", "-wal"] {
+        let sidecar = with_suffix(path, suf);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(meta) if meta.file_type().is_file() => {
+                let _ = fs::remove_file(&sidecar);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Remove the regular file at `path` when it is still `id` (`None` on a
+/// platform with no file identity: the path itself). Sidecars of that name
+/// go with it only after that file was removed. A missing main file does
+/// not authorize deleting sidecars by name. A different inode, a symlink or
+/// a directory is left alone.
+fn remove_db_file_if_ours(path: &Path, id: Option<(u64, u64)>) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.file_type().is_file() {
+        return;
+    }
+    let ours = match (id, crate::overlay_db::file_id(&meta)) {
+        (Some(want), Some(got)) => want == got,
+        (None, None) => true,
+        _ => false,
+    };
+    if !ours {
+        return;
+    }
+    let _ = fs::remove_file(path);
+    remove_sqlite_sidecars(path);
+}
+
+/// Two days ahead of now. Ahead of any open's start in this race, and
+/// inside a 32-bit `time_t` for the years this process can be running.
+/// Does not open `path`, so a lock this process holds on it stays.
+#[cfg(all(test, unix))]
+fn set_staging_mtime_ahead(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let ahead = SystemTime::now() + Duration::from_secs(2 * 24 * 3600);
+    let spec = libc::timespec {
+        tv_sec: ahead
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t,
+        tv_nsec: 0,
+    };
+    let times = [spec, spec];
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    assert_eq!(rc, 0, "utimensat {}", path.display());
+}
+
+/// A path under `root` whose name starts with [`OVERLAY_DB_STAGING_PREFIX`].
+/// The placeholder file is removed so SQLite creates the database itself
+/// (`0644 & !umask`, same as every other new overlay database).
+fn reserve_staging_path(root: &Path) -> io::Result<PathBuf> {
+    let named = tempfile::Builder::new()
+        .prefix(OVERLAY_DB_STAGING_PREFIX)
+        .make_in(root, |path| {
+            let mut opts = open_options_nofollow();
+            opts.write(true).create_new(true).open(path)
+        })?;
+    let path = named.path().to_path_buf();
+    named.close()?;
+    Ok(path)
+}
+
+/// Publish `from` as `to` without replacing an existing `to`.
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        if let Some(kind) = STAGING_RENAME_ERROR.with(|cell| cell.take()) {
+            return Err(io::Error::new(kind, "test: staging rename failed"));
+        }
+        if let Some(hook) = BEFORE_STAGING_RENAME.with(|cell| cell.borrow_mut().take()) {
+            hook(to);
+        }
+    }
+    let parent = from
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let from_name = from
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "staging file has no name"))?;
+    let to_name = to.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "overlay database file has no name",
+        )
+    })?;
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        let dir = File::open(parent)?;
+        match rustix::fs::renameat_with(
+            &dir,
+            from_name,
+            &dir,
+            to_name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) if e == rustix::io::Errno::EXIST => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("overlay database {} already exists", to.display()),
+            )),
+            Err(e) => Err(io::Error::from(e)),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = (parent, from_name, to_name);
+        match fs::hard_link(from, to) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("overlay database {} already exists", to.display()),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+        // Not one operation. `link` created `to` as a second name of the
+        // inode `from` had at that moment; a crash before the unlink leaves
+        // both names. The staging sweep unlinks only the extra name and does
+        // not open that inode (docs/sandbox.md, "First-open database publish
+        // by platform"). Unlink `from` only while it is still that inode.
+        let same = match (fs::symlink_metadata(from), fs::symlink_metadata(to)) {
+            (Ok(a), Ok(b)) => crate::overlay_db::file_id(&a) == crate::overlay_db::file_id(&b),
+            _ => false,
+        };
+        if same {
+            let _ = fs::remove_file(from);
+        }
+        Ok(())
+    }
+}
+
+/// Sync `dir` after a publish. Callers log a failure and continue: a failed
+/// directory fsync only warns, and the open still succeeds. On Windows this
+/// is a no-op (a directory cannot be opened to sync it).
+fn sync_overlay_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(dir)?.sync_all()
+    }
+}
+
+/// Schema, seal check and (when `run_initialize`) the creation record.
+/// One transaction. The test seam fails before any of that SQL.
+fn commit_overlay_schema(
+    conn: &mut Connection,
+    had_files: bool,
+    info: Option<&crate::overlay_meta::OverlayCreateInfo>,
+    exclude_plan: Option<&crate::overlay_meta::ExcludePlan>,
+    identity: Option<&crate::ClassifiedBase>,
+    run_initialize: bool,
+) -> Result<HashSet<String>> {
+    #[cfg(test)]
+    if let Some(hook) = FAIL_SCHEMA_STEP.with(|seam| seam.borrow_mut().take()) {
+        hook();
+        return Err(OverlayError::Msg("test: schema step failed".into()));
+    }
+    conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
+    let transaction = conn.transaction()?;
+    transaction.execute_batch(SCHEMA)?;
+    if crate::OverlayMeta::from_connection(&transaction)?
+        .as_ref()
+        .is_some_and(crate::OverlayMeta::layer_sealed)
+    {
+        return Err(OverlayError::Msg(
+            "overlay is sealed; mount it with --lower, or `overlay unseal`".into(),
+        ));
+    }
+    if run_initialize {
+        crate::overlay_meta::initialize(&transaction, had_files, info, exclude_plan, identity)?;
+    }
+    let tombstones = tombstone_set_from_conn(&transaction)?;
+    transaction.commit()?;
+    Ok(tombstones)
+}
+
+/// Initialize a new overlay database in a staging file and publish it.
+///
+/// The marker is created only after the rename. A folder that never got that
+/// far is not marked, so a later open does not refuse it as "used" (#194).
+/// The staging file is the only name removed on failure: a file that appears
+/// at the database path during init is left where it is (another open won,
+/// or a test planted it).
+fn publish_fresh_overlay_database(
+    root: &Path,
+    db_path: &Path,
+    info: Option<&crate::overlay_meta::OverlayCreateInfo>,
+    exclude_plan: Option<&crate::overlay_meta::ExcludePlan>,
+    identity: Option<&crate::ClassifiedBase>,
+) -> Result<FreshDatabase> {
+    let staging = reserve_staging_path(root)?;
+    let opened = match crate::overlay_db::open_overlay_db(
+        &staging,
+        OpenFlags::default(),
+        crate::DbName::Path,
+    ) {
+        Ok(opened) => opened,
+        Err(e) => {
+            // A refusal after SQLite created the file leaves a hidden staging
+            // name. It is not the database and there is no marker. This open
+            // did not identify the file, so it is not deleted here. The next
+            // successful open sweeps it when it is a regular file, older than
+            // that open, and not locked.
+            return Err(e.into());
+        }
+    };
+    let id = opened.id();
+    let (mut conn, registration) = opened.into_parts();
+    let schema = commit_overlay_schema(&mut conn, false, info, exclude_plan, identity, true);
+    // While the connection is still open. `utimensat` does not open the file,
+    // so it does not drop this process's fcntl lock.
+    #[cfg(all(test, unix))]
+    if schema.is_ok() && STAGING_MTIME_AHEAD.with(|cell| cell.get()) {
+        set_staging_mtime_ahead(&staging);
+    }
+    // Drop the connection before any other close of this inode, and before
+    // the rename: SQLite keeps the path it opened for its journal.
+    drop(conn);
+    drop(registration);
+    if let Err(e) = schema {
+        remove_db_file_if_ours(&staging, id);
+        return Err(e);
+    }
+    remove_sqlite_sidecars(&staging);
+    match rename_no_replace(&staging, db_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            remove_db_file_if_ours(&staging, id);
+            return Ok(FreshDatabase::Raced);
+        }
+        Err(e) => {
+            remove_db_file_if_ours(&staging, id);
+            return Err(OverlayError::Io(e));
+        }
+    }
+    let published_id = fs::symlink_metadata(db_path)
+        .ok()
+        .and_then(|m| crate::overlay_db::file_id(&m));
+    if let Err(e) = sync_overlay_dir(root) {
+        // A failed directory fsync only warns. The database is already published.
+        log::warn!(
+            "could not sync overlay folder {} after publishing the database: {e}",
+            root.display()
+        );
+    }
+    // Marker last. A crash before this leaves a database with a `files`
+    // table and no marker; the next open backfills the marker. A failure
+    // here removes the database this open just published, so the folder
+    // does not stay marked and does not keep a `files` table either.
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_OVERLAY_MARKER.with(|cell| cell.borrow_mut().take()) {
+        hook(db_path);
+    }
+    if let Err(e) = create_overlay_marker(&root.join(OVERLAY_MARKER)) {
+        remove_db_file_if_ours(db_path, published_id);
+        return Err(OverlayError::Io(e));
+    }
+    if let Err(e) = sync_overlay_dir(root) {
+        // A failed directory fsync only warns. The marker is already in place.
+        log::warn!(
+            "could not sync overlay folder {} after creating the marker: {e}",
+            root.display()
+        );
+    }
+    Ok(FreshDatabase::Published)
+}
+
 /// Create the empty [`OVERLAY_MARKER`] without following a symlink. An existing
 /// entry is accepted only if it is a regular file.
 /// Returns whether this call created it.
 fn create_overlay_marker(path: &Path) -> io::Result<bool> {
+    #[cfg(test)]
+    if FAIL_OVERLAY_MARKER.with(|cell| cell.replace(false)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "test: marker create failed",
+        ));
+    }
     match open_options_nofollow()
         .write(true)
         .create_new(true)
@@ -6582,6 +6966,347 @@ fn take_cow_before_persist(overlay: &WriteOverlay) -> impl FnOnce() {
         let _ = overlay;
         || {}
     }
+}
+
+/// Take the exclusive lock this open keeps until it closes.
+///
+/// A fresh publish writes one page ([`OPEN_TOUCH_TABLE`], created and dropped
+/// here) so the rollback journal opens now. If that table already exists it
+/// is left untouched and the open fails.
+fn take_exclusive_lock_for_open(conn: &Connection, published_fresh: bool) -> Result<()> {
+    if !published_fresh {
+        conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        return Ok(());
+    }
+    debug_assert!(
+        OPEN_TOUCH_TABLE
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+        "touch table name is interpolated into SQL"
+    );
+    let reserved = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [OPEN_TOUCH_TABLE],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if reserved {
+        return Err(OverlayError::Msg(format!(
+            "overlay database already has a table named {OPEN_TOUCH_TABLE}; \
+             that name is reserved for the lock taken at open"
+        )));
+    }
+    conn.execute_batch(&format!(
+        "BEGIN EXCLUSIVE; CREATE TABLE {OPEN_TOUCH_TABLE}(x); \
+         DROP TABLE {OPEN_TOUCH_TABLE}; COMMIT;"
+    ))?;
+    Ok(())
+}
+
+/// The live overlay database, used so a second name of it is unlinked and
+/// never opened. Unix compares `(dev, ino)`. Windows has no stable file
+/// index; creation time and length are the stand-in, and a time of 0 is
+/// "unknown" (the name is then left in place while a process holds it).
+struct LiveDatabase {
+    id: Option<(u64, u64)>,
+    #[cfg(windows)]
+    birth_len: Option<(u64, u64)>,
+}
+
+fn live_database(root: &Path) -> LiveDatabase {
+    let meta = fs::symlink_metadata(root.join(HIDDEN_DB))
+        .ok()
+        .filter(|meta| meta.file_type().is_file());
+    LiveDatabase {
+        id: meta.as_ref().and_then(crate::overlay_db::file_id),
+        #[cfg(windows)]
+        birth_len: meta.as_ref().and_then(windows_birth_and_len),
+    }
+}
+
+#[cfg(windows)]
+fn windows_birth_and_len(meta: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    let created = meta.creation_time();
+    if created == 0 {
+        None
+    } else {
+        Some((created, meta.len()))
+    }
+}
+
+fn is_another_name_of_live(meta: &fs::Metadata, live: &LiveDatabase) -> bool {
+    if let (Some(id), Some(live_id)) = (crate::overlay_db::file_id(meta), live.id) {
+        return id == live_id;
+    }
+    #[cfg(windows)]
+    if let (Some(birth), Some(live_birth)) = (windows_birth_and_len(meta), live.birth_len) {
+        return birth == live_birth;
+    }
+    false
+}
+
+/// `name` is a `-journal` / `-shm` / `-wal` of a staging file, not a staging
+/// file whose own suffix happens to be empty.
+fn staging_sidecar_stem(name: &str) -> Option<&str> {
+    for suf in ["-journal", "-shm", "-wal"] {
+        let Some(stem) = name.strip_suffix(suf) else {
+            continue;
+        };
+        if has_ascii_prefix(stem, OVERLAY_DB_STAGING_PREFIX)
+            && stem.len() > OVERLAY_DB_STAGING_PREFIX.len()
+        {
+            return Some(stem);
+        }
+    }
+    None
+}
+
+enum SweepChoice {
+    /// The staging name is gone (removed now, or already absent).
+    Removed,
+    /// Left in place.
+    Kept,
+}
+
+/// Remove first-open staging leftovers in `root` (not its subdirectories).
+///
+/// A name is removed only when `lstat` says it is a regular file, its mtime
+/// is strictly older than `attempt_started`, and no live process holds it.
+/// A second name of the live database is unlinked without being opened, so
+/// this process does not drop its own locks on that inode. On Windows that
+/// match is creation time and length, with no lock probe, so a coincidental
+/// match is treated as a second name. Sidecars are removed only when their
+/// staging file was removed or is already absent. Never deletes by prefix
+/// alone. Best-effort: an error is logged and that entry is skipped. The
+/// sweep never fails the open.
+///
+/// Between the lock probe and the unlink, a peer that has created its staging
+/// file but not yet run its first `BEGIN` holds no lock. The sweep runs only
+/// after this open owns the published database, so that peer loses the
+/// publish. The error it sees is a rename failure, not "in use".
+fn sweep_overlay_db_staging(root: &Path, attempt_started: SystemTime) {
+    let live = live_database(root);
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) => {
+            log::warn!(
+                "could not read overlay directory {} while sweeping first-open staging: {e}",
+                root.display()
+            );
+            return;
+        }
+    };
+    let mut bases = Vec::new();
+    let mut sidecars = Vec::new();
+    for ent in entries {
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                log::warn!(
+                    "could not read an overlay directory entry in {} while sweeping first-open staging: {e}",
+                    root.display()
+                );
+                continue;
+            }
+        };
+        let name_os = ent.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if let Some(stem) = staging_sidecar_stem(name) {
+            sidecars.push((stem.to_string(), ent.path()));
+        } else if has_ascii_prefix(name, OVERLAY_DB_STAGING_PREFIX) {
+            bases.push((name.to_string(), ent.path()));
+        }
+    }
+    let mut removed = HashSet::new();
+    let mut kept = HashSet::new();
+    for (name, path) in bases {
+        match sweep_one_staging_file(&path, attempt_started, &live, false) {
+            SweepChoice::Removed => {
+                removed.insert(name);
+            }
+            SweepChoice::Kept => {
+                kept.insert(name);
+            }
+        }
+    }
+    for (stem, path) in sidecars {
+        let base_gone = removed.contains(&stem)
+            || (!kept.contains(&stem) && fs::symlink_metadata(root.join(&stem)).is_err());
+        if base_gone {
+            let _ = sweep_one_staging_file(&path, attempt_started, &live, true);
+        }
+    }
+}
+
+fn staging_file_is_old_regular(meta: &fs::Metadata, attempt_started: SystemTime) -> bool {
+    // `symlink_metadata`: a symlink is not a regular file, and is not followed.
+    if !meta.file_type().is_file() {
+        return false;
+    }
+    match meta.modified() {
+        Ok(modified) => modified < attempt_started,
+        Err(_) => false,
+    }
+}
+
+fn unlink_staging_name(path: &Path) -> SweepChoice {
+    match fs::remove_file(path) {
+        Ok(()) => SweepChoice::Removed,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => SweepChoice::Removed,
+        Err(e) => {
+            log::warn!(
+                "could not remove first-open staging file {}: {e}",
+                path.display()
+            );
+            SweepChoice::Kept
+        }
+    }
+}
+
+fn sweep_one_staging_file(
+    path: &Path,
+    attempt_started: SystemTime,
+    live: &LiveDatabase,
+    sidecar: bool,
+) -> SweepChoice {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return SweepChoice::Removed,
+        Err(e) => {
+            log::warn!(
+                "could not stat {} while sweeping first-open staging: {e}",
+                path.display()
+            );
+            return SweepChoice::Kept;
+        }
+    };
+    if !staging_file_is_old_regular(&meta, attempt_started) {
+        return SweepChoice::Kept;
+    }
+    let id_before = crate::overlay_db::file_id(&meta);
+    // Another name of the live database is unlinked with no lock probe.
+    // Unix matches `(dev, ino)`. Windows matches creation time and length,
+    // so a coincidental match is treated as a second name.
+    if is_another_name_of_live(&meta, live) {
+        return unlink_staging_name(path);
+    }
+    if staging_lock_held_by_other_process(path, sidecar) {
+        return SweepChoice::Kept;
+    }
+    // Re-stat catches a replaced inode. It does not see a lock taken after
+    // the probe: that peer is unlinked and its rename fails, not "in use".
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return SweepChoice::Removed,
+        Err(e) => {
+            log::warn!(
+                "could not stat {} while sweeping first-open staging: {e}",
+                path.display()
+            );
+            return SweepChoice::Kept;
+        }
+    };
+    if !staging_file_is_old_regular(&meta, attempt_started)
+        || crate::overlay_db::file_id(&meta) != id_before
+    {
+        return SweepChoice::Kept;
+    }
+    unlink_staging_name(path)
+}
+
+/// `true` when a live process holds `path`, or the probe could not tell.
+/// On Unix the parent never opens `path`: a forked child does, and only
+/// `_exit`s. Opening it here would drop every fcntl lock this process holds
+/// on that inode when the descriptor closed.
+#[cfg(unix)]
+fn staging_lock_held_by_other_process(path: &Path, _sidecar: bool) -> bool {
+    let Ok(c_path) = c_path(path) else {
+        return true;
+    };
+    // SAFETY: the child calls only async-signal-safe functions (`open`,
+    // `fcntl`, `_exit`) and does not return into Rust.
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            return true;
+        }
+        if pid == 0 {
+            let fd = libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                libc::_exit(3);
+            }
+            let mut lk: libc::flock = std::mem::zeroed();
+            lk.l_type = libc::F_WRLCK as _;
+            lk.l_whence = libc::SEEK_SET as _;
+            lk.l_start = 0x4000_0000;
+            lk.l_len = 512;
+            if libc::fcntl(fd, libc::F_GETLK, &mut lk) != 0 {
+                libc::_exit(4);
+            }
+            #[allow(clippy::unnecessary_cast)]
+            let unlocked = lk.l_type as i32 == libc::F_UNLCK as i32;
+            libc::_exit(if unlocked { 0 } else { 1 });
+        }
+        let mut status = 0;
+        loop {
+            let waited = libc::waitpid(pid, &mut status, 0);
+            if waited == pid {
+                break;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return true;
+            }
+        }
+        if !libc::WIFEXITED(status) {
+            return true;
+        }
+        libc::WEXITSTATUS(status) != 0
+    }
+}
+
+/// Windows cannot compare file identity. `BEGIN EXCLUSIVE` with a zero busy
+/// timeout is the lock probe: busy leaves the name, including a second link
+/// of the database this process holds. A sidecar that is not a database is
+/// not locked that way; the main file was already judged.
+#[cfg(windows)]
+fn staging_lock_held_by_other_process(path: &Path, sidecar: bool) -> bool {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let conn = match Connection::open_with_flags(path, flags) {
+        Ok(conn) => conn,
+        Err(_) => return !sidecar,
+    };
+    let _ = conn.busy_timeout(Duration::ZERO);
+    match conn.execute_batch("BEGIN EXCLUSIVE") {
+        Ok(()) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            false
+        }
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            true
+        }
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn staging_lock_held_by_other_process(path: &Path, sidecar: bool) -> bool {
+    let _ = (path, sidecar);
+    true
 }
 
 /// Remove crash leftovers named [`COW_STAGING_PREFIX`]. Regular files only.
@@ -12753,30 +13478,131 @@ pub(crate) mod tests {
         assert!(e.contains(OVERLAY_MARKER), "{e}");
     }
 
-    /// Regression: a first open that fails after the marker was created
-    /// (SCHEMA on a read-only 0-byte database) must not leave the marker.
+    /// Names left under `dir` that are a marker or a first-open staging file.
+    fn marker_or_staging_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                n == OVERLAY_MARKER
+                    || n == LEGACY_OVERLAY_MARKER
+                    || n.starts_with(OVERLAY_DB_STAGING_PREFIX)
+            })
+            .collect()
+    }
+
+    /// Regression (#194): a read-only overlay folder fails in
+    /// `reserve_staging_path` with `PermissionDenied` (or `ReadOnlyFilesystem`)
+    /// before SQLite opens. That is still an access error, so the CLI keeps
+    /// the "readable and writable" hint. A missing path and a plain message
+    /// are not.
+    #[test]
+    fn regression_io_permission_denied_is_an_access_error() {
+        let denied = OverlayError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Permission denied",
+        ));
+        assert!(denied.is_access_error());
+        let erofs = OverlayError::Io(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "Read-only file system",
+        ));
+        assert!(erofs.is_access_error());
+        let missing = OverlayError::Io(io::Error::new(io::ErrorKind::NotFound, "missing"));
+        assert!(!missing.is_access_error());
+        assert!(!OverlayError::Msg("overlay path must be a folder".into()).is_access_error());
+        let cantopen = OverlayError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some("unable to open database file".into()),
+        ));
+        assert!(cantopen.is_access_error());
+    }
+
+    /// Regression (#194): a first open that fails must not leave the folder
+    /// marked. A folder with no database yet publishes nothing (staging file
+    /// included). A folder that already holds a database still drops a marker
+    /// this open created, and still opens as new afterwards.
     #[test]
     fn overlay_first_open_failure_removes_marker() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let overlay = dir.path().join("ov");
-        fs::create_dir(&overlay).unwrap();
-        let db = overlay.join(HIDDEN_DB);
+
+        // No database yet: the schema step fails before the rename. Nothing
+        // is published, and the next open creates the overlay.
+        let fresh = dir.path().join("fresh");
+        fs::create_dir(&fresh).unwrap();
+        FAIL_SCHEMA_STEP.with(|seam| *seam.borrow_mut() = Some(Box::new(|| {})));
+        let error = msg_of(reopen_keep_overlay(&fresh));
+        assert!(error.contains("schema step failed"), "{error}");
+        assert!(
+            !fresh.join(HIDDEN_DB).exists(),
+            "the database was published"
+        );
+        let left = marker_or_staging_names(&fresh);
+        assert!(left.is_empty(), "marked or staging left: {left:?}");
+        assert!(
+            !matches!(overlay_db_entry(&fresh).unwrap(), DbEntry::Lost { .. }),
+            "folder stayed marked as used"
+        );
+        let opened = reopen_keep_overlay(&fresh).expect("folder still opens as new");
+        drop(opened);
+        assert!(
+            fresh.join(OVERLAY_MARKER).is_file(),
+            "retry publishes the marker"
+        );
+        assert!(has_files_table(&fresh.join(HIDDEN_DB)));
+        let left = marker_or_staging_names(&fresh);
+        assert!(
+            left.as_slice() == [OVERLAY_MARKER],
+            "retry left extras: {left:?}"
+        );
+
+        // An existing read-only 0-byte database fails before it can be
+        // initialized. It must not stay marked, and it still opens once it
+        // is writable.
+        let readonly = dir.path().join("readonly");
+        fs::create_dir(&readonly).unwrap();
+        let db = readonly.join(HIDDEN_DB);
         fs::write(&db, b"").unwrap();
         fs::set_permissions(&db, fs::Permissions::from_mode(0o444)).unwrap();
         if fs::OpenOptions::new().write(true).open(&db).is_ok() {
             eprintln!("skip: read-only file is writable (running as root?)");
-            return;
+        } else {
+            let r = reopen_keep_overlay(&readonly);
+            assert!(r.is_err(), "a read-only database must fail");
+            assert!(
+                marker_or_staging_names(&readonly).is_empty(),
+                "marker must not stay"
+            );
+            assert!(
+                !matches!(overlay_db_entry(&readonly).unwrap(), DbEntry::Lost { .. }),
+                "read-only folder stayed marked as used"
+            );
+            fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(fs::metadata(&db).unwrap().len(), 0);
+            reopen_keep_overlay(&readonly).expect("folder still opens as new");
         }
-        let r = reopen_keep_overlay(&overlay);
-        assert!(r.is_err(), "SCHEMA on a read-only DB must fail");
+
+        // An existing writable 0-byte database fails in the schema step,
+        // after the marker was created. The cleanup removes that marker and
+        // leaves the 0-byte file to SQLite (#160); the folder opens as new.
+        let zero = dir.path().join("zero");
+        fs::create_dir(&zero).unwrap();
+        let db = zero.join(HIDDEN_DB);
+        fs::write(&db, b"").unwrap();
+        FAIL_SCHEMA_STEP.with(|seam| *seam.borrow_mut() = Some(Box::new(|| {})));
+        let error = msg_of(reopen_keep_overlay(&zero));
+        assert!(error.contains("schema step failed"), "{error}");
+        assert_eq!(fs::metadata(&db).unwrap().len(), 0, "0-byte file removed");
         assert!(
-            !overlay.join(OVERLAY_MARKER).exists(),
-            "marker must be removed"
+            marker_or_staging_names(&zero).is_empty(),
+            "marker stayed after the schema failure"
         );
-        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(fs::metadata(&db).unwrap().len(), 0);
-        reopen_keep_overlay(&overlay).expect("folder still opens as new");
+        assert!(
+            !matches!(overlay_db_entry(&zero).unwrap(), DbEntry::Lost { .. }),
+            "0-byte folder stayed marked as used"
+        );
+        reopen_keep_overlay(&zero).expect("0-byte folder still opens as new");
     }
 
     /// Robo-Ilya: a directory at the database path is named as such.
@@ -12808,6 +13634,20 @@ pub(crate) mod tests {
             drop(o);
             assert!(ov.join(OVERLAY_MARKER).is_file(), "{}", ov.display());
             assert!(has_files_table(&ov.join(HIDDEN_DB)));
+            // The fresh-publish lock write creates and drops this table in
+            // one transaction. It must not remain in the committed schema.
+            let c =
+                Connection::open_with_flags(ov.join(HIDDEN_DB), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            let touch = c
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'ratarmount_open_touch'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap();
+            assert!(touch.is_none(), "{}", ov.display());
         }
     }
 
@@ -12854,11 +13694,10 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    /// Regression (#160 fix round): the failed first open removed the
-    /// database name whenever a stat before SQLite's open found nothing, even
-    /// when the name held another file by the time of the cleanup. A new
-    /// database the open created is removed; a file put at the name after
-    /// SQLite's open is left alone.
+    /// Regression (#194, was #160): a failed first open of a folder with no
+    /// database deletes only its staging file. It does not publish, and it
+    /// does not remove a file planted at the database name during the schema
+    /// step. The folder stays unmarked.
     #[test]
     fn regression_failed_first_open_removes_only_the_database_it_opened() {
         let dir = tempfile::tempdir().unwrap();
@@ -12867,7 +13706,16 @@ pub(crate) mod tests {
         FAIL_SCHEMA_STEP.with(|seam| *seam.borrow_mut() = Some(Box::new(|| {})));
         let error = msg_of(reopen_keep_overlay(&fresh));
         assert!(error.contains("schema step failed"), "{error}");
-        assert!(!fresh.join(HIDDEN_DB).exists(), "the new database stayed");
+        assert!(
+            !fresh.join(HIDDEN_DB).exists(),
+            "the database was published"
+        );
+        let left = marker_or_staging_names(&fresh);
+        assert!(left.is_empty(), "staging or marker left: {left:?}");
+        assert!(
+            matches!(overlay_db_entry(&fresh).unwrap(), DbEntry::Absent),
+            "fresh folder is no longer absent"
+        );
 
         let swapped = dir.path().canonicalize().unwrap().join("swapped");
         fs::create_dir(&swapped).unwrap();
@@ -12885,8 +13733,509 @@ pub(crate) mod tests {
         assert_eq!(
             fs::read(&db).unwrap(),
             b"another file",
-            "the cleanup removed a file it never opened"
+            "the failed open removed a file it never published"
         );
+        let left = marker_or_staging_names(&swapped);
+        assert!(left.is_empty(), "staging or marker left: {left:?}");
+        assert!(
+            !matches!(overlay_db_entry(&swapped).unwrap(), DbEntry::Lost { .. }),
+            "planted file left the folder marked as used"
+        );
+    }
+
+    /// `utimensat`, so a test can age a file a live connection still holds.
+    /// Opening it to set the mtime would drop that connection's locks.
+    #[cfg(unix)]
+    fn set_mtime_unix_secs(path: &Path, secs: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let spec = libc::timespec {
+            tv_sec: secs as libc::time_t,
+            tv_nsec: 0,
+        };
+        let times = [spec, spec];
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                c.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(rc, 0, "utimensat {}", path.display());
+    }
+
+    /// Regression (#194): a crash leftover staging file and its journal are
+    /// removed on the next successful open. A symlink, a directory, a file
+    /// newer than the open, and a file a live process holds (and that file's
+    /// sidecar) stay. The sweep does not delete by prefix alone.
+    #[cfg(unix)]
+    #[test]
+    fn regression_staging_crash_leftover_is_swept_and_a_locked_one_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().canonicalize().unwrap().join("ov");
+        fs::create_dir(&overlay).unwrap();
+        let stale = overlay.join(format!("{OVERLAY_DB_STAGING_PREFIX}stale"));
+        fs::write(&stale, b"stale").unwrap();
+        let stale_journal = super::with_suffix(&stale, "-journal");
+        fs::write(&stale_journal, b"journal").unwrap();
+        set_mtime_unix_secs(&stale, 0);
+        set_mtime_unix_secs(&stale_journal, 0);
+
+        let held_path = overlay.join(format!("{OVERLAY_DB_STAGING_PREFIX}held"));
+        let held = Connection::open(&held_path).unwrap();
+        held.execute_batch(
+            "PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; CREATE TABLE held(x);",
+        )
+        .unwrap();
+        set_mtime_unix_secs(&held_path, 0);
+        let held_wal = super::with_suffix(&held_path, "-wal");
+        fs::write(&held_wal, b"sidecar").unwrap();
+        set_mtime_unix_secs(&held_wal, 0);
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&held_path),
+            "the holder has no lock for the sweep to see"
+        );
+
+        let link = overlay.join(format!("{OVERLAY_DB_STAGING_PREFIX}link"));
+        std::os::unix::fs::symlink("nowhere", &link).unwrap();
+        let nested = overlay.join(format!("{OVERLAY_DB_STAGING_PREFIX}dir"));
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("keep"), b"k").unwrap();
+        let young = overlay.join(format!("{OVERLAY_DB_STAGING_PREFIX}young"));
+        fs::write(&young, b"young").unwrap();
+        let future = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 86_400;
+        set_mtime_unix_secs(&young, future);
+
+        let opened = reopen_keep_overlay(&overlay).expect("open sweeps leftovers");
+        assert!(!stale.exists(), "stale staging file was left");
+        assert!(!stale_journal.exists(), "stale staging journal was left");
+        assert!(held_path.is_file(), "a locked staging file was removed");
+        assert!(
+            held_wal.is_file(),
+            "sidecar of a locked staging file was removed"
+        );
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&held_path),
+            "the sweep opened the locked file and dropped its lock"
+        );
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(nested.join("keep")).unwrap(), b"k");
+        assert_eq!(fs::read(&young).unwrap(), b"young");
+        assert!(overlay.join(OVERLAY_MARKER).is_file());
+        drop(opened);
+        assert!(has_files_table(&overlay.join(HIDDEN_DB)));
+        held.execute_batch("COMMIT;").unwrap();
+    }
+
+    /// Regression (#194): a second name of the live database (the crash
+    /// window of link-then-unlink) is unlinked without opening that inode.
+    /// The database and the lock this open holds both stay.
+    #[cfg(unix)]
+    #[test]
+    fn regression_staging_hard_link_of_the_live_database_drops_only_the_extra_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().canonicalize().unwrap().join("ov");
+        fs::create_dir(&overlay).unwrap();
+        drop(reopen_keep_overlay(&overlay).unwrap());
+        let db = overlay.join(HIDDEN_DB);
+        let extra = overlay.join(format!("{OVERLAY_DB_STAGING_PREFIX}extra"));
+        fs::hard_link(&db, &extra).unwrap();
+        set_mtime_unix_secs(&extra, 0);
+        let opened = reopen_keep_overlay(&overlay).unwrap();
+        assert!(!extra.exists(), "extra name of the live database was left");
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&db),
+            "unlinking the extra name dropped the lock on the database"
+        );
+        drop(opened);
+        assert!(has_files_table(&db), "the live database was removed");
+    }
+
+    /// Regression (#194): the no-replace publish loses when the database
+    /// name appears first. The planted file is untouched, this attempt's
+    /// staging file is removed, and the open continues on that database.
+    #[test]
+    fn regression_lost_race_keeps_the_planted_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().canonicalize().unwrap().join("ov");
+        fs::create_dir(&overlay).unwrap();
+        let db = overlay.join(HIDDEN_DB);
+        BEFORE_STAGING_RENAME.with(|seam| {
+            let db = db.clone();
+            *seam.borrow_mut() = Some(Box::new(move |dest: &Path| {
+                assert_eq!(dest, db.as_path());
+                let conn = Connection::open(&db).unwrap();
+                conn.execute_batch(SCHEMA).unwrap();
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('planted', 'yes')",
+                    [],
+                )
+                .unwrap();
+            }));
+        });
+        let opened = reopen_keep_overlay(&overlay).expect("the lost race still opens");
+        drop(opened);
+        let value: String = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row("SELECT value FROM meta WHERE key = 'planted'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(value, "yes", "the planted database was replaced");
+        let left = marker_or_staging_names(&overlay);
+        assert!(
+            left.as_slice() == [OVERLAY_MARKER],
+            "staging leftover or missing marker: {left:?}"
+        );
+        assert!(
+            !matches!(overlay_db_entry(&overlay).unwrap(), DbEntry::Lost { .. }),
+            "the lost race left the folder marked as lost"
+        );
+    }
+
+    /// Regression (#194): a rename error after the schema commit publishes
+    /// nothing. The staging file is removed and the folder stays absent.
+    #[test]
+    fn regression_staging_rename_error_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().canonicalize().unwrap().join("ov");
+        fs::create_dir(&overlay).unwrap();
+        STAGING_RENAME_ERROR.with(|cell| cell.set(Some(io::ErrorKind::PermissionDenied)));
+        let error = msg_of(reopen_keep_overlay(&overlay));
+        assert!(error.contains("staging rename failed"), "{error}");
+        assert!(!overlay.join(HIDDEN_DB).exists());
+        let left = marker_or_staging_names(&overlay);
+        assert!(left.is_empty(), "staging or marker left: {left:?}");
+        assert!(
+            matches!(overlay_db_entry(&overlay).unwrap(), DbEntry::Absent),
+            "a failed rename left a record"
+        );
+    }
+
+    /// Regression (#194): the marker failing after the publish removes the
+    /// database only while it is still this open's inode. The folder is not
+    /// left marked, and not left as a lost record.
+    #[test]
+    fn regression_marker_failure_after_publish_removes_only_our_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().canonicalize().unwrap().join("ov");
+        fs::create_dir(&overlay).unwrap();
+        FAIL_OVERLAY_MARKER.with(|cell| cell.set(true));
+        let error = msg_of(reopen_keep_overlay(&overlay));
+        assert!(error.contains("marker create failed"), "{error}");
+        assert!(
+            !overlay.join(HIDDEN_DB).exists(),
+            "published database stayed"
+        );
+        let left = marker_or_staging_names(&overlay);
+        assert!(left.is_empty(), "marker or staging left: {left:?}");
+        assert!(
+            matches!(overlay_db_entry(&overlay).unwrap(), DbEntry::Absent),
+            "marker failure left the folder lost or present"
+        );
+    }
+
+    /// Regression (#194): a marker failure after someone replaced the
+    /// published inode does not delete that other file.
+    #[test]
+    fn regression_marker_failure_after_publish_keeps_a_swapped_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().canonicalize().unwrap().join("ov");
+        fs::create_dir(&overlay).unwrap();
+        let db = overlay.join(HIDDEN_DB);
+        let aside = overlay.join("aside.sqlite");
+        let (hook_db, hook_aside) = (db.clone(), aside.clone());
+        BEFORE_OVERLAY_MARKER.with(|seam| {
+            *seam.borrow_mut() = Some(Box::new(move |dest: &Path| {
+                assert_eq!(dest, hook_db.as_path());
+                fs::rename(&hook_db, &hook_aside).unwrap();
+                fs::write(&hook_db, b"foreign").unwrap();
+            }));
+        });
+        FAIL_OVERLAY_MARKER.with(|cell| cell.set(true));
+        let error = msg_of(reopen_keep_overlay(&overlay));
+        assert!(error.contains("marker create failed"), "{error}");
+        assert_eq!(fs::read(&db).unwrap(), b"foreign");
+        assert!(
+            has_files_table(&aside),
+            "the published database was removed"
+        );
+        let left = marker_or_staging_names(&overlay);
+        assert!(left.is_empty(), "marker or staging left: {left:?}");
+        assert!(
+            !matches!(overlay_db_entry(&overlay).unwrap(), DbEntry::Lost { .. }),
+            "the swapped file left the folder lost"
+        );
+    }
+
+    /// Kills any child still running when the test returns or panics.
+    /// Disarm after every child has been waited on: `kill` on a reaped pid
+    /// can hit a recycled process.
+    #[cfg(unix)]
+    struct KillChildren {
+        kids: Vec<(std::process::Child, PathBuf)>,
+        armed: bool,
+    }
+    #[cfg(unix)]
+    impl Drop for KillChildren {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            for (child, _) in &mut self.kids {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// `wait` plus the piped stderr. Safe after `try_wait` has already reaped.
+    #[cfg(unix)]
+    fn reap_child(child: &mut std::process::Child) -> std::process::Output {
+        let status = child.wait().unwrap();
+        let mut stderr = Vec::new();
+        if let Some(mut err) = child.stderr.take() {
+            use std::io::Read;
+            err.read_to_end(&mut stderr).unwrap();
+        }
+        std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr,
+        }
+    }
+
+    /// Child of [`regression_concurrent_first_open_leaves_one_database`].
+    ///
+    /// Re-exec so the open runs in its own process. Two threads share fcntl
+    /// locks and SQLite's lock table, which is not the race. Waits until a
+    /// peer has reached the barrier, then opens. A success keeps the database
+    /// lock until the parent writes `release`, so the other process observes
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child process of regression_concurrent_first_open_leaves_one_database"]
+    fn regression_concurrent_first_open_child() {
+        let overlay = PathBuf::from(
+            std::env::var_os("RATARMOUNT_CONCURRENT_OPEN_OVERLAY").expect("child overlay"),
+        );
+        let barrier = PathBuf::from(
+            std::env::var_os("RATARMOUNT_CONCURRENT_OPEN_BARRIER").expect("child barrier"),
+        );
+        let result = PathBuf::from(
+            std::env::var_os("RATARMOUNT_CONCURRENT_OPEN_RESULT").expect("child result"),
+        );
+        let slot = barrier.join(format!("ready-{}", std::process::id()));
+        // The peer's sweep would otherwise treat this process's staging file
+        // as older than the peer's open and delete it while it holds no lock
+        // (the documented rename error). Keeping the mtime ahead leaves that
+        // file alone so this process meets the published database.
+        super::STAGING_MTIME_AHEAD.with(|cell| cell.set(true));
+        fs::write(&slot, b"1").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let ready = fs::read_dir(&barrier)
+                .unwrap()
+                .filter(|ent| {
+                    ent.as_ref()
+                        .ok()
+                        .and_then(|ent| ent.file_name().into_string().ok())
+                        .is_some_and(|name| name.starts_with("ready-"))
+                })
+                .count();
+            if ready >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "peer never reached the first-open barrier"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        match WriteOverlay::new_for_tests(Arc::new(KeepBase) as Arc<dyn MountSource>, &overlay) {
+            Ok(opened) => {
+                fs::write(&result, b"ok").unwrap();
+                let release = barrier.join("release");
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !release.exists() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "parent never released the holder"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                drop(opened);
+            }
+            Err(error) => {
+                fs::write(&result, format!("err\n{error}")).unwrap();
+            }
+        }
+    }
+
+    /// Regression (#194): two processes racing the first open of one empty
+    /// folder leave one database, one marker and no staging file, and the
+    /// folder is not lost. The winner keeps its lock until the peer has
+    /// finished, so the loser fails only with the database locked, busy, or
+    /// in use. fcntl locks are per process; this re-executes the test binary.
+    #[cfg(unix)]
+    #[test]
+    fn regression_concurrent_first_open_leaves_one_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().canonicalize().unwrap().join("ov");
+        fs::create_dir(&overlay).unwrap();
+        let barrier = dir.path().join("barrier");
+        fs::create_dir(&barrier).unwrap();
+        let mut children = KillChildren {
+            kids: Vec::new(),
+            armed: true,
+        };
+        for i in 0..2 {
+            let result = dir.path().join(format!("result-{i}"));
+            let child = StdCommand::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "write_overlay::tests::regression_concurrent_first_open_child",
+                ])
+                .env("RATARMOUNT_CONCURRENT_OPEN_OVERLAY", &overlay)
+                .env("RATARMOUNT_CONCURRENT_OPEN_BARRIER", &barrier)
+                .env("RATARMOUNT_CONCURRENT_OPEN_RESULT", &result)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            children.kids.push((child, result));
+        }
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            if children.kids.iter().all(|(_, result)| result.is_file()) {
+                break;
+            }
+            for (child, result) in &mut children.kids {
+                if result.is_file() {
+                    continue;
+                }
+                if child.try_wait().unwrap().is_some() {
+                    let output = reap_child(child);
+                    panic!(
+                        "child exited {} before writing a result\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a first-open child never wrote its result"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(barrier.join("release"), b"1").unwrap();
+        let mut oks = 0;
+        let mut errs = Vec::new();
+        for (child, result) in &mut children.kids {
+            let output = reap_child(child);
+            assert!(
+                output.status.success(),
+                "child failed\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = fs::read_to_string(result).unwrap();
+            if text == "ok" {
+                oks += 1;
+            } else if let Some(error) = text.strip_prefix("err\n") {
+                errs.push(error.to_string());
+            } else {
+                panic!("unexpected child result {text:?}");
+            }
+        }
+        children.armed = false;
+        assert_eq!(oks, 1, "expected one winner, errs={errs:?}");
+        assert_eq!(errs.len(), 1, "expected one loser, oks={oks} errs={errs:?}");
+        let error = &errs[0];
+        let lower = error.to_lowercase();
+        assert!(
+            lower.contains("locked") || lower.contains("busy") || lower.contains("in use"),
+            "{error}"
+        );
+        assert!(has_files_table(&overlay.join(HIDDEN_DB)));
+        let left = marker_or_staging_names(&overlay);
+        assert!(
+            left.as_slice() == [OVERLAY_MARKER],
+            "expected one marker and no staging file, found {left:?}"
+        );
+        assert!(
+            !matches!(overlay_db_entry(&overlay).unwrap(), DbEntry::Lost { .. }),
+            "the race left the folder lost"
+        );
+    }
+
+    /// Regression (#194): `ratarmount_open_touch` is reserved. A database that
+    /// already has it is not rewritten, and the row stays.
+    #[test]
+    fn regression_open_touch_table_is_reserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ratarmount_open_touch(x); INSERT INTO ratarmount_open_touch(x) VALUES (7);",
+        )
+        .unwrap();
+        super::take_exclusive_lock_for_open(&conn, false).expect("reopen takes no touch table");
+        let error = super::take_exclusive_lock_for_open(&conn, true).unwrap_err();
+        assert!(error.to_string().contains(OPEN_TOUCH_TABLE), "{error}");
+        let value: i64 = conn
+            .query_row("SELECT x FROM ratarmount_open_touch", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7, "the reserved table was dropped");
+    }
+
+    /// Regression (#194): sidecars are not deleted by name when the main file
+    /// is missing or is a different inode. Only a regular sidecar of a file
+    /// this call removed goes with it.
+    #[test]
+    fn regression_remove_db_file_if_ours_leaves_sidecars_when_the_main_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("gone.sqlite");
+        let journal = super::with_suffix(&db, "-journal");
+        fs::write(&journal, b"journal").unwrap();
+        super::remove_db_file_if_ours(&db, Some((u64::MAX, u64::MAX)));
+        assert_eq!(fs::read(&journal).unwrap(), b"journal");
+
+        let present = dir.path().join("present.sqlite");
+        fs::write(&present, b"db").unwrap();
+        let present_journal = super::with_suffix(&present, "-journal");
+        fs::write(&present_journal, b"journal").unwrap();
+        super::remove_db_file_if_ours(&present, Some((u64::MAX, u64::MAX)));
+        assert_eq!(fs::read(&present).unwrap(), b"db");
+        assert_eq!(fs::read(&present_journal).unwrap(), b"journal");
+    }
+
+    /// The sidecars removed with a file this call owns are regular files.
+    /// A symlink or a directory under a sidecar name stays.
+    #[cfg(unix)]
+    #[test]
+    fn regression_remove_db_file_if_ours_removes_only_regular_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        fs::write(&db, b"db").unwrap();
+        let id = crate::overlay_db::file_id(&fs::symlink_metadata(&db).unwrap());
+        let journal = super::with_suffix(&db, "-journal");
+        fs::write(&journal, b"j").unwrap();
+        let wal = super::with_suffix(&db, "-wal");
+        std::os::unix::fs::symlink("elsewhere", &wal).unwrap();
+        let shm = super::with_suffix(&db, "-shm");
+        fs::create_dir(&shm).unwrap();
+        super::remove_db_file_if_ours(&db, id);
+        assert!(!db.exists());
+        assert!(!journal.exists());
+        assert!(wal.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(shm.is_dir());
     }
 
     /// Overlays created before the marker existed get it on their next open.

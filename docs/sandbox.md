@@ -1811,6 +1811,10 @@ unpack stage's mode pass change modes through an `O_PATH` pin on Linux (by
 name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the
 check and the change is not detected) (#149); a failed first open leaves an
 existing 0-byte database to SQLite's rollback instead of truncating it (#160);
+a first open of a folder with no database initializes in a staging file and
+publishes the database and then the marker only after the schema commits, so
+a failure leaves the folder unmarked (#194; platform limits under
+[First-open database publish by platform](#first-open-database-publish-by-platform));
 and `overlay pack` ships SQLite copies of the layer database and of the base
 index (#156). Of the checked sites, the ZIP commit reader, the
 read-only layer, live diff, the seal sentinels, the pack member, sentinel and
@@ -1846,6 +1850,18 @@ wrappers could be installed:
 | macOS Python wheel | Constructor or private install, as on Linux | As above |
 | Windows library builds | None | The path is checked to be a regular file (no symlink under `SQLITE_OPEN_NOFOLLOW`) before and after SQLite's open; no file identity, so no swap-back detection. Commit-journal recovery needs Linux or macOS |
 | Any other Unix ABI (musl, 32-bit, big-endian, BSD) | None | Refused (`UnsupportedAbi` / `UnsupportedPlatform`): every `-w` mount and overlay verb that opens an overlay database fails, rather than falling back to pathname checks |
+
+### First-open database publish by platform
+
+A first `-w` open of a folder with no database builds it in a staging file and publishes that file, then the marker, only after the schema commits (#194).
+
+| Platform | Database publish | Directory fsync |
+|---|---|---|
+| Linux, Android, macOS | one `renameat` with `RENAME_NOREPLACE` (the database name appears only when the staging name is gone) | `fsync` of the overlay directory; a failure only warns and the open still succeeds |
+| Windows | hard link of the staging file onto the database name, then unlink of the staging name (not one atomic operation) | no-op (a directory cannot be opened to sync it) |
+| Any other Unix | hard link, then unlink, as on Windows (not one atomic operation). A checked open on these ABIs is refused before publish (see the table above) | `fsync` of the overlay directory; a failure only warns and the open still succeeds |
+
+A crash between the hard link and the unlink leaves the live database under both names. The next successful open removes only the extra staging name: it is a regular file, older than that open, and the sweep unlinks that name without opening it when the name is another link of the live database. On Windows there is no stable file index. Windows deletes a staging name whose creation time and length match the live database, with no lock check, and a coincidental match is treated as a second name; the name is unlinked and never opened. When the creation time is unavailable, a name a live process holds is left in place. The sweep does not delete by name prefix alone. A symlink, a directory, a file newer than the open, or a file a live process holds is left in place. Between the lock probe and the delete, a peer that has created its staging file but not yet locked it holds nothing the probe can see. That peer loses the publish, and the error is a rename failure rather than "in use". A crash or a refused open can leave a staging file with no database and no marker; the same sweep removes it on the next successful open. A failed directory fsync only warns. On Windows that fsync is a no-op.
 
 Ordinary index, SQLAR, digest-cache and publication connections are not checked
 opens: they keep SQLite's default `"unix"` VFS (auto locking on macOS). The
