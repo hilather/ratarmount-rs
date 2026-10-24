@@ -472,6 +472,19 @@ jobs:
             exit "$code"
           fi
 
+      - name: checked open (macOS 14.0 deployment target)
+        # The macOS wheel builds at MACOSX_DEPLOYMENT_TARGET=14.0 (python.yml),
+        # where Apple's linker rewrites `__mod_init_func` into `__init_offsets`
+        # (R11-CI-FIX2). The default-target `cargo test` above cannot see that;
+        # run the installer rows and the DSO fixture at the wheel's target in a
+        # separate target dir. Contract: test-harness/test-aarch64-checked-open-ci.sh.
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+          CARGO_TARGET_DIR: target/macos-deployment-14
+        run: |
+          cargo test -p ratarmount-index --lib checked_open
+          cargo test -p ratarmount-checked-open-fixture --test dso
+
       - name: Build release
         run: cargo build --release -p ratarmount
 

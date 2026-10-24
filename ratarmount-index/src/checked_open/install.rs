@@ -963,8 +963,11 @@ mod imp {
         });
     }
 
-    /// Retained constructor pointer; [`ctor_anchor`] references it so that any
-    /// caller of `installed()` links the object that carries it.
+    /// Registers [`constructor`] with the loader. [`ctor_anchor`] references
+    /// it by address so that any caller of `installed()` links the object
+    /// that carries it. Never read its value: at a macOS deployment target of
+    /// 14.0 Apple's linker rewrites `__mod_init_func` into `__init_offsets`
+    /// (32-bit image offsets), so the stored word is not an address.
     #[used]
     #[cfg_attr(target_os = "linux", link_section = ".init_array")]
     #[cfg_attr(
@@ -973,8 +976,12 @@ mod imp {
     )]
     static CTOR_ANCHOR: extern "C" fn() = constructor;
 
+    /// The constructor's code address (the loader proof's first anchor).
     pub(super) fn ctor_anchor() -> usize {
-        *std::hint::black_box(&CTOR_ANCHOR) as usize
+        // Address only, never the value (see `CTOR_ANCHOR`): this reference
+        // keeps the init-section entry linked. Do not remove it as dead code.
+        std::hint::black_box(std::ptr::addr_of!(CTOR_ANCHOR));
+        std::hint::black_box(constructor as extern "C" fn()) as *const () as usize
     }
 
     pub(super) fn status() -> Result<Witness, InstallStatus> {
@@ -1004,6 +1011,22 @@ mod imp {
     mod tests {
         use super::*;
         use crate::checked_open::install::PRETEND_THREADS_ENV;
+
+        /// Regression (R11-CI-FIX2): the macOS wheel (deployment target 14.0)
+        /// refused its private-instance install with `UnknownImage
+        /// {constructor}`: the anchor was the word stored in the init
+        /// section, which that linker rewrites into a 32-bit offset that
+        /// `dladdr` cannot resolve. The anchor is the constructor's address
+        /// and resolves to an image (main here; the DSO fixture covers a
+        /// non-main image). Red only at macOS 14.0 (CI step).
+        #[test]
+        fn regression_ctor_anchor_is_the_constructor_address() {
+            assert_eq!(ctor_anchor(), constructor as extern "C" fn() as usize);
+            assert!(
+                matches!(host_object(ctor_anchor()), Lookup::Found(_)),
+                "constructor anchor resolves to no image"
+            );
+        }
 
         fn real_slot(name: &CStr) -> usize {
             let vfs = find_vfs(c"unix", "unix").expect("unix VFS");

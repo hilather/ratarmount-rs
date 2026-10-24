@@ -21,18 +21,24 @@ CHILD = r"""
 import json, sys, threading
 stop = threading.Event()
 worker = None
-if sys.argv[1] == "thread":
+if sys.argv[1] in ("thread", "fail"):
     # A live worker before the import: the constructor must abstain.
     worker = threading.Thread(target=stop.wait)
     worker.start()
-import ratarmount_rs
-status = ratarmount_rs._native._checked_open_status()
-with ratarmount_rs.open(sys.argv[2], index=sys.argv[3]) as archive:
-    names = sorted(entry.path for entry in archive.ls("/"))
-    data = archive.read("/hello.txt", 0, 5)
-stop.set()
-if worker is not None:
-    worker.join()
+try:
+    # Everything after the worker starts: a failure here must end the child
+    # with its traceback, not hang interpreter shutdown on the worker.
+    if sys.argv[1] == "fail":
+        raise RuntimeError("injected import failure")
+    import ratarmount_rs
+    status = ratarmount_rs._native._checked_open_status()
+    with ratarmount_rs.open(sys.argv[2], index=sys.argv[3]) as archive:
+        names = sorted(entry.path for entry in archive.ls("/"))
+        data = archive.read("/hello.txt", 0, 5)
+finally:
+    stop.set()
+    if worker is not None:
+        worker.join()
 print(json.dumps({"status": status, "names": names, "data": data.decode()}))
 """
 
@@ -46,14 +52,19 @@ def _tar(path):
     return path
 
 
-def _child(mode, tmp_path):
+def _run_child(mode, tmp_path, timeout):
     tar = _tar(tmp_path / (mode + ".tar"))
     index = tmp_path / (mode + ".index.sqlite")
     result = subprocess.run(
         [sys.executable, "-I", "-c", CHILD, mode, str(tar), str(index)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
-        cwd=str(tmp_path), timeout=120,
+        cwd=str(tmp_path), timeout=timeout,
     )
+    return result, index
+
+
+def _child(mode, tmp_path):
+    result, index = _run_child(mode, tmp_path, 120)
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout.strip().splitlines()[-1])
     assert report["names"] == ["/hello.txt"]
@@ -94,6 +105,17 @@ def test_regression_native_thread_before_import(tmp_path):
     assert single["threads_at_install"] == 1, single
     assert single["exports_checked"] is None, single
     assert single["constructor"] == "AttemptedSingleThread", single
+
+
+def test_regression_child_failure_after_worker_does_not_hang(tmp_path):
+    """Regression (R11-CI-FIX2): when the import failed after the worker
+    thread started, the child never reached `stop.set()` and interpreter
+    shutdown waited on the non-daemon worker until the 120 s timeout, hiding
+    the real traceback. A failure after `worker.start()` must end the child
+    promptly with its error. Needs no checked-open support."""
+    result, _ = _run_child("fail", tmp_path, 30)
+    assert result.returncode != 0, result.stdout
+    assert "injected import failure" in result.stderr, result.stderr
 
 
 def test_regression_native_status_exposes_no_installer():
