@@ -570,13 +570,43 @@ fn open_backing(name: &str, backing_dir: Option<&Path>, depth: u32) -> Result<Ba
         )));
     }
     let path = resolve_backing_path(name, backing_dir)?;
-    if !path.is_file() {
-        return Err(Qcow2Error::Msg(format!(
-            "qcow2 backing file {} not found",
-            path.display()
-        )));
+    match ratarmount_core::fork_n::resolve_for_admit(&path) {
+        Err(err) => {
+            return Err(Qcow2Error::Msg(format!(
+                "fork-n refuses to resolve {}: {err}",
+                path.display()
+            )));
+        }
+        Ok(ratarmount_core::fork_n::ResolvedAdmit::Absent(composed)) => {
+            if ratarmount_core::fork_n::cohort_contains(&composed) {
+                return Err(Qcow2Error::Msg(format!(
+                    "fork-n refuses {}: canonical path is under a cohort mountpoint",
+                    path.display()
+                )));
+            }
+            if !path.is_file() {
+                return Err(Qcow2Error::Msg(format!(
+                    "qcow2 backing file {} not found",
+                    path.display()
+                )));
+            }
+        }
+        Ok(ratarmount_core::fork_n::ResolvedAdmit::Existing(resolved)) => {
+            if ratarmount_core::fork_n::cohort_contains(&resolved) {
+                return Err(Qcow2Error::Msg(format!(
+                    "fork-n refuses {}: canonical path is under a cohort mountpoint",
+                    path.display()
+                )));
+            }
+            if !path.is_file() {
+                return Err(Qcow2Error::Msg(format!(
+                    "qcow2 backing file {} not found",
+                    path.display()
+                )));
+            }
+        }
     }
-    let mut file = File::open(&path)?;
+    let mut file = ratarmount_core::fork_n::open_admitted(&path)?;
     match qcow_magic_version(&mut file) {
         Some(2 | 3) => {
             file.seek(SeekFrom::Start(0))?;
@@ -782,4 +812,27 @@ pub(crate) fn write_qcow2_v2_header(
         hdr.extend_from_slice(name.as_bytes());
     }
     hdr
+}
+
+#[cfg(test)]
+mod fork_n_backing_source {
+    /// Regression: `open_backing` admits through `open_admitted` and the
+    /// function body has no direct open of the backing path.
+    #[test]
+    fn fork_n_self_reopen_backing_under_mountpoint() {
+        let src = include_str!("disk.rs");
+        let start = src
+            .find("fn open_backing(")
+            .expect("open_backing is in disk.rs");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\nfn ")
+            .map(|index| index + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains("File::open"),
+            "open_backing must not open the backing path itself:\n{body}"
+        );
+    }
 }

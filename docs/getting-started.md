@@ -152,6 +152,7 @@ ratarmount -w :temp: archive.tar mnt/               # throwaway overlay
 ratarmount --commit-overlay -w ./changes archive.tar          # fold the changes into the archive
 ratarmount -w ./ov --commit-overlay-on-exit data.tar.zst mnt/ # commit when the mount ends
 ratarmount -w ./ov --commit-overlay-interval 2s new.tar.zst mnt/  # commit settled files while serving; creates new.tar.zst if missing
+ratarmount --top A=./ov-a --mount A=./mnt-a --top B=./ov-b --mount B=./mnt-b archive.tar
 ```
 
 Offline commits support uncompressed, gzip, bzip2 and xz TAR, `.tar.zst` and
