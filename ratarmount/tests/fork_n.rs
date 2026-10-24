@@ -187,7 +187,21 @@ fn is_regular_file(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
+/// Parent pid of `pid`, from `ps` (portable; `/proc` is Linux only).
+fn parent_pid(pid: u32) -> Option<u32> {
+    let out = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+fn pid_alive(pid: u32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+}
+
 /// Open fds in `pid` whose target is `db` (lstat of the link, not a follow of `db`).
+#[cfg(target_os = "linux")]
 fn sqlite_fd_count(pid: u32, db: &Path) -> usize {
     let Ok(want) = fs::canonicalize(db) else {
         return 0;
@@ -437,7 +451,7 @@ fn fork_n_hardlink_nlink_at_start() {
     assert!(
         text.contains(&format!(
             "fork-n refuses hardlinked regular file {}",
-            file.display()
+            file.canonicalize().unwrap().display()
         )),
         "{text}"
     );
@@ -584,15 +598,27 @@ fn handoff(foreground: bool) {
     if foreground {
         assert_eq!(pid, child.id());
     } else {
-        let kids = fs::read_to_string(format!("/proc/{}/task/{}/children", child.id(), child.id()))
-            .unwrap_or_default();
-        assert!(
-            kids.split_whitespace().any(|kid| kid == pid.to_string()),
-            "marker pid {pid} is not the forked child ({kids})"
+        #[cfg(target_os = "linux")]
+        {
+            let kids =
+                fs::read_to_string(format!("/proc/{}/task/{}/children", child.id(), child.id()))
+                    .unwrap_or_default();
+            assert!(
+                kids.split_whitespace().any(|kid| kid == pid.to_string()),
+                "marker pid {pid} is not the forked child ({kids})"
+            );
+        }
+        // Portable: the marker pid is a direct child of the launcher. The
+        // `forwarded` nonce check after exit proves the launcher waited on it.
+        assert_eq!(
+            parent_pid(pid),
+            Some(child.id()),
+            "marker pid {pid} is not the forked child"
         );
         // The parent dropped its connections before the fork. The child
         // reopened both databases. A parent that never released still has
         // the fd, and a child that never reopened does not.
+        #[cfg(target_os = "linux")]
         for db in [db_path(&top_a), db_path(&top_b)] {
             assert!(
                 sqlite_fd_count(pid, &db) >= 1,
@@ -614,7 +640,7 @@ fn handoff(foreground: bool) {
     assert_eq!(code_of(status, &stderr), 2, "{text}");
     if !foreground {
         let gone = (0..50).any(|_| {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
+            if !pid_alive(pid) {
                 return true;
             }
             thread::sleep(Duration::from_millis(20));
@@ -654,7 +680,7 @@ fn handoff(foreground: bool) {
     assert!(
         text.contains(&format!(
             "fork-n refuses hardlinked regular file {}",
-            file.display()
+            file.canonicalize().unwrap().display()
         )),
         "{text}"
     );

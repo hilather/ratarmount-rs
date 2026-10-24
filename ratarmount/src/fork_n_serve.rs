@@ -7,7 +7,9 @@
 //! whose `(st_dev, st_ino, mount_id)` still matches. This slice does not call
 //! `unmount_lazy`.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(debug_assertions)]
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
