@@ -77,6 +77,35 @@ const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
 const OPEN_FLAGS: OpenFlags =
     OpenFlags::SQLITE_OPEN_READ_ONLY.union(OpenFlags::SQLITE_OPEN_NO_MUTEX);
 
+/// A SQLAR connection and the hold on its inode. `conn` is first so it closes
+/// before the hold (#193).
+struct OpenedDb {
+    conn: Connection,
+    hold: Option<ratarmount_core::db_inodes::DbLockHold>,
+}
+
+fn open_checked_sqlar(path: &Path) -> Result<OpenedDb> {
+    let acquired = ratarmount_index::checked_open::open_reclassifying(
+        path,
+        OPEN_FLAGS,
+        ratarmount_index::checked_open::NameMode::Path,
+    )
+    .map_err(|refusal| match refusal.error {
+        ratarmount_index::checked_open::AcquireError::Sqlite(error) => SqlarError::Sqlite(error),
+        other => SqlarError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(other.to_string()),
+        )),
+    })?;
+    let ratarmount_index::checked_open::Acquired {
+        conn, lock_hold, ..
+    } = acquired;
+    Ok(OpenedDb {
+        conn,
+        hold: lock_hold,
+    })
+}
+
 /// SQLCipher default KDF iterations (current); salt is the first 16 file bytes.
 #[cfg(feature = "sqlcipher")]
 const SQLCIPHER_KDF_ITER: u32 = 256_000;
@@ -147,6 +176,10 @@ pub struct SqlarMountSource {
     name_map: Option<BTreeMap<String, String>>,
     #[allow(dead_code)]
     options: OpenOptions,
+    /// Dropped after `conn` (declaration order). Keeps a mismatch descriptor
+    /// of this inode until the connection closes.
+    #[allow(dead_code)]
+    db_hold: Option<ratarmount_core::db_inodes::DbLockHold>,
 }
 
 impl SqlarMountSource {
@@ -166,8 +199,8 @@ impl SqlarMountSource {
         }
 
         let header = read_header(&path)?;
-        let conn = match open_plain(&path) {
-            Ok(c) => c,
+        let opened = match open_plain(&path) {
+            Ok(opened) => opened,
             Err(plain_err) => {
                 if header_is_sqlite_magic(&header) {
                     // Plain SQLite header but not a usable SQLAR (missing table / corrupt).
@@ -178,13 +211,14 @@ impl SqlarMountSource {
             }
         };
 
-        let name_map = build_name_map(&conn)?;
+        let name_map = build_name_map(&opened.conn)?;
         Ok(Self {
             path,
-            conn: Mutex::new(conn),
+            conn: Mutex::new(opened.conn),
             mem_image: None,
             name_map,
             options: options.clone(),
+            db_hold: opened.hold,
         })
     }
 
@@ -253,6 +287,7 @@ impl SqlarMountSource {
             mem_image: Some(image),
             name_map,
             options: options.clone(),
+            db_hold: None,
         })
     }
 
@@ -331,10 +366,10 @@ fn has_sqlar_extension(path: &Path) -> bool {
 }
 
 /// Open unencrypted SQLAR and verify the `sqlar` table is readable.
-fn open_plain(path: &Path) -> Result<Connection> {
-    let conn = Connection::open_with_flags(path, OPEN_FLAGS)?;
-    verify_sqlar_readable(&conn)?;
-    Ok(conn)
+fn open_plain(path: &Path) -> Result<OpenedDb> {
+    let opened = open_checked_sqlar(path)?;
+    verify_sqlar_readable(&opened.conn)?;
+    Ok(opened)
 }
 
 /// Attach a pre-loaded plain SQLite image as the main DB via `sqlite3_deserialize`.
@@ -393,7 +428,7 @@ fn open_encrypted(
     options: &OpenOptions,
     header: &[u8],
     plain_err: SqlarError,
-) -> Result<Connection> {
+) -> Result<OpenedDb> {
     // Require at least a 16-byte salt for a plausible sqlcipher file.
     if header.len() < 16 {
         return Err(plain_err);
@@ -479,30 +514,28 @@ fn encrypted_from_stream_residual(
 
 /// Try each password with SQLCipher (passphrase form, then PBKDF2 raw key).
 #[cfg(feature = "sqlcipher")]
-fn try_sqlcipher_passwords(
-    path: &Path,
-    passwords: &[String],
-    salt: &[u8; 16],
-) -> Result<Connection> {
+fn try_sqlcipher_passwords(path: &Path, passwords: &[String], salt: &[u8; 16]) -> Result<OpenedDb> {
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha512;
 
     for password in passwords {
         // 1) Passphrase mode — SQLCipher derives the key itself.
-        if let Ok(conn) = Connection::open_with_flags(path, OPEN_FLAGS) {
-            if apply_pragma_key_passphrase(&conn, password).is_ok()
-                && verify_sqlar_readable(&conn).is_ok()
+        if let Ok(opened) = open_checked_sqlar(path) {
+            if apply_pragma_key_passphrase(&opened.conn, password).is_ok()
+                && verify_sqlar_readable(&opened.conn).is_ok()
             {
-                return Ok(conn);
+                return Ok(opened);
             }
         }
 
         // 2) Raw key from PBKDF2-HMAC-SHA512 (Python / sqlcipher3 parity; safe for any password chars).
         let mut key = [0u8; 32];
         pbkdf2_hmac::<Sha512>(password.as_bytes(), salt, SQLCIPHER_KDF_ITER, &mut key);
-        if let Ok(conn) = Connection::open_with_flags(path, OPEN_FLAGS) {
-            if apply_pragma_key_raw(&conn, &key).is_ok() && verify_sqlar_readable(&conn).is_ok() {
-                return Ok(conn);
+        if let Ok(opened) = open_checked_sqlar(path) {
+            if apply_pragma_key_raw(&opened.conn, &key).is_ok()
+                && verify_sqlar_readable(&opened.conn).is_ok()
+            {
+                return Ok(opened);
             }
         }
     }
@@ -599,8 +632,9 @@ pub fn looks_like_sqlar(path: &Path) -> bool {
         return has_sqlar_extension(path);
     }
     // Prefer verifying table when possible.
-    if let Ok(conn) = Connection::open_with_flags(path, OPEN_FLAGS) {
-        let has: bool = conn
+    if let Ok(opened) = open_checked_sqlar(path) {
+        let has: bool = opened
+            .conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlar' LIMIT 1",
                 [],

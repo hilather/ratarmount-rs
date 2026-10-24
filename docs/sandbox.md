@@ -1847,10 +1847,19 @@ wrappers could be installed:
 | Windows library builds | None | The path is checked to be a regular file (no symlink under `SQLITE_OPEN_NOFOLLOW`) before and after SQLite's open; no file identity, so no swap-back detection. Commit-journal recovery needs Linux or macOS |
 | Any other Unix ABI (musl, 32-bit, big-endian, BSD) | None | Refused (`UnsupportedAbi` / `UnsupportedPlatform`): every `-w` mount and overlay verb that opens an overlay database fails, rather than falling back to pathname checks |
 
-Ordinary index, SQLAR, digest-cache and publication connections are not checked
-opens: they keep SQLite's default `"unix"` VFS (auto locking on macOS). The
-checked `overlay pack --include-index` snapshot uses the checked family above
-(`"unix-posix"` on macOS). Managed byte readers are not connections; see
+Ordinary index, SQLAR, digest-cache and publication connections are checked
+opens that keep SQLite's default `"unix"` VFS (auto locking on macOS; the
+wrappers sit on the `"unix"` syscall table, which `"unix-posix"` shares). When
+the name is another regular file or not a regular file, they reclassify and
+retry, at most 3 times and within 100 ms, then fail with an error that says
+the database did not settle. Overlay-database opens are not retried. A retained
+regular mismatch descriptor goes to the database-inode coordinator (#193,
+#167): it is closed when this process does not hold that inode, and kept until
+the last holder drops when it does. The checked `overlay pack --include-index`
+snapshot uses the pinned VFS above (`"unix-posix"` on macOS) and does not
+retry: it is one open of the inode classified at the name (a different file
+is refused; a replacement that reuses that inode counts as the same file).
+Managed byte readers are not connections; see
 [Internal reads of index and database files](#internal-reads-of-index-and-database-files).
 
 The optional `sqlcipher` feature links SQLCipher's SQLite (older than 3.46.0),
@@ -1974,12 +1983,12 @@ and the cold index `0644 & !umask`, publication's rename keeps the temporary
 database's mode, companions take the database's mode, temporary files stay
 `0600 & !umask`.
 
-Connections and VFSes: checked overlay-database opens and the checked
-`snapshot_index_into` source use `"unix"` on Linux and `"unix-posix"` on macOS
-(POSIX locks only). Ordinary index, SQLAR, digest-cache and publication-snapshot
-connections keep SQLite's default `"unix"` VFS, which on macOS picks the
-locking style per filesystem (auto). Managed byte readers use `"unix"`
-(`"unix-posix"` on macOS) and take no lock.
+Connections and VFSes: checked overlay-database opens use `"unix"` on Linux and
+`"unix-posix"` on macOS (POSIX locks only) and do not retry a swap.
+`snapshot_index_into` uses that pinned VFS and does not retry: it is one open of the classified inode. Ordinary
+index, SQLAR, digest-cache and publication connections are checked opens on
+SQLite's default `"unix"` VFS (auto locking on macOS) and retry the same way.
+Managed byte readers use `"unix"` (`"unix-posix"` on macOS) and take no lock.
 
 `python3 -I packaging/test-internal-read-inventory.py` checks the inventory
 (`--self-test` for the scanner's own tests); a new production pathname read,

@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use ratarmount_core::{S_IFMT, S_IFREG};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OpenFlags;
 
 use crate::{CompactOpenCookie, IndexDirent, IndexError, Result, SqliteIndex, MAX_DIR_PAGE};
 
@@ -151,8 +151,11 @@ impl SqliteIndex {
                 } else if allow_sidecar_writes {
                     // Match open_writable's connection settings without CREATE:
                     // a removed sidecar must not be recreated by an optimization.
-                    let writer = Connection::open_with_flags(path,
-                        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+                    let writer = crate::open_database(
+                        path,
+                        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                        crate::checked_open::NameMode::Path,
+                    )?;
                     writer.busy_timeout(std::time::Duration::from_secs(10))?;
                     writer.execute_batch(
                         "PRAGMA temp_store = MEMORY;
@@ -586,7 +589,7 @@ mod tests {
         })
         .unwrap();
         let expected = idx.list_visible_files_by_offset().unwrap();
-        let blocker = Connection::open(&path).unwrap();
+        let blocker = rusqlite::Connection::open(&path).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         assert_eq!(collect_offset_pages(&idx, 1), expected);
         assert!(!has_offset_order_index(&idx));

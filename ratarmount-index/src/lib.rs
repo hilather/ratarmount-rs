@@ -470,6 +470,9 @@ pub fn serialize_tarstats(stats: &TarStats) -> String {
 
 struct BudgetConnection {
     inner: Arc<Mutex<Connection>>,
+    /// Keeps a republished inode's mismatch descriptors until this connection
+    /// drops. Declared after `inner` so the connection closes first (#193).
+    hold: Mutex<Option<ratarmount_core::db_inodes::DbLockHold>>,
     memory: Arc<Mutex<Option<ratarmount_core::budget::Reservation>>>,
     bytes: u64,
     _shrink: Option<ratarmount_core::budget::PressureHook>,
@@ -477,6 +480,13 @@ struct BudgetConnection {
 
 impl BudgetConnection {
     fn new(conn: Connection) -> Result<Self> {
+        Self::with_hold(conn, None)
+    }
+
+    fn with_hold(
+        conn: Connection,
+        hold: Option<ratarmount_core::db_inodes::DbLockHold>,
+    ) -> Result<Self> {
         let pool = ratarmount_core::budget::MemoryPool::global(
             "sqlite",
             64 * 1024 * 1024 + 256 * 1024 * 1024,
@@ -524,10 +534,19 @@ impl BudgetConnection {
         };
         Ok(Self {
             inner,
+            hold: Mutex::new(hold),
             memory,
             bytes,
             _shrink: shrink,
         })
+    }
+
+    /// Replace the connection, then the hold. The new hold is already
+    /// acquired, so a same-inode reopen never drops the count to zero.
+    /// The old connection closes before the old hold drops.
+    fn install(&self, conn: Connection, hold: Option<ratarmount_core::db_inodes::DbLockHold>) {
+        *self.inner.lock().expect("sqlite mutex poisoned") = conn;
+        *self.hold.lock().unwrap_or_else(|e| e.into_inner()) = hold;
     }
     fn configure(conn: &Connection, bytes: u64) -> Result<()> {
         conn.execute_batch(&format!(
@@ -701,6 +720,93 @@ fn reap_stale_writable_tmps(dest: &Path) {
     }
 }
 
+/// `Connection::open`'s flags: read-write, create, no mutex, URI.
+const OPEN_RWC: OpenFlags = OpenFlags::SQLITE_OPEN_READ_WRITE
+    .union(OpenFlags::SQLITE_OPEN_CREATE)
+    .union(OpenFlags::SQLITE_OPEN_NO_MUTEX)
+    .union(OpenFlags::SQLITE_OPEN_URI);
+
+/// A connection and the hold that keeps a refused descriptor of its inode
+/// until the connection is dropped. `conn` is declared first so it closes
+/// before the hold.
+pub(crate) struct LookupConn {
+    conn: Connection,
+    hold: Option<ratarmount_core::db_inodes::DbLockHold>,
+}
+
+impl std::ops::Deref for LookupConn {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl LookupConn {
+    fn into_parts(self) -> (Connection, Option<ratarmount_core::db_inodes::DbLockHold>) {
+        let LookupConn { conn, hold } = self;
+        (conn, hold)
+    }
+}
+
+/// Why a checked database open failed. [`DbOpen::Sqlite`] is SQLite's own
+/// error (a lookup may fall through to a private snapshot). [`DbOpen::Refused`]
+/// is a checked-open refusal, including one that says the database did not
+/// settle: it must not fall through to a raw copy.
+enum DbOpen {
+    Sqlite(rusqlite::Error),
+    Refused(rusqlite::Error),
+}
+
+impl From<DbOpen> for rusqlite::Error {
+    fn from(error: DbOpen) -> Self {
+        match error {
+            DbOpen::Sqlite(error) | DbOpen::Refused(error) => error,
+        }
+    }
+}
+
+impl From<DbOpen> for IndexError {
+    fn from(error: DbOpen) -> Self {
+        IndexError::Sqlite(error.into())
+    }
+}
+
+fn refusal_error(refusal: checked_open::Refusal) -> DbOpen {
+    match refusal.error {
+        checked_open::AcquireError::Sqlite(error) => DbOpen::Sqlite(error),
+        other => DbOpen::Refused(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(other.to_string()),
+        )),
+    }
+}
+
+fn open_database(
+    path: &Path,
+    flags: OpenFlags,
+    mode: checked_open::NameMode,
+) -> std::result::Result<LookupConn, DbOpen> {
+    let acquired = checked_open::open_reclassifying(path, flags, mode).map_err(refusal_error)?;
+    let checked_open::Acquired {
+        conn,
+        lock_hold,
+        id: _,
+        verification: _,
+        retained_low_fd: _,
+    } = acquired;
+    Ok(LookupConn {
+        conn,
+        hold: lock_hold,
+    })
+}
+
+fn plain_lookup(path: &Path, flags: OpenFlags) -> rusqlite::Result<LookupConn> {
+    Ok(LookupConn {
+        conn: Connection::open_with_flags(path, flags)?,
+        hold: None,
+    })
+}
+
 /// A read-only connection for a pure LOOKUP of an existing index. Nothing is
 /// created beside the index for ANY set of companion files.
 ///
@@ -725,39 +831,46 @@ fn reap_stale_writable_tmps(dest: &Path) {
 /// The immutable open and the snapshot are for a connection that reads and is
 /// dropped; they must not be held across a time another process may write the
 /// index.
-pub(crate) fn open_lookup_connection(path: &Path) -> rusqlite::Result<Connection> {
+pub(crate) fn open_lookup_connection(path: &Path) -> rusqlite::Result<LookupConn> {
     let plain = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let Ok(absolute) = path.canonicalize() else {
-        return Connection::open_with_flags(path, plain);
+        return plain_lookup(path, plain);
     };
     if !absolute.is_file() {
-        return Connection::open_with_flags(path, plain);
+        return plain_lookup(path, plain);
     }
     let side = |suffix: &str| {
         let mut name = absolute.clone().into_os_string();
         name.push(suffix);
         std::fs::symlink_metadata(PathBuf::from(name)).is_ok()
     };
+    // A checked refusal (another file, not regular, "did not settle") must
+    // not fall through to a raw copy of the live files. SQLite's own error
+    // still does, as it did before the checked open.
+    let fall_through = |error: DbOpen| match error {
+        DbOpen::Sqlite(_) => Ok(()),
+        DbOpen::Refused(error) => Err(error),
+    };
     match (side("-wal"), side("-shm"), side("-journal")) {
         (false, false, false) => {
-            if let Some(uri) = immutable_uri(&absolute) {
-                if let Ok(conn) =
-                    Connection::open_with_flags(&uri, plain | OpenFlags::SQLITE_OPEN_URI)
-                {
-                    return Ok(conn);
-                }
+            match open_database(&absolute, plain, checked_open::NameMode::Immutable) {
+                Ok(conn) => return Ok(conn),
+                Err(error) => fall_through(error)?,
             }
         }
         (true, true, false) => {
-            if let Ok(conn) = Connection::open_with_flags(&absolute, plain) {
-                if conn
-                    .query_row("SELECT count(*) FROM sqlite_master", [], |r| {
-                        r.get::<_, i64>(0)
-                    })
-                    .is_ok()
-                {
-                    return Ok(conn);
+            match open_database(&absolute, plain, checked_open::NameMode::Path) {
+                Ok(conn) => {
+                    if conn
+                        .query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .is_ok()
+                    {
+                        return Ok(conn);
+                    }
                 }
+                Err(error) => fall_through(error)?,
             }
         }
         _ => {}
@@ -780,9 +893,10 @@ pub(crate) fn open_lookup_connection(path: &Path) -> rusqlite::Result<Connection
 /// gets the same inode number from the filesystem, which counts as the same
 /// file and is copied. On Windows there is no identity: the final component
 /// is checked only for type (a regular file, not a symlink), so any regular
-/// file substituted at the name is copied. Unlike a lookup
-/// ([`open_lookup_connection`]) there is no snapshot fallback, which copies
-/// the live files raw: the index is opened `immutable=1` when it has no
+/// file substituted at the name is copied. This open does not retry (#193
+/// retries ordinary index, SQLAR and digest-cache connections only). Unlike a
+/// lookup ([`open_lookup_connection`]) there is no snapshot fallback, which
+/// copies the live files raw: the index is opened `immutable=1` when it has no
 /// companions, normally when it has both `-wal` and `-shm` (a live writer),
 /// and refused for any other set (a `-wal` without `-shm`, a lone `-shm`, a
 /// `-journal`). `dest` may be any byte string (non-UTF-8 included).
@@ -907,7 +1021,7 @@ thread_local! {
 /// Copy the index and its existing companions into a private temporary
 /// directory and open the copy (read-write there: recovery of a hot journal
 /// and of the WAL happen on the copy).
-fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
+fn snapshot_connection(absolute: &Path) -> rusqlite::Result<LookupConn> {
     let io = |e: std::io::Error| {
         rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
@@ -966,9 +1080,10 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
             })
             .unwrap_or_default();
     });
-    let conn = Connection::open_with_flags(
+    let conn = open_database(
         &copy,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        checked_open::NameMode::Path,
     )?;
     // Open the -wal/-shm and replay a journal now, before the files go.
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
@@ -978,35 +1093,6 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
     // removal fails and the directory stays in the temporary directory.
     let _ = dir.close();
     Ok(conn)
-}
-
-fn immutable_uri(absolute: &Path) -> Option<String> {
-    #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        absolute.as_os_str().as_bytes().to_vec()
-    };
-    #[cfg(not(unix))]
-    let bytes = {
-        let text = absolute.to_str()?.replace('\\', "/");
-        let text = text.strip_prefix("//?/").unwrap_or(&text).to_owned();
-        if text.starts_with('/') {
-            text.into_bytes()
-        } else {
-            format!("/{text}").into_bytes()
-        }
-    };
-    let mut uri = String::from("file:");
-    for byte in &bytes {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
-                uri.push(char::from(*byte));
-            }
-            other => uri.push_str(&format!("%{other:02X}")),
-        }
-    }
-    uri.push_str("?immutable=1");
-    Some(uri)
 }
 
 impl SqliteIndex {
@@ -1047,16 +1133,17 @@ impl SqliteIndex {
         lookup: bool,
     ) -> Result<Self> {
         let path = path.as_ref();
-        let conn = if lookup {
+        let opened = if lookup {
             open_lookup_connection(path)?
         } else {
-            Connection::open_with_flags(
+            open_database(
                 path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                checked_open::NameMode::Path,
             )?
         };
         // Favor lookup/list latency on warm mounts (find / getattr storms).
-        conn.execute_batch(
+        opened.execute_batch(
             r#"
             PRAGMA temp_store = MEMORY;
             PRAGMA cache_size = -65536;
@@ -1064,9 +1151,10 @@ impl SqliteIndex {
             PRAGMA query_only = ON;
             "#,
         )?;
+        let (conn, hold) = opened.into_parts();
         let mut idx = Self {
             path: Some(path.to_path_buf()),
-            conn: BudgetConnection::new(conn)?,
+            conn: BudgetConnection::with_hold(conn, hold)?,
             read_only: true,
             mem: None,
             mem_builder: Mutex::new(None),
@@ -1109,7 +1197,7 @@ impl SqliteIndex {
     /// Also starts a [`MemIndexBuilder`] so path/name strings are interned and
     /// compact rows are filled at insert time (no fat dual maps at seal).
     pub fn create_writable(path: Option<&Path>) -> Result<Self> {
-        let (conn, path_buf, publish_target) = match path {
+        let (conn, hold, path_buf, publish_target) = match path {
             Some(dest) => {
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -1117,9 +1205,11 @@ impl SqliteIndex {
                 // Concurrent readers keep dest's inode; do not remove_file dest.
                 reap_stale_writable_tmps(dest);
                 let tmp = writable_tmp_path(dest);
-                (Connection::open(&tmp)?, Some(tmp), Some(dest.to_path_buf()))
+                let opened = open_database(&tmp, OPEN_RWC, checked_open::NameMode::Path)?;
+                let (conn, hold) = opened.into_parts();
+                (conn, hold, Some(tmp), Some(dest.to_path_buf()))
             }
-            None => (Connection::open_in_memory()?, None, None),
+            None => (Connection::open_in_memory()?, None, None, None),
         };
         // Match Python `SQLiteIndex._open_sql_db` — large speedup for bulk inserts.
         // WHY: exclusive + tmp+rename is the publish lock; NTFS supports SQLite's
@@ -1138,7 +1228,7 @@ impl SqliteIndex {
         conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
         Ok(Self {
             path: path_buf,
-            conn: BudgetConnection::new(conn)?,
+            conn: BudgetConnection::with_hold(conn, hold)?,
             read_only: false,
             mem: None,
             mem_builder: Mutex::new(Some(MemIndexBuilder::new())),
@@ -1757,11 +1847,9 @@ impl SqliteIndex {
             Ok(())
         })?;
 
-        // Close tmp (journal still OFF). Do not WAL the tmp name.
-        {
-            let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
-            *guard = Connection::open_in_memory()?;
-        }
+        // Close tmp (journal still OFF). Do not WAL the tmp name. The
+        // in-memory stand-in drops the tmp connection before its hold.
+        self.conn.install(Connection::open_in_memory()?, None);
         // Managed sync (#151): the temporary index may be another name of a
         // database open in this process.
         managed_read::ManagedReadCursor::open(&tmp)?.sync_all()?;
@@ -1773,34 +1861,35 @@ impl SqliteIndex {
         // the next WAL open creates N+1 companions instead of replaying N.
         unlink_sqlite_journals(&dest);
 
-        {
-            let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
-            let conn = Connection::open(&dest)?;
-            conn.busy_timeout(std::time::Duration::from_secs(10))?;
-            conn.execute_batch(
-                r#"
+        let rw = open_database(&dest, OPEN_RWC, checked_open::NameMode::Path)?;
+        rw.busy_timeout(std::time::Duration::from_secs(10))?;
+        rw.execute_batch(
+            r#"
                 PRAGMA temp_store = MEMORY;
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
                 PRAGMA locking_mode = NORMAL;
                 "#,
-            )?;
-            // Force an unlock transition if EXCLUSIVE leaked across rename.
-            let _: i64 = conn.query_row(r#"SELECT COUNT(*) FROM "files""#, [], |r| r.get(0))?;
-            *guard = Connection::open_with_flags(
-                &dest,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            guard.execute_batch(
-                r#"
+        )?;
+        // Force an unlock transition if EXCLUSIVE leaked across rename.
+        let _: i64 = rw.query_row(r#"SELECT COUNT(*) FROM "files""#, [], |r| r.get(0))?;
+        let ro = open_database(
+            &dest,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            checked_open::NameMode::Path,
+        )?;
+        ro.execute_batch(
+            r#"
                 PRAGMA query_only = ON;
                 PRAGMA temp_store = MEMORY;
                 PRAGMA cache_size = -65536;
                 PRAGMA mmap_size = 268435456;
                 "#,
-            )?;
-            self.conn.enforce(&guard)?;
-        }
+        )?;
+        self.conn.enforce(&ro)?;
+        let (ro_conn, ro_hold) = ro.into_parts();
+        self.conn.install(ro_conn, ro_hold);
+        drop(rw);
         self.read_only = true;
         Ok(())
     }
@@ -1856,12 +1945,12 @@ impl SqliteIndex {
                     if let Some(ref p) = path {
                         // Close the exclusive-era handle and reopen RO so no exclusive file
                         // lock remains for factory open_writable / discard-index helpers.
-                        let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
-                        *guard = Connection::open_with_flags(
+                        let ro = open_database(
                             p,
                             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                            checked_open::NameMode::Path,
                         )?;
-                        guard.execute_batch(
+                        ro.execute_batch(
                             r#"
                     PRAGMA query_only = ON;
                     PRAGMA temp_store = MEMORY;
@@ -1869,7 +1958,9 @@ impl SqliteIndex {
                     PRAGMA mmap_size = 268435456;
                     "#,
                         )?;
-                        self.conn.enforce(&guard)?;
+                        self.conn.enforce(&ro)?;
+                        let (ro_conn, ro_hold) = ro.into_parts();
+                        self.conn.install(ro_conn, ro_hold);
                     } else {
                         // Pure :memory: — keep the same connection; no second openers.
                         self.with_conn(|conn| {
@@ -2733,7 +2824,7 @@ impl SqliteIndex {
     /// or incomplete.
     pub fn open_writable(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let conn = Connection::open(path)?;
+        let conn = open_database(path, OPEN_RWC, checked_open::NameMode::Path)?;
         // Brief wait if a concurrent reader is finishing (mount RO + side-table write).
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(
@@ -2745,9 +2836,10 @@ impl SqliteIndex {
             "#,
         )?;
         conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
+        let (conn, hold) = conn.into_parts();
         let idx = Self {
             path: Some(path.to_path_buf()),
-            conn: BudgetConnection::new(conn)?,
+            conn: BudgetConnection::with_hold(conn, hold)?,
             read_only: false,
             mem: None,
             // Existing DB: do not build MemIndex on write; open_read_only loads it.
@@ -3497,9 +3589,10 @@ fn file_info_from_named_row(row: &Row<'_>) -> rusqlite::Result<FileInfo> {
 /// Lightweight helper for factory gates that only have a path (B-119).
 pub fn index_file_row_count(path: impl AsRef<Path>) -> Result<u64> {
     let path = path.as_ref();
-    let conn = Connection::open_with_flags(
+    let conn = open_database(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        checked_open::NameMode::Path,
     )?;
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     // Favor a quick meta-only open; ignore mmap for a one-shot COUNT.
