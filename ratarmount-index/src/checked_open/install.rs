@@ -270,21 +270,25 @@ pub(crate) trait SyscallTable {
 pub(crate) struct Originals {
     pub(crate) open: ErasedFn,
     pub(crate) stat: ErasedFn,
+    /// `None` when this SQLite has no `"openat"` syscall (bundled 3.46).
+    pub(crate) openat: SyscallPtr,
 }
 
 fn addr(f: SyscallPtr) -> usize {
     f.map_or(0, |f| f as usize)
 }
 
-/// Steps 3-7 of design §3: capture both pointers, publish them, set `open`
-/// then `stat` and verify each by the getter. On a failure after the first
-/// mutation, restore the exact captured pointers (never null: SQLite maps null
-/// to its built-in default, which need not be what was captured) and verify.
+/// Steps 3-7 of design §3: capture `open`, `stat` and `openat` (when that
+/// slot exists), publish them, and set the hooks in this one call. A later
+/// lazy `xSetSystemCall` is not used. On a failure after the first mutation,
+/// restore the exact captured pointers (never null: SQLite maps null to its
+/// built-in default, which need not be what was captured) and verify.
 pub(crate) fn install_overrides(
     table: &dyn SyscallTable,
     originals: &OnceLock<Originals>,
     open_hook: ErasedFn,
     stat_hook: ErasedFn,
+    openat_hook: ErasedFn,
 ) -> Result<(), InstallFailure> {
     let open = table
         .get(c"open")
@@ -292,16 +296,28 @@ pub(crate) fn install_overrides(
     let stat = table
         .get(c"stat")
         .ok_or(InstallFailure::OriginalMissing("stat"))?;
-    let saved = *originals.get_or_init(|| Originals { open, stat });
-    if saved.open as usize != open as usize || saved.stat as usize != stat as usize {
+    // Absent on bundled SQLite 3.46 (`xGetSystemCall` returns null). Present
+    // means this same installation owns the slot.
+    let openat = table.get(c"openat");
+    let saved = *originals.get_or_init(|| Originals { open, stat, openat });
+    if saved.open as usize != open as usize
+        || saved.stat as usize != stat as usize
+        || saved.openat.map(|f| f as usize) != openat.map(|f| f as usize)
+    {
         // Another installation already published different originals.
         return Err(InstallFailure::OriginalsDiffer);
     }
-    let slots: [(&CStr, &'static str, ErasedFn, ErasedFn); 2] = [
+    let mut slots: [(&CStr, &'static str, ErasedFn, ErasedFn); 3] = [
         (c"open", "open", open, open_hook),
         (c"stat", "stat", stat, stat_hook),
+        (c"openat", "openat", open, openat_hook),
     ];
-    for (i, &(name, label, _, hook)) in slots.iter().enumerate() {
+    let mut n = 2;
+    if let Some(original) = openat {
+        slots[2].2 = original;
+        n = 3;
+    }
+    for (i, &(name, label, _, hook)) in slots[..n].iter().enumerate() {
         let rc = table.set(name, Some(hook));
         let failure = if rc != ffi::SQLITE_OK {
             Some(InstallFailure::Set { name: label, rc })
@@ -584,6 +600,7 @@ mod imp {
         methods: &'static str,
         open: &'static str,
         stat: &'static str,
+        openat: &'static str,
     }
 
     pub(super) const UNIX_REASONS: Reasons = Reasons {
@@ -593,6 +610,7 @@ mod imp {
         methods: "a \"unix\" VFS method (xOpen, xSetSystemCall, xGetSystemCall) changed",
         open: "the \"unix\" VFS's \"open\" system call was replaced",
         stat: "the \"unix\" VFS's \"stat\" system call was replaced",
+        openat: "the \"unix\" VFS's \"openat\" system call appeared or was replaced",
     };
     #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
     pub(super) const POSIX_REASONS: Reasons = Reasons {
@@ -602,6 +620,7 @@ mod imp {
         methods: "a \"unix-posix\" VFS method (xOpen, xSetSystemCall, xGetSystemCall) changed",
         open: "the \"unix-posix\" VFS's \"open\" system call was replaced",
         stat: "the \"unix-posix\" VFS's \"stat\" system call was replaced",
+        openat: "the \"unix-posix\" VFS's \"openat\" system call appeared or was replaced",
     };
 
     /// One selected VFS at installation: identity, version and the three
@@ -613,6 +632,9 @@ mod imp {
         pub(super) vfs: usize,
         pub(super) version: c_int,
         pub(super) methods: [usize; 3],
+        /// Address the `"openat"` slot must hold. `0` when the installation
+        /// saw no such call. A later non-null slot is a replacement.
+        pub(super) openat: usize,
     }
 
     /// The three methods of a VFS that passed the version-3 gate.
@@ -631,7 +653,8 @@ mod imp {
 
     /// F6 (r11 S6): every snapshotted VFS is still the registered one under
     /// its name, with the same version and methods, and its `open`/`stat`
-    /// slots hold `hooks`. Identity and version are compared before any
+    /// slots hold `hooks`. `openat` must still be the address the installation
+    /// left (`0` when the slot did not exist). Identity and version are compared before any
     /// version-3 field is read, and the methods before the getter is called;
     /// a VFS whose identity changed is never dereferenced. A diagnostic under
     /// the continuing contract (nothing reconfigures SQLite concurrently),
@@ -672,6 +695,9 @@ mod imp {
             if super::addr(table.get(c"stat")) != hooks[1] {
                 return Err(s.reasons.stat);
             }
+            if super::addr(table.get(c"openat")) != s.openat {
+                return Err(s.reasons.openat);
+            }
         }
         Ok(())
     }
@@ -696,7 +722,7 @@ mod imp {
         unsafe { check_hooks(snaps, &find, hook_addrs()) }
     }
 
-    pub(super) use acquire::{RealOpen, RealStat};
+    pub(super) use acquire::{RealOpen, RealOpenAt, RealStat};
 
     /// The only conversions between SQLite's erased `sqlite3_syscall_ptr` and
     /// the real signatures. SAFETY: SQLite's `"open"` slot holds an
@@ -705,7 +731,7 @@ mod imp {
     /// `int (*)(const char*, struct stat*)`; this module is compiled only for
     /// targets whose `libc::stat` matches the layout SQLite was built with.
     mod erased {
-        use super::{ErasedFn, RealOpen, RealStat};
+        use super::{ErasedFn, RealOpen, RealOpenAt, RealStat};
 
         pub(in super::super) fn from_open(f: RealOpen) -> ErasedFn {
             unsafe { std::mem::transmute::<RealOpen, ErasedFn>(f) }
@@ -718,6 +744,12 @@ mod imp {
         }
         pub(in super::super) fn to_stat(f: ErasedFn) -> RealStat {
             unsafe { std::mem::transmute::<ErasedFn, RealStat>(f) }
+        }
+        pub(in super::super) fn from_openat(f: RealOpenAt) -> ErasedFn {
+            unsafe { std::mem::transmute::<RealOpenAt, ErasedFn>(f) }
+        }
+        pub(in super::super) fn to_openat(f: ErasedFn) -> RealOpenAt {
+            unsafe { std::mem::transmute::<ErasedFn, RealOpenAt>(f) }
         }
     }
 
@@ -747,6 +779,29 @@ mod imp {
     pub(super) unsafe extern "C" fn hook_stat(path: *const c_char, buf: *mut libc::stat) -> c_int {
         match ORIGINALS.get() {
             Some(o) => unsafe { acquire::on_stat(erased::to_stat(o.stat), path, buf) },
+            None => {
+                set_errno(libc::ENOSYS);
+                -1
+            }
+        }
+    }
+
+    /// `"openat"` when the table has that slot. Installed together with
+    /// `open` and `stat`; never by a later call.
+    pub(super) unsafe extern "C" fn hook_openat(
+        dirfd: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mode: c_int,
+    ) -> c_int {
+        match ORIGINALS.get() {
+            Some(o) => {
+                let Some(original) = o.openat else {
+                    set_errno(libc::ENOSYS);
+                    return -1;
+                };
+                unsafe { acquire::on_openat(erased::to_openat(original), dirfd, path, flags, mode) }
+            }
             None => {
                 set_errno(libc::ENOSYS);
                 -1
@@ -921,6 +976,7 @@ mod imp {
                 p.xGetSystemCall.map(|f| f as usize),
             ) || super::addr(table.get(c"open")) != super::addr(posix_table.get(c"open"))
                 || super::addr(table.get(c"stat")) != super::addr(posix_table.get(c"stat"))
+                || super::addr(table.get(c"openat")) != super::addr(posix_table.get(c"openat"))
             {
                 return Err(InstallFailure::VfsSyscallsDiffer);
             }
@@ -930,6 +986,7 @@ mod imp {
             &ORIGINALS,
             erased::from_open(hook_open),
             erased::from_stat(hook_stat),
+            erased::from_openat(hook_openat),
         )?;
         // F6: published before the caller stores the installation result.
         let snaps = vfses
@@ -941,6 +998,7 @@ mod imp {
                 // SAFETY: every entry passed `find_vfs` (version >= 3).
                 version: unsafe { std::ptr::addr_of!((*vfs).iVersion).read() },
                 methods: unsafe { methods(vfs) },
+                openat: super::addr(VfsTable(vfs).get(c"openat")),
             })
             .collect();
         // Cannot fail: this is the only setter, and `STATE` admits one
@@ -1052,6 +1110,13 @@ mod imp {
             assert_eq!(observation(), Some(CtorObservation::AttemptedSingleThread));
             assert_eq!(real_slot(c"open"), erased::from_open(hook_open) as usize);
             assert_eq!(real_slot(c"stat"), erased::from_stat(hook_stat) as usize);
+            // Bundled SQLite 3.46 has no `openat` slot. A non-null slot must
+            // be the hook installed in the same call as `open` (R11-S8).
+            let openat = real_slot(c"openat");
+            assert!(
+                openat == 0 || openat == erased::from_openat(hook_openat) as usize,
+                "openat {openat:#x} is neither absent nor the installed hook"
+            );
             #[cfg(target_os = "macos")]
             {
                 let posix = VfsTable(find_vfs(c"unix-posix", "unix-posix").unwrap());
@@ -1303,6 +1368,8 @@ mod imp {
             /// The fake getter's `open` and `stat` slots.
             static FAKE_SLOTS: std::cell::Cell<[usize; 2]> =
                 const { std::cell::Cell::new([0x501, 0x502]) };
+            /// The fake getter's `openat` slot. `0` is "no such call".
+            static FAKE_OPENAT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         }
 
         unsafe extern "C" fn fake_get(
@@ -1311,7 +1378,15 @@ mod imp {
         ) -> ffi::sqlite3_syscall_ptr {
             let [open, stat] = FAKE_SLOTS.with(|s| s.get());
             let name = unsafe { CStr::from_ptr(name) };
-            let addr = if name == c"open" { open } else { stat };
+            let addr = if name == c"open" {
+                open
+            } else if name == c"stat" {
+                stat
+            } else if name == c"openat" {
+                FAKE_OPENAT.with(|s| s.get())
+            } else {
+                0
+            };
             // SAFETY: only compared as an address, never called.
             unsafe { std::mem::transmute::<usize, ffi::sqlite3_syscall_ptr>(addr) }
         }
@@ -1352,6 +1427,7 @@ mod imp {
                 vfs: vfs as *const _ as usize,
                 version: 3,
                 methods: [vfs.xOpen.map_or(0, |f| f as usize), 0x102, getter],
+                openat: 0,
             };
             let snaps = [
                 snap(&unix, c"unix", &UNIX_REASONS),
@@ -1366,6 +1442,12 @@ mod imp {
                 check_hooks(&snaps, find, hooks)
             };
             assert_eq!(check(&catalog(ptr(&unix), ptr(&posix))), Ok(()));
+            FAKE_OPENAT.with(|s| s.set(0x777));
+            assert_eq!(
+                check(&catalog(ptr(&unix), ptr(&posix))),
+                Err(UNIX_REASONS.openat)
+            );
+            FAKE_OPENAT.with(|s| s.set(0));
             assert_eq!(
                 check(&catalog(std::ptr::null_mut(), ptr(&posix))),
                 Err(UNIX_REASONS.missing)
@@ -1446,7 +1528,11 @@ mod imp {
                 unsafe { check_hooks(&counted, &catalog(ptr(&changed), ptr(&posix)), hooks) },
                 Ok(())
             );
-            assert_eq!(GETTER_CALLS.with(|c| c.get()), 2, "open and stat read");
+            assert_eq!(
+                GETTER_CALLS.with(|c| c.get()),
+                3,
+                "open, stat and openat read"
+            );
             set_method(&mut changed, 2, getter);
             // A changed method of the second (macOS) VFS refuses with its name.
             let mut posix_changed = fake_vfs([0x201, 0x10b, getter]);
@@ -1873,6 +1959,9 @@ mod tests {
     unsafe extern "C" fn stat_hook() {
         std::hint::black_box(6u32);
     }
+    unsafe extern "C" fn openat_hook() {
+        std::hint::black_box(7u32);
+    }
 
     /// A fake `xSetSystemCall`/`xGetSystemCall` with SQLite's semantics: null
     /// means "the built-in default", which differs from the custom pointer the
@@ -1938,7 +2027,7 @@ mod tests {
         fake: &Fake,
         originals: &OnceLock<Originals>,
     ) -> Result<Witness, InstallFailure> {
-        install_overrides(fake, originals, open_hook, stat_hook).map(|()| PRIVATE)
+        install_overrides(fake, originals, open_hook, stat_hook, openat_hook).map(|()| PRIVATE)
     }
 
     /// Regression (r9 v4 #1): constructor abstention seeded the installation
@@ -2264,7 +2353,7 @@ mod tests {
             }
         }
         assert_eq!(
-            install_overrides(&Empty, &OnceLock::new(), open_hook, stat_hook),
+            install_overrides(&Empty, &OnceLock::new(), open_hook, stat_hook, openat_hook),
             Err(InstallFailure::OriginalMissing("open"))
         );
 
@@ -2276,9 +2365,10 @@ mod tests {
         let _ = seeded.set(Originals {
             open: default_open,
             stat: default_stat,
+            openat: None,
         });
         assert_eq!(
-            install_overrides(&fake, &seeded, open_hook, stat_hook),
+            install_overrides(&fake, &seeded, open_hook, stat_hook, openat_hook),
             Err(InstallFailure::OriginalsDiffer)
         );
         assert_eq!(fake.sets.get(), 0);

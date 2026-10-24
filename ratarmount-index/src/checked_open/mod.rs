@@ -18,8 +18,11 @@
 //!
 //! A database open never installs anything. [`installed`] reports the terminal
 //! result or why nothing was installed. The installed wrappers forward every
-//! call unchanged unless the calling thread is inside [`open_checked`], which
-//! refuses with [`AcquireError::Unavailable`] when nothing is installed.
+//! call unchanged unless the calling thread is inside [`open_checked`], or
+//! the process has latched an overlay database ([`latch_overlay_nocreate`])
+//! and this `open` would create that file or its `-wal` / `-shm`.
+//! [`open_checked`] refuses with [`AcquireError::Unavailable`] when nothing
+//! is installed.
 //!
 //! The constructor runs in every binary that reaches `checked_open`
 //! ([`installed`] references the constructor, so the linker keeps it; a binary
@@ -65,6 +68,7 @@ mod host;
     allow(dead_code)
 )]
 mod install;
+mod nocreate;
 
 /// Thread-local seams inside the acquisition, for other crates' tests
 /// (`test-hooks` feature; never in a normal build).
@@ -110,3 +114,4 @@ pub use install::{
     constructor_observation, install_private_instance, installed, CtorObservation, InstallFailure,
     InstallStatus, InstallWhy, Witness, VERIFIED_TARGET,
 };
+pub use nocreate::latch_overlay_nocreate;

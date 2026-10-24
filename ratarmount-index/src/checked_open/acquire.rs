@@ -444,8 +444,10 @@ pub(crate) fn request(
     // here.
     let mut flags = (flags - OpenFlags::SQLITE_OPEN_URI) | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
     // An existing file that vanished must not be created anew (and then
-    // refused and retained as a 0-byte file).
-    if matches!(expect, Expect::Existing { .. }) {
+    // refused and retained as a 0-byte file). A latched overlay database
+    // (R11-S8) is the same refusal for a later `Expect::Fresh`, including
+    // after its directory is renamed (parent inode plus the file name).
+    if matches!(expect, Expect::Existing { .. }) || super::nocreate::db_path_is_latched(&path) {
         flags -= OpenFlags::SQLITE_OPEN_CREATE;
     }
     let name = match mode {
@@ -488,7 +490,8 @@ pub fn open_checked(
         if let Err(status) = super::install::installed() {
             return Err(refuse(AcquireError::Unavailable(status)));
         }
-        // F6 (r11 S6): the VFS and the two syscall slots still hold what the
+        // F6 (r11 S6): the VFS and the installed syscall slots (`open`,
+        // `stat`, and `openat` when that slot exists) still hold what the
         // installation left; checked before arming, never repaired.
         if let Err(reason) = super::install::hooks_intact() {
             return Err(refuse(AcquireError::Unavailable(
@@ -693,6 +696,9 @@ pub(crate) mod imp {
     };
 
     pub(crate) type RealOpen = unsafe extern "C" fn(*const c_char, c_int, c_int) -> c_int;
+    /// SQLite's `"openat"` when the syscall table has one: `posix` style,
+    /// mode as `int` (not variadic), matching `"open"`.
+    pub(crate) type RealOpenAt = unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_int;
     pub(crate) type RealStat = unsafe extern "C" fn(*const c_char, *mut libc::stat) -> c_int;
 
     thread_local! {
@@ -850,8 +856,28 @@ pub(crate) mod imp {
         }
     }
 
+    /// Apply the overlay no-create latch (R11-S8) before the armed path.
+    /// Nothing is latched: no lock and no allocation. A matching `O_CREAT`
+    /// of a missing database, `-wal` or `-shm` fails closed.
+    ///
+    /// # Safety
+    ///
+    /// `path` is null or SQLite's NUL-terminated path.
+    unsafe fn mediate_create(path: *const c_char, flags: c_int) -> Result<c_int, c_int> {
+        // SAFETY: the caller upholds `path`.
+        match unsafe { super::super::nocreate::prepare_open(path, flags) } {
+            super::super::nocreate::OpenPrep::Forward => Ok(flags),
+            super::super::nocreate::OpenPrep::StripCreate => {
+                Ok(flags & !libc::O_CREAT & !libc::O_EXCL)
+            }
+            super::super::nocreate::OpenPrep::Refuse => Err(libc::EACCES),
+        }
+    }
+
     /// The installed `open` wrapper. Unarmed (or a TLS failure): forward
-    /// unchanged. No allocation, logging, registry lock or unwinding.
+    /// unchanged, after the no-create latch. No allocation or unwinding. The
+    /// latch lock is taken only when an overlay database is latched and this
+    /// open carries `O_CREAT`.
     ///
     /// # Safety
     ///
@@ -863,6 +889,13 @@ pub(crate) mod imp {
         flags: c_int,
         mode: c_int,
     ) -> c_int {
+        let flags = match unsafe { mediate_create(path, flags) } {
+            Ok(flags) => flags,
+            Err(err) => {
+                set_errno(err);
+                return -1;
+            }
+        };
         let taken = ARMED.try_with(|c| c.take());
         let Ok(Some(mut a)) = taken else {
             return unsafe { real(path, flags, mode) };
@@ -872,6 +905,31 @@ pub(crate) mod imp {
         let _ = ARMED.try_with(|c| c.set(Some(a)));
         set_errno(e);
         fd
+    }
+
+    /// The installed `openat` wrapper, when SQLite's syscall table has that
+    /// slot. Same no-create rule as [`on_open`]; not an acquisition `open`
+    /// (this SQLite does not open databases with `openat`).
+    ///
+    /// # Safety
+    ///
+    /// The arguments of an `int (*)(int, const char*, int, int)` `openat`;
+    /// `real` is the captured original.
+    pub(crate) unsafe fn on_openat(
+        real: RealOpenAt,
+        dirfd: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mode: c_int,
+    ) -> c_int {
+        let flags = match unsafe { mediate_create(path, flags) } {
+            Ok(flags) => flags,
+            Err(err) => {
+                set_errno(err);
+                return -1;
+            }
+        };
+        unsafe { real(dirfd, path, flags, mode) }
     }
 
     #[allow(clippy::unnecessary_cast)] // `u16` mode on macOS
