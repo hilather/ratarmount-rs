@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Regression: test-only env seams (RATARMOUNT_TEST_HASH_LOG, _HASH_DELAY_MS,
-# _HASH_HOLD, _HASH_GATE, _STAT_PANIC) must not exist in a release binary.
+# _HASH_HOLD, _HASH_GATE, _STAT_PANIC) and the checked-open seams
+# (RATARMOUNT_TEST_CHECKED_OPEN_SEAMS) must not exist in a release binary.
 # Usage: packaging/test-no-test-hooks-in-release.sh [path/to/ratarmount]
 #        packaging/test-no-test-hooks-in-release.sh --self-test
 set -euo pipefail

@@ -87,3 +87,60 @@ fn regression_docs_state_failed_replacement_and_locator_rules() {
         assert!(docs.contains(sentence), "docs/sandbox.md lost: {sentence}");
     }
 }
+
+/// R11-S5 (#151, #183): the lock guarantees are scoped to processes that keep
+/// the database open (a daemonized mount holds no lock after its fork), the
+/// platform table is present, and the swap-back exclusion closed by the
+/// checked open is gone.
+#[test]
+fn regression_docs_scope_lock_claims_and_platform_matrix() {
+    let text = read("docs/sandbox.md");
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Every "in use" lock claim is scoped to a foreground mount (#183).
+    const SCOPE: &str = "(a foreground `-f` mount; a daemonized mount holds no lock, #183)";
+    for claim in [
+        "A mounted overlay's exclusive database lock is reported as \"in use\"",
+        "may fail with “in use” if another mount holds the database",
+        "Seal refuses a database held by another mount (“in use by another ratarmount process”)",
+        "A database locked by a mount returns “in use”",
+        "diff refuses a database locked by a mount",
+    ] {
+        assert!(
+            flat.contains(&format!("{claim} {SCOPE}")),
+            "docs/sandbox.md lock claim not scoped to #183: {claim}"
+        );
+    }
+    for sentence in [
+        "two packs are byte-identical only with the same ratarmount build",
+        "fails the pack instead of being shipped raw",
+    ] {
+        assert!(flat.contains(sentence), "docs/sandbox.md lost: {sentence}");
+    }
+    assert!(
+        !text.contains("SQLite (3.45.3)"),
+        "docs/sandbox.md names SQLCipher's SQLite version literally"
+    );
+    let python = read("docs/python.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        python.contains("Do not open the same database file (an overlay database, an index sidecar) through both at the same time in one process (#154)"),
+        "docs/python.md lost the #154 paragraph"
+    );
+    for sentence in [
+        "A daemonized ratarmount (the default without `-f`, for a FUSE mount and for an export server alike) currently holds no kernel lock on its overlay database at all",
+        "(#183). Until that is fixed, run with `-f` when another process may open the same overlay.",
+        "| Platform / host | Installation | Checked open |",
+        "opening one database file through both at once in one process is unsupported (#154",
+    ] {
+        assert!(text.contains(sentence), "docs/sandbox.md lost: {sentence}");
+    }
+    assert!(
+        !text.contains("swapped away and back at its path during its own open"),
+        "docs/sandbox.md still lists the swap-back exclusion the checked open closed"
+    );
+    let changelog = read("CHANGELOG.md");
+    assert!(changelog
+        .contains("still holds no kernel lock on its overlay database after it forks (#183)"));
+}

@@ -611,7 +611,8 @@ pub(crate) fn check_commit_base(
     base: &ClassifiedBase,
     archive: &Path,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
-    check_commit_base_with(conn, base, archive, None)
+    // The mount's own database: it always has its `files` table.
+    check_commit_base_with(conn, base, archive, None, true)
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -632,6 +633,10 @@ thread_local! {
 /// identity and the stamp all judge that one snapshot, which is returned on
 /// the archive path (`Some`) so the caller's writes compare against the very
 /// file the gate accepted. `None`: no local archive of the token was judged.
+///
+/// `required`: the record must have its `files` table (a mount's own
+/// database, or a marked overlay's): without it the record is lost and the
+/// commit refuses, never reads it as unrecorded (R10-B).
 pub(crate) fn check_commit_base_with(
     conn: &Connection,
     base: &ClassifiedBase,
@@ -640,6 +645,7 @@ pub(crate) fn check_commit_base_with(
         &ratarmount_compress::commit_journal::PendingJournal,
         &std::fs::Metadata,
     )>,
+    required: bool,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
     let refuse = |why: String| {
         CommitBaseRefusal(format!(
@@ -651,7 +657,7 @@ pub(crate) fn check_commit_base_with(
     // The recorded kind and the Unknown gate come first, under every digest
     // kind: a `none` directory overlay must not commit into an unrelated
     // archive, and a record with no usable kind never commits without force.
-    let meta = OverlayMeta::from_connection(conn)
+    let meta = OverlayMeta::from_connection_required(conn, required)
         .map_err(|e| refuse(format!("cannot read overlay metadata: {e}")))?;
     match Recorded::from_meta(meta.as_ref()) {
         Recorded::Unknown => {
@@ -829,15 +835,30 @@ pub(crate) fn check_commit_base_offline_with(
     )>,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
     let db = overlay.join(HIDDEN_DB);
+    let markers = || {
+        crate::write_overlay::overlay_markers(overlay)
+            .map(|m| !m.is_empty())
+            .map_err(|e| {
+                CommitBaseRefusal(format!(
+                    "cannot read the markers of {}: {e}",
+                    overlay.display()
+                ))
+            })
+    };
+    // A marker seen before the open requires the record, whatever the open
+    // and the later lookup see (a monotonic latch, #151).
+    let marked_before = markers()?;
     // The validated open (R7-F1): a database that is not a regular file
     // refuses here, before any authorization or recovery reads it.
-    let conn = crate::open_overlay_db(
+    let conn = crate::overlay_db::open_overlay_db_required(
         &db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         crate::DbName::Path,
+        marked_before,
     )
     .map_err(|e| CommitBaseRefusal(format!("cannot open {}: {e}", db.display())))?;
-    check_commit_base_with(&conn, base, archive, locked)
+    let marked = marked_before || conn.required_record() || markers()?;
+    check_commit_base_with(&conn, base, archive, locked, marked)
 }
 
 #[cfg(test)]
@@ -1283,6 +1304,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::overlay_meta::META_SCHEMA)
             .unwrap();
+        // A mount's own database always has its `files` table.
+        conn.execute_batch("CREATE TABLE files (x)").unwrap();
         OverlayMeta::set_many(
             &conn,
             &[
@@ -1320,6 +1343,7 @@ mod tests {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(crate::overlay_meta::META_SCHEMA)
                 .unwrap();
+            conn.execute_batch("CREATE TABLE files (x)").unwrap();
             OverlayMeta::set_many(&conn, rows).unwrap();
             conn
         };
@@ -1342,5 +1366,11 @@ mod tests {
             ("base_kind", "archive"),
         ]);
         check_commit_base(&archive, &token, &place.archive).unwrap();
+        // Regression (R10-B): a record without its `files` table is lost,
+        // never an unrecorded overlay the commit may write past.
+        let lost = Connection::open_in_memory().unwrap();
+        lost.execute_batch("CREATE TABLE other (x)").unwrap();
+        let err = check_commit_base(&lost, &token, &place.archive).unwrap_err();
+        assert!(err.0.contains("no files table"), "{err}");
     }
 }

@@ -44,3 +44,6 @@ anyhow = { version = "1", optional = true }
 # Already transitive rqbit dependencies; used for active LAN-only metadata discovery.
 librqbit-lsd = { version = "=9.0.1", optional = true }
 futures-lite = { version = "2", optional = true }
+
+[dev-dependencies]
+ratarmount-index = { workspace = true, features = ["test-hooks"] }

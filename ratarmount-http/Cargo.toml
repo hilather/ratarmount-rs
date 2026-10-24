@@ -9,7 +9,11 @@ description = "HTTP Range export of a ratarmount MountSource"
 ratarmount-core.workspace = true
 ratarmount-export-core.workspace = true
 ratarmount-compositing.workspace = true
+ratarmount-index.workspace = true
 log.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+ratarmount-index = { workspace = true, features = ["test-hooks"] }
+rusqlite.workspace = true
+libc.workspace = true

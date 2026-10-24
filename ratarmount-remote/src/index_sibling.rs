@@ -5,7 +5,6 @@
 //! CLI publication also supports GCS and Azure. The well-known
 //! `{url}.index.sqlite` key is not written.
 
-use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -72,7 +71,8 @@ fn index_sibling_object_keys(archive_key: &str, index_id: &str) -> (String, Stri
 fn read_exact_file(path: &Path, len: u64) -> Result<Vec<u8>> {
     let n = usize::try_from(len)
         .map_err(|_| RemoteError::S3(format!("index blob length {len} does not fit usize")))?;
-    let mut file = File::open(path)?;
+    // Managed (#151): the blob is an index that may be open in this process.
+    let mut file = ratarmount_index::managed_read::ManagedReadCursor::open(path)?;
     let mut buf = vec![0u8; n];
     file.read_exact(&mut buf)?;
     Ok(buf)

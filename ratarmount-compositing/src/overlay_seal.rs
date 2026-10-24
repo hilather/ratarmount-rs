@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ratarmount_core::MountSource;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, OpenFlags};
 use rustix::fs::{self as host, AtFlags, Dir, Mode, OFlags};
 
 use crate::overlay_changes::{self as changes, ChangeOptions};
@@ -57,7 +57,7 @@ fn root(dir: &Path) -> io::Result<OwnedFd> {
     Ok(host::open(dir, directory_flags(), Mode::empty())?)
 }
 
-fn connection(dir: &Path, immutable: bool) -> io::Result<Connection> {
+fn connection(dir: &Path, immutable: bool) -> io::Result<crate::OverlayDb> {
     let path = dir.join(HIDDEN_DB);
     if !fs::symlink_metadata(&path)?.is_file() {
         return Err(io::Error::other("overlay database must be a regular file"));
@@ -119,21 +119,15 @@ fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
         if kind == libc::S_IFLNK {
             continue;
         }
-        let flags = if kind == libc::S_IFDIR {
-            directory_flags()
-        } else {
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC
-        };
-        let child = host::openat(fd, name, flags, Mode::empty())?;
         if kind == libc::S_IFDIR {
-            chmod_tree(&child, writable)?;
-        } else {
-            host::fchmod(
-                &child,
-                change(
-                    crate::host_stat::fstat_named(&child, name.to_string_lossy().as_ref())?.st_mode,
-                ),
+            chmod_tree(
+                &host::openat(fd, name, directory_flags(), Mode::empty())?,
+                writable,
             )?;
+        } else {
+            // Never a data descriptor: closing one would release this
+            // process's locks on the overlay database (#149).
+            crate::host_stat::chmod_entry_at(fd, name, &stat, |mode| change(mode).as_raw_mode())?;
         }
     }
     if !writable {
@@ -263,7 +257,7 @@ pub(crate) fn seal_impl(
     // Readers can still take snapshots for canonical hashing. Competing writers,
     // including mounts in exclusive locking mode, cannot enter this interval.
     conn.execute_batch("BEGIN IMMEDIATE").map_err(sql_error)?;
-    if OverlayMeta::from_connection(&conn)
+    if OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
         .is_some_and(|m| m.layer_sealed())
     {
@@ -290,7 +284,7 @@ pub(crate) fn seal_impl(
         // overlay recorded no kind: the seal writes it now (no digest). An
         // accepted move to another place (a local copy of a remote archive)
         // is recorded too, so the sealed layer names the base it was sealed on.
-        let meta = OverlayMeta::from_connection(&conn).map_err(overlay_error)?;
+        let meta = OverlayMeta::from_opened(&conn).map_err(overlay_error)?;
         if !matches!(
             crate::overlay_gate::Recorded::from_meta(meta.as_ref()),
             crate::overlay_gate::Recorded::Nothing | crate::overlay_gate::Recorded::Unknown
@@ -318,7 +312,7 @@ pub(crate) fn seal_impl(
         )
         .map_err(sql_error)?;
     }
-    if OverlayMeta::from_connection(&conn)
+    if OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
         .is_none_or(|m| m.format_version().ok().flatten().is_none())
     {
@@ -356,16 +350,23 @@ fn write_sentinel(dir: &Path, layer_digest: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Open the sentinel under `root` for reading, admitted (R10-C): another name
+/// of an open overlay database is refused without closing a descriptor of it.
+fn open_sentinel(root: &OwnedFd) -> io::Result<OwnedFd> {
+    use std::os::fd::AsFd;
+    ratarmount_core::db_inodes::openat_admitted(
+        Some(root.as_fd()),
+        Path::new(SENTINEL),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+}
+
 /// Finish a seal that was interrupted after its metadata commit: write the
 /// missing sentinel (a present one must match exactly and is never replaced)
 /// and re-apply the read-only modes. Writes nothing to the sealed database.
 fn finish_sealed(dir: &Path, root: &OwnedFd, layer_digest: &str) -> io::Result<()> {
-    match host::openat(
-        root,
-        SENTINEL,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
+    match open_sentinel(root) {
         Ok(fd)
             if crate::host_stat::fstat_named(&fd, dir.join(SENTINEL))?.st_mode & libc::S_IFMT
                 == libc::S_IFREG =>
@@ -386,7 +387,7 @@ fn finish_sealed(dir: &Path, root: &OwnedFd, layer_digest: &str) -> io::Result<(
                 "sealed overlay sentinel is not a regular file; refusing to replace it",
             ))
         }
-        Err(rustix::io::Errno::NOENT) => write_sentinel(dir, layer_digest)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => write_sentinel(dir, layer_digest)?,
         Err(e) => {
             return Err(io::Error::other(format!(
                 "sealed overlay sentinel is not a regular file ({e}); refusing to replace it"
@@ -396,12 +397,25 @@ fn finish_sealed(dir: &Path, root: &OwnedFd, layer_digest: &str) -> io::Result<(
     chmod_tree(root, false)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs in [`unseal`] right after its permission walk (tests only).
+    static AFTER_UNSEAL_WALK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Remove seal metadata and restore owner write permission. Mode overrides stay.
 pub fn unseal(dir: &Path) -> io::Result<()> {
     let root = root(dir)?;
     // Probe before touching permissions, so a mounted overlay is never changed.
     OverlayMeta::read(dir).map_err(overlay_error)?;
     chmod_tree(&root, true)?;
+    #[cfg(test)]
+    AFTER_UNSEAL_WALK.with(|hook| {
+        if let Some(f) = hook.borrow_mut().as_mut() {
+            f()
+        }
+    });
     let conn = connection(dir, false)?;
     conn.execute_batch("BEGIN EXCLUSIVE").map_err(sql_error)?;
     conn.execute_batch(crate::overlay_meta::META_SCHEMA)
@@ -446,7 +460,7 @@ pub fn check_hash_format<'a>(get: impl Fn(&str) -> Option<&'a str>) -> io::Resul
 pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<VerifyReport> {
     let root = root(dir)?;
     let conn = connection(dir, true)?;
-    let meta = OverlayMeta::from_connection(&conn)
+    let meta = OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
         .filter(OverlayMeta::layer_sealed)
         .ok_or_else(|| io::Error::other("overlay is not sealed"))?;
@@ -469,12 +483,7 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         .filter(|p| rows.get(*p) != current.get(*p))
         .cloned()
         .collect();
-    let sentinel_ok = match host::openat(
-        &root,
-        SENTINEL,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
+    let sentinel_ok = match open_sentinel(&root) {
         Ok(fd)
             if crate::host_stat::fstat_named(&fd, dir.join(SENTINEL))?.st_mode & libc::S_IFMT
                 == libc::S_IFREG =>
@@ -487,8 +496,10 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
             bytes == recorded.as_bytes() || bytes == format!("{recorded}\n").as_bytes()
         }
         Ok(_) => false,
-        Err(e) if e == rustix::io::Errno::NOENT || e == rustix::io::Errno::LOOP => false,
-        Err(e) => return Err(e.into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) => {
+            false
+        }
+        Err(e) => return Err(e),
     };
     Ok(VerifyReport {
         ok: recorded == computed && sentinel_ok && mismatched.is_empty(),
@@ -711,6 +722,89 @@ mod tests {
         fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o400)).unwrap();
         assert!(seal(&f.dir, f.base.clone()).is_err());
         assert_eq!(fs::read(&sentinel).unwrap(), b"wrong digest\n");
+    }
+
+    /// A connection of this process holding SHARED on the overlay database
+    /// (a read transaction), as a mount or library user in the same process
+    /// would.
+    fn shared_holder(dir: &Path) -> crate::OverlayDb {
+        let holder = crate::open_overlay_db(
+            &dir.join(HIDDEN_DB),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            crate::DbName::Path,
+        )
+        .unwrap();
+        holder
+            .execute_batch("BEGIN; SELECT count(*) FROM files;")
+            .unwrap();
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&dir.join(HIDDEN_DB)),
+            "the holder's SHARED lock"
+        );
+        holder
+    }
+
+    /// Regression (#149): re-running `seal` on a sealed overlay re-applies the
+    /// read-only modes. The permission walk opened every regular file,
+    /// the overlay database included, to `fchmod` it, and closing that
+    /// descriptor released every fcntl lock this process held on the
+    /// database: another process could then write under a holder's read.
+    #[test]
+    fn regression_reseal_keeps_shared_db_lock() {
+        let f = Fixture::new();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let holder = shared_holder(&f.dir);
+        assert!(seal(&f.dir, f.base.clone()).unwrap().already_sealed);
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&f.dir.join(HIDDEN_DB)),
+            "the reseal's permission walk released the holder's lock"
+        );
+        assert_eq!(writable_entries(&f.dir), Vec::<String>::new());
+        holder
+            .execute_batch("SELECT count(*) FROM files; COMMIT;")
+            .unwrap();
+    }
+
+    /// Regression (#149): `unseal` makes the tree writable before it opens
+    /// the database; when that open then fails (busy: another connection
+    /// holds SHARED), the walk must not have released that connection's lock.
+    /// The lock is probed right after the walk: unseal's own failed
+    /// `BEGIN EXCLUSIVE` downgrades through SHARED, which re-takes a released
+    /// read lock and would hide the bug from a probe made afterwards.
+    #[test]
+    fn regression_unseal_failure_keeps_shared_db_lock() {
+        let f = Fixture::new();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let holder = shared_holder(&f.dir);
+        let db = f.dir.join(HIDDEN_DB);
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let record = seen.clone();
+        AFTER_UNSEAL_WALK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                record.set(Some(crate::overlay_db::other_process_sees_lock(&db)))
+            }))
+        });
+        let result = unseal(&f.dir);
+        AFTER_UNSEAL_WALK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            seen.get(),
+            Some(true),
+            "unseal's permission walk released the holder's lock"
+        );
+        let error = result.expect_err("busy while the holder reads");
+        assert!(
+            error.to_string().contains("locked") || error.kind() == io::ErrorKind::WouldBlock,
+            "{error}"
+        );
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&f.dir.join(HIDDEN_DB)),
+            "unseal's permission walk released the holder's lock"
+        );
+        holder
+            .execute_batch("SELECT count(*) FROM files; COMMIT;")
+            .unwrap();
+        drop(holder);
+        unseal(&f.dir).unwrap();
     }
 
     /// Regression: chmod -w changed lookup and readdir modes, and leaked the sentinel.

@@ -1,0 +1,22 @@
+[package]
+name = "ratarmount-checked-open-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Test fixture: a shared object with a private ratarmount-index SQLite (#151)"
+
+[lib]
+# `rlib` makes `cargo test` build the cdylib before `tests/dso.rs`; that test
+# never names this crate, so its executable does not link ratarmount-index.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ratarmount-index.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+tempfile.workspace = true

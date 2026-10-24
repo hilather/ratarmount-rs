@@ -3956,9 +3956,9 @@ fn regression_overlay_db_entry_not_a_regular_file() {
         drop(fx.open(BaseDigestRequest::Compute, false));
         let target = dangle_db(&fx.overlay);
         let db = fx.overlay.join(HIDDEN_DB);
-        let rows = crate::journal_recovery::Rows::Path(&db);
+        let rows = crate::journal_recovery::Rows::path(&db);
         assert!(
-            rows.with(|_| Ok(())).is_err(),
+            rows.with(|_, _| Ok(())).is_err(),
             "restamp must not be skipped"
         );
         assert!(!target.exists(), "nothing created through the symlink");
@@ -4385,7 +4385,7 @@ fn regression_equal_stamp_roll_forward_invalidates_the_strong_digest() {
         let db = fx.overlay.join(HIDDEN_DB);
         // pre == final == rows.
         let conn = rusqlite::Connection::open(&db).unwrap();
-        restamp_rows(&conn, &fx.archive, &applied((size, mtime)), mode).unwrap();
+        restamp_rows(&conn, &fx.archive, &applied((size, mtime)), mode, true).unwrap();
         drop(conn);
         assert_eq!(
             recorded_rows(&fx.overlay)[2].as_deref(),
@@ -4414,7 +4414,7 @@ fn regression_equal_stamp_roll_forward_invalidates_the_strong_digest() {
                 final_mtime_ns: mtime,
             };
             let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
-            restamp_rows(&conn, &fx.archive, &other, mode).unwrap();
+            restamp_rows(&conn, &fx.archive, &other, mode, true).unwrap();
             drop(conn);
             let now = recorded_rows(&fx.overlay);
             assert_eq!(
@@ -4438,7 +4438,7 @@ fn regression_equal_stamp_roll_forward_invalidates_the_strong_digest() {
                 final_mtime_ns: 7,
             };
             let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
-            restamp_rows(&conn, &fx.archive, &foreign, mode).unwrap();
+            restamp_rows(&conn, &fx.archive, &foreign, mode, true).unwrap();
             drop(conn);
             assert_eq!(
                 (recorded_rows(&fx.overlay), digest_rows(&fx.overlay)),
@@ -4537,7 +4537,7 @@ fn regression_commit_restamp_after_rollback_moves_only_a_started_unrestored_stam
             final_mtime_ns: final_mtime,
         };
         let conn = rusqlite::Connection::open(fx.overlay.join(HIDDEN_DB)).unwrap();
-        let result = restamp_rows(&conn, &fx.archive, &applied, Restamp::Commit);
+        let result = restamp_rows(&conn, &fx.archive, &applied, Restamp::Commit, true);
         drop(conn);
         let now = recorded_rows(&fx.overlay);
         match case {
@@ -4766,4 +4766,1480 @@ fn regression_journal_agrees_disjunct_three() {
         ..journal
     };
     assert!(!crate::journal_agrees((100, 9), (100, 9), &complete));
+}
+
+// ---- R10-B (#150): followed-stat errors never classify a record ----------
+
+/// Sets [`crate::write_overlay::FOLLOWED_STAT_ERRNO`] for this thread until
+/// dropped.
+struct FollowedStatErrno;
+
+impl FollowedStatErrno {
+    fn set(errno: i32) -> Self {
+        crate::write_overlay::FOLLOWED_STAT_ERRNO.with(|seam| seam.set(Some(errno)));
+        Self
+    }
+}
+
+impl Drop for FollowedStatErrno {
+    fn drop(&mut self) {
+        crate::write_overlay::FOLLOWED_STAT_ERRNO.with(|seam| seam.set(None));
+    }
+}
+
+/// The helper entry [`Unresolved::plant`] creates beside `dir`.
+#[cfg(unix)]
+fn side_of(dir: &Path, how: Unresolved) -> PathBuf {
+    let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+    dir.with_file_name(format!("side-{name}-{how:?}"))
+}
+
+/// How the database entry of an overlay is made unresolvable.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Unresolved {
+    /// A symlink through a regular file: `ENOTDIR`.
+    NotDir,
+    /// A symlink into a directory without search permission: `EACCES`.
+    Access,
+    /// A symlink loop: `ELOOP`.
+    Loop,
+    /// The followed `stat` fails with `EIO` (test seam).
+    Io,
+}
+
+#[cfg(unix)]
+impl Unresolved {
+    const ALL: [Unresolved; 4] = [Self::NotDir, Self::Access, Self::Loop, Self::Io];
+
+    /// Replace `dir`'s database by the unresolvable entry. `None` when the row
+    /// cannot run here (EACCES as root). The guard keeps the seam set.
+    fn plant(self, dir: &Path) -> Option<Option<FollowedStatErrno>> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let db = dir.join(HIDDEN_DB);
+        if fs::symlink_metadata(&db).is_ok() {
+            fs::rename(&db, side_of(dir, self).with_extension("saved")).unwrap();
+        }
+        let side = side_of(dir, self);
+        match self {
+            Self::NotDir => {
+                fs::write(&side, b"plain file").unwrap();
+                symlink(side.join("missing.sqlite"), &db).unwrap();
+            }
+            Self::Access => {
+                if unsafe { libc::geteuid() } == 0 {
+                    eprintln!("skip: EACCES row runs as root");
+                    return None;
+                }
+                fs::create_dir(&side).unwrap();
+                fs::write(side.join("db.sqlite"), b"x").unwrap();
+                fs::set_permissions(&side, fs::Permissions::from_mode(0o000)).unwrap();
+                symlink(side.join("db.sqlite"), &db).unwrap();
+            }
+            Self::Loop => symlink(HIDDEN_DB, &db).unwrap(),
+            Self::Io => {
+                fs::write(&db, b"not consulted").unwrap();
+                return Some(Some(FollowedStatErrno::set(libc::EIO)));
+            }
+        }
+        Some(None)
+    }
+
+    fn kind(self) -> std::io::ErrorKind {
+        let errno = match self {
+            Self::NotDir => libc::ENOTDIR,
+            Self::Access => libc::EACCES,
+            Self::Loop => libc::ELOOP,
+            Self::Io => libc::EIO,
+        };
+        std::io::Error::from_raw_os_error(errno).kind()
+    }
+
+    /// Undo [`Unresolved::Access`]'s permission change so the tempdir can be
+    /// removed.
+    fn cleanup(self, dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let side = side_of(dir, self);
+        if side.is_dir() || fs::symlink_metadata(&side).is_ok_and(|m| m.is_dir()) {
+            let _ = fs::set_permissions(&side, fs::Permissions::from_mode(0o700));
+        }
+    }
+}
+
+/// Regression (R10-B, #150): the shared classifier. A followed-`stat` error
+/// (`ENOTDIR`, `EACCES`, `ELOOP`, `EIO`) is an error, marked or not: never
+/// `Present` (which would let recovery act on the record) and never `Absent` /
+/// `Lost`. The v4 T9 table with its rows updated: a directory, a FIFO and an
+/// unmarked dangling symlink are errors; there is no identity-less `Present`.
+#[cfg(unix)]
+#[test]
+fn regression_overlay_db_followed_stat_errors_are_not_present() {
+    use crate::{overlay_db_absent, overlay_db_entry, DbEntry, OVERLAY_MARKER};
+    use std::os::unix::fs::{symlink, MetadataExt};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let mut n = 0;
+    let mut dir = |marked: bool| {
+        n += 1;
+        let d = root.join(format!("ov{n}"));
+        fs::create_dir(&d).unwrap();
+        if marked {
+            fs::write(d.join(OVERLAY_MARKER), b"").unwrap();
+        }
+        d
+    };
+    let real_db = |path: &Path| {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (x)")
+            .unwrap();
+    };
+    // Absent / Lost.
+    let d = dir(false);
+    assert!(matches!(overlay_db_entry(&d), Ok(DbEntry::Absent)));
+    assert!(overlay_db_absent(&d));
+    let d = dir(true);
+    assert!(matches!(
+        overlay_db_entry(&d),
+        Ok(DbEntry::Lost { empty: false, .. })
+    ));
+    assert!(!overlay_db_absent(&d), "a lost record is not absent");
+    let d = dir(true);
+    fs::write(d.join(HIDDEN_DB), b"").unwrap();
+    assert!(matches!(
+        overlay_db_entry(&d),
+        Ok(DbEntry::Lost { empty: true, .. })
+    ));
+    // Present: identity is the followed stat's.
+    let d = dir(false);
+    fs::write(d.join(HIDDEN_DB), b"").unwrap();
+    assert!(matches!(
+        overlay_db_entry(&d),
+        Ok(DbEntry::Present { marked: false, .. })
+    ));
+    let d = dir(true);
+    real_db(&d.join(HIDDEN_DB));
+    let id = fs::metadata(d.join(HIDDEN_DB)).unwrap().ino();
+    assert!(matches!(
+        overlay_db_entry(&d),
+        Ok(DbEntry::Present { marked: true, ref metadata }) if metadata.ino() == id
+    ));
+    let d = dir(false);
+    let target = root.join("target.sqlite");
+    real_db(&target);
+    symlink(&target, d.join(HIDDEN_DB)).unwrap();
+    let id = fs::metadata(&target).unwrap().ino();
+    assert!(matches!(
+        overlay_db_entry(&d),
+        Ok(DbEntry::Present { ref metadata, .. }) if metadata.ino() == id && metadata.is_file()
+    ));
+    let d = dir(true);
+    let empty = root.join("empty.sqlite");
+    fs::write(&empty, b"").unwrap();
+    symlink(&empty, d.join(HIDDEN_DB)).unwrap();
+    assert!(matches!(
+        overlay_db_entry(&d),
+        Ok(DbEntry::Lost { empty: true, .. })
+    ));
+    let d = dir(true);
+    symlink(root.join("nowhere"), d.join(HIDDEN_DB)).unwrap();
+    assert!(matches!(
+        overlay_db_entry(&d),
+        Ok(DbEntry::Lost { empty: false, .. })
+    ));
+    // Errors: unmarked dangling symlink, directory, FIFO, non-regular marker.
+    let d = dir(false);
+    symlink(root.join("nowhere"), d.join(HIDDEN_DB)).unwrap();
+    assert!(overlay_db_entry(&d).is_err());
+    assert!(!overlay_db_absent(&d));
+    for marked in [false, true] {
+        let d = dir(marked);
+        fs::create_dir(d.join(HIDDEN_DB)).unwrap();
+        assert!(overlay_db_entry(&d).is_err(), "directory, marked={marked}");
+        let d = dir(marked);
+        let c = std::ffi::CString::new(d.join(HIDDEN_DB).to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(overlay_db_entry(&d).is_err(), "FIFO, marked={marked}");
+    }
+    let d = dir(false);
+    fs::create_dir(d.join(OVERLAY_MARKER)).unwrap();
+    assert!(overlay_db_entry(&d).is_err(), "non-regular marker");
+    // Followed-stat errors: an error with its kind and the path, marked or
+    // not, and never absent.
+    for how in Unresolved::ALL {
+        for marked in [false, true] {
+            let d = dir(marked);
+            let Some(_seam) = how.plant(&d) else {
+                continue;
+            };
+            let error = match overlay_db_entry(&d) {
+                Err(crate::OverlayError::Io(e)) => e,
+                other => panic!("{how:?} marked={marked}: {other:?}"),
+            };
+            assert_eq!(error.kind(), how.kind(), "{how:?}: {error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&d.join(HIDDEN_DB).display().to_string()),
+                "{error}"
+            );
+            assert!(!overlay_db_absent(&d), "{how:?} marked={marked}");
+            how.cleanup(&d);
+        }
+    }
+}
+
+/// Leave `archive` with a stale prepare (`P`) locator and no journal: the
+/// crash came before the journal was written (or after it was removed).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stale_prepare(archive: &Path) {
+    use std::io::Write;
+    let len = fs::metadata(archive).unwrap().len();
+    let mut suffix = tempfile::tempfile().unwrap();
+    suffix.write_all(&[0u8; 1536]).unwrap();
+    let crashed = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+        archive,
+        len - 1024,
+        &mut suffix,
+        &mut |step| {
+            if step == "locator prepare" {
+                Err(std::io::Error::other("crash"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(crashed.is_err());
+    let _ = fs::remove_file(ratarmount_compress::commit_journal::journal_path(archive));
+    assert_eq!(locator(archive).get(4), Some(&b'P'), "stale P left");
+}
+
+/// The raw commit-journal locator xattr of `archive` (empty without one):
+/// CRC32 (4 bytes), the state byte, the journal path.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn locator(archive: &Path) -> Vec<u8> {
+    let mut buf = vec![0u8; 4096];
+    match rustix::fs::getxattr(archive, "user.ratarmount.commit-journal", &mut buf) {
+        Ok(n) => buf[..n].to_vec(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Regression (R10-B, #150, r9 Astra v4 #2): a marked overlay whose database
+/// is replaced by a symlink that cannot be resolved (`plain-file/missing.sqlite`
+/// gives `ENOTDIR`; also `EACCES`, `ELOOP`, injected `EIO`) next to an archive
+/// with a stale prepare locator and no journal. The followed-`stat` error was
+/// read as a present record, so recovery cleared the locator before anything
+/// refused. Every owner refuses under the lock now (the mount's top, a
+/// `--lower`-only mount, the offline path rows, the live mount's own
+/// connection), and the archive and its locator stay byte-identical.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_stale_prepare_locator_unresolved_target_is_kept() {
+    use ratarmount_compress::commit_journal::RecoverError;
+    for how in Unresolved::ALL {
+        for row in ["mount top", "lower only", "offline path", "live"] {
+            let fx = Fixture::new();
+            let live = fx.open(BaseDigestRequest::Compute, false);
+            let live = if row == "live" {
+                Some(live)
+            } else {
+                drop(live);
+                None
+            };
+            stale_prepare(&fx.archive);
+            let bytes = fs::read(&fx.archive).unwrap();
+            let before = locator(&fx.archive);
+            let Some(seam) = how.plant(&fx.overlay) else {
+                continue;
+            };
+            let db = fx.overlay.join(HIDDEN_DB);
+            let error = match row {
+                "mount top" => {
+                    let records = records_of(&fx);
+                    crate::recover_journal_at(
+                        &fx.archive,
+                        Some(&db),
+                        crate::Owner::Mount {
+                            records: &records,
+                            member: &fx.archive,
+                        },
+                    )
+                    .map(drop)
+                    .unwrap_err()
+                }
+                "lower only" => {
+                    let records = MountRecords {
+                        lowers: vec![fx.overlay.clone()],
+                        ..Default::default()
+                    };
+                    crate::recover_journal_at(
+                        &fx.archive,
+                        None,
+                        crate::Owner::Mount {
+                            records: &records,
+                            member: &fx.archive,
+                        },
+                    )
+                    .map(drop)
+                    .unwrap_err()
+                }
+                "offline path" => {
+                    crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Inode)
+                        .map(drop)
+                        .unwrap_err()
+                }
+                _ => {
+                    let error = live
+                        .as_ref()
+                        .unwrap()
+                        .recover_member_journal(&fx.archive)
+                        .unwrap_err();
+                    RecoverError::Refused(std::io::Error::other(error.to_string()))
+                }
+            };
+            assert!(
+                matches!(error, RecoverError::Refused(_)),
+                "{how:?} {row}: {error:?}"
+            );
+            drop(seam);
+            assert_eq!(locator(&fx.archive), before, "{how:?} {row}: locator kept");
+            assert_eq!(fs::read(&fx.archive).unwrap(), bytes, "{how:?} {row}");
+            assert!(
+                !ratarmount_compress::commit_journal::journal_path(&fx.archive).exists(),
+                "{how:?} {row}: no journal appears"
+            );
+            how.cleanup(&fx.overlay);
+        }
+    }
+}
+
+/// Regression (R10-B, v4 T7 live rows): a mounted overlay's own database
+/// replaced at its path by another database (a new inode), or removed while
+/// its marker stays, next to a stale prepare locator: the live recovery
+/// cleared the locator through the mount's connection without looking at the
+/// path. The guard compares the path with the inode the mount opened.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_live_recovery_refuses_a_replaced_or_lost_database() {
+    for replaced in [true, false] {
+        let fx = Fixture::new();
+        let ov = fx.open(BaseDigestRequest::Compute, false);
+        stale_prepare(&fx.archive);
+        let before = locator(&fx.archive);
+        let db = fx.overlay.join(HIDDEN_DB);
+        fs::rename(&db, fx.overlay.with_file_name("held.sqlite")).unwrap();
+        if replaced {
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute_batch("CREATE TABLE files (x)")
+                .unwrap();
+        }
+        let error = ov
+            .recover_member_journal(&fx.archive)
+            .unwrap_err()
+            .to_string();
+        let expect = if replaced {
+            "replaced while the overlay is mounted"
+        } else {
+            "missing or empty"
+        };
+        assert!(error.contains(expect), "replaced={replaced}: {error}");
+        assert_eq!(locator(&fx.archive), before, "replaced={replaced}");
+    }
+}
+
+/// Regression (R10-B, v4 T8/T13b): a complete journal of A's own commit is
+/// rolled forward, then the restamp finds the record lost after
+/// authorization: the database emptied, replaced by one without a `files`
+/// table (the plain-SQL check inside the restamp transaction), or removed
+/// with its marker. The restamp skipped (an empty record read as
+/// "unrecorded") and the journal was unlinked with the rows naming the
+/// pre-commit stamp. Now `Committed`, the journal is kept, and once the
+/// database is restored recovery finishes and the gate accepts.
+#[cfg(unix)]
+#[test]
+fn regression_restamp_refuses_when_the_record_vanishes_after_authorization() {
+    use ratarmount_compress::commit_journal::{PendingJournal, RecoverError};
+    for row in ["emptied", "no files table", "removed with marker"] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let db = fx.overlay.join(HIDDEN_DB);
+        let saved = fx.overlay.with_file_name("saved-db.sqlite");
+        fs::copy(&db, &saved).unwrap();
+        interrupt_complete(&fx.archive);
+        let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+        let records = records_of(&fx);
+        let archive = fx.archive.clone();
+        let overlay = fx.overlay.clone();
+        let db2 = db.clone();
+        let mut authorize = |h: &PendingJournal, m: &fs::Metadata| {
+            authorize_mount_recovery(&records, &archive, h, m)?;
+            match row {
+                "emptied" => fs::write(&db2, b"")?,
+                "no files table" => {
+                    fs::remove_file(&db2)?;
+                    rusqlite::Connection::open(&db2)
+                        .and_then(|c| c.execute_batch("CREATE TABLE other (x)"))
+                        .map_err(std::io::Error::other)?;
+                }
+                _ => {
+                    fs::remove_file(&db2)?;
+                    fs::remove_file(overlay.join(crate::OVERLAY_MARKER))?;
+                }
+            }
+            Ok(())
+        };
+        let error =
+            crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Test(&mut authorize))
+                .unwrap_err();
+        assert!(
+            matches!(error, RecoverError::Committed(_)),
+            "{row}: {error:?}"
+        );
+        assert!(journal.exists(), "{row}: journal kept");
+        assert!(
+            ratarmount_compress::commit_journal::pending(&fx.archive)
+                .unwrap()
+                .is_some_and(|j| j.complete),
+            "{row}"
+        );
+        let _ = fs::remove_file(&db);
+        fs::copy(&saved, &db).unwrap();
+        fs::write(fx.overlay.join(crate::OVERLAY_MARKER), b"").unwrap();
+        let applied = crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Inode)
+            .unwrap()
+            .expect("recovered");
+        assert!(applied.rolled_forward, "{row}");
+        assert!(!journal.exists(), "{row}");
+        assert_eq!(
+            stamp_rows(&fx.archive),
+            (
+                read_rows(&fx.overlay, &["base_size"])[0].clone(),
+                read_rows(&fx.overlay, &["base_mtime_ns"])[0].clone()
+            ),
+            "{row}: rows name the recovered archive"
+        );
+    }
+}
+
+/// Replace `overlay`'s database with another SQLite file that has no `files`
+/// table (the marker stays): the record of a used overlay is lost.
+#[cfg(unix)]
+fn replace_db_without_files(overlay: &Path) {
+    let db = overlay.join(HIDDEN_DB);
+    fs::remove_file(&db).unwrap();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("CREATE TABLE other (x); INSERT INTO other VALUES (1)")
+        .unwrap();
+    assert!(overlay.join(crate::OVERLAY_MARKER).is_file(), "marker kept");
+}
+
+/// Regression (R10-FIX1, r10 review B1 / skeptic #2, v4 T13a): a marked
+/// overlay whose database is replaced by a non-empty SQLite file without a
+/// `files` table read as an unrecorded overlay. With B (and its own torn or
+/// complete journal) renamed over A, the mount classified the journal `Own`
+/// and rolled B back before `WriteOverlay::open` refused; the offline gate
+/// accepted `Unrecorded` and recovery rewrote B; a stale `P` locator was
+/// cleared. The required-record reader refuses before any recovery write
+/// (mount top, `--lower`-only, offline `commit_overlay`): B, its journal and
+/// the locator stay byte-identical.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_marked_record_without_files_table_refuses_before_recovery() {
+    use ratarmount_compress::commit_journal::RecoverError;
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    for journal in ["torn", "complete", "stale P"] {
+        for row in ["mount top", "lower only", "offline commit"] {
+            let what = format!("{journal} / {row}");
+            let fx = Fixture::new();
+            drop(fx.open(BaseDigestRequest::Compute, false));
+            replace_db_without_files(&fx.overlay);
+            let kept = if journal == "stale P" {
+                stale_prepare(&fx.archive);
+                None
+            } else {
+                Some(rename_b_over_a(&fx, journal == "complete"))
+            };
+            let bytes = fs::read(&fx.archive).unwrap();
+            let before = locator(&fx.archive);
+            let db = fx.overlay.join(HIDDEN_DB);
+            let records = match row {
+                "lower only" => MountRecords {
+                    lowers: vec![fx.overlay.clone()],
+                    ..Default::default()
+                },
+                _ => records_of(&fx),
+            };
+            let error = match row {
+                "offline commit" => crate::commit_overlay(
+                    &fx.overlay,
+                    &fx.archive,
+                    &archive_token(&fx.archive),
+                    &opts,
+                )
+                .expect_err(&what)
+                .to_string(),
+                _ => {
+                    match classify_mount_journal(&records, &fx.archive).unwrap() {
+                        MountJournal::Deferred { why, .. } => {
+                            assert!(why.contains("no files table"), "{what}: {why}")
+                        }
+                        MountJournal::None if kept.is_none() => {}
+                        other => panic!("{what}: {other:?}"),
+                    }
+                    let top = (row == "mount top").then_some(db.as_path());
+                    let error = crate::recover_journal_at(
+                        &fx.archive,
+                        top,
+                        crate::Owner::Mount {
+                            records: &records,
+                            member: &fx.archive,
+                        },
+                    )
+                    .map(drop)
+                    .expect_err(&what);
+                    assert!(
+                        matches!(error, RecoverError::Refused(_)),
+                        "{what}: {error:?}"
+                    );
+                    error.to_string()
+                }
+            };
+            assert!(error.contains("no files table"), "{what}: {error}");
+            assert_eq!(fs::read(&fx.archive).unwrap(), bytes, "{what}: archive");
+            assert_eq!(locator(&fx.archive), before, "{what}: locator");
+            if let Some((_, journal_path, journal_bytes)) = &kept {
+                assert_eq!(
+                    &fs::read(journal_path).unwrap(),
+                    journal_bytes,
+                    "{what}: journal"
+                );
+            }
+        }
+    }
+}
+
+/// Regression (R10-FIX1, r10 skeptic #1): the database and the marker were
+/// both seen when recovery started, then both removed before the guard ran
+/// under the lock. `Rows::Path`'s guard accepted `Absent` despite its latched
+/// flags (only the restamp hook refused, after the rollback had written).
+/// The guard refuses before the first recovery write: the archive and its
+/// torn journal stay byte-identical.
+#[cfg(unix)]
+#[test]
+fn regression_rows_guard_refuses_a_record_removed_after_it_was_seen() {
+    use ratarmount_compress::commit_journal::RecoverError;
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    interrupt_append(&fx.archive);
+    let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+    let journal_bytes = fs::read(&journal).unwrap();
+    let bytes = fs::read(&fx.archive).unwrap();
+    let db = fx.overlay.join(HIDDEN_DB);
+    // Seen (the flags latch), then both removed before the locked guard.
+    let rows = crate::journal_recovery::Rows::path(&db);
+    fs::remove_file(&db).unwrap();
+    fs::remove_file(fx.overlay.join(crate::OVERLAY_MARKER)).unwrap();
+    let error = crate::journal_recovery::recover_journal(&fx.archive, rows, crate::Owner::Inode)
+        .map(drop)
+        .unwrap_err();
+    assert!(matches!(error, RecoverError::Refused(_)), "{error:?}");
+    assert!(error.to_string().contains("disappeared"), "{error}");
+    assert!(fs::read(&fx.archive).unwrap() == bytes, "no rollback");
+    assert!(fs::read(&journal).unwrap() == journal_bytes, "journal kept");
+}
+
+/// The four ways a used overlay's database is lost (its marker kept).
+#[cfg(unix)]
+const LOST_SHAPES: [&str; 4] = [
+    "deleted",
+    "0-byte",
+    "symlink to 0-byte",
+    "symlink to missing",
+];
+
+/// Lose `overlay`'s database in the way `shape` names.
+#[cfg(unix)]
+fn lose_db(overlay: &Path, shape: &str) {
+    let db = overlay.join(HIDDEN_DB);
+    fs::remove_file(&db).unwrap();
+    match shape {
+        "deleted" => {}
+        "0-byte" => fs::write(&db, b"").unwrap(),
+        "symlink to 0-byte" => {
+            let empty = overlay.with_file_name("empty.sqlite");
+            fs::write(&empty, b"").unwrap();
+            std::os::unix::fs::symlink(&empty, &db).unwrap();
+        }
+        _ => std::os::unix::fs::symlink(overlay.with_file_name("nowhere.sqlite"), &db).unwrap(),
+    }
+    assert!(overlay.join(crate::OVERLAY_MARKER).is_file(), "marker kept");
+}
+
+/// Regression (R10-FIX2, r10 review B2, v4 T5): a mount whose top or
+/// `--lower`-only record is lost (database deleted, 0-byte, a symlink to a
+/// 0-byte file or to nothing; marker kept) next to B renamed over A with its
+/// own torn or complete journal, or next to a stale prepare locator.
+/// `read_record` read a deleted or empty database as "no record", so the
+/// journal classified `Own` and was recovered; the stale locator was cleared.
+/// The classifier defers (or reports no journal for the stale locator), the
+/// locked recovery refuses, and B, its journal and the locator stay
+/// byte-identical.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_mount_lost_overlay_db_defers_recovery() {
+    use ratarmount_compress::commit_journal::RecoverError;
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for shape in LOST_SHAPES {
+        for journal in ["torn", "complete", "stale P"] {
+            for top in [true, false] {
+                let what = format!("{shape} / {journal} / top={top}");
+                let fx = Fixture::new();
+                drop(fx.open(BaseDigestRequest::Compute, false));
+                lose_db(&fx.overlay, shape);
+                let kept = if journal == "stale P" {
+                    stale_prepare(&fx.archive);
+                    None
+                } else {
+                    Some(rename_b_over_a(&fx, journal == "complete"))
+                };
+                let bytes = fs::read(&fx.archive).unwrap();
+                let before = locator(&fx.archive);
+                let records = if top {
+                    records_of(&fx)
+                } else {
+                    MountRecords {
+                        lowers: vec![fx.overlay.clone()],
+                        ..Default::default()
+                    }
+                };
+                let flag = if top {
+                    "--force-base-mismatch"
+                } else {
+                    "--force-stack-mismatch"
+                };
+                match classify_mount_journal(&records, &fx.archive).unwrap() {
+                    MountJournal::Deferred {
+                        why, force_flag, ..
+                    } => {
+                        assert_eq!(force_flag, flag, "{what}");
+                        assert!(why.contains("missing or empty"), "{what}: {why}");
+                    }
+                    MountJournal::None if kept.is_none() => {}
+                    other => panic!("{what}: {other:?}"),
+                }
+                let db = fx.overlay.join(HIDDEN_DB);
+                let error = crate::recover_journal_at(
+                    &fx.archive,
+                    top.then_some(db.as_path()),
+                    crate::Owner::Mount {
+                        records: &records,
+                        member: &fx.archive,
+                    },
+                )
+                .map(drop)
+                .expect_err(&what);
+                assert!(
+                    matches!(error, RecoverError::Refused(_)),
+                    "{what}: {error:?}"
+                );
+                assert!(
+                    error.to_string().contains("missing or empty"),
+                    "{what}: {error}"
+                );
+                assert!(fs::read(&fx.archive).unwrap() == bytes, "{what}: archive");
+                assert_eq!(locator(&fx.archive), before, "{what}: locator");
+                if let Some((_, path, journal_bytes)) = &kept {
+                    assert!(fs::read(path).unwrap() == *journal_bytes, "{what}: journal");
+                }
+            }
+        }
+    }
+}
+
+/// Regression (R10-FIX2, r10 review B2, v4 T7): the offline entry points with
+/// a lost record (the four shapes, marker kept). `commit_overlay` said "has no
+/// database" for a deleted one or read an empty one through the symlink;
+/// `commit_overlay_raw_dir` recovered B by inode and then refused;
+/// `recover_journal_at(.., Some(db), Owner::Inode)` rolled A's own torn
+/// journal back or cleared a stale prepare locator. Each refuses before any
+/// recovery write: the archive, its journal and the locator stay
+/// byte-identical.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_lost_record_refuses_before_recovery() {
+    use ratarmount_compress::commit_journal::RecoverError;
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let opts = CommitOverlayOptions {
+        yes: true,
+        ..Default::default()
+    };
+    for shape in LOST_SHAPES {
+        for row in [
+            "commit_overlay",
+            "commit_overlay_raw_dir",
+            "recover torn",
+            "recover stale P",
+        ] {
+            let what = format!("{shape} / {row}");
+            let fx = Fixture::new();
+            drop(fx.open(BaseDigestRequest::Compute, false));
+            lose_db(&fx.overlay, shape);
+            let journal = match row {
+                "recover torn" => {
+                    interrupt_append(&fx.archive);
+                    let path = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+                    let bytes = fs::read(&path).unwrap();
+                    Some((path, bytes))
+                }
+                "recover stale P" => {
+                    stale_prepare(&fx.archive);
+                    None
+                }
+                _ => {
+                    let (_, path, bytes) = rename_b_over_a(&fx, false);
+                    Some((path, bytes))
+                }
+            };
+            let bytes = fs::read(&fx.archive).unwrap();
+            let before = locator(&fx.archive);
+            let db = fx.overlay.join(HIDDEN_DB);
+            let error = match row {
+                "commit_overlay" => crate::commit_overlay(
+                    &fx.overlay,
+                    &fx.archive,
+                    &archive_token(&fx.archive),
+                    &opts,
+                )
+                .expect_err(&what)
+                .to_string(),
+                "commit_overlay_raw_dir" => {
+                    crate::commit_overlay_raw_dir(&fx.overlay, &fx.archive, &opts)
+                        .map(drop)
+                        .expect_err(&what)
+                        .to_string()
+                }
+                _ => {
+                    let error =
+                        crate::recover_journal_at(&fx.archive, Some(&db), crate::Owner::Inode)
+                            .map(drop)
+                            .expect_err(&what);
+                    assert!(
+                        matches!(error, RecoverError::Refused(_)),
+                        "{what}: {error:?}"
+                    );
+                    error.to_string()
+                }
+            };
+            assert!(error.contains("missing or empty"), "{what}: {error}");
+            assert!(fs::read(&fx.archive).unwrap() == bytes, "{what}: archive");
+            assert_eq!(locator(&fx.archive), before, "{what}: locator");
+            if let Some((path, journal_bytes)) = &journal {
+                assert!(fs::read(path).unwrap() == *journal_bytes, "{what}: journal");
+            }
+        }
+    }
+}
+
+// ---- R10-C (#148): payload opens of another name of an open database ------
+
+/// The overlay call was refused with `PermissionDenied` (an admission
+/// refusal), not some other error.
+#[cfg(unix)]
+fn denied<T: std::fmt::Debug>(result: crate::write_overlay::Result<T>) -> bool {
+    matches!(
+        result,
+        Err(crate::OverlayError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied
+    )
+}
+
+/// A hard link of `db` named `name` in the overlay root `dir`.
+#[cfg(unix)]
+fn link_db(db: &Path, dir: &Path, name: &str) -> PathBuf {
+    let alias = dir.join(name);
+    fs::hard_link(db, &alias).unwrap();
+    alias
+}
+
+/// Regression (R10-C, #148, r20 skeptic #1): the overlay database hard-linked
+/// under a payload name. FUSE/NFS-style `open_overlay_fd` and
+/// `MountSource::open` opened an unmanaged descriptor of the database inode
+/// and closed it after the read, releasing every fcntl lock this process held
+/// on it while SQLite still believed it held EXCLUSIVE: another process could
+/// then write beneath the mount. Both refuse with EACCES; a child's
+/// `BEGIN IMMEDIATE` is still busy afterwards and the holder still writes.
+#[cfg(unix)]
+#[test]
+fn regression_payload_db_alias_preserves_process_locks() {
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    let db = fx.overlay.join(HIDDEN_DB);
+    link_db(&db, &fx.overlay, "payload");
+    fs::write(fx.overlay.join("plain"), b"plain bytes").unwrap();
+    let error = ov.open_overlay_fd("/payload", libc::O_RDONLY).unwrap_err();
+    assert!(
+        error.to_string().contains("open overlay database"),
+        "{error}"
+    );
+    let fi = ov.lookup("/payload", 0).expect("payload listed");
+    let error = ov.open(&fi, 0).map(drop).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{error}"
+    );
+    // An ordinary payload still opens, reads and closes.
+    let fi = ov.lookup("/plain", 0).expect("plain");
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut ov.open(&fi, 0).unwrap(), &mut bytes).unwrap();
+    assert_eq!(bytes, b"plain bytes");
+    let fd = ov.open_overlay_fd("/plain", libc::O_RDONLY).unwrap();
+    ov.close_overlay_fd(fd);
+    assert!(
+        crate::overlay_db::lock_probe_is_busy(&db),
+        "another process must still see the mount's lock"
+    );
+    ov.set_meta("r10_probe", "still writes").unwrap();
+    assert!(crate::overlay_db::lock_probe_is_busy(&db));
+    // The probe itself: without the mount, the child takes the lock.
+    drop(ov);
+    assert!(!crate::overlay_db::lock_probe_is_busy(&db));
+}
+
+/// Regression (R10-C, #148): no write path truncates or changes the
+/// database through an alias: create over it, a writable `O_TRUNC` open, a
+/// read-only `O_TRUNC` open and an explicit truncate are refused; the
+/// database keeps its size (a `stat`, never a read: a read in this process
+/// would itself close a descriptor) and its lock.
+#[cfg(unix)]
+#[test]
+fn regression_payload_db_alias_write_never_truncates() {
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    let db = fx.overlay.join(HIDDEN_DB);
+    link_db(&db, &fx.overlay, "payload");
+    let size = fs::metadata(&db).unwrap().len();
+    assert!(size > 0);
+    assert!(denied(ov.create_file("/payload", 0o644)), "create over");
+    for flags in [
+        libc::O_WRONLY | libc::O_TRUNC,
+        libc::O_RDWR,
+        libc::O_RDONLY | libc::O_TRUNC,
+    ] {
+        assert!(
+            denied(ov.open_overlay_fd("/payload", flags)),
+            "{flags:#x} refused"
+        );
+    }
+    assert!(denied(ov.truncate("/payload", 0)), "truncate");
+    assert_eq!(fs::metadata(&db).unwrap().len(), size, "database unchanged");
+    assert!(crate::overlay_db::lock_probe_is_busy(&db));
+    ov.set_meta("r10_probe", "still writes").unwrap();
+}
+
+/// Regression (R10-C, #148): a payload of overlay A that is a hard link of
+/// overlay B's database (B mounted in the same process, holding its lock) is
+/// refused through A, naming B's database; B keeps its lock.
+#[cfg(unix)]
+#[test]
+fn regression_payload_alias_other_overlay() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let ov_a = a.open(BaseDigestRequest::Compute, false);
+    let ov_b = b.open(BaseDigestRequest::Compute, false);
+    let b_db = b.overlay.join(HIDDEN_DB);
+    link_db(&b_db, &a.overlay, "theirs");
+    let error = ov_a.open_overlay_fd("/theirs", libc::O_RDONLY).unwrap_err();
+    assert!(
+        error.to_string().contains(&b_db.display().to_string()),
+        "names B's database: {error}"
+    );
+    let fi = ov_a.lookup("/theirs", 0).expect("listed");
+    assert_eq!(
+        ov_a.open(&fi, 0).map(drop).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert!(crate::overlay_db::lock_probe_is_busy(&b_db));
+    ov_b.set_meta("r10_probe", "still writes").unwrap();
+    // Once B is unmounted, the name is an ordinary file of A.
+    drop(ov_b);
+    let fd = ov_a.open_overlay_fd("/theirs", libc::O_RDONLY).unwrap();
+    ov_a.close_overlay_fd(fd);
+}
+
+/// Regression (R10-FIX3, r10 skeptic #5): the commit-journal name of a
+/// member is a hard link of the mount's open database. `pending()` (reached
+/// by live recovery before the guard) and the rollback's journal read opened
+/// it, rejected the header and closed the descriptor, releasing the mount's
+/// locks. Both refuse with `PermissionDenied` now; another process is still
+/// busy and the holder still writes.
+#[cfg(unix)]
+#[test]
+fn regression_journal_reads_refuse_a_db_alias() {
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    let db = fx.overlay.join(HIDDEN_DB);
+    let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+    fs::hard_link(&db, &journal).unwrap();
+    let error = ratarmount_compress::commit_journal::pending(&fx.archive).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{error}"
+    );
+    assert!(ov.recover_member_journal(&fx.archive).is_err());
+    assert!(
+        crate::overlay_db::lock_probe_is_busy(&db),
+        "a journal read released the mount's lock"
+    );
+    ov.set_meta("r10_probe", "still writes").unwrap();
+    assert!(crate::overlay_db::lock_probe_is_busy(&db));
+}
+
+/// Regression (R10-FIX3, r10 skeptic #4): a commit writing the provenance
+/// manifest read the previous `<archive>.manifest.jsonl` through a plain
+/// open. When that name is a hard link of another overlay's open database
+/// (B, mounted in this process), the close after the (failed) parse released
+/// B's locks. The read is admitted: refused with `PermissionDenied`, B's
+/// lock survives and B still writes.
+#[cfg(unix)]
+#[test]
+fn regression_manifest_read_refuses_a_db_alias() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    drop(a.open(BaseDigestRequest::Compute, false));
+    fs::write(a.overlay.join("new"), b"new member").unwrap();
+    let ov_b = b.open(BaseDigestRequest::Compute, false);
+    let b_db = b.overlay.join(HIDDEN_DB);
+    let mut manifest = a.archive.as_os_str().to_os_string();
+    manifest.push(crate::base_sidecars::MANIFEST_SIDECAR_SUFFIX);
+    fs::hard_link(&b_db, PathBuf::from(&manifest)).unwrap();
+    let opts = CommitOverlayOptions {
+        yes: true,
+        manifest_hashes: Some("all".into()),
+        ..Default::default()
+    };
+    let error = crate::commit_overlay(&a.overlay, &a.archive, &archive_token(&a.archive), &opts)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("open overlay database"), "{error}");
+    assert!(
+        crate::overlay_db::lock_probe_is_busy(&b_db),
+        "the manifest read released B's lock"
+    );
+    ov_b.set_meta("r10_probe", "still writes").unwrap();
+}
+
+// ---- R10-D: the inode registry is never held across an open --------------
+
+/// Regression (R10-D, Fable r10 blocker 2): a FIFO planted under a payload
+/// name blocks its opener in `open(2)` (FUSE has always given that request
+/// thread to the FIFO). The database-inode registry must not be held across
+/// that open: while one thread is blocked opening the FIFO through
+/// `open_overlay_fd`, another thread's overlay-database open (which
+/// registers its inode) and an admitted payload open still return at once.
+#[cfg(unix)]
+#[test]
+fn regression_fifo_payload_does_not_stall_db_opens() {
+    use std::time::{Duration, Instant};
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    let fifo = fx.overlay.join("fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    fs::write(fx.overlay.join("plain"), b"plain").unwrap();
+    let other = Fixture::new();
+    drop(other.open(BaseDigestRequest::Compute, false));
+    let other_db = other.overlay.join(HIDDEN_DB);
+    std::thread::scope(|scope| {
+        let (started, blocked) = std::sync::mpsc::channel();
+        let ov = &ov;
+        let reader = scope.spawn(move || {
+            started.send(()).unwrap();
+            ov.open_overlay_fd("/fifo", libc::O_RDONLY)
+        });
+        blocked.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!reader.is_finished(), "the FIFO open blocks until a writer");
+        // The opens under test run on a helper thread with a watchdog: a
+        // regression fails the test instead of hanging it (on timeout a
+        // writer releases the FIFO reader first, so the scope can join).
+        let (done, finished) = std::sync::mpsc::channel();
+        let other_db = &other_db;
+        let helper = scope.spawn(move || {
+            let start = Instant::now();
+            let conn = crate::open_overlay_db(
+                other_db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                crate::DbName::Path,
+            )
+            .unwrap();
+            let fd = ov.open_overlay_fd("/plain", libc::O_RDONLY).unwrap();
+            ov.close_overlay_fd(fd);
+            drop(conn);
+            let _ = done.send(start.elapsed());
+        });
+        let waited = finished.recv_timeout(Duration::from_secs(5));
+        // Unblock the reader: a writer appears.
+        let writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        let fd = reader
+            .join()
+            .unwrap()
+            .expect("FIFO opened once a writer came");
+        ov.close_overlay_fd(fd);
+        drop(writer);
+        helper.join().unwrap();
+        let elapsed = waited.expect("database and payload opens waited on the blocked FIFO open");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    });
+}
+
+/// Regression (R10-FIX6, r10 skeptic #1): the required-record reader checked
+/// `files` and read `meta` as two autocommit reads. Another connection that
+/// committed `DROP TABLE files; DROP TABLE meta` between them made a lost
+/// record read as "unrecorded" (`Ok(None)`), so the offline gate passed a
+/// base that no longer matches the record. Both reads are now one read
+/// transaction: the concurrent DROP cannot commit while it is open, and the
+/// gate judges the record it found (the changed base is refused).
+#[test]
+fn regression_required_record_read_is_one_snapshot() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    write_tar(
+        &fx.archive,
+        &[("first", b"first member"), ("second", b"the base changed")],
+    );
+    let db = fx.overlay.join(HIDDEN_DB);
+    let arm = |dropped: Rc<Cell<Option<bool>>>| {
+        let db = db.clone();
+        crate::overlay_meta::BETWEEN_REQUIRED_READS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let other = rusqlite::Connection::open(&db).unwrap();
+                other.busy_timeout(std::time::Duration::ZERO).unwrap();
+                let committed = other
+                    .execute_batch("BEGIN IMMEDIATE; DROP TABLE files; DROP TABLE meta; COMMIT")
+                    .is_ok();
+                dropped.set(Some(committed));
+            }))
+        });
+    };
+    // The offline gate (an autocommit connection of its own).
+    let dropped = Rc::new(Cell::new(None));
+    arm(dropped.clone());
+    let refusal = crate::overlay_gate::check_commit_base_offline(
+        &fx.overlay,
+        &archive_token(&fx.archive),
+        &fx.archive,
+    )
+    .expect_err("the gate judged the record it read");
+    assert!(refusal.0.contains("base mismatch"), "{}", refusal.0);
+    // The overlay database uses the rollback (DELETE) journal: the reader's
+    // shared lock makes the writer's COMMIT busy. (Under WAL the DROP would
+    // commit and the reader would still see its snapshot.)
+    assert_eq!(dropped.get(), Some(false), "the DROP committed mid-read");
+    // The reader itself, on an autocommit connection.
+    let dropped = Rc::new(Cell::new(None));
+    arm(dropped.clone());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let meta = crate::OverlayMeta::from_connection_required(&conn, true)
+        .unwrap()
+        .expect("one snapshot: the record is there");
+    assert!(meta.get("base_size").is_some());
+    assert_eq!(dropped.get(), Some(false), "the DROP committed mid-read");
+    assert!(conn.is_autocommit(), "the reader's transaction ended");
+    // Inside a caller's transaction the reader opens none of its own.
+    let tx = conn.unchecked_transaction().unwrap();
+    assert!(crate::OverlayMeta::from_connection_required(&tx, true)
+        .unwrap()
+        .is_some());
+    drop(tx);
+    // Control: without a reader the DROP commits.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE files; DROP TABLE meta")
+        .unwrap();
+}
+
+/// Regression (R10-FIX7, r10 skeptic #2): offline recovery read its record
+/// with the mount's strict rule, which refuses a database entry that is a
+/// symlink, although the offline gate (and the classifier) accept a symlink
+/// to a regular database file. An offline commit of such an overlay next to a
+/// stale prepare locator was refused. The offline owner now reads the record
+/// through the symlink: the stale locator is cleared and the commit goes on;
+/// a mount's records keep the strict rule (it still defers).
+#[cfg(unix)]
+#[test]
+fn regression_offline_recovery_follows_a_symlinked_database() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let db = fx.overlay.join(HIDDEN_DB);
+    let elsewhere = fx.overlay.parent().unwrap().join("db-elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let target = elsewhere.join("overlay.sqlite");
+    fs::rename(&db, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &db).unwrap();
+    stale_prepare(&fx.archive);
+    assert!(!locator(&fx.archive).is_empty(), "a stale locator");
+    // A mount's records keep the strict rule.
+    let records = records_of(&fx);
+    match classify_mount_journal(&records, &fx.archive).unwrap() {
+        MountJournal::None => {}
+        other => panic!("no journal is pending: {other:?}"),
+    }
+    let rows = || {
+        let conn = rusqlite::Connection::open(&target).unwrap();
+        OverlayMeta::from_connection(&conn)
+            .unwrap()
+            .unwrap()
+            .values()
+            .clone()
+    };
+    let before = rows();
+    crate::commit_overlay(
+        &fx.overlay,
+        &fx.archive,
+        &archive_token(&fx.archive),
+        &CommitOverlayOptions {
+            yes: true,
+            ..Default::default()
+        },
+    )
+    .expect("the offline commit reads its record through the symlink");
+    assert!(
+        locator(&fx.archive).is_empty(),
+        "the stale locator is cleared"
+    );
+    assert!(
+        fs::symlink_metadata(&db).unwrap().file_type().is_symlink(),
+        "the database entry is still the symlink"
+    );
+    assert_eq!(rows(), before, "the record is unchanged");
+    crate::overlay_gate::check_commit_base_offline(
+        &fx.overlay,
+        &archive_token(&fx.archive),
+        &fx.archive,
+    )
+    .unwrap();
+}
+
+/// Run an offline `commit_overlay` of `fx` on a thread of its own (the seams
+/// are thread-local). Right before offline recovery, `inside` makes the
+/// archive need recovery (a journal started on another state, R7-F1
+/// "inside") and arms `arm`'s seams; it returns the archive and journal bytes
+/// recovery must leave alone and the commit's result.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn offline_commit_with_recovery_seams(
+    fx: &Fixture,
+    arm: impl FnOnce() + Send + 'static,
+) -> (ArchiveAndJournal, Result<String, String>) {
+    use std::sync::{Arc, Mutex};
+    let expected: Arc<Mutex<Option<ArchiveAndJournal>>> = Arc::default();
+    let (overlay, archive, seen) = (fx.overlay.clone(), fx.archive.clone(), expected.clone());
+    let result = std::thread::spawn(move || {
+        let token = archive_token(&archive);
+        let hook_archive = archive.clone();
+        crate::write_overlay::BEFORE_OFFLINE_RECOVERY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                use std::io::Write;
+                fs::File::options()
+                    .append(true)
+                    .open(&hook_archive)
+                    .unwrap()
+                    .write_all(&[0u8; 512])
+                    .unwrap();
+                interrupt_append(&hook_archive);
+                let journal = ratarmount_compress::commit_journal::journal_path(&hook_archive);
+                *seen.lock().unwrap() =
+                    Some((fs::read(&hook_archive).unwrap(), fs::read(journal).unwrap()));
+                arm();
+            }));
+        });
+        let opts = CommitOverlayOptions {
+            yes: true,
+            ..Default::default()
+        };
+        let result = crate::commit_overlay(&overlay, &archive, &token, &opts)
+            .map(|done| done.to_string())
+            .map_err(|e| e.to_string());
+        crate::overlay_db::AFTER_CLASSIFY.with(|hook| *hook.borrow_mut() = None);
+        crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
+        result
+    })
+    .join()
+    .unwrap();
+    let expected = expected.lock().unwrap().clone().expect("recovery seam ran");
+    (expected, result)
+}
+
+/// Regression (#151, r9 T1 at the locked owner gate): under the archive lock,
+/// the overlay database A is swapped to X (an unrecorded overlay record: a
+/// `files` table, no `meta`) after the gate's classification and back right
+/// after SQLite's real `open`. A pathname look before or after SQLite's open
+/// saw A, and the gate read X: "unrecorded", accepted, and recovery rolled
+/// the archive's journal (one this overlay never started) back. The checked
+/// acquisition refuses SQLite's descriptor of X: the archive, its journal and
+/// its locator are unchanged.
+// The acquisition seams exist only where the wrappers are installed.
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+))]
+#[test]
+fn regression_offline_gate_refuses_swap_inside_sqlite_open() {
+    use ratarmount_index::checked_open::test_seams::{Seam, Seams};
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    let ov = fx.open(BaseDigestRequest::Compute, false);
+    fs::write(ov.root().join("new"), b"new").unwrap();
+    drop(ov);
+    let db = fx.overlay.join(HIDDEN_DB);
+    let x = fx.overlay.with_file_name("x.sqlite");
+    let saved = fx.overlay.with_file_name("a.saved");
+    rusqlite::Connection::open(&x)
+        .unwrap()
+        .execute_batch("CREATE TABLE files (path, name, mtime, mode, uid, gid, deleted)")
+        .unwrap();
+    let a_id = crate::overlay_db::file_id(&fs::metadata(&db).unwrap());
+    let swaps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (s_db, s_x, s_saved, s_swaps) = (db.clone(), x.clone(), saved.clone(), swaps.clone());
+    let ((bytes, journal_bytes), result) = offline_commit_with_recovery_seams(&fx, move || {
+        let (c_db, c_x, c_saved) = (s_db.clone(), s_x.clone(), s_saved.clone());
+        crate::overlay_db::AFTER_CLASSIFY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+                if path == c_db && !c_saved.exists() {
+                    fs::rename(&c_db, &c_saved).unwrap();
+                    fs::rename(&c_x, &c_db).unwrap();
+                    s_swaps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }))
+        });
+        let restore = Seams::set(move |seam| {
+            if seam == Seam::AfterRealOpen && s_saved.exists() {
+                fs::rename(&s_db, &s_x).unwrap();
+                fs::rename(&s_saved, &s_db).unwrap();
+            }
+        });
+        // The seams live for the rest of the committing thread.
+        std::mem::forget(restore);
+    });
+    // Refused before any `open` (another test's connection made SQLite's
+    // reuse-selection `stat` see X first): restore A here.
+    if saved.exists() {
+        fs::rename(&db, &x).unwrap();
+        fs::rename(&saved, &db).unwrap();
+    }
+    assert!(
+        swaps.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "swapped"
+    );
+    let error = result.expect_err("the swapped record must refuse");
+    assert!(error.contains("another file"), "{error}");
+    assert_eq!(
+        crate::overlay_db::file_id(&fs::metadata(&db).unwrap()),
+        a_id
+    );
+    assert_eq!(fs::read(&fx.archive).unwrap(), bytes, "archive");
+    let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+    assert_eq!(fs::read(journal).unwrap(), journal_bytes, "journal");
+    assert!(!locator(&fx.archive).is_empty(), "locator kept");
+}
+
+/// Remove `overlay`'s markers and drop its record's tables (`drop`) or empty
+/// the database file `db` in place (`truncate`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mutate_record_and_markers(overlay: &Path, db: &Path, row: &str) {
+    for marker in crate::write_overlay::overlay_markers(overlay).unwrap() {
+        fs::remove_file(marker).unwrap();
+    }
+    if row == "drop" {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .execute_batch("DROP TABLE files; DROP TABLE meta")
+            .unwrap();
+    } else {
+        fs::File::options()
+            .write(true)
+            .open(db)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+    }
+}
+
+/// Regression (#151, #155): the record is mutated AFTER the acquisition and
+/// before its required snapshot read, together with the overlay's markers
+/// (`drop`: its tables are dropped; `truncate`: the same inode is emptied).
+/// The offline gate looked the markers up after its open and read an
+/// unmarked, table-less (or empty) database as "unrecorded" (accepted; this
+/// half fails without the latch). In a whole commit, recovery's own earlier
+/// observations refuse too (an inherited r10 pin: it passed before #151). The
+/// requirement latched at the classification survives: refused (no `files`
+/// table, or SQLite's corruption/I/O error), never an unrecorded success,
+/// with the archive and its journal unchanged.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_required_record_after_acquisition_keeps_journal() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for row in ["drop", "truncate"] {
+        // The offline gate alone: its own acquisition latched the marker.
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let overlay = fx.overlay.clone();
+        let mut done = false;
+        crate::overlay_db::AFTER_ACQUIRE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+                if !std::mem::replace(&mut done, true) {
+                    mutate_record_and_markers(&overlay, path, row);
+                }
+            }))
+        });
+        let gate = crate::overlay_gate::check_commit_base_offline(
+            &fx.overlay,
+            &archive_token(&fx.archive),
+            &fx.archive,
+        );
+        crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
+        let error = gate.expect_err(row).0;
+        assert!(
+            error.contains(crate::overlay_meta::NO_FILES_TABLE)
+                || error.contains("malformed")
+                || error.contains("not a database"),
+            "{row}: gate: {error}"
+        );
+
+        // A whole offline commit, mutated at the first open under recovery.
+        let fx = Fixture::new();
+        let ov = fx.open(BaseDigestRequest::Compute, false);
+        fs::write(ov.root().join("new"), b"new").unwrap();
+        drop(ov);
+        let overlay = fx.overlay.clone();
+        let ((bytes, journal_bytes), result) = offline_commit_with_recovery_seams(&fx, move || {
+            let mut done = false;
+            crate::overlay_db::AFTER_ACQUIRE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+                    if done || path != overlay.join(HIDDEN_DB) {
+                        return;
+                    }
+                    done = true;
+                    mutate_record_and_markers(&overlay, path, row);
+                }))
+            });
+        });
+        let error = result.expect_err(row);
+        assert!(
+            error.contains(crate::overlay_meta::NO_FILES_TABLE)
+                || error.contains("malformed")
+                || error.contains("not a database")
+                || error.contains("disk I/O"),
+            "{row}: {error}"
+        );
+        assert_eq!(fs::read(&fx.archive).unwrap(), bytes, "{row}: archive");
+        let journal = ratarmount_compress::commit_journal::journal_path(&fx.archive);
+        assert_eq!(fs::read(journal).unwrap(), journal_bytes, "{row}: journal");
+    }
+}
+
+/// Regression (#151, r9 v3 #3): a required observation is a latch. The
+/// recovery rows saw the overlay marked; the marker is then removed and the
+/// database emptied (same inode) or left without its `files` table. The rows'
+/// later acquisition still requires a non-empty record with a `files` table:
+/// the empty one is refused by the acquisition itself (the hook never runs),
+/// the table-less one reaches the hook only as required; a reader given the
+/// earlier requirement refuses both (an open given it refuses the empty one
+/// and latches the requirement for the table-less one), and a missing record
+/// is not created.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_required_marker_observation_is_monotonic() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for row in ["empty", "no files table", "missing"] {
+        let fx = Fixture::new();
+        drop(fx.open(BaseDigestRequest::Compute, false));
+        let db = fx.overlay.join(HIDDEN_DB);
+        let rows = crate::journal_recovery::Rows::path(&db);
+        for marker in crate::write_overlay::overlay_markers(&fx.overlay).unwrap() {
+            fs::remove_file(marker).unwrap();
+        }
+        match row {
+            "empty" => fs::File::options()
+                .write(true)
+                .open(&db)
+                .unwrap()
+                .set_len(0)
+                .unwrap(),
+            "no files table" => rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute_batch("DROP TABLE files")
+                .unwrap(),
+            _ => fs::remove_file(&db).unwrap(),
+        }
+        let mut seen = None;
+        let result = rows.with(|conn, required| {
+            seen = Some(required);
+            if required && !crate::overlay_meta::has_files_table(conn).unwrap() {
+                return Err(std::io::Error::other("required record without files"));
+            }
+            Ok(())
+        });
+        assert!(result.is_err(), "{row}: accepted");
+        match row {
+            "no files table" => assert_eq!(seen, Some(true), "{row}"),
+            _ => assert_eq!(seen, None, "{row}: the hook ran"),
+        }
+        let read = OverlayMeta::read_no_recovery_required(&fx.overlay, true);
+        assert!(read.is_err(), "{row}: {read:?}");
+        let open = crate::overlay_db::open_overlay_db_required(
+            &db,
+            rusqlite::OpenFlags::default(),
+            crate::DbName::Path,
+            true,
+        );
+        match open {
+            // The open itself does not read tables; the latch reaches the
+            // reader.
+            Ok(opened) if row == "no files table" => {
+                assert!(opened.required_record());
+                assert!(OverlayMeta::from_opened(&opened).is_err(), "{row}");
+            }
+            Ok(_) => panic!("{row}: opened"),
+            Err(_) => {}
+        }
+        assert_eq!(db.exists(), row != "missing", "{row}: nothing created");
+    }
 }

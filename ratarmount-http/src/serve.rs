@@ -155,6 +155,7 @@ fn serve_listener(
         locks: std::sync::Mutex::new(LockTable::default()),
         basic,
         index_sidecar: opts.index_sidecar.clone(),
+        sidecar: sidecar_admission(opts.index_sidecar.as_deref()),
     });
     match &opts.stop {
         None => {
@@ -180,6 +181,26 @@ fn serve_listener(
                 }
             }
         }
+    }
+}
+
+#[cfg(not(test))]
+fn sidecar_admission(_: Option<&std::path::Path>) -> crate::handler::SidecarAdmission {
+    crate::handler::SidecarAdmission::default()
+}
+
+/// Tests register a sidecar admission (hook, write timeout) by sidecar path.
+#[cfg(test)]
+pub(crate) static TEST_SIDECAR_ADMISSION: std::sync::Mutex<
+    Vec<(PathBuf, crate::handler::SidecarAdmission)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn sidecar_admission(path: Option<&std::path::Path>) -> crate::handler::SidecarAdmission {
+    let mut reg = TEST_SIDECAR_ADMISSION.lock().unwrap();
+    match reg.iter().position(|(p, _)| Some(p.as_path()) == path) {
+        Some(i) => reg.remove(i).1,
+        None => crate::handler::SidecarAdmission::default(),
     }
 }
 

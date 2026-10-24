@@ -1049,6 +1049,7 @@ fn http_state_debug_redacts_password() {
         locks: Mutex::new(crate::webdav::LockTable::default()),
         basic: Some(("u".into(), "secret-pass".into())),
         index_sidecar: None,
+        sidecar: Default::default(),
     };
     let d = format!("{st:?}");
     assert!(!d.contains("secret-pass"), "{d}");
@@ -1057,8 +1058,14 @@ fn http_state_debug_redacts_password() {
 
 /// Regression: HTTP GET of the sidecar is Content-Type `INDEX_MEDIA_TYPE`,
 /// not a FUSE control file, and `--http` still serves the indexed tree.
+/// Every test that serves the index sidecar (managed reads, process-wide
+/// `XOPEN_CALLS`) holds this, so the admission test's open count is not
+/// moved by another test's reads.
+static SIDECAR_SERIAL: Mutex<()> = Mutex::new(());
+
 #[test]
 fn index_content_type() {
+    let _g = SIDECAR_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let td = tempfile::tempdir().expect("sidecar tempdir");
     let sidecar = td.path().join("archive.tar.index.sqlite");
     let blob = b"SQLite format 3\0portable-index-bytes";
@@ -1120,4 +1127,563 @@ fn index_sidecar_missing_is_404() {
         status_line(&head).starts_with("HTTP/1.1 404"),
         ":memory: / no sidecar: {head}"
     );
+}
+
+/// R11-S7 (#151): the index sidecar endpoint reads through managed readers
+/// under an eight-reader admission.
+#[cfg(unix)]
+mod sidecar_s7 {
+    use super::*;
+    use crate::handler::{SidecarAdmission, SidecarStage, INDEX_SIDECAR_READERS};
+    use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+    use ratarmount_index::managed_read::XOPEN_CALLS;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Condvar;
+    use std::time::Instant;
+
+    /// The sidecar tests count the process-wide managed opens.
+    use super::SIDECAR_SERIAL as SERIAL;
+
+    struct Srv {
+        handle: Option<ExportServerHandle>,
+        stop: ExportStop,
+        addr: SocketAddr,
+    }
+
+    impl Drop for Srv {
+        fn drop(&mut self) {
+            self.stop.request_stop();
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn serve(sidecar: &Path, adm: SidecarAdmission) -> Srv {
+        crate::serve::TEST_SIDECAR_ADMISSION
+            .lock()
+            .unwrap()
+            .push((sidecar.to_path_buf(), adm));
+        let stop = ExportStop::new();
+        let opts = HttpOptions {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            stop: Some(stop.clone()),
+            index_sidecar: Some(sidecar.to_path_buf()),
+            ..HttpOptions::default()
+        };
+        let handle = spawn_http_thread(Arc::new(MemFs::fixture()), opts).expect("bind HTTP");
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, handle.port));
+        Srv {
+            handle: Some(handle),
+            stop,
+            addr,
+        }
+    }
+
+    fn admission(
+        hook: impl Fn(SidecarStage) -> io::Result<()> + Send + Sync + 'static,
+    ) -> SidecarAdmission {
+        SidecarAdmission {
+            hook: Some(Arc::new(hook)),
+            ..SidecarAdmission::default()
+        }
+    }
+
+    /// A WAL index of about `rows` x 100 KiB, checkpointed into the main file.
+    fn wal_index(path: &Path, rows: usize) -> Vec<u8> {
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.pragma_update(None, "journal_mode", "WAL").unwrap();
+        c.execute_batch("CREATE TABLE t(x BLOB)").unwrap();
+        for _ in 0..rows {
+            c.execute("INSERT INTO t VALUES (randomblob(100000))", [])
+                .unwrap();
+        }
+        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(c);
+        std::fs::read(path).unwrap()
+    }
+
+    /// A connection holding SHARED for its life (WAL keeps the main-file
+    /// lock; an open read transaction pins it).
+    fn holder(path: &Path) -> rusqlite::Connection {
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute_batch("BEGIN").unwrap();
+        let _: i64 = c
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        c
+    }
+
+    const GET: &str = "GET /.ratarmount-control/index.sqlite HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const HEAD: &str = "HEAD /.ratarmount-control/index.sqlite HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    fn range(a: u64, b: u64) -> String {
+        format!(
+            "GET /.ratarmount-control/index.sqlite HTTP/1.1\r\nHost: localhost\r\nRange: bytes={a}-{b}\r\n\r\n"
+        )
+    }
+
+    fn exchange(addr: SocketAddr, req: &str) -> Vec<u8> {
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        out
+    }
+
+    fn status(raw: &[u8]) -> u16 {
+        let (head, _) = split_head_body(raw);
+        status_line(&head)[9..12].parse().unwrap()
+    }
+
+    /// Descriptors of this process open on `path` (Linux: /proc/self/fd).
+    fn fds_on(path: &Path) -> usize {
+        let want = path.canonicalize().unwrap();
+        std::fs::read_dir("/proc/self/fd")
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| std::fs::read_link(e.path()).ok().as_deref() == Some(&want))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Descriptors of this process that the server on `port` owns: sockets
+    /// on that port (listener and accepted connections, from
+    /// /proc/net/tcp{,6}) plus descriptors on `path` (Linux only). Other
+    /// tests of this binary run concurrently, so the whole-process count is
+    /// no oracle; this one is.
+    fn server_fds(port: u16, path: &Path) -> usize {
+        let mut inodes = std::collections::HashSet::new();
+        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            let Ok(text) = std::fs::read_to_string(table) else {
+                continue;
+            };
+            for line in text.lines().skip(1) {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                let port_of = |c: &str| {
+                    c.rsplit(':')
+                        .next()
+                        .and_then(|p| u16::from_str_radix(p, 16).ok())
+                };
+                if cols.len() > 9
+                    && (port_of(cols[1]) == Some(port) || port_of(cols[2]) == Some(port))
+                {
+                    inodes.insert(format!("socket:[{}]", cols[9]));
+                }
+            }
+        }
+        let sockets = std::fs::read_dir("/proc/self/fd")
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| {
+                        std::fs::read_link(e.path())
+                            .ok()
+                            .is_some_and(|l| inodes.contains(&*l.to_string_lossy()))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        sockets + fds_on(path)
+    }
+
+    /// Wait until [`server_fds`] is back to `want` (descriptors close on the
+    /// server threads after the client saw its reply).
+    fn settle(port: u16, path: &Path, want: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let got = server_fds(port, path);
+            if got <= want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "server descriptors never settled: {got} > {want}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn tempdir() -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().canonicalize().unwrap();
+        (d, p)
+    }
+
+    /// Regression: serving the sidecar opened it with a raw `File` per
+    /// request; closing it released the locks of a connection of this
+    /// process on the same index (here a WAL session holding SHARED). GET,
+    /// Range and HEAD keep the lock; a missing sidecar is still 404.
+    #[test]
+    fn regression_http_index_sidecar_get_keeps_index_lock() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_d, dir) = tempdir();
+        let idx = dir.join("a.index.sqlite");
+        let bytes = wal_index(&idx, 3);
+        let h = holder(&idx);
+        assert!(other_process_sees_lock(&idx));
+        let srv = serve(&idx, SidecarAdmission::default());
+        let raw = exchange(srv.addr, GET);
+        assert_eq!(status(&raw), 200);
+        assert_eq!(split_head_body(&raw).1, bytes.as_slice());
+        assert!(other_process_sees_lock(&idx), "GET kept the lock");
+        let raw = exchange(srv.addr, &range(100, 199));
+        assert_eq!(status(&raw), 206);
+        assert_eq!(split_head_body(&raw).1, &bytes[100..200]);
+        let raw = exchange(srv.addr, HEAD);
+        assert_eq!(status(&raw), 200);
+        let (head, body) = split_head_body(&raw);
+        assert_eq!(
+            header_value(&head, "Content-Length"),
+            Some(bytes.len().to_string().as_str())
+        );
+        assert!(body.is_empty());
+        assert!(
+            other_process_sees_lock(&idx),
+            "Range and HEAD kept the lock"
+        );
+        drop(std::fs::File::open(&idx).unwrap());
+        assert!(!other_process_sees_lock(&idx), "oracle check");
+        drop(h);
+        drop(srv);
+        std::fs::remove_file(&idx).unwrap();
+        let srv = serve(&idx, SidecarAdmission::default());
+        assert_eq!(status(&exchange(srv.addr, GET)), 404);
+    }
+
+    /// Regression: a sidecar that came up short ended the body with a
+    /// successful `break` (a truncated download looked complete); an
+    /// unreadable sidecar is an error before any 200 header.
+    #[test]
+    fn regression_http_index_sidecar_read_failure_is_not_complete() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_d, dir) = tempdir();
+        let idx = dir.join("a.index.sqlite");
+        let bytes = wal_index(&idx, 3);
+        // Shrunk after the length was taken: short body, never complete,
+        // and the handler itself returns `UnexpectedEof` (a successful
+        // `break` would also close the connection short).
+        let i2 = idx.clone();
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let f2 = Arc::clone(&finished);
+        let srv = serve(
+            &idx,
+            admission(move |s| {
+                if let SidecarStage::Finished(kind) = s {
+                    f2.lock().unwrap().push(kind);
+                }
+                if s == SidecarStage::Acquired {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&i2)?
+                        .set_len(1000)?;
+                }
+                Ok(())
+            }),
+        );
+        let raw = exchange(srv.addr, GET);
+        let (head, body) = split_head_body(&raw);
+        assert!(status_line(&head).contains("200"), "{head}");
+        let advertised: usize = header_value(&head, "Content-Length")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(advertised, bytes.len());
+        assert!(body.len() < advertised, "short body is not complete");
+        drop(srv);
+        assert_eq!(
+            *finished.lock().unwrap(),
+            vec![Some(io::ErrorKind::UnexpectedEof)],
+            "the handler reports the short sidecar"
+        );
+        // A read error mid-body.
+        std::fs::write(&idx, &bytes).unwrap();
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = Arc::clone(&n);
+        let srv = serve(
+            &idx,
+            admission(move |s| {
+                if s == SidecarStage::BeforeChunk && n2.fetch_add(1, Ordering::SeqCst) == 1 {
+                    return Err(io::Error::other("injected"));
+                }
+                Ok(())
+            }),
+        );
+        let raw = exchange(srv.addr, GET);
+        assert!(split_head_body(&raw).1.len() < bytes.len());
+        drop(srv);
+        // Unreadable: 500, no 200 header (skip as root).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&idx, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&idx).is_ok() {
+            eprintln!("skip: running as root, cannot make the sidecar unreadable");
+        } else {
+            let srv = serve(&idx, SidecarAdmission::default());
+            assert_eq!(status(&exchange(srv.addr, GET)), 500);
+        }
+        std::fs::set_permissions(&idx, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    struct Gate {
+        open: Mutex<bool>,
+        cv: Condvar,
+        acquired: AtomicUsize,
+        fail_chunks: AtomicBool,
+    }
+
+    impl Gate {
+        fn wait_acquired(&self, n: usize) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while self.acquired.load(Ordering::SeqCst) < n {
+                assert!(
+                    Instant::now() < deadline,
+                    "admitted readers never reached {n}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn set(&self, open: bool) {
+            *self.open.lock().unwrap() = open;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Regression: one raw descriptor per in-flight sidecar request, with no
+    /// bound. Real loopback requests against a WAL index whose main-file lock
+    /// a session holds: eight admitted readers are held after acquisition;
+    /// more requests (HEAD included) get 503 without any byte open; the
+    /// descriptors on the inode stay within baseline + 8 during and after
+    /// repeated waves (parked descriptors are reused); read errors and
+    /// disconnects give their permits back; the lock stays until the session
+    /// lets go. Descriptor counts are Linux-only (/proc/self/fd).
+    #[test]
+    fn regression_http_index_sidecar_descriptor_bound() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_d, dir) = tempdir();
+        let idx = dir.join("a.index.sqlite");
+        let bytes = Arc::new(wal_index(&idx, 4));
+        let h = holder(&idx);
+        let base = fds_on(&idx);
+        let gate = Arc::new(Gate {
+            open: Mutex::new(false),
+            cv: Condvar::new(),
+            acquired: AtomicUsize::new(0),
+            fail_chunks: AtomicBool::new(false),
+        });
+        let g2 = Arc::clone(&gate);
+        let srv = serve(
+            &idx,
+            admission(move |s| {
+                match s {
+                    SidecarStage::Acquired => {
+                        g2.acquired.fetch_add(1, Ordering::SeqCst);
+                        let mut open = g2.open.lock().unwrap();
+                        while !*open {
+                            open = g2.cv.wait(open).unwrap();
+                        }
+                    }
+                    SidecarStage::BeforeChunk if g2.fail_chunks.load(Ordering::SeqCst) => {
+                        return Err(io::Error::other("injected"));
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }),
+        );
+        let linux = cfg!(target_os = "linux");
+        // The listener plus the session's descriptors on the index.
+        let settled = server_fds(srv.addr.port(), &idx);
+        for wave in 0..3 {
+            gate.set(false);
+            gate.acquired.store(0, Ordering::SeqCst);
+            let clients: Vec<_> = (0..INDEX_SIDECAR_READERS)
+                .map(|i| {
+                    let (addr, bytes) = (srv.addr, Arc::clone(&bytes));
+                    std::thread::spawn(move || {
+                        let req = if i % 2 == 0 {
+                            GET.to_string()
+                        } else {
+                            range(0, 99)
+                        };
+                        let raw = exchange(addr, &req);
+                        let body = split_head_body(&raw).1.to_vec();
+                        if i % 2 == 0 {
+                            assert_eq!(body, *bytes);
+                        } else {
+                            assert_eq!(body, &bytes[..100]);
+                        }
+                    })
+                })
+                .collect();
+            gate.wait_acquired(INDEX_SIDECAR_READERS);
+            let opens = XOPEN_CALLS.load(Ordering::SeqCst);
+            for req in [GET.to_string(), HEAD.to_string(), range(5, 9)] {
+                assert_eq!(status(&exchange(srv.addr, &req)), 503, "wave {wave}");
+            }
+            assert_eq!(
+                XOPEN_CALLS.load(Ordering::SeqCst),
+                opens,
+                "a refused request opened nothing"
+            );
+            if linux {
+                let during = fds_on(&idx);
+                assert!(during <= base + INDEX_SIDECAR_READERS, "{base} -> {during}");
+            }
+            assert!(other_process_sees_lock(&idx));
+            gate.set(true);
+            for c in clients {
+                c.join().unwrap();
+            }
+            if linux {
+                let after = fds_on(&idx);
+                assert!(
+                    after <= base + INDEX_SIDECAR_READERS,
+                    "wave {wave}: {base} -> {after} (parked descriptors must be reused)"
+                );
+            } else {
+                eprintln!("skip: descriptor counts are Linux-only");
+            }
+        }
+        // Read errors and disconnects release their permits.
+        gate.fail_chunks.store(true, Ordering::SeqCst);
+        for _ in 0..INDEX_SIDECAR_READERS + 2 {
+            exchange(srv.addr, GET);
+        }
+        gate.fail_chunks.store(false, Ordering::SeqCst);
+        for _ in 0..INDEX_SIDECAR_READERS + 2 {
+            let mut s = TcpStream::connect(srv.addr).unwrap();
+            s.write_all(GET.as_bytes()).unwrap();
+            drop(s);
+        }
+        // All eight permits are available again.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            gate.set(false);
+            gate.acquired.store(0, Ordering::SeqCst);
+            let clients: Vec<_> = (0..INDEX_SIDECAR_READERS)
+                .map(|_| {
+                    let addr = srv.addr;
+                    std::thread::spawn(move || status(&exchange(addr, HEAD)))
+                })
+                .collect();
+            std::thread::sleep(Duration::from_millis(300));
+            let got = gate.acquired.load(Ordering::SeqCst);
+            gate.set(true);
+            let codes: Vec<u16> = clients.into_iter().map(|c| c.join().unwrap()).collect();
+            if got == INDEX_SIDECAR_READERS && codes.iter().all(|&c| c == 200) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "permits never recovered: {codes:?}"
+            );
+        }
+        if linux {
+            assert!(fds_on(&idx) <= base + INDEX_SIDECAR_READERS);
+            // Every connection closed and every reader parked or reused:
+            // the server's descriptors are back where they started, apart
+            // from the (at most eight) parked index descriptors.
+            settle(srv.addr.port(), &idx, settled + INDEX_SIDECAR_READERS);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while server_fds(srv.addr.port(), &idx) - fds_on(&idx) > settled - base {
+                assert!(Instant::now() < deadline, "a socket was left behind");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert!(other_process_sees_lock(&idx), "lock held throughout");
+        drop(srv);
+        drop(h);
+        assert!(
+            !other_process_sees_lock(&idx),
+            "released once the session lets go (parked descriptors closed)"
+        );
+        if linux {
+            assert_eq!(fds_on(&idx), 0, "no descriptor left after release");
+        }
+    }
+
+    /// Regression: a client that requests the sidecar and stops reading held
+    /// its reader (and permit) forever, so eight such clients made every
+    /// later request 503. The body has a write timeout; the permits come
+    /// back while the stalled sockets are still open.
+    #[test]
+    fn regression_http_index_sidecar_stalled_reader_releases_reader() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_d, dir) = tempdir();
+        let idx = dir.join("big.index.sqlite");
+        // A WAL index larger than the loopback socket buffers, whose
+        // main-file lock a session holds throughout.
+        let bytes = Arc::new(wal_index(&idx, 320));
+        let h = holder(&idx);
+        assert!(other_process_sees_lock(&idx));
+        let gate = Arc::new(Gate {
+            open: Mutex::new(true),
+            cv: Condvar::new(),
+            acquired: AtomicUsize::new(0),
+            fail_chunks: AtomicBool::new(false),
+        });
+        let g2 = Arc::clone(&gate);
+        let srv = serve(
+            &idx,
+            SidecarAdmission {
+                write_timeout: Duration::from_millis(300),
+                ..admission(move |s| {
+                    if s == SidecarStage::Acquired {
+                        g2.acquired.fetch_add(1, Ordering::SeqCst);
+                        let mut open = g2.open.lock().unwrap();
+                        while !*open {
+                            open = g2.cv.wait(open).unwrap();
+                        }
+                    }
+                    Ok(())
+                })
+            },
+        );
+        let stalled: Vec<TcpStream> = (0..INDEX_SIDECAR_READERS)
+            .map(|_| {
+                let mut s = TcpStream::connect(srv.addr).unwrap();
+                s.write_all(GET.as_bytes()).unwrap();
+                s
+            })
+            .collect();
+        gate.wait_acquired(INDEX_SIDECAR_READERS);
+        let saturated = status(&exchange(srv.addr, HEAD));
+        assert_eq!(saturated, 503, "eight stalled readers hold every permit");
+        // Every permit comes back while the stalled sockets are still open:
+        // eight readers are admitted at once, and a ninth is refused.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            gate.set(false);
+            gate.acquired.store(0, Ordering::SeqCst);
+            let clients: Vec<_> = (0..INDEX_SIDECAR_READERS)
+                .map(|_| {
+                    let addr = srv.addr;
+                    std::thread::spawn(move || status(&exchange(addr, HEAD)))
+                })
+                .collect();
+            std::thread::sleep(Duration::from_millis(300));
+            let got = gate.acquired.load(Ordering::SeqCst);
+            let ninth = (got == INDEX_SIDECAR_READERS).then(|| status(&exchange(srv.addr, HEAD)));
+            gate.set(true);
+            let codes: Vec<u16> = clients.into_iter().map(|c| c.join().unwrap()).collect();
+            if got == INDEX_SIDECAR_READERS && codes.iter().all(|&c| c == 200) {
+                assert_eq!(ninth, Some(503), "only eight permits");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stalled readers never released every permit: {got} admitted, {codes:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // A full read still works and the session's lock was never released.
+        assert_eq!(split_head_body(&exchange(srv.addr, GET)).1, &bytes[..]);
+        assert!(other_process_sees_lock(&idx), "lock held throughout");
+        drop(stalled);
+        drop(srv);
+        drop(h);
+        assert!(!other_process_sees_lock(&idx));
+    }
 }

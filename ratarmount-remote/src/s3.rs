@@ -51,7 +51,7 @@
 //! | `AWS_ENDPOINT_URL` / `S3_ENDPOINT_URL` | MinIO / LocalStack (path-style) |
 //! | `RATARMOUNT_IMDS_BASE` / `AWS_EC2_METADATA_SERVICE_ENDPOINT` | Override IMDS base (tests) |
 
-use std::fs::File;
+use ratarmount_index::managed_read::ManagedReadCursor;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
@@ -1093,7 +1093,7 @@ fn plan_multipart(len: u64, prefix: u64) -> Result<Vec<PartOp>> {
     Ok(parts)
 }
 
-fn read_file_at(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>> {
+fn read_file_at(file: &mut ManagedReadCursor, offset: u64, len: usize) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0u8; len];
     file.read_exact(&mut buf)?;
@@ -1222,7 +1222,7 @@ fn complete_body_committed(body: &str) -> bool {
 fn upload_all_parts(
     ctx: &S3CallCtx,
     loc: &S3Location,
-    file: &mut File,
+    file: &mut ManagedReadCursor,
     if_match: Option<&str>,
     upload_id: &str,
     plan: &[PartOp],
@@ -1313,9 +1313,11 @@ pub fn put_s3_multipart(
 ) -> Result<()> {
     require_signing_creds()?;
     let ctx = prepare_s3_write(loc);
-    let mut file = File::open(staged)
+    // Managed (#151): one reader through every part, retry and the abort;
+    // the staged file may be an index open in this process.
+    let mut file = ManagedReadCursor::open(staged)
         .map_err(|e| RemoteError::S3(format!("staged file {}: {e}", staged.display())))?;
-    let len = file.metadata()?.len();
+    let len = file.len()?;
     let prefix = copy_prefix.unwrap_or(0);
     let plan = plan_multipart(len, prefix)?;
     let upload_id = create_multipart(&ctx, content_type)?;
@@ -4154,5 +4156,123 @@ mod tests {
             .unwrap();
         assert_eq!(pointer_at, reqs.len() - 1);
         assert!(pointer_at > 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // R11-S7 (#151): staged index/archive uploads read through managed
+    // readers; a file open as a database in this process keeps its locks.
+    // ---------------------------------------------------------------------
+
+    #[cfg(unix)]
+    use ratarmount_index::managed_read::{lock_probe::other_process_sees_lock, VfsLockHolder};
+
+    /// A staged file of `len` bytes held by this SQLite instance's lock (a
+    /// VFS-level SHARED lock: the same per-inode bookkeeping a connection
+    /// uses; the staged file need not be a database).
+    #[cfg(unix)]
+    fn held_staged(len: u64) -> (NamedTempFile, Vec<u8>, VfsLockHolder) {
+        let staged = NamedTempFile::new().unwrap();
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+        std::fs::write(staged.path(), &bytes).unwrap();
+        let lock = VfsLockHolder::shared(staged.path()).unwrap();
+        assert!(other_process_sees_lock(staged.path()));
+        (staged, bytes, lock)
+    }
+
+    /// Regression: the multipart upload opened the staged file with a raw
+    /// `File`; its close released this process's lock on it. Two parts, then
+    /// a failing second part (aborted) with the same one reader.
+    #[cfg(unix)]
+    #[test]
+    fn regression_s3_multipart_reader_keeps_index_lock() {
+        for mode in [MockWriteMode::Ok, MockWriteMode::SecondPut500] {
+            let s3 = MockS3Write::spawn("uid-s7", mode);
+            let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+            aws_signing_env(&_g, &s3.base_url);
+            let (staged, bytes, lock) = held_staged(S3_PUT_PART_BYTES + 4096);
+            let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
+            let got = put_s3_multipart(&loc, staged.path(), Some(0), None, None);
+            let reqs = s3.requests();
+            if mode == MockWriteMode::Ok {
+                got.unwrap();
+                let parts: Vec<_> = reqs
+                    .iter()
+                    .filter(|r| r.method == "PUT" && r.query().contains("partNumber"))
+                    .collect();
+                assert_eq!(parts.len(), 2);
+                let mut sent = parts[0].body.clone();
+                sent.extend_from_slice(&parts[1].body);
+                assert_eq!(sent, bytes);
+            } else {
+                assert!(got.is_err());
+                assert!(reqs.iter().any(|r| r.method == "DELETE"), "aborted");
+            }
+            assert!(
+                other_process_sees_lock(staged.path()),
+                "lock kept (failing part: {})",
+                mode == MockWriteMode::SecondPut500
+            );
+            drop(lock);
+        }
+    }
+
+    /// Regression: the index sibling PUT read the blob raw (single PutObject
+    /// path; the multipart path is `put_s3_multipart`); the exact-length
+    /// error is kept.
+    #[cfg(unix)]
+    #[test]
+    fn regression_index_sibling_upload_keeps_index_lock() {
+        let s3 = MockS3Write::spawn("uid-s7-idx", MockWriteMode::Ok);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        aws_signing_env(&_g, &s3.base_url);
+        let id = index_id_hex();
+        let (staged, bytes, lock) = held_staged(5000);
+        let pointer = format!(r#"{{"index_id":"{id}"}}"#);
+        let loc = parse_s3_url("s3://mybucket/dir/a.tar").unwrap();
+        crate::put_s3_index_siblings(&loc, &id, pointer.as_bytes(), staged.path()).unwrap();
+        let reqs = s3.requests();
+        assert_eq!(reqs[0].body, bytes);
+        assert!(other_process_sees_lock(staged.path()), "lock kept");
+        drop(lock);
+    }
+
+    /// Regression: a failed mandatory read of the staged file must not
+    /// complete the upload: the multipart upload is aborted, no
+    /// CompleteMultipartUpload is sent.
+    #[cfg(unix)]
+    #[test]
+    fn regression_publication_required_read_failure_aborts_completion() {
+        use ratarmount_index::managed_read::{seams, Seam};
+        let s3 = MockS3Write::spawn("uid-s7-fail", MockWriteMode::Ok);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        aws_signing_env(&_g, &s3.base_url);
+        let (staged, _bytes, lock) = held_staged(S3_PUT_PART_BYTES + 4096);
+        let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
+        let mut reads = 0;
+        let got = seams::with(
+            move |s| {
+                if s == Seam::BeforeRead {
+                    reads += 1;
+                    // Part 1 is 65 reads of at most 0x1ffff bytes; fail part 2.
+                    if reads == 66 {
+                        return Err(std::io::Error::other("injected"));
+                    }
+                }
+                Ok(())
+            },
+            || put_s3_multipart(&loc, staged.path(), Some(0), None, None),
+        );
+        assert!(got.unwrap_err().to_string().contains("injected"));
+        let reqs = s3.requests();
+        assert!(reqs.iter().any(|r| r.method == "DELETE"), "aborted");
+        assert!(
+            !reqs
+                .iter()
+                .any(|r| r.method == "POST" && r.query().starts_with("uploadId=")),
+            "never completed: {}",
+            summarize_reqs(&reqs)
+        );
+        assert!(other_process_sees_lock(staged.path()));
+        drop(lock);
     }
 }

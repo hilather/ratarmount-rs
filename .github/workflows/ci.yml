@@ -46,6 +46,27 @@ jobs:
       - name: canonical hash reference self-test
         run: python3 -I test-harness/canonical-hash/reference.py --self-test
 
+      - name: wheel export audit self-test
+        run: python3 -I packaging/audit_native_exports.py --self-test
+
+      - name: wheel blake3 no_neon feature graph (#199)
+        run: bash packaging/test-wheel-blake3-no-neon.sh
+
+      - name: internal-read inventory (#151)
+        run: |
+          python3 -I packaging/test-internal-read-inventory.py --self-test
+          python3 -I packaging/test-internal-read-inventory.py
+          # `unchanged-from-e6ca64e` creates must exist unchanged at the baseline.
+          git fetch --no-tags --depth=1 origin e6ca64e3a3d2c509840ca147fcf0d71703546318
+          mkdir -p "$RUNNER_TEMP/inventory-baseline"
+          git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/inventory-baseline"
+          python3 -I packaging/test-internal-read-inventory.py --verify-baseline "$RUNNER_TEMP/inventory-baseline"
+
+      - name: aarch64 checked-open CI contract
+        run: |
+          ./test-harness/test-aarch64-checked-open-ci.sh
+          ./test-harness/test-aarch64-checked-open-ci.sh --self-test
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -58,6 +79,39 @@ jobs:
         run: |
           chmod +x packaging/test-systemd-unit.sh
           ./packaging/test-systemd-unit.sh
+
+  # The checked SQLite open (#151) pins a `struct stat` layout and VFS ABI per
+  # target; every packaged Linux target runs those tests natively (the
+  # `check` job covers x86_64, macOS its own job). Linux aarch64 is packaged
+  # (python.yml wheels) and listed as supported in docs/sandbox.md.
+  # Contract: test-harness/test-aarch64-checked-open-ci.sh.
+  checked-open-aarch64:
+    name: checked open (linux aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y -o Acquire::Retries=5 \
+            pkg-config libarchive-dev zlib1g-dev
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test (checked open, native aarch64)
+        run: |
+          # Every test in the checked_open module: installer, ABI probes,
+          # acquisition decision table, snapshot_index_into.
+          cargo test -p ratarmount-index --lib checked_open
+          cargo test -p ratarmount-checked-open-fixture --test dso
+          cargo test -p ratarmount-compositing --lib regression_checked_open_registration_uses_acquired_inode
+          cargo test -p ratarmount-compositing --lib regression_offline_gate_refuses_swap_inside_sqlite_open
 
   # Optional feature: NFSv4.1 (embednfs, rustc ≥ 1.88). Default check job
   # uses stable rustc and does not compile embednfs. After the
@@ -417,6 +471,19 @@ jobs:
             echo "::endgroup::"
             exit "$code"
           fi
+
+      - name: checked open (macOS 14.0 deployment target)
+        # The macOS wheel builds at MACOSX_DEPLOYMENT_TARGET=14.0 (python.yml),
+        # where Apple's linker rewrites `__mod_init_func` into `__init_offsets`
+        # (R11-CI-FIX2). The default-target `cargo test` above cannot see that;
+        # run the installer rows and the DSO fixture at the wheel's target in a
+        # separate target dir. Contract: test-harness/test-aarch64-checked-open-ci.sh.
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+          CARGO_TARGET_DIR: target/macos-deployment-14
+        run: |
+          cargo test -p ratarmount-index --lib checked_open
+          cargo test -p ratarmount-checked-open-fixture --test dso
 
       - name: Build release
         run: cargo build --release -p ratarmount
