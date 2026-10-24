@@ -2075,6 +2075,38 @@
   },
   {
    "file": "ratarmount-compositing/src/write_overlay.rs",
+   "function": "reserve_staging_path",
+   "op": "OpenOptions",
+   "ordinal": 1,
+   "line": 6513,
+   "fingerprint": "c150df8f2b1120fc",
+   "disposition": "output-owner",
+   "mode_policy": "0666 & !umask (OpenOptions default, no .mode()). Unique staging placeholder, unlinked before SQLite creates the overlay database"
+  },
+  {
+   "file": "ratarmount-compositing/src/write_overlay.rs",
+   "function": "rename_no_replace",
+   "op": "File::open",
+   "ordinal": 1,
+   "line": 6538,
+   "fingerprint": "48c18782f41582c4",
+   "disposition": "out-of-family",
+   "category": "directory-handle-or-durability",
+   "reason": "overlay-directory handle for the no-replace rename of the staging database; reads no file content"
+  },
+  {
+   "file": "ratarmount-compositing/src/write_overlay.rs",
+   "function": "sync_overlay_dir",
+   "op": "File::open",
+   "ordinal": 1,
+   "line": 6588,
+   "fingerprint": "cbacbd13fdaaab69",
+   "disposition": "out-of-family",
+   "category": "directory-handle-or-durability",
+   "reason": "overlay-directory handle for the fsync after the database and the marker are published; reads no file content"
+  },
+  {
+   "file": "ratarmount-compositing/src/write_overlay.rs",
    "function": "create_overlay_marker",
    "op": "OpenOptions",
    "ordinal": 1,
