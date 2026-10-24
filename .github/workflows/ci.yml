@@ -442,6 +442,16 @@ jobs:
         timeout-minutes: 5
         run: cargo test -p ratarmount --test fuse_mount_in_base regression_mount_in_base_refuses -- --test-threads=2
 
+      - name: latched case-variant Fresh open (macOS)
+        # APFS is case-insensitive. A filter that matches nothing still exits 0,
+        # so this step requires the one macOS-only test to have passed.
+        # --exact is the full harness name; the short name matches nothing.
+        run: |
+          set -o pipefail
+          cargo test -p ratarmount-index --lib checked_open::acquire::tests::regression_latched_case_variant_fresh_open_refuses -- --exact \
+            | tee /tmp/case-variant.log
+          grep -q "1 passed" /tmp/case-variant.log
+
       - name: cargo test
         # Single-threaded default avoids SQLite side-table races under load; workers
         # still parallelize within crates when safe. --no-fail-fast surfaces all fails.

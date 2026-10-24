@@ -1969,6 +1969,88 @@ fn regression_latched_rename_dir_fresh_open_refuses() {
     );
 }
 
+/// Regression (R11-S8, Keystone B2): on case-insensitive APFS, latching
+/// `ov.sqlite` and then opening `OV.SQLITE` is the same directory entry.
+/// A later `Expect::Fresh` must not recreate the database, `-wal` or `-shm`
+/// under either spelling. macOS only: a case-sensitive host treats the two
+/// spellings as different files, and folding there would refuse a real
+/// second database.
+#[cfg(target_os = "macos")]
+#[test]
+fn regression_latched_case_variant_fresh_open_refuses() {
+    let (_t, dir) = tempdir();
+    let db = dir.join("ov.sqlite");
+    let got = open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap();
+    crate::checked_open::latch_overlay_nocreate(&db);
+    drop(got);
+    std::fs::remove_file(&db).unwrap();
+    let variant = dir.join("OV.SQLITE");
+    let again = open_checked(&variant, RWC, NameMode::Path, Expect::Fresh);
+    assert!(
+        again.is_err(),
+        "Fresh open of a case variant recreated the latched database: {again:?}"
+    );
+    for name in ["ov.sqlite", "OV.SQLITE"] {
+        let path = dir.join(name);
+        assert!(!path.exists(), "{name} was recreated");
+        assert!(!sibling(&path, "-wal").exists(), "{name}-wal was recreated");
+        assert!(!sibling(&path, "-shm").exists(), "{name}-shm was recreated");
+    }
+    let shm = sibling(&variant, "-shm");
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
+    let (fd, err) = hooked_open(&shm, flags);
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+    assert!(fd < 0, "case-variant -shm create returned {fd}");
+    assert_eq!(err, libc::EACCES, "errno {err}");
+    assert!(
+        !shm.exists(),
+        "refused case-variant -shm create left a file"
+    );
+}
+
+/// Regression (R11-S8, Keystone N1): a symlink created after the directory
+/// was renamed is not one of the latched spellings, and `lstat` of that
+/// symlink is not the latched directory inode. SQLite opens the canonical
+/// path, and that path's parent inode still refuses the create.
+#[test]
+fn regression_latched_new_symlink_to_renamed_dir_refuses() {
+    let (_t, dir) = tempdir();
+    let overlay = dir.join("overlay");
+    std::fs::create_dir(&overlay).unwrap();
+    let db = overlay.join("ov.sqlite");
+    let got = open_checked(&db, RWC, NameMode::Path, Expect::Fresh).unwrap();
+    crate::checked_open::latch_overlay_nocreate(&db);
+    drop(got);
+    let moved = dir.join("moved");
+    std::fs::rename(&overlay, &moved).unwrap();
+    let real_db = moved.join("ov.sqlite");
+    std::fs::remove_file(&real_db).unwrap();
+    let link = dir.join("alias");
+    std::os::unix::fs::symlink(&moved, &link).unwrap();
+    let via = link.join("ov.sqlite");
+    let again = open_checked(&via, RWC, NameMode::Path, Expect::Fresh);
+    assert!(
+        again.is_err(),
+        "Fresh open through a new symlink recreated the latched database: {again:?}"
+    );
+    assert!(!real_db.exists(), "symlink Fresh open left the database");
+    assert!(!via.exists(), "symlink Fresh open left a path");
+    for path in [&real_db, &via] {
+        assert!(
+            !sibling(path, "-wal").exists(),
+            "symlink Fresh open left -wal at {}",
+            path.display()
+        );
+        assert!(
+            !sibling(path, "-shm").exists(),
+            "symlink Fresh open left -shm at {}",
+            path.display()
+        );
+    }
+}
+
 /// Regression (R11-S8): a checked open that nobody latched can still create
 /// the file again. Index, SQLAR and digest-cache opens stay on that path.
 #[test]

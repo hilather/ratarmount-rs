@@ -20,7 +20,11 @@
 //! does not go through VFS `xOpen`). The slot is the one the installer
 //! published; nothing installs a second wrapper later. The hook matches the
 //! stored path spellings and, with no heap allocation, an `lstat` of the
-//! parent directory plus the file name.
+//! parent directory plus the file name. On macOS those compares are
+//! ASCII-case-insensitive and nothing else: `é` and `É` stay different, and
+//! NFC and NFD stay different, so a name that differs only by non-ASCII case
+//! or by Unicode normalization can still be created. Folding on every macOS
+//! volume, including a case-sensitive one, fails closed.
 //!
 //! **Deliberate S8 carve-out:** `-journal` is recorded with the latch and
 //! every open of it still passes through that slot, but the create is
@@ -80,9 +84,32 @@ struct Entry {
     base_journal: Vec<u8>,
 }
 
+/// Byte equality. On macOS, also ASCII case-insensitivity (same length, no
+/// heap). Non-ASCII case and NFC versus NFD are not the same name. Windows
+/// and Linux stay exact. `-journal` is not passed here.
+fn names_equal(stored: &[u8], got: &[u8]) -> bool {
+    if stored == got {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        stored.len() == got.len()
+            && stored
+                .iter()
+                .zip(got)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 #[cfg(unix)]
 fn basename_is_refused(entry: &Entry, name: &[u8]) -> bool {
-    entry.base == name || entry.base_wal == name || entry.base_shm == name
+    names_equal(&entry.base, name)
+        || names_equal(&entry.base_wal, name)
+        || names_equal(&entry.base_shm, name)
 }
 
 fn suffixed(path: &[u8], suffix: &str) -> Vec<u8> {
@@ -369,7 +396,7 @@ pub(crate) fn db_path_is_latched(path: &Path) -> bool {
     };
     let mut guard = lock::lock();
     guard.entries().iter().any(|entry| {
-        if entry.db == db {
+        if names_equal(&entry.db, db) {
             return true;
         }
         #[cfg(unix)]
@@ -380,7 +407,7 @@ pub(crate) fn db_path_is_latched(path: &Path) -> bool {
             let Some(name) = path.file_name() else {
                 return false;
             };
-            entry.parent == Some(id) && entry.base.as_slice() == name.as_encoded_bytes()
+            entry.parent == Some(id) && names_equal(&entry.base, name.as_encoded_bytes())
         }
         #[cfg(not(unix))]
         {
@@ -458,9 +485,9 @@ pub(crate) unsafe fn prepare_open(path: *const libc::c_char, flags: libc::c_int)
         return OpenPrep::Refuse;
     };
     let matched = guard.entries().iter().any(|entry| {
-        entry.db.as_slice() == bytes
-            || entry.wal.as_slice() == bytes
-            || entry.shm.as_slice() == bytes
+        names_equal(&entry.db, bytes)
+            || names_equal(&entry.wal, bytes)
+            || names_equal(&entry.shm, bytes)
             || parent.is_some_and(|(id, base)| {
                 entry.parent == Some(id) && basename_is_refused(entry, base)
             })
@@ -504,6 +531,7 @@ mod tests {
         assert_eq!(entry.journal, b"/overlay/db-journal");
         assert_eq!(entry.base_journal, b"db-journal");
         assert_ne!(entry.journal, entry.wal);
+        assert_ne!(entry.journal, entry.shm);
         assert_ne!(entry.base_journal, entry.base_wal);
         assert_ne!(entry.base_journal, entry.base_shm);
         assert_eq!(entry.parent, Some((1, 2)));
@@ -516,6 +544,21 @@ mod tests {
             assert!(basename_is_refused(&entry, &entry.base));
             assert!(basename_is_refused(&entry, &entry.base_wal));
             assert!(basename_is_refused(&entry, &entry.base_shm));
+            #[cfg(target_os = "macos")]
+            {
+                assert!(basename_is_refused(&entry, b"DB"));
+                assert!(basename_is_refused(&entry, b"DB-WAL"));
+                assert!(basename_is_refused(&entry, b"db-SHM"));
+                assert!(
+                    !basename_is_refused(&entry, b"DB-JOURNAL"),
+                    "a case variant of -journal stays the carve-out"
+                );
+            }
+            #[cfg(not(target_os = "macos"))]
+            assert!(
+                !basename_is_refused(&entry, b"DB"),
+                "case-sensitive hosts keep a different case as a different name"
+            );
         }
     }
 }

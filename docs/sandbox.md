@@ -1899,6 +1899,19 @@ after the file is removed or the directory is renamed, has
 database that vanishes between classification and SQLite's open is not
 recreated as a new 0-byte file beside the marker.
 
+On macOS the stored spellings and the file name compare ASCII-case-insensitively,
+on every volume, so latching `ov.sqlite` and later opening `OV.SQLITE` in
+that same directory does not create the database, `-wal` or `-shm`. The fold
+is ASCII only: `é` and `É` are different names, and NFC and NFD are different
+names. A name that differs only by non-ASCII case or by Unicode normalization
+can still be created.
+
+The latch does not follow a hard link of an existing database under another
+name, and it does not follow a rename or move of the database file into a
+different directory. Those are a different parent or a different file name.
+Renaming the parent directory is covered, because the directory inode is the
+key and the file's own inode is not.
+
 On a verified Unix host the installed `open` slot also refuses an `O_CREAT`
 that would create the database, `-wal` or `-shm` when that name is missing.
 The latch stores both the absolute path given to SQLite and, when it differs,
