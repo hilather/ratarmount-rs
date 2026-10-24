@@ -284,6 +284,14 @@ thread_local! {
     pub(crate) static FAIL_OVERLAY_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+// When set, the staging file's mtime is moved ahead before the rename.
+// A peer's sweep then skips it as newer than that peer's open, so the
+// race reaches the published database instead of a rename `ENOENT`.
+#[cfg(all(test, unix))]
+thread_local! {
+    static STAGING_MTIME_AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The `stat` through the database entry ([`FOLLOWED_STAT_ERRNO`] in tests).
 fn followed_db_stat(db_path: &Path) -> io::Result<fs::Metadata> {
     #[cfg(test)]
@@ -6567,6 +6575,33 @@ fn remove_db_file_if_ours(path: &Path, id: Option<(u64, u64)>) {
     remove_sqlite_sidecars(path);
 }
 
+/// Two days ahead of now. Ahead of any open's start in this race, and
+/// inside a 32-bit `time_t` for the years this process can be running.
+/// Does not open `path`, so a lock this process holds on it stays.
+#[cfg(all(test, unix))]
+fn set_staging_mtime_ahead(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let ahead = SystemTime::now() + Duration::from_secs(2 * 24 * 3600);
+    let spec = libc::timespec {
+        tv_sec: ahead
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t,
+        tv_nsec: 0,
+    };
+    let times = [spec, spec];
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    assert_eq!(rc, 0, "utimensat {}", path.display());
+}
+
 /// A path under `root` whose name starts with [`OVERLAY_DB_STAGING_PREFIX`].
 /// The placeholder file is removed so SQLite creates the database itself
 /// (`0644 & !umask`, same as every other new overlay database).
@@ -6735,6 +6770,12 @@ fn publish_fresh_overlay_database(
     let id = opened.id();
     let (mut conn, registration) = opened.into_parts();
     let schema = commit_overlay_schema(&mut conn, false, info, exclude_plan, identity, true);
+    // While the connection is still open. `utimensat` does not open the file,
+    // so it does not drop this process's fcntl lock.
+    #[cfg(all(test, unix))]
+    if schema.is_ok() && STAGING_MTIME_AHEAD.with(|cell| cell.get()) {
+        set_staging_mtime_ahead(&staging);
+    }
     // Drop the connection before any other close of this inode, and before
     // the rename: SQLite keeps the path it opened for its journal.
     drop(conn);
@@ -7035,10 +7076,17 @@ enum SweepChoice {
 /// A name is removed only when `lstat` says it is a regular file, its mtime
 /// is strictly older than `attempt_started`, and no live process holds it.
 /// A second name of the live database is unlinked without being opened, so
-/// this process does not drop its own locks on that inode. Sidecars are
-/// removed only when their staging file was removed or is already absent.
-/// Never deletes by prefix alone. Best-effort: an error is logged and that
-/// entry is skipped. The sweep never fails the open.
+/// this process does not drop its own locks on that inode. On Windows that
+/// match is creation time and length, with no lock probe, so a coincidental
+/// match is treated as a second name. Sidecars are removed only when their
+/// staging file was removed or is already absent. Never deletes by prefix
+/// alone. Best-effort: an error is logged and that entry is skipped. The
+/// sweep never fails the open.
+///
+/// Between the lock probe and the unlink, a peer that has created its staging
+/// file but not yet run its first `BEGIN` holds no lock. The sweep runs only
+/// after this open owns the published database, so that peer loses the
+/// publish. The error it sees is a rename failure, not "in use".
 fn sweep_overlay_db_staging(root: &Path, attempt_started: SystemTime) {
     let live = live_database(root);
     let entries = match fs::read_dir(root) {
@@ -7143,12 +7191,17 @@ fn sweep_one_staging_file(
         return SweepChoice::Kept;
     }
     let id_before = crate::overlay_db::file_id(&meta);
+    // Another name of the live database is unlinked with no lock probe.
+    // Unix matches `(dev, ino)`. Windows matches creation time and length,
+    // so a coincidental match is treated as a second name.
     if is_another_name_of_live(&meta, live) {
         return unlink_staging_name(path);
     }
     if staging_lock_held_by_other_process(path, sidecar) {
         return SweepChoice::Kept;
     }
+    // Re-stat catches a replaced inode. It does not see a lock taken after
+    // the probe: that peer is unlinked and its rename fails, not "in use".
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return SweepChoice::Removed,
@@ -13920,49 +13973,196 @@ pub(crate) mod tests {
         );
     }
 
-    /// Regression (#194): two first opens of one empty folder leave one
-    /// database, one marker and no staging file. A loser fails with the
-    /// database in use, or both succeed once the winner has closed.
+    /// Kills any child still running when the test returns or panics.
+    /// Disarm after every child has been waited on: `kill` on a reaped pid
+    /// can hit a recycled process.
+    #[cfg(unix)]
+    struct KillChildren {
+        kids: Vec<(std::process::Child, PathBuf)>,
+        armed: bool,
+    }
+    #[cfg(unix)]
+    impl Drop for KillChildren {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            for (child, _) in &mut self.kids {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// `wait` plus the piped stderr. Safe after `try_wait` has already reaped.
+    #[cfg(unix)]
+    fn reap_child(child: &mut std::process::Child) -> std::process::Output {
+        let status = child.wait().unwrap();
+        let mut stderr = Vec::new();
+        if let Some(mut err) = child.stderr.take() {
+            use std::io::Read;
+            err.read_to_end(&mut stderr).unwrap();
+        }
+        std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr,
+        }
+    }
+
+    /// Child of [`regression_concurrent_first_open_leaves_one_database`].
+    ///
+    /// Re-exec so the open runs in its own process. Two threads share fcntl
+    /// locks and SQLite's lock table, which is not the race. Waits until a
+    /// peer has reached the barrier, then opens. A success keeps the database
+    /// lock until the parent writes `release`, so the other process observes
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child process of regression_concurrent_first_open_leaves_one_database"]
+    fn regression_concurrent_first_open_child() {
+        let overlay = PathBuf::from(
+            std::env::var_os("RATARMOUNT_CONCURRENT_OPEN_OVERLAY").expect("child overlay"),
+        );
+        let barrier = PathBuf::from(
+            std::env::var_os("RATARMOUNT_CONCURRENT_OPEN_BARRIER").expect("child barrier"),
+        );
+        let result = PathBuf::from(
+            std::env::var_os("RATARMOUNT_CONCURRENT_OPEN_RESULT").expect("child result"),
+        );
+        let slot = barrier.join(format!("ready-{}", std::process::id()));
+        // The peer's sweep would otherwise treat this process's staging file
+        // as older than the peer's open and delete it while it holds no lock
+        // (the documented rename error). Keeping the mtime ahead leaves that
+        // file alone so this process meets the published database.
+        super::STAGING_MTIME_AHEAD.with(|cell| cell.set(true));
+        fs::write(&slot, b"1").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let ready = fs::read_dir(&barrier)
+                .unwrap()
+                .filter(|ent| {
+                    ent.as_ref()
+                        .ok()
+                        .and_then(|ent| ent.file_name().into_string().ok())
+                        .is_some_and(|name| name.starts_with("ready-"))
+                })
+                .count();
+            if ready >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "peer never reached the first-open barrier"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        match WriteOverlay::new_for_tests(Arc::new(KeepBase) as Arc<dyn MountSource>, &overlay) {
+            Ok(opened) => {
+                fs::write(&result, b"ok").unwrap();
+                let release = barrier.join("release");
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !release.exists() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "parent never released the holder"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                drop(opened);
+            }
+            Err(error) => {
+                fs::write(&result, format!("err\n{error}")).unwrap();
+            }
+        }
+    }
+
+    /// Regression (#194): two processes racing the first open of one empty
+    /// folder leave one database, one marker and no staging file, and the
+    /// folder is not lost. The winner keeps its lock until the peer has
+    /// finished, so the loser fails only with the database locked, busy, or
+    /// in use. fcntl locks are per process; this re-executes the test binary.
+    #[cfg(unix)]
     #[test]
     fn regression_concurrent_first_open_leaves_one_database() {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().canonicalize().unwrap().join("ov");
         fs::create_dir(&overlay).unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let mut handles = Vec::new();
-        for _ in 0..2 {
-            let overlay = overlay.clone();
-            let barrier = std::sync::Arc::clone(&barrier);
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                match WriteOverlay::new_for_tests(
-                    std::sync::Arc::new(KeepBase) as std::sync::Arc<dyn MountSource>,
-                    &overlay,
-                ) {
-                    Ok(opened) => {
-                        drop(opened);
-                        Ok(())
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
-            }));
+        let barrier = dir.path().join("barrier");
+        fs::create_dir(&barrier).unwrap();
+        let mut children = KillChildren {
+            kids: Vec::new(),
+            armed: true,
+        };
+        for i in 0..2 {
+            let result = dir.path().join(format!("result-{i}"));
+            let child = StdCommand::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "write_overlay::tests::regression_concurrent_first_open_child",
+                ])
+                .env("RATARMOUNT_CONCURRENT_OPEN_OVERLAY", &overlay)
+                .env("RATARMOUNT_CONCURRENT_OPEN_BARRIER", &barrier)
+                .env("RATARMOUNT_CONCURRENT_OPEN_RESULT", &result)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            children.kids.push((child, result));
         }
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            if children.kids.iter().all(|(_, result)| result.is_file()) {
+                break;
+            }
+            for (child, result) in &mut children.kids {
+                if result.is_file() {
+                    continue;
+                }
+                if child.try_wait().unwrap().is_some() {
+                    let output = reap_child(child);
+                    panic!(
+                        "child exited {} before writing a result\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a first-open child never wrote its result"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(barrier.join("release"), b"1").unwrap();
         let mut oks = 0;
         let mut errs = Vec::new();
-        for handle in handles {
-            match handle.join().expect("open thread") {
-                Ok(()) => oks += 1,
-                Err(error) => errs.push(error),
+        for (child, result) in &mut children.kids {
+            let output = reap_child(child);
+            assert!(
+                output.status.success(),
+                "child failed\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = fs::read_to_string(result).unwrap();
+            if text == "ok" {
+                oks += 1;
+            } else if let Some(error) = text.strip_prefix("err\n") {
+                errs.push(error.to_string());
+            } else {
+                panic!("unexpected child result {text:?}");
             }
         }
-        assert!(oks >= 1, "neither open succeeded: {errs:?}");
-        for error in &errs {
-            let lower = error.to_lowercase();
-            assert!(
-                lower.contains("locked") || lower.contains("busy") || lower.contains("in use"),
-                "{error}"
-            );
-        }
+        children.armed = false;
+        assert_eq!(oks, 1, "expected one winner, errs={errs:?}");
+        assert_eq!(errs.len(), 1, "expected one loser, oks={oks} errs={errs:?}");
+        let error = &errs[0];
+        let lower = error.to_lowercase();
+        assert!(
+            lower.contains("locked") || lower.contains("busy") || lower.contains("in use"),
+            "{error}"
+        );
         assert!(has_files_table(&overlay.join(HIDDEN_DB)));
         let left = marker_or_staging_names(&overlay);
         assert!(

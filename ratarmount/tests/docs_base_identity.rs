@@ -140,6 +140,10 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
         "a failure only warns and the open still succeeds",
         "On Windows that fsync is a no-op",
         "The sweep does not delete by name prefix alone",
+        "Windows deletes a staging name whose creation time and length match the live database, with no lock check",
+        "a coincidental match is treated as a second name",
+        "Between the lock probe and the delete, a peer that has created its staging file but not yet locked it holds nothing the probe can see",
+        "the error is a rename failure rather than \"in use\"",
         "A failed directory fsync only warns.",
         "opening one database file through both at once in one process is unsupported (#154",
     ] {
