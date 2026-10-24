@@ -887,6 +887,9 @@ thread_local! {
     /// The private lookup copies' names and modes, before they are opened.
     pub(crate) static SNAPSHOT_COPY_MODES: std::cell::RefCell<Vec<(String, u32)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Names in the staging directory after the copy's first statement.
+    pub(crate) static SNAPSHOT_STAGING_AFTER_STATEMENT: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -970,10 +973,25 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
         &copy,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    // Open the -wal/-shm and replay a journal now, before the files go.
+    // This is not `sqlite3_backup_step(-1)`. The first statement on the copy
+    // (the count below) is what opens the destination. When the copy is a WAL
+    // database, that statement creates `-wal` and `-shm` in this staging
+    // directory before any `journal_mode=DELETE` could run. Those files are
+    // expected: they live only here and must not appear beside the source.
+    // They go away with this temporary directory (#196).
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
         r.get::<_, i64>(0)
     })?;
+    #[cfg(all(test, unix))]
+    SNAPSHOT_STAGING_AFTER_STATEMENT.with(|m| {
+        *m.borrow_mut() = std::fs::read_dir(dir.path())
+            .map(|it| {
+                it.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+    });
     // Unix keeps unlinked files alive for the open descriptors; elsewhere the
     // removal fails and the directory stays in the temporary directory.
     let _ = dir.close();
