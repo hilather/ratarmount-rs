@@ -1036,7 +1036,11 @@ fn finish(args: &RunArgs, top: &Path, journal: &Path, execution: Execution) -> i
         },
     )
     .map_err(io::Error::other)?;
-    let lower = crate::MountLowerStack::compose(base.source(), &args.lower)?;
+    let lower = crate::MountLowerStack::compose(
+        base.source(),
+        &args.lower,
+        &crate::lower_stack_services(),
+    )?;
     if args.seal || args.pack.is_some() {
         overlay_seal::seal(top, &base, lower.clone())?;
     }

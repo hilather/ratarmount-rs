@@ -370,7 +370,14 @@ pub(super) fn lower_view(
     meta: Option<&OverlayMeta>,
 ) -> Result<std::sync::Arc<dyn ratarmount_core::MountSource>, String> {
     let lowers = lower_paths(lower, meta)?;
-    super::MountLowerStack::open(base.source(), None, &lowers, false).map(|(_, view)| view)
+    super::MountLowerStack::open(
+        base.source(),
+        None,
+        &lowers,
+        false,
+        &super::lower_stack_services(),
+    )
+    .map(|(_, view)| view)
 }
 
 /// What the identity gate decided for `seal`, `pack` and `diff`.

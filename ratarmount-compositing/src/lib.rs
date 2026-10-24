@@ -13,6 +13,7 @@ mod empty_archive;
 mod folder;
 pub mod host_stat;
 pub mod journal_recovery;
+pub mod lower_stack;
 mod oci_whiteout;
 pub mod overlay_changes;
 pub mod overlay_db;

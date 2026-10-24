@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser};
 use nix::unistd::{fork, setsid, ForkResult};
+pub(crate) use ratarmount_compositing::lower_stack::MountLowerStack;
 use ratarmount_compositing::{
     maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource, ControlFolderOptions,
     OverlayError, WriteOverlay, HIDDEN_DB,
@@ -1400,22 +1401,12 @@ struct MountedBase {
     existing_journals: Vec<PathBuf>,
 }
 
-/// Whether [`MountLowerStack`] compares the mounted base with the bottom
-/// lower's recorded identity. Only the mount path enforces it; offline
-/// commands (`verify`, `seal`, `pack`, `diff`, import) report base problems
-/// through their own checks.
+/// Mount-path policy for comparing the mounted base with the bottom lower's
+/// recorded identity. Offline commands use [`MountLowerStack::open`] /
+/// [`MountLowerStack::open_in`], which read the recorded digest and do not
+/// take this policy.
 enum BaseIdentity {
-    Offline,
     Enforce { base: MountedBase, force: bool },
-}
-
-struct MountLowerStack {
-    layers: Vec<(PathBuf, ratarmount_compositing::Immutability)>,
-    records: Vec<ratarmount_compositing::LowerLayerRecord>,
-    /// Identity of the base this stack is mounted on: the mounted base's own
-    /// when [`BaseIdentity::Enforce`] measured it (empty when unknown), else
-    /// the digest recorded by the bottom lower.
-    base_digest: Option<String>,
 }
 
 /// Compare the mounted base with what the bottom lower recorded, using
@@ -1482,256 +1473,12 @@ fn mounted_base_identity(
     Ok(identity)
 }
 
-impl MountLowerStack {
-    /// Open the same sealed lower stack used by the mount CLI for offline consumers.
-    pub(crate) fn compose(
-        base: Arc<dyn ratarmount_core::MountSource>,
-        paths: &[PathBuf],
-    ) -> std::io::Result<Arc<dyn ratarmount_core::MountSource>> {
-        Self::open(base, None, paths, false)
-            .map(|(_, view)| view)
-            .map_err(std::io::Error::other)
-    }
-
-    /// Open the lower stack on top of an existing `base`, bottom-up. A bundle
-    /// is verified against the view beneath it (base plus the lowers below)
-    /// before it is cached, so the base must exist first. `base_key` is the
-    /// base's strong digest when the caller already has one without reading
-    /// content (a supplied `--base-digest`, or a cached archive digest); only
-    /// then, and only above sealed immutable lowers, may a previous
-    /// verification be trusted instead of repeated.
-    pub(crate) fn open(
-        base: Arc<dyn ratarmount_core::MountSource>,
-        base_key: Option<&str>,
-        paths: &[PathBuf],
-        allow_unsealed: bool,
-    ) -> Result<(Self, Arc<dyn ratarmount_core::MountSource>), String> {
-        Self::open_in(base, base_key, paths, allow_unsealed, None)
-    }
-
-    /// [`Self::open`] with an explicit bundle cache directory (tests).
-    pub(crate) fn open_in(
-        base: Arc<dyn ratarmount_core::MountSource>,
-        base_key: Option<&str>,
-        paths: &[PathBuf],
-        allow_unsealed: bool,
-        cache: Option<&Path>,
-    ) -> Result<(Self, Arc<dyn ratarmount_core::MountSource>), String> {
-        Self::open_with(
-            base,
-            base_key,
-            paths,
-            allow_unsealed,
-            cache,
-            &BaseIdentity::Offline,
-        )
-    }
-
-    /// [`Self::open_in`] with the base identity policy (see [`BaseIdentity`]).
-    fn open_with(
-        base: Arc<dyn ratarmount_core::MountSource>,
-        base_key: Option<&str>,
-        paths: &[PathBuf],
-        allow_unsealed: bool,
-        cache: Option<&Path>,
-        identity: &BaseIdentity,
-    ) -> Result<(Self, Arc<dyn ratarmount_core::MountSource>), String> {
-        use ratarmount_compositing::{Immutability, LowerLayerRecord, OverlayMeta};
-        use sha2::{Digest, Sha256};
-        let mut stack = Self {
-            layers: Vec::new(),
-            records: Vec::new(),
-            base_digest: None,
-        };
-        let mut view = base;
-        for path in paths {
-            let cached;
-            let path = if path.is_file() {
-                let marker_key = base_key
-                    .filter(|_| {
-                        stack.layers.iter().zip(&stack.records).all(|((_, im), r)| {
-                            *im == Immutability::Immutable && !r.layer_digest.is_empty()
-                        })
-                    })
-                    .map(|key| {
-                        let mut hasher = Sha256::new();
-                        hasher.update(key.as_bytes());
-                        for record in &stack.records {
-                            hasher.update([0]);
-                            hasher.update(record.layer_digest.as_bytes());
-                        }
-                        format!("{:x}", hasher.finalize())
-                    });
-                cached = match cache {
-                    Some(cache) => overlay_pack::cached_lower_in(
-                        path,
-                        cache,
-                        view.clone(),
-                        marker_key.as_deref(),
-                    ),
-                    None => overlay_pack::cached_lower(path, view.clone(), marker_key.as_deref()),
-                }
-                .map_err(|e| format!("lower bundle {}: {e}", path.display()))?;
-                &cached
-            } else {
-                path
-            };
-            let path = path
-                .canonicalize()
-                .map_err(|e| format!("lower {}: {e}", path.display()))?;
-            let meta = OverlayMeta::read(&path).map_err(|e| overlay_open_error(&path, &e))?;
-            let sealed = meta.as_ref().is_some_and(OverlayMeta::layer_sealed);
-            if !sealed && !allow_unsealed {
-                return Err(format!(
-                    "lower {} is unsealed; pass --allow-unsealed-lower to use it",
-                    path.display()
-                ));
-            }
-            if stack.records.is_empty() {
-                stack.base_digest = match identity {
-                    BaseIdentity::Offline => meta
-                        .as_ref()
-                        .and_then(|m| m.base_digest())
-                        .map(str::to_owned),
-                    BaseIdentity::Enforce { base, force } => {
-                        Some(mounted_base_identity(&path, meta.as_ref(), base, *force)?)
-                    }
-                };
-            }
-            stack.records.push(LowerLayerRecord {
-                path: path.clone(),
-                layer_digest: meta
-                    .as_ref()
-                    .and_then(|m| m.get("layer_digest"))
-                    .unwrap_or("")
-                    .into(),
-                sealed_at: meta
-                    .as_ref()
-                    .and_then(|m| m.get("sealed_at"))
-                    .unwrap_or("")
-                    .into(),
-            });
-            let immutability = if sealed {
-                Immutability::Immutable
-            } else {
-                Immutability::Shared
-            };
-            view = ratarmount_compositing::compose_stack(view, &[(path.clone(), immutability)])
-                .map_err(|e| format!("error opening lower stack: {e}"))?;
-            stack.layers.push((path, immutability));
-        }
-        Ok((stack, view))
-    }
-
-    /// Identity a read-only composed mount (no `-w` top) serves through the
-    /// root `user.ratarmount.*` status xattrs. Empty without `--lower`.
-    fn read_only_metadata(&self) -> std::collections::BTreeMap<String, String> {
-        let mut metadata = std::collections::BTreeMap::new();
-        if self.records.is_empty() {
-            return metadata;
-        }
-        let base = self.base_digest.clone().unwrap_or_default();
-        let digests: Vec<&str> = self
-            .records
-            .iter()
-            .map(|r| r.layer_digest.as_str())
-            .collect();
-        // No stack identity without a known base (e.g. an uncached archive).
-        metadata.insert(
-            "stack_digest".into(),
-            if base.is_empty() {
-                String::new()
-            } else {
-                ratarmount_compositing::stack_digest(&base, &digests)
-            },
-        );
-        // An empty base here is an archive that was never hashed.
-        metadata.insert(
-            "base_digest_state".into(),
-            if base.is_empty() {
-                "pending"
-            } else {
-                "present"
-            }
-            .into(),
-        );
-        metadata.insert("base_digest".into(), base);
-        metadata.insert(
-            "lower_layers".into(),
-            serde_json::to_string(&self.records).expect("lower records"),
-        );
-        // The composed view cannot change only when every layer is sealed.
-        if self.records.iter().all(|r| !r.sealed_at.is_empty()) {
-            let top = self.records.last().expect("non-empty");
-            metadata.insert("sealed_at".into(), top.sealed_at.clone());
-        }
-        metadata
-    }
-
-    fn check_top(&self, dir: &Path, force: bool) -> Result<(), String> {
-        use ratarmount_compositing::OverlayMeta;
-        // A missing, unreadable, corrupt or locked database is left to
-        // `WriteOverlay::new`, whose errors name the file and the way out
-        // (#89); it also refuses a sealed top inside its open transaction.
-        if std::fs::symlink_metadata(dir.join(HIDDEN_DB)).is_err() {
-            return Ok(());
-        }
-        let Ok(meta) = OverlayMeta::read(dir) else {
-            return Ok(());
-        };
-        if meta.as_ref().is_some_and(OverlayMeta::layer_sealed) {
-            return Err(format!(
-                "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
-                dir.display()
-            ));
-        }
-        let recorded = meta
-            .as_ref()
-            .map(OverlayMeta::lower_layers)
-            .transpose()
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
-        let same = recorded.len() == self.records.len()
-            && recorded.iter().zip(&self.records).all(|(a, b)| {
-                std::path::absolute(&a.path).is_ok_and(|path| path == b.path)
-                    && a.layer_digest == b.layer_digest
-            });
-        if same {
-            return Ok(());
-        }
-        if !force {
-            return Err(format!("overlay {} stack mismatch: recorded lower_layers {}; given --lower {}; pass --force-stack-mismatch to override",
-                dir.display(), serde_json::to_string(&recorded).expect("lower records"),
-                serde_json::to_string(&self.records).expect("lower records")));
-        }
-        let mut conn = ratarmount_compositing::open_overlay_db(
-            &dir.join(HIDDEN_DB),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-            ratarmount_compositing::DbName::Path,
-        )
-        .map_err(|e| e.to_string())?;
-        conn.busy_timeout(Duration::ZERO)
-            .map_err(|e| e.to_string())?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
-            .map_err(|e| e.to_string())?;
-        if OverlayMeta::from_connection(&tx)
-            .map_err(|e| e.to_string())?
-            .as_ref()
-            .is_some_and(OverlayMeta::layer_sealed)
-        {
-            return Err("overlay is sealed; mount it with --lower, or `overlay unseal`".into());
-        }
-        tx.execute_batch(ratarmount_compositing::overlay_meta::META_SCHEMA)
-            .map_err(|e| e.to_string())?;
-        let timestamp: String = tx
-            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |row| {
-                row.get(0)
-            })
-            .map_err(|e| e.to_string())?;
-        OverlayMeta::set(&tx, "stack_mismatch_forced_at", &timestamp).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
-    }
+fn bottom_identity<'a>(
+    identity: &'a BaseIdentity,
+) -> impl Fn(&Path, Option<&ratarmount_compositing::OverlayMeta>) -> Result<String, String> + 'a {
+    let BaseIdentity::Enforce { base, force } = identity;
+    let force = *force;
+    move |path, meta| mounted_base_identity(path, meta, base, force)
 }
 
 fn main() {
@@ -2578,7 +2325,8 @@ fn main() {
         &args.lower,
         args.allow_unsealed_lower,
         None,
-        &lower_identity,
+        &bottom_identity(&lower_identity),
+        &lower_stack_services(),
     )
     .unwrap_or_else(|error| {
         eprintln!("error: {error}");
@@ -4971,6 +4719,26 @@ fn overlay_open_error(overlay_path: &Path, e: &OverlayError) -> String {
             db.display()
         ),
         _ => format!("error creating write overlay: {e}"),
+    }
+}
+
+pub(crate) fn resolve_lower_bundle(
+    path: &Path,
+    view: Arc<dyn MountSource>,
+    marker_key: Option<&str>,
+    cache: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    match cache {
+        Some(cache) => overlay_pack::cached_lower_in(path, cache, view, marker_key),
+        None => overlay_pack::cached_lower(path, view, marker_key),
+    }
+}
+
+pub(crate) fn lower_stack_services(
+) -> ratarmount_compositing::lower_stack::LowerStackServices<'static> {
+    ratarmount_compositing::lower_stack::LowerStackServices {
+        resolve_bundle: &resolve_lower_bundle,
+        format_meta_error: &overlay_open_error,
     }
 }
 
@@ -9045,7 +8813,10 @@ mod lower_stack_tests {
             Arc::new(FolderMountSource::new(base).unwrap());
         drop(crate::base_identity::fixtures::new_overlay(view.clone(), &dir).unwrap());
         let paths = [dir.clone()];
-        let open = |allow| MountLowerStack::open(view.clone(), None, &paths, allow).map(|r| r.0);
+        let open = |allow| {
+            MountLowerStack::open(view.clone(), None, &paths, allow, &lower_stack_services())
+                .map(|r| r.0)
+        };
         assert!(open(false).err().unwrap().contains("unsealed"));
         let stack = open(true).unwrap();
         assert_eq!(stack.layers[0].1, Immutability::Shared);
@@ -9124,9 +8895,17 @@ mod lower_stack_tests {
             ],
         );
         let paths = [lower];
-        let (stack, _) =
-            MountLowerStack::open_with(view, None, &paths, false, None, &enforce(&base, false))
-                .unwrap();
+        let policy = enforce(&base, false);
+        let (stack, _) = MountLowerStack::open_with(
+            view,
+            None,
+            &paths,
+            false,
+            None,
+            &bottom_identity(&policy),
+            &lower_stack_services(),
+        )
+        .unwrap();
         let metadata = stack.read_only_metadata();
         assert_eq!(metadata["base_digest"], weak);
         assert_eq!(
@@ -9173,19 +8952,39 @@ mod lower_stack_tests {
         let paths = [lower];
         let view: Arc<dyn ratarmount_core::MountSource> =
             Arc::new(FolderMountSource::new(&copy).unwrap());
-        MountLowerStack::open_in(view.clone(), None, &paths, false, None).unwrap();
+        MountLowerStack::open_in(
+            view.clone(),
+            None,
+            &paths,
+            false,
+            None,
+            &lower_stack_services(),
+        )
+        .unwrap();
+        let refuse = enforce(&copy, false);
         let error = MountLowerStack::open_with(
             view.clone(),
             None,
             &paths,
             false,
             None,
-            &enforce(&copy, false),
+            &bottom_identity(&refuse),
+            &lower_stack_services(),
         )
         .err()
         .unwrap();
         assert!(error.contains("--force-stack-mismatch"), "{error}");
-        MountLowerStack::open_with(view, None, &paths, false, None, &enforce(&copy, true)).unwrap();
+        let allow = enforce(&copy, true);
+        MountLowerStack::open_with(
+            view,
+            None,
+            &paths,
+            false,
+            None,
+            &bottom_identity(&allow),
+            &lower_stack_services(),
+        )
+        .unwrap();
     }
 
     /// An archive base whose digest is not cached has no identity to report:
@@ -9211,13 +9010,15 @@ mod lower_stack_tests {
             ],
         );
         let paths = [lower];
+        let policy = enforce(&archive, false);
         let (stack, _) = MountLowerStack::open_with(
             view,
             None,
             &paths,
             false,
             Some(root.path()),
-            &enforce(&archive, false),
+            &bottom_identity(&policy),
+            &lower_stack_services(),
         )
         .unwrap();
         let metadata = stack.read_only_metadata();
