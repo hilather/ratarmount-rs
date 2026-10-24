@@ -1986,11 +1986,30 @@ locking style per filesystem (auto). Managed byte readers use `"unix"`
 copy, create or descriptor conversion fails the check until it is classified,
 and so does a form the scanner cannot follow: an import from `std::fs` or
 `tokio::fs` it cannot resolve, or an `OpenOptions` builder bound to a variable
-that escapes its function. A production module whose source is under a
-`tests`, `benches` or `examples` directory (`#[path = "tests/reader.rs"]`,
-and a module that file declares) is scanned with the rest of the crate. The
-directory walk still skips those directories, so an integration test, bench
-or example that no production module names stays out of the inventory. Any
+that escapes its function. The directory walk skips `target` (Cargo
+build output), `vendor` (third-party crates), `test-harness` (CI fixtures),
+`clients` (language bindings), `benchmarks` (benchmark programs), every
+`build.rs`, and any `tests`, `benches` or `examples` directory. A production
+module whose file exists inside the workspace is scanned wherever it lives
+(`#[path = "tests/reader.rs"]`, `#[path = "../../benchmarks/r.rs"]`,
+`#[path = "../build.rs"]`, a `vendor/` target, and a module that file
+declares). A `#[path]` file's submodules are resolved beside that path
+(rustc does not insert the file stem, and a symlink is not retargeted).
+Raw strings, comments in the attribute, and `#[cfg_attr(not(test), path = "...")]`
+are recognized, including when `path` follows another meta (`allow`, `doc`)
+or is nested (`cfg_attr(not(test), cfg_attr(all(), path = "..."))`). Cooked
+`\u{...}` and `\xHH` escapes are decoded; a raw string is not, and an
+unknown escape is reported. A `#[path]` file the walk already loaded is
+resolved again once that declaration is seen. A nested file named `lib.rs`
+or `main.rs` inserts the stem; only `src/lib.rs`, `src/main.rs`, a top-level
+`lib.rs` or `main.rs`, and `src/bin/*.rs` are crate roots. A `cfg_attr` path whose predicate is unknown for a
+production build is reported; a path that is known is still loaded. A target outside the workspace is reported and not opened. That includes
+an absolute path, a symlink to an outside file, and `..` after a directory
+symlink (`realpath`, not lexical `normpath`). A fifo or other non-regular
+file is not opened either. A production `include!` (such as
+`include!(concat!(env!("OUT_DIR"), ...))`) is reported as unsupported and
+the generated file is not scanned. An integration test, bench, example or
+build script that no production module names stays out of the inventory. Any
 `.create(..)` or `.create_new(..)` argument other than a literal `false`
 counts as a create that needs a mode policy; a managed
 read reaching a raw helper is found through `use .. as` renames of the helper or
