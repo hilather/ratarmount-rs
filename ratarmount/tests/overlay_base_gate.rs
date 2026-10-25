@@ -72,6 +72,7 @@ enum Verb {
     Seal,
     Pack,
     Diff,
+    Verify,
 }
 
 /// A base of the given kind, and an overlay over it. `seal` seals the overlay
@@ -141,6 +142,7 @@ fn verb(env: &Env, v: Verb, overlay: &Path, base: &Path, extra: &[&str]) -> Outp
         Verb::Seal => vec!["overlay", "seal", s(overlay), s(base)],
         Verb::Pack => vec!["overlay", "pack", s(overlay), s(&bundle), s(base)],
         Verb::Diff => vec!["diff", s(overlay), s(base), "--hash", "--json"],
+        Verb::Verify => vec!["overlay", "verify", s(overlay), s(base)],
     };
     args.extend_from_slice(extra);
     env.run(&args)
@@ -365,6 +367,7 @@ fn regression_unchanged_base_passes_without_hashing() {
                 Verb::Seal => vec!["overlay", "seal", s(&overlay), s(&base)],
                 Verb::Pack => vec!["overlay", "pack", s(&overlay), s(&bundle), s(&base)],
                 Verb::Diff => vec!["diff", s(&overlay), s(&base), "--hash", "--json"],
+                Verb::Verify => vec!["overlay", "verify", s(&overlay), s(&base)],
             };
             let out = env.run_env(&args, &[("RATARMOUNT_TEST_HASH_LOG", &log)]);
             assert_eq!(out.status.code(), Some(0), "{kind:?} {v:?}: {}", text(&out));
@@ -1463,4 +1466,141 @@ fn regression_forced_pack_to_same_tree_repo_keeps_git_tree_row() {
         "a changed tree was accepted: {}",
         text(&out)
     );
+}
+
+// ---- #174: a pending commit journal on the base ----------------------------
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn have_gnu_tar() -> bool {
+    Command::new("tar")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("GNU tar"))
+}
+
+/// Leave `archive` mid-commit the way a crash does (journal on disk): the
+/// hook dies at `archive truncate` (torn) or `locator complete` (rolls
+/// forward on recovery).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::disallowed_methods)]
+fn crash_commit(archive: &Path, complete: bool) {
+    use std::io::Write;
+    let len = fs::metadata(archive).unwrap().len();
+    let mut suffix = tempfile::tempfile().unwrap();
+    suffix.write_all(&[0u8; 1536]).unwrap();
+    let step = if complete {
+        "locator complete"
+    } else {
+        "archive truncate"
+    };
+    let crashed = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+        archive,
+        len - 1024,
+        &mut suffix,
+        &mut |s| {
+            if s == step {
+                Err(std::io::Error::other("crash"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(crashed.is_err());
+}
+
+/// Regression (#174): an offline verb's classification open ran commit-journal
+/// recovery through the factory under `Owner::Inode`, so `mv B A` where B
+/// carries its own interrupted journal let `overlay seal`/`pack`/`verify` and
+/// `diff` rewrite B and unlink its journal before the base gate refused.
+/// Verbs never recover now: the pending journal refuses classification, and B
+/// and its journal stay byte-identical.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_verbs_leave_pending_commit_journal_untouched() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for complete in [false, true] {
+        for v in [Verb::Seal, Verb::Pack, Verb::Diff, Verb::Verify] {
+            let env = Env::new();
+            let (base, overlay) = fixture(&env, Kind::Archive, !matches!(v, Verb::Seal));
+            let foreign = env.path("foreign.tar");
+            assert!(Command::new("tar")
+                .args([
+                    "cf",
+                    s(&foreign),
+                    "-C",
+                    s(&env.path("basedir")),
+                    "x.txt",
+                    "y.txt",
+                ])
+                .status()
+                .unwrap()
+                .success());
+            crash_commit(&foreign, complete);
+            let bytes = fs::read(&foreign).unwrap();
+            let journal = ratarmount_compress::commit_journal::journal_path(&foreign);
+            let journal_bytes = fs::read(&journal).unwrap();
+            fs::rename(&foreign, &base).unwrap();
+            let out = verb(&env, v, &overlay, &base, &[]);
+            assert!(
+                !out.status.success(),
+                "{v:?} complete={complete}: must refuse: {}",
+                text(&out)
+            );
+            assert_eq!(
+                fs::read(&base).unwrap(),
+                bytes,
+                "{v:?} complete={complete}: archive"
+            );
+            assert_eq!(
+                fs::read(&journal).unwrap(),
+                journal_bytes,
+                "{v:?} complete={complete}: journal"
+            );
+            if matches!(v, Verb::Seal) {
+                assert!(!meta_of(&overlay).layer_sealed(), "sealed anyway");
+            }
+            assert!(!env.path("bundle.tar.zst").exists(), "{v:?} wrote a bundle");
+        }
+    }
+}
+
+/// Regression (#174): a commit journal deleted while its `A`/`C` locator is
+/// still on the archive (torn or committed bytes, nothing to recover from) is
+/// refused by verbs exactly as the factory's recovery refused it before.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_verbs_refuse_missing_commit_journal() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    for complete in [false, true] {
+        for v in [Verb::Seal, Verb::Pack, Verb::Diff, Verb::Verify] {
+            let env = Env::new();
+            let (base, overlay) = fixture(&env, Kind::Archive, !matches!(v, Verb::Seal));
+            crash_commit(&base, complete);
+            let bytes = fs::read(&base).unwrap();
+            let journal = ratarmount_compress::commit_journal::journal_path(&base);
+            fs::remove_file(&journal).unwrap();
+            let out = verb(&env, v, &overlay, &base, &[]);
+            assert!(
+                !out.status.success(),
+                "{v:?} complete={complete}: must refuse: {}",
+                text(&out)
+            );
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("commit-journal locator"),
+                "{v:?} complete={complete}: {err}"
+            );
+            assert_eq!(
+                fs::read(&base).unwrap(),
+                bytes,
+                "{v:?} complete={complete}: archive"
+            );
+        }
+    }
 }

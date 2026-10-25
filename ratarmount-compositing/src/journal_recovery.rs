@@ -646,6 +646,40 @@ pub fn recover_journal_at(
     recover_journal(archive, rows, owner)
 }
 
+/// The journal rule an offline open owes a base. Journals are never applied
+/// here — recovery is a mount's or a commit's write — but the states a
+/// recovery would refuse stay refused, read-only: a pending journal that was
+/// started for the file `member` resolves to now, or an active/complete
+/// locator whose journal is missing or moved. A prepare/done locator without
+/// its journal (nothing was replaced / the commit finished; mounts clear or
+/// tolerate those) and a journal naming another inode are not refused.
+#[doc(hidden)] // cross-crate seam for ratarmount's offline classification; not public API
+pub fn check_offline_journal(member: &Path) -> io::Result<()> {
+    let (pending, missing) = commit_journal::offline_journal_probe(member)?;
+    if let Some(journal) = pending {
+        if owns(&journal, member) {
+            return Err(io::Error::other(format!(
+                "{} carries a pending commit journal from an interrupted commit; recover it \
+                     first (`ratarmount --no-mount {}` rolls the interrupted append back or \
+                     forward)",
+                member.display(),
+                member.display()
+            )));
+        }
+    }
+    if let Some((phase, path)) = missing {
+        return Err(io::Error::other(format!(
+            "{} carries a {phase} commit-journal locator but its journal {} is missing or \
+                 moved; recover it through the archive's current directory name, or verify the \
+                 archive and remove its user.ratarmount.commit-journal xattr (setfattr -x on \
+                 Linux, xattr -d on macOS)",
+            member.display(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// `verify`'s journal rule: the archive at `path` carries its OWN pending
 /// journal (started for this very inode) that agrees with the record, which
 /// names `path`. The stamp then differs only because recovery has not run yet.

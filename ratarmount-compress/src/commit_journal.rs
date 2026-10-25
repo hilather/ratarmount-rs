@@ -337,19 +337,79 @@ pub struct PendingJournal {
     pub complete: bool,
 }
 
-/// The journal pending for `archive`, found the way [`recover_with`] finds it
-/// (the inode locator first, then the sibling path). `Ok(None)` when there is
-/// none or the platform has no journals. Never writes.
-pub fn pending(archive: &Path) -> io::Result<Option<PendingJournal>> {
+/// What the shared read-only probe found at `archive`. Private: the only
+/// cross-crate view is [`offline_journal_probe`]'s tuple.
+// The non-`None` variants are constructed only where journals exist.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+enum JournalProbe {
+    /// Neither a locator nor a journal file is present.
+    None,
+    /// A journal file is present; the header says whose it is.
+    Pending(PendingJournal),
+    /// A locator in the recorded phase (`P`, `A`, `C` or `D`) names a journal
+    /// that cannot be found. Phases `A` and `C` are the ones recovery refuses
+    /// (a torn or committed archive with nothing to recover from).
+    Missing(u8, PathBuf),
+    /// The located journal entry is not a regular file: an error for a caller
+    /// reproducing recovery's refusals, tolerated as `Ok(None)` by
+    /// [`pending`] (its long-standing contract).
+    NotRegular,
+}
+
+/// The journal state of `archive`, found the way [`recover_with`] finds it
+/// (the inode locator first, then the sibling path). Never writes; never
+/// locks.
+fn journal_probe(archive: &Path) -> io::Result<JournalProbe> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        unix::pending(archive)
+        unix::probe(archive)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = archive;
-        Ok(None)
+        Ok(JournalProbe::None)
     }
+}
+
+/// The journal pending for `archive`, found the way [`recover_with`] finds it
+/// (the inode locator first, then the sibling path). `Ok(None)` when there is
+/// none or the platform has no journals. Never writes.
+pub fn pending(archive: &Path) -> io::Result<Option<PendingJournal>> {
+    match journal_probe(archive)? {
+        JournalProbe::Pending(journal) => Ok(Some(journal)),
+        _ => Ok(None),
+    }
+}
+
+/// Read-only journal probe backing
+/// `ratarmount_compositing::journal_recovery::check_offline_journal` — one
+/// pass over [`journal_probe`], exposing no new types: the pending journal's
+/// header when a journal file is present, else the locator's phase word and
+/// the journal path it names when a locator in the active or complete phase
+/// cannot find its journal — the states a recovery would refuse. Hidden
+/// cross-crate seam; not public API.
+#[doc(hidden)]
+#[allow(clippy::type_complexity)]
+pub fn offline_journal_probe(
+    archive: &Path,
+) -> io::Result<(Option<PendingJournal>, Option<(&'static str, PathBuf)>)> {
+    Ok(match journal_probe(archive)? {
+        JournalProbe::Pending(journal) => (Some(journal), None),
+        JournalProbe::Missing(phase @ (b'A' | b'C'), path) => (
+            None,
+            Some((
+                match phase {
+                    b'A' => "active",
+                    _ => "complete",
+                },
+                path,
+            )),
+        ),
+        JournalProbe::NotRegular => {
+            return Err(io::Error::other("commit journal is not a regular file"));
+        }
+        _ => (None, None),
+    })
 }
 
 /// Why a journaled replacement did not finish. Every variant after
@@ -1174,10 +1234,10 @@ mod unix {
         })
     }
 
-    pub(super) fn pending(archive: &Path) -> io::Result<Option<PendingJournal>> {
-        let probe = match File::open(archive) {
+    pub(super) fn probe(archive: &Path) -> io::Result<JournalProbe> {
+        let file = match File::open(archive) {
             Ok(f) if f.metadata()?.is_file() => f,
-            Ok(_) => return Ok(None),
+            Ok(_) => return Ok(JournalProbe::None),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -1186,22 +1246,25 @@ mod unix {
                         | io::ErrorKind::PermissionDenied
                 ) =>
             {
-                return Ok(None)
+                return Ok(JournalProbe::None)
             }
             Err(e) => return Err(e),
         };
-        let marker = get_marker(&probe)?;
-        let complete = marker
-            .as_ref()
-            .is_some_and(|(state, _)| matches!(state, b'C' | b'D'));
-        let (path, present) = locate(archive, &probe, marker.map(|(_, p)| p))?;
+        let marker = get_marker(&file)?;
+        let phase = marker.as_ref().map(|(state, _)| *state);
+        let complete = phase.is_some_and(|state| matches!(state, b'C' | b'D'));
+        let (path, present) = locate(archive, &file, marker.map(|(_, p)| p))?;
+        let missing = |phase: Option<u8>| match phase {
+            Some(p) => JournalProbe::Missing(p, path.clone()),
+            None => JournalProbe::None,
+        };
         if !present {
-            return Ok(None);
+            return Ok(missing(phase));
         }
         let mut journal = match open_journal(&path) {
             Ok(f) if f.metadata()?.is_file() => f,
-            Ok(_) => return Ok(None),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) => return Ok(JournalProbe::NotRegular),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(missing(phase)),
             Err(e) => return Err(e),
         };
         let mut header = [0; HEADER_LEN as usize];
@@ -1209,7 +1272,7 @@ mod unix {
         if &header[..8] != MAGIC {
             return Err(io::Error::other("journal header/length mismatch"));
         }
-        Ok(Some(parse_pending(&header, complete)))
+        Ok(JournalProbe::Pending(parse_pending(&header, complete)))
     }
 
     /// Where the journal of the file `file` (opened through the name
@@ -2013,6 +2076,19 @@ mod tests {
         assert_eq!(fs::read(&journal).unwrap(), journal_before);
         assert!(recover(&path).unwrap());
         assert_eq!(pending(&path).unwrap(), None);
+    }
+
+    /// Regression (#174): `pending` keeps its long-standing tolerance for a
+    /// journal entry that is not a regular file (`Ok(None)`), while the
+    /// read-only offline check refuses it the way recovery does.
+    #[test]
+    fn regression_pending_tolerates_nonregular_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive");
+        fs::write(&path, b"plain").unwrap();
+        fs::create_dir(journal_path(&path)).unwrap();
+        assert_eq!(pending(&path).unwrap(), None);
+        assert!(offline_journal_probe(&path).is_err());
     }
 
     fn marker_present(path: &Path) -> bool {
