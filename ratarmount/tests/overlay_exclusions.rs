@@ -1,6 +1,6 @@
 //! Regression: the recorded exclusion set of a directory base's weak digest
-//! (overlay, journal, lowers, mount point) through the real CLI. Overlay
-//! creation and remount need no /dev/fuse; mounts and `--journal` do (Linux).
+//! (overlay, journal, lowers) through the real CLI. Overlay creation and
+//! remount need no /dev/fuse; mounts and `--journal` do (Linux).
 
 use std::ffi::OsStr;
 use std::fs;
