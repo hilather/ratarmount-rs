@@ -100,6 +100,18 @@ def main():
             ('optional-between', 'macro_rules! m { ($h:tt; $(($b:tt))?; $a:meta) => { $h $($b)? [$a] pub fn hidden() { let _=std::fs::read("x"); } } } m!(#; ; cfg(windows));'),
         ]:
             run(name, source, reject='N3')
+        # Regression: one capture name has different tokens across repetition
+        # iterations; an unknown repeated prefix must not hide a fixed read.
+        for name, source in [
+            ('repeated-prefix-star', 'macro_rules! m { ($($a:tt)*) => { pub fn visible() { $($a)* std::fs::read("x").unwrap(); } } } m!(#[cfg(windows)]);'),
+            ('repeated-prefix-plus', 'macro_rules! m { ($($a:tt)+) => { pub fn visible() { $($a)+ std::fs::read("x").unwrap(); } } } m!(#[cfg(windows)]);'),
+            ('repeated-prefix-optional', 'macro_rules! m { ($(($($a:tt)*))?) => { pub fn visible() { $($($a)*)? std::fs::read("x").unwrap(); } } } m!((#[cfg(windows)]));'),
+        ]:
+            run(name, source, reject='N3')
+        run('harmless-repeated-arguments', 'macro_rules! m { ($($a:tt),*) => { pub fn values() -> [u8; 2] { [$($a),*] } } } m!(1, 2);')
+        run('harmless-repeated-statements', 'macro_rules! m { ($($a:tt)*) => { pub fn values() { $(let _ = $a;)* } } } m!(1 2);')
+        run('harmless-trailing-macro-arguments', 'macro_rules! m { ($($a:tt)*) => { pub fn values() -> String { format!("prefix {}", $($a)*) } } } m!(7);')
+        run('whole-item-forwarding', 'macro_rules! m { ($($a:tt)*) => { $($a)* } } m!(pub fn visible() {});')
         run('nested-typed-indexing', 'macro_rules! outer { ($e:expr) => { macro_rules! inner { () => { $e[0] }; } pub fn first() -> u8 { inner!() } } } outer!([7]);')
         run('typed-ident-indexing', 'macro_rules! m { ($array:ident) => { $array[0] }; } pub fn first(array: [u8; 1]) -> u8 { m!(array) }')
         run('ambiguous-tt-indexing', 'macro_rules! m { ($array:tt) => { $array[0] }; } pub fn first(array: [u8; 1]) -> u8 { m!(array) }', reject='N3')

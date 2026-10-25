@@ -66,9 +66,27 @@ fn matcher_fragments(
     }
 }
 
-// Retain capture identities: repeating one opaque token-tree payload is
-// forwarding, not an attribute prefix assembled by the macro definition.
-type AttributeStates = BTreeSet<(u8, Option<String>, Option<String>)>;
+// A non-repeated capture denotes one opaque token. Repeated captures are
+// unknown: the same name can supply different punctuation in each iteration.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CaptureIdentity {
+    Single(String),
+    Repeated,
+}
+type AttributeStates = BTreeSet<(u8, Option<CaptureIdentity>, Option<CaptureIdentity>)>;
+
+fn same_single_capture(identity: &Option<CaptureIdentity>, name: &str, repeated: bool) -> bool {
+    !repeated && matches!(identity, Some(CaptureIdentity::Single(captured)) if captured == name)
+}
+
+fn whole_payload_forwarding(tokens: &[TokenTree]) -> bool {
+    matches!(tokens, [TokenTree::Punct(dollar), TokenTree::Group(body), TokenTree::Punct(quantifier)]
+        if dollar.as_char() == '$'
+            && body.delimiter() == Delimiter::Parenthesis
+            && matches!(quantifier.as_char(), '*' | '+' | '?')
+            && matches!(body.stream().into_iter().collect::<Vec<_>>().as_slice(),
+                [TokenTree::Punct(capture), TokenTree::Ident(_)] if capture.as_char() == '$'))
+}
 
 fn no_attribute_prefix() -> AttributeStates {
     BTreeSet::from([(0, None, None)])
@@ -90,7 +108,7 @@ impl Audit {
         fragments: &std::collections::BTreeMap<String, String>,
     ) {
         if transcriber {
-            self.attribute_tokens(tokens.clone(), no_attribute_prefix(), fragments);
+            self.attribute_tokens(tokens.clone(), no_attribute_prefix(), fragments, false);
         }
         let tokens: Vec<_> = tokens.into_iter().collect();
         for (i, token) in tokens.iter().enumerate() {
@@ -305,23 +323,38 @@ impl Audit {
         tokens: TokenStream,
         mut states: AttributeStates,
         fragments: &std::collections::BTreeMap<String, String>,
+        repeated_capture: bool,
     ) -> AttributeStates {
         let tokens: Vec<_> = tokens.into_iter().collect();
         let mut i = 0;
         while i < tokens.len() {
+            // An opaque trailing payload has no fixed suffix to hide. Preserve
+            // whole-item and macro-argument forwarding only outside an active
+            // attribute prefix or an enclosing unknown repetition.
+            if !repeated_capture
+                && states == no_attribute_prefix()
+                && whole_payload_forwarding(&tokens[i..])
+            {
+                return no_attribute_prefix();
+            }
             if matches!(&tokens[i], TokenTree::Punct(p) if p.as_char() == '$') {
                 if let Some(TokenTree::Ident(name)) = tokens.get(i + 1) {
                     let name = normalized_ident(name);
                     match fragments.get(&name).map(String::as_str) {
                         Some("tt") | None if name != "crate" => {
                             let mut possible = no_attribute_prefix();
-                            possible.insert((1, Some(name.clone()), None));
+                            let identity = if repeated_capture {
+                                CaptureIdentity::Repeated
+                            } else {
+                                CaptureIdentity::Single(name.clone())
+                            };
+                            possible.insert((1, Some(identity.clone()), None));
                             for (prefix, hash, bang) in &states {
-                                // One capture cannot be both punctuation and a
-                                // bracket group. Plain tt forwarding stays opaque.
+                                // A single capture cannot be both punctuation
+                                // and a bracket group. Repetition is unknown.
                                 if *prefix != 0
-                                    && hash.as_ref() != Some(&name)
-                                    && bang.as_ref() != Some(&name)
+                                    && !same_single_capture(hash, &name, repeated_capture)
+                                    && !same_single_capture(bang, &name, repeated_capture)
                                 {
                                     self.emit(
                                         tokens[i].span(),
@@ -329,8 +362,10 @@ impl Audit {
                                         "metavariable transcriber attribute prefix",
                                     );
                                 }
-                                if *prefix == 1 && hash.as_ref() != Some(&name) {
-                                    possible.insert((2, hash.clone(), Some(name.clone())));
+                                if *prefix == 1
+                                    && !same_single_capture(hash, &name, repeated_capture)
+                                {
+                                    possible.insert((2, hash.clone(), Some(identity.clone())));
                                 }
                             }
                             states = possible;
@@ -357,8 +392,12 @@ impl Audit {
                         };
                         if let Some(TokenTree::Punct(quantifier)) = tokens.get(end) {
                             if matches!(quantifier.as_char(), '?' | '*' | '+') {
-                                let mut repeated =
-                                    self.attribute_tokens(body.stream(), states.clone(), fragments);
+                                let mut repeated = self.attribute_tokens(
+                                    body.stream(),
+                                    states.clone(),
+                                    fragments,
+                                    true,
+                                );
                                 if quantifier.as_char() != '?' {
                                     let mut reached = repeated.clone();
                                     loop {
@@ -369,6 +408,7 @@ impl Audit {
                                             body.stream(),
                                             repeated,
                                             fragments,
+                                            true,
                                         );
                                         let previous = reached.len();
                                         reached.extend(repeated.iter().cloned());
@@ -525,6 +565,30 @@ mod tests {
         assert!(policies("($array:tt) => { $array[0] };")
             .iter()
             .any(|p| p == "N3"));
+    }
+    /// Regression: different repetition iterations assembled an attribute that
+    /// pruned a fixed read, while same-name capture identities hid the prefix.
+    #[test]
+    fn regression_repeated_capture_attribute_prefix() {
+        for src in [
+            "($($a:tt)*) => { pub fn visible() { $($a)* std::fs::read(\"x\").unwrap(); } }",
+            "($($a:tt)+) => { pub fn visible() { $($a)+ std::fs::read(\"x\").unwrap(); } }",
+            "($(($($a:tt)*))?) => { pub fn visible() { $($($a)*)? std::fs::read(\"x\").unwrap(); } }",
+            "($($a:tt)?) => { $($a)? [allow(dead_code)] pub fn visible() {} }",
+            "($($a:tt)*) => { # $($a)* }",
+        ] {
+            assert!(policies(src).iter().any(|p| p == "N3"), "{src}");
+        }
+        for src in [
+            "($($a:tt),*) => { pub fn values() -> [u8; 2] { [$($a),*] } }",
+            "($($a:tt)*) => { pub fn values() { $(let _ = $a;)* } }",
+            r#"($($a:tt)*) => { pub fn values() -> String { format!("prefix {}", $($a)*) } }"#,
+            "($($a:tt)*) => { $($a)* }",
+            "($($a:tt)+) => { $($a)+ }",
+            "($($a:tt)?) => { $($a)? }",
+        ] {
+            assert!(policies(src).is_empty(), "{src}");
+        }
     }
     /// Regression: forwarding payloads concealed literal nested macro definitions.
     #[test]

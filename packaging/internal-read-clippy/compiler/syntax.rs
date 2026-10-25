@@ -137,6 +137,20 @@ fn contains_link_name(meta: &Meta) -> bool {
     matches!(meta,Meta::List(l) if name(&l.path)=="cfg_attr" && parts(l.tokens.clone()).iter().skip(1).any(contains_link_name))
 }
 
+// This is a spelling refusal, not macro identity resolution. Any explicit
+// rename of a `cfg` import could hide a target cfg! from the syntax check.
+fn renamed_cfg(tree: &ast::UseTree) -> bool {
+    match &tree.kind {
+        ast::UseTreeKind::Simple(Some(_)) => tree
+            .prefix
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident.name.as_str() == "cfg"),
+        ast::UseTreeKind::Nested { items, .. } => items.iter().any(|(tree, _)| renamed_cfg(tree)),
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 struct Syntax {
     states: Vec<(bool, bool)>,
@@ -267,7 +281,7 @@ impl EarlyLintPass for Syntax {
                 && l.path.segments[0].ident.to_string() == "forbid"
                 && parts(l.tokens)
                     .iter()
-                    .any(|m| matches!(m,Meta::Path(p) if name(p)=="unused_macros"))
+                    .any(|m| matches!(m,Meta::Path(p) if p.is_ident("unused_macros")))
         });
         if !valid {
             self.report(
@@ -342,6 +356,16 @@ impl EarlyLintPass for Syntax {
             kind,
             pprust::item_to_string(item),
         );
+        if let ItemKind::Use(tree) = &item.kind {
+            if self.n4(cx, item.span) && renamed_cfg(tree) {
+                self.report(
+                    cx,
+                    item.span,
+                    "N4",
+                    "aliased cfg import outside reviewed file",
+                );
+            }
+        }
         if matches!(item.kind, ItemKind::Mod(..)) {
             self.module_spans.push(item.span);
         }

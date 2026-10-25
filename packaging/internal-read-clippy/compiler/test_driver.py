@@ -25,9 +25,9 @@ def main():
         policy=root/'policy.json'
         sysroot=subprocess.check_output(['rustc','+1.98.0','--print','sysroot'],text=True).strip()
         env={**os.environ,'INTERNAL_READ_ROOT':str(root),'INTERNAL_READ_CONFIG':str(policy),'CLIPPY_CONF_DIR':str(conf),'LD_LIBRARY_PATH':str(Path(sysroot)/'lib'),'RUSTC_BOOTSTRAP':'1'}
-        def run(name,source,*,reject=False,rules=None,crate='control',source_path=None,extra_flags=(),crate_type='lib',native_baseline=False):
+        def run(name,source,*,reject=False,rules=None,crate='control',source_path=None,extra_flags=(),crate_type='lib',native_baseline=False,root_forbid=True):
             (conf/'clippy.toml').write_text(rules or 'disallowed-methods=[{path="std::fs::read",reason="inventory-op:fs::read"}]\ndisallowed-macros=[{path="std::include",reason="review include"}]\n')
-            policy.write_text(json.dumps(config));src=source_path or root/'lib.rs';src.parent.mkdir(parents=True,exist_ok=True);src.write_text('#![forbid(unused_macros)]\n'+source+'\n')
+            policy.write_text(json.dumps(config));src=source_path or root/'lib.rs';src.parent.mkdir(parents=True,exist_ok=True);src.write_text(('#![forbid(unused_macros)]\n' if root_forbid else '')+source+'\n')
             report=root/'report.jsonl';env['INTERNAL_READ_REPORT']=str(report)
             rustargs=[str(src),'--crate-name',crate,'--crate-type='+crate_type,'--edition=2024','--emit=metadata','--out-dir',str(root)]
             baseline=None
@@ -45,6 +45,37 @@ def main():
             if baseline is not None:result['native_baseline_exit']=baseline.returncode
             results.append(result)
             return rows
+        # Regression: a qualified tool lint ending in unused_macros must not
+        # satisfy the production-root requirement or permit dormant read macros.
+        spoof='#![forbid(rustdoc::unused_macros)]\n#![allow(unused_macros)]\nmacro_rules! hidden {()=>{pub fn read(){let _=std::fs::read("x");}}}'
+        rows=run('qualified-unused-macros-forbid',spoof,root_forbid=False,native_baseline=True,reject=True,extra_flags=['-Dwarnings'])
+        assert any(r['kind']=='syntax' and r['policy']=='N3' and 'missing unconditional forbid' in r['detail'] for r in rows)
+        run('exact-unused-macros-forbid-list','#![forbid(dead_code, unused_macros)] pub fn visible(){}',root_forbid=False,native_baseline=True,extra_flags=['-Dwarnings'])
+
+        # Regression: renaming cfg! hid target predicates in restricted files.
+        # Refuse the import syntax, preserving N4's existing file/package scope.
+        package_before=env.get('CARGO_PKG_NAME')
+        env['CARGO_PKG_NAME']=config['classified_packages'][0]
+        config['restricted_packages']=[env['CARGO_PKG_NAME']]
+        aliases={
+            'simple':'use std::cfg as target_cfg;',
+            'grouped':'use std::{cfg as target_cfg};',
+            'nested':'use {std::{cfg as target_cfg}};',
+            'raw':'use ::std::r#cfg as r#target_cfg;',
+        }
+        for name,import_source in aliases.items():
+            rows=run('cfg-alias-'+name,import_source+'pub const VALUE:bool=target_cfg!(windows);',native_baseline=True,reject=True,extra_flags=['-Dwarnings'])
+            assert any(r['kind']=='syntax' and r['policy']=='N4' and 'aliased cfg import' in r['detail'] for r in rows)
+        run('ordinary-cfg-import','use std::cfg; pub const VALUE:bool=cfg!(debug_assertions);',native_baseline=True,extra_flags=['-Dwarnings'])
+        run('unrelated-macro-alias','use std::stringify as target_string; pub const VALUE:&str=target_string!(windows);',native_baseline=True,extra_flags=['-Dwarnings'])
+        reviewed_before=config['reviewed_target_files']
+        config['reviewed_target_files']=[{'file':'lib.rs'}]
+        run('cfg-alias-reviewed',aliases['simple']+'pub const VALUE:bool=target_cfg!(windows);',native_baseline=True,extra_flags=['-Dwarnings'])
+        config['reviewed_target_files']=reviewed_before
+        config['restricted_packages']=[]
+        run('cfg-alias-unrestricted',aliases['simple']+'pub const VALUE:bool=target_cfg!(windows);',native_baseline=True,extra_flags=['-Dwarnings'])
+        if package_before is None:env.pop('CARGO_PKG_NAME')
+        else:env['CARGO_PKG_NAME']=package_before
         for configured in [['std::include'],['core::include'],['std::include','core::include']]:
             rules='disallowed-macros=['+','.join('{path="'+path+'",reason="review include"}' for path in configured)+']\n'
             for pos in ['item','expression']:

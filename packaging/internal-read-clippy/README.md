@@ -73,13 +73,17 @@ metavariable transcriber attributes, including substituted brackets and attribut
 prefixes. Prefix recognition uses matcher fragment kinds and repetition grammar,
 independent of the following item, statement, field or variant. Ambiguous `tt`
 substitutions beside brackets or a distinct capture are refused; typed indexing
-and ordinary macro invocations remain permitted. Repeating one opaque token-tree
-capture retains the documented forwarding gap. Literal nested macro definitions
+and ordinary macro invocations remain permitted. A repetition that can supply an
+unknown attribute prefix before fixed syntax is refused, including `*`, `+` and
+`?` forms. Whole-item forwarding, opaque trailing arguments without an active
+attribute prefix, and harmless separator-delimited repetitions remain permitted. Literal nested macro definitions
 in invocation payloads receive the same grammar audit, with generic matchers and
 other payload data preserved.
-Every production root must forbid unused macros. N4 refuses target predicates in
-the 40 reviewed failed-cross-check packages outside exact reviewed files in
-`policy.json`. File exceptions have no
+Every production root must contain an unconditional `forbid` naming the exact
+single-segment `unused_macros` lint. N4 refuses target predicates and explicit
+`use ... cfg as alias` imports in the 40 reviewed failed-cross-check packages
+outside exact reviewed files in `policy.json`. The alias check is a conservative
+syntax refusal; it does not resolve macro identity. File exceptions have no
 content hash: inactive alternatives still need ordinary code review. The CSI
 include exception is limited to its exact reviewed source file and compiler item,
 with identity/multiplicity in the manifest.
