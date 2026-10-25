@@ -3997,12 +3997,9 @@ fn materialize_seekable_body_for_path_backends(
     let size = body.size();
     let mut reader = body.open_reader().map_err(|e| e.to_string())?;
     drop(body);
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0538-M01","item":"ratarmount_session::factory::materialize_seekable_body_for_path_backends","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0538-M01","item":"ratarmount_session::factory::materialize_seekable_body_for_path_backends","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
     std::io::copy(&mut reader, &mut tmp).map_err(|e| e.to_string())?;

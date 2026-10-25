@@ -1,11 +1,8 @@
 //! Create a POSIX-empty uncompressed TAR or one-frame `.tar.zst` (`O_EXCL`).
 
-#[cfg_attr(
-    internal_read_inventory,
-    expect(
-        clippy::disallowed_types,
-        reason = r###"internal-read:v1 {"id":"IR-E0001-T01","item":"ratarmount_compositing::empty_archive","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for the empty-archive writer; this type reference opens nothing.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-    )
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0001-T01","item":"ratarmount_compositing::empty_archive","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for the empty-archive writer; this type reference opens nothing.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
 )]
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -105,27 +102,18 @@ fn create_new_empty_archive(
     path: &Path,
     kind: EmptyArchiveKind,
 ) -> Result<EmptyCreateOutcome, OverlayError> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0137-M01","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0137-M01","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
     )]
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_types,
-            reason = r###"internal-read:v1 {"id":"IR-B0137-T01","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-        )
+    #[expect(
+        clippy::disallowed_types,
+        reason = r###"internal-read:v1 {"id":"IR-B0137-T01","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
     )]
     let mut opts = OpenOptions::new();
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0002-M01","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"output-owner","category":"empty-archive-output","reason":"Configure exclusive creation of a previously absent empty archive without replacing an existing entry.","creation":{"policy":"exclusive-new-file","basis":"The writer uses create_new and mode 0666 subject to umask; existing entries follow the explicit validation/error path."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0002-M01","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"output-owner","category":"empty-archive-output","reason":"Configure exclusive creation of a previously absent empty archive without replacing an existing entry.","creation":{"policy":"exclusive-new-file","basis":"The writer uses create_new and mode 0666 subject to umask; existing entries follow the explicit validation/error path."}}"###
     )]
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -135,12 +123,9 @@ fn create_new_empty_archive(
     }
     {
         let __inventory_condition_6225 = {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0137-M02","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0137-M02","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
             )]
             let __inventory_value_0 = opts.open(path);
             __inventory_value_0
@@ -194,12 +179,9 @@ fn initialize_empty_archive(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0138-M01","item":"ratarmount_compositing::empty_archive::initialize_empty_archive","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0138-M01","item":"ratarmount_compositing::empty_archive::initialize_empty_archive","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new_in(parent)?;
     write_empty_archive(tmp.as_file_mut(), kind)?;
@@ -251,12 +233,9 @@ fn sync_parent_dir(path: &Path) {
             return;
         }
         if let Ok(dir) = {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0139-M01","item":"ratarmount_compositing::empty_archive::sync_parent_dir","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0139-M01","item":"ratarmount_compositing::empty_archive::sync_parent_dir","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let __inventory_value_0 = File::open(parent);
             __inventory_value_0

@@ -301,12 +301,9 @@ pub fn fetch_ftp_to_temp(url: &str) -> Result<(NamedTempFile, u64)> {
 
 fn fetch_ftp_location_to_temp(loc: &FtpLocation) -> Result<(NamedTempFile, u64)> {
     let bytes = with_session(loc, |c| c.retr_all(&loc.path))?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0485-M01","item":"ratarmount_remote::ftp::fetch_ftp_location_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0485-M01","item":"ratarmount_remote::ftp::fetch_ftp_location_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new()?;
     tmp.write_all(&bytes)?;

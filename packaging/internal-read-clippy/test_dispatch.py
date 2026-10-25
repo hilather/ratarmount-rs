@@ -66,8 +66,9 @@ exclude = ["dependency"]
         (root / "dependency/src/lib.rs").write_text('pub fn raw_dependency_read(){ let _ = std::fs::read("unmarked dependency input"); }\n')
         def mark(identifier, item):
             review = {"id": identifier, "item": item, "disposition": "support", "category": "fixture", "reason": "Compile the selected input reader", "creation": {"policy": "none", "basis": "Existing fixture input only"}}
-            return '#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r#"internal-read:v1 ' + json.dumps(review) + '"#))]\n'
+            return '#[expect(clippy::disallowed_methods, reason = r#"internal-read:v1 ' + json.dumps(review) + '"#)]\n'
         (root / "vendor/owned.rs").write_text('''#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 #[path = "../tests/production.rs"] pub mod production;
 pub fn load() {
 ''' + mark("IR-DISPATCH-ROOT", "dispatch_fixture::load") + '''let _ = std::fs::read("input");
@@ -161,6 +162,37 @@ pub fn main() { ::std::println!("cargo::rerun-if-changed=vendor/owned.rs"); }
                 assert any(report.name.startswith(row["key"] + "-") for row in settings["targets"]), report
                 policy.validate_report(report)
             results.append({"case": "nonproduction-and-shared-source-tests", "exit": checked.returncode})
+            # Regression: removing the documented root forbid cannot disable
+            # the mandatory unused-macro lint injected by the CI dispatcher.
+            source = root / "vendor/owned.rs"
+            original = source.read_text()
+            source.write_text(original.replace('#![forbid(unused_macros)]\n', '')
+                              + '\nmacro_rules! dormant_unexported { () => {}; }\n')
+            rejected = subprocess.run(
+                ["flock", "/tmp/muse-cargo.lock", "cargo", "+1.98.0", "clippy",
+                 "--lib", "--message-format=json"], cwd=root, env=env,
+                capture_output=True, text=True)
+            codes = {((row.get("message") or {}).get("code") or {}).get("code")
+                     for line in rejected.stdout.splitlines()
+                     if (row := json.loads(line)).get("reason") == "compiler-message"}
+            assert rejected.returncode and "unused_macros" in codes, (rejected.stdout, rejected.stderr)
+            (args.output / "missing-root-unused-macro.jsonl").write_text(rejected.stdout)
+            source.write_text(original.replace('#![forbid(unused_macros)]\n',
+                                               '#![allow(unused_macros)]\n')
+                              + '\nmacro_rules! dormant_unexported { () => {}; }\n')
+            lowered = subprocess.run(
+                ["flock", "/tmp/muse-cargo.lock", "cargo", "+1.98.0", "clippy",
+                 "--lib", "--message-format=json"], cwd=root, env=env,
+                capture_output=True, text=True)
+            lowered_codes = {((row.get("message") or {}).get("code") or {}).get("code")
+                             for line in lowered.stdout.splitlines()
+                             if (row := json.loads(line)).get("reason") == "compiler-message"}
+            assert lowered.returncode and "E0453" in lowered_codes, (lowered.stdout, lowered.stderr)
+            assert "unused_macros" in lowered.stdout, lowered.stdout
+            (args.output / "lowered-unused-macro.jsonl").write_text(lowered.stdout)
+            source.write_text(original)
+            results.append({"case": "missing-root-unused-macro", "rejected": True,
+                            "diagnostic": "unused_macros", "lowering_diagnostic": "E0453"})
             # A new config or dispatcher revision gets a distinct cache, so
             # Cargo cannot replay artifacts compiled with the previous policy.
             with (tools / "clippy.toml").open("a") as output:

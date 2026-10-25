@@ -188,12 +188,9 @@ mod unix {
         mode: u32,
     ) -> io::Result<OwnedFd> {
         // Safety: `name` is NUL-terminated and outlives the call.
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0282-M01","item":"ratarmount_core::db_inodes::unix::openat_raw","disposition":"residual","reason":"the admitted-open primitive itself; reverse-order payload retirement needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0282-M01","item":"ratarmount_core::db_inodes::unix::openat_raw","disposition":"residual","reason":"the admitted-open primitive itself; reverse-order payload retirement needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let fd = unsafe { libc::openat(dir, name.as_ptr(), flags, mode as libc::c_uint) };
         if fd < 0 {
@@ -202,12 +199,9 @@ mod unix {
             // Safety: a new descriptor owned by this process.
             Ok(unsafe {
                 {
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0283-M01","item":"ratarmount_core::db_inodes::unix::openat_raw","disposition":"residual","reason":"the admitted-open primitive itself; reverse-order payload retirement needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0283-M01","item":"ratarmount_core::db_inodes::unix::openat_raw","disposition":"residual","reason":"the admitted-open primitive itself; reverse-order payload retirement needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                     )]
                     let __inventory_value_0 = OwnedFd::from_raw_fd(fd);
                     __inventory_value_0
@@ -231,12 +225,9 @@ mod unix {
     /// [`openat_admitted`] relative to the current directory.
     pub fn open_admitted(path: &Path, flags: libc::c_int, mode: u32) -> io::Result<OwnedFd> {
         {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0284-M01","item":"ratarmount_core::db_inodes::unix::open_admitted","disposition":"residual","reason":"the admitted-open primitive itself; reverse-order payload retirement needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0284-M01","item":"ratarmount_core::db_inodes::unix::open_admitted","disposition":"residual","reason":"the admitted-open primitive itself; reverse-order payload retirement needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let __inventory_value_0 = openat_admitted(None, path, flags, mode);
             __inventory_value_0

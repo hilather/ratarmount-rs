@@ -142,12 +142,9 @@ pub(super) mod linux {
     pub(crate) fn has_initial_sys_admin() -> bool {
         match (
             {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0411-M01","item":"ratarmount_fuse::passthrough::linux::has_initial_sys_admin","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0411-M01","item":"ratarmount_fuse::passthrough::linux::has_initial_sys_admin","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                 )]
                 let __inventory_value_0 = std::fs::read_to_string("/proc/self/status");
                 __inventory_value_0
@@ -298,12 +295,9 @@ pub(super) mod linux {
     /// INIT has completed, but request dispatch has not started. Use fuser's raw
     /// equivalent of ReplyOpen::open_backing, then close the temporary ID.
     pub(crate) fn probe(session: impl AsFd) -> io::Result<()> {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0412-M01","item":"ratarmount_fuse::passthrough::linux::probe","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0412-M01","item":"ratarmount_fuse::passthrough::linux::probe","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let file = tempfile::tempfile().map_err(probe_error)?;
         let id = fuser::BackingId::create_raw(&session, &file).map_err(probe_error)?;
@@ -326,12 +320,9 @@ pub(super) mod linux {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "no passthrough cache directory")
             })?;
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0051-M01","item":"ratarmount_fuse::passthrough::linux::cache_parent","disposition":"output-owner","category":"passthrough-cache-directory","reason":"Ensure the selected absolute user cache root exists before passthrough cache allocation.","creation":{"policy":"recursive-directory","basis":"The root comes from absolute XDG_CACHE_HOME or HOME/.cache and retains current directory defaults."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0051-M01","item":"ratarmount_fuse::passthrough::linux::cache_parent","disposition":"output-owner","category":"passthrough-cache-directory","reason":"Ensure the selected absolute user cache root exists before passthrough cache allocation.","creation":{"policy":"recursive-directory","basis":"The root comes from absolute XDG_CACHE_HOME or HOME/.cache and retains current directory defaults."}}"###
         )]
         std::fs::create_dir_all(&root)?;
         Ok(root)
@@ -372,12 +363,9 @@ pub(super) mod linux {
 
     fn private_dir(parent: &Path) -> io::Result<tempfile::TempDir> {
         {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0413-M01","item":"ratarmount_fuse::passthrough::linux::private_dir","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0413-M01","item":"ratarmount_fuse::passthrough::linux::private_dir","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
             )]
             let __inventory_value_0 = tempfile::Builder::new()
                 .prefix("ratarmount-passthrough-")
@@ -390,27 +378,18 @@ pub(super) mod linux {
     fn temporary_in(parent: &Path) -> io::Result<File> {
         // No directory metadata write on filesystems supporting O_TMPFILE.
         if let Ok(file) = {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_types,
-                    reason = r###"internal-read:v1 {"id":"IR-B0414-T01","item":"ratarmount_fuse::passthrough::linux::temporary_in","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-                )
+            #[expect(
+                clippy::disallowed_types,
+                reason = r###"internal-read:v1 {"id":"IR-B0414-T01","item":"ratarmount_fuse::passthrough::linux::temporary_in","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
             )]
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0414-M01","item":"ratarmount_fuse::passthrough::linux::temporary_in","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0414-M01","item":"ratarmount_fuse::passthrough::linux::temporary_in","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
             )]
             let mut __inventory_value_0 = std::fs::OpenOptions::new();
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0414-M02","item":"ratarmount_fuse::passthrough::linux::temporary_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0414-M02","item":"ratarmount_fuse::passthrough::linux::temporary_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
             )]
             let __inventory_value_1 = __inventory_value_0
                 .read(true)
@@ -424,12 +403,9 @@ pub(super) mod linux {
         }
         let dir = private_dir(parent)?;
         {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0415-M01","item":"ratarmount_fuse::passthrough::linux::temporary_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0415-M01","item":"ratarmount_fuse::passthrough::linux::temporary_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
             )]
             let __inventory_value_0 = tempfile::tempfile_in(dir.path());
             __inventory_value_0

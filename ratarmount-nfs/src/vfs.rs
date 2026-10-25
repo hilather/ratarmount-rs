@@ -349,12 +349,9 @@ impl RatarmountNfs {
         let path = self.inodes.path_for_id(id).ok_or(nfsstat3::NFS3ERR_STALE)?;
         let flags = libc::O_RDWR | libc::O_CREAT;
         let fd = ov.open_overlay_fd(&path, flags).map_err(overlay_to_nfs)?;
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0475-M01","item":"<ratarmount_nfs::vfs::RatarmountNfs>::write_sync","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0475-M01","item":"<ratarmount_nfs::vfs::RatarmountNfs>::write_sync","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         let wrote = ov.write_all_at(&file, &path, offset, data);

@@ -301,12 +301,9 @@ fn try_materialize_split_from_parent(
         return None;
     }
     // Materialize joined stream by opening each part through the parent mount.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0135-M01","item":"ratarmount_compositing::automount::try_materialize_split_from_parent","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0135-M01","item":"ratarmount_compositing::automount::try_materialize_split_from_parent","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new().ok()?;
     for part_path in &set.paths {
@@ -876,12 +873,9 @@ impl AutoMountLayer {
                     return None;
                 }
             };
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0136-M01","item":"<ratarmount_compositing::automount::AutoMountLayer>::try_mount_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0136-M01","item":"<ratarmount_compositing::automount::AutoMountLayer>::try_mount_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
             )]
             let mut tmp = match NamedTempFile::new() {
                 Ok(t) => t,

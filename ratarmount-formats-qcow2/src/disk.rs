@@ -142,12 +142,9 @@ impl Qcow2VirtualDisk {
 
     /// Open a QCOW2 image from a host path (resolves relative backing files).
     pub fn open_path(path: &Path) -> Result<Self> {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0339-M01","item":"<ratarmount_formats_qcow2::disk::Qcow2VirtualDisk>::open_path","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0339-M01","item":"<ratarmount_formats_qcow2::disk::Qcow2VirtualDisk>::open_path","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let file = File::open(path)?;
         Self::open_from_reader(file, path, path.parent())
@@ -583,12 +580,9 @@ fn open_backing(name: &str, backing_dir: Option<&Path>, depth: u32) -> Result<Ba
             path.display()
         )));
     }
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0340-M01","item":"ratarmount_formats_qcow2::disk::open_backing","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0340-M01","item":"ratarmount_formats_qcow2::disk::open_backing","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut file = File::open(&path)?;
     match qcow_magic_version(&mut file) {
@@ -748,12 +742,9 @@ pub fn parse_qcow2_header<R: Read + Seek>(reader: &mut R) -> Result<Qcow2Header>
 
 /// Detect QCOW2 (`QFI\xfb` + version 2 or 3). No extension fallback.
 pub fn looks_like_qcow2(path: &Path) -> bool {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0341-M01","item":"ratarmount_formats_qcow2::disk::looks_like_qcow2","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0341-M01","item":"ratarmount_formats_qcow2::disk::looks_like_qcow2","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut f = match File::open(path) {
         Ok(f) => f,

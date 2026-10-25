@@ -42,18 +42,27 @@ for the actual definition. The manifest records both identities separately.
 Each operation needs the smallest legal handwritten statement/type expectation:
 
 ```rust
-#[cfg_attr(internal_read_inventory, expect(
+#[expect(
     clippy::disallowed_methods,
     reason = r#"internal-read:v1 {"id":"IR-example","item":"example::load","disposition":"managed-read","category":"index-cache","reason":"Read the admitted index cache","creation":{"policy":"none","basis":"Existing input only"}}"#
-))]
+)]
 let bytes = managed_read::read(path)?;
 ```
 
-The activation cfg is reserved for this exact protocol and registered through
-workspace lint inheritance. Ordinary builds leave it off. Reasons contain a
-stable unique id, compiler-validated item owner, classification, human reason and
-explicit reviewed creation policy/basis. Preserve baseline family/issue/regression
-metadata. An approval cannot own a whole function/module or multiple operations;
+Only a direct `#[expect]` with one disallowed-item lint and one literal review
+reason can approve an operation. In restricted packages, `allow`/`warn` for
+these lints and any `cfg_attr` wrapping `allow`/`warn`/`expect` are refused at
+crate, module and item level, including reviewed files and literal macro
+transcribers. Rustc's registered lint groups supply membership for group
+suppressions too; there is no handwritten group table. The
+`internal_read_inventory` cfg is registered through workspace lint inheritance.
+Ordinary builds leave it off and use a root
+`cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))`
+so inventory expectations do not fail against the ordinary journal-only config.
+Selected policy/native compilations enable the cfg and require fulfillment.
+Reasons contain a stable unique id, compiler-validated item owner, classification,
+human reason and explicit reviewed creation policy/basis. Preserve baseline
+family/issue/regression metadata. An approval cannot own a whole function/module or multiple operations;
 split chains into local leaves. Independent journal expectations remain
 unconditional and never authorize an inventory operation.
 
@@ -61,6 +70,9 @@ unconditional and never authorize an inventory operation.
 candidate. Review before copying it to `manifest.json`; CI never refreshes it.
 Canonical keys are `(item path, complete literal reason)`, with defining operation
 identity, normalized leaf digest, multiplicity and observed profiles as values.
+The comparison is bidirectional: every expectation must have an approved entry,
+and every approved entry must have a matching expectation. CI fails for either
+addition or deletion.
 Absolute source spans and line numbers are transient. Source movement alone does
 not change approval; rebinding the same configured reexport must change it.
 Dependency provenance belongs in the run attestation and cache key rather than
@@ -79,18 +91,34 @@ unknown attribute prefix before fixed syntax is refused, including `*`, `+` and
 attribute prefix, and harmless separator-delimited repetitions remain permitted. Literal nested macro definitions
 in invocation payloads receive the same grammar audit, with generic matchers and
 other payload data preserved.
-Every production root must contain an unconditional `forbid` naming the exact
-single-segment `unused_macros` lint. N4 refuses target predicates and explicit
-`use ... cfg as alias` imports in the 40 reviewed failed-cross-check packages
-outside exact reviewed files in `policy.json`. The alias check is a conservative
-syntax refusal; it does not resolve macro identity. File exceptions have no
-content hash: inactive alternatives still need ordinary code review. The CSI
+CI supplies `-F unused_macros`; the root `forbid` attributes document that rule.
+There is no root-attribute source check. N4 refuses target predicates in stripping
+`cfg`/`cfg_attr` attributes in the 40 reviewed restricted packages outside exact
+reviewed files in `policy.json`. It also refuses unparseable `cfg_attr` predicates
+and `clippy`/`not(clippy)` stripping, even in reviewed files. `cfg!` returns a
+boolean and keeps both branches type-checked; direct, nested and aliased uses
+remain permitted. File exceptions have no content hash: inactive alternatives
+still need ordinary code review. N4 is defence in depth behind the native CI
+matrix, whose Windows coverage is explicitly limited to supported packages. The CSI
 include exception is limited to its exact reviewed source file and compiler item,
 with identity/multiplicity in the manifest.
 
+`native.json` records supported native coverage: all 40 restricted packages on
+the existing macOS job (excluding ISA-L, which needs an additional native
+library), and index/TAR/ZIP on the new Windows MSVC job. `native.py` uses stock
+Clippy with Cargo metadata dispatch, so `--all-targets` keeps inventory checks
+on production lib/bin compilations. Native production Clippy uses
+`-D clippy::disallowed_methods -F unused_macros -D warnings`; `-D` permits reviewed
+expectations, and `-D warnings` makes unfulfilled expectations fail. Its
+cargo-hack `--each-feature` selections include default and no-default-feature builds. The Linux controls prove that a
+read behind `not(feature)` is diagnosed and a test/build-script/dependency read
+does not gain an inventory obligation. The Windows-only fixture must emit the
+exact `clippy::disallowed_methods` diagnostic on the Windows runner. Local
+Linux verification uses `native.py --fixtures`; it does not probe other targets.
+
 Intentional gaps include unused exported macros, whole-item forwarding without
-forbidden tokens, arbitrary non-target cfg predicates, and target-inactive calls
-in reviewed files. Broader dependency acquisitions/read_dir and extending N4 to
+forbidden tokens, other non-target cfg predicates, and calls in reviewed files
+on targets outside the native matrix. Broader dependency acquisitions/read_dir and extending N4 to
 the other eight packages are follow-up #209. SQLite/rusqlite pathname opens rely
 on runtime checked_open enforcement. The retired collector's transitive helper
 proofs and mode inference are not claimed here.

@@ -881,12 +881,9 @@ fn fetch_azure_location_to_temp(loc: &AzureLocation) -> Result<(NamedTempFile, u
         return Err(azure_status_error(source, status, loc, &body));
     }
     let mut reader = resp.into_reader();
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0477-M01","item":"ratarmount_remote::azure::fetch_azure_location_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0477-M01","item":"ratarmount_remote::azure::fetch_azure_location_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new()?;
     let n = io::copy(&mut reader, &mut tmp)?;
@@ -1161,12 +1158,9 @@ pub fn put_azure_bytes(
     if_match: Option<&str>,
 ) -> Result<()> {
     if body.len() as u64 > AZURE_PUT_BLOB_MAX {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0478-M01","item":"ratarmount_remote::azure::put_azure_bytes","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0478-M01","item":"ratarmount_remote::azure::put_azure_bytes","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let mut tmp = NamedTempFile::new()?;
         tmp.write_all(body)?;
@@ -1201,12 +1195,9 @@ pub fn put_azure_blocks(
     let _ = resolve_put_auth()?;
     // Managed (#151): the file may be an index open in this process. One
     // owner; the single body and every block are independent cursors.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0479-M01","item":"ratarmount_remote::azure::put_azure_blocks","disposition":"managed-read","regression":"regression_azure_single_and_block_uploads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0479-M01","item":"ratarmount_remote::azure::put_azure_blocks","disposition":"managed-read","regression":"regression_azure_single_and_block_uploads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let owner = ratarmount_index::managed_read::ManagedReadCursor::open(path)
         .map_err(|e| azure_err(format!("opening {} for PUT: {e}", path.display())))?;
@@ -1253,12 +1244,9 @@ pub fn put_azure_blocks(
 }
 
 fn azure_spool_file() -> Result<NamedTempFile> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0480-M01","item":"ratarmount_remote::azure::azure_spool_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0480-M01","item":"ratarmount_remote::azure::azure_spool_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let tmp = NamedTempFile::new()?;
     #[cfg(unix)]

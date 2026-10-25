@@ -320,12 +320,9 @@ fn build(
     stage: &Path,
     args: &ShardArgs,
 ) -> Result<Vec<Artifact>> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0091-M01","item":"ratarmount::shard::build","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0091-M01","item":"ratarmount::shard::build","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tar = tempfile::tempfile_in(stage)?;
     let mut boundaries = Vec::new();
@@ -338,27 +335,18 @@ fn build(
                 out.write_all(&headers)?;
                 if member.link.is_none() {
                     let mut file = {
-                        #[cfg_attr(
-                            internal_read_inventory,
-                            expect(
-                                clippy::disallowed_types,
-                                reason = r###"internal-read:v1 {"id":"IR-B0092-T01","item":"ratarmount::shard::build","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-                            )
+                        #[expect(
+                            clippy::disallowed_types,
+                            reason = r###"internal-read:v1 {"id":"IR-B0092-T01","item":"ratarmount::shard::build","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
                         )]
-                        #[cfg_attr(
-                            internal_read_inventory,
-                            expect(
-                                clippy::disallowed_methods,
-                                reason = r###"internal-read:v1 {"id":"IR-B0092-M01","item":"ratarmount::shard::build","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
-                            )
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0092-M01","item":"ratarmount::shard::build","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
                         )]
                         let mut __inventory_value_0 = fs::OpenOptions::new();
-                        #[cfg_attr(
-                            internal_read_inventory,
-                            expect(
-                                clippy::disallowed_methods,
-                                reason = r###"internal-read:v1 {"id":"IR-B0092-M02","item":"ratarmount::shard::build","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                            )
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0092-M02","item":"ratarmount::shard::build","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                         )]
                         let __inventory_value_1 = __inventory_value_0
                             .read(true)
@@ -397,12 +385,9 @@ fn build(
     // Keep EOF with the final sample, so frame-per-sample has no extra EOF frame.
     *boundaries.last_mut().ok_or("cannot build an empty shard")? += 1024;
     tar.seek(SeekFrom::Start(0))?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0093-M01","item":"ratarmount::shard::build","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0093-M01","item":"ratarmount::shard::build","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut file = tempfile::NamedTempFile::new_in(stage)?;
     if args.codec == Codec::None {
@@ -452,12 +437,9 @@ pub(super) fn index_request(archive: &Path, index: &Path) -> OpenRequest {
 pub(super) fn sha256(path: &Path) -> Result<String> {
     // Managed (#151): an artifact may be an index open in this process.
     Ok({
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0094-M01","item":"ratarmount::shard::sha256","disposition":"managed-read","regression":"regression_shard_artifact_hash_keeps_aliased_database_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0094-M01","item":"ratarmount::shard::sha256","disposition":"managed-read","regression":"regression_shard_artifact_hash_keeps_aliased_database_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let __inventory_value_0 = ratarmount_index::managed_read::sha256_hex(path);
         __inventory_value_0
@@ -503,12 +485,9 @@ pub(super) fn run(args: &ShardArgs) -> Result<Manifest> {
     if !root.is_dir() {
         return Err("input must be a directory".into());
     }
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0141-M01","item":"ratarmount::shard::run","disposition":"output-owner","category":"shard-output-directory","reason":"Create the caller-selected shard output directory before validating its relation to the input tree.","creation":{"policy":"recursive-directory","basis":"The sharding command owns output creation, rejects output inside the canonical input and refuses an existing shards.json; default modes remain unchanged."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0141-M01","item":"ratarmount::shard::run","disposition":"output-owner","category":"shard-output-directory","reason":"Create the caller-selected shard output directory before validating its relation to the input tree.","creation":{"policy":"recursive-directory","basis":"The sharding command owns output creation, rejects output inside the canonical input and refuses an existing shards.json; default modes remain unchanged."}}"###
     )]
     fs::create_dir_all(&args.output)?;
     let output = fs::canonicalize(&args.output)?;
@@ -549,12 +528,9 @@ pub(super) fn run(args: &ShardArgs) -> Result<Manifest> {
     if start < samples.len() {
         plans.push((start, samples.len()));
     }
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0095-M01","item":"ratarmount::shard::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0095-M01","item":"ratarmount::shard::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let stage = tempfile::tempdir_in(&output)?;
     let artifacts: Vec<_> = parallel_map(&plans, args.jobs, |_, &(start, end)| {
@@ -593,9 +569,9 @@ pub(super) fn run(args: &ShardArgs) -> Result<Manifest> {
         }
         .ok_or("mtime out of range")?;
         {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0096-M01","item":"ratarmount::shard::run","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0096-M01","item":"ratarmount::shard::run","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###)]
 let mut __inventory_value_0 = File::options();
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0096-M02","item":"ratarmount::shard::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0096-M02","item":"ratarmount::shard::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###)]
 let __inventory_value_1 = __inventory_value_0
             .write(true)
             .open(&path);
@@ -642,12 +618,9 @@ __inventory_value_1
             fs::hard_link(stage.path().join(index), output.join(index))?;
         }
     }
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0097-M01","item":"ratarmount::shard::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0097-M01","item":"ratarmount::shard::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut json = tempfile::NamedTempFile::new_in(&output)?;
     serde_json::to_writer_pretty(&mut json, &manifest)?;

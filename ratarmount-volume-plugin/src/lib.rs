@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! Linux Docker volume protocol v1. The only mount dependency is an executable.
 #![cfg(target_os = "linux")]
@@ -11,12 +12,9 @@ use options::{validate, validate_name, Options};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg_attr(
-    internal_read_inventory,
-    expect(
-        clippy::disallowed_types,
-        reason = r###"internal-read:v1 {"id":"IR-E0101-T01","item":"ratarmount_volume_plugin","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for Docker volume driver state locks and journal output.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-    )
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0101-T01","item":"ratarmount_volume_plugin","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for Docker volume driver state locks and journal output.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
 )]
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -72,10 +70,10 @@ fn deserialize_options<'de, D: serde::Deserializer<'de>>(
 impl<M: Mounter> Driver<M> {
     pub fn open(state: &Path, mut mounter: M) -> Result<Self, String> {
         {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-E0102-T01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the recursive private state-directory builder for the volume driver.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###))]
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0102-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","category":"creation-builder","reason":"Construct the recursive private state-directory builder for the volume driver.","creation":{"policy":"none","basis":"Builder setup owns no path; the create leaf requests 0700 and is separately reviewed."}}"###))]
+#[expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-E0102-T01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the recursive private state-directory builder for the volume driver.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###)]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0102-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","category":"creation-builder","reason":"Construct the recursive private state-directory builder for the volume driver.","creation":{"policy":"none","basis":"Builder setup owns no path; the create leaf requests 0700 and is separately reviewed."}}"###)]
 let mut __inventory_value_0 = fs::DirBuilder::new();
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0103-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"output-owner","category":"runtime-state-directory","reason":"Create the volume driver state tree before canonicalization and lifetime locking.","creation":{"policy":"private-recursive-directory","basis":"DirBuilder requests recursive mode 0700; the state path is canonicalized before driver files are opened."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0103-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"output-owner","category":"runtime-state-directory","reason":"Create the volume driver state tree before canonicalization and lifetime locking.","creation":{"policy":"private-recursive-directory","basis":"DirBuilder requests recursive mode 0700; the state path is canonicalized before driver files are opened."}}"###)]
 let __inventory_value_1 = __inventory_value_0
             .recursive(true)
             .mode(0o700)
@@ -87,13 +85,13 @@ __inventory_value_1
             .canonicalize()
             .map_err(|_| "cannot resolve state directory")?;
         let lock = {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-B0546-T01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###))]
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0546-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###))]
+#[expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-B0546-T01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###)]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0546-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###)]
 let mut __inventory_value_0 = OpenOptions::new();
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0104-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"output-owner","category":"runtime-lock","reason":"Permit creation of the no-follow volume-driver lifetime lock without truncation.","creation":{"policy":"create-or-open","basis":"The lock is read/write mode 0600 with CLOEXEC/NOFOLLOW and is held for the driver lifetime."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0104-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"output-owner","category":"runtime-lock","reason":"Permit creation of the no-follow volume-driver lifetime lock without truncation.","creation":{"policy":"create-or-open","basis":"The lock is read/write mode 0600 with CLOEXEC/NOFOLLOW and is held for the driver lifetime."}}"###)]
 let __inventory_value_1 = __inventory_value_0
             .create(true);
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0546-M02","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0546-M02","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###)]
 let __inventory_value_2 = __inventory_value_1
             .truncate(false)
             .read(true)
@@ -108,12 +106,9 @@ __inventory_value_2
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err("state directory is already in use".into());
         }
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0547-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"out-of-family","category":"structured-control-record","reason":"daemon state journal","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0547-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"out-of-family","category":"structured-control-record","reason":"daemon state journal","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let definitions: BTreeMap<String, Definition> = match fs::read(state.join("volumes.json")) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| "invalid volumes.json")?,
@@ -126,10 +121,10 @@ __inventory_value_2
         }
         let root = state.join("mnt");
         {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-E0105-T01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the mode-aware builder for the volume driver mount root.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###))]
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0105-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","category":"creation-builder","reason":"Construct the mode-aware builder for the volume driver mount root.","creation":{"policy":"none","basis":"This constructor is setup only; the following create leaf owns the mode-0755 directory output."}}"###))]
+#[expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-E0105-T01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the mode-aware builder for the volume driver mount root.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###)]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0105-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"support","category":"creation-builder","reason":"Construct the mode-aware builder for the volume driver mount root.","creation":{"policy":"none","basis":"This constructor is setup only; the following create leaf owns the mode-0755 directory output."}}"###)]
 let mut __inventory_value_0 = fs::DirBuilder::new();
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0106-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"output-owner","category":"mountpoint-directory","reason":"Create the volume driver mnt root and accept an existing directory for later mountpoint checks.","creation":{"policy":"directory","basis":"DirBuilder requests 0755; AlreadyExists is handled without truncating or replacing a host entry."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0106-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::open","disposition":"output-owner","category":"mountpoint-directory","reason":"Create the volume driver mnt root and accept an existing directory for later mountpoint checks.","creation":{"policy":"directory","basis":"DirBuilder requests 0755; AlreadyExists is handled without truncating or replacing a host entry."}}"###)]
 let __inventory_value_1 = __inventory_value_0
             .mode(0o755)
             .create(&root);
@@ -167,44 +162,29 @@ __inventory_value_1
 
     fn persist(&self, definitions: &BTreeMap<String, Definition>) -> Result<(), String> {
         let temp = self.state.join("volumes.json.tmp");
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0549-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::persist","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0549-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::persist","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let result = (|| -> io::Result<()> {
             let mut file = {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_types,
-                        reason = r###"internal-read:v1 {"id":"IR-B0548-T01","item":"<ratarmount_volume_plugin::Driver<T0>>::persist","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = r###"internal-read:v1 {"id":"IR-B0548-T01","item":"<ratarmount_volume_plugin::Driver<T0>>::persist","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
                 )]
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0548-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::persist","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0548-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::persist","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
                 )]
                 let mut __inventory_value_0 = OpenOptions::new();
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0107-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::persist","disposition":"output-owner","category":"structured-control-record","reason":"Configure the temporary volumes.json output before atomic state publication.","creation":{"policy":"create-or-truncate","basis":"The temporary state record uses 0600 and NOFOLLOW/CLOEXEC, is synced, then renamed over the durable state file."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0107-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::persist","disposition":"output-owner","category":"structured-control-record","reason":"Configure the temporary volumes.json output before atomic state publication.","creation":{"policy":"create-or-truncate","basis":"The temporary state record uses 0600 and NOFOLLOW/CLOEXEC, is synced, then renamed over the durable state file."}}"###
                 )]
                 let __inventory_value_1 = __inventory_value_0.write(true).create(true);
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0548-M02","item":"<ratarmount_volume_plugin::Driver<T0>>::persist","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0548-M02","item":"<ratarmount_volume_plugin::Driver<T0>>::persist","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                 )]
                 let __inventory_value_2 = __inventory_value_1
                     .truncate(true)
@@ -325,12 +305,9 @@ __inventory_value_1
                         }
                         Ok(_) => {}
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            #[cfg_attr(
-                                internal_read_inventory,
-                                expect(
-                                    clippy::disallowed_methods,
-                                    reason = r###"internal-read:v1 {"id":"IR-E0108-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::dispatch","disposition":"output-owner","category":"mountpoint-directory","reason":"Create a missing named volume mountpoint after rejecting symlinks and non-directories.","creation":{"policy":"exclusive-directory","basis":"create_dir runs only after NotFound under the canonical state mount root; current permissions are retained."}}"###
-                                )
+                            #[expect(
+                                clippy::disallowed_methods,
+                                reason = r###"internal-read:v1 {"id":"IR-E0108-M01","item":"<ratarmount_volume_plugin::Driver<T0>>::dispatch","disposition":"output-owner","category":"mountpoint-directory","reason":"Create a missing named volume mountpoint after rejecting symlinks and non-directories.","creation":{"policy":"exclusive-directory","basis":"create_dir runs only after NotFound under the canonical state mount root; current permissions are retained."}}"###
                             )]
                             fs::create_dir(&path).map_err(|_| "cannot create mountpoint")?;
                         }

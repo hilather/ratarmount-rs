@@ -38,7 +38,7 @@ def main():
                   "category": "fixture", "reason": "Exercise a resolved reexport identity",
                   "creation": {"policy": "none", "basis": "Compile-only fixture"}}
         reason = "internal-read:v1 " + json.dumps(review, separators=(",", ":"))
-        mark = '#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r#"' + reason + '"#))]\n'
+        mark = '#[expect(clippy::disallowed_methods, reason = r#"' + reason + '"#)]\n'
         prefix = '''#![forbid(unused_macros)]
 pub mod a { pub fn open() -> u8 { 1 } }
 pub mod b { pub fn open() -> u8 { 2 } }
@@ -68,6 +68,24 @@ pub mod b { pub fn open() -> u8 { 2 } }
 
         source = prefix + 'pub use a::open as acquire;\npub fn load() {\n' + mark + 'let _ = acquire();\n}\n'
         first = generate("original", source)
+        # Regression: a fulfilled, well-formed expectation still needs review
+        # in the approved manifest; removing its source must also fail the diff.
+        approved = args.output / "approved.json"
+        approved.write_text(policy.canonical(first))
+        unmanifested_source = source.replace("IR-REBIND", "IR-UNMANIFESTED")
+        unmanifested_report = compile_case("unmanifested-expect", unmanifested_source, collection=False)
+        unmanifested = policy.manifest([("all-features", unmanifested_report)], {})
+        for name, candidate in [
+            ("unmanifested-expect", unmanifested),
+            ("manifest-without-source-expect", generate("removed-expect", prefix)),
+        ]:
+            try:
+                policy.check_diff(candidate, approved)
+            except policy.PolicyError as error:
+                assert "internal-read manifest changed; review the candidate" == str(error)
+                results.append({"case": name + "-diff", "refusal": str(error)})
+            else:
+                raise AssertionError(name + ": missing bidirectional approval refusal")
         rebound = generate("rebound", source.replace("pub use a::open", "pub use b::open"))
         assert first["entries"][0]["configured_path"] == rebound["entries"][0]["configured_path"]
         assert first["entries"][0]["reason"] == rebound["entries"][0]["reason"]

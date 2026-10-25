@@ -190,12 +190,9 @@ fn export_git(args: &GitSnapshotArgs, output: &mut impl Write) -> Result<i32> {
     let source = open_git_base(&args.git_base)?;
     let mut entries = BTreeMap::new();
     collect_git_entries(&source, "", &mut entries)?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0098-M01","item":"ratarmount::snapshot::export_git","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0098-M01","item":"ratarmount::snapshot::export_git","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tar = tempfile::tempfile()?;
     {
@@ -234,12 +231,9 @@ fn export_git(args: &GitSnapshotArgs, output: &mut impl Write) -> Result<i32> {
     }
     let len = tar.metadata()?.len();
     tar.seek(SeekFrom::Start(0))?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0099-M01","item":"ratarmount::snapshot::export_git","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0099-M01","item":"ratarmount::snapshot::export_git","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut encoded =
         tempfile::NamedTempFile::new_in(archive.parent().ok_or("missing output parent")?)?;
@@ -433,24 +427,18 @@ fn materialize_tree(source: &GitMountSource, path: &str, destination: &Path) -> 
         let target = destination.join(&name);
         match info.mode & S_IFMT {
             S_IFDIR => {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0142-M01","item":"ratarmount::snapshot::materialize_tree","disposition":"output-owner","category":"snapshot-output-directory","reason":"Materialize a Git snapshot directory entry in the caller-owned output tree.","creation":{"policy":"exclusive-directory","basis":"create_dir refuses collisions; recursive materialization owns the output and retains existing directory permissions."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0142-M01","item":"ratarmount::snapshot::materialize_tree","disposition":"output-owner","category":"snapshot-output-directory","reason":"Materialize a Git snapshot directory entry in the caller-owned output tree.","creation":{"policy":"exclusive-directory","basis":"create_dir refuses collisions; recursive materialization owns the output and retains existing directory permissions."}}"###
                 )]
                 fs::create_dir(&target)?;
                 materialize_tree(source, &format!("{path}/{name}"), &target)?;
             }
             S_IFLNK => std::os::unix::fs::symlink(&info.linkname, target)?,
             S_IFREG => {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0100-M01","item":"ratarmount::snapshot::materialize_tree","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0100-M01","item":"ratarmount::snapshot::materialize_tree","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                 )]
                 let mut file = fs::File::create(&target)?;
                 io::copy(&mut source.open(&info, 0)?, &mut file)?;
@@ -510,12 +498,9 @@ pub(super) fn run(args: &SnapshotArgs, output: &mut impl Write) -> Result<i32> {
             let temporary;
             let mut tags = args.tags.clone();
             let dir = if let Some(spec) = &args.git {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0101-M01","item":"ratarmount::snapshot::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0101-M01","item":"ratarmount::snapshot::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                 )]
                 let __inventory_assigned = tempfile::tempdir()?;
                 temporary = __inventory_assigned;

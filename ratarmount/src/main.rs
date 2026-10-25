@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! ratarmount CLI (Phases 0–11 + CLI flag parity).
 
@@ -1073,12 +1074,9 @@ fn create_tmpfs_overlay_in(
         }
         {
             let __inventory_condition_44740 = {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0021-M01","item":"ratarmount::create_tmpfs_overlay_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0021-M01","item":"ratarmount::create_tmpfs_overlay_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                 )]
                 let __inventory_value_0 = tempfile::Builder::new()
                     .prefix("ratarmount-write-overlay.")
@@ -2177,12 +2175,9 @@ fn main() {
     if let Some(ref pf) = args.password_file {
         {
             let __inventory_condition_87856 = {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0022-M01","item":"ratarmount::main","disposition":"out-of-family","category":"configuration-or-credentials","reason":"password file named on the command line","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0022-M01","item":"ratarmount::main","disposition":"out-of-family","category":"configuration-or-credentials","reason":"password file named on the command line","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                 )]
                 let __inventory_value_0 = std::fs::read_to_string(pf);
                 __inventory_value_0
@@ -2915,12 +2910,9 @@ fn main() {
         None => None,
         Some((_, plan)) => {
             // First durable creation of the accepted mount point.
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0114-M01","item":"ratarmount::main","disposition":"output-owner","category":"mountpoint-directory","reason":"Create the accepted FUSE mountpoint after the guard has validated the mount plan.","creation":{"policy":"recursive-directory","basis":"Only the explicit guarded FUSE path is created; export-only operation supplies no mountpoint and does not reach this leaf."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0114-M01","item":"ratarmount::main","disposition":"output-owner","category":"mountpoint-directory","reason":"Create the accepted FUSE mountpoint after the guard has validated the mount plan.","creation":{"policy":"recursive-directory","basis":"Only the explicit guarded FUSE path is created; export-only operation supplies no mountpoint and does not reach this leaf."}}"###
             )]
             std::fs::create_dir_all(&plan.mp).ok();
             Some(plan.mp.clone())
@@ -3178,12 +3170,9 @@ fn main() {
 /// (disk-backed or tmpfs) for `:temp:`.
 fn overlay_dir_for(args: &Args, w: &Path) -> PathBuf {
     if w.as_os_str() == ":temp:" {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0023-M01","item":"ratarmount::overlay_dir_for","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0023-M01","item":"ratarmount::overlay_dir_for","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let td = if args.overlay_tmpfs.is_some() {
             create_tmpfs_overlay()
@@ -3984,12 +3973,9 @@ fn run_exports(
                     join_export_handles(handles);
                     finish_overlay_serve(overlay_arc, None, interval, commit_exit);
                     if let Err(e) = mount_err {
-                        #[cfg_attr(
-                            internal_read_inventory,
-                            expect(
-                                clippy::disallowed_methods,
-                                reason = r###"internal-read:v1 {"id":"IR-B0024-M01","item":"ratarmount::run_exports","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                            )
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0024-M01","item":"ratarmount::run_exports","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                         )]
                         let _ = std::fs::write(
                             "/tmp/ratarmount-rs-fuse-error.log",
@@ -4201,12 +4187,9 @@ fn run_fuse_and_nfs(
             let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
                 Ok(h) => h,
                 Err(e) => {
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0025-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0025-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                     )]
                     let _ = std::fs::write(
                         "/tmp/ratarmount-rs-nfs-error.log",
@@ -4233,12 +4216,9 @@ fn run_fuse_and_nfs(
             let _ = handle.join();
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0026-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0026-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                 )]
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-fuse-error.log",
@@ -4360,12 +4340,9 @@ fn run_fuse_only(
             wait_control_reply(&control);
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0027-M01","item":"ratarmount::run_fuse_only","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0027-M01","item":"ratarmount::run_fuse_only","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                 )]
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-fuse-error.log",
@@ -4423,35 +4400,23 @@ fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::Writ
     if let Some(path) = log_file {
         {
             let __inventory_condition_172220 = {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_types,
-                        reason = r###"internal-read:v1 {"id":"IR-B0028-T01","item":"ratarmount::init_logger","disposition":"support","category":"builder-type-support","reason":"Builder type support: logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = r###"internal-read:v1 {"id":"IR-B0028-T01","item":"ratarmount::init_logger","disposition":"support","category":"builder-type-support","reason":"Builder type support: logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
                 )]
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0028-M01","item":"ratarmount::init_logger","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"logger output or standard descriptor setup"}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0028-M01","item":"ratarmount::init_logger","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"logger output or standard descriptor setup"}"###
                 )]
                 let mut __inventory_value_0 = std::fs::OpenOptions::new();
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0115-M01","item":"ratarmount::init_logger","disposition":"output-owner","category":"diagnostic-log","reason":"Configure append-or-create logging for the explicit CLI log file.","creation":{"policy":"append-or-create","basis":"The log file is diagnostic output, preserves existing data, and retains default/umask file permissions."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0115-M01","item":"ratarmount::init_logger","disposition":"output-owner","category":"diagnostic-log","reason":"Configure append-or-create logging for the explicit CLI log file.","creation":{"policy":"append-or-create","basis":"The log file is diagnostic output, preserves existing data, and retains default/umask file permissions."}}"###
                 )]
                 let __inventory_value_1 = __inventory_value_0.create(true);
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0028-M02","item":"ratarmount::init_logger","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0028-M02","item":"ratarmount::init_logger","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                 )]
                 let __inventory_value_2 = __inventory_value_1.append(true).open(path);
                 __inventory_value_2
@@ -4983,12 +4948,9 @@ fn mount_table_lists(path: &Path) -> bool {
     let candidates = path_mount_candidates(path);
 
     if let Ok(text) = {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0029-M01","item":"ratarmount::mount_table_lists","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0029-M01","item":"ratarmount::mount_table_lists","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let __inventory_value_0 = std::fs::read_to_string("/proc/self/mountinfo");
         __inventory_value_0
@@ -5100,12 +5062,9 @@ fn overlay_open_error(overlay_path: &Path, e: &OverlayError) -> String {
 /// fails: on any error the fd is left as it was.
 fn neutralize_dead_stdio() {
     for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0116-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"standard-descriptor-control","reason":"Determine whether stdin/stdout/stderr is closed before filling vacant standard slots.","creation":{"policy":"none","basis":"F_GETFD queries the standard slot only; no descriptor is opened or duplicated by this operation."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0116-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"standard-descriptor-control","reason":"Determine whether stdin/stdout/stderr is closed before filling vacant standard slots.","creation":{"policy":"none","basis":"F_GETFD queries the standard slot only; no descriptor is opened or duplicated by this operation."}}"###
         )]
         let closed = unsafe { libc::fcntl(target, libc::F_GETFD) } == -1
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
@@ -5121,12 +5080,9 @@ fn neutralize_dead_stdio() {
         if !(closed || dead) {
             continue;
         }
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0030-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0030-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
         if null < 0 {
@@ -5134,22 +5090,16 @@ fn neutralize_dead_stdio() {
         }
         unsafe {
             if null != target {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0031-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0031-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                 )]
                 libc::dup2(null, target);
             } else {
                 // `open` reused the closed target; drop O_CLOEXEC like dup2 would.
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0117-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"standard-descriptor-control","reason":"Clear descriptor flags when preparing the already-filled standard slot for process handoff.","creation":{"policy":"none","basis":"F_SETFD updates an existing descriptor; /dev/null acquisition and redirection have their own events."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0117-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"standard-descriptor-control","reason":"Clear descriptor flags when preparing the already-filled standard slot for process handoff.","creation":{"policy":"none","basis":"F_SETFD updates an existing descriptor; /dev/null acquisition and redirection have their own events."}}"###
                 )]
                 libc::fcntl(target, libc::F_SETFD, 0);
             }
@@ -5164,65 +5114,44 @@ fn neutralize_dead_stdio() {
 }
 
 fn redirect_stdio_to_null() -> std::io::Result<()> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_types,
-            reason = r###"internal-read:v1 {"id":"IR-E0118-T01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions locally for standard-stream redirection to /dev/null.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-        )
+    #[expect(
+        clippy::disallowed_types,
+        reason = r###"internal-read:v1 {"id":"IR-E0118-T01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions locally for standard-stream redirection to /dev/null.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
     )]
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
     let devnull = {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_types,
-                reason = r###"internal-read:v1 {"id":"IR-B0032-T01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-type-support","reason":"Builder type support: logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-            )
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0032-T01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-type-support","reason":"Builder type support: logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
         )]
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0032-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"logger output or standard descriptor setup"}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0032-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"logger output or standard descriptor setup"}"###
         )]
         let mut __inventory_value_0 = OpenOptions::new();
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0032-M02","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0032-M02","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let __inventory_value_1 = __inventory_value_0.read(true).write(true).open("/dev/null");
         __inventory_value_1
     }?;
     let fd = devnull.as_raw_fd();
     unsafe {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0033-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0033-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         libc::dup2(fd, 0);
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0034-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0034-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         libc::dup2(fd, 1);
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0035-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0035-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         libc::dup2(fd, 2);
     }

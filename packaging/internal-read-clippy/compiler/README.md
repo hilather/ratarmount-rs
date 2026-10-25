@@ -30,7 +30,12 @@ emission and the resolved disallowed-macros map remain Clippy's. The one CSI
 exception is matched by reviewed filename and compiler-validated named owner.
 
 The compiler pre-expansion pass receives the root and every source module
-rustc loads. It checks only N2–N4 grammar and the reserved expectation protocol.
+rustc loads. It checks only N2–N4 grammar and the direct expectation protocol.
+The original crate AST retains root cfg_attr spelling after Rustc supplies
+configured root attributes to the regular callback; both receive the audit.
+Registered Rustc lint groups determine which source lint levels can suppress
+the protected lint, including literal repo macro transcribers. This is lint
+metadata, not a textual operation or path resolver.
 Raw N2 findings are deferred to exact compiler HIR module ownership, including
 compiler module ranges for inactive syntax in a loaded file; an absent or
 ambiguous enclosing module fails. Every local HIR foreign block and link_name

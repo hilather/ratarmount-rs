@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! TAR indexing and open-by-offset (Phase 1–3).
 //!
@@ -361,12 +362,9 @@ impl SqliteIndexedTar {
         index.check_backend_name(BACKEND_NAME)?;
         // Reject sibling indexes for a replaced archive (size/mtime fingerprint).
         index.check_tarstats_matches_archive(&archive_path)?;
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0361-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar>::open_with_existing_index","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0361-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar>::open_with_existing_index","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let data_file = File::open(&data_path)?;
         Ok(Self {
@@ -416,20 +414,14 @@ impl SqliteIndexedTar {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let data_path = data_path.as_ref().to_path_buf();
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0362-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar>::create_index","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0362-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar>::create_index","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let mut file = File::open(&data_path)?;
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0363-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar>::create_index","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0363-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar>::create_index","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let backend = ContentBackend::File {
             file: Arc::new(file.try_clone()?),
@@ -990,7 +982,7 @@ impl MountSource for SqliteIndexedTar {
         }
         Some(ratarmount_core::BackingExtent {
             file: {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0364-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar as ratarmount_core::MountSource<ratarmount_formats_tar::SqliteIndexedTar>>::backing_extent","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0364-M01","item":"<ratarmount_formats_tar::SqliteIndexedTar as ratarmount_core::MountSource<ratarmount_formats_tar::SqliteIndexedTar>>::backing_extent","disposition":"residual","reason":"long-lived plain TAR backend and backing-extent owner","family":"plain-tar-backend","issue":"#196","category":"plain-tar-backend","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
 let __inventory_value_0 = file.as_ref().try_clone();
 __inventory_value_0
 }.ok()?,
@@ -3245,12 +3237,9 @@ impl MountSource for SingleFileMountSource {
         }
         match &self.backend {
             SingleFileBackend::Path { path, .. } => {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0365-M01","item":"<ratarmount_formats_tar::SingleFileMountSource as ratarmount_core::MountSource<ratarmount_formats_tar::SingleFileMountSource>>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0365-M01","item":"<ratarmount_formats_tar::SingleFileMountSource as ratarmount_core::MountSource<ratarmount_formats_tar::SingleFileMountSource>>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                 )]
                 let file = File::open(path)?;
                 Ok(Box::new(StenciledFile::new(file, vec![(0, self.size)])))

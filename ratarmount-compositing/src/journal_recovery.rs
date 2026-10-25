@@ -1146,12 +1146,9 @@ pub(crate) fn open_copy_source(
     from: &CopyFrom,
 ) -> io::Result<(fs::File, fs::Metadata)> {
     commit_journal::fault::point("copy source open")?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0143-M01","item":"ratarmount_compositing::journal_recovery::open_copy_source","disposition":"residual","reason":"open_copy_source: source of every commit copy fallback; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0143-M01","item":"ratarmount_compositing::journal_recovery::open_copy_source","disposition":"residual","reason":"open_copy_source: source of every commit copy fallback; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let file = fs::File::open(archive)?;
     let source = recheck_copy_source(archive, &file, original, from)?;

@@ -25,7 +25,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     sysroot = Path(subprocess.check_output(["rustc", "+1.98.0", "--print", "sysroot"], text=True).strip())
     metadata = {"id": "IR-JOURNAL-FIXTURE", "item": "control::run", "disposition": "support", "category": "fixture", "reason": "Read the fixture's input", "creation": {"policy": "none", "basis": "Existing input only"}}
-    inventory = "#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r#\"internal-read:v1 " + json.dumps(metadata) + "\"#))]"
+    inventory = "#[expect(clippy::disallowed_methods, reason = r#\"internal-read:v1 " + json.dumps(metadata) + "\"#)]"
     journal = '#[expect(clippy::disallowed_methods, reason = "journal-policy: reviewed internal call")]'
     variants = {
         "separate": journal + '\nlet () = journal();\n' + inventory + '\nlet _ = std::fs::read("input");',

@@ -144,12 +144,9 @@ impl LocalIndexCache {
     }
 
     fn ensure_dir(&self) -> io::Result<()> {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0059-M01","item":"<ratarmount_index::local_cache::LocalIndexCache>::ensure_dir","disposition":"output-owner","category":"index-cache-directory","reason":"Create the local index cache tree before applying private Unix permissions.","creation":{"policy":"recursive-directory","basis":"ensure_dir applies mode 0700 on Unix after std creation; platform defaults remain for unsupported mode APIs."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0059-M01","item":"<ratarmount_index::local_cache::LocalIndexCache>::ensure_dir","disposition":"output-owner","category":"index-cache-directory","reason":"Create the local index cache tree before applying private Unix permissions.","creation":{"policy":"recursive-directory","basis":"ensure_dir applies mode 0700 on Unix after std creation; platform defaults remain for unsupported mode APIs."}}"###
         )]
         fs::create_dir_all(&self.dir)?;
         #[cfg(unix)]
@@ -161,12 +158,9 @@ impl LocalIndexCache {
     }
 
     fn read_header(&self, key: &str) -> io::Result<LocalIndexHeader> {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0428-M01","item":"<ratarmount_index::local_cache::LocalIndexCache>::read_header","disposition":"residual","reason":"{hex}.json header of the local-index-v1 cache of 0.7.x sidecars (lookup/touch and list_entries eviction); not the meta-v3 metadata cache, so not mandatory","family":"local-index-v1-cache-header","issue":"#196","category":"local-index-v1-cache-header","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0428-M01","item":"<ratarmount_index::local_cache::LocalIndexCache>::read_header","disposition":"residual","reason":"{hex}.json header of the local-index-v1 cache of 0.7.x sidecars (lookup/touch and list_entries eviction); not the meta-v3 metadata cache, so not mandatory","family":"local-index-v1-cache-header","issue":"#196","category":"local-index-v1-cache-header","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let bytes = fs::read(self.json_path(key))?;
         serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -186,12 +180,9 @@ impl LocalIndexCache {
         let json =
             serde_json::to_vec(&hdr).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0429-M01","item":"<ratarmount_index::local_cache::LocalIndexCache>::write_header","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0429-M01","item":"<ratarmount_index::local_cache::LocalIndexCache>::write_header","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
             )]
             let mut f = File::create(&part)?;
             f.write_all(&json)?;

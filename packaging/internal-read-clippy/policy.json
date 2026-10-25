@@ -97,7 +97,7 @@
     "source": "#201 accepted plan, prior-match/keystone/cross-target-summary.json",
     "source_sha256": "91fd0f995c8ddcc0a7c0c14db63ea1a8f662aeaa769643dbd60a98d670ce8b94",
     "failed_package_target_rows": 80,
-    "note": "Metadata only; native Linux Clippy and manifest diff enforce. No cross-target scanner."
+    "note": "Historical classification metadata only. Native Linux Clippy and manifest diff enforce approvals; native macOS/MSVC CI adds supported target and feature coverage. N4 is defence in depth for residual target predicates."
   },
   "reviewed_target_files": [
     {

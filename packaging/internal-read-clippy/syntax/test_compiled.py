@@ -33,7 +33,7 @@ def main():
         config['include_exceptions'] = []
         policy = root / 'policy.json'
         env = {**os.environ, 'CARGO_PKG_NAME': 'ratarmount-index', 'CARGO_CRATE_NAME': 'control', 'INTERNAL_READ_ROOT': str(root), 'INTERNAL_READ_CONFIG': str(policy), 'CLIPPY_CONF_DIR': str(root / 'conf'), 'RUSTC_BOOTSTRAP': '1', 'LD_LIBRARY_PATH': str(Path(sysroot) / 'lib')}
-        def run(name, source, *, reject=None, files=None, reviewed=False, root_forbid=True, native=True, allow_ffi=False):
+        def run(name, source, *, reject=None, files=None, reviewed=False, root_forbid=True, native=True, allow_ffi=False, reject_detail=None):
             config['allowed_extern_module'] = 'control::ffi' if allow_ffi else 'reviewed::ffi'
             config['reviewed_target_files'] = [{'file': 'custom-root.rs', 'reviewer': 'compiled fixture', 'reason': 'Test exact reviewed-file behavior independently of N2.'}] if reviewed else []
             policy.write_text(json.dumps(config))
@@ -49,20 +49,75 @@ def main():
                 assert check.returncode == 0, (name, 'fixture must compile before enforcement', check.stderr)
             report = root / 'report.jsonl'
             env['INTERNAL_READ_REPORT'] = str(report)
-            done = subprocess.run([str(args.driver.resolve()), *common, '-Dclippy::disallowed_methods', '-Dclippy::disallowed_types', '-Dclippy::disallowed_macros'], env=env, capture_output=True, text=True)
+            done = subprocess.run([str(args.driver.resolve()), *common, '--error-format=json', '-Dclippy::disallowed_methods', '-Funused_macros', '-Dclippy::disallowed_types', '-Dclippy::disallowed_macros'], env=env, capture_output=True, text=True)
             events = [json.loads(line) for line in report.read_text().splitlines()] if report.exists() else []
             observed = {row.get('policy') for row in events if row.get('kind') == 'syntax'}
             observed.update('N2' for row in events if row.get('kind') in {'foreign_block', 'link_name', 'raw_n2'} and not row.get('allowed'))
             # N2 is a compiler hard diagnostic after exact HIR module lookup.
             if 'N2 ' in done.stderr or 'N2:' in done.stderr:
                 observed.add('N2')
+            if reject == 'Clippy':
+                assert any(row.get('kind') == 'operation' and row.get('resolved') == 'std::fs::read' and row.get('lint') == 'clippy::disallowed_methods' for row in events), (name, events, done.stderr)
+                assert any(json.loads(line).get('code', {}) and json.loads(line)['code']['code'] == 'clippy::disallowed_methods' for line in done.stderr.splitlines() if line.startswith('{')), (name, done.stderr)
+                observed.add('Clippy')
             assert bool(done.returncode) == bool(reject), (name, done.returncode, done.stderr)
             if reject:
                 assert reject in observed, (name, reject, sorted(str(x) for x in observed), done.stderr)
+                if reject == 'N4' or reject_detail:
+                    detail = reject_detail or 'target predicate outside reviewed file'
+                    assert reject + ': ' + detail in done.stderr, (name, detail, done.stderr)
+            elif done.returncode == 0:
+                assert not any(row.get('kind') == 'syntax' for row in events), (name, events)
             (args.output / f'{name}.stderr').write_text(done.stderr)
             (args.output / f'{name}.jsonl').write_text(report.read_text() if report.exists() else '')
             results.append({'name': name, 'compiled': native, 'exit': done.returncode, 'expected': reject or 'accept', 'observed': sorted(str(x) for x in observed)})
             return events
+        # Regression: -D must permit reviewed direct expects, but source cannot
+        # lower the acquisition lint or hide an approval in cfg_attr.
+        for reviewed in (False, True):
+            suffix = '-reviewed' if reviewed else ''
+            for scope, wrap in [
+                ('crate', lambda attr: '#![' + attr + '] pub fn visible() {}'),
+                ('module', lambda attr: '#[' + attr + '] pub mod nested { pub fn visible() {} }'),
+                ('item', lambda attr: '#[' + attr + '] pub fn visible() {}'),
+            ]:
+                for level in ('allow', 'warn'):
+                    run('source-' + level + '-' + scope + suffix,
+                        wrap(level + '(clippy::disallowed_methods)'),
+                        reviewed=reviewed, reject='EXPECT',
+                        reject_detail='allow/warn of disallowed lint is refused')
+                for predicate in ('all()', 'any()'):
+                    run('cfg-attr-expect-' + scope + '-' + predicate + suffix,
+                        wrap('cfg_attr(' + predicate + ',expect(clippy::disallowed_methods,reason="review"))'),
+                        reviewed=reviewed, reject='EXPECT',
+                        reject_detail='cfg_attr-wrapped disallowed lint level is refused')
+            run('nested-cfg-attr-warn' + suffix,
+                '#[cfg_attr(all(),cfg_attr(any(),warn(clippy::disallowed_methods)))] pub fn visible() {}',
+                reviewed=reviewed, reject='EXPECT',
+                reject_detail='cfg_attr-wrapped disallowed lint level is refused')
+        run('direct-reviewed-expect', 'pub fn load() { #[expect(clippy::disallowed_methods,reason="review")] let _ = std::fs::read("x"); }')
+        run('test-module-allow-outside-production',
+            '#[cfg(test)] #[allow(clippy::disallowed_methods)] mod tests { fn load() { let _ = std::fs::read("x"); } }')
+        for group in ('all', 'style'):
+            run('source-group-allow-' + group,
+                '#![allow(clippy::' + group + ')] pub fn visible() {}',
+                reject='EXPECT', reject_detail='allow/warn of disallowed lint is refused')
+            run('source-group-expect-' + group,
+                '#![expect(clippy::' + group + ',reason="review")] pub fn load() { let _ = std::fs::read("x"); }',
+                reject='EXPECT', reject_detail='disallowed lint requires direct expect with literal reason')
+            run('macro-group-allow-' + group,
+                'macro_rules! m { () => { #[allow(clippy::' + group + ')] pub fn load() { let _ = std::fs::read("x"); } }; } m!();',
+                reject='EXPECT', reject_detail='allow/warn of disallowed lint is refused')
+        run('macro-literal-allow',
+            'macro_rules! m { () => { #[allow(clippy::disallowed_methods)] pub fn load() { let _ = std::fs::read("x"); } }; } m!();',
+            reject='EXPECT', reject_detail='allow/warn of disallowed lint is refused')
+        run('crate-root-boolean-target',
+            '#![cfg_attr(true,cfg(windows))] pub fn load() { let _ = std::fs::read("x"); }',
+            reject='N4', reject_detail='cfg_attr predicate or attributes could not be parsed')
+        run('crate-root-clippy-stripping',
+            '#![cfg(not(clippy))] pub fn load() { let _ = std::fs::read("x"); }',
+            reject='N4', reject_detail='clippy cfg predicate hides code from native Clippy')
+
         # N3 checks macro grammar before cfg substitution or invocation.
         run('substituted-attribute', 'macro_rules! m { ($g:meta) => { #[$g] pub fn hidden() {} } } m!(cfg(not(clippy)));', reject='N3')
         run('repeated-attribute', '#[macro_export] macro_rules! m { ($($g:meta),*) => { $(#[$g])* pub fn hidden() {} } }', reject='N3')
@@ -162,13 +217,46 @@ def main():
         run('loaded-test-subtree', '#[path="loaded.rs"] mod production;', files={'loaded.rs': '#[cfg(test)] mod tests { unsafe extern "C" { pub fn arbitrary(); } #[cfg(windows)] fn hidden(){} #[macro_export] macro_rules! ignored { () => { #[cfg(unix)] fn hidden(){} } } }'})
         run('unloaded-feature-module', '#[cfg(feature="off")] #[path="does-not-exist.rs"] mod dormant;')
         run('nested-cfg-attr-target', '#[cfg_attr(all(),cfg_attr(all(),cfg(target_os="windows")))] pub fn hidden() {}', reject='N4')
+        # Regression: a failed nested predicate parse previously became an
+        # empty any(), skipping N4 before the compiler stripped a hidden read.
+        run('boolean-any-target', '#[cfg(any(false,windows))] pub fn hidden() { let _ = std::fs::read("x"); }', reject='N4')
+        run('boolean-any-target-cfg-attr', '#[cfg_attr(all(),cfg(any(false,windows)))] pub fn hidden() { let _ = std::fs::read("x"); }', reject='N4')
+        run('boolean-any-feature-inactive', '#[cfg(any(false,feature="off"))] pub fn hidden() { let _ = std::fs::read("x"); }')
         run('raw-target-predicate', '#[cfg(r#target_os="windows")] pub fn hidden() {}', reject='N4')
-        run('target-cfg-macro', 'pub fn target() -> bool { cfg!(all(unix,target_family="unix")) }', reject='N4')
+        # Regression: cfg! is a boolean and strips no code, including nested
+        # invocations and imports. The native lint still sees both branches.
+        run('target-cfg-macro', 'pub fn target() -> bool { cfg!(all(unix,target_family="unix")) }')
+        run('nested-target-cfg-macro', 'pub fn target() -> String { format!("{}", cfg!(windows)) }')
+        run('if-target-cfg-positive', 'pub fn visible() -> u8 { if cfg!(windows) { 1 } else { 2 } }')
+        run('harmless-macro-nesting', 'macro_rules! outer { () => { macro_rules! inner { () => { 7 } } pub fn value() -> u8 { inner!() } } } outer!();')
+        run('macro-body-cfg-positive', 'macro_rules! platform { () => { pub fn visible() -> bool { cfg!(windows) } } } platform!();')
+        run('nested-macro-body-cfg-positive', 'macro_rules! outer { () => { macro_rules! inner { () => { cfg!(windows) } } pub fn value() -> bool { inner!() } } } outer!();')
+        run('macro-body-cfg-read', 'macro_rules! platform { () => { pub fn visible() { if cfg!(windows) { let _ = std::fs::read("x"); } } } } platform!();', reject='Clippy')
+        run('opaque-cfg-macro-data', 'pub const TEXT: &str = stringify!(cfg!(windows));')
+        run('if-target-cfg-read', 'pub fn visible() { if cfg!(windows) { let _ = std::fs::read("x"); } }', reject='Clippy')
+        for name, attribute in [
+            ('boolean-true-target', 'cfg_attr(true,cfg(windows))'),
+            ('boolean-false-target', 'cfg_attr(false,cfg(windows))'),
+            ('nested-boolean-target', 'cfg_attr(all(),cfg_attr(true,cfg(windows)))'),
+            ('boolean-true-clippy', 'cfg_attr(true,cfg(not(clippy)))'),
+        ]:
+            run(name, '#[' + attribute + '] pub fn hidden() { let _ = std::fs::read("x"); }', reject='N4', reject_detail='cfg_attr predicate or attributes could not be parsed')
+        for reviewed in [False, True]:
+            for name, attribute in [
+                ('positive', 'cfg(clippy)'),
+                ('negative', 'cfg(not(clippy))'),
+                ('boolean-any-negative', 'cfg(any(false,not(clippy)))'),
+                ('boolean-any-cfg-attr', 'cfg_attr(all(),cfg(any(false,not(clippy))))'),
+                ('conditional-positive', 'cfg_attr(clippy, cfg(windows))'),
+                ('conditional-negative', 'cfg_attr(not(clippy), cfg(windows))'),
+                ('nested-negative', 'cfg_attr(all(), cfg_attr(all(), cfg(not(clippy))))'),
+            ]:
+                run('clippy-cfg-' + name + ('-reviewed' if reviewed else ''), '#[' + attribute + '] pub fn hidden() { let _ = std::fs::read("x"); }', reviewed=reviewed, reject='N4', reject_detail='clippy cfg predicate hides code from native Clippy')
         run('feature-only-predicate', '#[cfg(feature="off")] pub fn hidden() {}')
         run('target-attribute-not-predicate', '#[cfg_attr(feature="simd",target_feature(enable="sse2"))] pub fn visible() {}')
         run('reviewed-file-before-edit', '#[cfg(windows)] pub fn hidden() {}', reviewed=True)
         run('reviewed-file-unrelated-edit', '// unrelated edit\n#[cfg(windows)] pub fn hidden() {}\npub fn extra() {}', reviewed=True)
-        run('custom-root-missing-forbid', 'pub fn visible() {}', reject='N3', root_forbid=False)
+        run('custom-root-no-source-forbid', 'pub fn visible() {}', root_forbid=False)
         run('reserved-cfg', '#[cfg(internal_read_inventory)] pub fn hidden() {}', reject='EXPECT')
         run('reserved-raw-cfg', '#[cfg(r#internal_read_inventory)] pub fn hidden() {}', reject='EXPECT')
         run('reserved-cfg-macro', 'pub fn hidden() -> bool { cfg!(internal_read_inventory) }', reject='EXPECT')

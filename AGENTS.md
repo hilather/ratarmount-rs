@@ -18,10 +18,13 @@ python3 -I packaging/internal-read-clippy/policy.py
 
 The internal-read inventory (#151/#201) uses Clippy's resolved disallowed-item
 lints and a reviewed manifest in `packaging/internal-read-clippy/`. New operations
-need narrow per-site production-only expectations with literal review reasons,
-creation metadata and an explicit manifest review. The generator writes a
-candidate; CI never refreshes approvals. N2–N4 are syntax refusals only, with no
-textual operation, path/reexport, creation-flag or foreign-symbol resolver.
+need narrow per-site direct `#[expect]` attributes with literal review reasons,
+creation metadata and an explicit manifest review. Restricted source cannot lower
+the disallowed-item lints with `allow`/`warn` or wrap their expectations in
+`cfg_attr`. CI compares item-path/reason approvals in both directions: an
+unmanifested expectation or an approval without a matching expectation fails.
+The generator writes a candidate; CI never refreshes approvals. N2–N4 are syntax
+refusals only, with no textual operation, path/reexport, creation-flag or foreign-symbol resolver.
 Production membership is whatever Clippy compiles for the selected lib/bin
 all-features targets and documented feature profiles. Retyping an already
 inventoried descriptor is not a new inventory event. Transitive managed-reader
@@ -37,8 +40,17 @@ calls in repository proc-macro crate implementations still receive normal
 Clippy enforcement. N2 refuses all local HIR foreign blocks/link_name regardless
 of origin except the exact reviewed `ratarmount_formats_libarchive::ffi` module.
 N4 file exceptions have no content hash: inactive alternatives require ordinary
-review, and native Linux does not lint their inactive calls. Dormant exported
-macros and arbitrary non-target cfg predicates remain follow-up #209.
+review. N4 is defence in depth behind native Linux/macOS/Windows CI coverage;
+Linux does not lint inactive target alternatives. Only stripping cfg/cfg_attr
+target predicates need reviewed files; cfg! returns a boolean and is permitted.
+Unparseable cfg_attr predicates and clippy/not(clippy) stripping are refused in
+restricted packages, including reviewed files. Native CI uses
+`-D clippy::disallowed_methods -F unused_macros -D warnings`, preserving reviewed
+expectations while rejecting unfulfilled ones. Root forbid attributes document
+the unused-macro rule without a source-shape check. Ordinary builds suppress
+unfulfilled inventory expectations only while `internal_read_inventory` is off;
+selected policy/native compilations enable it and require fulfillment.
+Dormant exported macros and other non-target cfg predicates remain follow-up #209.
 
 Do **not** push code that fails `cargo fmt --check`.
 

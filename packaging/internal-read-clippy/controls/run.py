@@ -70,7 +70,7 @@ path = "lib.rs"
             if check.returncode:
                 raise AssertionError(f'{case}: baseline failed to compile:\n{check.stderr}\n{check.stdout}')
             report = project / f'{case}.jsonl'
-            flags = ['-Dwarnings', '-Dclippy::disallowed_methods', '-Dclippy::disallowed_types', '-Dclippy::disallowed_macros', '-Dunfulfilled_lint_expectations', '--cfg', 'internal_read_inventory', '--check-cfg=cfg(internal_read_inventory)']
+            flags = ['-Dwarnings', '-Fclippy::disallowed_methods', '-Funused_macros', '-Dclippy::disallowed_types', '-Dclippy::disallowed_macros', '-Dunfulfilled_lint_expectations', '--cfg', 'internal_read_inventory', '--check-cfg=cfg(internal_read_inventory)']
             env = {**base_env, 'RUSTC_WORKSPACE_WRAPPER': str(driver), 'CLIPPY_ARGS': '__CLIPPY_HACKERY__'.join(flags), 'CLIPPY_CONF_DIR': str(conf), 'INTERNAL_READ_REPORT': str(report), 'INTERNAL_READ_CONFIG': str(project / 'policy.json'), 'INTERNAL_READ_ROOT': str(project), 'RUSTC_BOOTSTRAP': '1', 'CARGO_TARGET_DIR': str(project / 'policy-target')}
             run = cargo(project, env, 'check', '--offline', '--lib', '--all-features', '--message-format=json')
             events = [json.loads(line) for line in report.read_text().splitlines()] if report.exists() else []
@@ -107,6 +107,13 @@ path = "lib.rs"
                 (project / 'policy.json').write_text(json.dumps(policy))
             if bool(run.returncode) != bool(expected) or not expected.issubset(mechanisms):
                 raise AssertionError(f'{case}: wanted {sorted(expected)}, observed exit={run.returncode}, mechanisms={sorted(mechanisms)}\n{run.stderr}\n{run.stdout}')
+            # Regression: an unrelated compilation failure cannot stand in for
+            # the named syntax refusal promised by this fixture.
+            for mechanism in expected & {'N2', 'N3', 'N4'}:
+                diagnostic_output = run.stdout + run.stderr
+                if mechanism == 'N2' and independent:
+                    diagnostic_output += independent_run.stdout + independent_run.stderr
+                assert mechanism in diagnostic_output, (case, mechanism, diagnostic_output)
             summary.append({'fixture': case, 'check_exit': check.returncode, 'policy_exit': run.returncode, 'observed_mechanisms': sorted(mechanisms), 'expected_mechanisms': sorted(expected), 'disallowed_diagnostic_counts': {code: disallowed_codes.count(code) for code in sorted(set(disallowed_codes))}, 'independent_compilation': independent, 'accepted_gap': case in {'extern-crate-alias-dormant', 'accepted-retyping'}})
     result = {'schema': 1, 'scope': 'Compiled production libraries; declarations are not executed.', 'cases': summary}
     if args.output:

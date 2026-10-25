@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 
 #[derive(Default)]
 struct Audit {
+    restricted: bool,
+    suppression_lint_names: BTreeSet<String>,
     findings: BTreeSet<(usize, String, String)>,
 }
 
@@ -166,7 +168,10 @@ impl Audit {
                 }
             }
 
-            if macro_body && (is_ident(token, "cfg") || is_ident(token, "cfg_attr")) {
+            let boolean_cfg = is_ident(token, "cfg")
+                && matches!(tokens.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!');
+            if macro_body && !boolean_cfg && (is_ident(token, "cfg") || is_ident(token, "cfg_attr"))
+            {
                 self.emit(token.span(), "N3", "cfg/cfg_attr token in macro_rules body");
             }
             if is_ident(token, "extern") {
@@ -210,6 +215,16 @@ impl Audit {
                 if let Some(TokenTree::Group(group)) = tokens.get(attr_index) {
                     if group.delimiter() == Delimiter::Bracket {
                         let inner: Vec<_> = group.stream().into_iter().collect();
+                        if self.restricted && macro_body && transcriber {
+                            if let Ok(meta) = syn::parse2::<syn::Meta>(group.stream()) {
+                                if let Err(detail) = suppression_attribute_with_lints(
+                                    &meta,
+                                    &self.suppression_lint_names,
+                                ) {
+                                    self.emit(token.span(), "EXPECT", &detail);
+                                }
+                            }
+                        }
                         if inner.first().is_some_and(|t| is_ident(t, "link_name"))
                             || (inner.first().is_some_and(|t| is_ident(t, "cfg_attr"))
                                 && contains_ident(group.stream(), "link_name"))
@@ -439,8 +454,26 @@ impl Audit {
 /// Audit one compiler-observed `macro_rules!` body. N2 findings remain pending
 /// until the adapter applies the single exact compiler-module exception.
 pub fn audit_macro(source: &str) -> Result<Vec<(String, String)>, String> {
+    audit_macro_scoped(source, false)
+}
+
+/// Apply restricted-package lint-level refusals to literal transcriber attributes.
+pub fn audit_macro_scoped(source: &str, restricted: bool) -> Result<Vec<(String, String)>, String> {
+    audit_macro_with_lints(source, restricted, &BTreeSet::new())
+}
+
+/// Lint groups are provided by the compiler's registered lint store.
+pub fn audit_macro_with_lints(
+    source: &str,
+    restricted: bool,
+    protected_lints: &BTreeSet<String>,
+) -> Result<Vec<(String, String)>, String> {
     let tokens = source.parse::<TokenStream>().map_err(|e| e.to_string())?;
-    let mut audit = Audit::default();
+    let mut audit = Audit {
+        restricted,
+        suppression_lint_names: protected_lints.clone(),
+        ..Audit::default()
+    };
     audit.macro_rules(tokens, &Default::default());
     Ok(audit
         .findings
@@ -453,8 +486,29 @@ pub fn audit_macro(source: &str) -> Result<Vec<(String, String)>, String> {
 /// Other payload tokens are data: only discovered `macro_rules!` definitions
 /// enter the N2/N3 grammar audit, with their own matcher/transcriber boundaries.
 pub fn audit_macro_payload(source: &str) -> Result<Vec<(String, String)>, String> {
+    audit_macro_payload_scoped(source, false)
+}
+
+/// Preserve package scope for literal definitions nested in invocation payloads.
+pub fn audit_macro_payload_scoped(
+    source: &str,
+    restricted: bool,
+) -> Result<Vec<(String, String)>, String> {
+    audit_macro_payload_with_lints(source, restricted, &BTreeSet::new())
+}
+
+/// Keep the compiler-provided group identities for nested literal definitions.
+pub fn audit_macro_payload_with_lints(
+    source: &str,
+    restricted: bool,
+    protected_lints: &BTreeSet<String>,
+) -> Result<Vec<(String, String)>, String> {
     let tokens = source.parse::<TokenStream>().map_err(|e| e.to_string())?;
-    let mut audit = Audit::default();
+    let mut audit = Audit {
+        restricted,
+        suppression_lint_names: protected_lints.clone(),
+        ..Audit::default()
+    };
     audit.macro_payload(tokens);
     Ok(audit
         .findings
@@ -627,6 +681,17 @@ mod tests {
             assert!(policies(src).iter().any(|p| p == "N3"), "{src}");
         }
     }
+    /// Regression: cfg! in a macro body yields a bool and removes no code.
+    #[test]
+    fn regression_cfg_macro_in_macro_rules_body_is_allowed() {
+        for source in [
+            "() => { pub fn platform() -> bool { cfg!(windows) } };",
+            r#"() => { pub fn platform() -> String { format!("{}", cfg!(windows)) } };"#,
+            "() => { macro_rules! inner { () => { cfg!(windows) }; } };",
+        ] {
+            assert!(policies(source).is_empty(), "{source}");
+        }
+    }
     #[test]
     fn regression_extern_optional_abi_and_arbitrary_foreign_names() {
         for src in [
@@ -654,77 +719,173 @@ mod tests {
     }
 }
 
-/// Exact reserved activation protocol. This parses metadata, never operations.
-pub fn inventory_attribute(meta: &syn::Meta) -> Result<Option<(String, String)>, String> {
-    use syn::{parse::Parser, punctuated::Punctuated, Expr, Lit, Token};
-    fn named(path: &syn::Path, name: &str) -> bool {
-        path.leading_colon.is_none() && path.segments.len() == 1 && path.segments[0].ident == name
-    }
-    let rendered = quote_meta(meta);
-    if !contains_ident(rendered.clone(), "internal_read_inventory") {
+fn attribute_named(path: &syn::Path, name: &str) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == 1
+        && path.segments[0].ident.to_string().trim_start_matches("r#") == name
+}
+
+fn lint_name(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|part| part.ident.to_string().trim_start_matches("r#").to_owned())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn inventory_lint(path: &syn::Path) -> bool {
+    matches!(
+        lint_name(path).as_str(),
+        "clippy::disallowed_methods" | "clippy::disallowed_types"
+    )
+}
+
+fn meta_parts(tokens: TokenStream) -> Result<Vec<syn::Meta>, String> {
+    use syn::{parse::Parser, punctuated::Punctuated, Token};
+    Punctuated::<syn::Meta, Token![,]>::parse_terminated
+        .parse2(tokens)
+        .map(|parts| parts.into_iter().collect())
+        .map_err(|error| error.to_string())
+}
+
+fn direct_expect(meta: &syn::Meta) -> Result<Option<(String, String)>, String> {
+    use syn::{Expr, Lit};
+    let syn::Meta::List(expect) = meta else {
+        return Ok(None);
+    };
+    if !attribute_named(&expect.path, "expect") {
         return Ok(None);
     }
-    let syn::Meta::List(outer) = meta else {
-        return Err("reserved activation outside exact cfg_attr(expect)".into());
-    };
-    if !named(&outer.path, "cfg_attr") {
-        return Err("reserved activation outside exact cfg_attr(expect)".into());
-    }
-    let parts = Punctuated::<syn::Meta, Token![,]>::parse_terminated
-        .parse2(outer.tokens.clone())
-        .map_err(|e| e.to_string())?;
-    if parts.len() != 2 {
-        return Err("inventory cfg_attr requires exactly predicate and expect".into());
-    }
-    let mut parts = parts.into_iter();
-    if !matches!(parts.next(), Some(syn::Meta::Path(path)) if named(&path,"internal_read_inventory"))
-    {
-        return Err("reserved activation predicate must be literal internal_read_inventory".into());
-    }
-    let Some(syn::Meta::List(expect)) = parts.next() else {
-        return Err("inventory cfg_attr must contain expect".into());
-    };
-    if !named(&expect.path, "expect") {
-        return Err("inventory activation permits expect only".into());
-    }
-    let args = Punctuated::<syn::Meta, Token![,]>::parse_terminated
-        .parse2(expect.tokens)
-        .map_err(|e| e.to_string())?;
-    if args.len() != 2 {
-        return Err("inventory expect requires one lint and one literal reason".into());
-    }
-    let mut args = args.into_iter();
-    let Some(syn::Meta::Path(lint)) = args.next() else {
-        return Err("missing inventory lint".into());
-    };
-    let lint = lint
-        .segments
+    let args = meta_parts(expect.tokens.clone())?;
+    if !args
         .iter()
-        .map(|s| s.ident.to_string())
-        .collect::<Vec<_>>()
-        .join("::");
-    if !matches!(
-        lint.as_str(),
-        "clippy::disallowed_methods" | "clippy::disallowed_types"
-    ) {
-        return Err("invalid inventory lint".into());
+        .any(|arg| matches!(arg, syn::Meta::Path(path) if inventory_lint(path)))
+    {
+        return Ok(None);
     }
-    let Some(syn::Meta::NameValue(reason)) = args.next() else {
-        return Err("missing inventory reason".into());
+    if args.len() != 2 {
+        return Err("disallowed lint requires direct expect with literal reason".into());
+    }
+    let syn::Meta::Path(lint) = &args[0] else {
+        return Err("disallowed lint requires direct expect with literal reason".into());
     };
-    if !named(&reason.path, "reason") {
-        return Err("missing inventory reason".into());
+    if !inventory_lint(lint) {
+        return Err("disallowed lint requires direct expect with literal reason".into());
+    }
+    let syn::Meta::NameValue(reason) = &args[1] else {
+        return Err("disallowed lint requires direct expect with literal reason".into());
+    };
+    if !attribute_named(&reason.path, "reason") {
+        return Err("disallowed lint requires direct expect with literal reason".into());
     }
     let Expr::Lit(syn::ExprLit {
         lit: Lit::Str(reason),
         ..
-    }) = reason.value
+    }) = &reason.value
     else {
-        return Err("inventory reason must be a literal string".into());
+        return Err("disallowed lint requires direct expect with literal reason".into());
     };
-    let reason = reason.value();
+    let lint = lint
+        .segments
+        .iter()
+        .map(|part| part.ident.to_string().trim_start_matches("r#").to_owned())
+        .collect::<Vec<_>>()
+        .join("::");
+    Ok(Some((lint, reason.value())))
+}
+
+/// Refuse source lint lowerings; Clippy continues to resolve every operation.
+/// The reserved cfg is only an ordinary-build unfulfilled-expectation switch.
+pub fn suppression_attribute(meta: &syn::Meta) -> Result<(), String> {
+    suppression_attribute_with_lints(meta, &BTreeSet::new())
+}
+
+/// Refuse groups according to compiler-provided membership, without a spelling table.
+pub fn suppression_attribute_with_lints(
+    meta: &syn::Meta,
+    protected_lints: &BTreeSet<String>,
+) -> Result<(), String> {
+    fn check(
+        meta: &syn::Meta,
+        conditional: bool,
+        protected_lints: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let syn::Meta::List(list) = meta else {
+            return Ok(());
+        };
+        if attribute_named(&list.path, "cfg_attr") {
+            let parts = meta_parts(list.tokens.clone())
+                .map_err(|_| "cfg_attr predicate or attributes could not be parsed".to_owned())?;
+            for nested in parts.iter().skip(1) {
+                check(nested, true, protected_lints)?;
+            }
+            return Ok(());
+        }
+        let lowering = attribute_named(&list.path, "allow") || attribute_named(&list.path, "warn");
+        if !lowering && !attribute_named(&list.path, "expect") {
+            return Ok(());
+        }
+        let parts = meta_parts(list.tokens.clone())?;
+        if !parts.iter().any(|part| {
+            matches!(part, syn::Meta::Path(path)
+            if inventory_lint(path) || protected_lints.contains(&lint_name(path)))
+        }) {
+            return Ok(());
+        }
+        if conditional {
+            return Err("cfg_attr-wrapped disallowed lint level is refused".into());
+        }
+        if lowering {
+            return Err("allow/warn of disallowed lint is refused".into());
+        }
+        // A group expectation can hide several independent operations and
+        // cannot be the required one-specific-lint approval protocol.
+        if !parts
+            .iter()
+            .any(|part| matches!(part, syn::Meta::Path(path) if inventory_lint(path)))
+        {
+            return Err("disallowed lint requires direct expect with literal reason".into());
+        }
+        direct_expect(meta).map(|_| ())
+    }
+    check(meta, false, protected_lints)
+}
+
+fn dormant_expect_switch(meta: &syn::Meta) -> bool {
+    let syn::Meta::List(list) = meta else {
+        return false;
+    };
+    if !attribute_named(&list.path, "cfg_attr") {
+        return false;
+    }
+    let Ok(parts) = meta_parts(list.tokens.clone()) else {
+        return false;
+    };
+    let [syn::Meta::List(predicate), syn::Meta::List(level)] = parts.as_slice() else {
+        return false;
+    };
+    attribute_named(&predicate.path, "not")
+        && matches!(meta_parts(predicate.tokens.clone()).as_deref(), Ok([syn::Meta::Path(path)]) if attribute_named(path, "internal_read_inventory"))
+        && attribute_named(&level.path, "allow")
+        && matches!(meta_parts(level.tokens.clone()).as_deref(), Ok([syn::Meta::Path(path)]) if attribute_named(path, "unfulfilled_lint_expectations"))
+}
+
+/// Direct per-site approval metadata. This parses attributes, never operations.
+pub fn inventory_attribute(meta: &syn::Meta) -> Result<Option<(String, String)>, String> {
+    if contains_ident(quote_meta(meta), "internal_read_inventory") {
+        return if dormant_expect_switch(meta) {
+            Ok(None)
+        } else {
+            Err("reserved activation outside ordinary-build expectation switch".into())
+        };
+    }
+    let Some((lint, reason)) = direct_expect(meta)? else {
+        return Ok(None);
+    };
+    // The independent journal restrictions have ordinary literal reasons.
+    // Their configured rule namespace remains separate from the inventory.
     if !reason.starts_with("internal-read:v1 ") {
-        return Err("invalid inventory reason namespace".into());
+        return Ok(None);
     }
     Ok(Some((lint, reason)))
 }
@@ -734,12 +895,15 @@ fn quote_meta(meta: &syn::Meta) -> TokenStream {
     meta.to_token_stream()
 }
 
-/// Find target predicates in cfg/cfg_attr grammar only. A nested ordinary
-/// attribute named target_feature is not itself a cfg predicate.
-pub fn target_attribute(meta: &syn::Meta) -> bool {
+/// Inspect only stripping attributes. Unrecognized cfg_attr grammar is a
+/// refusal, never evidence that the attribute has no restricted predicate.
+fn attribute_predicate(
+    meta: &syn::Meta,
+    predicate: fn(TokenStream) -> bool,
+) -> Result<bool, String> {
     use syn::{parse::Parser, punctuated::Punctuated, Token};
     let syn::Meta::List(list) = meta else {
-        return false;
+        return Ok(false);
     };
     let name = list
         .path
@@ -748,21 +912,35 @@ pub fn target_attribute(meta: &syn::Meta) -> bool {
         .map(|s| s.ident.to_string().trim_start_matches("r#").to_owned())
         .unwrap_or_default();
     match name.as_str() {
-        "cfg" => target_predicate(list.tokens.clone()),
+        "cfg" => Ok(predicate(list.tokens.clone())),
         "cfg_attr" => {
-            let Ok(parts) =
-                Punctuated::<syn::Meta, Token![,]>::parse_terminated.parse2(list.tokens.clone())
-            else {
-                return false;
-            };
+            let parts = Punctuated::<syn::Meta, Token![,]>::parse_terminated
+                .parse2(list.tokens.clone())
+                .map_err(|_| "cfg_attr predicate or attributes could not be parsed".to_owned())?;
             let mut parts = parts.iter();
-            parts
+            let first = parts
                 .next()
-                .is_some_and(|predicate| target_predicate(quote_meta(predicate)))
-                || parts.any(target_attribute)
+                .ok_or_else(|| "cfg_attr predicate or attributes could not be parsed".to_owned())?;
+            let mut found = predicate(quote_meta(first));
+            for attribute in parts {
+                found |= attribute_predicate(attribute, predicate)?;
+            }
+            Ok(found)
         }
-        _ => false,
+        _ => Ok(false),
     }
+}
+
+/// Find target predicates in cfg/cfg_attr grammar only. A nested ordinary
+/// attribute named target_feature is not itself a cfg predicate.
+pub fn target_attribute(meta: &syn::Meta) -> Result<bool, String> {
+    attribute_predicate(meta, target_predicate)
+}
+
+/// Clippy-specific stripping cannot be exempted by a reviewed target file:
+/// it prevents the native lint from observing the item on every operating system.
+pub fn clippy_attribute(meta: &syn::Meta) -> Result<bool, String> {
+    attribute_predicate(meta, |tokens| contains_ident(tokens, "clippy"))
 }
 
 #[cfg(test)]
@@ -772,12 +950,191 @@ mod cfg_attribute_tests {
     fn regression_target_attribute_names_are_not_predicates() {
         let ordinary: syn::Meta =
             syn::parse_str(r#"cfg_attr(feature="simd",target_feature(enable="sse2"))"#).unwrap();
-        assert!(!target_attribute(&ordinary));
+        assert!(!target_attribute(&ordinary).unwrap());
         for source in [
             r#"cfg_attr(unix, target_feature(enable="sse2"))"#,
             r#"cfg_attr(all(),cfg_attr(all(),cfg(not(windows))))"#,
         ] {
-            assert!(target_attribute(&syn::parse_str(source).unwrap()));
+            assert!(target_attribute(&syn::parse_str(source).unwrap()).unwrap());
         }
+    }
+    /// Regression: a syn parse failure previously hid stable boolean cfg_attr.
+    #[test]
+    fn regression_cfg_attr_parse_failure_is_refused() {
+        for source in [
+            "cfg_attr(true, cfg(windows))",
+            "cfg_attr(false, cfg(windows))",
+            "cfg_attr(true, cfg(not(clippy)))",
+            "cfg_attr(all(), cfg_attr(true, cfg(windows)))",
+            "cfg_attr()",
+        ] {
+            let meta = syn::parse_str(source).unwrap();
+            assert!(target_attribute(&meta).is_err(), "{source}");
+            assert!(clippy_attribute(&meta).is_err(), "{source}");
+        }
+    }
+    /// Regression: Clippy-specific cfg strips code on every native runner.
+    #[test]
+    fn regression_clippy_stripping_predicates() {
+        for source in [
+            "cfg(clippy)",
+            "cfg(not(clippy))",
+            "cfg_attr(not(clippy), cfg(windows))",
+            "cfg_attr(all(), cfg_attr(all(), cfg(not(clippy))))",
+        ] {
+            assert!(
+                clippy_attribute(&syn::parse_str(source).unwrap()).unwrap(),
+                "{source}"
+            );
+        }
+        for source in [
+            r#"cfg(feature="clippy")"#,
+            "cfg_attr(all(), allow(clippy::style))",
+        ] {
+            assert!(
+                !clippy_attribute(&syn::parse_str(source).unwrap()).unwrap(),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod expectation_attribute_tests {
+    use super::*;
+
+    /// Regression: approvals are direct attributes, without conditional activation.
+    #[test]
+    fn regression_direct_expect_protocol() {
+        let direct = r#"expect(clippy::disallowed_methods, reason="internal-read:v1 {}")"#;
+        assert_eq!(
+            inventory_attribute(&syn::parse_str(direct).unwrap()).unwrap(),
+            Some((
+                "clippy::disallowed_methods".into(),
+                "internal-read:v1 {}".into()
+            ))
+        );
+        for source in [
+            r#"cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason="internal-read:v1 {}"))"#,
+            "cfg(internal_read_inventory)",
+            "cfg(r#internal_read_inventory)",
+        ] {
+            assert!(
+                inventory_attribute(&syn::parse_str(source).unwrap()).is_err(),
+                "{source}"
+            );
+        }
+        for source in [
+            r#"expect(clippy::disallowed_methods, reason="Reviewed independent journal operation")"#,
+            "cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))",
+        ] {
+            assert!(
+                inventory_attribute(&syn::parse_str(source).unwrap())
+                    .unwrap()
+                    .is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    /// Regression: -D must not be lowered through local lint-level attributes.
+    #[test]
+    fn regression_disallowed_lint_suppressions_are_refused() {
+        for source in [
+            "allow(clippy::disallowed_methods)",
+            "allow(dead_code, clippy::disallowed_types)",
+            "warn(clippy::disallowed_methods)",
+            r#"cfg_attr(all(), expect(clippy::disallowed_methods, reason="review"))"#,
+            "cfg_attr(all(), warn(clippy::disallowed_methods))",
+            "cfg_attr(all(), allow(clippy::disallowed_methods))",
+            r#"cfg_attr(all(), cfg_attr(all(), expect(clippy::disallowed_types, reason="review")))"#,
+            r#"cfg_attr(false, expect(clippy::disallowed_methods, reason="review"))"#,
+            "expect(clippy::disallowed_methods)",
+            r#"expect(clippy::disallowed_methods, clippy::disallowed_types, reason="review")"#,
+            "expect(clippy::disallowed_methods, reason=concat!(\"review\"))",
+        ] {
+            assert!(
+                suppression_attribute(&syn::parse_str(source).unwrap()).is_err(),
+                "{source}"
+            );
+        }
+        for source in [
+            r#"expect(clippy::disallowed_methods, reason="review")"#,
+            r#"expect(clippy::disallowed_types, reason="review")"#,
+            "allow(clippy::needless_return)",
+            "deny(clippy::disallowed_methods)",
+            "forbid(clippy::disallowed_methods)",
+            "cfg_attr(all(), allow(dead_code))",
+            "cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))",
+        ] {
+            assert!(
+                suppression_attribute(&syn::parse_str(source).unwrap()).is_ok(),
+                "{source}"
+            );
+        }
+    }
+
+    /// Regression: group membership comes from the compiler, not a fixed table.
+    #[test]
+    fn regression_compiler_provided_lint_groups_cannot_lower_inventory() {
+        let protected = BTreeSet::from(["synthetic::approved_group".to_owned()]);
+        for source in [
+            "allow(synthetic::approved_group)",
+            "warn(synthetic::approved_group)",
+            r#"expect(synthetic::approved_group, reason="review")"#,
+            r#"cfg_attr(all(), expect(synthetic::approved_group, reason="review"))"#,
+        ] {
+            let meta = syn::parse_str(source).unwrap();
+            assert!(suppression_attribute(&meta).is_ok(), "{source}");
+            assert!(
+                suppression_attribute_with_lints(&meta, &protected).is_err(),
+                "{source}"
+            );
+        }
+        for source in [
+            "allow(synthetic::unrelated)",
+            r#"expect(synthetic::unrelated, reason="review")"#,
+            r#"expect(clippy::disallowed_methods, reason="review")"#,
+        ] {
+            assert!(
+                suppression_attribute_with_lints(&syn::parse_str(source).unwrap(), &protected)
+                    .is_ok(),
+                "{source}"
+            );
+        }
+        let body = "() => { #[allow(synthetic::approved_group)] pub fn load() {} };";
+        assert!(audit_macro_scoped(body, true).unwrap().is_empty());
+        assert!(audit_macro_with_lints(body, true, &protected)
+            .unwrap()
+            .iter()
+            .any(|(policy, _)| policy == "EXPECT"));
+        assert!(audit_macro_with_lints(body, false, &protected)
+            .unwrap()
+            .is_empty());
+        let payload = format!("macro_rules! load {{ {body} }}");
+        assert!(audit_macro_payload_with_lints(&payload, true, &protected)
+            .unwrap()
+            .iter()
+            .any(|(policy, _)| policy == "EXPECT"));
+    }
+
+    /// Regression: a literal transcriber allow must not lower native -D either.
+    #[test]
+    fn regression_macro_suppression_refusal_keeps_package_scope() {
+        let body = "() => { #[allow(clippy::disallowed_methods)] pub fn load() {} };";
+        assert!(audit_macro(body).unwrap().is_empty());
+        assert!(audit_macro_scoped(body, true)
+            .unwrap()
+            .iter()
+            .any(|(policy, detail)| policy == "EXPECT"
+                && detail == "allow/warn of disallowed lint is refused"));
+        let payload = format!("macro_rules! load {{ {body} }}");
+        assert!(audit_macro_payload_scoped(&payload, true)
+            .unwrap()
+            .iter()
+            .any(|(policy, _)| policy == "EXPECT"));
+        assert!(audit_macro_payload_scoped(&payload, false)
+            .unwrap()
+            .is_empty());
     }
 }

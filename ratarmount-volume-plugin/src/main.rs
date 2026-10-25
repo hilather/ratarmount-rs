@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -86,27 +87,18 @@ mod linux {
             let dir = parent.join(staging_name());
             {
                 let __inventory_condition_3626 = {
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_types,
-                            reason = r###"internal-read:v1 {"id":"IR-E0109-T01","item":"ratarmount_volume_plugin::linux::stage_dir","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the private socket staging-directory builder in the volume plugin binary.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_types,
+                        reason = r###"internal-read:v1 {"id":"IR-E0109-T01","item":"ratarmount_volume_plugin::linux::stage_dir","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the private socket staging-directory builder in the volume plugin binary.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
                     )]
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-E0109-M01","item":"ratarmount_volume_plugin::linux::stage_dir","disposition":"support","category":"creation-builder","reason":"Construct the private socket staging-directory builder in the volume plugin binary.","creation":{"policy":"none","basis":"Builder setup is separate from the following mode-0700 staging create operation."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0109-M01","item":"ratarmount_volume_plugin::linux::stage_dir","disposition":"support","category":"creation-builder","reason":"Construct the private socket staging-directory builder in the volume plugin binary.","creation":{"policy":"none","basis":"Builder setup is separate from the following mode-0700 staging create operation."}}"###
                     )]
                     let mut __inventory_value_0 = fs::DirBuilder::new();
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-E0110-M01","item":"ratarmount_volume_plugin::linux::stage_dir","disposition":"output-owner","category":"socket-staging-directory","reason":"Create a fresh private socket staging directory with bounded collision retry.","creation":{"policy":"exclusive-directory","basis":"The generated name uses DirBuilder mode 0700; EEXIST retries and no replacing fallback is introduced."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0110-M01","item":"ratarmount_volume_plugin::linux::stage_dir","disposition":"output-owner","category":"socket-staging-directory","reason":"Create a fresh private socket staging directory with bounded collision retry.","creation":{"policy":"exclusive-directory","basis":"The generated name uses DirBuilder mode 0700; EEXIST retries and no replacing fallback is introduced."}}"###
                     )]
                     let __inventory_value_1 = __inventory_value_0.mode(0o700).create(&dir);
                     __inventory_value_1
@@ -175,27 +167,18 @@ mod linux {
             return UnixListener::bind(&staged);
         }
         let handle = {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_types,
-                    reason = r###"internal-read:v1 {"id":"IR-B0550-T01","item":"ratarmount_volume_plugin::linux::bind_staged","disposition":"support","category":"builder-type-support","reason":"Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-                )
+            #[expect(
+                clippy::disallowed_types,
+                reason = r###"internal-read:v1 {"id":"IR-B0550-T01","item":"ratarmount_volume_plugin::linux::bind_staged","disposition":"support","category":"builder-type-support","reason":"Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
             )]
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0550-M01","item":"ratarmount_volume_plugin::linux::bind_staged","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0550-M01","item":"ratarmount_volume_plugin::linux::bind_staged","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"}"###
             )]
             let mut __inventory_value_0 = fs::OpenOptions::new();
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0550-M02","item":"ratarmount_volume_plugin::linux::bind_staged","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0550-M02","item":"ratarmount_volume_plugin::linux::bind_staged","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let __inventory_value_1 = __inventory_value_0
                 .read(true)
@@ -238,12 +221,9 @@ mod linux {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
         // musl's libc crate bindings may lack renameat2 (musl 1.2.3); call the syscall directly.
         // SAFETY: both pointers are valid NUL-terminated strings for the call.
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0111-M01","item":"ratarmount_volume_plugin::linux::rename_noreplace","disposition":"out-of-family","category":"socket-publication","reason":"Publish the already-bound volume-plugin socket with a no-replace rename syscall.","creation":{"policy":"none","basis":"renameat2 moves the existing staged socket with RENAME_NOREPLACE; it opens no pathname or descriptor."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0111-M01","item":"ratarmount_volume_plugin::linux::rename_noreplace","disposition":"out-of-family","category":"socket-publication","reason":"Publish the already-bound volume-plugin socket with a no-replace rename syscall.","creation":{"policy":"none","basis":"renameat2 moves the existing staged socket with RENAME_NOREPLACE; it opens no pathname or descriptor."}}"###
         )]
         let rc = unsafe {
             libc::syscall(
@@ -298,12 +278,9 @@ mod linux {
                 return Err(io::Error::other("expected exactly one systemd socket"));
             }
             // SAFETY: systemd passes ownership of fd 3 to this process.
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0551-M01","item":"ratarmount_volume_plugin::linux::listener","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"systemd socket activation descriptor","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0551-M01","item":"ratarmount_volume_plugin::linux::listener","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"systemd socket activation descriptor","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let listener = unsafe { UnixListener::from_raw_fd(3) };
             if listener.local_addr()?.as_pathname() != Some(path) {
@@ -313,12 +290,9 @@ mod linux {
             // Children must not keep the activation socket alive after shutdown.
             if unsafe {
                 {
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-E0112-M01","item":"ratarmount_volume_plugin::linux::listener","disposition":"out-of-family","category":"descriptor-control","reason":"Restore close-on-exec on the inherited systemd activation listener.","creation":{"policy":"none","basis":"F_SETFD changes the existing fd 3 flags after validating its socket address; children cannot retain the listener."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0112-M01","item":"ratarmount_volume_plugin::linux::listener","disposition":"out-of-family","category":"descriptor-control","reason":"Restore close-on-exec on the inherited systemd activation listener.","creation":{"policy":"none","basis":"F_SETFD changes the existing fd 3 flags after validating its socket address; children cannot retain the listener."}}"###
                     )]
                     let __inventory_value_0 =
                         libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
@@ -332,12 +306,9 @@ mod linux {
         }
         socket_path_fits(path)?;
         if let Some(parent) = path.parent() {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0113-M01","item":"ratarmount_volume_plugin::linux::listener","disposition":"output-owner","category":"socket-parent-directory","reason":"Create the configured volume-plugin socket parent before staged binding.","creation":{"policy":"recursive-directory","basis":"The parent keeps current directory defaults; staging creation and final publication are separately reviewed."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0113-M01","item":"ratarmount_volume_plugin::linux::listener","disposition":"output-owner","category":"socket-parent-directory","reason":"Create the configured volume-plugin socket parent before staged binding.","creation":{"policy":"recursive-directory","basis":"The parent keeps current directory defaults; staging creation and final publication are separately reviewed."}}"###
             )]
             fs::create_dir_all(parent)?;
         }

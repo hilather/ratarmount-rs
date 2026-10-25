@@ -70,27 +70,18 @@ impl MountSource for LiveView {
         if let Some(UserData::Other(tag)) = fi.userdata.last() {
             if let Some(path) = tag.strip_prefix("diff-live:") {
                 let mut file = {
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_types,
-                            reason = r###"internal-read:v1 {"id":"IR-B0102-T01","item":"<ratarmount::diff::live::LiveView as ratarmount_core::MountSource<ratarmount::diff::live::LiveView>>::open","disposition":"support","category":"builder-type-support","reason":"Builder type support: O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_types,
+                        reason = r###"internal-read:v1 {"id":"IR-B0102-T01","item":"<ratarmount::diff::live::LiveView as ratarmount_core::MountSource<ratarmount::diff::live::LiveView>>::open","disposition":"support","category":"builder-type-support","reason":"Builder type support: O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
                     )]
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0102-M01","item":"<ratarmount::diff::live::LiveView as ratarmount_core::MountSource<ratarmount::diff::live::LiveView>>::open","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read"}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0102-M01","item":"<ratarmount::diff::live::LiveView as ratarmount_core::MountSource<ratarmount::diff::live::LiveView>>::open","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read"}"###
                     )]
                     let mut __inventory_value_0 = fs::OpenOptions::new();
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0102-M02","item":"<ratarmount::diff::live::LiveView as ratarmount_core::MountSource<ratarmount::diff::live::LiveView>>::open","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0102-M02","item":"<ratarmount::diff::live::LiveView as ratarmount_core::MountSource<ratarmount::diff::live::LiveView>>::open","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                     )]
                     let __inventory_value_1 = __inventory_value_0
                         .read(true)
@@ -113,12 +104,9 @@ impl MountSource for LiveView {
                     // cannot redirect an open outside the overlay.
                     // Admitted (R10-C): another name of an open overlay
                     // database is refused without closing a descriptor of it.
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0104-M01","item":"<ratarmount::diff::live::LiveView as ratarmount_core::MountSource<ratarmount::diff::live::LiveView>>::open","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0104-M01","item":"<ratarmount::diff::live::LiveView as ratarmount_core::MountSource<ratarmount::diff::live::LiveView>>::open","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                     )]
                     let __inventory_assigned =
                         File::from(ratarmount_core::db_inodes::openat_admitted(

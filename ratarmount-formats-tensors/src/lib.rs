@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! Read-only safetensors and GGUF v2/v3 mounts with SQLite listings and stenciled
 //! tensor ranges. Nested readers are retained in place, without a temporary body.
@@ -163,12 +164,9 @@ impl TensorsMountSource {
                 }
             }
         }
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0369-M01","item":"<ratarmount_formats_tensors::TensorsMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0369-M01","item":"<ratarmount_formats_tensors::TensorsMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let mut reader = File::open(path)?;
         let size = reader.metadata()?.len();
@@ -479,12 +477,9 @@ impl MountSource for TensorsMountSource {
         match &self.backend {
             Backend::Path(path) => Ok(Box::new(StenciledFile::new(
                 {
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0370-M01","item":"<ratarmount_formats_tensors::TensorsMountSource as ratarmount_core::MountSource<ratarmount_formats_tensors::TensorsMountSource>>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0370-M01","item":"<ratarmount_formats_tensors::TensorsMountSource as ratarmount_core::MountSource<ratarmount_formats_tensors::TensorsMountSource>>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                     )]
                     let __inventory_value_0 = File::open(path);
                     __inventory_value_0
@@ -521,7 +516,7 @@ pub fn looks_like_safetensors(path: &Path) -> bool {
         return true;
     }
     {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0371-M01","item":"ratarmount_formats_tensors::looks_like_safetensors","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0371-M01","item":"ratarmount_formats_tensors::looks_like_safetensors","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
 let __inventory_value_0 = File::open(path);
 __inventory_value_0
 }
@@ -554,7 +549,7 @@ pub fn looks_like_gguf(path: &Path) -> bool {
         return true;
     }
     {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0372-M01","item":"ratarmount_formats_tensors::looks_like_gguf","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0372-M01","item":"ratarmount_formats_tensors::looks_like_gguf","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
 let __inventory_value_0 = File::open(path);
 __inventory_value_0
 }.ok().is_some_and(|mut reader| {

@@ -3,12 +3,9 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-#[cfg_attr(
-    internal_read_inventory,
-    expect(
-        clippy::disallowed_types,
-        reason = r###"internal-read:v1 {"id":"IR-E0005-T01","item":"ratarmount_compositing::write_overlay","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import the FsOpenOptions alias used by overlay output and no-follow builder helpers.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-    )
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0005-T01","item":"ratarmount_compositing::write_overlay","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import the FsOpenOptions alias used by overlay output and no-follow builder helpers.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
 )]
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -1055,12 +1052,9 @@ impl WriteOverlay {
         let before = if let Some(policy) = &self.policy {
             use std::os::fd::AsRawFd;
             let meta = file.metadata()?;
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0006-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::write_at_inner","disposition":"out-of-family","category":"descriptor-control","reason":"Read existing overlay output descriptor flags before choosing the append/write path.","creation":{"policy":"none","basis":"F_GETFL queries an already-open file; it creates and duplicates no descriptor."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0006-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::write_at_inner","disposition":"out-of-family","category":"descriptor-control","reason":"Read existing overlay output descriptor flags before choosing the append/write path.","creation":{"policy":"none","basis":"F_GETFL queries an already-open file; it creates and duplicates no descriptor."}}"###
             )]
             let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
             if flags < 0 {
@@ -1233,12 +1227,9 @@ impl WriteOverlay {
                 )));
             }
         } else {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0007-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::open_with_create_info","disposition":"output-owner","category":"overlay-directory","reason":"Create a missing overlay root after planning exclusions and rejecting an existing non-directory.","creation":{"policy":"recursive-directory","basis":"The overlay owner creates the requested tree with std directory defaults and umask, then canonicalizes the root."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0007-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::open_with_create_info","disposition":"output-owner","category":"overlay-directory","reason":"Create a missing overlay root after planning exclusions and rejecting an existing non-directory.","creation":{"policy":"recursive-directory","basis":"The overlay owner creates the requested tree with std directory defaults and umask, then canonicalizes the root."}}"###
             )]
             fs::create_dir_all(&root)?;
         }
@@ -1403,12 +1394,9 @@ impl WriteOverlay {
         // The folder is fsynced first so a crash cannot leave neither marker;
         // skipped when there is no legacy marker to remove.
         let legacy_present = fs::symlink_metadata(root.join(LEGACY_OVERLAY_MARKER)).is_ok();
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0162-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::open_with_create_info","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0162-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::open_with_create_info","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let marker_durable = legacy_present
             && fs::symlink_metadata(&new_marker_path).is_ok_and(|m| m.file_type().is_file())
@@ -1765,12 +1753,9 @@ impl WriteOverlay {
         let real_parent = self.realpath(&parent);
         self.ensure_under_root(&real_parent)?;
         if !real_parent.exists() && self.current_base().is_dir(&parent) {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0008-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_parent","disposition":"output-owner","category":"overlay-directory","reason":"Materialize an archive parent directory inside the checked overlay root before a mutation.","creation":{"policy":"recursive-directory","basis":"Only a missing parent represented as a base directory is materialized; host directory creation keeps existing default/umask behavior."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0008-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_parent","disposition":"output-owner","category":"overlay-directory","reason":"Materialize an archive parent directory inside the checked overlay root before a mutation.","creation":{"policy":"recursive-directory","basis":"Only a missing parent represented as a base directory is materialized; host directory creation keeps existing default/umask behavior."}}"###
             )]
             fs::create_dir_all(&real_parent)?;
         }
@@ -1835,12 +1820,9 @@ impl WriteOverlay {
         self.apply_metadata(path, &mut fi);
         self.remember_base_xattrs(path, self.current_base().as_ref(), &fi)?;
         if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0009-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_modifiable_inner","disposition":"output-owner","category":"overlay-directory","reason":"Materialize a base directory during copy-on-write and then apply the archived directory metadata.","creation":{"policy":"recursive-directory","basis":"The path passes overlay confinement checks; set_host_metadata restores the base directory metadata after creation."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0009-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_modifiable_inner","disposition":"output-owner","category":"overlay-directory","reason":"Materialize a base directory during copy-on-write and then apply the archived directory metadata.","creation":{"policy":"recursive-directory","basis":"The path passes overlay confinement checks; set_host_metadata restores the base directory metadata after creation."}}"###
             )]
             fs::create_dir_all(&real)?;
             set_host_metadata(&real, &metadata_from_info(&fi))?;
@@ -1852,12 +1834,9 @@ impl WriteOverlay {
             // so copying the body would materialize an empty regular file and
             // a later commit would drop the link member entirely.
             if let Some(parent) = real.parent() {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0010-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_modifiable_inner","disposition":"output-owner","category":"overlay-directory","reason":"Create the confined parent before publishing a base symlink as a symlink during copy-on-write.","creation":{"policy":"recursive-directory","basis":"Parent creation uses existing std defaults; the symlink operation and its metadata are handled separately."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0010-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::ensure_modifiable_inner","disposition":"output-owner","category":"overlay-directory","reason":"Create the confined parent before publishing a base symlink as a symlink during copy-on-write.","creation":{"policy":"recursive-directory","basis":"Parent creation uses existing std defaults; the symlink operation and its metadata are handled separately."}}"###
                 )]
                 fs::create_dir_all(parent)?;
             }
@@ -1918,12 +1897,9 @@ impl WriteOverlay {
             self.apply_metadata(&path, &mut fi);
             self.remember_base_xattrs(&path, base.as_ref(), &fi)?;
             if ratarmount_core::is_dir_mode(fi.mode) {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0011-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::copy_with_reservation","disposition":"output-owner","category":"overlay-directory","reason":"Materialize a directory in the reservation-aware copy-on-write branch before applying its base metadata.","creation":{"policy":"recursive-directory","basis":"Confinement and mutation checks precede creation; archived directory metadata is restored afterward."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0011-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::copy_with_reservation","disposition":"output-owner","category":"overlay-directory","reason":"Materialize a directory in the reservation-aware copy-on-write branch before applying its base metadata.","creation":{"policy":"recursive-directory","basis":"Confinement and mutation checks precede creation; archived directory metadata is restored afterward."}}"###
                 )]
                 fs::create_dir_all(&real)?;
                 set_host_metadata(&real, &metadata_from_info(&fi))?;
@@ -2213,12 +2189,9 @@ impl WriteOverlay {
     #[cfg(unix)]
     pub fn clone_overlay_fd(&self, fd: i32, path: &str) -> io::Result<File> {
         use std::os::fd::FromRawFd;
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0163-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::clone_overlay_fd","disposition":"residual","reason":"duplicates a live overlay handle (no pathname open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0163-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::clone_overlay_fd","disposition":"residual","reason":"duplicates a live overlay handle (no pathname open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
         if duplicate < 0 {
@@ -2227,12 +2200,9 @@ impl WriteOverlay {
         self.register_write_fd(duplicate, path);
         Ok(unsafe {
             {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0164-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::clone_overlay_fd","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0164-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::clone_overlay_fd","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                 )]
                 let __inventory_value_0 = File::from_raw_fd(duplicate);
                 __inventory_value_0
@@ -2295,12 +2265,9 @@ impl WriteOverlay {
         #[cfg(unix)]
         {
             use std::os::unix::io::FromRawFd;
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0165-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::close_overlay_fd","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0165-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::close_overlay_fd","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let _ = unsafe { File::from_raw_fd(fd) };
         }
@@ -2374,12 +2341,9 @@ impl WriteOverlay {
             self.ensure_under_root(&real)?;
             if let Some(parent) = real.parent() {
                 self.ensure_under_root(parent)?;
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0012-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::create_file_inner","disposition":"output-owner","category":"overlay-directory","reason":"Ensure the confined parent exists before creating the caller-requested overlay file.","creation":{"policy":"recursive-directory","basis":"The parent is checked under the overlay root and keeps ordinary directory defaults; file mode is reviewed on the admitted open."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0012-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::create_file_inner","disposition":"output-owner","category":"overlay-directory","reason":"Ensure the confined parent exists before creating the caller-requested overlay file.","creation":{"policy":"recursive-directory","basis":"The parent is checked under the overlay root and keeps ordinary directory defaults; file mode is reviewed on the admitted open."}}"###
                 )]
                 fs::create_dir_all(parent)?;
             }
@@ -2394,12 +2358,9 @@ impl WriteOverlay {
             let _account = self.account_path(path);
             // Admitted before `O_TRUNC` and the chmod (R10-C): never a
             // descriptor of an open overlay database.
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0013-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::create_file_inner","disposition":"output-owner","category":"overlay-content","reason":"Open the new overlay payload through admitted acquisition before truncation and permission application.","creation":{"policy":"create-or-truncate","basis":"The admitted O_CREAT/O_TRUNC open uses caller mode masked to 07777, then sets the requested permission bits on the acquired descriptor."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0013-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::create_file_inner","disposition":"output-owner","category":"overlay-content","reason":"Open the new overlay payload through admitted acquisition before truncation and permission application.","creation":{"policy":"create-or-truncate","basis":"The admitted O_CREAT/O_TRUNC open uses caller mode masked to 07777, then sets the requested permission bits on the acquired descriptor."}}"###
             )]
             let f = open_admitted_file(
                 &real,
@@ -2410,12 +2371,9 @@ impl WriteOverlay {
                 use std::os::unix::fs::PermissionsExt;
                 f.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
             }
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0166-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::create_file_inner","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0166-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::create_file_inner","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let fd = {
                 use std::os::unix::io::IntoRawFd;
@@ -2502,21 +2460,15 @@ impl WriteOverlay {
                 use std::os::unix::io::IntoRawFd;
                 let _account = self.account_path(path);
                 {
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0167-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::open_overlay_fd_with_mode","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0167-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::open_overlay_fd_with_mode","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                     )]
                     let __inventory_value_0 =
                         ratarmount_core::db_inodes::open_admitted(&real, flags, mode & 0o7777);
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0168-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::open_overlay_fd_with_mode","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0168-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::open_overlay_fd_with_mode","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                     )]
                     let __inventory_value_1 = __inventory_value_0?.into_raw_fd();
                     __inventory_value_1
@@ -2557,12 +2509,9 @@ impl WriteOverlay {
         self.ensure_parent(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0014-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir","disposition":"output-owner","category":"overlay-directory","reason":"Create the directory requested by the overlay mkdir operation and mark it present.","creation":{"policy":"recursive-directory","basis":"Confinement/mutation checks precede creation; Unix permissions are explicitly set to caller mode masked to 07777."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0014-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::mkdir","disposition":"output-owner","category":"overlay-directory","reason":"Create the directory requested by the overlay mkdir operation and mark it present.","creation":{"policy":"recursive-directory","basis":"Confinement/mutation checks precede creation; Unix permissions are explicitly set to caller mode masked to 07777."}}"###
         )]
         fs::create_dir_all(&real)?;
         #[cfg(unix)]
@@ -2684,24 +2633,18 @@ impl WriteOverlay {
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
         #[cfg(unix)]
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0015-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::truncate","disposition":"out-of-family","category":"overlay-content","reason":"Acquire the existing overlay payload through the admitted helper before truncating it.","creation":{"policy":"none","basis":"This O_WRONLY/O_NOFOLLOW acquisition has no create flag and cannot invent a missing payload."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0015-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::truncate","disposition":"out-of-family","category":"overlay-content","reason":"Acquire the existing overlay payload through the admitted helper before truncating it.","creation":{"policy":"none","basis":"This O_WRONLY/O_NOFOLLOW acquisition has no create flag and cannot invent a missing payload."}}"###
         )]
         let f = open_admitted_file(&real, libc::O_WRONLY | libc::O_NOFOLLOW, 0)?;
         #[cfg(not(unix))]
         let f = {
             let mut options = open_options_nofollow();
             options.write(true);
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0169-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"non-Unix overlay payload open for truncate (no admitted open off Unix); payload ownership needs the excluded coordinator","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::truncate","native_observed":false,"creation":{"policy":"none","basis":"Existing non-Unix overlay payload opened write-only before explicit truncation; no create flag."},"category":"overlay-payload"}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0169-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"non-Unix overlay payload open for truncate (no admitted open off Unix); payload ownership needs the excluded coordinator","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::truncate","native_observed":false,"creation":{"policy":"none","basis":"Existing non-Unix overlay payload opened write-only before explicit truncation; no create flag."},"category":"overlay-payload"}"###
             )]
             let opened = options.open(&real)?;
             opened
@@ -2734,12 +2677,9 @@ impl WriteOverlay {
             )));
         }
         if let Some(parent) = real.parent() {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0016-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::create_symlink","disposition":"output-owner","category":"overlay-directory","reason":"Create the confined parent before creating a caller-requested overlay symlink.","creation":{"policy":"recursive-directory","basis":"The destination absence/confinement checks run first; parent directory creation preserves current defaults."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0016-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::create_symlink","disposition":"output-owner","category":"overlay-directory","reason":"Create the confined parent before creating a caller-requested overlay symlink.","creation":{"policy":"recursive-directory","basis":"The destination absence/confinement checks run first; parent directory creation preserves current defaults."}}"###
             )]
             fs::create_dir_all(parent)?;
         }
@@ -2852,12 +2792,9 @@ impl WriteOverlay {
             None
         };
         if let Some(parent) = to_real.parent() {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0017-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::rename_inner","disposition":"output-owner","category":"overlay-directory","reason":"Create the rename destination parent inside the checked overlay root before the host rename.","creation":{"policy":"recursive-directory","basis":"Only the destination parent is created; payload ownership and tombstone publication remain in the rename transaction path."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0017-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::rename_inner","disposition":"output-owner","category":"overlay-directory","reason":"Create the rename destination parent inside the checked overlay root before the host rename.","creation":{"policy":"recursive-directory","basis":"Only the destination parent is created; payload ownership and tombstone publication remain in the rename transaction path."}}"###
             )]
             fs::create_dir_all(parent)?;
         }
@@ -3380,12 +3317,9 @@ impl WriteOverlay {
                  INSERT OR REPLACE INTO meta(key, value) VALUES('test_scratch', hex(randomblob(6000000)));",
             )
             .expect("hold transaction");
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0018-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::test_hold_open_transaction","disposition":"out-of-family","category":"feature-test-hook","reason":"Publish the explicit readiness file for the test-hooks open-transaction hold.","creation":{"policy":"create-or-truncate","basis":"This hook-only readiness output uses fs::write and existing umask behavior; it is not an archive input."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0018-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::test_hold_open_transaction","disposition":"out-of-family","category":"feature-test-hook","reason":"Publish the explicit readiness file for the test-hooks open-transaction hold.","creation":{"policy":"create-or-truncate","basis":"This hook-only readiness output uses fs::write and existing umask behavior; it is not an archive input."}}"###
             )]
             std::fs::write(ready, b"ready").expect("ready file");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -5003,30 +4937,21 @@ impl WriteOverlay {
         ratarmount_compress::fastcopy::log_commit_copy(source.len(), method);
         tmp.as_file().sync_all()?;
         let work_tar = tmp.path().to_path_buf();
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0170-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::persist_uncompressed_tar_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0170-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::persist_uncompressed_tar_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let list_dir = tempfile::tempdir()?;
         let deletion_list = list_dir.path().join("deletions.lst");
         let append_list = list_dir.path().join("append.lst");
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0171-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::persist_uncompressed_tar_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0171-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::persist_uncompressed_tar_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         fs::write(&deletion_list, &plan.deletions_nul)?;
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0172-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::persist_uncompressed_tar_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0172-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay>::persist_uncompressed_tar_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         fs::write(&append_list, &plan.appends_nul)?;
         if !plan.deletions_nul.is_empty() {
@@ -5481,12 +5406,9 @@ pub fn patch_sidecar_if_present(
             .map_err(|e| OverlayError::Msg(e.to_string()))?
         }
         _ => {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0173-M01","item":"ratarmount_compositing::write_overlay::patch_sidecar_if_present","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0173-M01","item":"ratarmount_compositing::write_overlay::patch_sidecar_if_present","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let mut file = File::open(archive)?;
             SqliteIndexedTar::patch_index_from(
@@ -5570,12 +5492,9 @@ fn uncompressed_patch_window(
         }
     }
     let eof = {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0174-M01","item":"ratarmount_compositing::write_overlay::uncompressed_patch_window","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0174-M01","item":"ratarmount_compositing::write_overlay::uncompressed_patch_window","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let mut old = File::open(archive)?;
         find_last_tar_eof(&mut old, 0)?.unwrap_or(0)
@@ -5808,24 +5727,18 @@ impl MountSource for WriteOverlay {
                 let real = self.realpath(path);
                 self.ensure_under_root(&real)?;
                 #[cfg(unix)]
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0019-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open","disposition":"out-of-family","category":"overlay-content","reason":"Acquire an existing overlay member through the admitted read-only helper for an overlay open.","creation":{"policy":"none","basis":"O_RDONLY/O_NOFOLLOW opens an existing payload; descriptor admission prevents borrowing an open database inode."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0019-M01","item":"<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open","disposition":"out-of-family","category":"overlay-content","reason":"Acquire an existing overlay member through the admitted read-only helper for an overlay open.","creation":{"policy":"none","basis":"O_RDONLY/O_NOFOLLOW opens an existing payload; descriptor admission prevents borrowing an open database inode."}}"###
                 )]
                 let opened = open_admitted_file(&real, libc::O_RDONLY | libc::O_NOFOLLOW, 0);
                 #[cfg(not(unix))]
                 let opened = {
                     let mut options = open_options_nofollow();
                     options.read(true);
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0175-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"non-Unix overlay payload open (no admitted open off Unix); payload ownership needs the excluded coordinator","item":"<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open","native_observed":false,"creation":{"policy":"none","basis":"Existing non-Unix overlay payload opened read-only; missing content stays missing."},"category":"overlay-payload"}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0175-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"non-Unix overlay payload open (no admitted open off Unix); payload ownership needs the excluded coordinator","item":"<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open","native_observed":false,"creation":{"policy":"none","basis":"Existing non-Unix overlay payload opened read-only; missing content stays missing."},"category":"overlay-payload"}"###
                     )]
                     let opened = options.open(&real);
                     opened
@@ -5980,21 +5893,15 @@ fn write_commit_manifest(
     // Admitted (R10-FIX3): a manifest name that is a hard link of an open
     // overlay database is refused without a descriptor of it being closed.
     #[cfg(unix)]
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0020-M01","item":"ratarmount_compositing::write_overlay::write_commit_manifest","disposition":"out-of-family","category":"structured-control-record","reason":"Read the previous commit manifest id through admitted acquisition before writing its replacement manifest.","creation":{"policy":"none","basis":"The previous sidecar is opened read-only/nonblocking; NotFound starts at id zero and no input is created."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0020-M01","item":"ratarmount_compositing::write_overlay::write_commit_manifest","disposition":"out-of-family","category":"structured-control-record","reason":"Read the previous commit manifest id through admitted acquisition before writing its replacement manifest.","creation":{"policy":"none","basis":"The previous sidecar is opened read-only/nonblocking; NotFound starts at id zero and no input is created."}}"###
     )]
     let opened = open_admitted_file(&dest, libc::O_RDONLY | libc::O_NONBLOCK, 0);
     #[cfg(not(unix))]
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0176-I01","disposition":"out-of-family","category":"structured-control-record","reason":"commit manifest JSON read back before rewrite","item":"ratarmount_compositing::write_overlay::write_commit_manifest","native_observed":false,"creation":{"policy":"none","basis":"Existing manifest input is read before a separately created replacement is published."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0176-I01","disposition":"out-of-family","category":"structured-control-record","reason":"commit manifest JSON read back before rewrite","item":"ratarmount_compositing::write_overlay::write_commit_manifest","native_observed":false,"creation":{"policy":"none","basis":"Existing manifest input is read before a separately created replacement is published."}}"###
     )]
     let opened = File::open(&dest);
     let previous = match opened {
@@ -6012,12 +5919,9 @@ fn write_commit_manifest(
         Err(e) => return Err(e.into()),
     };
     let commit_id = now.max(previous.saturating_add(1));
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0177-M01","item":"ratarmount_compositing::write_overlay::write_commit_manifest","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0177-M01","item":"ratarmount_compositing::write_overlay::write_commit_manifest","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     let mut dirs = vec!["/".to_string()];
@@ -6072,12 +5976,9 @@ fn write_commit_manifest(
         return Err(io::Error::other("injected manifest publication failure").into());
     }
     tmp.persist(&dest).map_err(|e| OverlayError::Io(e.error))?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0178-M01","item":"ratarmount_compositing::write_overlay::write_commit_manifest","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0178-M01","item":"ratarmount_compositing::write_overlay::write_commit_manifest","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     File::open(parent)?.sync_all()?;
     Ok(())
@@ -6215,12 +6116,9 @@ fn persist_provenance_plan(
                 },
             )
         } else if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0179-M01","item":"ratarmount_compositing::write_overlay::persist_provenance_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0179-M01","item":"ratarmount_compositing::write_overlay::persist_provenance_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
             )]
             let mut tmp = tempfile::NamedTempFile::new()?;
             let mut reader = base.open(&fi, 0)?;
@@ -6378,12 +6276,9 @@ fn persist_provenance_plan(
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0180-M01","item":"ratarmount_compositing::write_overlay::persist_provenance_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0180-M01","item":"ratarmount_compositing::write_overlay::persist_provenance_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
         // The stamp checked against the gate is the one the copy publishes
@@ -6658,12 +6553,9 @@ fn open_park_fd(host: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
     // (R10-C): another name of an open overlay database is never parked.
     #[cfg(not(target_os = "linux"))]
     {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0181-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","item":"ratarmount_compositing::write_overlay::open_park_fd","native_observed":false,"creation":{"policy":"none","basis":"The non-Linux Unix path parks an admitted existing payload descriptor; no create flags are used."},"category":"overlay-payload"}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0181-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","item":"ratarmount_compositing::write_overlay::open_park_fd","native_observed":false,"creation":{"policy":"none","basis":"The non-Linux Unix path parks an admitted existing payload descriptor; no create flags are used."},"category":"overlay-payload"}"###
         )]
         let fd = ratarmount_core::db_inodes::open_admitted(host, park_open_flags(), 0);
         fd
@@ -6673,12 +6565,9 @@ fn open_park_fd(host: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
         use std::os::unix::io::{FromRawFd, OwnedFd};
         let c = c_path(host)?;
         // Safety: `c` is NUL-terminated. Flags never include `O_CREAT`.
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0182-M01","item":"ratarmount_compositing::write_overlay::open_park_fd","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0182-M01","item":"ratarmount_compositing::write_overlay::open_park_fd","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let fd = unsafe { libc::open(c.as_ptr(), park_open_flags(), 0) };
         if fd < 0 {
@@ -6687,12 +6576,9 @@ fn open_park_fd(host: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
             // Safety: `fd` is a new descriptor owned by this process.
             Ok(unsafe {
                 {
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0183-M01","item":"ratarmount_compositing::write_overlay::open_park_fd","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0183-M01","item":"ratarmount_compositing::write_overlay::open_park_fd","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                     )]
                     let __inventory_value_0 = OwnedFd::from_raw_fd(fd);
                     __inventory_value_0
@@ -6748,28 +6634,19 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
 fn create_overlay_marker(path: &Path) -> io::Result<bool> {
     {
         let __inventory_condition_278275 = {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0184-M01","item":"ratarmount_compositing::write_overlay::create_overlay_marker","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0184-M01","item":"ratarmount_compositing::write_overlay::create_overlay_marker","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
             )]
             let mut __inventory_value_0 = open_options_nofollow();
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0021-M01","item":"ratarmount_compositing::write_overlay::create_overlay_marker","disposition":"output-owner","category":"overlay-control-record","reason":"Configure exclusive creation of the no-follow overlay ownership marker.","creation":{"policy":"exclusive-new-file","basis":"An existing name is accepted only when symlink_metadata reports a regular file; creation uses ordinary file permissions."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0021-M01","item":"ratarmount_compositing::write_overlay::create_overlay_marker","disposition":"output-owner","category":"overlay-control-record","reason":"Configure exclusive creation of the no-follow overlay ownership marker.","creation":{"policy":"exclusive-new-file","basis":"An existing name is accepted only when symlink_metadata reports a regular file; creation uses ordinary file permissions."}}"###
             )]
             let __inventory_value_1 = __inventory_value_0.write(true).create_new(true);
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0184-M02","item":"ratarmount_compositing::write_overlay::create_overlay_marker","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0184-M02","item":"ratarmount_compositing::write_overlay::create_overlay_marker","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
             )]
             let __inventory_value_2 = __inventory_value_1.open(path);
             __inventory_value_2
@@ -6797,36 +6674,27 @@ fn create_overlay_marker(path: &Path) -> io::Result<bool> {
 #[cfg(unix)]
 pub(crate) fn open_admitted_file(path: &Path, flags: libc::c_int, mode: u32) -> io::Result<File> {
     {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0185-M01","item":"ratarmount_compositing::write_overlay::open_admitted_file","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0185-M01","item":"ratarmount_compositing::write_overlay::open_admitted_file","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
 let __inventory_value_0 = ratarmount_core::db_inodes::open_admitted(path, flags | libc::O_CLOEXEC, mode);
 __inventory_value_0
 }.map(File::from)
 }
 
 /// WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no equivalent bit.
-#[cfg_attr(
-    internal_read_inventory,
-    expect(
-        clippy::disallowed_types,
-        reason = r###"internal-read:v1 {"id":"IR-E0022-T01","item":"ratarmount_compositing::write_overlay::HostOpenOptions","disposition":"support","category":"builder-type-support","reason":"Builder type support: Return the no-follow OpenOptions builder from the shared overlay helper.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-    )
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0022-T01","item":"ratarmount_compositing::write_overlay::HostOpenOptions","disposition":"support","category":"builder-type-support","reason":"Builder type support: Return the no-follow OpenOptions builder from the shared overlay helper.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
 )]
 type HostOpenOptions = FsOpenOptions;
 
 pub(crate) fn open_options_nofollow() -> HostOpenOptions {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0186-M01","item":"ratarmount_compositing::write_overlay::open_options_nofollow","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"builder constructor: returns an O_NOFOLLOW OpenOptions and opens nothing; each call site is its own OpenOptions entry"}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0186-M01","item":"ratarmount_compositing::write_overlay::open_options_nofollow","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"builder constructor: returns an O_NOFOLLOW OpenOptions and opens nothing; each call site is its own OpenOptions entry"}"###
     )]
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_types,
-            reason = r###"internal-read:v1 {"id":"IR-B0186-T01","item":"ratarmount_compositing::write_overlay::open_options_nofollow","disposition":"support","category":"builder-type-support","reason":"Builder type support: builder constructor: returns an O_NOFOLLOW OpenOptions and opens nothing; each call site is its own OpenOptions entry","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-        )
+    #[expect(
+        clippy::disallowed_types,
+        reason = r###"internal-read:v1 {"id":"IR-B0186-T01","item":"ratarmount_compositing::write_overlay::open_options_nofollow","disposition":"support","category":"builder-type-support","reason":"Builder type support: builder constructor: returns an O_NOFOLLOW OpenOptions and opens nothing; each call site is its own OpenOptions entry","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
     )]
     let mut opts = FsOpenOptions::new();
     #[cfg(unix)]
@@ -6848,16 +6716,16 @@ fn cow_length_mismatch(copied: u64, expected: u64) -> io::Error {
 
 fn create_cow_staging(parent: &Path) -> io::Result<tempfile::NamedTempFile> {
     {
-        #[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0023-M01","item":"ratarmount_compositing::write_overlay::create_cow_staging","disposition":"output-owner","category":"overlay-staging","reason":"Allocate the named sibling COW staging file through tempfile Builder::make_in.","creation":{"policy":"exclusive-new-file","basis":"The supplied creation closure uses no-follow options and create_new; tempfile owns cleanup until publication."}}"###))]
+        #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0023-M01","item":"ratarmount_compositing::write_overlay::create_cow_staging","disposition":"output-owner","category":"overlay-staging","reason":"Allocate the named sibling COW staging file through tempfile Builder::make_in.","creation":{"policy":"exclusive-new-file","basis":"The supplied creation closure uses no-follow options and create_new; tempfile owns cleanup until publication."}}"###)]
 let __inventory_value_0 = tempfile::Builder::new()
         .prefix(COW_STAGING_PREFIX)
         .make_in(parent, |path| {
-            #[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0187-M01","item":"ratarmount_compositing::write_overlay::create_cow_staging","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###))]
+            #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0187-M01","item":"ratarmount_compositing::write_overlay::create_cow_staging","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###)]
 let mut opts = open_options_nofollow();
             {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0024-M01","item":"ratarmount_compositing::write_overlay::create_cow_staging","disposition":"output-owner","category":"overlay-staging","reason":"Set exclusive creation on the no-follow COW staging file builder.","creation":{"policy":"exclusive-new-file","basis":"The staging closure uses create_new so a collision cannot truncate an existing path; file permissions retain existing default/umask behavior."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0024-M01","item":"ratarmount_compositing::write_overlay::create_cow_staging","disposition":"output-owner","category":"overlay-staging","reason":"Set exclusive creation on the no-follow COW staging file builder.","creation":{"policy":"exclusive-new-file","basis":"The staging closure uses create_new so a collision cannot truncate an existing path; file permissions retain existing default/umask behavior."}}"###)]
 let __inventory_value_0 = opts.write(true).create_new(true);
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0187-M02","item":"ratarmount_compositing::write_overlay::create_cow_staging","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0187-M02","item":"ratarmount_compositing::write_overlay::create_cow_staging","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###)]
 let __inventory_value_1 = __inventory_value_0.open(path);
 __inventory_value_1
 }
@@ -6897,12 +6765,9 @@ fn publish_cow_staging(
             // Windows cannot open a directory as a File to fsync it.
             #[cfg(not(windows))]
             if let Some(parent) = real.parent() {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0188-M01","item":"ratarmount_compositing::write_overlay::publish_cow_staging","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"parent directory handle for the post-rename fsync; reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0188-M01","item":"ratarmount_compositing::write_overlay::publish_cow_staging","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"parent directory handle for the post-rename fsync; reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                 )]
                 let r = {
                     #[cfg(test)]
@@ -7102,12 +6967,9 @@ fn uncompressed_append_offset(
 ) -> Result<Option<u64>> {
     let mut touched = plan.deleted_paths.clone();
     touched.extend(plan.append_entries.iter().map(|(p, _)| p.clone()));
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0189-M01","item":"ratarmount_compositing::write_overlay::uncompressed_append_offset","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0189-M01","item":"ratarmount_compositing::write_overlay::uncompressed_append_offset","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut file = File::open(archive)?;
     Ok(ratarmount_formats_tar::tar_append_offset(
@@ -7210,12 +7072,9 @@ fn append_uncompressed_tar_plan(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0190-M01","item":"ratarmount_compositing::write_overlay::append_uncompressed_tar_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0190-M01","item":"ratarmount_compositing::write_overlay::append_uncompressed_tar_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tail = tempfile::NamedTempFile::new_in(parent)?;
     ratarmount_formats_tar::write_ustar_members(tail.as_file_mut(), &members)?;
@@ -8176,12 +8035,9 @@ fn normalize_archive_rel_path(path: &str) -> String {
 
 /// True if path looks like a ZIP local/central/EOCD signature (`PK…`).
 fn is_zip_archive(path: &Path) -> Result<bool> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0191-M01","item":"ratarmount_compositing::write_overlay::is_zip_archive","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0191-M01","item":"ratarmount_compositing::write_overlay::is_zip_archive","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut f = File::open(path)?;
     let mut magic = [0u8; 4];
@@ -8314,12 +8170,9 @@ fn rebuild_zip_with_overlay(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0192-M01","item":"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0192-M01","item":"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
 
@@ -8368,21 +8221,15 @@ fn rebuild_zip_with_overlay(
             } else {
                 let src_path = write_overlay.join(rel);
                 #[cfg(unix)]
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0025-M01","item":"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay","disposition":"out-of-family","category":"overlay-content","reason":"Acquire an existing overlay file through admission while rebuilding a ZIP member.","creation":{"policy":"none","basis":"The helper opens the source O_RDONLY; the ZIP writer owns the separate output file."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0025-M01","item":"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay","disposition":"out-of-family","category":"overlay-content","reason":"Acquire an existing overlay file through admission while rebuilding a ZIP member.","creation":{"policy":"none","basis":"The helper opens the source O_RDONLY; the ZIP writer owns the separate output file."}}"###
                 )]
                 let opened = open_admitted_file(&src_path, libc::O_RDONLY, 0);
                 #[cfg(not(unix))]
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0193-I01","disposition":"residual","family":"archive-and-member-io","issue":"#196","reason":"commit rebuild input (overlay member or plain temp); payload ownership excluded","item":"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay","native_observed":false,"creation":{"policy":"none","basis":"Existing overlay member input for ZIP reconstruction; output is independently owned."},"category":"archive-input"}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0193-I01","disposition":"residual","family":"archive-and-member-io","issue":"#196","reason":"commit rebuild input (overlay member or plain temp); payload ownership excluded","item":"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay","native_observed":false,"creation":{"policy":"none","basis":"Existing overlay member input for ZIP reconstruction; output is independently owned."},"category":"archive-input"}"###
                 )]
                 let opened = File::open(&src_path);
                 let mut src_file = opened.map_err(|e| {
@@ -8563,31 +8410,22 @@ fn commit_overlay_tar(
 
     let plan = collect_overlay_commit_plan(write_overlay)?;
 
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0194-M01","item":"ratarmount_compositing::write_overlay::commit_overlay_tar","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0194-M01","item":"ratarmount_compositing::write_overlay::commit_overlay_tar","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let tmp = tempfile::tempdir()?;
     let deletion_list = tmp.path().join("deletions.lst");
     let append_list = tmp.path().join("append.lst");
 
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0195-M01","item":"ratarmount_compositing::write_overlay::commit_overlay_tar","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0195-M01","item":"ratarmount_compositing::write_overlay::commit_overlay_tar","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     fs::write(&deletion_list, &plan.deletions_nul)?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0196-M01","item":"ratarmount_compositing::write_overlay::commit_overlay_tar","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0196-M01","item":"ratarmount_compositing::write_overlay::commit_overlay_tar","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     fs::write(&append_list, &plan.appends_nul)?;
 
@@ -8882,22 +8720,16 @@ fn recompress_replace(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0197-M01","item":"ratarmount_compositing::write_overlay::recompress_replace","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0197-M01","item":"ratarmount_compositing::write_overlay::recompress_replace","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
 
     {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0198-M01","item":"ratarmount_compositing::write_overlay::recompress_replace","disposition":"residual","reason":"commit rebuild input (overlay member or plain temp); payload ownership excluded","family":"archive-and-member-io","issue":"#196","category":"archive-and-member-io","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0198-M01","item":"ratarmount_compositing::write_overlay::recompress_replace","disposition":"residual","reason":"commit rebuild input (overlay member or plain temp); payload ownership excluded","family":"archive-and-member-io","issue":"#196","category":"archive-and-member-io","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let mut src = BufReader::new(File::open(plain)?);
         let mut out = BufWriter::new(tmp.as_file_mut());
@@ -9024,7 +8856,7 @@ fn file_sha256(path: &Path) -> Result<String> {
     // Managed (#151): a remote spool may be another name of a database open
     // in this process.
     {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0199-M01","item":"ratarmount_compositing::write_overlay::file_sha256","disposition":"managed-read","regression":"regression_remote_spool_hash_keeps_aliased_database_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0199-M01","item":"ratarmount_compositing::write_overlay::file_sha256","disposition":"managed-read","regression":"regression_remote_spool_hash_keeps_aliased_database_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
 let __inventory_value_0 = ratarmount_index::managed_read::sha256_hex(path);
 __inventory_value_0
 }.map_err(|e| OverlayError::Msg(e.to_string()))
@@ -9137,12 +8969,9 @@ fn find_last_n_tar_window(archive: &Path, map: &ZstdFrameMap, kind: &str) -> Res
     }
     let last_plain = map.frames.last().map(|f| f.uncompressed_size).unwrap_or(0);
     warn_large_zstd_window(kind, last_plain);
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0200-M01","item":"ratarmount_compositing::write_overlay::find_last_n_tar_window","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0200-M01","item":"ratarmount_compositing::write_overlay::find_last_n_tar_window","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut src = File::open(archive)?;
     for n in 1..=map.frames.len() {
@@ -9154,12 +8983,9 @@ fn find_last_n_tar_window(archive: &Path, map: &ZstdFrameMap, kind: &str) -> Res
         if n > 1 {
             warn_large_zstd_window(kind, window_plain);
         }
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0026-M01","item":"ratarmount_compositing::write_overlay::find_last_n_tar_window","disposition":"output-owner","category":"compression-staging","reason":"Buffer a decoded candidate TAR suffix while finding a safe zstd rewrite window.","creation":{"policy":"spill-private-temporary","basis":"The bounded spool starts in memory and may roll to tempfile storage using tempfile private temporary-file defaults."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0026-M01","item":"ratarmount_compositing::write_overlay::find_last_n_tar_window","disposition":"output-owner","category":"compression-staging","reason":"Buffer a decoded candidate TAR suffix while finding a safe zstd rewrite window.","creation":{"policy":"spill-private-temporary","basis":"The bounded spool starts in memory and may roll to tempfile storage using tempfile private temporary-file defaults."}}"###
         )]
         let mut suffix = tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize);
         decode_zstd_frames_to(&mut src, map, from_idx, &mut suffix)
@@ -9292,12 +9118,9 @@ fn suffix_window_has_member_boundary(
     map: &ZstdFrameMap,
     from_idx: usize,
 ) -> Result<bool> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0027-M01","item":"ratarmount_compositing::write_overlay::suffix_window_has_member_boundary","disposition":"output-owner","category":"compression-staging","reason":"Buffer a decoded suffix to validate that its starting point is a TAR member boundary.","creation":{"policy":"spill-private-temporary","basis":"The existing memory cap controls rollover to a private tempfile; the spool is temporary analysis output."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0027-M01","item":"ratarmount_compositing::write_overlay::suffix_window_has_member_boundary","disposition":"output-owner","category":"compression-staging","reason":"Buffer a decoded suffix to validate that its starting point is a TAR member boundary.","creation":{"policy":"spill-private-temporary","basis":"The existing memory cap controls rollover to a private tempfile; the spool is temporary analysis output."}}"###
     )]
     let mut suffix = tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize);
     decode_zstd_frames_to(src, map, from_idx, &mut suffix)
@@ -9316,12 +9139,9 @@ fn offline_tar_zst_from_idx(archive: &Path, map: &ZstdFrameMap, min_oh: u64) -> 
     }
     let from_idx0 = frame_covering_uncomp(map, min_oh)?;
     let mut from_idx = from_idx0;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0201-M01","item":"ratarmount_compositing::write_overlay::offline_tar_zst_from_idx","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0201-M01","item":"ratarmount_compositing::write_overlay::offline_tar_zst_from_idx","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut src = File::open(archive)?;
     while from_idx > 0 {
@@ -9437,12 +9257,9 @@ fn reset_overlay_dir(root: &Path) -> Result<()> {
 
 fn is_uncompressed_tar(path: &Path) -> Result<bool> {
     use std::io::{Read, Seek, SeekFrom};
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0202-M01","item":"ratarmount_compositing::write_overlay::is_uncompressed_tar","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0202-M01","item":"ratarmount_compositing::write_overlay::is_uncompressed_tar","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut f = File::open(path)?;
     // Reject common compression magics

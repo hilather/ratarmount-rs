@@ -145,21 +145,15 @@ where
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0277-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0277-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new_in(parent)?;
     crate::commit_journal::fault::point("copy source open")?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0278-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace","disposition":"residual","reason":"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0278-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace","disposition":"residual","reason":"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut src = File::open(path)?;
     let source = src.metadata()?;
@@ -238,12 +232,9 @@ where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
     crate::commit_journal::fault::check("before splice scan")?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0279-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"residual","reason":"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0279-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"residual","reason":"zstd splice source of the base archive under the commit journal; mutation ownership belongs to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut src = File::open(path)?;
     let source = src.metadata()?;
@@ -262,24 +253,18 @@ where
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0280-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0280-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tail = NamedTempFile::new_in(parent)?;
     let stats = write_zstd_splice_suffix(&mut src, &map, from_idx, transform, tail.as_file_mut())?;
     if !stats.wrote_seek_table {
         // A new frame may exceed the seek-table u32 limit. Keep the existing
         // no-size-refusal rule: publish the staged suffix through copy/rename.
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0281-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0281-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let mut tmp = NamedTempFile::new_in(parent)?;
         let method = crate::fastcopy::copy_range(
@@ -325,12 +310,9 @@ where
 
 fn spill_sink() -> tempfile::SpooledTempFile {
     {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0028-M01","item":"ratarmount_compress::zstd_splice::spill_sink","disposition":"output-owner","category":"compression-staging","reason":"Construct the spill sink used for the compressed rewrite tail.","creation":{"policy":"spill-private-temporary","basis":"SpooledTempFile uses the existing memory cap and tempfile defaults on disk rollover; it does not create a named archive input."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0028-M01","item":"ratarmount_compress::zstd_splice::spill_sink","disposition":"output-owner","category":"compression-staging","reason":"Construct the spill sink used for the compressed rewrite tail.","creation":{"policy":"spill-private-temporary","basis":"SpooledTempFile uses the existing memory cap and tempfile defaults on disk rollover; it does not create a named archive input."}}"###
         )]
         let __inventory_value_0 = tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize);
         __inventory_value_0

@@ -885,7 +885,7 @@
     },
     {
       "item": "<ratarmount_compositing::overlay_layer::ReadOnlyOverlayLayer>::open_host",
-      "leaf_digest": "23328ab5f5536bf92a1e02f128398a997c4bf0bf781e880ef4ae3172c48f79b6",
+      "leaf_digest": "21c8b982d9f2913c59d4531c714c89e61b06d6854b7f924a2bf31c4fcdb594fb",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -936,7 +936,7 @@
     },
     {
       "item": "<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open",
-      "leaf_digest": "ddbd69d26cd09d2732993863ba5a98897c523e06225b450951187fcf048855fb",
+      "leaf_digest": "afbcb67aeacdd4339eba9457d02bfac3f6f67d5d2dcf477671face2dde2d7a3c",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -1546,7 +1546,7 @@
     },
     {
       "item": "<ratarmount_compositing::write_overlay::WriteOverlay>::truncate",
-      "leaf_digest": "854e4b889664882e8e904053ec2f4551a2097f59516083aab60fdce91c480ffe",
+      "leaf_digest": "a2a5af81304f52ed74eee58dd18c7935576b67a94780c16abbe44bc2e0624210",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -2393,7 +2393,7 @@
     {
       "configured_path": "std::fs::File::open",
       "item": "<ratarmount_csi::Journal>::save",
-      "leaf_digest": "9da52668c8bebacfedc89c8230962814b808f5b75e14fe8c0250cfd814e7c315",
+      "leaf_digest": "f85aa9887a6c2da2bd84424a2360d9e24cec97fb36cac2c6908b50e02a0a63e5",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "directory-handle-or-durability",
@@ -4429,7 +4429,7 @@
     },
     {
       "item": "<ratarmount_index::managed_read::imp::ByteFile>::open",
-      "leaf_digest": "4401edf91f8cb8ae3c4fdf706a40955ea1b6608d9aeab899160014b296694974",
+      "leaf_digest": "6323e3a730a8fe1831cfa46c86049b1e7788e0fcde2c03c5094e4f44654ef145",
       "metadata": {
         "category": "managed-reader-backend",
         "creation": {
@@ -6149,7 +6149,7 @@
     {
       "configured_path": "std::fs::File::open",
       "item": "<ratarmount_volume_plugin::Driver<T0>>::persist",
-      "leaf_digest": "49fa8de9714ca3d31fe6c9f9c6e1a8fd7ca3c3f1ca2bb6b3db4cddfec94706ef",
+      "leaf_digest": "be4d08c966d2dd693a30f75a04274d0354946e29d22aba04fb62d157c7cb9663",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "directory-handle-or-durability",
@@ -11442,7 +11442,7 @@
     {
       "configured_path": "tempfile::Builder::make_in",
       "item": "ratarmount_compositing::write_overlay::create_cow_staging",
-      "leaf_digest": "5c8a2cd4af8fce1c41106b35ed5969f4cea360644b7d029b76ccc0e3a9a5a9ba",
+      "leaf_digest": "2a412922b29297dd0ac08962a2f9e6763cf231b5dd340bf020bc3fea6704b4ab",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "overlay-staging",
@@ -11822,7 +11822,7 @@
     },
     {
       "item": "ratarmount_compositing::write_overlay::open_park_fd",
-      "leaf_digest": "7eda3f81631d8e52981f7c1a8b38225cc2ddbc17d904622a16b1b1e4f55e1803",
+      "leaf_digest": "c73dbd9529e510c023a9c4ff36d5e18893968fa036c10f1bdab55fb53af0243e",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -12037,7 +12037,7 @@
     },
     {
       "item": "ratarmount_compositing::write_overlay::rebuild_zip_with_overlay",
-      "leaf_digest": "0377c56e7ac38eb483d2c16adc22a24cd3c3acff383515a4c183bd83d282ca04",
+      "leaf_digest": "7651349fa4e2ac175d18949f031f51af965eeadf22dd622ead6ba2d33fd60294",
       "metadata": {
         "category": "archive-input",
         "creation": {
@@ -12224,7 +12224,7 @@
     },
     {
       "item": "ratarmount_compositing::write_overlay::write_commit_manifest",
-      "leaf_digest": "26a7777a121488168b0a0d38356bcbc63a864b9e390aedf0c686e487c1aa3f92",
+      "leaf_digest": "ed1521b6c635fc30e109dd4d5c48106c47da1312ef2d94c6b784e9478c1bbe09",
       "metadata": {
         "category": "structured-control-record",
         "creation": {
@@ -12909,7 +12909,7 @@
     },
     {
       "item": "ratarmount_compress::fastcopy::copy_to_temp",
-      "leaf_digest": "346bee8013f8c1cd796d8e098a191d0cbf3645ede8ec188b9038d046e175fd02",
+      "leaf_digest": "aa3c1d60de2a3fce518a3ae55388311cd88f7466db278772977c67dad78898f8",
       "metadata": {
         "category": "compression-staging",
         "creation": {
@@ -12932,7 +12932,7 @@
     },
     {
       "item": "ratarmount_compress::fastcopy::copy_to_temp",
-      "leaf_digest": "140ee5f9fc08a5e786a3077bcba2a21b881b12684c44f795d45935c2b25051c5",
+      "leaf_digest": "a5c15ca3a6b6906808d87f7290475c00e70f4da2e8d9fba6f32d32e6cfa74efb",
       "metadata": {
         "category": "compression-staging",
         "creation": {
@@ -12955,7 +12955,7 @@
     },
     {
       "item": "ratarmount_compress::fastcopy::copy_to_temp",
-      "leaf_digest": "233185cdbc83936250101f3aa7cea0d5e1ef9dd298d009be6accde7ea4b1451b",
+      "leaf_digest": "49dde39743553e605daf4cd0d182b9a751d13353a06e4b3d538d42c1fa828204",
       "metadata": {
         "category": "runtime-resource-or-descriptor-handoff",
         "creation": {
@@ -15601,7 +15601,7 @@
     },
     {
       "item": "ratarmount_formats_tar::write::write_file_on_disk",
-      "leaf_digest": "e5e9aa60bce518ad04162124ce6ae1861282ae0721d9d2b111ef8fc5bf403716",
+      "leaf_digest": "167a1373b7649b8fff371a364e6541b709b4f4b59a6c22f086fdb5d188ae42c2",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -16296,7 +16296,7 @@
     },
     {
       "item": "ratarmount_formats_zip::read_file_range_at_into",
-      "leaf_digest": "0812cfe92d202712d0d81c6609981e6fe3fd1e3b54218e039d6728a8a2fa3a24",
+      "leaf_digest": "0e8abdb8ec419b34eb5b535c0b29994b6b316eb2ce097e047768befb41238c56",
       "metadata": {
         "category": "archive-input",
         "creation": {
@@ -16590,7 +16590,7 @@
     },
     {
       "item": "ratarmount_fuse::reopen_parked_readonly",
-      "leaf_digest": "31feb52dcd1c08c377e31cb582e9554cabc50c706aa659918b73474e1b6c067f",
+      "leaf_digest": "89f744c5dc665b8893c4860b8b10f69427de1f66dd536580cfb9442e8fe7f5e4",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -20437,7 +20437,7 @@
     {
       "configured_path": "ratarmount_index::managed_read::copy_create_or_truncate",
       "item": "ratarmount_session::factory::remote_open::try_install_remote_index",
-      "leaf_digest": "8ae989b8d43f5b3726c32e1fa754d9cfcbceea9ee1e0d38b192cae8c0b177736",
+      "leaf_digest": "01189c0e0506a920908d5832fd551a426a265fceac0039ce35de05598a8a9421",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "managed-read",
@@ -20910,12 +20910,12 @@
     }
   ],
   "policy": {
-    "configuration": "783d1a0b16c2d9b2e0adf34c0ed4f141ea47cbc5d27d2ab97b931da093063ba1",
+    "configuration": "d7c030694a27a844905b8fc34ae7d7663dd664cfe4b2bd638939c80e2bf88d33",
     "profiles": "f04aa50122d4ae1f0504b6411c5b47cacf3a97a9e3080e175166f3b744aa4bd8",
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
       "component_digest": "6fdbc2122f41ca9f892fe09782f4f3b6e18f23d60483a3403d3e5e0da119a0f2",
-      "patch_digest": "306e60e3c09344a053cc17bbd6e2b2a331a6c43c91f264d304e7aff798be2b6f",
+      "patch_digest": "29803c7e2733313f1d73c7c5e2df213bed140183f887a73cc3c6dccc28668422",
       "schema": 1,
       "source_digest": "5a9993673ce40804e6b50300df59ecb3d13942c1c89cd11e76acf705b331f982"
     }

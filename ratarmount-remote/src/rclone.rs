@@ -352,12 +352,9 @@ fn rclone_cat_to_temp(loc: &RcloneLocation, offset: u64, count: u64) -> Result<N
         .stdout
         .take()
         .ok_or_else(|| rclone_io("rclone stdout not piped"))?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0518-M01","item":"ratarmount_remote::rclone::rclone_cat_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0518-M01","item":"ratarmount_remote::rclone::rclone_cat_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new()?;
     io::copy(&mut stdout, &mut tmp)?;

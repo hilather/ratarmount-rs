@@ -52,12 +52,9 @@ pub fn resolve_index(
         IndexPolicy::Temp => {
             let p = temp_index_path();
             if let Some(parent) = p.parent() {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0099-M01","item":"ratarmount_session::resolve::resolve_index","disposition":"output-owner","category":"index-cache-directory","reason":"Create the resolved index parent before applying private Unix directory permissions.","creation":{"policy":"recursive-directory","basis":"The resolver sets 0700 on Unix after creation; non-Unix keeps its existing platform behavior."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0099-M01","item":"ratarmount_session::resolve::resolve_index","disposition":"output-owner","category":"index-cache-directory","reason":"Create the resolved index parent before applying private Unix directory permissions.","creation":{"policy":"recursive-directory","basis":"The resolver sets 0700 on Unix after creation; non-Unix keeps its existing platform behavior."}}"###
                 )]
                 std::fs::create_dir_all(parent).map_err(|e| Error::Internal(e.to_string()))?;
                 #[cfg(unix)]

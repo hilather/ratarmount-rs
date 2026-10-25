@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! Userspace SFTP export of a [`ratarmount_core::MountSource`] (P-10).
 //!

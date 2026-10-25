@@ -231,12 +231,9 @@ fn output_family(path: &Path) -> Result<Dest> {
 }
 
 fn classify_input(path: &Path) -> Result<InputKind> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0250-M01","item":"ratarmount_compress::repack_seekable::classify_input","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0250-M01","item":"ratarmount_compress::repack_seekable::classify_input","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut file = File::open(path)?;
     let mut buf = [0u8; 16];
@@ -382,12 +379,9 @@ fn repack_zstd_dest(
 ) -> Result<RepackReport> {
     let input_len = fs::metadata(input)?.len();
     if kind == InputKind::Zstd {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0251-M01","item":"ratarmount_compress::repack_seekable::repack_zstd_dest","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0251-M01","item":"ratarmount_compress::repack_seekable::repack_zstd_dest","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let mut src = File::open(input)?;
         let map = scan_zstd_frames(&mut src).map_err(|e| {
@@ -462,12 +456,9 @@ fn repack_gzip_dest(
 
     // Temps are durable before any final name is replaced. An index error
     // drops the temps and leaves the previous archive and sidecars.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0252-M01","item":"ratarmount_compress::repack_seekable::repack_gzip_dest","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0252-M01","item":"ratarmount_compress::repack_seekable::repack_gzip_dest","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut body = NamedTempFile::new_in(parent)?;
     copy_path(input, body.as_file_mut())?;
@@ -481,12 +472,9 @@ fn repack_gzip_dest(
 
     let mut sides = Vec::with_capacity(blobs.len());
     for (ext, blob) in gzip_sidecar_exts(opts.gzip_sidecar).iter().zip(blobs) {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0253-M01","item":"ratarmount_compress::repack_seekable::repack_gzip_dest","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0253-M01","item":"ratarmount_compress::repack_seekable::repack_gzip_dest","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let mut side = NamedTempFile::new_in(parent)?;
         side.write_all(&blob)?;
@@ -609,12 +597,9 @@ fn move_aside(path: &Path) -> Result<Option<PathBuf>> {
         Err(e) => return Err(e.into()),
         Ok(_) => {}
     }
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0254-M01","item":"ratarmount_compress::repack_seekable::move_aside","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0254-M01","item":"ratarmount_compress::repack_seekable::move_aside","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let (file, bak) = NamedTempFile::new_in(parent_dir(path))?
         .keep()
@@ -680,12 +665,9 @@ fn recompress_kind(
 ) -> Result<(u32, u64)> {
     match kind {
         InputKind::Zstd => {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0255-M01","item":"ratarmount_compress::repack_seekable::recompress_kind","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0255-M01","item":"ratarmount_compress::repack_seekable::recompress_kind","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let file = File::open(input)?;
             let mut dec = zstd::stream::read::Decoder::new(file)
@@ -693,12 +675,9 @@ fn recompress_kind(
             recompress_read_to_zstd(&mut dec, out, opts.frame_size, opts.zstd_level)
         }
         InputKind::Gzip => {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0256-M01","item":"ratarmount_compress::repack_seekable::recompress_kind","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0256-M01","item":"ratarmount_compress::repack_seekable::recompress_kind","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let file = File::open(input)?;
             // Multi-member: a single gzip decoder stops at the first member and
@@ -707,12 +686,9 @@ fn recompress_kind(
             recompress_read_to_zstd(&mut dec, out, opts.frame_size, opts.zstd_level)
         }
         InputKind::Plain => {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0257-M01","item":"ratarmount_compress::repack_seekable::recompress_kind","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0257-M01","item":"ratarmount_compress::repack_seekable::recompress_kind","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let mut file = File::open(input)?;
             recompress_read_to_zstd(&mut file, out, opts.frame_size, opts.zstd_level)
@@ -810,12 +786,9 @@ fn sum_uncompressed(map: &ZstdFrameMap) -> Result<u64> {
 }
 
 fn copy_path(input: &Path, out: &mut File) -> Result<()> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0258-M01","item":"ratarmount_compress::repack_seekable::copy_path","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0258-M01","item":"ratarmount_compress::repack_seekable::copy_path","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut src = File::open(input)?;
     io::copy(&mut src, out)?;
@@ -823,12 +796,9 @@ fn copy_path(input: &Path, out: &mut File) -> Result<()> {
 }
 
 fn write_atomic(output: &Path, write_body: impl FnOnce(&mut File) -> Result<()>) -> Result<u64> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0259-M01","item":"ratarmount_compress::repack_seekable::write_atomic","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0259-M01","item":"ratarmount_compress::repack_seekable::write_atomic","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new_in(parent_dir(output))?;
     write_body(tmp.as_file_mut())?;

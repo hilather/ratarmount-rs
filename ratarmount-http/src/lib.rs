@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! HTTP Range and WebDAV export of a [`ratarmount_core::MountSource`] (P-5 / P-6).
 //!

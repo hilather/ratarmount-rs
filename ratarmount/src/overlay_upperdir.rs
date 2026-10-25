@@ -72,12 +72,9 @@ pub fn run(
     let stack = ImportStack::open_base(&args.base, &args.lower, false, context)?;
     validate_destination(&args.directory)?;
     if !args.directory.exists() {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0131-M01","item":"ratarmount::overlay_cmd::upperdir::run","disposition":"output-owner","category":"overlay-import-directory","reason":"Claim a missing validated upperdir-conversion destination before opening overlay state.","creation":{"policy":"exclusive-directory","basis":"create_dir cannot replace an existing entry and retains current directory-default permissions."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0131-M01","item":"ratarmount::overlay_cmd::upperdir::run","disposition":"output-owner","category":"overlay-import-directory","reason":"Claim a missing validated upperdir-conversion destination before opening overlay state.","creation":{"policy":"exclusive-directory","basis":"create_dir cannot replace an existing entry and retains current directory-default permissions."}}"###
         )]
         fs::create_dir(&args.directory).map_err(|e| e.to_string())?;
     }
@@ -330,12 +327,9 @@ fn apply(
             // Admitted (R10-FIX3): an upperdir file that is another name of
             // an open overlay database (the destination's) is refused without
             // a descriptor of it being closed.
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0084-M01","item":"ratarmount::overlay_cmd::upperdir::apply","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0084-M01","item":"ratarmount::overlay_cmd::upperdir::apply","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let mut input = ratarmount_core::db_inodes::open_admitted(
                 &entry.host,
@@ -355,12 +349,9 @@ fn apply(
             let fd = overlay
                 .create_file(path, 0o600)
                 .map_err(|e| format!("{path}: {e}"))?;
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0085-M01","item":"ratarmount::overlay_cmd::upperdir::apply","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0085-M01","item":"ratarmount::overlay_cmd::upperdir::apply","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let file = unsafe { fs::File::from_raw_fd(fd) };
             let copied = (|| {

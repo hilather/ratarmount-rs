@@ -1990,13 +1990,18 @@ build scripts and dependency implementations do not acquire inventory obligation
 merely by being build prerequisites. No independent source/module resolver or
 textual operation collector runs in CI.
 
-Each reviewed operation has a narrow production-only `#[expect]` with a literal
-reason and creation policy. Strict Clippy checks stale expectations; a mandatory
-collection pass observes the actual resolved definitions even under source
-`allow` attributes. CI generates a manifest and compares it byte for byte with
-the reviewed manifest. Its identity is the enclosing item path plus complete
-literal reason. Moving a leaf down a file does not change that identity;
-changing the operation, reason, leaf syntax or multiplicity changes the manifest.
+Each reviewed operation has a narrow direct `#[expect]` with a literal reason
+and creation policy. Restricted source cannot lower the disallowed-item lints
+with `allow`/`warn` or use `cfg_attr`-wrapped expectations. Native CI uses
+`-D clippy::disallowed_methods -F unused_macros -D warnings`, so reviewed
+expectations work and unfulfilled expectations fail. Ordinary compilations
+suppress unfulfilled inventory expectations while `internal_read_inventory` is
+off; selected policy/native compilations enable it. A mandatory collection pass
+observes the actual resolved definitions. CI compares the generated manifest
+byte for byte with the reviewed manifest, rejecting both unmanifested
+expectations and approvals without a matching expectation. Its identity is the
+enclosing item path plus complete literal reason. Moving a leaf down a file does
+not change that identity; changing the operation, reason, leaf syntax or multiplicity changes the manifest.
 Creation and mode metadata are explicit review decisions, never inferred from
 flags or builder chains.
 
@@ -2015,12 +2020,15 @@ broader dependency acquisitions and `read_dir` coverage are follow-up #209.
 Only N2–N4 add syntax refusals: every local foreign block and `link_name` must
 belong to the exact reviewed `ratarmount_formats_libarchive::ffi` compiler module;
 repo macros cannot contain cfg/cfg_attr or substituted transcriber attributes;
-and target predicates in the 40 packages whose cross checks failed require an
-exact reviewed-file exception. Those file exceptions have no content hash.
-Changes to inactive target alternatives need ordinary review, and native Linux
-Clippy cannot establish equivalent enforcement of their inactive calls. Macro
-expansion records enforce the configured include ban; CSI has one reviewed
-source-file/item exception. Unused exported macros and arbitrary non-target cfg
+and stripping target cfg/cfg_attr attributes in the 40 restricted packages
+require an exact reviewed-file exception. Unparseable cfg_attr predicates and
+clippy/not(clippy) stripping are refused there even in reviewed files. cfg!
+returns a boolean, so both branches remain type-checked and linted. CI supplies
+`-F unused_macros`; root forbid attributes document the rule without a syntax
+check. N4 is defence in depth behind the native CI matrix. File exceptions have
+no content hash; changes to alternatives outside native matrix coverage still
+need ordinary review. Macro expansion records enforce the configured include ban; CSI has one reviewed
+source-file/item exception. Unused exported macros and other non-target cfg
 predicates remain documented gaps (#209).
 
 A managed read reports an SQLite allocation failure as out of memory, never as

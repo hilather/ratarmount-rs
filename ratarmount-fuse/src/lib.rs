@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! FUSE mount using `fuser` low-level API (read + optional write overlay).
 
@@ -1051,12 +1052,9 @@ impl RatarmountFs {
                 Some(OpenBackend::OverlayFd(fd)) => {
                     // Duplicate the opened inode, never reopen its pathname.
                     use std::os::fd::BorrowedFd;
-                    #[cfg_attr(
-                        internal_read_inventory,
-                        expect(
-                            clippy::disallowed_methods,
-                            reason = r###"internal-read:v1 {"id":"IR-B0404-M01","item":"<ratarmount_fuse::RatarmountFs>::passthrough_file","disposition":"residual","reason":"FUSE passthrough duplicates the handle's already-admitted overlay payload descriptor (OverlayFd) and never reopens its pathname; reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                        )
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0404-M01","item":"<ratarmount_fuse::RatarmountFs>::passthrough_file","disposition":"residual","reason":"FUSE passthrough duplicates the handle's already-admitted overlay payload descriptor (OverlayFd) and never reopens its pathname; reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                     )]
                     let fd = unsafe { BorrowedFd::borrow_raw(*fd) }.try_clone_to_owned()?;
                     let file = std::fs::File::from(fd);
@@ -2580,7 +2578,7 @@ impl RatarmountFs {
         let path = self.mutation_path(ino)?;
         self.with_overlay_handle(fh, &path, EACCES, |file| {
             let fd = file.as_raw_fd();
-            #[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0048-M01","item":"<ratarmount_fuse::RatarmountFs>::setattr_detached","disposition":"out-of-family","category":"descriptor-control","reason":"Read the detached overlay descriptor flags before choosing append/write behavior.","creation":{"policy":"none","basis":"F_GETFL queries an already-held FUSE file descriptor; no pathname is opened and no descriptor is duplicated."}}"###))]
+            #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0048-M01","item":"<ratarmount_fuse::RatarmountFs>::setattr_detached","disposition":"out-of-family","category":"descriptor-control","reason":"Read the detached overlay descriptor flags before choosing append/write behavior.","creation":{"policy":"none","basis":"F_GETFL queries an already-held FUSE file descriptor; no pathname is opened and no descriptor is duplicated."}}"###)]
 let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if flags < 0 {
                 return Err(EIO);
@@ -2911,12 +2909,9 @@ fn reopen_parked_readonly(raw: libc::c_int) -> Result<libc::c_int, i32> {
     {
         let path = std::ffi::CString::new(format!("/proc/self/fd/{raw}")).map_err(|_| EIO)?;
         // O_CLOEXEC so a later exec does not inherit the orphan.
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0406-M01","item":"ratarmount_fuse::reopen_parked_readonly","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0406-M01","item":"ratarmount_fuse::reopen_parked_readonly","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
@@ -2927,12 +2922,9 @@ fn reopen_parked_readonly(raw: libc::c_int) -> Result<libc::c_int, i32> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0407-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"non-Linux duplicate of the parked payload descriptor (no pathname open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","item":"ratarmount_fuse::reopen_parked_readonly","native_observed":false,"creation":{"policy":"none","basis":"F_DUPFD_CLOEXEC duplicates the already-parked payload descriptor and creates no pathname."},"category":"overlay-payload"}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0407-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"non-Linux duplicate of the parked payload descriptor (no pathname open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","item":"ratarmount_fuse::reopen_parked_readonly","native_observed":false,"creation":{"policy":"none","basis":"F_DUPFD_CLOEXEC duplicates the already-parked payload descriptor and creates no pathname."},"category":"overlay-payload"}"###
         )]
         let fd = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
@@ -3745,7 +3737,7 @@ fn validate_allow_other_with(options: &str, uid: u32, config: &Path) -> std::io:
     {
         return Ok(());
     }
-    #[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0408-M01","item":"ratarmount_fuse::validate_allow_other_with","disposition":"out-of-family","category":"configuration-or-credentials","reason":"/etc/fuse.conf","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+    #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0408-M01","item":"ratarmount_fuse::validate_allow_other_with","disposition":"out-of-family","category":"configuration-or-credentials","reason":"/etc/fuse.conf","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
 let allowed = match std::fs::read_to_string(config) {
         Ok(contents) => fuse_conf_allows_other(&contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,

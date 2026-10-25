@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! Userspace SMB 2.0.2 / 3.1.1 export of a [`ratarmount_core::MountSource`] (P-2).
 //!

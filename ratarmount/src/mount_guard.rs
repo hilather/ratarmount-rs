@@ -113,7 +113,7 @@ impl FsIdentity for RealFs {
         #[cfg(target_os = "linux")]
         {
             {
-#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0036-M01","item":"<ratarmount::mount_guard::RealFs as ratarmount::mount_guard::FsIdentity<ratarmount::mount_guard::RealFs>>::mountinfo_bytes","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0036-M01","item":"<ratarmount::mount_guard::RealFs as ratarmount::mount_guard::FsIdentity<ratarmount::mount_guard::RealFs>>::mountinfo_bytes","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
 let __inventory_value_0 = std::fs::read("/proc/self/mountinfo");
 __inventory_value_0
 }.ok()
@@ -140,12 +140,9 @@ pub(crate) fn mount_id_statx(p: &Path) -> Option<u64> {
     let cpath = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is the 256-byte statx buffer and `cpath` is NUL-terminated.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0119-M01","item":"ratarmount::mount_guard::mount_id_statx","disposition":"out-of-family","category":"mount-identity-probe","reason":"Query statx mount identity for the guard without acquiring a filesystem descriptor.","creation":{"policy":"none","basis":"The direct SYS_statx call fills the local metadata buffer and returns no new fd; the generic syscall ban requires this review."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0119-M01","item":"ratarmount::mount_guard::mount_id_statx","disposition":"out-of-family","category":"mount-identity-probe","reason":"Query statx mount identity for the guard without acquiring a filesystem descriptor.","creation":{"policy":"none","basis":"The direct SYS_statx call fills the local metadata buffer and returns no new fd; the generic syscall ban requires this review."}}"###
     )]
     let rc = unsafe {
         libc::syscall(
@@ -187,12 +184,9 @@ pub(crate) fn mount_id_handle(p: &Path) -> Option<u64> {
     };
     let mut mnt_id: libc::c_int = -1;
     // SAFETY: `fh` has the kernel `struct file_handle` layout with 128 handle bytes.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0120-M01","item":"ratarmount::mount_guard::mount_id_handle","disposition":"out-of-family","category":"mount-identity-probe","reason":"Query name_to_handle_at mount identity when statx cannot provide the mount id.","creation":{"policy":"none","basis":"This direct syscall fills the local FileHandle/mount-id buffers and acquires no file descriptor; EOVERFLOW is handled explicitly."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0120-M01","item":"ratarmount::mount_guard::mount_id_handle","disposition":"out-of-family","category":"mount-identity-probe","reason":"Query name_to_handle_at mount identity when statx cannot provide the mount id.","creation":{"policy":"none","basis":"This direct syscall fills the local FileHandle/mount-id buffers and acquires no file descriptor; EOVERFLOW is handled explicitly."}}"###
     )]
     let rc = unsafe {
         libc::syscall(
@@ -989,12 +983,9 @@ pub(crate) fn decisive_check<F: FsIdentity>(
 pub(crate) fn prepare_overlay_dir(w: &Path) -> io::Result<()> {
     if !w.exists() {
         {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0121-M01","item":"ratarmount::mount_guard::prepare_overlay_dir","disposition":"output-owner","category":"overlay-directory","reason":"Create the missing overlay directory after the mount guard has validated the proposed layout.","creation":{"policy":"recursive-directory","basis":"An existing path is left for the overlay opener to validate; new directory creation keeps existing std defaults."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0121-M01","item":"ratarmount::mount_guard::prepare_overlay_dir","disposition":"output-owner","category":"overlay-directory","reason":"Create the missing overlay directory after the mount guard has validated the proposed layout.","creation":{"policy":"recursive-directory","basis":"An existing path is left for the overlay opener to validate; new directory creation keeps existing std defaults."}}"###
             )]
             let __inventory_value_0 = std::fs::create_dir_all(w);
             __inventory_value_0

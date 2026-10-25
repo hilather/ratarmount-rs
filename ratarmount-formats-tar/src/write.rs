@@ -1024,12 +1024,9 @@ fn write_file_on_disk<W: Write>(
     // On Unix the open is admitted (R10-C): another name (a hard link) of an
     // open overlay database is refused without closing a descriptor of it.
     #[cfg(unix)]
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0367-M01","item":"ratarmount_formats_tar::write::write_file_on_disk","disposition":"residual","reason":"TAR commit helper opens an overlay payload through admission","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0367-M01","item":"ratarmount_formats_tar::write::write_file_on_disk","disposition":"residual","reason":"TAR commit helper opens an overlay payload through admission","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let f = std::fs::File::from(ratarmount_core::db_inodes::open_admitted(
         path,
@@ -1040,12 +1037,9 @@ fn write_file_on_disk<W: Write>(
     let f = {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0368-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"TAR commit helper opens an overlay payload through admission","mode_policy":"unchanged-from-e6ca64e","item":"ratarmount_formats_tar::write::write_file_on_disk","native_observed":false,"creation":{"policy":"none","basis":"Read-only fallback opens an existing overlay payload and requests no creation."},"category":"overlay-payload"}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0368-I01","disposition":"residual","family":"payload-admitted-readers","issue":"#196","reason":"TAR commit helper opens an overlay payload through admission","mode_policy":"unchanged-from-e6ca64e","item":"ratarmount_formats_tar::write::write_file_on_disk","native_observed":false,"creation":{"policy":"none","basis":"Read-only fallback opens an existing overlay payload and requests no creation."},"category":"overlay-payload"}"###
         )]
         let opened = options.open(path)?;
         opened

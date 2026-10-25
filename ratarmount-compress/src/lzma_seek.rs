@@ -32,12 +32,9 @@ pub fn open_seekable_lzma_with_threads(
     let path = path.as_ref();
     let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
 
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0247-M01","item":"ratarmount_compress::lzma_seek::open_seekable_lzma_with_threads","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0247-M01","item":"ratarmount_compress::lzma_seek::open_seekable_lzma_with_threads","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let file = File::open(path)?;
     let mut input = BufReader::new(file);

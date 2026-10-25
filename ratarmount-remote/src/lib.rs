@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! Remote URL access for Phase 10.
 //!
@@ -361,12 +362,9 @@ fn load_http_cookie() -> Result<Option<String>> {
     let Some(path) = non_empty_env(HTTP_COOKIE_FILE_ENV) else {
         return Ok(None);
     };
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0511-M01","item":"ratarmount_remote::load_http_cookie","disposition":"out-of-family","category":"configuration-or-credentials","reason":"credentials or client configuration file","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0511-M01","item":"ratarmount_remote::load_http_cookie","disposition":"out-of-family","category":"configuration-or-credentials","reason":"credentials or client configuration file","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let text = std::fs::read_to_string(&path).map_err(|e| {
         RemoteError::Http(format!(
@@ -558,12 +556,9 @@ pub fn is_remote_url(s: &str) -> bool {
 
 /// Copy a seekable/stream body into a kept temp file.
 fn keep_from_reader(input: &str, mut r: impl Read) -> Result<RemoteLocal> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0512-M01","item":"ratarmount_remote::keep_from_reader","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0512-M01","item":"ratarmount_remote::keep_from_reader","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new()?;
     let size = io::copy(&mut r, &mut tmp)?;
@@ -1073,12 +1068,9 @@ fn fetch_http_full_get(loc: &HttpLocation) -> Result<(NamedTempFile, u64)> {
         return Err(http_status_err(resp.status(), &loc.url));
     }
     let mut reader = resp.into_reader();
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0513-M01","item":"ratarmount_remote::fetch_http_full_get","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0513-M01","item":"ratarmount_remote::fetch_http_full_get","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new()?;
     let n = io::copy(&mut reader, &mut tmp)?;
@@ -1089,12 +1081,9 @@ fn fetch_http_full_get(loc: &HttpLocation) -> Result<(NamedTempFile, u64)> {
 
 /// Sequential Range GET materialization into a tempfile.
 fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile, u64)> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0514-M01","item":"ratarmount_remote::fetch_http_via_ranges","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0514-M01","item":"ratarmount_remote::fetch_http_via_ranges","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new()?;
     if size == 0 {
@@ -1212,12 +1201,9 @@ impl HttpRangeFile {
                 64 * 1024 * 1024,
                 ratarmount_core::budget::Priority::Cache,
             );
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0515-M01","item":"<ratarmount_remote::HttpRangeFile>::open_with_auth","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0515-M01","item":"<ratarmount_remote::HttpRangeFile>::open_with_auth","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
             )]
             let mut file = tempfile::tempfile()?;
             let size = io::copy(&mut resp.into_reader(), &mut file)?;

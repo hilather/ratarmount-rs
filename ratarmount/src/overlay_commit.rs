@@ -835,7 +835,7 @@ fn install_hf_live_commit(
             state.ready()?;
             let mut range = state.repo.open_file(&state.repo.location.path)
                 .map_err(|e| OverlayError::Msg(e.to_string()))?;
-            #[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0038-M01","item":"ratarmount::overlay_commit::install_hf_live_commit","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###))]
+            #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0038-M01","item":"ratarmount::overlay_commit::install_hf_live_commit","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###)]
 let mut file = tempfile::NamedTempFile::new()?;
             let len = std::io::copy(&mut range, &mut file)?;
             if len != range.len() {
@@ -862,12 +862,9 @@ let mut file = tempfile::NamedTempFile::new()?;
 /// (the staged file may be open as a database in this process; a raw `File`
 /// close would release that connection's locks).
 fn staged_zstd_blocks(staged: &Path) -> Result<Vec<(i64, i64)>, String> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0039-M01","item":"ratarmount::overlay_commit::staged_zstd_blocks","disposition":"managed-read","regression":"regression_live_commit_zstd_blocks_keep_staged_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0039-M01","item":"ratarmount::overlay_commit::staged_zstd_blocks","disposition":"managed-read","regression":"regression_live_commit_zstd_blocks_keep_staged_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut cursor = ratarmount_index::managed_read::ManagedReadCursor::open(staged)
         .map_err(|e| e.to_string())?;
@@ -894,12 +891,9 @@ fn publish_hf(
     }
     // Build a fresh snapshot without mutating the index still used by the pinned base.
     // Even :memory: mounts publish all three names, and a failed upload leaves the old index usable.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0040-M01","item":"ratarmount::overlay_commit::publish_hf","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0040-M01","item":"ratarmount::overlay_commit::publish_hf","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let dir = tempfile::tempdir().map_err(|e| retryable(e.to_string()))?;
     let sidecar = dir.path().join("index.sqlite");
@@ -957,12 +951,9 @@ fn publish_hf(
         .map_err(|e| retryable(e.to_string()))?;
     let json = index_pointer_to_json(&pointer).map_err(|e| retryable(e.to_string()))?;
     // Managed (#151): the sidecar is the mount's own index.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0041-M01","item":"ratarmount::overlay_commit::publish_hf","disposition":"managed-read","regression":"regression_live_commit_hf_reads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0041-M01","item":"ratarmount::overlay_commit::publish_hf","disposition":"managed-read","regression":"regression_live_commit_hf_reads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let blob =
         ratarmount_index::managed_read::read(&sidecar).map_err(|e| retryable(e.to_string()))?;
@@ -1156,12 +1147,9 @@ fn publish_s3(
         );
         let put = if len <= S3_PUT_SINGLE_MAX {
             // Managed (#151): the staged archive may be a database open here.
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0042-M01","item":"ratarmount::overlay_commit::publish_s3","disposition":"managed-read","regression":"regression_live_commit_s3_single_put_body_keeps_archive_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0042-M01","item":"ratarmount::overlay_commit::publish_s3","disposition":"managed-read","regression":"regression_live_commit_s3_single_put_body_keeps_archive_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let body = ratarmount_index::managed_read::read(&req.staged)
                 .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
@@ -1350,12 +1338,9 @@ fn publish_gcs(
         }
     };
     // Managed (#151): the sidecar is the mount's own index.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0043-M01","item":"ratarmount::overlay_commit::publish_gcs","disposition":"managed-read","regression":"regression_live_commit_gcs_reads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0043-M01","item":"ratarmount::overlay_commit::publish_gcs","disposition":"managed-read","regression":"regression_live_commit_gcs_reads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let blob = match ratarmount_index::managed_read::read(&sidecar) {
         Ok(b) => b,

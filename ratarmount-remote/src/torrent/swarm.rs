@@ -307,10 +307,10 @@ impl Swarm {
             .spawn(move || {
                 let initializing = Arc::new(AtomicBool::new(true));
                 let setup = || -> io::Result<_> {
-                    #[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0091-M01","item":"<ratarmount_remote::torrent::swarm::Swarm>::with_cache","disposition":"output-owner","category":"torrent-scratch-directory","reason":"Create the selected swarm cache root before stale scratch sweeping and private scratch allocation.","creation":{"policy":"recursive-directory","basis":"The cache root keeps current defaults; tempfile creates the per-swarm child and its ownership marker is reviewed separately."}}"###))]
+                    #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0091-M01","item":"<ratarmount_remote::torrent::swarm::Swarm>::with_cache","disposition":"output-owner","category":"torrent-scratch-directory","reason":"Create the selected swarm cache root before stale scratch sweeping and private scratch allocation.","creation":{"policy":"recursive-directory","basis":"The cache root keeps current defaults; tempfile creates the per-swarm child and its ownership marker is reviewed separately."}}"###)]
 std::fs::create_dir_all(&cache_dir)?;
                     scratch::sweep(&cache_dir, Duration::from_secs(24 * 60 * 60));
-                    #[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0535-M01","item":"<ratarmount_remote::torrent::swarm::Swarm>::with_cache","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###))]
+                    #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0535-M01","item":"<ratarmount_remote::torrent::swarm::Swarm>::with_cache","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###)]
 let scratch = tempfile::Builder::new()
                         .prefix("swarm-")
                         .tempdir_in(cache_dir)?;
@@ -327,7 +327,7 @@ let scratch = tempfile::Builder::new()
                     }
                     if options.policy == TorrentSwarmPolicy::Lan {
                         let path = scratch.path().join("lan-allowlist.txt");
-                        #[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0536-M01","item":"<ratarmount_remote::torrent::swarm::Swarm>::with_cache","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###))]
+                        #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0536-M01","item":"<ratarmount_remote::torrent::swarm::Swarm>::with_cache","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###)]
 std::fs::write(&path, LAN_ALLOWLIST)?;
                         config.allowlist_url = Some(url::Url::from_file_path(path).map_err(|_| error("invalid LAN allowlist path"))?.into());
                     }

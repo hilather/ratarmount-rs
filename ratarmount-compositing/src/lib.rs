@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! Compositing layers: folder bind, union, recursive auto-mount, write overlay,
 //! file versions, path prefix, path transform, in-FS control folder, OCI overlayfs,

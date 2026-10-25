@@ -104,12 +104,9 @@ impl Magnet {
 
 fn read_metadata(path: &Path) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0530-M01","item":"ratarmount_remote::torrent::metadata::read_metadata","disposition":"residual","reason":"local .torrent metainfo input","family":"remote-listing-and-torrent-caches","issue":"#196","category":"remote-listing-and-torrent-caches","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0530-M01","item":"ratarmount_remote::torrent::metadata::read_metadata","disposition":"residual","reason":"local .torrent metainfo input","family":"remote-listing-and-torrent-caches","issue":"#196","category":"remote-listing-and-torrent-caches","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     std::fs::File::open(path)?
         .take(MAX_META + 1)
@@ -145,24 +142,18 @@ fn fetch(url: &str, timeout: std::time::Duration) -> io::Result<Vec<u8>> {
 }
 
 pub(crate) fn save(meta: &Metainfo, dir: &Path) -> io::Result<()> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0089-M01","item":"ratarmount_remote::torrent::metadata::save","disposition":"output-owner","category":"torrent-metadata-cache-directory","reason":"Create the torrent metadata cache directory before persisting validated v1/v2 metainfo.","creation":{"policy":"recursive-directory","basis":"This is metadata output, written through separately reviewed temporary files with current permissions."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0089-M01","item":"ratarmount_remote::torrent::metadata::save","disposition":"output-owner","category":"torrent-metadata-cache-directory","reason":"Create the torrent metadata cache directory before persisting validated v1/v2 metainfo.","creation":{"policy":"recursive-directory","basis":"This is metadata output, written through separately reviewed temporary files with current permissions."}}"###
     )]
     std::fs::create_dir_all(dir)?;
     for hash in [meta.v1_hash.as_ref(), meta.v2_hash.as_ref()]
         .into_iter()
         .flatten()
     {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0531-M01","item":"ratarmount_remote::torrent::metadata::save","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0531-M01","item":"ratarmount_remote::torrent::metadata::save","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let mut temp = tempfile::NamedTempFile::new_in(dir)?;
         temp.write_all(&meta.bytes)?;

@@ -72,12 +72,9 @@ fn read_exact_file(path: &Path, len: u64) -> Result<Vec<u8>> {
     let n = usize::try_from(len)
         .map_err(|_| RemoteError::S3(format!("index blob length {len} does not fit usize")))?;
     // Managed (#151): the blob is an index that may be open in this process.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0510-M01","item":"ratarmount_remote::index_sibling::read_exact_file","disposition":"managed-read","regression":"regression_index_sibling_upload_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0510-M01","item":"ratarmount_remote::index_sibling::read_exact_file","disposition":"managed-read","regression":"regression_index_sibling_upload_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut file = ratarmount_index::managed_read::ManagedReadCursor::open(path)?;
     let mut buf = vec![0u8; n];

@@ -68,12 +68,9 @@ fn cache_path(meta: &Metainfo, dir: &Path, source: &str) -> std::path::PathBuf {
 
 fn cached(meta: &Metainfo, dir: &Path, source: &str) -> Hashes {
     let read = || -> Option<Hashes> {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0528-M01","item":"ratarmount_remote::torrent::checksums::cached","disposition":"residual","reason":"torrent checksum cache record","family":"remote-listing-and-torrent-caches","issue":"#196","category":"remote-listing-and-torrent-caches","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0528-M01","item":"ratarmount_remote::torrent::checksums::cached","disposition":"residual","reason":"torrent checksum cache record","family":"remote-listing-and-torrent-caches","issue":"#196","category":"remote-listing-and-torrent-caches","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let file = std::fs::File::open(cache_path(meta, dir, source)).ok()?;
         let mut bytes = Vec::new();
@@ -102,20 +99,14 @@ pub(super) fn save(meta: &Metainfo, dir: &Path, source: &str, hashes: &Hashes) -
     if hashes.is_empty() {
         return Ok(());
     }
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0088-M01","item":"ratarmount_remote::torrent::checksums::save","disposition":"output-owner","category":"torrent-checksum-cache-directory","reason":"Create the checksum cache output directory before writing an atomic hash-summary tempfile.","creation":{"policy":"recursive-directory","basis":"Empty checksum sets return early; nonempty summary output uses the existing directory and tempfile defaults."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0088-M01","item":"ratarmount_remote::torrent::checksums::save","disposition":"output-owner","category":"torrent-checksum-cache-directory","reason":"Create the checksum cache output directory before writing an atomic hash-summary tempfile.","creation":{"policy":"recursive-directory","basis":"Empty checksum sets return early; nonempty summary output uses the existing directory and tempfile defaults."}}"###
     )]
     std::fs::create_dir_all(dir)?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0529-M01","item":"ratarmount_remote::torrent::checksums::save","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0529-M01","item":"ratarmount_remote::torrent::checksums::save","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut temp = tempfile::NamedTempFile::new_in(dir)?;
     let files: BTreeMap<_, _> = hashes.iter().map(|(p, h)| (p, hex::encode(h))).collect();

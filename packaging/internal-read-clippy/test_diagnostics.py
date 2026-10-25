@@ -31,7 +31,7 @@ pub fn journal() {}
 pub fn load() {
     #[expect(clippy::disallowed_methods, reason="Reviewed journal delegation")]
     let () = journal();
-    #[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason=r#"internal-read:v1 ''' + json.dumps(review) + '''"#))]
+    #[expect(clippy::disallowed_methods, reason=r#"internal-read:v1 ''' + json.dumps(review) + '''"#)]
     let _ = std::fs::read("input");
 }
 ''')

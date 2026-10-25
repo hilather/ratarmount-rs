@@ -171,7 +171,8 @@ def dispatch(arguments):
             env["CLIPPY_ARGS"] = upstream_clippy_args
         env["LD_LIBRARY_PATH"] = settings["compiler_libraries"] + os.pathsep + env.get("LD_LIBRARY_PATH", "")
         flags = ["--cfg", "internal_read_inventory", "--check-cfg=cfg(internal_read_inventory)",
-                 "-D", "warnings", "-D", "unfulfilled_lint_expectations"]
+                 "-D", "warnings", "-D", "unfulfilled_lint_expectations",
+                 "-F", "unused_macros"]
         for lint in LINTS:
             flags.extend(["--force-warn" if settings["mode"] == "collection" else "-D", lint])
         command = [settings["driver"], rustc, *rustargs, *flags]

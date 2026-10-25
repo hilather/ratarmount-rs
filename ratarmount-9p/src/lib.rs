@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! Userspace 9P2000.L TCP export of a [`ratarmount_core::MountSource`].
 //!

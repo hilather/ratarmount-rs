@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! ZIP archive mount source (`backendName=ZipMountSource`).
 //!
@@ -776,12 +777,9 @@ impl ZipMountSource {
         // Reject sibling indexes for a replaced archive (size/mtime fingerprint).
         index.check_tarstats_matches_archive(archive_path)?;
         let opened = open_archive_file(archive_path)?;
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0392-M01","item":"<ratarmount_formats_zip::ZipMountSource>::open_existing","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0392-M01","item":"<ratarmount_formats_zip::ZipMountSource>::open_existing","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let mut archive = match ZipArchive::new(opened.file.try_clone()?) {
             Ok(a) => a,
@@ -997,12 +995,9 @@ impl ZipMountSource {
             );
         }
 
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0393-M01","item":"<ratarmount_formats_zip::ZipMountSource>::create_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0393-M01","item":"<ratarmount_formats_zip::ZipMountSource>::create_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let mut archive = match ZipArchive::new(opened.file.try_clone()?) {
             Ok(a) => a,
@@ -1373,12 +1368,9 @@ fn read_file_range_at_into(file: &File, offset: u64, buf: &mut [u8]) -> io::Resu
     }
     #[cfg(not(any(unix, windows)))]
     {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0394-I01","disposition":"residual","family":"factory-and-format-readers","issue":"#196","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","item":"ratarmount_formats_zip::read_file_range_at_into","native_observed":false,"creation":{"policy":"none","basis":"try_clone duplicates the already-held archive descriptor; it opens no pathname."},"category":"archive-input"}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0394-I01","disposition":"residual","family":"factory-and-format-readers","issue":"#196","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","item":"ratarmount_formats_zip::read_file_range_at_into","native_observed":false,"creation":{"policy":"none","basis":"try_clone duplicates the already-held archive descriptor; it opens no pathname."},"category":"archive-input"}"###
         )]
         let mut f = file.try_clone()?;
         f.seek(SeekFrom::Start(offset))?;
@@ -1610,12 +1602,9 @@ impl ZipMountSource {
         // An oversized member or refused reservation stays seekable on disk.
         let compressed = self.open_stored(data_start, compressed_size);
         let decoder = flate2::read::DeflateDecoder::new(compressed);
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0395-M01","item":"<ratarmount_formats_zip::ZipMountSource>::open_deflate","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0395-M01","item":"<ratarmount_formats_zip::ZipMountSource>::open_deflate","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let mut file = tempfile::tempfile()?;
         io::copy(&mut decoder.take(size), &mut file)?;
@@ -1997,27 +1986,18 @@ fn has_sig_at(file: &mut File, off: u64, sig: &[u8; 4]) -> io::Result<bool> {
 /// Mutates `path` in place — only call on temp/materialized copies we own.
 fn normalize_multidisk_eocd(path: &Path) -> io::Result<MultidiskNormalize> {
     let mut file = {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_types,
-                reason = r###"internal-read:v1 {"id":"IR-B0396-T01","item":"ratarmount_formats_zip::normalize_multidisk_eocd","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-            )
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0396-T01","item":"ratarmount_formats_zip::normalize_multidisk_eocd","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
         )]
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0396-M01","item":"ratarmount_formats_zip::normalize_multidisk_eocd","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0396-M01","item":"ratarmount_formats_zip::normalize_multidisk_eocd","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
         )]
         let mut __inventory_value_0 = std::fs::OpenOptions::new();
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0396-M02","item":"ratarmount_formats_zip::normalize_multidisk_eocd","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0396-M02","item":"ratarmount_formats_zip::normalize_multidisk_eocd","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let __inventory_value_1 = __inventory_value_0.read(true).write(true).open(path);
         __inventory_value_1
@@ -2149,20 +2129,14 @@ fn normalize_multidisk_eocd(path: &Path) -> io::Result<MultidiskNormalize> {
 
 /// Copy `path` into a new temp file (for safe in-place EOCD rewrite of a user archive).
 fn materialize_archive_copy(path: &Path) -> io::Result<NamedTempFile> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0397-M01","item":"ratarmount_formats_zip::materialize_archive_copy","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0397-M01","item":"ratarmount_formats_zip::materialize_archive_copy","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = NamedTempFile::new()?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0398-M01","item":"ratarmount_formats_zip::materialize_archive_copy","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0398-M01","item":"ratarmount_formats_zip::materialize_archive_copy","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut src = File::open(path)?;
     io::copy(&mut src, &mut tmp)?;
@@ -2177,12 +2151,9 @@ fn open_archive_file(path: &Path) -> Result<OpenedArchive> {
             let (tmp, _) = materialize_joined_parts(&parts)?;
             // Rewrite multi-disk markers on the joined stream when CD offsets look cumulative.
             let outcome = normalize_multidisk_eocd(tmp.path())?;
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0399-M01","item":"ratarmount_formats_zip::open_archive_file","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0399-M01","item":"ratarmount_formats_zip::open_archive_file","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let file = File::open(tmp.path())?;
             let open_path = tmp.path().to_path_buf();
@@ -2201,12 +2172,9 @@ fn open_archive_file(path: &Path) -> Result<OpenedArchive> {
     // private copy (never mutate the user archive) and normalize there.
     match normalize_probe_and_copy(path)? {
         Some((tmp, outcome)) => {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0400-M01","item":"ratarmount_formats_zip::open_archive_file","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0400-M01","item":"ratarmount_formats_zip::open_archive_file","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let file = File::open(tmp.path())?;
             let open_path = tmp.path().to_path_buf();
@@ -2220,12 +2188,9 @@ fn open_archive_file(path: &Path) -> Result<OpenedArchive> {
             })
         }
         None => {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0401-M01","item":"ratarmount_formats_zip::open_archive_file","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0401-M01","item":"ratarmount_formats_zip::open_archive_file","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let file = File::open(path)?;
             Ok(OpenedArchive {
@@ -2258,12 +2223,9 @@ fn normalize_probe_and_copy(path: &Path) -> Result<Option<(NamedTempFile, Multid
 
 /// Cheap read-only check: EOCD (and ZIP64 locator if present) indicate multi-disk.
 fn eocd_looks_multidisk(path: &Path) -> io::Result<bool> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0402-M01","item":"ratarmount_formats_zip::eocd_looks_multidisk","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0402-M01","item":"ratarmount_formats_zip::eocd_looks_multidisk","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut file = File::open(path)?;
     let file_len = file.seek(SeekFrom::End(0))?;
@@ -2400,12 +2362,9 @@ pub fn default_index_path(archive: &Path) -> PathBuf {
 /// True if path looks like a ZIP archive (including first multi-part volume).
 pub fn looks_like_zip(path: &Path) -> bool {
     if let Ok(mut f) = {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0403-M01","item":"ratarmount_formats_zip::looks_like_zip","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0403-M01","item":"ratarmount_formats_zip::looks_like_zip","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let __inventory_value_0 = File::open(path);
         __inventory_value_0

@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! Core types and the `MountSource` trait (mirrors Python `ratarmountcore.mountsource`).
 

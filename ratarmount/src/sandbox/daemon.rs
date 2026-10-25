@@ -38,27 +38,18 @@ pub fn validate_name(name: &str) -> Result<()> {
 fn private_dir(path: &Path) -> Result<()> {
     {
         let __inventory_condition_1232 = {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_types,
-                    reason = r###"internal-read:v1 {"id":"IR-E0133-T01","item":"ratarmount::sandbox::daemon::private_dir","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the sandbox private-directory builder.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-                )
+            #[expect(
+                clippy::disallowed_types,
+                reason = r###"internal-read:v1 {"id":"IR-E0133-T01","item":"ratarmount::sandbox::daemon::private_dir","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the sandbox private-directory builder.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
             )]
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0133-M01","item":"ratarmount::sandbox::daemon::private_dir","disposition":"support","category":"creation-builder","reason":"Construct the sandbox private-directory builder.","creation":{"policy":"none","basis":"The builder constructor opens nothing; create and post-creation ownership/private-mode checks are separate."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0133-M01","item":"ratarmount::sandbox::daemon::private_dir","disposition":"support","category":"creation-builder","reason":"Construct the sandbox private-directory builder.","creation":{"policy":"none","basis":"The builder constructor opens nothing; create and post-creation ownership/private-mode checks are separate."}}"###
             )]
             let mut __inventory_value_0 = fs::DirBuilder::new();
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0134-M01","item":"ratarmount::sandbox::daemon::private_dir","disposition":"output-owner","category":"sandbox-state-directory","reason":"Create an owned private sandbox directory or validate an existing one.","creation":{"policy":"private-directory","basis":"DirBuilder requests 0700; symlink_metadata then requires a real directory owned by euid with no group/other permissions."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0134-M01","item":"ratarmount::sandbox::daemon::private_dir","disposition":"output-owner","category":"sandbox-state-directory","reason":"Create an owned private sandbox directory or validate an existing one.","creation":{"policy":"private-directory","basis":"DirBuilder requests 0700; symlink_metadata then requires a real directory owned by euid with no group/other permissions."}}"###
             )]
             let __inventory_value_1 = __inventory_value_0.mode(0o700).create(path);
             __inventory_value_1
@@ -84,35 +75,23 @@ fn private_dir(path: &Path) -> Result<()> {
 
 pub fn lock(path: &Path) -> Result<File> {
     let file = {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_types,
-                reason = r###"internal-read:v1 {"id":"IR-B0106-T01","item":"ratarmount::sandbox::daemon::lock","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-            )
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0106-T01","item":"ratarmount::sandbox::daemon::lock","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
         )]
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0106-M01","item":"ratarmount::sandbox::daemon::lock","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0106-M01","item":"ratarmount::sandbox::daemon::lock","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
         )]
         let mut __inventory_value_0 = fs::OpenOptions::new();
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0135-M01","item":"ratarmount::sandbox::daemon::lock","disposition":"output-owner","category":"runtime-lock","reason":"Permit creating the sandbox daemon lock while preserving an existing lock inode.","creation":{"policy":"create-or-open","basis":"The lock uses 0600, NOFOLLOW/CLOEXEC and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0135-M01","item":"ratarmount::sandbox::daemon::lock","disposition":"output-owner","category":"runtime-lock","reason":"Permit creating the sandbox daemon lock while preserving an existing lock inode.","creation":{"policy":"create-or-open","basis":"The lock uses 0600, NOFOLLOW/CLOEXEC and truncate(false); owner/type/mode/nlink checks run on the acquired descriptor."}}"###
         )]
         let __inventory_value_1 = __inventory_value_0.read(true).write(true).create(true);
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0106-M02","item":"ratarmount::sandbox::daemon::lock","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0106-M02","item":"ratarmount::sandbox::daemon::lock","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let __inventory_value_2 = __inventory_value_1
             .truncate(false)
@@ -228,12 +207,9 @@ fn socket_alive(path: &Path) -> io::Result<bool> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0107-M01","item":"ratarmount::sandbox::daemon::socket_alive","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"socket descriptor probe","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0107-M01","item":"ratarmount::sandbox::daemon::socket_alive","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"socket descriptor probe","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
@@ -301,23 +277,17 @@ struct State {
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().expect("state path has parent");
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0108-M01","item":"ratarmount::sandbox::daemon::atomic_json","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0108-M01","item":"ratarmount::sandbox::daemon::atomic_json","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer(&mut file, value).map_err(|e| invalid(e.to_string()))?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|e| ApiError::from(e.error))?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0109-M01","item":"ratarmount::sandbox::daemon::atomic_json","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0109-M01","item":"ratarmount::sandbox::daemon::atomic_json","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     File::open(parent)?.sync_all()?;
     Ok(())
@@ -345,12 +315,9 @@ impl<M: Mounter> Supervisor<M> {
         let guard = lock(&root.join("daemon.lock"))?;
         private_dir(&root.join("attempts"))?;
         private_dir(&root.join("indexes"))?;
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0110-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::open","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0110-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::open","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let bases = match fs::read(root.join("bases.json")) {
             Ok(bytes) => {
@@ -374,12 +341,9 @@ impl<M: Mounter> Supervisor<M> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e.into()),
         };
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0111-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::open","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0111-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::open","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let ram_root: Option<PathBuf> = match fs::read(root.join("ram-root.json")) {
             Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?),
@@ -676,12 +640,9 @@ impl<M: Mounter> Supervisor<M> {
                 if Instant::now() >= deadline {
                     return Err(ApiError::new("timeout", "attempt batch startup timed out"));
                 }
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0112-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::new_attempts","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0112-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::new_attempts","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                 )]
                 let dir = tempfile::Builder::new()
                     .prefix("attempt-")
@@ -712,12 +673,9 @@ impl<M: Mounter> Supervisor<M> {
                     let log = self.attempts[id].path.parent().unwrap().join("mount.log");
                     let mut diagnostic = String::new();
                     if let Ok(file) = {
-                        #[cfg_attr(
-                            internal_read_inventory,
-                            expect(
-                                clippy::disallowed_methods,
-                                reason = r###"internal-read:v1 {"id":"IR-B0113-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::new_attempts","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                            )
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0113-M01","item":"<ratarmount::sandbox::daemon::Supervisor<T0>>::new_attempts","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                         )]
                         let __inventory_value_0 = File::open(log);
                         __inventory_value_0

@@ -256,12 +256,9 @@ impl SharedRapidgzip {
         let path = path.to_path_buf();
         let decoder = make_decoder(spacing, threads, /* keep_index */ true, crc32_enabled)?;
 
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0226-M01","item":"<ratarmount_compress::gzip_rapidgzip::SharedRapidgzip>::open_with_threads_crc","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0226-M01","item":"<ratarmount_compress::gzip_rapidgzip::SharedRapidgzip>::open_with_threads_crc","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let file = File::open(&path)?;
         // Full decode once to collect the index; payload discarded (same cost class
@@ -435,12 +432,9 @@ impl SharedRapidgzip {
         index_blob: &[u8],
     ) -> Result<Arc<Self>> {
         let path = path.to_path_buf();
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0227-M01","item":"<ratarmount_compress::gzip_rapidgzip::SharedRapidgzip>::open_with_imported_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0227-M01","item":"<ratarmount_compress::gzip_rapidgzip::SharedRapidgzip>::open_with_imported_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let compressed_len = File::open(&path)?.metadata()?.len();
         let index = import_index_blob(index_blob, Some(compressed_len))?;
@@ -572,12 +566,9 @@ impl SharedRapidgzip {
         let index = (*self.index).clone();
         let inner = match &self.backend {
             RapidgzipBackend::Path(path) => {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0228-M01","item":"<ratarmount_compress::gzip_rapidgzip::SharedRapidgzip>::reader","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0228-M01","item":"<ratarmount_compress::gzip_rapidgzip::SharedRapidgzip>::reader","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                 )]
                 let file = File::open(path)?;
                 let ir = self

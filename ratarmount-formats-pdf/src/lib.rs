@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! PDF MountSource (`backendName=PDFMountSource`).
 //!
@@ -64,12 +65,9 @@ pub type Result<T> = std::result::Result<T, PdfError>;
 
 pub fn looks_like_pdf(path: &Path) -> bool {
     if let Ok(mut f) = {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0337-M01","item":"ratarmount_formats_pdf::looks_like_pdf","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0337-M01","item":"ratarmount_formats_pdf::looks_like_pdf","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let __inventory_value_0 = File::open(path);
         __inventory_value_0
@@ -1082,12 +1080,9 @@ impl PdfMountSource {
         );
         let t0 = Instant::now();
 
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0338-M01","item":"<ratarmount_formats_pdf::PdfMountSource>::create_index","disposition":"residual","reason":"lopdf opens and reads the whole PDF by pathname with its own std::fs::File (the PDF backend's reader is not a managed owner)","family":"foreign-library-or-caller-owned","issue":"#196","category":"foreign-library-or-caller-owned","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0338-M01","item":"<ratarmount_formats_pdf::PdfMountSource>::create_index","disposition":"residual","reason":"lopdf opens and reads the whole PDF by pathname with its own std::fs::File (the PDF backend's reader is not a managed owner)","family":"foreign-library-or-caller-owned","issue":"#196","category":"foreign-library-or-caller-owned","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let doc = Document::load(archive_path)
             .map_err(|e| PdfError::Msg(format!("failed to load PDF: {e}")))?;

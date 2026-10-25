@@ -147,12 +147,9 @@ pub fn load_authorized_keys(src: &AuthorizedKeysSource) -> io::Result<Vec<String
     };
     {
         let __inventory_condition_5214 = {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-B0542-M01","item":"ratarmount_sftp::auth::load_authorized_keys","disposition":"out-of-family","category":"configuration-or-credentials","reason":"SSH authorized_keys file","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0542-M01","item":"ratarmount_sftp::auth::load_authorized_keys","disposition":"out-of-family","category":"configuration-or-credentials","reason":"SSH authorized_keys file","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
             let __inventory_value_0 = fs::read_to_string(path);
             __inventory_value_0

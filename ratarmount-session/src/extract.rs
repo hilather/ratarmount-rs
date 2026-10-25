@@ -1,11 +1,8 @@
 //! Streaming extract (`Session::extract_to`).
 
-#[cfg_attr(
-    internal_read_inventory,
-    expect(
-        clippy::disallowed_types,
-        reason = r###"internal-read:v1 {"id":"IR-E0092-T01","item":"ratarmount_session::extract","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for exclusive extraction staging files.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-    )
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0092-T01","item":"ratarmount_session::extract","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for exclusive extraction staging files.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
 )]
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -34,12 +31,9 @@ impl Session {
         progress: Option<&dyn Fn(ExtractProgress)>,
         cancel: Option<&AtomicBool>,
     ) -> Result<(), Error> {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-E0093-M01","item":"<ratarmount_session::session::Session>::extract_to","disposition":"output-owner","category":"extraction-directory","reason":"Create the caller-requested extraction destination tree before member traversal.","creation":{"policy":"recursive-directory","basis":"The extraction request explicitly owns this output root and preserves current std directory modes."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0093-M01","item":"<ratarmount_session::session::Session>::extract_to","disposition":"output-owner","category":"extraction-directory","reason":"Create the caller-requested extraction destination tree before member traversal.","creation":{"policy":"recursive-directory","basis":"The extraction request explicitly owns this output root and preserves current std directory modes."}}"###
         )]
         std::fs::create_dir_all(&req.dest_dir).map_err(|e| map_dest_io(e, &req.dest_dir))?;
         let mut state = ExtractState {
@@ -135,12 +129,9 @@ impl Session {
             if !req.allow_unsafe_paths && dest_is_symlink(&dest)? {
                 return Err(Error::PathEscape(member.to_string()));
             }
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0094-M01","item":"<ratarmount_session::session::Session>::extract_one_named","disposition":"output-owner","category":"extraction-directory","reason":"Create an archive directory entry after applying extraction path/symlink checks.","creation":{"policy":"recursive-directory","basis":"The destination is a checked extraction output; ordinary directory permissions remain unchanged."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0094-M01","item":"<ratarmount_session::session::Session>::extract_one_named","disposition":"output-owner","category":"extraction-directory","reason":"Create an archive directory entry after applying extraction path/symlink checks.","creation":{"policy":"recursive-directory","basis":"The destination is a checked extraction output; ordinary directory permissions remain unchanged."}}"###
             )]
             std::fs::create_dir_all(&dest).map_err(|e| map_dest_io(e, &dest))?;
             state.files_done += 1;
@@ -148,12 +139,9 @@ impl Session {
             return Ok(());
         }
         if let Some(parent) = dest.parent() {
-            #[cfg_attr(
-                internal_read_inventory,
-                expect(
-                    clippy::disallowed_methods,
-                    reason = r###"internal-read:v1 {"id":"IR-E0095-M01","item":"<ratarmount_session::session::Session>::extract_one_named","disposition":"output-owner","category":"extraction-directory","reason":"Create a checked extracted member parent before symlink or regular-file publication.","creation":{"policy":"recursive-directory","basis":"This parent supports caller-requested output and retains default/umask permissions."}}"###
-                )
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0095-M01","item":"<ratarmount_session::session::Session>::extract_one_named","disposition":"output-owner","category":"extraction-directory","reason":"Create a checked extracted member parent before symlink or regular-file publication.","creation":{"policy":"recursive-directory","basis":"This parent supports caller-requested output and retains default/umask permissions."}}"###
             )]
             std::fs::create_dir_all(parent).map_err(|e| map_dest_io(e, parent))?;
         }
@@ -302,35 +290,23 @@ fn create_extract_tmp(dest: &Path) -> Result<(std::fs::File, PathBuf), Error> {
         let tmp = parent.join(format!(".{stem}.extract-{seq}.tmp"));
         {
             let __inventory_condition_12240 = {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_types,
-                        reason = r###"internal-read:v1 {"id":"IR-B0537-T01","item":"ratarmount_session::extract::create_extract_tmp","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = r###"internal-read:v1 {"id":"IR-B0537-T01","item":"ratarmount_session::extract::create_extract_tmp","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
                 )]
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0537-M01","item":"ratarmount_session::extract::create_extract_tmp","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0537-M01","item":"ratarmount_session::extract::create_extract_tmp","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
                 )]
                 let mut __inventory_value_0 = OpenOptions::new();
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-E0096-M01","item":"ratarmount_session::extract::create_extract_tmp","disposition":"output-owner","category":"extraction-staging","reason":"Configure exclusive sibling extraction temporary creation with collision retry.","creation":{"policy":"exclusive-new-file","basis":"create_new prevents replacing a destination/collision; successful staged output is published only after extraction completes."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0096-M01","item":"ratarmount_session::extract::create_extract_tmp","disposition":"output-owner","category":"extraction-staging","reason":"Configure exclusive sibling extraction temporary creation with collision retry.","creation":{"policy":"exclusive-new-file","basis":"create_new prevents replacing a destination/collision; successful staged output is published only after extraction completes."}}"###
                 )]
                 let __inventory_value_1 = __inventory_value_0.write(true).create_new(true);
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0537-M02","item":"ratarmount_session::extract::create_extract_tmp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0537-M02","item":"ratarmount_session::extract::create_extract_tmp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
                 )]
                 let __inventory_value_2 = __inventory_value_1.open(&tmp);
                 __inventory_value_2

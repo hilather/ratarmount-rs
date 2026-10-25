@@ -334,12 +334,9 @@ fn sidecar_tarstats_ok(idx_path: &Path, archive: &Path) -> bool {
 fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
     let _ = io::stdout().flush();
     // SAFETY: duplicating STDOUT_FILENO to restore after `/dev/null` redirect.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0016-M01","item":"ratarmount::find::silence_stdout","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0016-M01","item":"ratarmount::find::silence_stdout","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
     if saved < 0 {
@@ -350,27 +347,18 @@ fn silence_stdout<T>(f: impl FnOnce() -> T) -> T {
 
 fn restore_stdout_after<T>(saved: RawFd, f: impl FnOnce() -> T) -> T {
     let devnull = {
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_types,
-                reason = r###"internal-read:v1 {"id":"IR-B0017-T01","item":"ratarmount::find::restore_stdout_after","disposition":"support","category":"builder-type-support","reason":"Builder type support: standard descriptor handoff","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
-            )
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0017-T01","item":"ratarmount::find::restore_stdout_after","disposition":"support","category":"builder-type-support","reason":"Builder type support: standard descriptor handoff","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
         )]
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0017-M01","item":"ratarmount::find::restore_stdout_after","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"standard descriptor handoff"}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0017-M01","item":"ratarmount::find::restore_stdout_after","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"standard descriptor handoff"}"###
         )]
         let mut __inventory_value_0 = std::fs::OpenOptions::new();
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0017-M02","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0017-M02","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         let __inventory_value_1 = __inventory_value_0.write(true).open("/dev/null");
         __inventory_value_1
@@ -379,23 +367,17 @@ fn restore_stdout_after<T>(saved: RawFd, f: impl FnOnce() -> T) -> T {
         Ok(null) => {
             // SAFETY: `saved` is a dup of stdout; `null` is an open `/dev/null`.
             unsafe {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0018-M01","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0018-M01","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                 )]
                 libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO);
             }
             let out = f();
             unsafe {
-                #[cfg_attr(
-                    internal_read_inventory,
-                    expect(
-                        clippy::disallowed_methods,
-                        reason = r###"internal-read:v1 {"id":"IR-B0019-M01","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-                    )
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0019-M01","item":"ratarmount::find::restore_stdout_after","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
                 )]
                 libc::dup2(saved, libc::STDOUT_FILENO);
                 libc::close(saved);

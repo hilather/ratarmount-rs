@@ -1452,12 +1452,9 @@ fn handle_index_sidecar(
         );
     };
     sidecar_stage!(state, Admitted)?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0416-M01","item":"ratarmount_http::handler::handle_index_sidecar","disposition":"managed-read","regression":"regression_http_index_sidecar_get_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0416-M01","item":"ratarmount_http::handler::handle_index_sidecar","disposition":"managed-read","regression":"regression_http_index_sidecar_get_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let cursor = match ratarmount_index::managed_read::ManagedReadCursor::open(path) {
         Ok(c) => c,

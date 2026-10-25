@@ -446,12 +446,9 @@ fn registry_get_bytes(url: &str, bearer: Option<&str>, hint_size: u64) -> Result
 fn keep_temp_bytes(bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("ratarmount-oci-index-").suffix(suffix);
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0516-M01","item":"ratarmount_remote::oci::keep_temp_bytes","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0516-M01","item":"ratarmount_remote::oci::keep_temp_bytes","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     let mut tmp = builder.tempfile()?;
     tmp.write_all(bytes)?;
@@ -982,12 +979,9 @@ fn lookup_oci_credentials(registry: &str) -> Option<OciCreds> {
 
 fn creds_from_docker_config(registry: &str) -> Option<OciCreds> {
     let path = docker_config_path()?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0517-M01","item":"ratarmount_remote::oci::creds_from_docker_config","disposition":"out-of-family","category":"configuration-or-credentials","reason":"credentials or client configuration file","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0517-M01","item":"ratarmount_remote::oci::creds_from_docker_config","disposition":"out-of-family","category":"configuration-or-credentials","reason":"credentials or client configuration file","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let text = std::fs::read_to_string(&path).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;

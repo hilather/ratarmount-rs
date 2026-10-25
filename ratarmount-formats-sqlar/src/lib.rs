@@ -1,4 +1,5 @@
 #![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
 
 //! SQLAR (SQLite Archiver) mount source — Python `SQLARMountSource` parity.
 //!
@@ -320,12 +321,9 @@ impl SqlarMountSource {
 /// may be open as a database in this process.
 fn read_header(path: &Path) -> Result<Vec<u8>> {
     Ok({
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0354-M01","item":"ratarmount_formats_sqlar::read_header","disposition":"managed-read","regression":"regression_sqlar_header_probes_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0354-M01","item":"ratarmount_formats_sqlar::read_header","disposition":"managed-read","regression":"regression_sqlar_header_probes_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let __inventory_value_0 = ratarmount_index::managed_read::read_prefix(path, 16);
         __inventory_value_0
@@ -599,12 +597,9 @@ fn build_name_map(conn: &Connection) -> Result<Option<BTreeMap<String, String>>>
 /// (encrypted sqlcipher archives omit the magic and store salt in the first 16 bytes).
 pub fn looks_like_sqlar(path: &Path) -> bool {
     // Managed (#151): the probe may hit an SQLAR open in this process.
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0355-M01","item":"ratarmount_formats_sqlar::looks_like_sqlar","disposition":"managed-read","regression":"regression_sqlar_header_probes_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0355-M01","item":"ratarmount_formats_sqlar::looks_like_sqlar","disposition":"managed-read","regression":"regression_sqlar_header_probes_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let Ok(magic) = ratarmount_index::managed_read::read_prefix(path, 16) else {
         return false;

@@ -265,12 +265,9 @@ pub fn load_password_from_env() -> Result<Vec<u8>> {
         if meta.len() > MAX_PASSWORD_FILE {
             return Err(ResticError::Msg("RESTIC_PASSWORD_FILE too large".into()));
         }
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0342-M01","item":"ratarmount_formats_restic::repo::load_password_from_env","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0342-M01","item":"ratarmount_formats_restic::repo::load_password_from_env","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let s = fs::read_to_string(&path)?;
         // restic TrimRight(s, "\r\n") — all trailing CR/LF, not a single newline.
@@ -506,12 +503,9 @@ fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>> {
         )));
     }
     Ok({
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0343-M01","item":"ratarmount_formats_restic::repo::read_capped","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0343-M01","item":"ratarmount_formats_restic::repo::read_capped","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let __inventory_value_0 = fs::read(path);
         __inventory_value_0
@@ -523,12 +517,9 @@ fn read_pack_slice(root: &Path, pack_id: &str, offset: u64, length: u64) -> Resu
         return Err(ResticError::Msg("pack slice exceeds blob cap".into()));
     }
     let path = pack_path(root, pack_id)?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0344-M01","item":"ratarmount_formats_restic::repo::read_pack_slice","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0344-M01","item":"ratarmount_formats_restic::repo::read_pack_slice","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
     )]
     let mut f = File::open(&path)?;
     let meta = f.metadata()?;
@@ -688,44 +679,29 @@ fn write_synthetic_repo_version(
     password: &[u8],
     version: u32,
 ) -> Result<SyntheticRepo> {
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0042-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the keys directory of the synthetic restic repository fixture.","creation":{"policy":"recursive-directory","basis":"The test-hooks synthetic repository writer uses ordinary directory defaults; it does not open a user repository for reading."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0042-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the keys directory of the synthetic restic repository fixture.","creation":{"policy":"recursive-directory","basis":"The test-hooks synthetic repository writer uses ordinary directory defaults; it does not open a user repository for reading."}}"###
     )]
     fs::create_dir_all(dir.join("keys"))?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0043-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the data directory of the synthetic restic repository fixture.","creation":{"policy":"recursive-directory","basis":"This all-features test-hooks writer owns its fixture output tree and retains ordinary directory permissions."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0043-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the data directory of the synthetic restic repository fixture.","creation":{"policy":"recursive-directory","basis":"This all-features test-hooks writer owns its fixture output tree and retains ordinary directory permissions."}}"###
     )]
     fs::create_dir_all(dir.join("data"))?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0044-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the index directory of the synthetic restic repository fixture.","creation":{"policy":"recursive-directory","basis":"Synthetic fixture output keeps the existing std directory defaults and umask."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0044-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the index directory of the synthetic restic repository fixture.","creation":{"policy":"recursive-directory","basis":"Synthetic fixture output keeps the existing std directory defaults and umask."}}"###
     )]
     fs::create_dir_all(dir.join("index"))?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0045-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the snapshots directory of the synthetic restic repository fixture.","creation":{"policy":"recursive-directory","basis":"This fixture producer creates output directories only; ordinary permissions remain unchanged."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0045-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the snapshots directory of the synthetic restic repository fixture.","creation":{"policy":"recursive-directory","basis":"This fixture producer creates output directories only; ordinary permissions remain unchanged."}}"###
     )]
     fs::create_dir_all(dir.join("snapshots"))?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0046-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the locks directory of the synthetic restic repository fixture.","creation":{"policy":"recursive-directory","basis":"The test-hooks producer owns the synthetic output tree and preserves existing default directory modes."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0046-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the locks directory of the synthetic restic repository fixture.","creation":{"policy":"recursive-directory","basis":"The test-hooks producer owns the synthetic output tree and preserves existing default directory modes."}}"###
     )]
     fs::create_dir_all(dir.join("locks"))?;
 
@@ -763,12 +739,9 @@ fn write_synthetic_repo_version(
     });
     let key_bytes = serde_json::to_vec(&key_doc)?;
     let key_id = hex_encode(&sha256(&key_bytes));
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0345-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0345-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     fs::write(dir.join("keys").join(&key_id), &key_bytes)?;
 
@@ -780,12 +753,9 @@ fn write_synthetic_repo_version(
     iv[0] = 2;
     // restic config is never zstd-wrapped.
     let cfg_enc = encrypt(&master, cfg.to_string().as_bytes(), &iv);
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0346-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0346-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     fs::write(dir.join("config"), &cfg_enc)?;
 
@@ -838,20 +808,14 @@ fn write_synthetic_repo_version(
 
     let pack_id = hex_encode(&sha256(&pack));
     let shard = dir.join("data").join(&pack_id[..2]);
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-E0047-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the hash-prefix shard directory before writing the synthetic restic pack.","creation":{"policy":"recursive-directory","basis":"The pack shard is fixture output under data and uses existing default/umask directory permissions."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0047-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"out-of-family","category":"feature-test-hook","reason":"Create the hash-prefix shard directory before writing the synthetic restic pack.","creation":{"policy":"recursive-directory","basis":"The pack shard is fixture output under data and uses existing default/umask directory permissions."}}"###
     )]
     fs::create_dir_all(&shard)?;
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0347-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0347-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     fs::write(shard.join(&pack_id), &pack)?;
 
@@ -881,12 +845,9 @@ fn write_synthetic_repo_version(
     iv[0] = 6;
     let index_enc = seal_unpacked(&master, index.to_string().as_bytes(), version, &iv)?;
     let index_id = hex_encode(&sha256(&index_enc));
-    #[cfg_attr(
-        internal_read_inventory,
-        expect(
-            clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0348-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-        )
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0348-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
     )]
     fs::write(dir.join("index").join(&index_id), &index_enc)?;
 
@@ -905,12 +866,9 @@ fn write_synthetic_repo_version(
         iv[0] = 7 + i as u8;
         let snap_enc = seal_unpacked(&master, snap.to_string().as_bytes(), version, &iv)?;
         let snap_id = hex_encode(&sha256(&snap_enc));
-        #[cfg_attr(
-            internal_read_inventory,
-            expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0349-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
-            )
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0349-M01","item":"ratarmount_formats_restic::repo::write_synthetic_repo_version","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
         )]
         fs::write(dir.join("snapshots").join(&snap_id), &snap_enc)?;
         snap_ids.push(snap_id);

@@ -11,11 +11,37 @@ use std::collections::BTreeSet;
 use syn::{Meta, Token, parse::Parser, punctuated::Punctuated};
 
 use crate::internal_read_grammar::{
-    audit_macro, audit_macro_payload, inventory_attribute, target_attribute, target_predicate,
+    audit_macro_payload_with_lints, audit_macro_with_lints, clippy_attribute, inventory_attribute,
+    suppression_attribute_with_lints, target_attribute,
 };
 
 pub fn register(_: &Session, store: &mut LintStore) {
-    store.register_pre_expansion_lint_pass(Box::new(|| Box::<Syntax>::default()));
+    let mut protected_lints = BTreeSet::from([
+        "clippy::disallowed_methods".to_owned(),
+        "clippy::disallowed_types".to_owned(),
+    ]);
+    let protected_ids = protected_lints
+        .iter()
+        .flat_map(|name| {
+            store
+                .find_lints(name)
+                .expect("protected Clippy lint must be registered")
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    // Rustc owns lint-group membership. Do not maintain another spelling table
+    // that can miss an allow(clippy::all/style) lowering of the protected lint.
+    for (name, ids, _) in store.get_lint_groups() {
+        if ids.iter().any(|id| protected_ids.contains(id)) {
+            protected_lints.insert(name.to_owned());
+        }
+    }
+    store.register_pre_expansion_lint_pass(Box::new(move || {
+        Box::new(Syntax {
+            protected_lints: protected_lints.clone(),
+            ..Syntax::default()
+        })
+    }));
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -49,11 +75,10 @@ fn name(path: &syn::Path) -> String {
         .map(|s| s.ident.to_string().trim_start_matches("r#").to_owned())
         .unwrap_or_default()
 }
-fn parts(tokens: proc_macro2::TokenStream) -> Vec<Meta> {
+fn parts(tokens: proc_macro2::TokenStream) -> syn::Result<Vec<Meta>> {
     Punctuated::<Meta, Token![,]>::parse_terminated
         .parse2(tokens)
         .map(|p| p.into_iter().collect())
-        .unwrap_or_default()
 }
 fn eval(meta: &Meta, sess: &Session, target_unknown: bool) -> Truth {
     let ident = name(meta.path());
@@ -61,7 +86,8 @@ fn eval(meta: &Meta, sess: &Session, target_unknown: bool) -> Truth {
         && (ident == "windows"
             || ident == "unix"
             || ident.starts_with("target_")
-            || ident == "internal_read_inventory")
+            || ident == "internal_read_inventory"
+            || ident == "clippy")
     {
         return Truth::Unknown;
     }
@@ -88,7 +114,11 @@ fn eval(meta: &Meta, sess: &Session, target_unknown: bool) -> Truth {
             }
         }
         Meta::List(v) => {
-            let p = parts(v.tokens.clone());
+            // A failed parse is not an empty any()/all(). Keep the source in
+            // the syntax audit so an inactive target predicate cannot escape N4.
+            let Ok(p) = parts(v.tokens.clone()) else {
+                return Truth::Unknown;
+            };
             match ident.as_str() {
                 "all" => p
                     .iter()
@@ -104,7 +134,9 @@ fn eval(meta: &Meta, sess: &Session, target_unknown: bool) -> Truth {
 }
 fn attr_cfg(meta: &Meta, sess: &Session, target_unknown: bool) -> Truth {
     if let Meta::List(list) = meta {
-        let p = parts(list.tokens.clone());
+        let Ok(p) = parts(list.tokens.clone()) else {
+            return Truth::Unknown;
+        };
         match name(&list.path).as_str() {
             "cfg" if p.len() == 1 => eval(&p[0], sess, target_unknown),
             "cfg_attr" if !p.is_empty() => {
@@ -134,25 +166,12 @@ fn contains_link_name(meta: &Meta) -> bool {
     if name(meta.path()) == "link_name" {
         return true;
     }
-    matches!(meta,Meta::List(l) if name(&l.path)=="cfg_attr" && parts(l.tokens.clone()).iter().skip(1).any(contains_link_name))
-}
-
-// This is a spelling refusal, not macro identity resolution. Any explicit
-// rename of a `cfg` import could hide a target cfg! from the syntax check.
-fn renamed_cfg(tree: &ast::UseTree) -> bool {
-    match &tree.kind {
-        ast::UseTreeKind::Simple(Some(_)) => tree
-            .prefix
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident.name.as_str() == "cfg"),
-        ast::UseTreeKind::Nested { items, .. } => items.iter().any(|(tree, _)| renamed_cfg(tree)),
-        _ => false,
-    }
+    matches!(meta,Meta::List(l) if name(&l.path)=="cfg_attr" && parts(l.tokens.clone()).is_ok_and(|parts| parts.iter().skip(1).any(contains_link_name)))
 }
 
 #[derive(Default)]
 struct Syntax {
+    protected_lints: BTreeSet<String>,
     states: Vec<(bool, bool)>,
     emitted: BTreeSet<(u32, u32, String)>,
     leaf_emitted: BTreeSet<(u32, u32)>,
@@ -190,17 +209,20 @@ impl Syntax {
             );
         }
     }
-    fn n4(&self, cx: &EarlyContext<'_>, span: Span) -> bool {
+    fn restricted(&self) -> bool {
         let cfg = crate::internal_read::config();
         let package = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
-        let restricted = cfg["restricted_packages"]
+        cfg["restricted_packages"]
             .as_array()
-            .is_some_and(|p| p.iter().any(|p| p.as_str() == Some(&package)));
+            .is_some_and(|p| p.iter().any(|p| p.as_str() == Some(&package)))
+    }
+    fn n4(&self, cx: &EarlyContext<'_>, span: Span) -> bool {
+        let cfg = crate::internal_read::config();
         let file = self.file(cx, span);
         let reviewed = cfg["reviewed_target_files"]
             .as_array()
             .is_some_and(|p| p.iter().any(|p| p["file"].as_str() == Some(&file)));
-        restricted && !reviewed
+        self.restricted() && !reviewed
     }
     fn leaf(
         &mut self,
@@ -273,28 +295,68 @@ impl EarlyLintPass for Syntax {
         crate::internal_read::emit(
             json!({"kind":"syntax_loaded","scope":"crate","span":crate::internal_read::span(cx.sess(),krate.spans.inner_span)}),
         );
-        let valid = krate.attrs.iter().any(|a| {
-            let Some(Meta::List(l)) = parsed(a) else {
-                return false;
-            };
-            l.path.is_ident("forbid")
-                && l.path.segments[0].ident.to_string() == "forbid"
-                && parts(l.tokens)
-                    .iter()
-                    .any(|m| matches!(m,Meta::Path(p) if p.is_ident("unused_macros")))
-        });
-        if !valid {
-            self.report(
-                cx,
-                krate.spans.inner_span,
-                "N3",
-                "production root missing unconditional forbid(unused_macros)",
-            );
+        // Rustc supplies pre-configured root attributes to check_attributes,
+        // but the crate AST still has their original cfg_attr spelling here.
+        // Audit that compiler-owned syntax before conditional lint attributes
+        // can become indistinguishable from direct approvals.
+        for attr in &krate.attrs {
+            let Some(meta) = parsed(attr) else { continue };
+            if self.restricted() {
+                if let Err(detail) = suppression_attribute_with_lints(&meta, &self.protected_lints)
+                {
+                    self.report(cx, attr.span, "EXPECT", &detail);
+                }
+                match clippy_attribute(&meta) {
+                    Ok(true) => self.report(
+                        cx,
+                        attr.span,
+                        "N4",
+                        "clippy cfg predicate hides code from native Clippy",
+                    ),
+                    Err(detail) => self.report(cx, attr.span, "N4", &detail),
+                    Ok(false) => {}
+                }
+            }
+            if let Err(detail) = inventory_attribute(&meta) {
+                self.report(cx, attr.span, "EXPECT", &detail);
+            }
+            match target_attribute(&meta) {
+                Ok(true) => {
+                    self.observe_target(cx, attr.span);
+                    if self.n4(cx, attr.span) {
+                        self.report(
+                            cx,
+                            attr.span,
+                            "N4",
+                            "target predicate outside reviewed file",
+                        );
+                    }
+                }
+                Err(detail) if self.restricted() => self.report(cx, attr.span, "N4", &detail),
+                Ok(false) | Err(_) => {}
+            }
         }
     }
     fn check_attributes(&mut self, cx: &EarlyContext<'_>, attrs: &[ast::Attribute]) {
         let (parent_scan, parent_active) = self.state();
         let metas = attrs.iter().filter_map(parsed).collect::<Vec<_>>();
+        if parent_scan && self.restricted() {
+            for attr in attrs {
+                let Some(meta) = parsed(attr) else {
+                    continue;
+                };
+                match clippy_attribute(&meta) {
+                    Ok(true) => self.report(
+                        cx,
+                        attr.span,
+                        "N4",
+                        "clippy cfg predicate hides code from native Clippy",
+                    ),
+                    Err(detail) => self.report(cx, attr.span, "N4", &detail),
+                    Ok(false) => {}
+                }
+            }
+        }
         let scan = parent_scan
             && metas
                 .iter()
@@ -311,6 +373,12 @@ impl EarlyLintPass for Syntax {
             let Some(meta) = parsed(attr) else {
                 continue;
             };
+            if self.restricted() {
+                if let Err(detail) = suppression_attribute_with_lints(&meta, &self.protected_lints)
+                {
+                    self.report(cx, attr.span, "EXPECT", &detail);
+                }
+            }
             if let Err(detail) = inventory_attribute(&meta) {
                 self.report(cx, attr.span, "EXPECT", &detail);
             }
@@ -321,16 +389,20 @@ impl EarlyLintPass for Syntax {
                     self.module_spans.last().copied(),
                 );
             }
-            if target_attribute(&meta) {
-                self.observe_target(cx, attr.span);
-                if self.n4(cx, attr.span) {
-                    self.report(
-                        cx,
-                        attr.span,
-                        "N4",
-                        "target predicate outside reviewed file",
-                    );
+            match target_attribute(&meta) {
+                Ok(true) => {
+                    self.observe_target(cx, attr.span);
+                    if self.n4(cx, attr.span) {
+                        self.report(
+                            cx,
+                            attr.span,
+                            "N4",
+                            "target predicate outside reviewed file",
+                        );
+                    }
                 }
+                Err(detail) if self.restricted() => self.report(cx, attr.span, "N4", &detail),
+                Ok(false) | Err(_) => {}
             }
         }
     }
@@ -356,16 +428,6 @@ impl EarlyLintPass for Syntax {
             kind,
             pprust::item_to_string(item),
         );
-        if let ItemKind::Use(tree) = &item.kind {
-            if self.n4(cx, item.span) && renamed_cfg(tree) {
-                self.report(
-                    cx,
-                    item.span,
-                    "N4",
-                    "aliased cfg import outside reviewed file",
-                );
-            }
-        }
         if matches!(item.kind, ItemKind::Mod(..)) {
             self.module_spans.push(item.span);
         }
@@ -415,7 +477,7 @@ impl EarlyLintPass for Syntax {
             return;
         }
         let text = pprust::tts_to_string(&def.body.tokens);
-        match audit_macro(&text) {
+        match audit_macro_with_lints(&text, self.restricted(), &self.protected_lints) {
             Ok(findings) => {
                 for (policy, detail) in findings {
                     if policy == "N2" {
@@ -445,7 +507,11 @@ impl EarlyLintPass for Syntax {
         // Invocation tokens are otherwise opaque: only literal nested macro
         // definitions have Rust matcher/transcriber grammar at this stage.
         // Inspect them before expansion can erase cfg-gated transcribers.
-        match audit_macro_payload(&macro_tokens) {
+        match audit_macro_payload_with_lints(
+            &macro_tokens,
+            self.restricted(),
+            &self.protected_lints,
+        ) {
             Ok(findings) => {
                 for (policy, detail) in findings {
                     if policy == "N2" {
@@ -483,21 +549,7 @@ impl EarlyLintPass for Syntax {
                 "reserved activation cfg in macro payload",
             );
         }
-        let path = mac
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident.name.as_str().to_string())
-            .unwrap_or_default();
-        if path == "cfg" {
-            if let Ok(tokens) = pprust::tts_to_string(&mac.args.tokens).parse() {
-                if target_predicate(tokens) {
-                    self.observe_target(cx, mac.span());
-                    if self.n4(cx, mac.span()) {
-                        self.report(cx, mac.span(), "N4", "target cfg! outside reviewed file");
-                    }
-                }
-            }
-        }
+        // cfg! yields a boolean; both branches remain type-checked and linted.
+        // Its spelling, nesting and aliases do not create N4 obligations.
     }
 }
