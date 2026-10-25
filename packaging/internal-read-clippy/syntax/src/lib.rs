@@ -67,6 +67,30 @@ impl Audit {
                 && matches!(token, TokenTree::Punct(p) if p.as_char() == '$')
                 && matches!(tokens.get(i + 1), Some(TokenTree::Ident(_)))
             {
+                let prefix_end = i
+                    + 2
+                    + usize::from(
+                        matches!(tokens.get(i + 2), Some(TokenTree::Punct(p)) if p.as_char() == '!'),
+                    );
+                // A substituted `#` can introduce an attribute without a
+                // literal hash. Require an attribute subject after the bracket
+                // to distinguish ordinary `$array[$index]` expressions.
+                let attribute_subject = tokens.get(prefix_end + 1).is_some_and(|t| {
+                    matches!(t, TokenTree::Punct(p) if matches!(p.as_char(), '#' | '$'))
+                        || matches!(t, TokenTree::Ident(id) if matches!(normalized_ident(id).as_str(),
+                            "pub" | "fn" | "mod" | "struct" | "enum" | "union" | "trait" |
+                            "impl" | "const" | "static" | "async" | "unsafe" | "extern" |
+                            "type" | "use" | "macro_rules" | "let"))
+                });
+                if matches!(tokens.get(prefix_end), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket)
+                    && attribute_subject
+                {
+                    self.emit(
+                        token.span(),
+                        "N3",
+                        "metavariable transcriber attribute prefix",
+                    );
+                }
                 let mut next = i + 2;
                 if matches!(tokens.get(next), Some(TokenTree::Literal(_))) {
                     next += 1;
@@ -138,6 +162,16 @@ impl Audit {
                     + usize::from(
                         matches!(tokens.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!'),
                     );
+                if macro_body
+                    && transcriber
+                    && matches!(tokens.get(attr_index), Some(TokenTree::Punct(p)) if p.as_char() == '$')
+                {
+                    self.emit(
+                        token.span(),
+                        "N3",
+                        "metavariable transcriber attribute delimiter",
+                    );
+                }
                 if let Some(TokenTree::Group(group)) = tokens.get(attr_index) {
                     if group.delimiter() == Delimiter::Bracket {
                         let inner: Vec<_> = group.stream().into_iter().collect();
@@ -168,6 +202,27 @@ impl Audit {
         }
     }
 
+    fn macro_payload(&mut self, tokens: TokenStream) {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            if is_ident(&tokens[i], "macro_rules")
+                && matches!(tokens.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                && matches!(tokens.get(i + 2), Some(TokenTree::Ident(_)))
+            {
+                if let Some(TokenTree::Group(body)) = tokens.get(i + 3) {
+                    self.macro_rules(body.stream());
+                    i += 4;
+                    continue;
+                }
+            }
+            if let TokenTree::Group(group) = &tokens[i] {
+                self.macro_payload(group.stream());
+            }
+            i += 1;
+        }
+    }
+
     fn macro_rules(&mut self, tokens: TokenStream) {
         // Parse the outer macro arm grammar, preserving delimiters. Matching
         // #[$attr] in a matcher is permitted; emitting it is refused.
@@ -191,6 +246,20 @@ pub fn audit_macro(source: &str) -> Result<Vec<(String, String)>, String> {
     let tokens = source.parse::<TokenStream>().map_err(|e| e.to_string())?;
     let mut audit = Audit::default();
     audit.macro_rules(tokens);
+    Ok(audit
+        .findings
+        .into_iter()
+        .map(|(_, policy, detail)| (policy, detail))
+        .collect())
+}
+
+/// Audit literal nested definitions in a compiler-observed invocation payload.
+/// Other payload tokens are data: only discovered `macro_rules!` definitions
+/// enter the N2/N3 grammar audit, with their own matcher/transcriber boundaries.
+pub fn audit_macro_payload(source: &str) -> Result<Vec<(String, String)>, String> {
+    let tokens = source.parse::<TokenStream>().map_err(|e| e.to_string())?;
+    let mut audit = Audit::default();
+    audit.macro_payload(tokens);
     Ok(audit
         .findings
         .into_iter()
@@ -226,6 +295,58 @@ mod tests {
             "() => { macro_rules! inner { (#[$guard:meta]) => { pub fn fine() {} }; } };"
         )
         .is_empty());
+    }
+    /// Regression: substituted attribute delimiters/prefixes hid target-gated reads.
+    #[test]
+    fn regression_substituted_attribute_delimiters_and_prefixes() {
+        for src in [
+            "($attr:tt) => { # $attr pub fn hidden() {} };",
+            "($attr:tt) => { mod hidden { #! $attr pub fn read() {} } };",
+            "($($attr:tt)*) => { $(# $attr)* pub fn hidden() {} };",
+            "($hash:tt $attr:meta) => { $hash [$attr] pub fn hidden() {} };",
+            "($hash:tt $attr:meta) => { mod hidden { $hash ! [$attr] pub fn read() {} } };",
+            "($hash:tt) => { $hash [allow(dead_code)] pub fn hidden() {} };",
+        ] {
+            assert!(policies(src).iter().any(|p| p == "N3"), "{src}");
+        }
+        for src in [
+            "(# $attr:tt) => { pub fn fine() {} };",
+            "(#! $attr:tt) => { pub fn fine() {} };",
+            "($hash:tt [$attr:meta]) => { pub fn fine() {} };",
+            "() => { macro_rules! inner { (# $attr:tt) => { pub fn fine() {} }; } };",
+            "($array:expr, $index:expr) => { $array[$index] };",
+            "($array:expr, $index:expr) => { let value = $array[$index]; value };",
+            "($array:expr, $index:expr) => { $array[$index] + 1 };",
+            "($macro:ident) => { $macro![tokens]; pub fn fine() {} };",
+        ] {
+            assert!(policies(src).is_empty(), "{src}");
+        }
+    }
+    /// Regression: forwarding payloads concealed literal nested macro definitions.
+    #[test]
+    fn regression_literal_definitions_in_invocation_payloads() {
+        for src in [
+            "macro_rules! hidden { () => { #[cfg(windows)] pub fn read() {} }; } hidden!();",
+            "mod nested { macro_rules! hidden { () => { #[cfg_attr(all(), cfg(windows))] pub fn read() {} }; } hidden!(); }",
+            "forward! { macro_rules! hidden { ($attr:tt) => { # $attr pub fn read() {} }; } }",
+        ] {
+            let findings = audit_macro_payload(src).unwrap();
+            assert!(findings.iter().any(|(policy, _)| policy == "N3"), "{src}");
+        }
+        for src in [
+            "unsafe extern { fn payload_data(); }",
+            "#[cfg(windows)] pub fn payload_data() {}",
+            "macro_rules! inner { (#[$attr:meta]) => { pub fn fine() {} }; }",
+            "let text = \"macro_rules! hidden { () => { #[cfg(windows)] fn f() {} }; }\";",
+        ] {
+            assert!(audit_macro_payload(src).unwrap().is_empty(), "{src}");
+        }
+        assert!(audit_macro_payload(
+            "macro_rules! ffi { () => { unsafe extern { fn arbitrary(); } }; }"
+        )
+        .unwrap()
+        .iter()
+        .any(|(policy, _)| policy == "N2"));
     }
     #[test]
     fn regression_cfg_matcher_transcriber_raw_and_nested_macro() {

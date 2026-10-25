@@ -69,9 +69,12 @@ the canonical manifest header.
 N2 permits foreign blocks/link_name only in the exact compiler module
 `ratarmount_formats_libarchive::ffi`, including a post-expansion HIR check with no
 provenance exception. N3 refuses cfg/cfg_attr anywhere in repo macros and
-metavariable transcriber attributes, and requires every production root to forbid
-unused macros. N4 refuses target predicates in the 40 reviewed failed-cross-check
-packages outside exact reviewed files in `policy.json`. File exceptions have no
+metavariable transcriber attributes, including substituted brackets and attribute
+prefixes. Literal nested macro definitions in invocation payloads receive the
+same grammar audit, with generic matchers and other payload data preserved.
+Every production root must forbid unused macros. N4 refuses target predicates in
+the 40 reviewed failed-cross-check packages outside exact reviewed files in
+`policy.json`. File exceptions have no
 content hash: inactive alternatives still need ordinary code review. The CSI
 include exception is limited to its exact reviewed source file and compiler item,
 with identity/multiplicity in the manifest.

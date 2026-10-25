@@ -20915,7 +20915,7 @@
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
       "component_digest": "6fdbc2122f41ca9f892fe09782f4f3b6e18f23d60483a3403d3e5e0da119a0f2",
-      "patch_digest": "36e01cabbefbb114dcde02ca3666e7fa4a6380f1b0359d7bac288fb37b481268",
+      "patch_digest": "f01999ab2580815b30ae41659d3c709e3c26c7a0be6ef64e581a07952a58c94a",
       "schema": 1,
       "source_digest": "5a9993673ce40804e6b50300df59ecb3d13942c1c89cd11e76acf705b331f982"
     }

@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use syn::{Meta, Token, parse::Parser, punctuated::Punctuated};
 
 use crate::internal_read_grammar::{
-    audit_macro, inventory_attribute, target_attribute, target_predicate,
+    audit_macro, audit_macro_payload, inventory_attribute, target_attribute, target_predicate,
 };
 
 pub fn register(_: &Session, store: &mut LintStore) {
@@ -418,6 +418,30 @@ impl EarlyLintPass for Syntax {
             return;
         }
         let macro_tokens = pprust::tts_to_string(&mac.args.tokens);
+        // Invocation tokens are otherwise opaque: only literal nested macro
+        // definitions have Rust matcher/transcriber grammar at this stage.
+        // Inspect them before expansion can erase cfg-gated transcribers.
+        match audit_macro_payload(&macro_tokens) {
+            Ok(findings) => {
+                for (policy, detail) in findings {
+                    if policy == "N2" {
+                        crate::internal_read::n2_raw_pending(
+                            mac.span(),
+                            &detail,
+                            self.module_spans.last().copied(),
+                        );
+                    } else {
+                        self.report(cx, mac.span(), &policy, &detail);
+                    }
+                }
+            }
+            Err(detail) => self.report(
+                cx,
+                mac.span(),
+                "N3",
+                &format!("macro payload token grammar parse failed: {detail}"),
+            ),
+        }
         fn reserved(tokens: proc_macro2::TokenStream) -> bool {
             tokens.into_iter().any(|token| match token {
                 proc_macro2::TokenTree::Ident(id) => {

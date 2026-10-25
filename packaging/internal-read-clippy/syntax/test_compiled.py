@@ -71,6 +71,32 @@ def main():
         run('literal-cfg-matcher', '#[macro_export] macro_rules! m { (#[cfg(unix)]) => {} }', reject='N3')
         run('raw-cfg-transcriber', '#[macro_export] macro_rules! m { () => { #[r#cfg(unix)] pub fn hidden() {} } }', reject='N3')
         run('nested-cfg-macro', '#[macro_export] macro_rules! outer { () => { macro_rules! inner { () => { #[cfg_attr(all(),allow(dead_code))] pub fn hidden() {} } } } }', reject='N3')
+        # Regression: substituted attribute delimiters/prefixes hid a read from
+        # native Clippy without a literal bracket group immediately after #.
+        hidden_read = 'pub fn hidden() { let _ = std::fs::read("x"); }'
+        for name, matcher, attribute, invocation in [
+            ('substituted-brackets', '$a:tt', '# $a', '[cfg(windows)]'),
+            ('repeated-substituted-brackets', '$($a:tt)*', '$(# $a)*', '[cfg(windows)]'),
+            ('substituted-prefix', '$h:tt $a:meta', '$h [$a]', '# cfg(windows)'),
+        ]:
+            run(name, f'macro_rules! m {{ ({matcher}) => {{ {attribute} {hidden_read} }} }} m!({invocation});', reject='N3')
+        run('inner-substituted-brackets', 'macro_rules! m { ($a:tt) => { mod hidden { #! $a ' + hidden_read + ' } } } m!([cfg(windows)]);', reject='N3')
+        run('inner-substituted-prefix', 'macro_rules! m { ($h:tt $a:meta) => { mod hidden { $h ! [$a] ' + hidden_read + ' } } } m!(# cfg(windows));', reject='N3')
+        # Regression: literal macro definitions inside invocation payloads must
+        # start a fresh matcher/transcriber audit, including nested groups.
+        forward = 'macro_rules! pass { ($($t:tt)*) => { $($t)* }; } '
+        nested_cfg = 'macro_rules! hidden { () => { #[cfg(windows)] ' + hidden_read + ' } } hidden!();'
+        run('payload-nested-cfg-macro', forward + 'pass! { ' + nested_cfg + ' }', reject='N3')
+        run('payload-grouped-nested-cfg-macro', forward + 'pass! { mod nested { ' + nested_cfg + ' } }', reject='N3')
+        run('payload-nested-substituted-attribute', forward + 'pass! { macro_rules! hidden { ($a:meta) => { #[$a] ' + hidden_read + ' } } hidden!(cfg(windows)); }', reject='N3')
+        run('payload-nested-substituted-brackets', forward + 'pass! { macro_rules! hidden { ($a:tt) => { # $a ' + hidden_read + ' } } hidden!([cfg(windows)]); }', reject='N3')
+        run('payload-nested-generic-matcher', forward + 'pass! { macro_rules! visible { (#[$a:meta]) => { pub fn visible() {} } } visible!(#[allow(dead_code)]); }')
+        run('opaque-payload-cfg', 'macro_rules! ignore { ($($t:tt)*) => {}; } ignore! { #[cfg(windows)] ' + hidden_read + ' }')
+        run('opaque-payload-extern', 'macro_rules! ignore { ($($t:tt)*) => {}; } ignore! { unsafe extern { fn arbitrary(); } }')
+        payload_foreign = 'macro_rules! foreign { () => { unsafe extern { pub fn arbitrary(); } } } foreign!();'
+        run('payload-nested-foreign-macro', forward + 'pass! { ' + payload_foreign + ' }', reject='N2')
+        run('payload-nested-foreign-exact-owner', forward + 'pub mod ffi { pass! { ' + payload_foreign + ' } }', allow_ffi=True)
+        run('payload-nested-foreign-sibling-owner', forward + 'pub mod sibling { pass! { ' + payload_foreign + ' } }', reject='N2', allow_ffi=True)
         # N2 does not inspect a foreign declaration's name or optional ABI text.
         for name, matcher, head, args_text in [
             ('optional-abi', '$kw:ident $($abi:literal)?', 'unsafe $kw $($abi)?', 'extern "C"'),
