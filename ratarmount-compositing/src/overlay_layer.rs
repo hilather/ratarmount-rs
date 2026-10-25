@@ -320,7 +320,6 @@ impl ReadOnlyOverlayLayer {
         }
         #[cfg(unix)]
         {
-            use std::os::fd::{AsRawFd, FromRawFd};
             use std::os::unix::fs::OpenOptionsExt;
             // Pin each parent descriptor: checking symlink_metadata alone
             // leaves a race if an unsealed layer swaps a directory for a link.
@@ -331,8 +330,6 @@ impl ReadOnlyOverlayLayer {
             let path = normpath(path);
             let mut parts = path.trim_start_matches('/').split('/').peekable();
             while let Some(part) = parts.next() {
-                let name = std::ffi::CString::new(part)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
                 let flags = libc::O_RDONLY
                     | libc::O_NOFOLLOW
                     | libc::O_CLOEXEC
@@ -342,13 +339,14 @@ impl ReadOnlyOverlayLayer {
                     } else {
                         0
                     };
-                // SAFETY: file and name remain alive during openat. A successful
-                // call returns a new descriptor owned by the File below.
-                let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
-                if fd < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                file = unsafe { File::from_raw_fd(fd) };
+                // Admitted (R10-C): another name of an open overlay database
+                // is refused without a descriptor of it being closed.
+                file = File::from(ratarmount_core::db_inodes::openat_admitted(
+                    Some(std::os::fd::AsFd::as_fd(&file)),
+                    Path::new(part),
+                    flags,
+                    0,
+                )?);
             }
             Ok(file)
         }

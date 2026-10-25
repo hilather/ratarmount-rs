@@ -181,6 +181,27 @@ fn path_writable(path: &Path) -> bool {
 /// within version 2.
 pub const MAX_FORMAT_VERSION: u32 = 2;
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once between the `files` check and the `meta` read of
+    /// [`OverlayMeta::from_connection_required`].
+    pub(crate) static BETWEEN_REQUIRED_READS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The refusal of a used overlay's database that has no `files` table.
+pub(crate) const NO_FILES_TABLE: &str =
+    "the overlay database has no files table (the record of a used overlay is lost)";
+
+/// Does `conn` have the `files` table? Plain SQL (no transaction of its own).
+pub(crate) fn has_files_table(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files')",
+        [],
+        |row| row.get(0),
+    )
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(transparent)]
 pub struct OverlayMeta {
@@ -201,9 +222,44 @@ impl OverlayMeta {
         Self::read_with(dir.as_ref(), false)
     }
 
+    /// [`Self::read_no_recovery`] of a record that must have a `files` table
+    /// when `required` (a marked overlay: its record is the one it used).
+    pub(crate) fn read_no_recovery_required(dir: &Path, required: bool) -> Result<Option<Self>> {
+        Self::read_with_required(dir, false, required, false)
+    }
+
+    /// [`Self::read_no_recovery_required`] that accepts a database entry that
+    /// is a symlink to a regular file, as the offline gate's open does (an
+    /// offline commit's record, R10-FIX7).
+    pub(crate) fn read_no_recovery_required_followed(
+        dir: &Path,
+        required: bool,
+    ) -> Result<Option<Self>> {
+        Self::read_with_required(dir, false, required, true)
+    }
+
     fn read_with(dir: &Path, recover_hot: bool) -> Result<Option<Self>> {
+        // A marked overlay was used: its database must hold the `files`
+        // table, or its record is lost, never "unrecorded" (R10-B).
+        let required = !crate::write_overlay::overlay_markers(dir)?.is_empty();
+        Self::read_with_required(dir, recover_hot, required, false)
+    }
+
+    /// `follow`: the database entry may be a symlink to a regular file (the
+    /// open follows it); otherwise it must itself be a regular file.
+    fn read_with_required(
+        dir: &Path,
+        recover_hot: bool,
+        required: bool,
+        follow: bool,
+    ) -> Result<Option<Self>> {
         let db = dir.join(HIDDEN_DB);
-        if !fs::symlink_metadata(&db)?.is_file() {
+        let entry = if follow {
+            fs::metadata(&db)?
+        } else {
+            fs::symlink_metadata(&db)?
+        };
+        if !entry.is_file() {
             return Err(OverlayError::Msg(format!(
                 "overlay database {} must be a regular file",
                 db.display()
@@ -216,7 +272,10 @@ impl OverlayMeta {
                 crate::DbName::Path,
             )?;
             conn.busy_timeout(std::time::Duration::ZERO)?;
-            Self::from_connection(&conn)
+            // One read transaction: the `files` check and the `meta` rows
+            // describe the same database state.
+            let tx = conn.unchecked_transaction()?;
+            Self::from_connection_required(&tx, required)
         };
         let result = match read() {
             Err(OverlayError::Sqlite(error)) if recover_hot && is_hot_journal(&error) => {
@@ -238,6 +297,37 @@ impl OverlayMeta {
             }
             error => error,
         })
+    }
+
+    /// [`Self::from_connection`] of a record that must exist when `required`:
+    /// a used (marked) overlay, or a mount's own database, without a `files`
+    /// table has lost its record, which must refuse rather than read as an
+    /// unrecorded overlay (R10-B). The `files` check and the `meta` read are
+    /// one snapshot: outside a transaction this opens a read transaction of
+    /// its own (R10-FIX6: a `DROP TABLE files; DROP TABLE meta` committed
+    /// between two autocommit reads read as "unrecorded"); inside the
+    /// caller's transaction, that one covers both reads.
+    pub fn from_connection_required(conn: &Connection, required: bool) -> Result<Option<Self>> {
+        if !conn.is_autocommit() {
+            return Self::from_transaction_required(conn, required);
+        }
+        // Read-only: dropping the transaction rolls it back.
+        let tx = conn.unchecked_transaction()?;
+        Self::from_transaction_required(&tx, required)
+    }
+
+    /// [`Self::from_connection_required`] inside a transaction the caller
+    /// holds (both reads see its snapshot).
+    fn from_transaction_required(conn: &Connection, required: bool) -> Result<Option<Self>> {
+        debug_assert!(!conn.is_autocommit(), "a transaction covers both reads");
+        if required && !has_files_table(conn)? {
+            return Err(OverlayError::Msg(NO_FILES_TABLE.to_owned()));
+        }
+        #[cfg(test)]
+        if let Some(hook) = BETWEEN_REQUIRED_READS.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        Self::from_connection(conn)
     }
 
     pub fn from_connection(conn: &Connection) -> Result<Option<Self>> {
