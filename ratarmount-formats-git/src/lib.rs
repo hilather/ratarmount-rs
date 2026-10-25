@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Git repository tree MountSource (`backendName=GitMountSource`).
 //!
 //! Opens a git repository (worktree with `.git`, or bare) and mounts the tree at
@@ -150,6 +153,10 @@ impl GitMountSource {
                 path.display()
             )));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0315-M01","item":"<ratarmount_formats_git::GitMountSource>::open","disposition":"residual","reason":"libgit2 opens the repository (config, HEAD, refs, packs, loose objects) by pathname with its own descriptors; the git backend's ownership is outside this process's Rust readers (a repository file aliasing an open database would be closed by libgit2)","family":"foreign-library-or-caller-owned","issue":"#196","category":"foreign-library-or-caller-owned","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let repo = Repository::open(path)?;
         let reference = reference
             .map(|s| s.to_string())

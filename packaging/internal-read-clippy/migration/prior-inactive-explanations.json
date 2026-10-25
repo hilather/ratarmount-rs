@@ -1,0 +1,576 @@
+{
+  "evidence_stage": "completed six production profiles: workspace all-features/default, Python embedding/extension-module, NFSv4 library and CLI bins",
+  "counts": {
+    "inactive-target-cfg": 13
+  },
+  "entries": {
+    "ratarmount-compositing/src/overlay_layer.rs|ReadOnlyOverlayLayer::open_host|OpenOptions|2": {
+      "inventory_key": {
+        "file": "ratarmount-compositing/src/overlay_layer.rs",
+        "function": "ReadOnlyOverlayLayer::open_host",
+        "op": "OpenOptions",
+        "ordinal": 2
+      },
+      "line": 354,
+      "source": "        open_options_nofollow().read(true).open(host)",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-compositing/src/overlay_layer.rs",
+        "line": 353,
+        "attribute": "#[cfg(not(unix))]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-compositing/src/write_overlay.rs|WriteOverlay::truncate|OpenOptions|1": {
+      "inventory_key": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "function": "WriteOverlay::truncate",
+        "op": "OpenOptions",
+        "ordinal": 1
+      },
+      "line": 2561,
+      "source": "        let f = open_options_nofollow().write(true).open(&real)?;",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "line": 2560,
+        "attribute": "#[cfg(not(unix))]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-compositing/src/write_overlay.rs|WriteOverlay::open|OpenOptions|1": {
+      "inventory_key": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "function": "WriteOverlay::open",
+        "op": "OpenOptions",
+        "ordinal": 1
+      },
+      "line": 5610,
+      "source": "                let opened = open_options_nofollow().read(true).open(&real);",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "line": 5609,
+        "attribute": "#[cfg(not(unix))]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-compositing/src/write_overlay.rs|write_commit_manifest|File::open|1": {
+      "inventory_key": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "function": "write_commit_manifest",
+        "op": "File::open",
+        "ordinal": 1
+      },
+      "line": 5763,
+      "source": "    let opened = File::open(&dest);",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "line": 5762,
+        "attribute": "#[cfg(not(unix))]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-compositing/src/write_overlay.rs|open_park_fd|open_admitted|1": {
+      "inventory_key": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "function": "open_park_fd",
+        "op": "open_admitted",
+        "ordinal": 1
+      },
+      "line": 6397,
+      "source": "        ratarmount_core::db_inodes::open_admitted(host, park_open_flags(), 0)",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "line": 6395,
+        "attribute": "#[cfg(not(target_os = \"linux\"))]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-compositing/src/write_overlay.rs|rebuild_zip_with_overlay|File::open|1": {
+      "inventory_key": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "function": "rebuild_zip_with_overlay",
+        "op": "File::open",
+        "ordinal": 1
+      },
+      "line": 7984,
+      "source": "                let opened = File::open(&src_path);",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "line": 7983,
+        "attribute": "#[cfg(not(unix))]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-compress/src/fastcopy.rs|copy_to_temp|tempdir|1": {
+      "inventory_key": {
+        "file": "ratarmount-compress/src/fastcopy.rs",
+        "function": "copy_to_temp",
+        "op": "tempdir",
+        "ordinal": 1
+      },
+      "line": 197,
+      "source": "        let dir = tempfile::tempdir_in(parent)?;",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-compress/src/fastcopy.rs",
+        "line": 191,
+        "attribute": "#[cfg(target_os = \"macos\")]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-compress/src/fastcopy.rs|copy_to_temp|tempfile|1": {
+      "inventory_key": {
+        "file": "ratarmount-compress/src/fastcopy.rs",
+        "function": "copy_to_temp",
+        "op": "tempfile",
+        "ordinal": 1
+      },
+      "line": 202,
+      "source": "            let tmp = tempfile::NamedTempFile::new_in(parent)?;",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-compress/src/fastcopy.rs",
+        "line": 191,
+        "attribute": "#[cfg(target_os = \"macos\")]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-compress/src/fastcopy.rs|copy_to_temp|OpenOptions|1": {
+      "inventory_key": {
+        "file": "ratarmount-compress/src/fastcopy.rs",
+        "function": "copy_to_temp",
+        "op": "OpenOptions",
+        "ordinal": 1
+      },
+      "line": 205,
+      "source": "            let file = std::fs::OpenOptions::new()",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-compress/src/fastcopy.rs",
+        "line": 191,
+        "attribute": "#[cfg(target_os = \"macos\")]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-formats-tar/src/write.rs|write_file_on_disk|OpenOptions|1": {
+      "inventory_key": {
+        "file": "ratarmount-formats-tar/src/write.rs",
+        "function": "write_file_on_disk",
+        "op": "OpenOptions",
+        "ordinal": 1
+      },
+      "line": 1033,
+      "source": "    let f = std::fs::OpenOptions::new().read(true).open(path)?;",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-formats-tar/src/write.rs",
+        "line": 1032,
+        "attribute": "#[cfg(not(unix))]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-formats-zip/src/lib.rs|read_file_range_at_into|try_clone|1": {
+      "inventory_key": {
+        "file": "ratarmount-formats-zip/src/lib.rs",
+        "function": "read_file_range_at_into",
+        "op": "try_clone",
+        "ordinal": 1
+      },
+      "line": 1360,
+      "source": "        let mut f = file.try_clone()?;",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-formats-zip/src/lib.rs",
+        "line": 1358,
+        "attribute": "#[cfg(not(any(unix, windows)))]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "This fallback is inactive on all currently packaged Unix/Windows platforms. Either explicitly remove the unsupported-target fallback, or retain it in a narrow inactive-target residual; a Windows or macOS build does not activate it."
+    },
+    "ratarmount-fuse/src/lib.rs|reopen_parked_readonly|F_DUPFD_CLOEXEC|1": {
+      "inventory_key": {
+        "file": "ratarmount-fuse/src/lib.rs",
+        "function": "reopen_parked_readonly",
+        "op": "F_DUPFD_CLOEXEC",
+        "ordinal": 1
+      },
+      "line": 2913,
+      "source": "        let fd = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-fuse/src/lib.rs",
+        "line": 2911,
+        "attribute": "#[cfg(not(target_os = \"linux\"))]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    },
+    "ratarmount-index/src/managed_read.rs|ByteFile::open|File::open|1": {
+      "inventory_key": {
+        "file": "ratarmount-index/src/managed_read.rs",
+        "function": "ByteFile::open",
+        "op": "File::open",
+        "ordinal": 1
+      },
+      "line": 855,
+      "source": "            let file = File::open(path)?;",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "explained; implementation resolution required",
+      "classification": "inactive-target-cfg",
+      "cfg": {
+        "file": "ratarmount-index/src/managed_read.rs",
+        "line": 839,
+        "attribute": "#[cfg(not(unix))]"
+      },
+      "explanation": "The old scanner includes this target alternative syntactically; Linux Clippy removes it before expanded HIR is linted, even with --all-features.",
+      "resolution": "Use a production target build on a target where this cfg is active, or retain a narrow residual for compiler-inactive target branches. A default/Python/NFS feature run on Linux cannot activate this site."
+    }
+  },
+  "resolved_counts": {
+    "trait-impl-specific-call": 13
+  },
+  "rejected_alternative": {
+    "policy": "std::convert::From::from ban",
+    "reason": "Catches13 original conversions but generated clap sibling impl restriction allows prevent fulfilling nearby expects; rejected."
+  },
+  "resolved_by_file_type": {
+    "ratarmount/src/overlay_pack.rs|append_host|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount/src/overlay_pack.rs",
+        "function": "append_host",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 263,
+      "source": "                        File::from(openat_admitted(&fd, name.as_str(), regular_flags())?);",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount/src/overlay_pack.rs|pack|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount/src/overlay_pack.rs",
+        "function": "pack",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 367,
+      "source": "            let mut file = File::from(host::open(journal, regular_flags(), Mode::empty())?);",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount/src/overlay_pack.rs|sentinel_matches|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount/src/overlay_pack.rs",
+        "function": "sentinel_matches",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 617,
+      "source": "    let mut file = File::from(fd);",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount/src/overlay_pack.rs|sweep_pack_temps_in|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount/src/overlay_pack.rs",
+        "function": "sweep_pack_temps_in",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 876,
+      "source": "        let file = File::from(fd);",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount/src/overlay_pack.rs|open_lock_at|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount/src/overlay_pack.rs",
+        "function": "open_lock_at",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 1015,
+      "source": "    Ok(File::from(openat_admitted(dir, name, flags)?))",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount/src/overlay_pack.rs|extract_with_limits|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount/src/overlay_pack.rs",
+        "function": "extract_with_limits",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 1295,
+      "source": "            let mut file = File::from(child);",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount/src/overlay_pack.rs|finalize_stage|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount/src/overlay_pack.rs",
+        "function": "finalize_stage",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 1384,
+      "source": "        let file = File::from(fd);",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount/src/diff/live.rs|LiveView::open|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount/src/diff/live.rs",
+        "function": "LiveView::open",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 91,
+      "source": "                    file = File::from(ratarmount_core::db_inodes::openat_admitted(",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount-compositing/src/overlay_layer.rs|ReadOnlyOverlayLayer::open_host|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount-compositing/src/overlay_layer.rs",
+        "function": "ReadOnlyOverlayLayer::open_host",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 344,
+      "source": "                file = File::from(ratarmount_core::db_inodes::openat_admitted(",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount-compositing/src/overlay_seal.rs|finish_sealed|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount-compositing/src/overlay_seal.rs",
+        "function": "finish_sealed",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 376,
+      "source": "            fs::File::from(fd)",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount-compositing/src/overlay_seal.rs|verify|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount-compositing/src/overlay_seal.rs",
+        "function": "verify",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 493,
+      "source": "            fs::File::from(fd)",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount-formats-tar/src/write.rs|write_file_on_disk|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount-formats-tar/src/write.rs",
+        "function": "write_file_on_disk",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 1027,
+      "source": "    let f = std::fs::File::from(ratarmount_core::db_inodes::open_admitted(",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    },
+    "ratarmount-fuse/src/lib.rs|RatarmountFs::passthrough_file|File::from|1": {
+      "inventory_key": {
+        "file": "ratarmount-fuse/src/lib.rs",
+        "function": "RatarmountFs::passthrough_file",
+        "op": "File::from",
+        "ordinal": 1
+      },
+      "line": 1053,
+      "source": "                    let file = std::fs::File::from(fd);",
+      "observed_logs": [
+        "all-features-01.jsonl",
+        "all-features-forced.jsonl",
+        "default-production-forced.jsonl"
+      ],
+      "status": "resolved by chosen File type lint",
+      "classification": "trait-impl-specific-call",
+      "explanation": "The source uses File::from(OwnedFd), resolved through a From implementation. Candidate std::fs::File::from/tokio::fs::File::from paths produced no diagnostic for this baseline row. Exact trait-impl enforcement must be demonstrated, or retain a narrowly scoped direct conversion residual.",
+      "resolution": "The chosen disallowed type std::fs::File reports the explicit File receiver path at this File::from(OwnedFd) site. All13 original rows match exact primary source lines; no trait-conversion residual remains."
+    }
+  }
+}

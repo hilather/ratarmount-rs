@@ -99,6 +99,10 @@ fn inputs(args: &ExportArgs) -> Result<Vec<Input>> {
     for path in &args.inputs {
         if path.file_name().is_some_and(|s| s == "shards.json") {
             // Managed (#151): every internal input of export-index.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0008-M01","item":"ratarmount::export_index::inputs","disposition":"managed-read","regression":"regression_export_index_input_reads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let manifest: Manifest =
                 serde_json::from_slice(&ratarmount_index::managed_read::read(path)?)?;
             if manifest.format != "ratarmount-shards-v1" {
@@ -118,6 +122,10 @@ fn inputs(args: &ExportArgs) -> Result<Vec<Input>> {
             }
         } else {
             // Accept named or anonymous SQLite sidecars; do not rely on suffixes.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0009-M01","item":"ratarmount::export_index::inputs","disposition":"managed-read","regression":"regression_export_index_input_reads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let magic = ratarmount_index::managed_read::read_prefix(path, 16)?;
             let sqlite = magic.as_slice() == b"SQLite format 3\0";
             let sidecar = if sqlite {
@@ -205,6 +213,10 @@ fn frame_map(index: &SqliteIndex, archive: Option<&Path>) -> Result<Vec<ZstdFram
     if let Some(archive) = archive {
         // One managed reader (the archive may be open as a database here)
         // for the magic and the frame scan.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0010-M01","item":"ratarmount::export_index::frame_map","disposition":"managed-read","regression":"regression_export_index_input_reads_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut cursor = ratarmount_index::managed_read::ManagedReadCursor::open(archive)?;
         let mut magic = Vec::with_capacity(4);
         (&mut cursor).take(4).read_to_end(&mut magic)?;
@@ -329,6 +341,10 @@ fn parquet_export(inputs: &[Input], out: &mut dyn Write) -> Result<()> {
     use parquet::arrow::ArrowWriter;
     use std::sync::Arc;
     // Spool binary output so stdout remains streaming and need not implement Send.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0011-M01","item":"ratarmount::export_index::parquet_export","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut spool = tempfile::tempfile()?;
     let mut fields = Vec::new();
     for (i, name) in COLUMNS.iter().enumerate() {
@@ -407,12 +423,30 @@ fn parquet_export(inputs: &[Input], out: &mut dyn Write) -> Result<()> {
 pub(super) fn cli_stdout() -> io::Result<File> {
     use std::os::fd::FromRawFd;
     io::stdout().flush()?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0012-M01","item":"ratarmount::export_index::cli_stdout","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let fd = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0013-M01","item":"ratarmount::export_index::cli_stdout","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let stdout = unsafe { File::from_raw_fd(fd) };
-    if unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0 {
+    if unsafe {
+        {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0014-M01","item":"ratarmount::export_index::cli_stdout","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO);
+            __inventory_value_0
+        }
+    } < 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(stdout)
@@ -454,6 +488,10 @@ pub(super) fn run(args: &ExportArgs, stdout: &mut dyn Write) -> Result<()> {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0015-M01","item":"ratarmount::export_index::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         export(
             &inputs,

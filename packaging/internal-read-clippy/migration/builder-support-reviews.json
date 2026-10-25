@@ -1,0 +1,528 @@
+{
+  "reviewer": "Codex implementation source review",
+  "scope": "Preparatory constructors only; actual resources and creation settings keep individual approvals. Original dispositions/reasons retained as provenance.",
+  "entries": [
+    {
+      "id": "IR-B0017-M01",
+      "item": "ratarmount::find::restore_stdout_after",
+      "disposition": "support",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "out-of-family",
+      "baseline_reason": "standard descriptor handoff"
+    },
+    {
+      "id": "IR-B0028-M01",
+      "item": "ratarmount::init_logger",
+      "disposition": "support",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "out-of-family",
+      "baseline_reason": "logger output or standard descriptor setup"
+    },
+    {
+      "id": "IR-B0032-M01",
+      "item": "ratarmount::redirect_stdio_to_null",
+      "disposition": "support",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "out-of-family",
+      "baseline_reason": "logger output or standard descriptor setup"
+    },
+    {
+      "id": "IR-B0065-M01",
+      "item": "<ratarmount::overlay_pack::StageLock>::beside",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0083-M01",
+      "item": "ratarmount::overlay_pack::write_marker",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0092-M01",
+      "item": "ratarmount::shard::build",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0096-M01",
+      "item": "ratarmount::shard::run",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0102-M01",
+      "item": "<ratarmount::diff::live::LiveView as ratarmount_core::MountSource<ratarmount::diff::live::LiveView>>::open",
+      "disposition": "support",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "out-of-family",
+      "baseline_reason": "O_DIRECTORY handle for a descriptor-relative walk; no file content read"
+    },
+    {
+      "id": "IR-B0106-M01",
+      "item": "ratarmount::sandbox::daemon::lock",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0119-M01",
+      "item": "<ratarmount::sandbox::run::RunLock>::acquire",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0137-M01",
+      "item": "ratarmount_compositing::empty_archive::create_new_empty_archive",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0149-M01",
+      "item": "<ratarmount_compositing::overlay_layer::ReadOnlyOverlayLayer>::open_host",
+      "disposition": "support",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "out-of-family",
+      "baseline_reason": "O_DIRECTORY | O_NOFOLLOW descriptor of the layer root that pins the openat walk; reads no file content"
+    },
+    {
+      "id": "IR-B0184-M01",
+      "item": "ratarmount_compositing::write_overlay::create_overlay_marker",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0186-M01",
+      "item": "ratarmount_compositing::write_overlay::open_options_nofollow",
+      "disposition": "support",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "out-of-family",
+      "baseline_reason": "builder constructor: returns an O_NOFOLLOW OpenOptions and opens nothing; each call site is its own OpenOptions entry"
+    },
+    {
+      "id": "IR-B0187-M01",
+      "item": "ratarmount_compositing::write_overlay::create_cow_staging",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0214-M01",
+      "item": "ratarmount_compress::commit_journal::unix::replace",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0218-M01",
+      "item": "ratarmount_compress::commit_journal::unix::recover",
+      "disposition": "support",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "family": "commit-journal-recovery",
+      "issue": "#196",
+      "category": "builder-setup",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "residual",
+      "baseline_reason": "base archive opened read-write by journal recovery to lock it and roll back or forward; recovery and mutation ownership belong to the excluded broader machinery"
+    },
+    {
+      "id": "IR-B0285-M01",
+      "item": "<ratarmount_csi::Journal>::open",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0287-M01",
+      "item": "<ratarmount_csi::Journal>::save",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0289-M01",
+      "item": "ratarmount_csi::linux::bind_staged",
+      "disposition": "support",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "out-of-family",
+      "baseline_reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"
+    },
+    {
+      "id": "IR-B0396-M01",
+      "item": "ratarmount_formats_zip::normalize_multidisk_eocd",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0409-M01",
+      "item": "<ratarmount_fuse::oplog::OpLog>::open",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0414-M01",
+      "item": "ratarmount_fuse::passthrough::linux::temporary_in",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0421-M01",
+      "item": "ratarmount_index::digest_cache::open_lock_file",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0443-M01",
+      "item": "ratarmount_index::location::test_writable_dir",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0449-M01",
+      "item": "ratarmount_index::managed_read::copy_exclusive_new",
+      "disposition": "support",
+      "regression": "regression_exclusive_create_mode_table",
+      "mode_policy": "create_new with the source mode & !umask; exact source permissions through the handle after the copy",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0451-M01",
+      "item": "ratarmount_index::managed_read::copy_create_or_truncate",
+      "disposition": "support",
+      "regression": "regression_exclusive_create_mode_table",
+      "mode_policy": "create-or-truncate with the source mode & !umask; exact source permissions through the handle before any write",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0462-M01",
+      "item": "ratarmount_index::payload_cache::copy_hash_to_tmp",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0465-M01",
+      "item": "ratarmount_index::range_cache::open_regular",
+      "disposition": "support",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "family": "range-cache",
+      "issue": "#196",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "residual",
+      "baseline_reason": "range-cache completion owner / persisted original open helper"
+    },
+    {
+      "id": "IR-B0494-M01",
+      "item": "ratarmount_remote::hf_cache::open_regular",
+      "disposition": "support",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "family": "hf-payload-cache",
+      "issue": "#196",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "residual",
+      "baseline_reason": "HF local cache payload open helper"
+    },
+    {
+      "id": "IR-B0503-M01",
+      "item": "<ratarmount_remote::hf_cache::HubCache>::install_with",
+      "disposition": "support",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "family": "hf-payload-cache",
+      "issue": "#196",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "residual",
+      "baseline_reason": "huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"
+    },
+    {
+      "id": "IR-B0533-M01",
+      "item": "ratarmount_remote::torrent::scratch::mark_owned",
+      "disposition": "support",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "out-of-family",
+      "baseline_reason": "torrent scratch ownership marker"
+    },
+    {
+      "id": "IR-B0534-M01",
+      "item": "ratarmount_remote::torrent::scratch::sweep",
+      "disposition": "support",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "out-of-family",
+      "baseline_reason": "torrent scratch ownership marker"
+    },
+    {
+      "id": "IR-B0537-M01",
+      "item": "ratarmount_session::extract::create_extract_tmp",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0546-M01",
+      "item": "<ratarmount_volume_plugin::Driver<T0>>::open",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0548-M01",
+      "item": "<ratarmount_volume_plugin::Driver<T0>>::persist",
+      "disposition": "support",
+      "mode_policy": "unchanged-from-e6ca64e",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "output-owner",
+      "baseline_reason": "Preserve this reviewed output acquisition and its existing permissions."
+    },
+    {
+      "id": "IR-B0550-M01",
+      "item": "ratarmount_volume_plugin::linux::bind_staged",
+      "disposition": "support",
+      "category": "builder-setup",
+      "reason": "Prepare the builder for this item's separately reviewed open/create leaf.",
+      "creation": {
+        "policy": "none",
+        "basis": "Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."
+      },
+      "supports_disposition": "out-of-family",
+      "baseline_reason": "O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"
+    }
+  ]
+}

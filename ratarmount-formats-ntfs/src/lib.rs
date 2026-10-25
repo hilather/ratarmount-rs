@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! NTFS filesystem image mount source (read-only).
 //!
 //! Uses the pure-Rust [`ntfs`] crate for in-process MFT / index / `$DATA` reads
@@ -294,6 +297,10 @@ impl NtfsMountSource {
             )));
         }
         {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0330-M01","item":"<ratarmount_formats_ntfs::NtfsMountSource>::open_with_offset","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let file = File::open(path)?;
             let mut disk = OffsetDisk::from_file(file, partition_offset);
             validate_ntfs(&mut disk, &path.display().to_string())?;
@@ -367,6 +374,10 @@ impl NtfsMountSource {
                 path,
                 partition_offset,
             } => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0331-M01","item":"<ratarmount_formats_ntfs::NtfsMountSource>::with_disk","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
                 let file = File::open(path)?;
                 let mut disk = OffsetDisk::from_file(file, *partition_offset);
                 f(&mut disk)
@@ -642,7 +653,14 @@ pub fn looks_like_ntfs(path: &Path) -> bool {
 /// Extension fallback (`.ntfs`) is only applied at offset 0 so a bad partition
 /// offset on a `*.ntfs` file is not masked.
 pub fn looks_like_ntfs_at(path: &Path, partition_offset: u64) -> bool {
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0332-M01","item":"ratarmount_formats_ntfs::looks_like_ntfs_at","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = File::open(path);
+        __inventory_value_0
+    } {
         if looks_like_ntfs_reader_at(&mut f, partition_offset) {
             return true;
         }

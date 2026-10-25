@@ -243,6 +243,10 @@ fn build(entries: Vec<Entry>, capacity: usize, opener: Box<Opener>) -> Arc<dyn M
 }
 
 pub(crate) fn open(list: &Path, capacity: usize) -> Result<Arc<dyn MountSource>, String> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0001-M01","item":"ratarmount::corpus::open","disposition":"out-of-family","category":"configuration-or-credentials","reason":"corpus list file named on the command line","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
     let entries = parse_list(&text, list.parent().unwrap_or(Path::new(".")))?;
     Ok(build(

@@ -128,3 +128,6 @@ libc.workspace = true
 [[example]]
 name = "ai-zstd-read"
 path = "../benchmarks/ai/session-read.rs"
+
+[lints]
+workspace = true

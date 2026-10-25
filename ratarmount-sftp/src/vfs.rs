@@ -256,6 +256,10 @@ impl RatarmountSftp {
         let fd = ov
             .open_overlay_fd(&path, flags)
             .map_err(|e| io_to_errno(&overlay_to_io(e)))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0544-M01","item":"<ratarmount_sftp::vfs::RatarmountSftp>::write","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         let wrote = ov.write_all_at(&file, &path, offset, data);
         ov.finish_owned_write_fd(file);

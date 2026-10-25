@@ -254,6 +254,10 @@ fn publish_remote(
         verify_stats(&stats, &fingerprint(reader.as_mut())?)?;
     }
     // Snapshot before fingerprinting the blob. Do not rewrite an index held by the mount.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0086-M01","item":"ratarmount::publish_index::publish_remote","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
     snapshot_sidecar(opts.sidecar, tmp.path())?;
     {
@@ -281,6 +285,10 @@ fn publish_remote(
     let pointer_bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
     if let Some(repo) = target_repo {
         // Managed (#151): the snapshot is read through SQLite's VFS.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0087-M01","item":"ratarmount::publish_index::publish_remote","disposition":"sqlite-snapshot","regression":"regression_publish_index_readers_keep_index_lock","category":"sqlite-snapshot","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let blob = ratarmount_index::managed_read::read(tmp.path()).map_err(|e| e.to_string())?;
         let blob_path = format!("{}.index.{}.sqlite", repo.location.path, pointer.index_id);
         let pointer_path = format!("{}.index.ptr", repo.location.path);
@@ -336,6 +344,10 @@ fn snapshot_sidecar(source: &Path, dest: &Path) -> Result<(), String> {
 fn atomic_copy(src: &Path, dest: &Path) -> io::Result<()> {
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0132-M01","item":"ratarmount::publish_index::atomic_copy","disposition":"output-owner","category":"published-index-directory","reason":"Create the publication destination parent before atomic managed-source index copying.","creation":{"policy":"recursive-directory","basis":"Only output parents are created; the separately reviewed managed copy and tempfile publication preserve source/input obligations."}}"###
+            )]
             fs::create_dir_all(parent)?;
         }
     }
@@ -343,11 +355,29 @@ fn atomic_copy(src: &Path, dest: &Path) -> io::Result<()> {
     builder.prefix(".ratarmount-publish-").suffix(".tmp");
     let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = match parent {
-        Some(p) => builder.tempfile_in(p)?,
-        None => builder.tempfile_in(".")?,
+        Some(p) => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0088-M01","item":"ratarmount::publish_index::atomic_copy","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempfile_in(p);
+            __inventory_value_0
+        }?,
+        None => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0089-M01","item":"ratarmount::publish_index::atomic_copy","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempfile_in(".");
+            __inventory_value_0
+        }?,
     };
     {
         // Managed (#151): the source is an index that may be open here.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0090-M01","item":"ratarmount::publish_index::atomic_copy","disposition":"managed-read","regression":"regression_publish_index_readers_keep_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         ratarmount_index::managed_read::copy_into(src, &mut tmp)?;
         tmp.flush()?;
     }

@@ -1,0 +1,10 @@
+[package]
+name = "internal-read-alias-witnesses"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[lib]
+path = "lib.rs"
+[dependencies]
+ratarmount-core = { path = "../../../../ratarmount-core" }
+[workspace]

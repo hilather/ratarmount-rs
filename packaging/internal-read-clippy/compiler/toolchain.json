@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "toolchain": "1.98.0",
+  "revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
+  "host": "x86_64-unknown-linux-gnu",
+  "source": {
+    "url": "https://codeload.github.com/rust-lang/rust/tar.gz/88d9e12ae178fab0fb5cc050a94da85685d449ea",
+    "sha256": "5a9993673ce40804e6b50300df59ecb3d13942c1c89cd11e76acf705b331f982"
+  },
+  "rustc_dev": {
+    "url": "https://static.rust-lang.org/dist/rustc-dev-1.98.0-x86_64-unknown-linux-gnu.tar.xz",
+    "sha256": "6fdbc2122f41ca9f892fe09782f4f3b6e18f23d60483a3403d3e5e0da119a0f2"
+  }
+}

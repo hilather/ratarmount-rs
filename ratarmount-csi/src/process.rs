@@ -91,6 +91,10 @@ impl ProcessMounter {
 #[tonic::async_trait]
 impl Mounter for ProcessMounter {
     async fn mounted(&self, target: &str) -> Result<bool, Status> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0290-M01","item":"<ratarmount_csi::process::ProcessMounter as ratarmount_csi::Mounter<ratarmount_csi::process::ProcessMounter>>::mounted","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let info = fs::read("/proc/self/mountinfo")
             .map_err(|_| Status::internal("cannot read Linux mountinfo"))?;
         Ok(mountinfo_contains(&info, target))
@@ -115,12 +119,20 @@ impl Mounter for ProcessMounter {
             .iter()
             .any(|arg| arg == "--overlay-tmpfs" || arg.starts_with("--overlay-tmpfs="))
         {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0038-M01","item":"<ratarmount_csi::process::ProcessMounter as ratarmount_csi::Mounter<ratarmount_csi::process::ProcessMounter>>::mount","disposition":"output-owner","category":"tmpfs-overlay-directory","reason":"Create the CSI tmpfs overlay root before protecting it and verifying tmpfs.","creation":{"policy":"recursive-directory","basis":"The root is set to 0700 and require_tmpfs validates the backing filesystem before creating the per-target overlay."}}"###
+            )]
             fs::create_dir_all(&self.overlay_root)
                 .map_err(|_| Status::internal("cannot create overlay root"))?;
             fs::set_permissions(&self.overlay_root, fs::Permissions::from_mode(0o700))
                 .map_err(|_| Status::internal("cannot protect overlay root"))?;
             require_tmpfs(&self.overlay_root)?;
             let overlay = self.overlay_path(&spec.target);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0039-M01","item":"<ratarmount_csi::process::ProcessMounter as ratarmount_csi::Mounter<ratarmount_csi::process::ProcessMounter>>::mount","disposition":"output-owner","category":"tmpfs-overlay-directory","reason":"Create the target-specific CSI overlay directory on the verified tmpfs root.","creation":{"policy":"exclusive-directory","basis":"create_dir refuses an existing name and set_permissions immediately applies 0700."}}"###
+            )]
             fs::create_dir(&overlay)
                 .map_err(|_| Status::internal("cannot create private tmpfs overlay"))?;
             fs::set_permissions(&overlay, fs::Permissions::from_mode(0o700))

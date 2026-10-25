@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! In-process NFS export of a [`ratarmount_core::MountSource`].
 //!
 //! Userspace NFSv3 adapter (default). Optional NFSv4.1 (`--features nfsv4`,

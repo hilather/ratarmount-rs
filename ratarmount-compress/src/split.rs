@@ -196,9 +196,17 @@ pub fn check_for_split_file_in_folder(path: &Path) -> Option<SplitFileSet> {
 
 /// Concatenate split parts into a seekable temp file (small/medium volumes; matches tests).
 pub fn materialize_joined_parts(parts: &[PathBuf]) -> io::Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0262-M01","item":"ratarmount_compress::split::materialize_joined_parts","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     let mut total = 0u64;
     for p in parts {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0263-M01","item":"ratarmount_compress::split::materialize_joined_parts","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut f = File::open(p)?;
         let n = io::copy(&mut f, &mut tmp)?;
         total += n;
@@ -263,6 +271,10 @@ impl Read for JoinedFile {
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "joined eof"))?;
         // Reopen if needed
         if !matches!(&self.open, Some((i, _)) if *i == idx) {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0264-M01","item":"<ratarmount_compress::split::JoinedFile as std::io::Read<ratarmount_compress::split::JoinedFile>>::read","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let f = File::open(&self.parts[idx].0)?;
             self.open = Some((idx, f));
         }

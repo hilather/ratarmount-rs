@@ -1,0 +1,138 @@
+{
+  "basis": "Compiled exact-path native witnesses use the workspace-locked API families; Cargo normal dependency declarations and feature tables are reviewed together. Unavailable platform/definition rows retain explicit dispositions.",
+  "provenance": {
+    "dependencies": [
+      {
+        "checksum": "b903b73e45dc0c6c596f2d37eccece7c1c8bb6e4407b001096387c63d0d93724",
+        "name": "git2",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.19.0"
+      },
+      {
+        "checksum": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2",
+        "name": "libc",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.2.189"
+      },
+      {
+        "checksum": "c5c8ecfc6c72051981c0459f75ccc585e7ff67c70829560cda8e647882a9abff",
+        "name": "lopdf",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.34.0"
+      },
+      {
+        "checksum": "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46",
+        "name": "nix",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.29.0"
+      },
+      {
+        "checksum": "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6",
+        "name": "nix",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.30.1"
+      },
+      {
+        "checksum": "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d",
+        "name": "nix",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "0.31.3"
+      },
+      {
+        "checksum": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d",
+        "name": "rustix",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.1.5"
+      },
+      {
+        "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
+        "name": "tempfile",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "3.27.0"
+      },
+      {
+        "checksum": "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed",
+        "name": "tokio",
+        "source": "registry+https://github.com/rust-lang/crates.io-index",
+        "version": "1.53.1"
+      }
+    ],
+    "fixture_dependencies": {
+      "aliases": [
+        {
+          "checksum": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2",
+          "name": "libc",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.2.189"
+        }
+      ],
+      "journal": [
+        {
+          "checksum": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2",
+          "name": "libc",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.2.189"
+        },
+        {
+          "checksum": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d",
+          "name": "rustix",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.1.5"
+        },
+        {
+          "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
+          "name": "tempfile",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "3.27.0"
+        }
+      ],
+      "public": [
+        {
+          "checksum": "b903b73e45dc0c6c596f2d37eccece7c1c8bb6e4407b001096387c63d0d93724",
+          "name": "git2",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.19.0"
+        },
+        {
+          "checksum": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2",
+          "name": "libc",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.2.189"
+        },
+        {
+          "checksum": "c5c8ecfc6c72051981c0459f75ccc585e7ff67c70829560cda8e647882a9abff",
+          "name": "lopdf",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.34.0"
+        },
+        {
+          "checksum": "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46",
+          "name": "nix",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.29.0"
+        },
+        {
+          "checksum": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d",
+          "name": "rustix",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.1.5"
+        },
+        {
+          "checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
+          "name": "tempfile",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "3.27.0"
+        },
+        {
+          "checksum": "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed",
+          "name": "tokio",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.53.1"
+        }
+      ]
+    },
+    "root_declarations_sha256": "a54b82755d62520be7b9f44e09b38f3a8b1cf8b1bd4d46402724424e9cca718a",
+    "schema": 1
+  },
+  "reviewer": "PR #201 accepted N1 API review, implementation verification"
+}

@@ -179,6 +179,10 @@ where
 ///
 /// See [`export_zstd_blocks_from_reader`].
 pub fn export_zstd_blocks(path: impl AsRef<Path>) -> Result<Vec<(u64, u64)>> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0269-M01","item":"ratarmount_compress::zstd_seek::export_zstd_blocks","disposition":"residual","reason":"path form of the zstd frame scan (compress cannot depend on the managed reader); its remaining callers read a mounted or committed base archive (write_overlay commits, the factory's zstdblocks export, the live-commit last-frame warning); the mandatory export-index frame map and the Hub live commit's zstdblocks use the reader form on a ManagedReadCursor","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut file = File::open(path)?;
     export_zstd_blocks_from_reader(&mut file)
 }
@@ -238,6 +242,10 @@ pub fn scan_zstd_frames<R: Read + Seek>(reader: &mut R) -> Result<ZstdFrameMap> 
 
 /// [`scan_zstd_frames`] from a filesystem path.
 pub fn scan_zstd_frames_path(path: &Path) -> Result<ZstdFrameMap> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0270-M01","item":"ratarmount_compress::zstd_seek::scan_zstd_frames_path","disposition":"residual","reason":"path form of the zstd frame scan (compress cannot depend on the managed reader); its remaining callers read a mounted or committed base archive (write_overlay commits, the factory's zstdblocks export, the live-commit last-frame warning); the mandatory export-index frame map and the Hub live commit's zstdblocks use the reader form on a ManagedReadCursor","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut file = File::open(path)?;
     scan_zstd_frames(&mut file)
 }
@@ -569,6 +577,10 @@ impl SeekableZstd {
         let path = path.as_ref().to_path_buf();
         let threads = ParallelizationSpec::resolve_zero(options.threads).max(1);
         let options = ZstdReadOptions { threads, ..options };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0271-M01","item":"<ratarmount_compress::zstd_seek::SeekableZstd>::open_with_options","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(&path)?;
         match classify_zstd(&mut file, threads)? {
             ZstdPlan::Mapped {
@@ -805,6 +817,10 @@ fn decode_full(path: &Path, threads: u32) -> Result<Arc<dyn SeekableBody>> {
             return Ok(body as Arc<dyn SeekableBody>);
         }
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0272-M01","item":"ratarmount_compress::zstd_seek::decode_full","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let file = File::open(path)?;
     let dec =
         zstd::stream::read::Decoder::new(file).map_err(|e| CompressError::Msg(e.to_string()))?;
@@ -841,6 +857,10 @@ where
 
 /// Parallel decompress of independent zstd frames into one contiguous buffer.
 fn try_parallel_frame_decode(path: &Path, threads: u32) -> Result<Vec<u8>> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0273-M01","item":"ratarmount_compress::zstd_seek::try_parallel_frame_decode","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let data = std::fs::read(path)?;
     try_parallel_frame_decode_bytes(&data, threads)
 }
@@ -1109,7 +1129,14 @@ struct ZstdFrameReader {
 impl ZstdBackend {
     fn open_compressed(&self) -> io::Result<CompressedHandle> {
         match self {
-            Self::Path(p) => Ok(CompressedHandle::File(File::open(p)?)),
+            Self::Path(p) => Ok(CompressedHandle::File({
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0274-M01","item":"<ratarmount_compress::zstd_seek::ZstdBackend>::open_compressed","disposition":"residual","reason":"zstd backend reader of a mounted base; broader backend migration is excluded","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 = File::open(p);
+                __inventory_value_0
+            }?)),
             Self::Shared(shared) => Ok(CompressedHandle::Shared {
                 inner: Arc::clone(shared),
                 pos: 0,
@@ -1313,7 +1340,14 @@ impl ZstdFrameReader {
         if let ZstdBackend::Path(path) = &self.backend {
             if let Some((offset, len)) = self.compressed_prefetch_range(next, budget) {
                 if let (Ok(file), Ok(offset), Ok(len)) = (
-                    File::open(path),
+                    {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0275-M01","item":"<ratarmount_compress::zstd_seek::ZstdFrameReader>::prefetch","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                        )]
+                        let __inventory_value_0 = File::open(path);
+                        __inventory_value_0
+                    },
                     libc::off_t::try_from(offset),
                     libc::off_t::try_from(len),
                 ) {
@@ -1450,6 +1484,10 @@ impl ZstdFrameReader {
                         input.take(info.compressed_size.unwrap_or(u64::MAX)),
                     )?
                     .single_frame();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0276-M01","item":"<ratarmount_compress::zstd_seek::ZstdFrameReader>::ensure_frame","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                    )]
                     let mut spool = tempfile::tempfile()?;
                     let expected = self.frame_size(best);
                     let size = io::copy(&mut decoder.take(expected.saturating_add(1)), &mut spool)?;

@@ -16,3 +16,6 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 fatfs = "0.3"
+
+[lints]
+workspace = true

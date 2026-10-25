@@ -612,6 +612,10 @@ pub(crate) fn put_overlay(
     let existed = MountSource::lookup(overlay, path, 0).is_some();
     let fd = overlay_create_file(overlay, path, 0o644)?;
     // SAFETY: `overlay_create_file` returns a new fd we own.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0417-M01","item":"ratarmount_http::webdav::put_overlay","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     let result = (|| -> io::Result<()> {
         let mut remaining = content_len;
@@ -665,6 +669,10 @@ pub(crate) fn copy_overlay_file(
     }
     let fd = overlay_create_file(overlay, dest, 0o644)?;
     // SAFETY: `overlay_create_file` returns a new fd we own.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0418-M01","item":"ratarmount_http::webdav::copy_overlay_file","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     let result = (|| -> io::Result<()> {
         if fi.size == 0 {

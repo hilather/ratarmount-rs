@@ -194,24 +194,39 @@ pub fn copy_to_temp(
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0222-I01","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","item":"ratarmount_compress::fastcopy::copy_to_temp","native_observed":false,"creation":{"policy":"private-temporary-directory","basis":"tempfile::tempdir_in creates the macOS clone staging directory with tempfile private defaults; original unchanged-from-e6ca64e mode provenance is retained."},"category":"compression-staging","reason":"macOS private clone staging directory"}"###
+        )]
         let dir = tempfile::tempdir_in(parent)?;
         let path = dir.path().join("clone");
         let name = CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid_range())?;
         if unsafe { libc::fclonefileat(src.as_raw_fd(), libc::AT_FDCWD, name.as_ptr(), 0) } == 0 {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0223-I01","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","item":"ratarmount_compress::fastcopy::copy_to_temp","native_observed":false,"creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile allocates a private sibling; the previously cloned file is then renamed over that temporary pathname, retaining the reviewed existing clone flow."},"category":"compression-staging","reason":"macOS named clone output publication"}"###
+            )]
             let tmp = tempfile::NamedTempFile::new_in(parent)?;
             std::fs::rename(&path, tmp.path())?;
             let (_, temp_path) = tmp.into_parts();
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&temp_path)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0224-I01","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"range-copy probe on a private temporary file","mode_policy":"unchanged-from-e6ca64e","item":"ratarmount_compress::fastcopy::copy_to_temp","native_observed":false,"creation":{"policy":"none","basis":"The read/write OpenOptions path reopens the already-created temporary clone after rename; it requests no creation."}}"###
+            )]
+            let file = options.open(&temp_path)?;
             return Ok((
                 tempfile::NamedTempFile::from_parts(file, temp_path),
                 CopyMethod::Reflink,
             ));
         }
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0225-M01","item":"ratarmount_compress::fastcopy::copy_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     let len = src.metadata()?.len();
     let method = copy_range(src, 0, tmp.as_file_mut(), 0, len)?;

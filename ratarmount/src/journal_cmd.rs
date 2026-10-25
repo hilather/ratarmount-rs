@@ -308,6 +308,10 @@ pub fn run(args: &JournalArgs) -> io::Result<()> {
             since_mark,
             until_mark,
         } => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0020-M01","item":"ratarmount::journal_cmd::run","disposition":"out-of-family","category":"structured-control-record","reason":"operation journal JSONL","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let summary = summarize(
                 BufReader::new(File::open(file)?),
                 since_mark.as_deref(),

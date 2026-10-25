@@ -1,5 +1,9 @@
 //! Create a POSIX-empty uncompressed TAR or one-frame `.tar.zst` (`O_EXCL`).
 
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0001-T01","item":"ratarmount_compositing::empty_archive","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for the empty-archive writer; this type reference opens nothing.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+)]
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -98,48 +102,72 @@ fn create_new_empty_archive(
     path: &Path,
     kind: EmptyArchiveKind,
 ) -> Result<EmptyCreateOutcome, OverlayError> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0137-M01","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = r###"internal-read:v1 {"id":"IR-B0137-T01","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+    )]
     let mut opts = OpenOptions::new();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0002-M01","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"output-owner","category":"empty-archive-output","reason":"Configure exclusive creation of a previously absent empty archive without replacing an existing entry.","creation":{"policy":"exclusive-new-file","basis":"The writer uses create_new and mode 0666 subject to umask; existing entries follow the explicit validation/error path."}}"###
+    )]
     opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o666);
     }
-    match opts.open(path) {
-        Ok(mut f) => {
-            let wrote = write_empty_archive(&mut f, kind).and_then(|_| f.sync_all());
-            if let Err(e) = wrote {
-                let _ = fs::remove_file(path);
-                return Err(e.into());
+    {
+        let __inventory_condition_6225 = {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0137-M02","item":"ratarmount_compositing::empty_archive::create_new_empty_archive","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = opts.open(path);
+            __inventory_value_0
+        };
+        match __inventory_condition_6225 {
+            Ok(mut f) => {
+                let wrote = write_empty_archive(&mut f, kind).and_then(|_| f.sync_all());
+                if let Err(e) = wrote {
+                    let _ = fs::remove_file(path);
+                    return Err(e.into());
+                }
+                sync_parent_dir(path);
+                eprintln!("created empty archive {}", path.display());
+                log::info!("created empty archive {}", path.display());
+                Ok(EmptyCreateOutcome::Created)
             }
-            sync_parent_dir(path);
-            eprintln!("created empty archive {}", path.display());
-            log::info!("created empty archive {}", path.display());
-            Ok(EmptyCreateOutcome::Created)
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match fs::symlink_metadata(path) {
-            Ok(m) if m.file_type().is_file() => Ok(EmptyCreateOutcome::Unchanged),
-            Ok(m) if m.file_type().is_dir() => Err(OverlayError::Msg(format!(
-                "{} is a directory",
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                match fs::symlink_metadata(path) {
+                    Ok(m) if m.file_type().is_file() => Ok(EmptyCreateOutcome::Unchanged),
+                    Ok(m) if m.file_type().is_dir() => Err(OverlayError::Msg(format!(
+                        "{} is a directory",
+                        path.display()
+                    ))),
+                    Ok(m) if m.file_type().is_symlink() => Err(OverlayError::Msg(
+                        "refusing to create archive at symlink path".into(),
+                    )),
+                    Ok(_) => Err(OverlayError::Msg(
+                        "refusing to create archive at non-regular path".into(),
+                    )),
+                    Err(stat_err) => Err(stat_err.into()),
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(OverlayError::Msg(format!(
+                "cannot create {}: parent directory does not exist",
                 path.display()
             ))),
-            Ok(m) if m.file_type().is_symlink() => Err(OverlayError::Msg(
-                "refusing to create archive at symlink path".into(),
-            )),
-            Ok(_) => Err(OverlayError::Msg(
-                "refusing to create archive at non-regular path".into(),
-            )),
-            Err(stat_err) => Err(stat_err.into()),
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(OverlayError::Msg(format!(
-            "cannot create {}: parent directory does not exist",
-            path.display()
-        ))),
-        Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => Err(OverlayError::Msg(format!(
-            "cannot create {}: parent is not a directory",
-            path.display()
-        ))),
-        Err(e) => Err(e.into()),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => Err(OverlayError::Msg(format!(
+                "cannot create {}: parent is not a directory",
+                path.display()
+            ))),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -151,6 +179,10 @@ fn initialize_empty_archive(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0138-M01","item":"ratarmount_compositing::empty_archive::initialize_empty_archive","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new_in(parent)?;
     write_empty_archive(tmp.as_file_mut(), kind)?;
     apply_create_mode(tmp.as_file())?;
@@ -200,7 +232,14 @@ fn sync_parent_dir(path: &Path) {
         if parent.as_os_str().is_empty() {
             return;
         }
-        if let Ok(dir) = File::open(parent) {
+        if let Ok(dir) = {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0139-M01","item":"ratarmount_compositing::empty_archive::sync_parent_dir","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = File::open(parent);
+            __inventory_value_0
+        } {
             let _ = dir.sync_all();
         }
     }

@@ -386,6 +386,10 @@ pub(crate) fn thread_count() -> Option<u32> {
 fn os_thread_count() -> Option<u32> {
     let mut buf = [0u8; 1024];
     // SAFETY: plain syscalls on a local buffer and our own descriptor.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0474-M01","item":"ratarmount_index::checked_open::install::os_thread_count","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let fd = unsafe {
         libc::open(
             c"/proc/self/stat".as_ptr(),

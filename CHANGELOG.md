@@ -4,6 +4,8 @@
 
 ### Changes
 
+- **Compiler-resolved internal-read approvals (#201):** production library/binary Clippy passes use resolved disallowed-item definitions, narrow reviewed expectations and a stable manifest diff, with N2–N4 syntax refusals. The old collector, transitive helper proofs, flag/mode inference and descriptor-retyping events are retired. Runtime openat2/checked_open/seccomp enforcement remains the boundary; see [the policy](packaging/internal-read-clippy/README.md) and [sandbox notes](docs/sandbox.md).
+
 - Checked overlay SQLite acquisition validates SQLite's acquired inode and refuses substitutions, lost required records, caller-built URIs, and replaced VFS hooks. Installation is load-time or private-extension prepublication, with native export audits and Linux aarch64 CI (#151, supersedes #199).
 - A daemonized mount still holds no kernel lock on its overlay database after it forks (#183); use foreground `-f` when another process may open it.
 - Required-record observations now latch for the held/retry operation: deleting markers cannot weaken gates, recovery rows, seal/verify/pack metadata checks, or pending-base digest updates.

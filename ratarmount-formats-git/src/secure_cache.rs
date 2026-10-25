@@ -27,7 +27,16 @@ fn fd_result(fd: libc::c_int) -> io::Result<File> {
         Err(io::Error::last_os_error())
     } else {
         // SAFETY: a successful open returns a new owned descriptor.
-        Ok(unsafe { File::from_raw_fd(fd) })
+        Ok(unsafe {
+            {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0316-M01","item":"ratarmount_formats_git::synthetic::secure_cache::fd_result","disposition":"residual","reason":"git object cache directory walk (secure_cache) feeding libgit2-backed reads","family":"foreign-library-or-caller-owned","issue":"#196","category":"foreign-library-or-caller-owned","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 = File::from_raw_fd(fd);
+                __inventory_value_0
+            }
+        })
     }
 }
 
@@ -45,6 +54,10 @@ impl Directory {
         if !path.is_absolute() {
             return Err(io::Error::other("synthetic Git requires an absolute platform cache root (set XDG_CACHE_HOME or HOME)"));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0317-M01","item":"<ratarmount_formats_git::synthetic::secure_cache::Directory>::root","disposition":"residual","reason":"git object cache directory walk (secure_cache) feeding libgit2-backed reads","family":"foreign-library-or-caller-owned","issue":"#196","category":"foreign-library-or-caller-owned","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut dir = Self(File::open("/")?);
         for component in path.components() {
             match component {
@@ -69,6 +82,10 @@ impl Directory {
     pub fn child(&self, name: &OsStr) -> io::Result<Self> {
         let name = c_name(name)?;
         // SAFETY: directory fd and NUL-terminated name are valid for this call.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0318-M01","item":"<ratarmount_formats_git::synthetic::secure_cache::Directory>::child","disposition":"residual","reason":"git object cache directory walk (secure_cache) feeding libgit2-backed reads","family":"foreign-library-or-caller-owned","issue":"#196","category":"foreign-library-or-caller-owned","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let fd = unsafe {
             libc::openat(
                 self.0.as_raw_fd(),
@@ -83,6 +100,10 @@ impl Directory {
         let name = c_name(name)?;
         // O_NONBLOCK prevents a malicious FIFO from hanging validation.
         // SAFETY: directory fd and NUL-terminated name are valid for this call.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0319-M01","item":"<ratarmount_formats_git::synthetic::secure_cache::Directory>::file","disposition":"residual","reason":"git object cache directory walk (secure_cache) feeding libgit2-backed reads","family":"foreign-library-or-caller-owned","issue":"#196","category":"foreign-library-or-caller-owned","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let fd = unsafe {
             libc::openat(
                 self.0.as_raw_fd(),
@@ -104,7 +125,17 @@ impl Directory {
     pub fn mkdir(&self, name: &OsStr) -> io::Result<()> {
         let name = c_name(name)?;
         // SAFETY: directory fd and NUL-terminated name are valid for this call.
-        if unsafe { libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        if unsafe {
+            {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0040-M01","item":"<ratarmount_formats_git::synthetic::secure_cache::Directory>::mkdir","disposition":"output-owner","category":"synthetic-git-cache","reason":"Create a 0700 child of an already-held no-follow Git cache directory descriptor.","creation":{"policy":"directory-relative","basis":"mkdirat uses a validated single-component name and mode 0700; existing names are subsequently accessed through checked directory handles."}}"###
+                )]
+                let __inventory_value_0 = libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o700);
+                __inventory_value_0
+            }
+        } != 0
+        {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::AlreadyExists {
                 return Err(error);
@@ -117,12 +148,23 @@ impl Directory {
         let name = c_name(name)?;
         // SAFETY: valid directory descriptor and terminated single-component name.
         fd_result(unsafe {
-            libc::openat(
-                self.0.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
+            {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0320-M01","item":"<ratarmount_formats_git::synthetic::secure_cache::Directory>::create_file","disposition":"residual","reason":"git object cache directory walk (secure_cache) feeding libgit2-backed reads","family":"foreign-library-or-caller-owned","issue":"#196","mode_policy":"unchanged-from-e6ca64e","category":"foreign-library-or-caller-owned","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )]
+                let __inventory_value_0 = libc::openat(
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                );
+                __inventory_value_0
+            }
         })
     }
 
@@ -141,7 +183,17 @@ impl Directory {
             ));
             let c = c_name(&name)?;
             // SAFETY: valid directory descriptor and terminated generated name.
-            if unsafe { libc::mkdirat(self.0.as_raw_fd(), c.as_ptr(), 0o700) } == 0 {
+            if unsafe {
+                {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0041-M01","item":"<ratarmount_formats_git::synthetic::secure_cache::Directory>::staging","disposition":"output-owner","category":"synthetic-git-staging","reason":"Create a uniquely generated 0700 Git repository staging directory beneath the held cache descriptor.","creation":{"policy":"exclusive-directory-relative","basis":"mkdirat retries name collisions and then obtains the new child through the checked cache directory wrapper."}}"###
+                    )]
+                    let __inventory_value_0 = libc::mkdirat(self.0.as_raw_fd(), c.as_ptr(), 0o700);
+                    __inventory_value_0
+                }
+            } == 0
+            {
                 let dir = self.child(&name)?;
                 return Ok((name, dir));
             }
@@ -179,6 +231,10 @@ impl Directory {
         // A separately opened descriptor has its own directory offset.
         let fd = self.child(OsStr::new("."))?.0;
         use std::os::fd::IntoRawFd;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0321-M01","item":"<ratarmount_formats_git::synthetic::secure_cache::Directory>::names","disposition":"residual","reason":"git object cache directory walk (secure_cache) feeding libgit2-backed reads","family":"foreign-library-or-caller-owned","issue":"#196","category":"foreign-library-or-caller-owned","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let raw = fd.into_raw_fd();
         // SAFETY: fdopendir takes ownership on success; closed below on failure.
         let stream = unsafe { libc::fdopendir(raw) };

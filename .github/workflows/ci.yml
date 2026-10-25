@@ -30,9 +30,15 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          # The policy runner keeps strict/collection targets in separate
+          # keyed subdirectories; keep both plus the pinned Clippy-only build.
+          cache-directories: |
+            target/internal-read-policy
+            ~/.cargo/internal-read-clippy
 
       - name: cargo fmt
-        run: cargo fmt --all -- --check
+        run: CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo fmt --all -- --check
 
       - name: windows-lib workflow + stable Windows API guard
         run: ./packaging/test-windows-lib-ci.sh
@@ -52,15 +58,38 @@ jobs:
       - name: wheel blake3 no_neon feature graph (#199)
         run: bash packaging/test-wheel-blake3-no-neon.sh
 
-      - name: internal-read inventory (#151)
+      - name: internal-read CI contract
         run: |
-          python3 -I packaging/test-internal-read-inventory.py --self-test
-          python3 -I packaging/test-internal-read-inventory.py
-          # `unchanged-from-e6ca64e` creates must exist unchanged at the baseline.
-          git fetch --no-tags --depth=1 origin e6ca64e3a3d2c509840ca147fcf0d71703546318
-          mkdir -p "$RUNNER_TEMP/inventory-baseline"
-          git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/inventory-baseline"
-          python3 -I packaging/test-internal-read-inventory.py --verify-baseline "$RUNNER_TEMP/inventory-baseline"
+          python3 -I packaging/internal-read-clippy/test_ci.py
+          python3 -I packaging/internal-read-clippy/test_native.py
+
+      - name: Native Clippy fixture controls (Linux)
+        run: python3 -I packaging/internal-read-clippy/native.py --fixtures
+
+      - name: Pinned policy toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy
+
+      - name: Build pinned Clippy-only policy driver
+        run: python3 -I packaging/internal-read-clippy/compiler/build.py
+
+      - name: internal-read compiler and manifest regressions
+        run: |
+          DRIVER="$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver"
+          EVIDENCE="$RUNNER_TEMP/internal-read-regressions"
+          python3 -I packaging/internal-read-clippy/compiler/test_driver.py --driver "$DRIVER" --output "$EVIDENCE/compiler"
+          python3 -I packaging/internal-read-clippy/syntax/test_compiled.py --driver "$DRIVER" --output "$EVIDENCE/syntax"
+          CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR="$HOME/.cargo/internal-read-clippy/grammar-target" flock /tmp/muse-cargo.lock cargo +1.98.0 test --locked --manifest-path packaging/internal-read-clippy/syntax/Cargo.toml
+          python3 -I packaging/internal-read-clippy/controls/run.py --driver "$DRIVER" --output "$EVIDENCE/controls.json"
+          python3 -I packaging/internal-read-clippy/test_policy.py
+          python3 -I packaging/internal-read-clippy/test_manifest.py --driver "$DRIVER" --output "$EVIDENCE/manifest"
+          python3 -I packaging/internal-read-clippy/test_diagnostics.py --driver "$DRIVER" --output "$EVIDENCE/diagnostics"
+          python3 -I packaging/internal-read-clippy/test_dispatch.py --driver "$DRIVER" --output "$EVIDENCE/dispatch"
+          python3 -I packaging/internal-read-clippy/witnesses/test_provenance.py
+          python3 -I packaging/internal-read-clippy/witnesses/run.py --driver "$DRIVER" --output "$EVIDENCE/api"
+          python3 -I packaging/internal-read-clippy/witnesses/test_journal_protocol.py --driver "$DRIVER" --output "$EVIDENCE/journal"
+
+      - name: Production Clippy and reviewed manifest diff
+        run: python3 -I packaging/internal-read-clippy/policy.py
 
       - name: aarch64 checked-open CI contract
         run: |
@@ -68,12 +97,12 @@ jobs:
           ./test-harness/test-aarch64-checked-open-ci.sh --self-test
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
         env:
           RATARMOUNT_REQUIRE_XORRISO: "1"
-        run: cargo test --workspace
+        run: CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test --workspace
 
       - name: packaging systemd/autofs helper
         run: |

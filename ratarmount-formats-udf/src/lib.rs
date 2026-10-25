@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Read-only UDF (ECMA-167 / UDF 2.01) filesystem image mount source.
 //!
 //! In-process extent reads (no loop mount). Detection is a Volume Recognition
@@ -141,6 +144,10 @@ impl UdfMountSource {
                 path.display()
             )));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0373-M01","item":"<ratarmount_formats_udf::UdfMountSource>::open_with_offset","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = File::open(path)?;
         Self::from_reader(file, path.to_path_buf(), partition_offset)
             .map_err(|e| UdfError::Msg(format!("failed to open UDF image {}: {e}", path.display())))
@@ -596,7 +603,14 @@ pub fn looks_like_udf(path: &Path) -> bool {
 /// Extension fallback (`*.udf`) applies only at offset 0 so a partitioned
 /// disk named `*.udf` is not reported as a superfloppy.
 pub fn looks_like_udf_at(path: &Path, partition_offset: u64) -> bool {
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0374-M01","item":"ratarmount_formats_udf::looks_like_udf_at","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = File::open(path);
+        __inventory_value_0
+    } {
         if looks_like_udf_reader_at(&mut f, partition_offset) {
             return true;
         }

@@ -358,6 +358,10 @@ fn bytes_to_tempfile(
     token: &str,
     bytes: Vec<u8>,
 ) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0481-M01","item":"ratarmount_remote::dropbox::bytes_to_tempfile","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     tmp.write_all(&bytes).map_err(|e| {
         RemoteError::Dropbox(redact_token(
@@ -506,6 +510,10 @@ fn fetch_dropbox_via_ranges(
     api_url: &str,
     size: u64,
 ) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0482-M01","item":"ratarmount_remote::dropbox::fetch_dropbox_via_ranges","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     if size == 0 {
         tmp.flush()?;
@@ -618,6 +626,10 @@ fn fetch_dropbox_full_body(
     }
 
     let mut reader = resp.into_reader();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0483-M01","item":"ratarmount_remote::dropbox::fetch_dropbox_full_body","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     let n = io::copy(&mut reader, &mut tmp).map_err(|e| {
         RemoteError::Dropbox(redact_token(
@@ -1230,7 +1242,14 @@ impl MountSource for DropboxMountSource {
                 .map_err(|_| io::Error::other("temp_files lock poisoned"))?;
             guard.push(kept.clone());
         }
-        Ok(Box::new(File::open(kept)?))
+        Ok(Box::new({
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0484-M01","item":"<ratarmount_remote::dropbox::DropboxMountSource as ratarmount_core::MountSource<ratarmount_remote::dropbox::DropboxMountSource>>::open","disposition":"residual","reason":"spooled remote payload body","family":"http-spool-cache","issue":"#196","category":"http-spool-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = File::open(kept);
+            __inventory_value_0
+        }?))
     }
 
     fn is_immutable(&self) -> bool {

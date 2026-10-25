@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! Test fixture (#151): a shared object that links ratarmount-index and its
 //! bundled SQLite privately, as the Python `_native` module does. Its
 //! constructor runs at `dlopen`; `tests/dso.rs` loads it into a process that

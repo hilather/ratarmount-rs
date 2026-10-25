@@ -1,0 +1,898 @@
+[
+  {
+    "path": "nix::dir::Dir::open",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::dir::Dir::openat",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::sys::mman::shm_open",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::mqueue::mq_open",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::unistd::mkdtemp",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::fcntl::openat2",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::sys::memfd::memfd_create",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::dlsym",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::dlvsym",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::dlmopen",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::posix_spawn_file_actions_adddup2",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::sem_open",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mq_open",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::memfd_create",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::fs::memfd_create",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::clonefile",
+    "availability": "unavailable-native",
+    "reason": "Apple-only definition; isolated sweep-2 platform fixture observed this definition on aarch64-apple-darwin. Native Linux cannot compile it."
+  },
+  {
+    "path": "libc::clonefileat",
+    "availability": "unavailable-native",
+    "reason": "Apple-only definition; isolated sweep-2 platform fixture observed this definition on aarch64-apple-darwin. Native Linux cannot compile it."
+  },
+  {
+    "path": "libc::fclonefileat",
+    "availability": "unavailable-native",
+    "reason": "Apple-only definition; isolated sweep-2 platform fixture observed this definition on aarch64-apple-darwin. Native Linux cannot compile it."
+  },
+  {
+    "path": "libc::copyfile",
+    "availability": "unavailable-native",
+    "reason": "Apple-only definition; isolated sweep-2 platform fixture observed this definition on aarch64-apple-darwin. Native Linux cannot compile it."
+  },
+  {
+    "path": "rustix::fs::fclonefileat",
+    "availability": "unavailable-native",
+    "reason": "Apple-only definition; isolated sweep-2 platform fixture observed this definition on aarch64-apple-darwin. Native Linux cannot compile it."
+  },
+  {
+    "path": "libc::wopen",
+    "availability": "unavailable-native",
+    "reason": "Windows-only definition; isolated sweep-2 platform fixture observed applicable definitions on x86_64-pc-windows-gnu. Native Linux cannot compile it."
+  },
+  {
+    "path": "libc::open_osfhandle",
+    "availability": "unavailable-native",
+    "reason": "Windows-only definition; isolated sweep-2 platform fixture observed applicable definitions on x86_64-pc-windows-gnu. Native Linux cannot compile it."
+  },
+  {
+    "path": "rustix::shm::open",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mknod",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mknodat",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::fs::mknodat",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::shm_open",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::posix_spawn_file_actions_addopen",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mkfifo",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mkfifoat",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::fs::mkfifoat",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::fcntl::open",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::fcntl::openat",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::fcntl::fcntl",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::unistd::dup",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::unistd::dup2",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::unistd::dup3",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::unistd::mkstemp",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::unistd::mkfifo",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::unistd::mkfifoat",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::unistd::mkdir",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::sys::stat::mknod",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::sys::stat::mknodat",
+    "availability": "native-external"
+  },
+  {
+    "path": "nix::sys::stat::mkdirat",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::tmpfile",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::tmpfile64",
+    "availability": "native-external"
+  },
+  {
+    "path": "ratarmount_index::managed_read::VfsLockHolder::shared",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_index::managed_read::lock_probe::other_process_sees_lock",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_index::managed_read::imp::ByteFile::open",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "libc::syscall",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::fopen",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::fopen64",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::freopen",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::freopen64",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::open_by_handle_at",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mkdir",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mkdirat",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::spooled_tempfile",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::spooled_tempfile_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::SpooledTempFile::new",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::SpooledTempFile::new_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::SpooledTempFile::roll",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::SpooledTempFile::set_len",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::SpooledTempFile::into_file",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::io::fcntl_dupfd",
+    "availability": "unavailable-native",
+    "reason": "rustix 1.1.5 exposes this definition only for ESP-IDF; native Linux unavailable."
+  },
+  {
+    "path": "rustix::io::fcntl_dupfd_cloexec",
+    "availability": "native-external"
+  },
+  {
+    "path": "ratarmount_compositing::write_overlay::open_admitted_file",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "libc::openat64",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::creat",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::creat64",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mkstemp",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mkostemp",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mkstemps",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mkostemps",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::mkstemp64",
+    "availability": "unavailable-native",
+    "reason": "Locked libc 0.2.189 does not expose this Rust definition on x86_64 Linux; the compiled availability fixture gives E0425."
+  },
+  {
+    "path": "libc::mkostemp64",
+    "availability": "unavailable-native",
+    "reason": "Locked libc 0.2.189 does not expose this Rust definition on x86_64 Linux; the compiled availability fixture gives E0425."
+  },
+  {
+    "path": "libc::mkstemps64",
+    "availability": "unavailable-native",
+    "reason": "Locked libc 0.2.189 does not expose this Rust definition on x86_64 Linux; the compiled availability fixture gives E0425."
+  },
+  {
+    "path": "libc::mkostemps64",
+    "availability": "unavailable-native",
+    "reason": "Locked libc 0.2.189 does not expose this Rust definition on x86_64 Linux; the compiled availability fixture gives E0425."
+  },
+  {
+    "path": "libc::mkdtemp",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::fcntl64",
+    "availability": "unavailable-native",
+    "reason": "Locked libc 0.2.189 does not expose this Rust definition on x86_64 Linux; the compiled availability fixture gives E0425."
+  },
+  {
+    "path": "std::fs::OpenOptions::create",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::OpenOptions::create_new",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::OpenOptions::create",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::OpenOptions::create_new",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::create_dir",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::create_dir_all",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::DirBuilder::new",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::DirBuilder::create",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::create_dir",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::create_dir_all",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::DirBuilder::new",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::DirBuilder::create",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::fs::mkdir",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::fs::mkdirat",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::Builder::make",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::Builder::make_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "lopdf::Document::load_with_password",
+    "availability": "unavailable-native",
+    "reason": "Locked lopdf 0.34.0 does not declare Document::load_with_password."
+  },
+  {
+    "path": "std::net::TcpStream::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::net::TcpListener::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::net::UdpSocket::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::os::unix::net::UnixListener::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::os::unix::net::UnixDatagram::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::os::windows::io::OwnedHandle::try_clone",
+    "availability": "unavailable-native",
+    "reason": "Windows-only definition; isolated sweep-2 platform fixture observed applicable definitions on x86_64-pc-windows-gnu. Native Linux cannot compile it."
+  },
+  {
+    "path": "std::os::windows::io::BorrowedHandle::try_clone_to_owned",
+    "availability": "unavailable-native",
+    "reason": "Windows-only definition; isolated sweep-2 platform fixture observed applicable definitions on x86_64-pc-windows-gnu. Native Linux cannot compile it."
+  },
+  {
+    "path": "std::os::windows::io::BorrowedSocket::try_clone_to_owned",
+    "availability": "unavailable-native",
+    "reason": "Windows-only definition; isolated sweep-2 platform fixture observed applicable definitions on x86_64-pc-windows-gnu. Native Linux cannot compile it."
+  },
+  {
+    "path": "std::os::windows::io::OwnedSocket::try_clone",
+    "availability": "unavailable-native",
+    "reason": "Windows-only definition; isolated sweep-2 platform fixture observed applicable definitions on x86_64-pc-windows-gnu. Native Linux cannot compile it."
+  },
+  {
+    "path": "std::io::PipeReader::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::io::PipeWriter::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::os::windows::io::FromRawHandle::from_raw_handle",
+    "availability": "unavailable-native",
+    "reason": "Windows-only definition; isolated sweep-2 platform fixture observed applicable definitions on x86_64-pc-windows-gnu. Native Linux cannot compile it."
+  },
+  {
+    "path": "tokio::net::windows::named_pipe::NamedPipeServer::from_raw_handle",
+    "availability": "unavailable-native",
+    "reason": "Windows-only definition; isolated sweep-2 platform fixture observed applicable definitions on x86_64-pc-windows-gnu. Native Linux cannot compile it."
+  },
+  {
+    "path": "tokio::net::windows::named_pipe::NamedPipeClient::from_raw_handle",
+    "availability": "unavailable-native",
+    "reason": "Windows-only definition; isolated sweep-2 platform fixture observed applicable definitions on x86_64-pc-windows-gnu. Native Linux cannot compile it."
+  },
+  {
+    "path": "std::os::windows::io::IntoRawHandle::into_raw_handle",
+    "availability": "unavailable-native",
+    "reason": "Windows-only definition; isolated sweep-2 platform fixture observed applicable definitions on x86_64-pc-windows-gnu. Native Linux cannot compile it."
+  },
+  {
+    "path": "ratarmount_formats_libarchive::archive_read_open_filename_w",
+    "availability": "unavailable-native",
+    "reason": "Repository ffi has no archive_read_open_filename_w declaration."
+  },
+  {
+    "path": "ratarmount_formats_libarchive::archive_read_open_filenames",
+    "availability": "unavailable-native",
+    "reason": "Repository ffi has no archive_read_open_filenames declaration."
+  },
+  {
+    "path": "ratarmount_formats_libarchive::archive_read_open_filename",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_compositing::write_overlay::open_options_nofollow",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_core::db_inodes::unix::open_admitted",
+    "availability": "native-repository-alias",
+    "reason": "Compiled public and private spellings independently against the actual ratarmount-core dependency."
+  },
+  {
+    "path": "ratarmount_core::db_inodes::unix::openat_admitted",
+    "availability": "native-repository-alias",
+    "reason": "Compiled public and private spellings independently against the actual ratarmount-core dependency."
+  },
+  {
+    "path": "ratarmount::overlay_pack::openat_admitted",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "std::fs::File::open",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::File::open",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::File::create",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::File::create",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::File::create_new",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::File::create_new",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::read",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::read",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::read_to_string",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::read_to_string",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::copy",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::copy",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::write",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::write",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::OpenOptions::new",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::File::options",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::OpenOptions::open",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::OpenOptions::new",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::File::options",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::OpenOptions::open",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::tempfile",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::tempfile_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::NamedTempFile::new",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::NamedTempFile::new_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::NamedTempFile::with_prefix",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::NamedTempFile::with_prefix_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::NamedTempFile::with_suffix",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::NamedTempFile::with_suffix_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::Builder::tempfile",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::Builder::tempfile_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::tempdir",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::tempdir_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::TempDir::new",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::TempDir::new_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::TempDir::with_prefix",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::TempDir::with_prefix_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::TempDir::with_suffix",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::TempDir::with_suffix_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::Builder::tempdir",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::Builder::tempdir_in",
+    "availability": "native-external"
+  },
+  {
+    "path": "tempfile::NamedTempFile::reopen",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::fs::open",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::fs::openat",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::fs::openat2",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::open",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::openat",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::open64",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::dup",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::io::dup",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::dup2",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::io::dup2",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::dup3",
+    "availability": "native-external"
+  },
+  {
+    "path": "rustix::io::dup3",
+    "availability": "native-external"
+  },
+  {
+    "path": "libc::fcntl",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::os::fd::FromRawFd::from_raw_fd",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::os::fd::IntoRawFd::into_raw_fd",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::fs::File::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::os::unix::net::UnixStream::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "tokio::fs::File::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::os::fd::BorrowedFd::try_clone_to_owned",
+    "availability": "native-external"
+  },
+  {
+    "path": "std::os::fd::OwnedFd::try_clone",
+    "availability": "native-external"
+  },
+  {
+    "path": "git2::Repository::open",
+    "availability": "native-external"
+  },
+  {
+    "path": "git2::Repository::open_bare",
+    "availability": "native-external"
+  },
+  {
+    "path": "git2::Repository::open_ext",
+    "availability": "native-external"
+  },
+  {
+    "path": "git2::Repository::open_from_env",
+    "availability": "native-external"
+  },
+  {
+    "path": "git2::Repository::discover",
+    "availability": "native-external"
+  },
+  {
+    "path": "lopdf::Document::load",
+    "availability": "native-external"
+  },
+  {
+    "path": "lopdf::Document::load_filtered",
+    "availability": "native-external"
+  },
+  {
+    "path": "ratarmount_index::managed_read::read",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_index::managed_read::read_to_string",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_index::managed_read::read_prefix",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_index::managed_read::sha256_hex",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_index::managed_read::copy_exclusive_new",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_index::managed_read::copy_create_or_truncate",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_index::managed_read::copy_into",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_index::managed_read::ManagedReadCursor::open",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_core::db_inodes::open_admitted",
+    "availability": "native-repository-alias",
+    "reason": "Compiled public and private spellings independently against the actual ratarmount-core dependency."
+  },
+  {
+    "path": "ratarmount_core::db_inodes::openat_admitted",
+    "availability": "native-repository-alias",
+    "reason": "Compiled public and private spellings independently against the actual ratarmount-core dependency."
+  },
+  {
+    "path": "ratarmount_index::range_cache::open_regular",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_remote::hf_cache::open_regular",
+    "availability": "repository",
+    "reason": "Must be witnessed against the actual compiled repository definition."
+  },
+  {
+    "path": "ratarmount_compress::commit_journal::recover",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::commit_journal::recover_with",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::commit_journal::recover_guarded",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::commit_journal::authorize_owned",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::commit_journal::authorize_forced",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::commit_journal::replace_suffix_with_hook",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::commit_journal::guard_copy",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::splice_zstd_last_frames_append",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::splice_zstd_last_frames_append_with",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::splice_zstd_last_frames_replace",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  }
+]
