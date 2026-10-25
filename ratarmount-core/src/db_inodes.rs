@@ -313,7 +313,11 @@ mod unix {
     }
 
     /// Open without `O_TRUNC`, check the descriptor obtained, quarantine a
-    /// refused one, truncate only an admitted file.
+    /// refused one, truncate only an admitted file. With `O_CREAT`, an
+    /// exclusive attempt first learns whether THIS call created the file:
+    /// only a new inode may skip the writable reopen a read-only `O_TRUNC`
+    /// needs; an existing file (an empty one included) may not, so its
+    /// write permission is still checked.
     fn generic(
         dir: RawFd,
         c: &CString,
@@ -321,7 +325,24 @@ mod unix {
         flags: libc::c_int,
         mode: u32,
     ) -> io::Result<Option<OwnedFd>> {
-        let fd = openat_raw(dir, c, flags & !libc::O_TRUNC, mode)?;
+        let mut created = false;
+        let fd = if flags & libc::O_CREAT != 0 {
+            match openat_raw(dir, c, (flags | libc::O_EXCL) & !libc::O_TRUNC, mode) {
+                Ok(fd) => {
+                    created = true;
+                    fd
+                }
+                // The name exists: open it (`O_CREAT` is kept so a file
+                // removed meanwhile, or a dangling symlink's target, is
+                // created as `open(2)` would); it counts as existing.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && flags & libc::O_EXCL == 0 => {
+                    openat_raw(dir, c, flags & !libc::O_TRUNC, mode)?
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            openat_raw(dir, c, flags & !libc::O_TRUNC, mode)?
+        };
         // A descriptor whose identity cannot be established may be the
         // database's: quarantined, never closed.
         let st = match fstat(fd.as_raw_fd()) {
@@ -338,13 +359,13 @@ mod unix {
         if flags & libc::O_TRUNC != 0 && st.st_mode & libc::S_IFMT == libc::S_IFREG {
             if flags & libc::O_ACCMODE != libc::O_RDONLY {
                 truncate(&fd)?;
-            } else if st.st_size != 0 {
-                // An empty read-only open (a fresh creation included) has
-                // nothing to truncate: no writable reopen, which a new
-                // mode-`000` file would refuse (R10-FIX9).
-                // `O_RDONLY | O_TRUNC`: truncate through a writable handle on
-                // the same, admitted inode (write permission is required, as
-                // for the kernel's own `O_TRUNC`).
+            } else if !created {
+                // Only a file THIS call created skips the writable reopen
+                // (a fresh mode-`000` file would refuse it — R10-FIX9).
+                // `O_RDONLY | O_TRUNC` on an existing file (empty included):
+                // truncate through a writable handle on the same, admitted
+                // inode (write permission is required, as for the kernel's
+                // own `O_TRUNC`).
                 let writer = openat_raw(
                     dir,
                     c,
@@ -530,5 +551,39 @@ mod tests {
         assert_eq!(fs::metadata(&fresh).unwrap().mode() & 0o7777, 0);
         truncated.unwrap();
         assert_eq!(fs::metadata(&existing).unwrap().len(), 0);
+    }
+
+    /// Regression (sweep 1): on the generic path an `O_RDONLY | O_TRUNC`
+    /// open of an EXISTING empty file skipped the writable reopen because
+    /// `st_size == 0`, conflating it with a fresh creation — a mode-`444`
+    /// file opened `Ok` where `open(2)` returns `EACCES`. Only an inode
+    /// this call created may skip the reopen; an existing file goes through
+    /// the writable handle, so its write permission is checked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_generic_open_read_only_trunc_of_an_existing_empty_file() {
+        use super::unix::FORCE_GENERIC;
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // Safety: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: root bypasses the mode-444 write-permission check");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        fs::write(&empty, b"").unwrap();
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o444)).unwrap();
+        let writable = tmp.path().join("writable");
+        fs::write(&writable, b"").unwrap();
+        FORCE_GENERIC.with(|f| f.set(true));
+        let error = open_admitted(&empty, libc::O_RDONLY | libc::O_TRUNC, 0).unwrap_err();
+        let opened = open_admitted(&writable, libc::O_RDONLY | libc::O_TRUNC, 0);
+        FORCE_GENERIC.with(|f| f.set(false));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(empty.is_file());
+        // R10-FIX10: a writable existing empty file still opens (and is
+        // truncated through the writable handle).
+        opened.unwrap();
     }
 }
