@@ -23,6 +23,9 @@ creation metadata and an explicit manifest review. Restricted source cannot lowe
 the disallowed-item lints with `allow`/`warn` or wrap their expectations in
 `cfg_attr`. CI compares item-path/reason approvals in both directions: an
 unmanifested expectation or an approval without a matching expectation fails.
+Every protected-lint source expectation is checked regardless of cfg activity
+or reason text; journal exemptions require an explicit reviewed manifest flag
+and exact operation identity.
 The generator writes a candidate; CI never refreshes approvals. N2–N4 are syntax
 refusals only, with no textual operation, path/reexport, creation-flag or foreign-symbol resolver.
 Production membership is whatever Clippy compiles for the selected lib/bin
@@ -40,16 +43,21 @@ calls in repository proc-macro crate implementations still receive normal
 Clippy enforcement. N2 refuses all local HIR foreign blocks/link_name regardless
 of origin except the exact reviewed `ratarmount_formats_libarchive::ffi` module.
 N4 file exceptions have no content hash: inactive alternatives require ordinary
-review. N4 is defence in depth behind native Linux/macOS/Windows CI coverage;
-Linux does not lint inactive target alternatives. Only stripping cfg/cfg_attr
-target predicates need reviewed files; cfg! returns a boolean and is permitted.
+review. Inventory enforcement is Linux-only; inactive native alternatives remain
+out of scope and require ordinary review. N4 structurally refuses any target
+predicate in cfg/cfg_attr at any nesting level, regardless of other predicates
+or parent cfg activity, outside reviewed files. Syntax audits also inspect
+inactive item bodies. cfg! returns a boolean and is permitted. N3 refuses nested
+macro_rules! definitions in restricted macro transcribers.
 Unparseable cfg_attr predicates and clippy/not(clippy) stripping are refused in
-restricted packages, including reviewed files. Native CI uses
+restricted packages, including reviewed files. Linux production Clippy uses
 `-D clippy::disallowed_methods -F unused_macros -D warnings`, preserving reviewed
 expectations while rejecting unfulfilled ones. Root forbid attributes document
 the unused-macro rule without a source-shape check. Ordinary builds suppress
 unfulfilled inventory expectations only while `internal_read_inventory` is off;
-selected policy/native compilations enable it and require fulfillment.
+selected policy compilations and Linux fixture controls enable it and require
+fulfillment. Native macOS/Windows inventory coverage is deferred; their existing
+build/test jobs do not provide inventory approvals.
 Dormant exported macros and other non-target cfg predicates remain follow-up #209.
 
 Do **not** push code that fails `cargo fmt --check`.
@@ -76,6 +84,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Symptom / fix | Commands |
 |---------------|----------|
 | #201: Clippy resolved definitions, N2–N4 syntax, narrow expectations and manifest diff; quiet-print shadowing; typed statfs | `python3 -I packaging/internal-read-clippy/test_policy.py` · `python3 -I packaging/internal-read-clippy/controls/run.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver"` · `python3 -I packaging/internal-read-clippy/policy.py` · `cargo test -p ratarmount --bin ratarmount regression_typed_statfs` |
+| #201 r10b: false/release/feature cfg hid syntax, macro generators hid attributes, and inactive/shadowed expectations escaped manifest review | `python3 -I packaging/internal-read-clippy/syntax/test_compiled.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-syntax` · `python3 -I packaging/internal-read-clippy/test_manifest.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-manifest` |
 | BIG fixture builder missing tar.lz4 / multi-frame zstd | `./benchmarks/test-compare-fixtures.sh` |
 | Vector-wave fixture builder missing catalog tars | `./benchmarks/test-compare-vector-wave.sh` |
 | Format sweep fixture builder: missing-producer skips, corrupt or count-mismatched reads, `PREPARE_ONLY` / `NO_FUSE` regressions (AI-FMTBENCH) | `./benchmarks/test-compare-formats.sh` |

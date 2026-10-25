@@ -1992,18 +1992,23 @@ textual operation collector runs in CI.
 
 Each reviewed operation has a narrow direct `#[expect]` with a literal reason
 and creation policy. Restricted source cannot lower the disallowed-item lints
-with `allow`/`warn` or use `cfg_attr`-wrapped expectations. Native CI uses
+with `allow`/`warn` or use `cfg_attr`-wrapped expectations. Linux production
+Clippy uses
 `-D clippy::disallowed_methods -F unused_macros -D warnings`, so reviewed
 expectations work and unfulfilled expectations fail. Ordinary compilations
 suppress unfulfilled inventory expectations while `internal_read_inventory` is
-off; selected policy/native compilations enable it. A mandatory collection pass
+off; selected policy compilations and Linux fixture controls enable it.
+A mandatory collection pass
 observes the actual resolved definitions. CI compares the generated manifest
 byte for byte with the reviewed manifest, rejecting both unmanifested
 expectations and approvals without a matching expectation. Its identity is the
 enclosing item path plus complete literal reason. Moving a leaf down a file does
 not change that identity; changing the operation, reason, leaf syntax or multiplicity changes the manifest.
 Creation and mode metadata are explicit review decisions, never inferred from
-flags or builder chains.
+flags or builder chains. Every protected-lint source expectation is checked
+regardless of cfg activity or reason text. Independent journal exemptions need
+an explicit `journal_exemption: true` manifest entry with the exact item,
+literal reason, lint and resolved/configured rule identity.
 
 This lint guards against mistakes in honest repository code. It is not a
 security boundary. Runtime enforcement through openat2 handles and the seccomp
@@ -2019,15 +2024,20 @@ broader dependency acquisitions and `read_dir` coverage are follow-up #209.
 
 Only N2–N4 add syntax refusals: every local foreign block and `link_name` must
 belong to the exact reviewed `ratarmount_formats_libarchive::ffi` compiler module;
-repo macros cannot contain cfg/cfg_attr or substituted transcriber attributes;
-and stripping target cfg/cfg_attr attributes in the 40 restricted packages
-require an exact reviewed-file exception. Unparseable cfg_attr predicates and
-clippy/not(clippy) stripping are refused there even in reviewed files. cfg!
+repo macros cannot contain cfg/cfg_attr or substituted transcriber attributes,
+and restricted macro transcribers cannot define nested macro_rules! macros.
+Any target predicate in cfg/cfg_attr in the 40 restricted packages requires an
+exact reviewed-file exception, regardless of nesting, other predicates or
+parent cfg activity. Syntax audits inspect inactive item bodies too.
+Unparseable cfg_attr predicates and clippy/not(clippy) stripping are refused
+there even in reviewed files. cfg!
 returns a boolean, so both branches remain type-checked and linted. CI supplies
 `-F unused_macros`; root forbid attributes document the rule without a syntax
-check. N4 is defence in depth behind the native CI matrix. File exceptions have
-no content hash; changes to alternatives outside native matrix coverage still
-need ordinary review. Macro expansion records enforce the configured include ban; CSI has one reviewed
+check. Inventory enforcement is Linux-only. File exceptions have no content
+hash; inactive macOS/Windows alternatives remain out of scope and require
+ordinary review. The existing platform build/test jobs do not provide inventory
+approvals. Macro expansion records enforce the configured include ban; CSI
+has one reviewed
 source-file/item exception. Unused exported macros and other non-target cfg
 predicates remain documented gaps (#209).
 

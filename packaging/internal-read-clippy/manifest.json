@@ -802,6 +802,38 @@
       "rule_reason": "inventory-op:File::open"
     },
     {
+      "configured_path": "ratarmount_compress::commit_journal::authorize_forced",
+      "item": "<ratarmount_compositing::journal_recovery::Owner<'L0>>::authorize",
+      "journal_exemption": true,
+      "leaf_digest": "f2c1d2e47763c1da6ae961725f3740a559eadd5a33b7d82fc9540b5260271375",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "Owner::Forced represents the caller's explicit force flag",
+      "resolved": "ratarmount_compress::commit_journal::authorize_forced",
+      "rule_reason": "use ratarmount_compositing::Owner::Forced (only behind a --force-* flag)"
+    },
+    {
+      "configured_path": "ratarmount_compress::commit_journal::authorize_owned",
+      "item": "<ratarmount_compositing::journal_recovery::Owner<'L0>>::authorize",
+      "journal_exemption": true,
+      "leaf_digest": "aa1a9e34e37df91e4cc10a203ebb9571c77b91df85a6183908429eb8e896e86f",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "Owner::Inode is the reviewed authority for applying the locked inode's own journal",
+      "resolved": "ratarmount_compress::commit_journal::authorize_owned",
+      "rule_reason": "use ratarmount_compositing::Owner::Inode"
+    },
+    {
       "configured_path": "ratarmount_compositing::write_overlay::open_options_nofollow",
       "item": "<ratarmount_compositing::overlay_layer::ReadOnlyOverlayLayer>::open_host",
       "leaf_digest": "5639f83c98c0193aa09c48d92b105af9c9d7362a8cb7637a6571b51a477b2463",
@@ -10808,6 +10840,86 @@
       "rule_reason": "inventory-op:File::open"
     },
     {
+      "configured_path": "ratarmount_compress::commit_journal::guard_copy",
+      "item": "ratarmount_compositing::journal_recovery::publish_over",
+      "journal_exemption": true,
+      "leaf_digest": "4bc65734a2ef8d217f3931cae49cd0bbd867410e660522bf857ce7483b2f10bc",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The compositing publisher holds the checked-source guard across the publication callback",
+      "resolved": "ratarmount_compress::commit_journal::guard_copy",
+      "rule_reason": "use journal_recovery::publish_over"
+    },
+    {
+      "configured_path": "ratarmount_compress::commit_journal::recover_guarded",
+      "item": "ratarmount_compositing::journal_recovery::recover_journal",
+      "journal_exemption": true,
+      "leaf_digest": "02c51d4ea2bd77673e832ff0c82d78d9618136ec75ddeffe9082e7cc1f34721f",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The compositing recovery owner supplies authorization, row guards and the before-unlink restamp",
+      "resolved": "ratarmount_compress::commit_journal::recover_guarded",
+      "rule_reason": "recover through ratarmount_compositing::recover_journal_at with an Owner"
+    },
+    {
+      "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
+      "item": "ratarmount_compositing::journal_recovery::replace_committing",
+      "journal_exemption": true,
+      "leaf_digest": "efcf1d057a73a9144b4d4f047c850886baecceb20cc8dbfe581ec67b54937fa3",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The compositing replacement wrapper supplies the checked base and commit restamp hook",
+      "resolved": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
+      "rule_reason": "use journal_recovery::replace_committing"
+    },
+    {
+      "configured_path": "ratarmount_compress::splice_zstd_last_frames_append_with",
+      "item": "ratarmount_compositing::journal_recovery::splice_append_committing",
+      "journal_exemption": true,
+      "leaf_digest": "fa986198be38709b799b786193b3b42b4bed8fa5d9aad7dabf634677e42524f4",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The compositing append wrapper supplies the checked base and commit restamp hook",
+      "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "rule_reason": "use journal_recovery::splice_append_committing"
+    },
+    {
+      "configured_path": "ratarmount_compress::splice_zstd_last_frames_replace",
+      "item": "ratarmount_compositing::journal_recovery::splice_replace_over",
+      "journal_exemption": true,
+      "leaf_digest": "f1c790e05bdc6567c58c47231559a82e96bcf2e0b9f17456c35146996d7fae32",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The compositing copy-splice wrapper provides the previously accepted source stamp",
+      "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace",
+      "rule_reason": "use journal_recovery::splice_replace_over"
+    },
+    {
       "configured_path": "rustix::fs::open",
       "item": "ratarmount_compositing::overlay_changes::mentioned_paths_with_immutability",
       "leaf_digest": "c64d29cfe74665e6f20a8949d76ba22cb9e6e66879728e6db7c5cf21cd4a7a76",
@@ -12490,6 +12602,54 @@
       "rule_reason": "inventory-op:File::open"
     },
     {
+      "configured_path": "ratarmount_compress::commit_journal::authorize_forced",
+      "item": "ratarmount_compress::commit_journal::recover",
+      "journal_exemption": true,
+      "leaf_digest": "f6c554a842fe6bac8ce002b71f4902615630b583d98c2e9afe91c66e052975c6",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The documented test recovery helper explicitly selects forced authorization",
+      "resolved": "ratarmount_compress::commit_journal::authorize_forced",
+      "rule_reason": "use ratarmount_compositing::Owner::Forced (only behind a --force-* flag)"
+    },
+    {
+      "configured_path": "ratarmount_compress::commit_journal::recover_with",
+      "item": "ratarmount_compress::commit_journal::recover",
+      "journal_exemption": true,
+      "leaf_digest": "29e167ecf478643afec6f4469ae100954ddefc0c61e2cfcab7a74375349b295d",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The test recovery helper delegates to the journal recovery implementation",
+      "resolved": "ratarmount_compress::commit_journal::recover_with",
+      "rule_reason": "recover through ratarmount_compositing::recover_journal_at with an Owner"
+    },
+    {
+      "configured_path": "ratarmount_compress::commit_journal::recover_guarded",
+      "item": "ratarmount_compress::commit_journal::recover_with",
+      "journal_exemption": true,
+      "leaf_digest": "c876220a9e54672f88086b2d729a360225fc209bf4a7526205be8c4e4d06f91a",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The recovery API delegates to its guarded implementation with an empty extra guard",
+      "resolved": "ratarmount_compress::commit_journal::recover_guarded",
+      "rule_reason": "recover through ratarmount_compositing::recover_journal_at with an Owner"
+    },
+    {
       "configured_path": "std::fs::File::open",
       "item": "ratarmount_compress::commit_journal::unix::guard_copy",
       "leaf_digest": "7d3787d8232e8476c74ac31166147b2930ed49760c6cb46137412e55ca860984",
@@ -13975,6 +14135,54 @@
       "rule_reason": "inventory-op:tempfile"
     },
     {
+      "configured_path": "ratarmount_compress::splice_zstd_last_frames_append_with",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append",
+      "journal_exemption": true,
+      "leaf_digest": "2f30d180db13fb8f969ee53046412da9764624f44a92316b39865f19fca49159",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The append convenience API delegates to the implementation with an empty unlink hook",
+      "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "rule_reason": "use journal_recovery::splice_append_committing"
+    },
+    {
+      "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "journal_exemption": true,
+      "leaf_digest": "69cf8c9780946a48ffecdaa762c2d13adb7734b3920dd669ba2bc52bce6cc964",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The append splice commits its checked suffix through the journal implementation",
+      "resolved": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
+      "rule_reason": "use journal_recovery::replace_committing"
+    },
+    {
+      "configured_path": "ratarmount_compress::commit_journal::guard_copy",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
+      "journal_exemption": true,
+      "leaf_digest": "bb617f19dee9893805035b25db922b90875c11a32a1bdb58385785dc03c242c6",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The oversized splice fallback holds the journal guard while publishing its staged copy",
+      "resolved": "ratarmount_compress::commit_journal::guard_copy",
+      "rule_reason": "use journal_recovery::publish_over"
+    },
+    {
       "configured_path": "std::fs::File::open",
       "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
       "leaf_digest": "ffe36dbe6ba452a84db204280dfe78f8127ab653d06c86dbedf8cfc333965f69",
@@ -14055,6 +14263,22 @@
       "reason": "internal-read:v1 {\"id\":\"IR-B0281-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
+    },
+    {
+      "configured_path": "ratarmount_compress::commit_journal::guard_copy",
+      "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace",
+      "journal_exemption": true,
+      "leaf_digest": "bb617f19dee9893805035b25db922b90875c11a32a1bdb58385785dc03c242c6",
+      "lint": "clippy::disallowed_methods",
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "The splice implementation holds the journal copy guard while publishing the staged archive",
+      "resolved": "ratarmount_compress::commit_journal::guard_copy",
+      "rule_reason": "use journal_recovery::publish_over"
     },
     {
       "configured_path": "tempfile::NamedTempFile::new_in",
@@ -20910,12 +21134,12 @@
     }
   ],
   "policy": {
-    "configuration": "d7c030694a27a844905b8fc34ae7d7663dd664cfe4b2bd638939c80e2bf88d33",
+    "configuration": "537187ebd86f7ab8994a53020bdac01cf6da90d37a9cc1ddb23055516320ccf3",
     "profiles": "f04aa50122d4ae1f0504b6411c5b47cacf3a97a9e3080e175166f3b744aa4bd8",
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
       "component_digest": "6fdbc2122f41ca9f892fe09782f4f3b6e18f23d60483a3403d3e5e0da119a0f2",
-      "patch_digest": "29803c7e2733313f1d73c7c5e2df213bed140183f887a73cc3c6dccc28668422",
+      "patch_digest": "36782c56c35274ee13dfa0fd461040485b7507f5797ebb188abc736d735b3871",
       "schema": 1,
       "source_digest": "5a9993673ce40804e6b50300df59ecb3d13942c1c89cd11e76acf705b331f982"
     }

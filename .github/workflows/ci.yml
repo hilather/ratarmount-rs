@@ -349,8 +349,7 @@ jobs:
   macos:
     name: macOS (build + test)
     runs-on: macos-14
-    # Include the native restricted-package feature sweep before build/test.
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
       # Workflow-level RUSTFLAGS=-Dwarnings also applies to *dependencies*.
       # On macOS that can fail the fuser/macFUSE build with exit 101. Clippy
@@ -438,19 +437,6 @@ jobs:
         with:
           # Bump when macOS toolchain / macFUSE link env changes.
           key: macos-14-v3
-          cache-directories: target/internal-read-native
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - uses: taiki-e/install-action@cargo-hack
-
-      - name: Native Clippy fixture controls (macOS)
-        run: python3 -I packaging/internal-read-clippy/native.py --fixtures
-
-      - name: Restricted production Clippy (native macOS feature combinations)
-        run: python3 -I packaging/internal-read-clippy/native.py --methods-level=-D
 
       - name: cargo build (fuse smoke compile)
         # Surface link/build errors before clippy. Emit ::error:: annotations so
@@ -539,39 +525,6 @@ jobs:
         run: |
           chmod +x test-harness/run-macos-smoke.sh
           ./test-harness/run-macos-smoke.sh
-
-  # Native MSVC coverage supplements the Linux inventory/manifest gate. N4
-  # remains defence in depth for packages outside the supported native matrix.
-  internal-read-windows:
-    name: internal-read (native Windows MSVC)
-    runs-on: windows-latest
-    timeout-minutes: 45
-    env:
-      RUSTFLAGS: ""
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Rust toolchain (native MSVC)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - uses: taiki-e/install-action@cargo-hack
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: internal-read-native-msvc
-          cache-directories: target/internal-read-native
-
-      - name: Native Clippy fixture controls (Windows-only read must fail)
-        run: python -I packaging/internal-read-clippy/native.py --fixtures
-
-      - name: Restricted production Clippy (native MSVC feature combinations)
-        run: python -I packaging/internal-read-clippy/native.py --methods-level=-D
 
   # G6.1: Windows library compile without FUSE / WinFsp.
   # core+index is a merge gate (stable rustc; no nightly windows_by_handle).

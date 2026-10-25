@@ -107,6 +107,11 @@ pub fn main() { ::std::println!("cargo::rerun-if-changed=vendor/owned.rs"); }
         candidate = args.output.resolve() / "candidate.json"
         attestation = args.output.resolve() / "run.json"
         parameters = argparse.Namespace(driver=driver, target_dir=root / "cache", candidate=candidate, attestation=attestation, manifest=root / "approved.json", collect=True)
+        # Regression: collection reads a reviewed approval document for explicit
+        # journal exemptions; an empty fixture starts with no exemptions.
+        # Candidate generation must never populate those approvals itself.
+        approved = {"schema": 1, "policy": {}, "entries": []}
+        parameters.manifest.write_text(policy.canonical(approved))
         base_env = os.environ.copy()
         for key in list(os.environ):
             if key.startswith(("INTERNAL_READ_", "CLIPPY_")) or key in {"RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_TARGET_DIR", "CARGO_ENCODED_RUSTFLAGS"}:
@@ -145,6 +150,7 @@ pub fn main() { ::std::println!("cargo::rerun-if-changed=vendor/owned.rs"); }
             first = run("initial-strict-collection", fresh=False)
             warm = run("warm-strict-collection", fresh=True)
             assert first == warm
+            assert json.loads(parameters.manifest.read_text()) == approved
             # Unit/integration/example targets and dependency implementations do
             # not acquire obligations, including --test of the exact lib root.
             dispatch = first / "strict/fixture/dispatch.json"

@@ -101,6 +101,12 @@
   },
   "reviewed_target_files": [
     {
+      "file": "ratarmount-9p/src/serve.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix socket accept deadline helpers and nonblocking/retry regressions; nested macOS/BSD branches are within the inline cfg(test) module."
+    },
+    {
       "file": "ratarmount-compositing/src/empty_archive.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
@@ -137,6 +143,12 @@
       "reason": "Reviewed Unix device/inode identity versus non-Unix unavailable identity; lock-probe subprocess helpers are test-only."
     },
     {
+      "file": "ratarmount-compositing/src/overlay_fsck.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix killed-writer/hot-journal incomplete-import regression inside the inline cfg(test) module."
+    },
+    {
       "file": "ratarmount-compositing/src/overlay_gate.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
@@ -161,6 +173,18 @@
       "reason": "Reviewed Unix modes, timestamps and xattr ABI adaptation for overlay metadata; unsupported xattr paths fail or return absent as documented."
     },
     {
+      "file": "ratarmount-compositing/src/overlay_policy.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix overlay policy/quota fixture helper and mutation, symlink, concurrent quota and status regressions inside the inline cfg(test) module."
+    },
+    {
+      "file": "ratarmount-compositing/src/quiet_print.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. The only target predicate gates a Linux cfg(test) quiet-print pipe failure module."
+    },
+    {
       "file": "ratarmount-compositing/src/write_overlay.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
@@ -179,10 +203,22 @@
       "reason": "Reviewed Linux copy_file_range with io copy fallback and macOS clonefile temporary allocation; three original macOS-only baseline sites retain individual metadata."
     },
     {
+      "file": "ratarmount-compress/src/repack_seekable.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix symlink-output refusal branch of repack_refuses_same_path_and_existing_output inside the inline cfg(test) module."
+    },
+    {
       "file": "ratarmount-compress/src/zstd_seek.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
       "reason": "Reviewed Linux prefetch/advisory opens; other platforms omit advice without acquiring a replacement file."
+    },
+    {
+      "file": "ratarmount-formats-git/src/lib.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. The top-level target attribute directly gates cfg(all(test,unix)) synthetic_tests; remaining Unix permission/symlink setup/assertions are in the inline cfg(test) list_dirents test."
     },
     {
       "file": "ratarmount-formats-git/src/synthetic.rs",
@@ -195,6 +231,18 @@
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
       "reason": "Reviewed Unix byte-preserving path to CString and non-Unix UTF-8 validation before libarchive opening."
+    },
+    {
+      "file": "ratarmount-formats-sevenzip/src/lib.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix set_mtime_unix helper used only by the inline cfg(test) metadata regressions."
+    },
+    {
+      "file": "ratarmount-formats-sqlar/src/lib.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix header-probe lock and macOS automatic-VFS regressions inside the inline cfg(test) module."
     },
     {
       "file": "ratarmount-formats-tar/src/lib.rs",
@@ -287,6 +335,12 @@
       "reason": "Reviewed Unix private modes and inode/mtime stamps, macOS cache root and stable Windows metadata fallback."
     },
     {
+      "file": "ratarmount-index/src/location.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix/non-Unix permission branches of sibling_existing_file_used_when_parent_not_writable are inside the inline cfg(test) module."
+    },
+    {
       "file": "ratarmount-index/src/managed_read.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
@@ -297,6 +351,12 @@
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
       "reason": "Reviewed Unix private cache-directory permissions; cfg(test) accessors do not enter production syntax ownership."
+    },
+    {
+      "file": "ratarmount-index/src/payload_cache.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. macOS/other-host assertions in payload_cache_macos_library_caches are inside the inline cfg(test) module."
     },
     {
       "file": "ratarmount-index/src/range_cache.rs",
@@ -323,6 +383,12 @@
       "reason": "Reviewed Unix no-follow opens, identity stamps, publication modes/symlinks, positional reads and non-Unix locked spool-reader fallback."
     },
     {
+      "file": "ratarmount-remote/src/hf_commit.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix regression_hf_archive_upload_keeps_index_lock inside the inline cfg(test) module."
+    },
+    {
       "file": "ratarmount-remote/src/ipfs.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
@@ -333,6 +399,12 @@
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
       "reason": "Reviewed Unix executable-bit check and Windows .exe discovery; subprocess remote access remains unchanged."
+    },
+    {
+      "file": "ratarmount-remote/src/s3.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix S3 archive upload/index-lock test helper and regression branches are all inside the inline cfg(test) module."
     },
     {
       "file": "ratarmount-remote/src/smb.rs",
@@ -365,10 +437,34 @@
       "reason": "Reviewed Windows replacement fallback and Unix atomic symlink publication; non-Unix symlink extraction retains its documented skip behavior."
     },
     {
+      "file": "ratarmount-session/src/factory.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Linux quiet-print and Unix SQLAR lock regressions are in cfg(test) tests; git_tests is directly all(test,feature=git,unix); Unix Git source-bind setup/assertions are inside cfg(test) source_bind_tests."
+    },
+    {
+      "file": "ratarmount-session/src/remote_open.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix remote archive/cache/index lock test helpers and regressions are all inside the inline cfg(test) tests module."
+    },
+    {
       "file": "ratarmount-session/src/resolve.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
       "reason": "Reviewed Unix 0700 permission adjustment on the created cache parent; other targets keep platform permissions."
+    },
+    {
+      "file": "ratarmount-smb/src/serve.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix accept helpers and nonblocking/retry regressions, including macOS/BSD subbranches, are all inside the inline cfg(test) module."
+    },
+    {
+      "file": "ratarmount/src/export_index.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix regression_export_index_input_reads_keep_index_lock inside the inline cfg(test) module."
     },
     {
       "file": "ratarmount/src/journal_cmd.rs",
@@ -389,6 +485,24 @@
       "reason": "Reviewed Linux statx/name_to_handle_at and mountinfo identity probes; non-Linux fallbacks supply no mount identity."
     },
     {
+      "file": "ratarmount/src/overlay_cmd.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix lock-retention regression_digest_base_file_keeps_sqlar_lock inside the inline cfg(test) module."
+    },
+    {
+      "file": "ratarmount/src/overlay_commit.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix object-store publish and live-commit lock-retention test helpers and regressions inside the inline cfg(test) module."
+    },
+    {
+      "file": "ratarmount/src/overlay_create.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix dangling database symlink regression inside the inline cfg(test) module."
+    },
+    {
       "file": "ratarmount/src/overlay_pack.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
@@ -399,6 +513,18 @@
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
       "reason": "Reviewed Linux/macOS xattr ABI and errno differences; unsupported upperdir inspection fails explicitly."
+    },
+    {
+      "file": "ratarmount/src/publish_index.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix WAL-holder test helper and index snapshot/read lock regressions inside the inline cfg(test) module."
+    },
+    {
+      "file": "ratarmount/src/quiet_print.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. The only target predicate gates a Linux cfg(test) quiet-print pipe failure module."
     },
     {
       "file": "ratarmount/src/sandbox/daemon.rs",
@@ -417,6 +543,12 @@
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
       "reason": "Reviewed Linux /proc runner identity, parent-death setup and fusermount selection; other Unix uses umount and the existing conservative runner fallback."
+    },
+    {
+      "file": "ratarmount/src/shard.rs",
+      "reviewer": "#201 r10b structural source review",
+      "provenance": "64ad4e3 loaded inline test target predicates reviewed for r10b",
+      "reason": "Reviewed target predicates are test-only. Unix artifact hash aliased-database lock regression inside the inline cfg(test) module."
     },
     {
       "file": "test-harness/ratarmount-checked-open-fixture/src/lib.rs",

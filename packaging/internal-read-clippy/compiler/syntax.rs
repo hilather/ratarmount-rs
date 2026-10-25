@@ -5,7 +5,7 @@ use rustc_ast::{self as ast, AttrKind, HasAttrs, ItemKind, StmtKind};
 use rustc_ast_pretty::pprust;
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext, LintStore};
 use rustc_session::{Session, impl_lint_pass};
-use rustc_span::{Span, Symbol};
+use rustc_span::Span;
 use serde_json::json;
 use std::collections::BTreeSet;
 use syn::{Meta, Token, parse::Parser, punctuated::Punctuated};
@@ -44,31 +44,6 @@ pub fn register(_: &Session, store: &mut LintStore) {
     }));
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Truth {
-    False,
-    True,
-    Unknown,
-}
-impl Truth {
-    fn not(self) -> Self {
-        match self {
-            Self::False => Self::True,
-            Self::True => Self::False,
-            Self::Unknown => Self::Unknown,
-        }
-    }
-    fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::False, _) | (_, Self::False) => Self::False,
-            (Self::True, Self::True) => Self::True,
-            _ => Self::Unknown,
-        }
-    }
-    fn or(self, other: Self) -> Self {
-        self.not().and(other.not()).not()
-    }
-}
 fn name(path: &syn::Path) -> String {
     path.segments
         .last()
@@ -79,77 +54,6 @@ fn parts(tokens: proc_macro2::TokenStream) -> syn::Result<Vec<Meta>> {
     Punctuated::<Meta, Token![,]>::parse_terminated
         .parse2(tokens)
         .map(|p| p.into_iter().collect())
-}
-fn eval(meta: &Meta, sess: &Session, target_unknown: bool) -> Truth {
-    let ident = name(meta.path());
-    if target_unknown
-        && (ident == "windows"
-            || ident == "unix"
-            || ident.starts_with("target_")
-            || ident == "internal_read_inventory"
-            || ident == "clippy")
-    {
-        return Truth::Unknown;
-    }
-    match meta {
-        Meta::Path(_) => {
-            if sess.config.contains(&(Symbol::intern(&ident), None)) {
-                Truth::True
-            } else {
-                Truth::False
-            }
-        }
-        Meta::NameValue(v) => {
-            let value = match &v.value {
-                syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) => Some(Symbol::intern(&s.value())),
-                _ => None,
-            };
-            if sess.config.contains(&(Symbol::intern(&ident), value)) {
-                Truth::True
-            } else {
-                Truth::False
-            }
-        }
-        Meta::List(v) => {
-            // A failed parse is not an empty any()/all(). Keep the source in
-            // the syntax audit so an inactive target predicate cannot escape N4.
-            let Ok(p) = parts(v.tokens.clone()) else {
-                return Truth::Unknown;
-            };
-            match ident.as_str() {
-                "all" => p
-                    .iter()
-                    .fold(Truth::True, |a, m| a.and(eval(m, sess, target_unknown))),
-                "any" => p
-                    .iter()
-                    .fold(Truth::False, |a, m| a.or(eval(m, sess, target_unknown))),
-                "not" if p.len() == 1 => eval(&p[0], sess, target_unknown).not(),
-                _ => Truth::Unknown,
-            }
-        }
-    }
-}
-fn attr_cfg(meta: &Meta, sess: &Session, target_unknown: bool) -> Truth {
-    if let Meta::List(list) = meta {
-        let Ok(p) = parts(list.tokens.clone()) else {
-            return Truth::Unknown;
-        };
-        match name(&list.path).as_str() {
-            "cfg" if p.len() == 1 => eval(&p[0], sess, target_unknown),
-            "cfg_attr" if !p.is_empty() => {
-                let condition = eval(&p[0], sess, target_unknown);
-                p[1..].iter().fold(Truth::True, |a, m| {
-                    a.and(condition.not().or(attr_cfg(m, sess, target_unknown)))
-                })
-            }
-            _ => Truth::True,
-        }
-    } else {
-        Truth::True
-    }
 }
 fn parsed(attr: &ast::Attribute) -> Option<Meta> {
     if !matches!(attr.kind, AttrKind::Normal(_)) {
@@ -172,7 +76,6 @@ fn contains_link_name(meta: &Meta) -> bool {
 #[derive(Default)]
 struct Syntax {
     protected_lints: BTreeSet<String>,
-    states: Vec<(bool, bool)>,
     emitted: BTreeSet<(u32, u32, String)>,
     leaf_emitted: BTreeSet<(u32, u32)>,
     targets: BTreeSet<(u32, u32)>,
@@ -180,9 +83,6 @@ struct Syntax {
 }
 impl_lint_pass!(Syntax => []);
 impl Syntax {
-    fn state(&self) -> (bool, bool) {
-        self.states.last().copied().unwrap_or((true, true))
-    }
     fn report(&mut self, cx: &EarlyContext<'_>, span: Span, policy: &str, detail: &str) {
         if self
             .emitted
@@ -232,9 +132,6 @@ impl Syntax {
         kind: &str,
         text: String,
     ) {
-        if !self.state().0 {
-            return;
-        }
         for attr in attrs {
             let Some(meta) = parsed(attr) else {
                 continue;
@@ -247,19 +144,13 @@ impl Syntax {
                     {
                         continue;
                     }
-                    crate::internal_read::register_leaf(
-                        &reason,
-                        attr.span,
-                        span,
-                        kind,
-                        self.state().1,
-                    );
+                    crate::internal_read::register_leaf(&reason, attr.span, span, kind);
                     let tokens = text
                         .parse::<proc_macro2::TokenStream>()
                         .map(|s| s.to_string())
                         .unwrap_or(text.clone());
                     crate::internal_read::emit(
-                        json!({"schema":1,"kind":"expectation","reason":reason,"lint":lint,"span":crate::internal_read::span(cx.sess(),attr.span),"leaf":{"span":crate::internal_read::span(cx.sess(),span),"kind":kind,"tokens":tokens},"native_active":self.state().1}),
+                        json!({"schema":1,"kind":"expectation","reason":reason,"lint":lint,"span":crate::internal_read::span(cx.sess(),attr.span),"leaf":{"span":crate::internal_read::span(cx.sess(),span),"kind":kind,"tokens":tokens},"source":true}),
                     );
                     if matches!(kind, "fn" | "mod" | "impl" | "closure" | "block" | "item") {
                         self.report(
@@ -317,8 +208,15 @@ impl EarlyLintPass for Syntax {
                     Ok(false) => {}
                 }
             }
-            if let Err(detail) = inventory_attribute(&meta) {
-                self.report(cx, attr.span, "EXPECT", &detail);
+            match inventory_attribute(&meta) {
+                Ok(Some(_)) => self.report(
+                    cx,
+                    attr.span,
+                    "EXPECT",
+                    "inventory expectation must own a narrow statement/type leaf",
+                ),
+                Err(detail) => self.report(cx, attr.span, "EXPECT", &detail),
+                Ok(None) => {}
             }
             match target_attribute(&meta) {
                 Ok(true) => {
@@ -338,9 +236,7 @@ impl EarlyLintPass for Syntax {
         }
     }
     fn check_attributes(&mut self, cx: &EarlyContext<'_>, attrs: &[ast::Attribute]) {
-        let (parent_scan, parent_active) = self.state();
-        let metas = attrs.iter().filter_map(parsed).collect::<Vec<_>>();
-        if parent_scan && self.restricted() {
+        if self.restricted() {
             for attr in attrs {
                 let Some(meta) = parsed(attr) else {
                     continue;
@@ -357,18 +253,9 @@ impl EarlyLintPass for Syntax {
                 }
             }
         }
-        let scan = parent_scan
-            && metas
-                .iter()
-                .all(|m| attr_cfg(m, cx.sess(), true) != Truth::False);
-        let active = parent_active
-            && metas
-                .iter()
-                .all(|m| attr_cfg(m, cx.sess(), false) != Truth::False);
-        self.states.push((scan, active));
-        if !scan {
-            return;
-        }
+        // Audit every compiler-loaded node structurally, including inactive
+        // inline bodies. HIR events, rather than a second cfg evaluator, tell
+        // the manifest which expectations have compiled operations.
         for attr in attrs {
             let Some(meta) = parsed(attr) else {
                 continue;
@@ -406,13 +293,29 @@ impl EarlyLintPass for Syntax {
             }
         }
     }
-    fn check_attributes_post(&mut self, _: &EarlyContext<'_>, _: &[ast::Attribute]) {
-        self.states.pop();
+    fn check_attributes_post(&mut self, cx: &EarlyContext<'_>, attrs: &[ast::Attribute]) {
+        // Every protected attribute must have been claimed by a supported
+        // compiler leaf callback. Unclaimed subjects (fields, parameters, etc.)
+        // cannot disappear from review merely because their cfg is inactive.
+        for attr in attrs {
+            let Some(meta) = parsed(attr) else {
+                continue;
+            };
+            if matches!(inventory_attribute(&meta), Ok(Some(_)))
+                && !self
+                    .leaf_emitted
+                    .contains(&(attr.span.lo().0, attr.span.hi().0))
+            {
+                self.report(
+                    cx,
+                    attr.span,
+                    "EXPECT",
+                    "inventory expectation must own a narrow statement/type leaf",
+                );
+            }
+        }
     }
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &ast::Item) {
-        if !self.state().0 {
-            return;
-        }
         let kind = match &item.kind {
             ItemKind::Fn(_) => "fn",
             ItemKind::Mod(..) => "mod",
@@ -440,7 +343,7 @@ impl EarlyLintPass for Syntax {
         }
     }
     fn check_item_post(&mut self, _: &EarlyContext<'_>, item: &ast::Item) {
-        if self.state().0 && matches!(item.kind, ItemKind::Mod(..)) {
+        if matches!(item.kind, ItemKind::Mod(..)) {
             self.module_spans.pop();
         }
     }
@@ -473,7 +376,7 @@ impl EarlyLintPass for Syntax {
         );
     }
     fn check_mac_def(&mut self, cx: &EarlyContext<'_>, def: &ast::MacroDef) {
-        if !self.state().0 || !def.macro_rules {
+        if !def.macro_rules {
             return;
         }
         let text = pprust::tts_to_string(&def.body.tokens);
@@ -500,9 +403,6 @@ impl EarlyLintPass for Syntax {
         }
     }
     fn check_mac(&mut self, cx: &EarlyContext<'_>, mac: &ast::MacCall) {
-        if !self.state().0 {
-            return;
-        }
         let macro_tokens = pprust::tts_to_string(&mac.args.tokens);
         // Invocation tokens are otherwise opaque: only literal nested macro
         // definitions have Rust matcher/transcriber grammar at this stage.

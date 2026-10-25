@@ -11,16 +11,14 @@ struct SourceLeaf {
     attribute: Span,
     leaf: Span,
     broad: bool,
-    active: bool,
 }
 static SOURCE_LEAVES: Mutex<Vec<SourceLeaf>> = Mutex::new(Vec::new());
-pub fn register_leaf(reason: &str, attribute: Span, leaf: Span, kind: &str, active: bool) {
+pub fn register_leaf(reason: &str, attribute: Span, leaf: Span, kind: &str) {
     SOURCE_LEAVES.lock().unwrap().push(SourceLeaf {
         reason: reason.to_owned(),
         attribute,
         leaf,
         broad: matches!(kind, "fn" | "mod" | "impl" | "closure" | "block" | "item"),
-        active,
     });
 }
 
@@ -329,9 +327,7 @@ fn approved_leaf(
             .lock()
             .unwrap()
             .iter()
-            .filter(|leaf| {
-                leaf.active && leaf.reason == reason.as_str() && leaf.attribute.contains(attribute)
-            })
+            .filter(|leaf| leaf.reason == reason.as_str() && leaf.attribute.contains(attribute))
             .cloned()
             .collect::<Vec<_>>();
         if candidates.len() > 1 {
@@ -596,16 +592,23 @@ pub fn finish(tcx: TyCtxt<'_>) {
         if !seen_expectations.insert((*id, ex.reason)) {
             continue;
         }
-        if let Some(reason) = ex.reason
-            && reason.as_str().starts_with("internal-read:v1 ")
-        {
-            let (sp, broad, source_observed) =
-                approved_leaf(tcx, id.hir_id, ex.reason, ex.emission_span);
-            let text = normalized_leaf(tcx.sess, sp);
-            emit(
-                json!({"kind":"expectation","active":true,"source_leaf_observed":source_observed,"source_leaf_span":if source_observed{span(tcx.sess,sp)}else{Value::Null},"owner":owner(tcx,id.hir_id.owner.def_id.to_def_id()),"reason":reason.to_string(),"broad":broad,"leaf":text,"leaf_digest":leaf_digest(&text),"span":span(tcx.sess,sp)}),
-            );
-        }
+        // Rustc's selected lint specification identifies the protected lint;
+        // rationale text never decides whether an expectation is inventoried.
+        // The source audit separately retains inactive and shadowed attributes.
+        let Some(lint) = [
+            crate::disallowed_methods::DISALLOWED_METHODS,
+            crate::disallowed_types::DISALLOWED_TYPES,
+        ]
+        .into_iter()
+        .find(|lint| tcx.lint_level_spec_at_node(lint, id.hir_id).lint_id() == Some(*id)) else {
+            continue;
+        };
+        let (sp, broad, source_observed) =
+            approved_leaf(tcx, id.hir_id, ex.reason, ex.emission_span);
+        let text = normalized_leaf(tcx.sess, sp);
+        emit(
+            json!({"kind":"expectation","lint":lint.name_lower(),"active":true,"source_leaf_observed":source_observed,"source_leaf_span":if source_observed{span(tcx.sess,sp)}else{Value::Null},"owner":owner(tcx,id.hir_id.owner.def_id.to_def_id()),"reason":ex.reason.map(|reason| reason.to_string()),"broad":broad,"leaf":text,"leaf_digest":leaf_digest(&text),"span":span(tcx.sess,sp)}),
+        );
     }
     emit(
         json!({"kind":"complete","success":tcx.dcx().has_errors().is_none(),"crate":tcx.crate_name(LOCAL_CRATE).to_string(),"syntax_complete":SYNTAX_SEEN.load(Ordering::Relaxed),"expanded_complete":EXPANSION_SEEN.load(Ordering::Relaxed),"hir_complete":true}),

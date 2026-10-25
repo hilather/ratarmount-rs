@@ -19,7 +19,7 @@ class CiContract(unittest.TestCase):
 
     def test_regression_linux_policy_keeps_existing_job_and_budget(self):
         names = set(re.findall(r"(?m)^  ([a-zA-Z0-9_-]+):", self.jobs))
-        self.assertEqual(names, {"check", "checked-open-aarch64", "nfsv4", "bittorrent", "benchmark-gates", "benchmark-gates-full", "fuse-harness", "macos", "internal-read-windows", "windows-lib", "msrv"})
+        self.assertEqual(names, {"check", "checked-open-aarch64", "nfsv4", "bittorrent", "benchmark-gates", "benchmark-gates-full", "fuse-harness", "macos", "windows-lib", "msrv"})
         self.assertIn("name: fmt + clippy + test", self.check)
         self.assertIn("timeout-minutes: 45", self.check)
         self.assertIn("RUSTFLAGS: -Dwarnings", self.workflow)
@@ -53,22 +53,20 @@ class CiContract(unittest.TestCase):
         for command in ["packaging/test-windows-lib-ci.sh", "packaging/test-workspace-lock-version.sh", "packaging/test-portable-deps-selftest.sh", "test-harness/canonical-hash/reference.py --self-test", "packaging/audit_native_exports.py --self-test", "packaging/test-wheel-blake3-no-neon.sh", "test-harness/test-aarch64-checked-open-ci.sh", "packaging/test-systemd-unit.sh"]:
             self.assertIn(command, self.check)
 
-    def test_regression_native_feature_coverage_uses_macos_and_msvc_runners(self):
-        for job, runner in (("macos", "macos-14"), ("internal-read-windows", "windows-latest")):
-            match = re.search(r"(?ms)^  " + job + r":\n(.*?)(?=^  [a-zA-Z0-9_-]+:|\Z)", self.jobs)
-            self.assertIsNotNone(match)
-            body = match.group(1)
-            self.assertIn("runs-on: " + runner, body)
-            self.assertIn("components: ", body)
-            self.assertIn("clippy", body)
-            self.assertIn("taiki-e/install-action@cargo-hack", body)
-            self.assertIn("native.py --fixtures", body)
-            self.assertIn("native.py --methods-level=-D", body)
-            self.assertNotIn("continue-on-error: true", body.split("Build release", 1)[0])
-            self.assertNotIn("--target ", body)
-            self.assertNotIn("rustup target add", body)
-        self.assertIn("Windows-only read must fail", self.workflow)
+    def test_regression_inventory_policy_is_linux_only(self):
+        """Regression: #201 must not enable unapproved native-only operations."""
+        self.assertIn("runs-on: ubuntu-latest", self.check)
         self.assertIn("native.py --fixtures", self.check)
+        self.assertNotIn("internal-read-windows:", self.jobs)
+        for job in ("macos", "windows-lib"):
+            match = re.search(r"(?ms)^  " + job + r":\n(.*?)(?=^  [a-zA-Z0-9_-]+:|\Z)", self.jobs)
+            self.assertIsNotNone(match, "pre-existing platform build must remain")
+            body = match.group(1)
+            self.assertNotIn("internal-read-clippy/", body)
+            self.assertNotIn("cargo-hack", body)
+            self.assertNotIn("internal-read-native", body)
+        self.assertIn("name: macOS (build + test)", self.jobs)
+        self.assertIn("name: windows-lib (core+index gate; session skippable)", self.jobs)
 
 
 if __name__ == "__main__":

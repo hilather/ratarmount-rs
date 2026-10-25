@@ -34,6 +34,13 @@ class Contract(unittest.TestCase):
             "source_leaf_span": {"file": "src/a.rs", "lo": 5, "hi": 25},
             "span": {"file": "src/a.rs", "lo": 10, "hi": 20},
         }
+        rule = policy.tomllib.loads((policy.ROOT / "clippy.toml").read_text())["disallowed-methods"][0]
+        self.journal = dict(self.operation, reason="A reviewed journal call",
+                            configured_path=rule["path"], resolved=rule["path"],
+                            rule_reason=rule["reason"])
+        self.exemption = {"journal_exemption": True, "item": self.journal["owner"],
+                          **{key: self.journal[key] for key in
+                             ("reason", "lint", "resolved", "configured_path", "rule_reason")}}
         self.complete = {
             "schema": 1, "kind": "complete", "success": True, "syntax_complete": True,
             "expanded_complete": True, "hir_complete": True,
@@ -97,6 +104,76 @@ class Contract(unittest.TestCase):
         row = dict(self.operation, reason="Journal authorization")
         with self.assertRaisesRegex(PolicyError, "literal"):
             self.generate(row)
+
+    def test_regression_journal_needs_explicit_flag_and_exact_lookup(self):
+        path = self.report([self.journal, self.complete])
+        with self.assertRaisesRegex(PolicyError, "explicit journal exemption"):
+            manifest([("default", path)], {})
+        for flag in (False, None):
+            approval = dict(self.exemption, journal_exemption=flag)
+            with self.assertRaisesRegex(PolicyError, "explicit manifest flag"):
+                manifest([("default", path)], {}, [approval])
+        approved = manifest([("default", path)], {}, [self.exemption])
+        entry = approved["entries"][0]
+        self.assertTrue(entry["journal_exemption"])
+        self.assertEqual(entry["multiplicity"], 1)
+        for field in ("resolved", "configured_path", "rule_reason", "lint"):
+            row = dict(self.journal, **{field: "changed"})
+            path = self.report([row, self.complete])
+            with self.assertRaisesRegex(PolicyError, "(lookup differs|lint differs)"):
+                manifest([("default", path)], {}, [self.exemption])
+
+    def test_regression_journal_flag_cannot_approve_inventory_or_unknown_rules(self):
+        row = dict(self.operation, reason=self.journal["reason"])
+        path = self.report([row, self.complete])
+        with self.assertRaisesRegex(PolicyError, "cannot approve an inventory rule"):
+            manifest([("default", path)], {}, [self.exemption])
+        for changed in (dict(rule_reason="unknown-policy"),
+                        dict(configured_path="std::fs::read"),
+                        dict(rule_reason="inventory-op:fs::read")):
+            approval = dict(self.exemption, **changed)
+            with self.assertRaisesRegex(PolicyError, "independent root Clippy rule"):
+                manifest([("default", path)], {}, [approval])
+
+    def test_regression_inactive_noninventory_reason_requires_manifest(self):
+        row = {"schema": 1, "kind": "expectation", "native_active": False,
+               "lint": "clippy::disallowed_methods", "reason": self.journal["reason"],
+               "leaf": {"tokens": "let _ = journal();"}}
+        path = self.report([row, self.complete])
+        with self.assertRaisesRegex(PolicyError, "literal internal-read:v1 reason"):
+            manifest([("default", path)], {})
+        entry = manifest([("default", path)], {}, [self.exemption])["entries"][0]
+        self.assertTrue(entry["journal_exemption"])
+        self.assertFalse(entry["native_observed"])
+        ambiguous = dict(self.exemption, item="probe::other")
+        with self.assertRaisesRegex(PolicyError, "ambiguous inactive journal"):
+            manifest([("default", path)], {}, [self.exemption, ambiguous])
+
+    def test_regression_active_shadowed_source_expectation_cannot_disappear(self):
+        row = {"schema": 1, "kind": "expectation", "source": True,
+               "lint": "clippy::disallowed_methods", "reason": "unreviewed shadowed approval",
+               "leaf": {"tokens": "let _ = std::fs::read(input);"}}
+        path = self.report([row, self.complete])
+        with self.assertRaisesRegex(PolicyError, "literal internal-read:v1 reason"):
+            manifest([("default", path)], {})
+        row = dict(row, reason=self.operation["reason"])
+        path = self.report([row, self.operation, self.complete])
+        entry = manifest([("default", path)], {})["entries"][0]
+        self.assertTrue(entry["native_observed"])
+        self.assertEqual(entry["multiplicity"], 1)
+        path = self.report([row, row, self.complete])
+        with self.assertRaisesRegex(PolicyError, "multiple operations/marks"):
+            manifest([("default", path)], {})
+
+    def test_regression_stale_and_broad_journal_expectations_fail(self):
+        row = dict(self.journal, kind="expectation", active=True)
+        path = self.report([row, self.complete])
+        with self.assertRaisesRegex(PolicyError, "no inventory lookup"):
+            manifest([("default", path)], {}, [self.exemption])
+        row = dict(self.journal, broad=True)
+        path = self.report([row, self.complete])
+        with self.assertRaisesRegex(PolicyError, "broad inventory expectation"):
+            manifest([("default", path)], {}, [self.exemption])
 
     def test_regression_compiler_owner_must_match_literal_owner(self):
         with self.assertRaisesRegex(PolicyError, "declared owner"):

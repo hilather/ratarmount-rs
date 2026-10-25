@@ -33,7 +33,7 @@ def main():
         config['include_exceptions'] = []
         policy = root / 'policy.json'
         env = {**os.environ, 'CARGO_PKG_NAME': 'ratarmount-index', 'CARGO_CRATE_NAME': 'control', 'INTERNAL_READ_ROOT': str(root), 'INTERNAL_READ_CONFIG': str(policy), 'CLIPPY_CONF_DIR': str(root / 'conf'), 'RUSTC_BOOTSTRAP': '1', 'LD_LIBRARY_PATH': str(Path(sysroot) / 'lib')}
-        def run(name, source, *, reject=None, files=None, reviewed=False, root_forbid=True, native=True, allow_ffi=False, reject_detail=None):
+        def run(name, source, *, reject=None, files=None, reviewed=False, root_forbid=True, native=True, allow_ffi=False, reject_detail=None, flags=()):
             config['allowed_extern_module'] = 'control::ffi' if allow_ffi else 'reviewed::ffi'
             config['reviewed_target_files'] = [{'file': 'custom-root.rs', 'reviewer': 'compiled fixture', 'reason': 'Test exact reviewed-file behavior independently of N2.'}] if reviewed else []
             policy.write_text(json.dumps(config))
@@ -43,7 +43,7 @@ def main():
                 path.write_text(content)
             src = root / 'custom-root.rs'
             src.write_text(('#![forbid(unused_macros)]\n' if root_forbid else '') + source + '\n')
-            common = [str(src), '--crate-name=control', '--crate-type=lib', '--edition=2024', '--emit=metadata', '--out-dir', str(root)]
+            common = [str(src), '--crate-name=control', '--crate-type=lib', '--edition=2024', '--emit=metadata', '--out-dir', str(root), *flags]
             if native:
                 check = subprocess.run(['rustc', '+1.98.0', *common], env=env, capture_output=True, text=True)
                 assert check.returncode == 0, (name, 'fixture must compile before enforcement', check.stderr)
@@ -96,8 +96,19 @@ def main():
                 reviewed=reviewed, reject='EXPECT',
                 reject_detail='cfg_attr-wrapped disallowed lint level is refused')
         run('direct-reviewed-expect', 'pub fn load() { #[expect(clippy::disallowed_methods,reason="review")] let _ = std::fs::read("x"); }')
+        # Regression: unsupported subjects also need fail-closed review, even
+        # when a reviewed Windows cfg strips the subject before HIR exists.
+        for subject, source in [
+            ('field', '#[cfg(windows)] pub struct Hidden { #[expect(clippy::disallowed_types,reason="ordinary review")] field: std::fs::OpenOptions }'),
+            ('variant', '#[cfg(windows)] pub enum Hidden { #[expect(clippy::disallowed_methods,reason="ordinary review")] Value }'),
+            ('parameter', '#[cfg(windows)] pub fn hidden(#[expect(clippy::disallowed_types,reason="ordinary review")] value: std::fs::OpenOptions) {}'),
+            ('crate', '#![cfg(windows)] #![expect(clippy::disallowed_methods,reason="ordinary review")] pub fn hidden() {}'),
+        ]:
+            run('inactive-unsupported-expect-' + subject, source, reviewed=True,
+                reject='EXPECT', reject_detail='inventory expectation must own a narrow statement/type leaf')
         run('test-module-allow-outside-production',
-            '#[cfg(test)] #[allow(clippy::disallowed_methods)] mod tests { fn load() { let _ = std::fs::read("x"); } }')
+            '#[cfg(test)] #[allow(clippy::disallowed_methods)] mod tests { fn load() { let _ = std::fs::read("x"); } }',
+            reject='EXPECT', reject_detail='allow/warn of disallowed lint is refused')
         for group in ('all', 'style'):
             run('source-group-allow-' + group,
                 '#![allow(clippy::' + group + ')] pub fn visible() {}',
@@ -122,7 +133,7 @@ def main():
         run('substituted-attribute', 'macro_rules! m { ($g:meta) => { #[$g] pub fn hidden() {} } } m!(cfg(not(clippy)));', reject='N3')
         run('repeated-attribute', '#[macro_export] macro_rules! m { ($($g:meta),*) => { $(#[$g])* pub fn hidden() {} } }', reject='N3')
         run('generic-attribute-matcher', '#[macro_export] macro_rules! m { (#[$g:meta]) => { pub fn visible() {} } }')
-        run('nested-generic-attribute-matcher', '#[macro_export] macro_rules! outer { () => { macro_rules! inner { (#[$g:meta]) => { pub fn visible() {} } } } }')
+        run('nested-generic-attribute-matcher', '#[macro_export] macro_rules! outer { () => { macro_rules! inner { (#[$g:meta]) => { pub fn visible() {} } } } }', reject='N3')
         run('literal-cfg-matcher', '#[macro_export] macro_rules! m { (#[cfg(unix)]) => {} }', reject='N3')
         run('raw-cfg-transcriber', '#[macro_export] macro_rules! m { () => { #[r#cfg(unix)] pub fn hidden() {} } }', reject='N3')
         run('nested-cfg-macro', '#[macro_export] macro_rules! outer { () => { macro_rules! inner { () => { #[cfg_attr(all(),allow(dead_code))] pub fn hidden() {} } } } }', reject='N3')
@@ -167,7 +178,19 @@ def main():
         run('harmless-repeated-statements', 'macro_rules! m { ($($a:tt)*) => { pub fn values() { $(let _ = $a;)* } } } m!(1 2);')
         run('harmless-trailing-macro-arguments', 'macro_rules! m { ($($a:tt)*) => { pub fn values() -> String { format!("prefix {}", $($a)*) } } } m!(7);')
         run('whole-item-forwarding', 'macro_rules! m { ($($a:tt)*) => { $($a)* } } m!(pub fn visible() {});')
-        run('nested-typed-indexing', 'macro_rules! outer { ($e:expr) => { macro_rules! inner { () => { $e[0] }; } pub fn first() -> u8 { inner!() } } } outer!([7]);')
+        run('nested-typed-indexing', 'macro_rules! outer { ($e:expr) => { macro_rules! inner { () => { $e[0] }; } pub fn first() -> u8 { inner!() } } } outer!([7]);', reject='N3')
+        # Regression: make!($) substitutes escaped dollars before a generated
+        # matcher can hide a fixed read with a substituted attribute.
+        run('escaped-dollar-macro-generator', '''macro_rules! make {
+            ($d:tt) => { macro_rules! hidden {
+                ($d h:tt $d a:tt) => {
+                    $d h $d a pub fn hidden() { let _ = std::fs::read("x"); }
+                }
+            } }
+        }
+        make!($);
+        hidden!(# [cfg(windows)]);''', reject='N3',
+            reject_detail='nested macro_rules definition in transcriber')
         run('typed-ident-indexing', 'macro_rules! m { ($array:ident) => { $array[0] }; } pub fn first(array: [u8; 1]) -> u8 { m!(array) }')
         run('ambiguous-tt-indexing', 'macro_rules! m { ($array:tt) => { $array[0] }; } pub fn first(array: [u8; 1]) -> u8 { m!(array) }', reject='N3')
         # Regression: literal macro definitions inside invocation payloads must
@@ -214,7 +237,7 @@ def main():
             events = run('loaded-' + path.replace('/', '-').replace('.', '-'), f'#[path="{path}"] mod production;', files={path: payload}, reject='N4')
             assert any(row.get('kind') == 'target_predicate' and row.get('span', {}).get('file') == path for row in events)
         run('unloaded-test-module', '#[cfg(test)] #[path="does-not-exist.rs"] mod tests;')
-        run('loaded-test-subtree', '#[path="loaded.rs"] mod production;', files={'loaded.rs': '#[cfg(test)] mod tests { unsafe extern "C" { pub fn arbitrary(); } #[cfg(windows)] fn hidden(){} #[macro_export] macro_rules! ignored { () => { #[cfg(unix)] fn hidden(){} } } }'})
+        run('loaded-test-subtree', '#[path="loaded.rs"] mod production;', files={'loaded.rs': '#[cfg(test)] mod tests { unsafe extern "C" { pub fn arbitrary(); } #[cfg(windows)] fn hidden(){} #[macro_export] macro_rules! ignored { () => { #[cfg(unix)] fn hidden(){} } } }'}, reject='N4')
         run('unloaded-feature-module', '#[cfg(feature="off")] #[path="does-not-exist.rs"] mod dormant;')
         run('nested-cfg-attr-target', '#[cfg_attr(all(),cfg_attr(all(),cfg(target_os="windows")))] pub fn hidden() {}', reject='N4')
         # Regression: a failed nested predicate parse previously became an
@@ -223,14 +246,29 @@ def main():
         run('boolean-any-target-cfg-attr', '#[cfg_attr(all(),cfg(any(false,windows)))] pub fn hidden() { let _ = std::fs::read("x"); }', reject='N4')
         run('boolean-any-feature-inactive', '#[cfg(any(false,feature="off"))] pub fn hidden() { let _ = std::fs::read("x"); }')
         run('raw-target-predicate', '#[cfg(r#target_os="windows")] pub fn hidden() {}', reject='N4')
+        # Regression: target syntax and suppression checks cannot depend on
+        # debug/release, feature selection, or an inactive inline parent.
+        run('release-conjunct-target', '#[cfg(all(not(debug_assertions), windows))] pub fn hidden() { let _ = std::fs::read("x"); }', reject='N4')
+        run('enabled-feature-conjunct-target', '#[cfg(all(not(feature="backend"), windows))] pub fn hidden() { let _ = std::fs::read("x"); }', flags=('--cfg', 'feature="backend"'), reject='N4')
+        run('enabled-feature-parent-target', '#[cfg(not(feature="backend"))] mod hidden { #[cfg(windows)] pub fn load() { let _ = std::fs::read("x"); } }', flags=('--cfg', 'feature="backend"'), reject='N4')
+        for predicate in ['windows', 'unix', 'target_os="windows"', 'target_family="windows"', 'target_arch="wasm32"', 'target_env="msvc"', 'target_pointer_width="32"']:
+            run('structural-target-' + predicate.split('=')[0], '#[cfg_attr(any(),cfg(all(any(),not(' + predicate + '))))] pub fn hidden() {}', reject='N4')
+        for reviewed in (False, True):
+            for level, attribute, detail in [
+                ('allow', 'allow(clippy::disallowed_methods)', 'allow/warn of disallowed lint is refused'),
+                ('warn', 'warn(clippy::disallowed_types)', 'allow/warn of disallowed lint is refused'),
+                ('cfg-attr-expect', 'cfg_attr(all(),expect(clippy::disallowed_methods,reason="review"))', 'cfg_attr-wrapped disallowed lint level is refused'),
+            ]:
+                run('inactive-parent-' + level + ('-reviewed' if reviewed else ''), '#[cfg(any())] mod hidden { #[' + attribute + '] pub fn load() {} }', reviewed=reviewed, reject='EXPECT', reject_detail=detail)
+                run('release-parent-' + level + ('-reviewed' if reviewed else ''), '#[cfg(not(debug_assertions))] mod hidden { #[' + attribute + '] pub fn load() {} }', reviewed=reviewed, reject='EXPECT', reject_detail=detail)
         # Regression: cfg! is a boolean and strips no code, including nested
         # invocations and imports. The native lint still sees both branches.
         run('target-cfg-macro', 'pub fn target() -> bool { cfg!(all(unix,target_family="unix")) }')
         run('nested-target-cfg-macro', 'pub fn target() -> String { format!("{}", cfg!(windows)) }')
         run('if-target-cfg-positive', 'pub fn visible() -> u8 { if cfg!(windows) { 1 } else { 2 } }')
-        run('harmless-macro-nesting', 'macro_rules! outer { () => { macro_rules! inner { () => { 7 } } pub fn value() -> u8 { inner!() } } } outer!();')
+        run('harmless-macro-nesting', 'macro_rules! outer { () => { macro_rules! inner { () => { 7 } } pub fn value() -> u8 { inner!() } } } outer!();', reject='N3')
         run('macro-body-cfg-positive', 'macro_rules! platform { () => { pub fn visible() -> bool { cfg!(windows) } } } platform!();')
-        run('nested-macro-body-cfg-positive', 'macro_rules! outer { () => { macro_rules! inner { () => { cfg!(windows) } } pub fn value() -> bool { inner!() } } } outer!();')
+        run('nested-macro-body-cfg-positive', 'macro_rules! outer { () => { macro_rules! inner { () => { cfg!(windows) } } pub fn value() -> bool { inner!() } } } outer!();', reject='N3')
         run('macro-body-cfg-read', 'macro_rules! platform { () => { pub fn visible() { if cfg!(windows) { let _ = std::fs::read("x"); } } } } platform!();', reject='Clippy')
         run('opaque-cfg-macro-data', 'pub const TEXT: &str = stringify!(cfg!(windows));')
         run('if-target-cfg-read', 'pub fn visible() { if cfg!(windows) { let _ = std::fs::read("x"); } }', reject='Clippy')

@@ -118,6 +118,58 @@ pub mod b { pub fn open() -> u8 { 2 } }
             pass
         else:
             raise AssertionError("source allow authorized an unmarked lookup")
+        unrelated = generate("unrelated-expect", prefix + '#[expect(dead_code, reason="review")] fn unused() {}\n')
+        assert unrelated["entries"] == [], unrelated
+        ordinary = compile_case("active-ordinary-expect", source.replace(mark,
+            '#[expect(clippy::disallowed_methods, reason="ordinary review")]\n'), collection=False)
+        active_rows = [r for r in policy.json_lines(ordinary)
+                       if r.get("kind") == "expectation" and r.get("active") is True]
+        assert any(r.get("reason") == "ordinary review" and r.get("lint") == "clippy::disallowed_methods"
+                   for r in active_rows), active_rows
+        try:
+            policy.manifest([("all-features", ordinary)], {})
+        except policy.PolicyError as error:
+            assert "literal internal-read:v1 reason" in str(error), str(error)
+            results.append({"case": "active-ordinary-expect-unmanifested", "refusal": str(error)})
+        else:
+            raise AssertionError("ordinary reason authorized an unmanifested active expectation")
+        # Regression: a later fulfilled expect shadows the first HIR lint ID.
+        # Source validation must still retain and reject the earlier approval.
+        shadowed = compile_case("shadowed-ordinary-expect", source.replace(mark,
+            '#[allow(unfulfilled_lint_expectations)]\n'
+            '#[expect(clippy::disallowed_methods, reason="shadowed ordinary review")]\n' + mark),
+            collection=False)
+        try:
+            policy.manifest([("all-features", shadowed)], {})
+        except policy.PolicyError as error:
+            assert "literal internal-read:v1 reason" in str(error), str(error)
+            results.append({"case": "shadowed-ordinary-expect-unmanifested", "refusal": str(error)})
+        else:
+            raise AssertionError("shadowed unmanifested expectation was dropped")
+        # Regression: inactive Windows expectations with ordinary reason text
+        # disappeared from Linux approval checks. A reviewed file only exempts
+        # its target predicates; it cannot exempt any expectation from review.
+        config["restricted_packages"] = ["ratarmount-index"]
+        config["reviewed_target_files"] = [{"file": "lib.rs", "reviewer": "compiled fixture",
+                                            "reason": "Exercise inactive manifest validation"}]
+        (root / "policy.json").write_text(json.dumps(config))
+        env["CARGO_PKG_NAME"] = "ratarmount-index"
+        for name, predicate, literal in [
+            ("inactive-windows-ordinary-expect", "windows", "review journal operation"),
+            ("inactive-false-ordinary-expect", "any()", "ordinary review"),
+            ("inactive-release-ordinary-expect", "not(debug_assertions)", ""),
+        ]:
+            source = prefix + '#[cfg(' + predicate + ')] pub fn hidden() {\n' + \
+                '#[expect(clippy::disallowed_methods, reason=' + json.dumps(literal) + ')]\n' + \
+                'let _ = a::open();\n}\n'
+            report = compile_case(name, source, collection=False)
+            try:
+                policy.manifest([("all-features", report)], {})
+            except policy.PolicyError as error:
+                assert "literal internal-read:v1 reason" in str(error), (name, str(error))
+                results.append({"case": name + "-unmanifested", "refusal": str(error)})
+            else:
+                raise AssertionError(name + ": inactive unmanifested expectation was dropped")
     (args.output / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
     print(f"{len(results)} compiled manifest regressions passed")
 

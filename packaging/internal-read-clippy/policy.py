@@ -237,31 +237,50 @@ def validate_config(metadata):
         raise PolicyError("include requires the exact reviewed CSI source-file/item exception")
 
 
-def manifest(reports, header):
+def manifest(reports, header, journal_exemptions=()):
     """Canonical identities never contain compiler byte positions or file paths."""
     entries = {}
     ids = {}
-    journal_reasons = {r["reason"] for r in tomllib.loads((ROOT / "clippy.toml").read_text())["disallowed-methods"]}
+    journal_rules = {(r["path"], r["reason"]) for r in
+                     tomllib.loads((ROOT / "clippy.toml").read_text())["disallowed-methods"]
+                     if not r["reason"].startswith("inventory-op:")}
+    journal = {}
+    for approval in journal_exemptions:
+        if approval.get("journal_exemption") is not True:
+            raise PolicyError("journal exemption requires an explicit manifest flag")
+        fields = ("item", "reason", "lint", "resolved", "configured_path", "rule_reason")
+        if any(not isinstance(approval.get(field), str) or not approval[field] for field in fields):
+            raise PolicyError("journal exemption requires an item, reason and exact resolved lookup fields")
+        if (approval["configured_path"], approval["rule_reason"]) not in journal_rules:
+            raise PolicyError("journal exemption is not an independent root Clippy rule")
+        if approval["lint"] != "clippy::disallowed_methods":
+            raise PolicyError("journal exemption requires the exact disallowed-methods lint")
+        key = (approval["item"], approval["reason"])
+        if key in journal:
+            raise PolicyError("duplicate journal exemption item/reason")
+        journal[key] = approval
     active_marks = set()
     observed_marks = set()
     for profile, report in reports:
-        seen = set()
+        seen_source = set()
+        seen_operations = set()
         for row in validate_report(report):
             if row["kind"] not in {"operation", "expectation", "include_exception"}:
                 continue
-            if row["kind"] == "expectation" and "native_active" in row:
-                # The pre-pruning callback retains only inactive source marks.
-                # HIR supplies compiler-validated ownership for active marks.
-                if row["native_active"]:
-                    continue
-                review = metadata_reason(row["reason"])
-                row = dict(row, active=False, owner=review["item"],
+            source_mark = row["kind"] == "expectation" and (
+                row.get("source") is True or "native_active" in row)
+            if source_mark:
+                # Every pre-pruning source expectation needs approval, including
+                # active marks which HIR may shadow with another lint level.
+                # HIR and resolved operations still supply active ownership.
+                matches = [approval for approval in journal.values()
+                           if approval["reason"] == row.get("reason")
+                           and approval["lint"] == row.get("lint")]
+                if len(matches) > 1:
+                    raise PolicyError("ambiguous inactive journal expectation owner")
+                owner = matches[0]["item"] if matches else metadata_reason(row.get("reason"))["item"]
+                row = dict(row, active=False, owner=owner,
                            leaf_digest=digest(row["leaf"]["tokens"].encode()))
-            if row["kind"] == "operation" and not row.get("rule_reason", "").startswith("inventory-op:"):
-                # The eleven independent journal restrictions remain Clippy policy.
-                if row.get("rule_reason") not in journal_reasons:
-                    raise PolicyError(f"unknown Clippy rule namespace: {row.get('rule_reason')}")
-                continue
             if row["kind"] == "operation":
                 source_leaf(row)
             if row["kind"] == "include_exception":
@@ -273,30 +292,50 @@ def manifest(reports, header):
                          "multiplicity": 1, "profiles": []}
             else:
                 reason = row.get("reason")
-                review = metadata_reason(reason)
                 owner = row["owner"]
-                if owner != review["item"]:
-                    raise PolicyError(f"declared owner differs from compiler owner: {review['id']}: {owner}")
-                if row.get("broad", False):
-                    raise PolicyError(f"broad inventory expectation: {review['id']}")
                 key = (owner, reason)
-                if review["id"] in ids and ids[review["id"]] != key:
-                    raise PolicyError(f"duplicate expectation id: {review['id']}")
-                ids[review["id"]] = key
+                approval = journal.get(key)
+                if row.get("broad", False):
+                    raise PolicyError(f"broad inventory expectation: {owner}: {reason}")
+                if approval is not None:
+                    if row.get("lint") != approval["lint"]:
+                        raise PolicyError(f"journal expectation lint differs from manifest: {key}")
+                    if row["kind"] == "operation":
+                        if row.get("rule_reason", "").startswith("inventory-op:"):
+                            raise PolicyError(f"journal exemption cannot approve an inventory rule: {key}")
+                        for field in ("lint", "resolved", "configured_path", "rule_reason"):
+                            if row.get(field) != approval[field]:
+                                raise PolicyError(f"journal lookup differs from manifest field {field}: {key}")
+                    value = {"item": owner, "reason": reason, "journal_exemption": True,
+                             "native_observed": row["kind"] == "operation", "profiles": [],
+                             "leaf_digest": row["leaf_digest"]}
+                    for field in ("lint", "resolved", "configured_path", "rule_reason"):
+                        value[field] = approval[field]
+                else:
+                    if (row["kind"] == "operation"
+                            and not row.get("rule_reason", "").startswith("inventory-op:")):
+                        raise PolicyError(f"unknown Clippy rule namespace or missing explicit journal exemption: {row.get('rule_reason')}: {key}")
+                    review = metadata_reason(reason)
+                    if owner != review["item"]:
+                        raise PolicyError(f"declared owner differs from compiler owner: {review['id']}: {owner}")
+                    if review["id"] in ids and ids[review["id"]] != key:
+                        raise PolicyError(f"duplicate expectation id: {review['id']}")
+                    ids[review["id"]] = key
+                    value = {"item": owner, "reason": reason, "metadata": review,
+                             "native_observed": row["kind"] == "operation", "profiles": [],
+                             "leaf_digest": row["leaf_digest"]}
+                    if row["kind"] == "operation":
+                        for field in ("lint", "resolved", "configured_path", "rule_reason"):
+                            if not row.get(field):
+                                raise PolicyError(f"missing resolved lookup field {field}: {review['id']}")
+                            value[field] = row[field]
                 if row["kind"] == "expectation" and row.get("active", True):
                     active_marks.add(key)
-                    continue  # Active metadata must also have an operation event.
+                    continue  # Every active protected expectation needs a lookup.
                 if row["kind"] == "operation":
                     observed_marks.add(key)
-                value = {"item": owner, "reason": reason, "metadata": review,
-                         "native_observed": row["kind"] == "operation", "profiles": [],
-                         "leaf_digest": row["leaf_digest"]}
-                if row["kind"] == "operation":
-                    for name in ("lint", "resolved", "configured_path", "rule_reason"):
-                        if not row.get(name):
-                            raise PolicyError(f"missing resolved lookup field {name}: {review['id']}")
-                        value[name] = row[name]
                     value["multiplicity"] = 1
+            seen = seen_source if source_mark else seen_operations
             if key in seen:
                 raise PolicyError(f"multiple operations/marks under one expectation: {key[0]}")
             seen.add(key)
@@ -408,7 +447,9 @@ def run(args):
             runs.append({"mode": mode, "profile": label, "seconds": elapsed,
                          "targets": len(expected), "exit": result.returncode})
             print(f"{mode}/{label}: {len(expected)} production targets, {elapsed:.2f}s", flush=True)
-    candidate = manifest(reports, header)
+    approved = json.loads(Path(args.manifest).read_text())
+    exemptions = [row for row in approved["entries"] if row.get("journal_exemption") is True]
+    candidate = manifest(reports, header, journal_exemptions=exemptions)
     Path(args.candidate).write_text(canonical(candidate))
     attestation = {"schema": SCHEMA, "runs": runs, "seconds": time.monotonic() - started,
                    "cargo_lock": digest((ROOT / "Cargo.lock").read_bytes()),

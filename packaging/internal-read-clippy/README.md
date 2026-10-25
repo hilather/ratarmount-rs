@@ -59,12 +59,18 @@ suppressions too; there is no handwritten group table. The
 Ordinary builds leave it off and use a root
 `cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))`
 so inventory expectations do not fail against the ordinary journal-only config.
-Selected policy/native compilations enable the cfg and require fulfillment.
+Selected policy compilations and Linux fixture controls enable the cfg and
+require fulfillment.
 Reasons contain a stable unique id, compiler-validated item owner, classification,
 human reason and explicit reviewed creation policy/basis. Preserve baseline
 family/issue/regression metadata. An approval cannot own a whole function/module or multiple operations;
 split chains into local leaves. Independent journal expectations remain
-unconditional and never authorize an inventory operation.
+unconditional and never authorize an inventory operation. Every protected-lint
+expectation is checked, including inactive or shadowed source attributes and
+reasons without the inventory prefix. Independent journal exemptions need an
+explicit `journal_exemption: true` manifest entry for the exact item, literal
+reason, lint and resolved/configured rule identity; prose alone grants no
+exemption.
 
 `policy.py --collect` writes `target/internal-read-manifest.json` as a review
 candidate. Review before copying it to `manifest.json`; CI never refreshes it.
@@ -88,38 +94,40 @@ substitutions beside brackets or a distinct capture are refused; typed indexing
 and ordinary macro invocations remain permitted. A repetition that can supply an
 unknown attribute prefix before fixed syntax is refused, including `*`, `+` and
 `?` forms. Whole-item forwarding, opaque trailing arguments without an active
-attribute prefix, and harmless separator-delimited repetitions remain permitted. Literal nested macro definitions
-in invocation payloads receive the same grammar audit, with generic matchers and
-other payload data preserved.
+attribute prefix, and harmless separator-delimited repetitions remain permitted.
+Literal nested macro definitions in invocation payloads receive the same
+grammar audit, with generic matchers and other payload data preserved.
+Restricted macro transcribers cannot define nested macro_rules! macros:
+macro-generating macros are refused without auditing generated grammar.
 CI supplies `-F unused_macros`; the root `forbid` attributes document that rule.
 There is no root-attribute source check. N4 refuses target predicates in stripping
 `cfg`/`cfg_attr` attributes in the 40 reviewed restricted packages outside exact
-reviewed files in `policy.json`. It also refuses unparseable `cfg_attr` predicates
-and `clippy`/`not(clippy)` stripping, even in reviewed files. `cfg!` returns a
+reviewed files in `policy.json`, at every nesting level regardless of other
+predicates or parent cfg activity. Syntax audits inspect inactive item bodies.
+It also refuses unparseable `cfg_attr` predicates and `clippy`/`not(clippy)`
+stripping, even in reviewed files. `cfg!` returns a
 boolean and keeps both branches type-checked; direct, nested and aliased uses
 remain permitted. File exceptions have no content hash: inactive alternatives
-still need ordinary code review. N4 is defence in depth behind the native CI
-matrix, whose Windows coverage is explicitly limited to supported packages. The CSI
+still need ordinary code review. Inventory enforcement is Linux-only. The CSI
 include exception is limited to its exact reviewed source file and compiler item,
 with identity/multiplicity in the manifest.
 
-`native.json` records supported native coverage: all 40 restricted packages on
-the existing macOS job (excluding ISA-L, which needs an additional native
-library), and index/TAR/ZIP on the new Windows MSVC job. `native.py` uses stock
-Clippy with Cargo metadata dispatch, so `--all-targets` keeps inventory checks
-on production lib/bin compilations. Native production Clippy uses
+`native.py --fixtures` supplies Linux stock-Clippy controls with Cargo metadata
+dispatch, so `--all-targets` keeps inventory checks on production lib/bin
+compilations. Production Clippy uses
 `-D clippy::disallowed_methods -F unused_macros -D warnings`; `-D` permits reviewed
-expectations, and `-D warnings` makes unfulfilled expectations fail. Its
-cargo-hack `--each-feature` selections include default and no-default-feature builds. The Linux controls prove that a
-read behind `not(feature)` is diagnosed and a test/build-script/dependency read
-does not gain an inventory obligation. The Windows-only fixture must emit the
-exact `clippy::disallowed_methods` diagnostic on the Windows runner. Local
-Linux verification uses `native.py --fixtures`; it does not probe other targets.
+expectations, and `-D warnings` makes unfulfilled expectations fail. The Linux
+controls prove that a read behind `not(feature)` is diagnosed and a
+test/build-script/dependency read does not gain an inventory obligation.
+The native macOS/Windows sweeps in `native.py` and `native.json` are deferred
+helpers, not CI gates or approval evidence. The pre-existing macOS build/test and
+Windows library-check jobs remain independent of this Linux inventory policy.
 
 Intentional gaps include unused exported macros, whole-item forwarding without
 forbidden tokens, other non-target cfg predicates, and calls in reviewed files
-on targets outside the native matrix. Broader dependency acquisitions/read_dir and extending N4 to
-the other eight packages are follow-up #209. SQLite/rusqlite pathname opens rely
+on inactive macOS/Windows targets. Native inventory coverage is deferred.
+Broader dependency acquisitions/read_dir and extending N4 to the other eight
+packages are follow-up #209. SQLite/rusqlite pathname opens rely
 on runtime checked_open enforcement. The retired collector's transitive helper
 proofs and mode inference are not claimed here.
 

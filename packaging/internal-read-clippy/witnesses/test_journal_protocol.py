@@ -34,6 +34,8 @@ def main():
         "stacked-same-leaf": journal + '\n' + inventory + '\nlet () = journal();',
         "stacked-mixed": journal + '\n' + inventory + '\nlet _ = (journal(), std::fs::read("input"));',
         "journal-hides-inventory": journal + '\nlet _ = (journal(), std::fs::read("input"));',
+        "inactive-unmanifested": '#[cfg(windows)]\n#[expect(clippy::disallowed_methods, reason="review journal operation")]\nlet _ = std::fs::read("input");',
+        "inactive-reviewed": '#[cfg(windows)]\n' + journal + '\nlet () = journal();',
     }
     results = []
     with tempfile.TemporaryDirectory(prefix="internal-read-journal-") as temporary:
@@ -44,6 +46,13 @@ def main():
         config_path.write_text(json.dumps(config))
         journal_reason = tomllib.loads((policy.ROOT / "clippy.toml").read_text())["disallowed-methods"][0]["reason"]
         (root / "clippy.toml").write_text('disallowed-methods=[{path="control::journal",reason=' + json.dumps(journal_reason) + '},{path="std::fs::read",reason="inventory-op:fs::read"}]\n')
+        # Fixture exemptions are explicit, reviewed inputs, never inferred from
+        # the expectation's prose or automatically accepted from compiler events.
+        exemption = {"journal_exemption": True, "item": "control::run",
+                     "reason": "journal-policy: reviewed internal call",
+                     "lint": "clippy::disallowed_methods", "resolved": "control::journal",
+                     "configured_path": "control::journal", "rule_reason": journal_reason}
+        policy.ROOT = root
         env = os.environ.copy()
         env.update(INTERNAL_READ_ROOT=str(root), INTERNAL_READ_CONFIG=str(config_path), CLIPPY_CONF_DIR=str(root), LD_LIBRARY_PATH=str(sysroot / "lib") + os.pathsep + env.get("LD_LIBRARY_PATH", ""))
         for name, body in variants.items():
@@ -63,19 +72,23 @@ def main():
                     assert rejected == expected, (name, mode, run.stderr)
                 elif not rejected:
                     try:
-                        manifest = policy.manifest([("all-features", report)], {})
+                        manifest = policy.manifest([("all-features", report)], {}, [exemption])
                     except policy.PolicyError:
                         manifest_rejected = True
                     else:
                         manifest_rejected = False
-                        if name in {"separate", "unmarked-journal"}:
-                            assert len(manifest["entries"]) == (1 if name == "separate" else 0), (name, manifest)
+                        expected_entries = 2 if name == "separate" else 1
+                        assert len(manifest["entries"]) == expected_entries, (name, manifest)
+                        if name == "inactive-reviewed":
+                            assert manifest["entries"][0]["native_observed"] is False
+                    assert manifest_rejected == (name not in {"separate", "inactive-reviewed"}), (name, mode)
                     if name == "separate":
-                        assert not manifest_rejected, (name, mode)
-                    if name in {"journal-hides-inventory", "stacked-same-leaf"}:
-                        assert manifest_rejected, (name, mode)
-                    # Strict Clippy independently rejects stale/stacked journal
-                    # expectations, including a mixed journal/inventory leaf.
+                        try:
+                            policy.manifest([("all-features", report)], {})
+                        except policy.PolicyError:
+                            pass
+                        else:
+                            raise AssertionError("journal reason approved itself without the explicit manifest flag")
                 results.append({"fixture": name, "mode": mode, "exit": run.returncode, "manifest_rejected": manifest_rejected})
     (args.output / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
     print(f"{len(results)} journal protocol regressions passed")
