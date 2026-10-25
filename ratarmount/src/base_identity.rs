@@ -121,7 +121,11 @@ impl GitIntent {
 }
 
 /// Open and classify a base for an offline verb: through the factory, with an
-/// in-memory index, no index writes and the invocation's index folders.
+/// in-memory index, no index writes and the invocation's index folders. The
+/// open never recovers a commit journal (recovery is a mount's or a commit's
+/// write); a base whose journal state recovery would refuse — a pending
+/// journal started for it, or an active/complete locator whose journal is
+/// missing — is refused instead.
 pub fn classify_offline(
     base: &Path,
     git: GitIntent,
@@ -185,11 +189,22 @@ fn classify_offline_in_memory(
             kind == Some(BaseKind::Git) && ratarmount_formats_git::looks_like_git(base)
         }
     };
+    // Recovery is a mount's or a commit's write; this read-only check refuses
+    // the journal states recovery would refuse. It probes the path as typed:
+    // a `file://` or remote input names no local file, and
+    // `recover_journals: false` below still keeps the factory from applying
+    // one.
+    ratarmount_compositing::journal_recovery::check_offline_journal(base)
+        .map_err(|e| e.to_string())?;
     let mut options = OpenOptions {
         write_index: false,
         index_in_memory: true,
         index_folders: context.index_folders.clone(),
         git: git_tree,
+        // The factory must not roll a journal in on the way to the gate:
+        // recovery is a write that belongs to a mount or a commit, after the
+        // record rules decide who may apply it.
+        recover_journals: false,
         ..Default::default()
     };
     let mut opener = FactoryOpener::new(
@@ -478,5 +493,222 @@ mod tests {
         // The other offline verbs keep the factory's in-memory open.
         let fresh = classify_offline(&archive, GitIntent::Replay(None), &context).unwrap();
         assert!(fresh.source().lookup("/f", 0).is_some());
+    }
+
+    fn write_tar_file(path: &Path) {
+        let members = [ratarmount_formats_tar::UstarMember {
+            path: "f",
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"x" },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            xattrs: &[],
+        }];
+        let mut file = std::fs::File::create(path).unwrap();
+        ratarmount_formats_tar::write_ustar_members(&mut file, &members).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut file).unwrap();
+    }
+
+    /// Leave `archive` mid-commit the way a crash does: `step` names the hook
+    /// the attempt dies at (`archive truncate`: torn, marker `A`; `locator
+    /// complete`: rolled forward on recovery, marker `C`; `journal unlink`:
+    /// finished, marker `D`, journal already gone).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(clippy::disallowed_methods)]
+    fn crash_commit(archive: &Path, step: &'static str) {
+        use std::io::Write;
+        let len = std::fs::metadata(archive).unwrap().len();
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(&[0u8; 1536]).unwrap();
+        let crashed = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+            archive,
+            len - 1024,
+            &mut suffix,
+            &mut |s| {
+                if s == step {
+                    Err(std::io::Error::other("crash"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(crashed.is_err());
+    }
+
+    /// Regression (#174): offline classification opened the base through the
+    /// factory with `recover_journals` on, so a pending commit journal was
+    /// rolled back or forward under `Owner::Inode` before any identity gate —
+    /// a write a mount or an offline commit would refuse for a foreign journal
+    /// (B renamed over A; the journal's inode matches the renamed file). The
+    /// classify open now refuses a pending journal started for the file and
+    /// never recovers: archive and journal stay byte-identical.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn regression_offline_classify_refuses_pending_commit_journal() {
+        use ratarmount_compress::commit_journal::{journal_path, pending};
+        for complete in [false, true] {
+            for renamed in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let base = dir.path().join("base.tar");
+                write_tar_file(&base);
+                let (crashed, journal) = if renamed {
+                    let foreign = dir.path().join("foreign.tar");
+                    write_tar_file(&foreign);
+                    crash_commit(
+                        &foreign,
+                        if complete {
+                            "locator complete"
+                        } else {
+                            "archive truncate"
+                        },
+                    );
+                    let journal = journal_path(&foreign);
+                    let bytes = std::fs::read(&foreign).unwrap();
+                    std::fs::rename(&foreign, &base).unwrap();
+                    (bytes, journal)
+                } else {
+                    crash_commit(
+                        &base,
+                        if complete {
+                            "locator complete"
+                        } else {
+                            "archive truncate"
+                        },
+                    );
+                    (std::fs::read(&base).unwrap(), journal_path(&base))
+                };
+                let journal_bytes = std::fs::read(&journal).unwrap();
+                let context = OverlayRunContext::default();
+                let error = match classify_offline(&base, GitIntent::Replay(None), &context) {
+                    Err(error) => error,
+                    Ok(_) => panic!("a pending commit journal must refuse classification"),
+                };
+                assert!(
+                    error.contains("commit journal"),
+                    "complete={complete} renamed={renamed}: {error}"
+                );
+                assert_eq!(
+                    std::fs::read(&base).unwrap(),
+                    crashed,
+                    "complete={complete} renamed={renamed}: archive"
+                );
+                assert_eq!(
+                    std::fs::read(&journal).unwrap(),
+                    journal_bytes,
+                    "complete={complete} renamed={renamed}: journal"
+                );
+                assert!(
+                    pending(&base).unwrap().is_some(),
+                    "complete={complete} renamed={renamed}: journal still pending"
+                );
+            }
+        }
+    }
+
+    /// The `user.ratarmount.commit-journal` locator bytes on `path`, if set.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn commit_locator(path: &Path) -> Option<Vec<u8>> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = c"user.ratarmount.commit-journal";
+        let mut buf = vec![0u8; 8192];
+        #[cfg(target_os = "linux")]
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        if n < 0 {
+            return None;
+        }
+        buf.truncate(n as usize);
+        Some(buf)
+    }
+
+    /// Regression (#174): a locator whose journal is missing refuses the way
+    /// recovery would — an `A` or `C` phase means the archive sits mid-crash
+    /// (a torn TAR that ends on a header boundary parses, so the factory open
+    /// alone is no guard). A `D` locator with its journal already unlinked is
+    /// what a finished commit leaves: classification proceeds. Either way the
+    /// locator itself is left for a mount or `--no-mount` to act on.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn regression_offline_classify_missing_commit_journal() {
+        use ratarmount_compress::commit_journal::journal_path;
+        for step in ["archive truncate", "locator complete"] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("base.tar");
+            write_tar_file(&base);
+            crash_commit(&base, step);
+            let bytes = std::fs::read(&base).unwrap();
+            let locator = commit_locator(&base);
+            assert!(locator.is_some(), "{step}: the crash left a locator");
+            let journal = journal_path(&base);
+            std::fs::remove_file(&journal).unwrap();
+            let context = OverlayRunContext::default();
+            let error = match classify_offline(&base, GitIntent::Replay(None), &context) {
+                Err(error) => error,
+                Ok(_) => panic!("a missing journal must refuse classification"),
+            };
+            assert!(error.contains("commit-journal locator"), "{step}: {error}");
+            assert_eq!(std::fs::read(&base).unwrap(), bytes, "{step}: archive");
+            assert!(!journal.exists(), "{step}: journal");
+            assert_eq!(commit_locator(&base), locator, "{step}: locator");
+        }
+        // Finished commit (`D` locator, journal already unlinked): allowed.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.tar");
+        write_tar_file(&base);
+        crash_commit(&base, "journal unlink");
+        let locator = commit_locator(&base);
+        let context = OverlayRunContext::default();
+        classify_offline(&base, GitIntent::Replay(None), &context)
+            .expect("a finished commit's stale locator does not refuse");
+        assert!(!journal_path(&base).exists());
+        assert_eq!(commit_locator(&base), locator, "stale D locator left alone");
+    }
+
+    /// Regression (#174): a sibling journal whose header names ANOTHER inode
+    /// (a copy of a crashed archive's journal left beside a fresh base) is not
+    /// this file's journal: the refusal does not fire, but
+    /// `recover_journals: false` is what keeps the factory from recovering it.
+    /// Under the old default the factory's `Owner::Inode` recovery refused the
+    /// inode mismatch and the open failed — this test fails if the flag is
+    /// dropped.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn regression_offline_classify_ignores_foreign_sibling_journal() {
+        use ratarmount_compress::commit_journal::journal_path;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.tar");
+        write_tar_file(&base);
+        let victim = dir.path().join("victim.tar");
+        write_tar_file(&victim);
+        crash_commit(&victim, "archive truncate");
+        let bytes = std::fs::read(&base).unwrap();
+        let journal = journal_path(&base);
+        let journal_bytes = std::fs::read(journal_path(&victim)).unwrap();
+        std::fs::copy(journal_path(&victim), &journal).unwrap();
+        let context = OverlayRunContext::default();
+        let token = classify_offline(&base, GitIntent::Replay(None), &context)
+            .expect("a journal naming another inode does not refuse");
+        assert!(token.source().lookup("/f", 0).is_some());
+        assert_eq!(std::fs::read(&base).unwrap(), bytes, "archive");
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes, "journal");
     }
 }

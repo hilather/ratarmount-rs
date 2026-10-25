@@ -387,7 +387,7 @@ renamed directory, a reused name) is recovered without touching the rows and
 is left to the gate (`--force-base-mismatch`). Mounting applies the same ownership check
 before any recovery (the plain mount, `-w` remounts, sessions and rolling
 series): a journal started for another file refuses the open with the archive
-and journal untouched, and the archive's own crash still recovers at mount.
+and journal untouched, and the archive's own crash still recovers at mount. Offline verbs (`overlay seal`, `pack` and `verify`, `diff`, `overlay import`, the `sandbox run` finish) never recover: they refuse a base that carries a pending journal for its own inode, or an active/complete locator whose journal is missing or moved, and the archive and journal are left untouched for a mount or `ratarmount --no-mount` to recover.
 Every readable record (the `-w` overlay and each `--lower` directory) votes on a
 member's journal before any recovery write: the journal's pre-commit stamp must
 be the recorded stamp (or the rows already describe the committed bytes). A
