@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! Core types and the `MountSource` trait (mirrors Python `ratarmountcore.mountsource`).
 
 mod atomic_update;

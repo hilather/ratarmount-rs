@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! URL classification shared by the optional Python extension and embedding rlib.
 
 use std::path::PathBuf;

@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! Custom 7z MountSource with real pack offsets (`backendName=SevenZipMountSource`).
 //!
 //! Port of Python `ratarmountcore.mountsource.formats.sevenzip` + `sevenzip.py`
@@ -245,6 +247,13 @@ impl SevenZipMountSource {
         recreate: bool,
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0351-M01","item":"<ratarmount_formats_sevenzip::SevenZipMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let file = File::open(&archive_path)?;
         Self::open_from_reader(
             file,
@@ -338,6 +347,13 @@ impl SevenZipMountSource {
         // Missing tarstats still Ok (legacy indexes).
         index.check_tarstats_matches_archive(archive_path)?;
 
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0352-M01","item":"<ratarmount_formats_sevenzip::SevenZipMountSource>::open_existing_path","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let mut file = File::open(archive_path)?;
         let archive = parse::parse_7z_archive(&mut file, |folder, packed| {
             decode::decompress_folder(folder, packed, None)

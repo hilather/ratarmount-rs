@@ -35,3 +35,6 @@ flate2 = "1"
 xz2 = { version = "0.1", features = ["static"] }
 zstd = "0.13"
 bzip2 = { version = "0.5", features = ["static"] }
+
+[lints]
+workspace = true

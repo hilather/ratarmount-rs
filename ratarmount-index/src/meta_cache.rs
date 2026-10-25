@@ -235,6 +235,13 @@ impl MetaCache {
             // exact permissions, digest computed while copying. A failure
             // before the rename removes only this staging file (the helper
             // does) and leaves an existing blob unchanged.
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0454-M01","item":"<ratarmount_index::meta_cache::MetaCache>::install","disposition":"managed-read","regression":"regression_meta_cache_install_keeps_source_index_lock","mode_policy":"exact source permissions (exclusive-new .part, source mode & !umask at creation)","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"exact source permissions (exclusive-new .part, source mode & !umask at creation)","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
             let copy = managed_read::copy_exclusive_new(
                 src,
                 &part,
@@ -275,6 +282,13 @@ impl MetaCache {
     }
 
     fn ensure_dir(&self) -> io::Result<()> {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0077-M01","item":"<ratarmount_index::meta_cache::MetaCache>::ensure_dir","disposition":"output-owner","category":"meta-cache-directory","reason":"Create the remote metadata cache tree before applying private Unix permissions.","creation":{"policy":"recursive-directory","basis":"MetaCache::ensure_dir applies mode 0700 on Unix and retains platform defaults elsewhere."}}"###
+            )
+        )]
         fs::create_dir_all(&self.dir)?;
         #[cfg(unix)]
         {
@@ -293,6 +307,13 @@ impl MetaCache {
     }
 
     fn read_header(&self, key: &str) -> Result<MetaHeader, HeaderError> {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0455-M01","item":"<ratarmount_index::meta_cache::MetaCache>::read_header","disposition":"managed-read","regression":"regression_meta_cache_lookup_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let bytes = managed_read::read(&self.hdr_path(key)).map_err(HeaderError::Io)?;
         serde_json::from_slice(&bytes).map_err(HeaderError::Malformed)
     }
@@ -302,6 +323,13 @@ impl MetaCache {
         let json =
             serde_json::to_vec(hdr).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0456-M01","item":"<ratarmount_index::meta_cache::MetaCache>::write_header","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
             let mut f = File::create(&part)?;
             f.write_all(&json)?;
             f.sync_all()?;
@@ -432,7 +460,17 @@ fn is_cache_miss(e: &io::Error) -> bool {
 }
 
 fn blob_sha256(path: &Path) -> io::Result<String> {
-    managed_read::sha256_hex(path)
+    {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0457-M01","item":"ratarmount_index::meta_cache::blob_sha256","disposition":"managed-read","regression":"regression_meta_cache_lookup_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
+        let __inventory_value_0 = managed_read::sha256_hex(path);
+        __inventory_value_0
+    }
 }
 
 /// Why a header could not be read: I/O (a missing header is a miss, any other

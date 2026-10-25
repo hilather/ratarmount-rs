@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! Userspace SMB 2.0.2 / 3.1.1 export of a [`ratarmount_core::MountSource`] (P-2).
 //!
 //! Listen on `127.0.0.1:20445` (unprivileged; well-known 445 needs root).

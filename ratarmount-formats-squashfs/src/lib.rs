@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! SquashFS mount source.
 //!
 //! Prefer **in-process** random access via the pure-Rust [`backhand`] crate (parity with
@@ -331,6 +333,13 @@ impl SquashFsMountSource {
 
     fn open_inprocess(path: &Path, offset: u64) -> Result<Backend> {
         let kind = detect_kind(path, offset)?;
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0356-M01","item":"<ratarmount_formats_squashfs::SquashFsMountSource>::open_inprocess","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         Self::open_inprocess_from_bufread(reader, offset, kind, path)
@@ -403,6 +412,13 @@ impl SquashFsMountSource {
             ));
         }
 
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0357-M01","item":"<ratarmount_formats_squashfs::SquashFsMountSource>::open_unsquashfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
         let extract = TempDir::with_prefix("ratarmount-squashfs.")?;
         let out = extract.path().to_path_buf();
         // unsquashfs -f -d OUT [-o OFFSET] IMAGE
@@ -681,6 +697,13 @@ fn compressor_name(id: Option<u16>) -> &'static str {
 
 /// Read SquashFS v4 superblock compressor id at `offset` (if magic matches).
 fn read_superblock_compressor(path: &Path, offset: u64) -> Result<Option<u16>> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0358-M01","item":"ratarmount_formats_squashfs::read_superblock_compressor","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut f = File::open(path)?;
     read_superblock_compressor_reader(&mut f, offset)
 }
@@ -709,6 +732,13 @@ fn read_superblock_compressor_reader<R: Read + Seek>(
 
 /// Choose LE or BE v4 kind from superblock magic at `offset`, with workspace XZ compressor.
 fn detect_kind(path: &Path, offset: u64) -> Result<Kind> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0359-M01","item":"ratarmount_formats_squashfs::detect_kind","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut f = File::open(path)?;
     detect_kind_reader(&mut f, offset)
 }
@@ -733,6 +763,13 @@ fn detect_kind_reader<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<Kin
 
 /// Detect SquashFS; returns superblock offset if found (0..1 MiB scan for AppImage).
 pub fn find_squashfs_offset(path: &Path) -> Result<Option<u64>> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0360-M01","item":"ratarmount_formats_squashfs::find_squashfs_offset","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut f = File::open(path)?;
     find_squashfs_offset_reader(&mut f)
 }

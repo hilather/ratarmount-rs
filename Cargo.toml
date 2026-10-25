@@ -111,3 +111,6 @@ libc = "0.2"
 log = "0.4"
 env_logger = "0.11"
 tempfile = "3"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(internal_read_inventory)'] }

@@ -161,13 +161,30 @@ fn generate_ed25519() -> io::Result<PrivateKey> {
 fn write_host_key(path: &Path, key: &PrivateKey) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0100-M01","item":"ratarmount_sftp::handler::write_host_key","disposition":"output-owner","category":"sftp-host-key-directory","reason":"Create the configured SFTP host key parent before writing a generated host key.","creation":{"policy":"recursive-directory","basis":"This reviewed site creates only the parent tree with current defaults; host-key content writing is separately inventoried."}}"###
+                )
+            )]
             std::fs::create_dir_all(dir)?;
         }
     }
     let encoded = key
         .to_openssh(russh::keys::ssh_key::LineEnding::LF)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    std::fs::write(path, encoded.as_bytes())
+    {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0543-M01","item":"ratarmount_sftp::handler::write_host_key","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
+        let __inventory_value_0 = std::fs::write(path, encoded.as_bytes());
+        __inventory_value_0
+    }
 }
 
 #[derive(Clone)]

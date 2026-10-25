@@ -301,6 +301,13 @@ fn try_materialize_split_from_parent(
         return None;
     }
     // Materialize joined stream by opening each part through the parent mount.
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0135-M01","item":"ratarmount_compositing::automount::try_materialize_split_from_parent","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut tmp = NamedTempFile::new().ok()?;
     for part_path in &set.paths {
         // `check_for_split_file_in` may return basenames or dir-prefixed paths; use the name only.
@@ -849,56 +856,64 @@ impl AutoMountLayer {
             }
         }
 
-        let persist =
-            if let Some(joined) = try_materialize_split_from_parent(parent.as_ref(), &rest) {
-                debug!(
-                    "automount: using split-join materialize for {} -> {}",
-                    rest,
-                    joined.display()
-                );
-                joined
-            } else {
-                let mut reader = match parent.open(&fi, 0) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        debug!(
+        let persist = if let Some(joined) =
+            try_materialize_split_from_parent(parent.as_ref(), &rest)
+        {
+            debug!(
+                "automount: using split-join materialize for {} -> {}",
+                rest,
+                joined.display()
+            );
+            joined
+        } else {
+            let mut reader = match parent.open(&fi, 0) {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(
                         "automount: parent.open for temp spool failed for {rest} (kind={:?}): {e}",
                         e.kind()
                     );
-                        return None;
-                    }
-                };
-                let mut tmp = match NamedTempFile::new() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        debug!("automount: NamedTempFile::new failed for {rest}: {e}");
-                        return None;
-                    }
-                };
-                if let Err(e) = io::copy(&mut reader, &mut tmp) {
-                    debug!("automount: copy to temp failed for {rest}: {e}");
                     return None;
-                }
-                if let Err(e) = tmp.flush() {
-                    debug!("automount: temp flush failed for {rest}: {e}");
-                    return None;
-                }
-                let tmp_path = tmp.into_temp_path();
-                match tmp_path.keep() {
-                    Ok(p) => {
-                        debug!(
-                            "automount: spooled {} -> {} for path open",
-                            rest,
-                            p.display()
-                        );
-                        p
-                    }
-                    Err(e) => {
-                        debug!("automount: temp keep failed for {rest}: {e}");
-                        return None;
-                    }
                 }
             };
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0136-M01","item":"<ratarmount_compositing::automount::AutoMountLayer>::try_mount_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
+            let mut tmp = match NamedTempFile::new() {
+                Ok(t) => t,
+                Err(e) => {
+                    debug!("automount: NamedTempFile::new failed for {rest}: {e}");
+                    return None;
+                }
+            };
+            if let Err(e) = io::copy(&mut reader, &mut tmp) {
+                debug!("automount: copy to temp failed for {rest}: {e}");
+                return None;
+            }
+            if let Err(e) = tmp.flush() {
+                debug!("automount: temp flush failed for {rest}: {e}");
+                return None;
+            }
+            let tmp_path = tmp.into_temp_path();
+            match tmp_path.keep() {
+                Ok(p) => {
+                    debug!(
+                        "automount: spooled {} -> {} for path open",
+                        rest,
+                        p.display()
+                    );
+                    p
+                }
+                Err(e) => {
+                    debug!("automount: temp keep failed for {rest}: {e}");
+                    return None;
+                }
+            }
+        };
         let nested = match (self.open_nested)(&persist) {
             Ok(s) => s,
             Err(e) => {

@@ -804,6 +804,13 @@ pub fn directory_digest_excluding(root: &Path, excludes: &BaseExcludes) -> Resul
     for rel in paths {
         let path = root.join(&rel);
         let meta = fs::symlink_metadata(&path)?;
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0153-M01","item":"ratarmount_compositing::overlay_meta::directory_digest_excluding","disposition":"managed-read","regression":"regression_directory_strong_digest_keeps_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let (size, content) = if meta.is_dir() {
             (0, String::new())
         } else if meta.is_file() {
@@ -914,7 +921,8 @@ impl PendingBase {
                 }
                 test_hash_seam(path);
                 // Managed (#151): the archive may be a database open here.
-                let cursor = ratarmount_index::managed_read::ManagedReadCursor::open(path)?;
+                #[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0154-M01","item":"<ratarmount_compositing::overlay_meta::PendingBase>::hash","disposition":"managed-read","regression":"regression_pending_base_hash_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+let cursor = ratarmount_index::managed_read::ManagedReadCursor::open(path)?;
                 sha256_hex_stream(&mut Checked(cursor, check))
             })
             .map_err(|e| {
@@ -936,7 +944,40 @@ impl PendingBase {
 fn test_hash_seam(path: &Path) {
     use std::io::Write;
     if let Some(log) = std::env::var_os("RATARMOUNT_TEST_HASH_LOG") {
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log) {
+        if let Ok(mut file) = {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_types,
+                    reason = r###"internal-read:v1 {"id":"IR-E0003-T01","item":"ratarmount_compositing::overlay_meta::test_hash_seam","disposition":"support","category":"builder-type-support","reason":"Builder type support: Append archive hash-start events to the explicit RATARMOUNT_TEST_HASH_LOG instrumentation path when test-hooks is enabled.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+                )
+            )]
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0003-M01","item":"ratarmount_compositing::overlay_meta::test_hash_seam","disposition":"out-of-family","category":"feature-test-hook","reason":"Append archive hash-start events to the explicit RATARMOUNT_TEST_HASH_LOG instrumentation path when test-hooks is enabled.","creation":{"policy":"append-or-create","basis":"The hook opens append/create, never truncates an existing log, and uses platform-default file permissions."}}"###
+                )
+            )]
+            let mut __inventory_value_0 = fs::OpenOptions::new();
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0003-M02","item":"ratarmount_compositing::overlay_meta::test_hash_seam","disposition":"out-of-family","category":"feature-test-hook","reason":"Append archive hash-start events to the explicit RATARMOUNT_TEST_HASH_LOG instrumentation path when test-hooks is enabled.","creation":{"policy":"append-or-create","basis":"The hook opens append/create, never truncates an existing log, and uses platform-default file permissions."}}"###
+                )
+            )]
+            let __inventory_value_1 = __inventory_value_0.create(true);
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0003-M03","item":"ratarmount_compositing::overlay_meta::test_hash_seam","disposition":"out-of-family","category":"feature-test-hook","reason":"Append archive hash-start events to the explicit RATARMOUNT_TEST_HASH_LOG instrumentation path when test-hooks is enabled.","creation":{"policy":"append-or-create","basis":"The hook opens append/create, never truncates an existing log, and uses platform-default file permissions."}}"###
+                )
+            )]
+            let __inventory_value_2 = __inventory_value_1.append(true).open(log);
+            __inventory_value_2
+        } {
             let _ = file.write_all(format!("{}\n", path.display()).as_bytes());
         }
     }
@@ -979,6 +1020,13 @@ pub fn test_hash_gate() -> Option<PathBuf> {
 pub fn test_pack_hold() {
     #[cfg(any(test, feature = "test-hooks"))]
     if let Some(ready) = std::env::var_os("RATARMOUNT_TEST_PACK_HOLD") {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0004-M01","item":"ratarmount_compositing::overlay_meta::test_pack_hold","disposition":"out-of-family","category":"feature-test-hook","reason":"Write the RATARMOUNT_TEST_PACK_HOLD readiness marker before the bounded pack hold.","creation":{"policy":"create-or-truncate","basis":"The test-hooks readiness marker is explicit instrumentation output, written through fs::write with ordinary umask permissions."}}"###
+            )
+        )]
         let _ = fs::write(ready, b"ready");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
@@ -1490,6 +1538,13 @@ pub(crate) fn verify_base_path(dir: &Path, base: &Path) -> BaseCheck {
         Some(text) => BaseExcludes::from_json(text),
         None => Ok(BaseExcludes::default()),
     };
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0155-M01","item":"ratarmount_compositing::overlay_meta::verify_base_path","disposition":"managed-read","regression":"regression_strong_base_verification_keeps_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let result: Result<(String, String, BaseStrength)> = if base_meta.is_dir() {
         match kind {
             Some("strong") => excludes()

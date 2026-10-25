@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! GPT/MBR partition-table mount source.
 //!
 //! Whole-disk images with a partition table are presented as `/pN/` directories
@@ -331,6 +333,13 @@ impl BlockMountSource {
                 path.display()
             )));
         }
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0297-M01","item":"<ratarmount_formats_block::BlockMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let mut file = File::open(path)?;
         let partitions = parse_partition_table(&mut file)?;
         drop(file);
@@ -472,6 +481,13 @@ fn try_open_fs_shared(shared: SharedSeekReader, part: &Partition) -> Option<Arc<
 /// Superfloppy FAT/EXT4 at offset 0 returns **false** so those crates keep the
 /// image. No `.img` extension fallback (too generic).
 pub fn looks_like_block(path: &Path) -> bool {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0298-M01","item":"ratarmount_formats_block::looks_like_block","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(_) => return false,

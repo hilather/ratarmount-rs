@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! Read-only exFAT filesystem image mount source.
 //!
 //! In-process cluster reads (no loop mount / `exfat-fuse`). Detection is OEM
@@ -109,6 +111,13 @@ impl ExfatMountSource {
             )));
         }
         // One fd for the mount lifetime (list/open must not reopen per cluster).
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0307-M01","item":"<ratarmount_formats_exfat::ExfatMountSource>::open_with_offset","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let file = File::open(path)?;
         Self::from_reader(file, path.to_path_buf(), partition_offset).map_err(|e| {
             ExfatError::Msg(format!(
@@ -766,7 +775,17 @@ pub fn looks_like_exfat(path: &Path) -> bool {
 /// Extension fallback (`*.exfat`) applies only at offset 0 so a partitioned
 /// disk named `*.exfat` is not reported as a superfloppy.
 pub fn looks_like_exfat_at(path: &Path, partition_offset: u64) -> bool {
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0308-M01","item":"ratarmount_formats_exfat::looks_like_exfat_at","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
+        let __inventory_value_0 = File::open(path);
+        __inventory_value_0
+    } {
         if looks_like_exfat_reader_at(&mut f, partition_offset) {
             return true;
         }

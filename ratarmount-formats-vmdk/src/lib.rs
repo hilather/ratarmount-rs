@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! VMDK virtual-disk mount source (hosted KDMV sparse).
 //!
 //! Parses a VMware disk descriptor and hosted sparse extents (`KDMV` magic),
@@ -169,6 +171,13 @@ where
 }
 
 fn open_disk_from_path(path: &Path) -> Result<sparse::VmdkDisk> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0378-M01","item":"ratarmount_formats_vmdk::open_disk_from_path","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut file = File::open(path)?;
     let mut probe = [0u8; 4096];
     let n = read_prefix(&mut file, &mut probe)?;
@@ -193,6 +202,13 @@ fn open_disk_from_path(path: &Path) -> Result<sparse::VmdkDisk> {
 }
 
 fn open_kdmv_path(path: &Path) -> Result<sparse::VmdkDisk> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0379-M01","item":"ratarmount_formats_vmdk::open_kdmv_path","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let file = File::open(path)?;
     let backend = sparse::share_reader(file);
     let (extent, desc) = sparse::open_sparse_extent(backend)?;
@@ -262,6 +278,13 @@ fn open_descriptor_path(desc_path: &Path, desc: &VmdkDescriptor) -> Result<spars
 }
 
 fn open_sparse_file(path: &Path) -> Result<sparse::DiskExtent> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0380-M01","item":"ratarmount_formats_vmdk::open_sparse_file","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let file = File::open(path)?;
     let backend = sparse::share_reader(file);
     let (extent, desc) = sparse::open_sparse_extent(backend)?;
@@ -272,6 +295,13 @@ fn open_sparse_file(path: &Path) -> Result<sparse::DiskExtent> {
 }
 
 fn open_flat_file(path: &Path, ext: &DescriptorExtent) -> Result<sparse::DiskExtent> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0381-M01","item":"ratarmount_formats_vmdk::open_flat_file","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let file = File::open(path)?;
     let backend = sparse::share_reader(file);
     let size_bytes = ext.sectors.saturating_mul(SECTOR);
@@ -293,6 +323,13 @@ fn read_sidecar_descriptor(path: &Path) -> Result<String> {
             path.display()
         )));
     }
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0382-M01","item":"ratarmount_formats_vmdk::read_sidecar_descriptor","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let file = File::open(path)?;
     let mut buf = Vec::new();
     file.take(MAX_SIDECAR_DESCRIPTOR_BYTES)
@@ -427,6 +464,13 @@ fn read_prefix<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
 /// Detect KDMV sparse magic or a text disk descriptor. COWD is **not** claimed
 /// (ESXi residual). No `.vmdk` extension fallback.
 pub fn looks_like_vmdk(path: &Path) -> bool {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0383-M01","item":"ratarmount_formats_vmdk::looks_like_vmdk","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(_) => return false,

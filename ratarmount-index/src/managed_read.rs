@@ -63,6 +63,13 @@ impl ManagedReadCursor {
     /// Open `path` for reading. Symlinks are resolved first (the VFS opens
     /// with `O_NOFOLLOW`); a missing file is `NotFound`.
     pub fn open(path: &Path) -> io::Result<Self> {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0067-M01","item":"<ratarmount_index::managed_read::ManagedReadCursor>::open","disposition":"managed-read","category":"managed-reader-backend","reason":"Open the managed cursor through its SQLite-backed ByteFile implementation.","creation":{"policy":"none","basis":"The cursor reads an existing path through the managed backend; no file creation is requested."}}"###
+            )
+        )]
         let file = imp::ByteFile::open(path)?;
         Ok(Self {
             owner: Arc::new(Owner {
@@ -208,6 +215,13 @@ pub fn is_not_regular_file(e: &io::Error) -> bool {
 /// the memory this process may allocate is an `OutOfMemory` error, not an
 /// abort.
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0444-M01","item":"ratarmount_index::managed_read::read","disposition":"managed-read","regression":"regression_internal_cursor_close_keeps_posix_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut c = ManagedReadCursor::open(path)?;
     let len = c.len()?;
     let oom = || {
@@ -225,11 +239,22 @@ pub fn read(path: &Path) -> io::Result<Vec<u8>> {
 
 /// Read the whole file as UTF-8.
 pub fn read_to_string(path: &Path) -> io::Result<String> {
-    String::from_utf8(read(path)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    String::from_utf8({
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0068-M01","item":"ratarmount_index::managed_read::read_to_string","disposition":"managed-read","category":"managed-reader-delegation","reason":"Delegate UTF-8 text loading to the managed byte reader before validating UTF-8.","creation":{"policy":"none","basis":"The nested managed_read::read reads existing content; UTF-8 conversion creates no pathname resource."}}"###))]
+let __inventory_value_0 = read(path);
+__inventory_value_0
+}?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Read at most `max` bytes from the start of the file (fewer at EOF).
 pub fn read_prefix(path: &Path, max: usize) -> io::Result<Vec<u8>> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0445-M01","item":"ratarmount_index::managed_read::read_prefix","disposition":"managed-read","regression":"regression_internal_cursor_close_keeps_posix_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut c = ManagedReadCursor::open(path)?;
     let mut out = Vec::with_capacity(max.min(1 << 20));
     (&mut c).take(max as u64).read_to_end(&mut out)?;
@@ -239,6 +264,13 @@ pub fn read_prefix(path: &Path, max: usize) -> io::Result<Vec<u8>> {
 /// Lowercase hex SHA-256 of the whole file. An I/O error is an error, never a
 /// digest of partial bytes.
 pub fn sha256_hex(path: &Path) -> io::Result<String> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0446-M01","item":"ratarmount_index::managed_read::sha256_hex","disposition":"managed-read","regression":"regression_internal_cursor_close_keeps_posix_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut c = ManagedReadCursor::open(path)?;
     sha256_hex_cursor(&mut c)
 }
@@ -250,6 +282,13 @@ pub fn sha256_hex_cursor(c: &mut ManagedReadCursor) -> io::Result<String> {
 
 /// Stream the whole file into `out`; returns the byte count.
 pub fn copy_into<W: Write + ?Sized>(src: &Path, out: &mut W) -> io::Result<u64> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0447-M01","item":"ratarmount_index::managed_read::copy_into","disposition":"managed-read","regression":"regression_internal_cursor_close_keeps_posix_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut c = ManagedReadCursor::open(src)?;
     copy_cursor(&mut c, out, None)
 }
@@ -314,14 +353,49 @@ pub fn copy_exclusive_new(
 ) -> io::Result<ExclusiveCopy> {
     let CopySourcePermissions::Exact = perms;
     let meta = fs::metadata(src)?;
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0448-M01","item":"ratarmount_index::managed_read::copy_exclusive_new","disposition":"managed-read","regression":"regression_internal_cursor_close_keeps_posix_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut c = ManagedReadCursor::open(src)?;
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0449-M01","item":"ratarmount_index::managed_read::copy_exclusive_new","disposition":"support","regression":"regression_exclusive_create_mode_table","mode_policy":"create_new with the source mode & !umask; exact source permissions through the handle after the copy","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+        )
+    )]
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0449-T01","item":"ratarmount_index::managed_read::copy_exclusive_new","disposition":"support","regression":"regression_exclusive_create_mode_table","mode_policy":"create_new with the source mode & !umask; exact source permissions through the handle after the copy","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )
+    )]
     let mut opts = fs::OpenOptions::new();
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0069-M01","item":"ratarmount_index::managed_read::copy_exclusive_new","disposition":"output-owner","category":"managed-copy-output","reason":"Configure exclusive creation of the managed copy destination.","creation":{"policy":"exclusive-new-file","basis":"create_new refuses existing destinations; Unix source permission bits are applied by the copy helper before bytes are written."}}"###
+        )
+    )]
     opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         opts.mode(meta.permissions().mode() & 0o7777);
     }
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0449-M02","item":"ratarmount_index::managed_read::copy_exclusive_new","disposition":"output-owner","regression":"regression_exclusive_create_mode_table","mode_policy":"create_new with the source mode & !umask; exact source permissions through the handle after the copy","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"create_new with the source mode & !umask; exact source permissions through the handle after the copy","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut file = opts.open(dest)?;
     let result = (|| {
         let mut hash = (digest == CopyDigest::Sha256).then(Sha256::new);
@@ -356,14 +430,49 @@ pub fn copy_exclusive_new(
 /// not removed (it may have existed before).
 pub fn copy_create_or_truncate(src: &Path, dest: &Path) -> io::Result<u64> {
     let meta = fs::metadata(src)?;
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0450-M01","item":"ratarmount_index::managed_read::copy_create_or_truncate","disposition":"managed-read","regression":"regression_internal_cursor_close_keeps_posix_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut c = ManagedReadCursor::open(src)?;
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0451-M01","item":"ratarmount_index::managed_read::copy_create_or_truncate","disposition":"support","regression":"regression_exclusive_create_mode_table","mode_policy":"create-or-truncate with the source mode & !umask; exact source permissions through the handle before any write","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+        )
+    )]
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0451-T01","item":"ratarmount_index::managed_read::copy_create_or_truncate","disposition":"support","regression":"regression_exclusive_create_mode_table","mode_policy":"create-or-truncate with the source mode & !umask; exact source permissions through the handle before any write","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )
+    )]
     let mut opts = fs::OpenOptions::new();
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0070-M01","item":"ratarmount_index::managed_read::copy_create_or_truncate","disposition":"output-owner","category":"managed-copy-output","reason":"Configure create-or-truncate output for a managed-source copy.","creation":{"policy":"create-or-truncate","basis":"The helper intentionally permits a zero-length/existing destination and applies source permissions before copying."}}"###
+        )
+    )]
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         opts.mode(meta.permissions().mode() & 0o7777);
     }
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0451-M02","item":"ratarmount_index::managed_read::copy_create_or_truncate","disposition":"output-owner","regression":"regression_exclusive_create_mode_table","mode_policy":"create-or-truncate with the source mode & !umask; exact source permissions through the handle before any write","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"create-or-truncate with the source mode & !umask; exact source permissions through the handle before any write","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut file = opts.open(dest)?;
     seams::fire(Seam::BeforePermissions)?;
     file.set_permissions(meta.permissions())?;
@@ -497,7 +606,19 @@ mod seams {
 pub(crate) fn ensure_standard_descriptors() -> io::Result<()> {
     fn occupied(fd: libc::c_int) -> bool {
         // SAFETY: F_GETFD on any number is harmless.
-        unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
+        unsafe {
+            ({
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0071-M01","item":"ratarmount_index::managed_read::ensure_standard_descriptors::occupied","disposition":"out-of-family","category":"standard-descriptor-control","reason":"Check whether a standard descriptor slot is occupied before filling vacant slots.","creation":{"policy":"none","basis":"F_GETFD is a harmless query on the numeric slot; the later /dev/null opens have independent approvals."}}"###
+                    )
+                )]
+                let __inventory_value_0 = libc::fcntl(fd, libc::F_GETFD);
+                __inventory_value_0
+            }) >= 0
+        }
     }
     seams::fire(Seam::BeforeLowFdFill)?;
     if (0..3).all(occupied) {
@@ -512,6 +633,13 @@ pub(crate) fn ensure_standard_descriptors() -> io::Result<()> {
     loop {
         // No O_CLOEXEC: the placeholder stays a standard descriptor.
         // SAFETY: a constant C string; the descriptor is ours.
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0452-M01","item":"ratarmount_index::managed_read::ensure_standard_descriptors","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"/dev/null placeholder for a vacant standard descriptor 0-2 before the byte VFS opens; reads no file content","non_mandatory_callers":["ByteFile::open"],"creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
         if fd < 0 {
             let e = io::Error::last_os_error();
@@ -852,6 +980,13 @@ mod imp {
             super::seams::fire(super::Seam::BeforeOpen)?;
             #[cfg(any(test, feature = "test-hooks"))]
             super::XOPEN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0453-I01","disposition":"managed-read","reason":"non-Unix backend of ManagedReadCursor (an ordinary private file)","regression":"regression_internal_cursor_clones_have_independent_offsets","managed_backend":true,"item":"<ratarmount_index::managed_read::imp::ByteFile>::open","native_observed":false,"creation":{"policy":"none","basis":"The non-Unix managed backend opens an existing private input file and validates regular-file type."},"category":"managed-reader-backend"}"###
+                )
+            )]
             let file = File::open(path)?;
             if !file.metadata()?.is_file() {
                 return Err(super::not_regular_file(path));
@@ -897,6 +1032,13 @@ pub mod lock_probe {
             let pid = libc::fork();
             assert!(pid >= 0, "fork failed");
             if pid == 0 {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0072-M01","item":"ratarmount_index::managed_read::lock_probe::other_process_sees_lock","disposition":"out-of-family","category":"feature-test-hook","reason":"Open the explicit lock-probe file read-only in the forked child process.","creation":{"policy":"none","basis":"The child uses O_RDONLY/CLOEXEC only, asks the kernel about locks and exits; no file is created or content read."}}"###
+                    )
+                )]
                 let fd = libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
                 if fd < 0 {
                     libc::_exit(3);
@@ -906,7 +1048,18 @@ pub mod lock_probe {
                 lk.l_whence = libc::SEEK_SET as _;
                 lk.l_start = 0x4000_0000;
                 lk.l_len = 512;
-                if libc::fcntl(fd, libc::F_GETLK, &mut lk) != 0 {
+                if {
+                    #[cfg_attr(
+                        internal_read_inventory,
+                        expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-E0073-M01","item":"ratarmount_index::managed_read::lock_probe::other_process_sees_lock","disposition":"out-of-family","category":"feature-test-hook","reason":"Ask F_GETLK whether the child observes the parent SQLite shared lock.","creation":{"policy":"none","basis":"This query uses the child-held descriptor and neither duplicates nor creates a resource."}}"###
+                        )
+                    )]
+                    let __inventory_value_0 = libc::fcntl(fd, libc::F_GETLK, &mut lk);
+                    __inventory_value_0
+                } != 0
+                {
                     libc::_exit(4);
                 }
                 #[allow(clippy::unnecessary_cast)]
@@ -949,7 +1102,17 @@ pub fn with_close_probes<R>(
             }
             match s {
                 Seam::AfterOpen => {
-                    if let Ok(lock) = VfsLockHolder::shared(&path) {
+                    if let Ok(lock) = {
+                        #[cfg_attr(
+                            internal_read_inventory,
+                            expect(
+                                clippy::disallowed_methods,
+                                reason = r###"internal-read:v1 {"id":"IR-E0074-M01","item":"ratarmount_index::managed_read::with_close_probes","disposition":"out-of-family","category":"feature-test-hook","reason":"Acquire a managed shared-lock holder at the AfterOpen test seam to verify that managed closes retain locks.","creation":{"policy":"none","basis":"VfsLockHolder opens an existing path through ByteFile; this all-features test-hooks instrumentation requests no creation."}}"###
+                            )
+                        )]
+                        let __inventory_value_0 = VfsLockHolder::shared(&path);
+                        __inventory_value_0
+                    } {
                         h2.borrow_mut().push((path, lock));
                     }
                 }
@@ -957,6 +1120,13 @@ pub fn with_close_probes<R>(
                     let mut held = h2.borrow_mut();
                     if let Some(i) = held.iter().rposition(|(p, _)| *p == path) {
                         let (p, lock) = held.remove(i);
+                        #[cfg_attr(
+                            internal_read_inventory,
+                            expect(
+                                clippy::disallowed_methods,
+                                reason = r###"internal-read:v1 {"id":"IR-E0075-M01","item":"ratarmount_index::managed_read::with_close_probes","disposition":"out-of-family","category":"feature-test-hook","reason":"Run the child lock-observation probe after a managed close before releasing the test-held lock.","creation":{"policy":"none","basis":"The probe only queries an existing file/lock relationship and has separately reviewed child acquisition."}}"###
+                            )
+                        )]
                         let kept = lock_probe::other_process_sees_lock(&p);
                         s2.borrow_mut().push((p, kept));
                         drop(lock);
@@ -1007,6 +1177,13 @@ pub struct VfsLockHolder {
 #[cfg(all(unix, any(test, feature = "test-hooks")))]
 impl VfsLockHolder {
     pub fn shared(path: &Path) -> io::Result<Self> {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0076-M01","item":"<ratarmount_index::managed_read::VfsLockHolder>::shared","disposition":"managed-read","category":"feature-test-hook","reason":"Construct the test-hook shared-lock holder using the managed ByteFile reader.","creation":{"policy":"none","basis":"The helper opens existing content and then takes the SQLite shared lock; it does not create an input."}}"###
+            )
+        )]
         let mut file = imp::ByteFile::open(path)?;
         file.lock_shared()?;
         Ok(Self { file })

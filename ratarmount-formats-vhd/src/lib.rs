@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! VHD / VHDX virtual-disk mount source.
 //!
 //! Translates guest LBA bytes through a Connectix VHD footer (fixed or dynamic
@@ -77,6 +79,13 @@ impl VhdMountSource {
                 path.display()
             )));
         }
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0375-M01","item":"<ratarmount_formats_vhd::VhdMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let file = File::open(path)?;
         Self::from_reader(file, path.to_path_buf())
     }
@@ -165,6 +174,13 @@ fn mount_virtual_disk(mut disk: VirtualDisk, label: &Path) -> Result<Box<dyn Mou
 
 /// Footer cookie `conectix` at EOF (fixed) or offset 0 (dynamic copy).
 pub fn looks_like_vhd(path: &Path) -> bool {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0376-M01","item":"ratarmount_formats_vhd::looks_like_vhd","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(_) => return false,
@@ -174,6 +190,13 @@ pub fn looks_like_vhd(path: &Path) -> bool {
 
 /// File identifier `vhdxfile` at offset 0.
 pub fn looks_like_vhdx(path: &Path) -> bool {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0377-M01","item":"ratarmount_formats_vhd::looks_like_vhdx","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(_) => return false,

@@ -89,6 +89,13 @@ pub fn open_seekable_bzip2_with_threads(
     threads: u32,
 ) -> Result<Arc<dyn SeekableBody>> {
     let path = path.as_ref();
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0203-M01","item":"ratarmount_compress::bzip2_seek::open_seekable_bzip2_with_threads","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let file = File::open(path)?;
     let len = file.metadata()?.len();
     open_seekable_bzip2_with_file(file, len, threads, path, IN_MEMORY_COMPRESSED_CAP)
@@ -164,6 +171,13 @@ where
 ///
 /// See [`export_bzip2_blocks_from_reader`].
 pub fn export_bzip2_blocks(path: impl AsRef<Path>) -> Result<Vec<(u64, u64)>> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0204-M01","item":"ratarmount_compress::bzip2_seek::export_bzip2_blocks","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut file = File::open(path)?;
     export_bzip2_blocks_from_reader(&mut file)
 }
@@ -182,10 +196,24 @@ pub fn export_bzip2_blocks_from_reader<R: Read + Seek>(reader: &mut R) -> Result
         reader.read_to_end(&mut compressed)?;
         CompressedStore::Memory(Arc::new(compressed))
     } else {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0205-M01","item":"ratarmount_compress::bzip2_seek::export_bzip2_blocks_from_reader","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
         let mut tmp = NamedTempFile::new()?;
         io::copy(reader, tmp.as_file_mut())?;
         tmp.as_file_mut().flush()?;
         let spool_len = tmp.as_file().metadata()?.len();
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0206-M01","item":"ratarmount_compress::bzip2_seek::export_bzip2_blocks_from_reader","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let reopened = tmp.reopen()?;
         CompressedStore::shared_file(reopened, spool_len, Some(tmp))
     };
@@ -241,10 +269,24 @@ where
         CompressedStore::Memory(Arc::new(compressed))
     } else {
         // Spool once so we retain seekable compressed storage without Arc<Vec>.
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0207-M01","item":"ratarmount_compress::bzip2_seek::open_seekable_bzip2_from_reader_with_cap","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
         let mut tmp = NamedTempFile::new()?;
         io::copy(&mut reader, tmp.as_file_mut())?;
         tmp.as_file_mut().flush()?;
         let spool_len = tmp.as_file().metadata()?.len();
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0208-M01","item":"ratarmount_compress::bzip2_seek::open_seekable_bzip2_from_reader_with_cap","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let reopened = tmp.reopen()?;
         CompressedStore::shared_file(reopened, spool_len, Some(tmp))
     };
@@ -437,6 +479,13 @@ impl SeekableBzip2 {
     ) -> Result<Arc<Self>> {
         let path = path.as_ref();
         let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0209-M01","item":"<ratarmount_compress::bzip2_seek::SeekableBzip2>::open_with_bzip2_blocks","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         let mut file = file;
@@ -473,10 +522,24 @@ impl SeekableBzip2 {
             reader.read_to_end(&mut compressed)?;
             CompressedStore::Memory(Arc::new(compressed))
         } else {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0210-M01","item":"<ratarmount_compress::bzip2_seek::SeekableBzip2>::open_with_bzip2_blocks_from_reader","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
             let mut tmp = NamedTempFile::new()?;
             io::copy(&mut reader, tmp.as_file_mut())?;
             tmp.as_file_mut().flush()?;
             let spool_len = tmp.as_file().metadata()?.len();
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0211-M01","item":"<ratarmount_compress::bzip2_seek::SeekableBzip2>::open_with_bzip2_blocks_from_reader","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
             let reopened = tmp.reopen()?;
             CompressedStore::shared_file(reopened, spool_len, Some(tmp))
         };

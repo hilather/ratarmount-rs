@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! Electron ASAR MountSource (`backendName=ASARMountSource`).
 //!
 //! Format: pickled JSON header + concatenated file payloads. Members open via
@@ -150,6 +152,13 @@ fn walk_asar_entries(header: &Value, data_offset: u64) -> Vec<FileRow> {
 }
 
 pub fn looks_like_asar(path: &Path) -> bool {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0294-M01","item":"ratarmount_formats_asar::looks_like_asar","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let Ok(mut f) = File::open(path) else {
         return false;
     };
@@ -179,6 +188,13 @@ impl AsarMountSource {
         recreate: bool,
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0295-M01","item":"<ratarmount_formats_asar::AsarMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let file = File::open(&archive_path)?;
         Self::open_from_reader(
             file,
@@ -256,6 +272,13 @@ impl AsarMountSource {
         // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
         // Missing tarstats still Ok (legacy indexes).
         index.check_tarstats_matches_archive(archive_path)?;
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0296-M01","item":"<ratarmount_formats_asar::AsarMountSource>::open_existing_path","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let file = File::open(archive_path)?;
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(file)));
         Ok(Self {

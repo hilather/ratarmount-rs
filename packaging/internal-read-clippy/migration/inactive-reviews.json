@@ -1,0 +1,552 @@
+{
+  "schema": 1,
+  "entries": [
+    {
+      "inactive_index": 1,
+      "baseline_index": 152,
+      "baseline_identity": {
+        "file": "ratarmount-compositing/src/overlay_layer.rs",
+        "function": "ReadOnlyOverlayLayer::open_host",
+        "op": "OpenOptions",
+        "ordinal": 2,
+        "fingerprint": "45fb1bed2902ea53"
+      },
+      "cfg": "#[cfg(not(unix))]",
+      "original_source": "        open_options_nofollow().read(true).open(host)",
+      "metadata": {
+        "id": "IR-B0152-I01",
+        "disposition": "residual",
+        "family": "payload-admitted-readers",
+        "issue": "#196",
+        "reason": "non-Unix overlay payload open (no admitted open off Unix); payload ownership needs the excluded coordinator",
+        "item": "<ratarmount_compositing::overlay_layer::ReadOnlyOverlayLayer>::open_host",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "Existing non-Unix overlay payload opened read-only; there is no creation request."
+        },
+        "category": "overlay-payload"
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "#[cfg(not(unix))] {",
+          "    let mut options = open_options_nofollow();",
+          "    options.read(true);",
+          "    // Attach the retained mark immediately to this one open leaf.",
+          "    let opened = options.open(host);",
+          "    opened",
+          "}"
+        ],
+        "scope": "The original trailing expression becomes a cfg-gated block; the marked let owns the final open only."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 2,
+      "baseline_index": 169,
+      "baseline_identity": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "function": "WriteOverlay::truncate",
+        "op": "OpenOptions",
+        "ordinal": 1,
+        "fingerprint": "faf69a3f9b9cd17e"
+      },
+      "cfg": "#[cfg(not(unix))]",
+      "original_source": "        let f = open_options_nofollow().write(true).open(&real)?;",
+      "metadata": {
+        "id": "IR-B0169-I01",
+        "disposition": "residual",
+        "family": "payload-admitted-readers",
+        "issue": "#196",
+        "reason": "non-Unix overlay payload open for truncate (no admitted open off Unix); payload ownership needs the excluded coordinator",
+        "item": "<ratarmount_compositing::write_overlay::WriteOverlay>::truncate",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "Existing non-Unix overlay payload opened write-only before explicit truncation; no create flag."
+        },
+        "category": "overlay-payload"
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "#[cfg(not(unix))]",
+          "let f = {",
+          "    let mut options = open_options_nofollow();",
+          "    options.write(true);",
+          "    // Attach the retained mark immediately to this one open leaf.",
+          "    let opened = options.open(&real)?;",
+          "    opened",
+          "};"
+        ],
+        "scope": "Preserve the native Unix binding; only the inactive alternative is split."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 3,
+      "baseline_index": 175,
+      "baseline_identity": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "function": "WriteOverlay::open",
+        "op": "OpenOptions",
+        "ordinal": 1,
+        "fingerprint": "992cf2f62aa53a77"
+      },
+      "cfg": "#[cfg(not(unix))]",
+      "original_source": "                let opened = open_options_nofollow().read(true).open(&real);",
+      "metadata": {
+        "id": "IR-B0175-I01",
+        "disposition": "residual",
+        "family": "payload-admitted-readers",
+        "issue": "#196",
+        "reason": "non-Unix overlay payload open (no admitted open off Unix); payload ownership needs the excluded coordinator",
+        "item": "<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "Existing non-Unix overlay payload opened read-only; missing content stays missing."
+        },
+        "category": "overlay-payload"
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "#[cfg(not(unix))]",
+          "let opened = {",
+          "    let mut options = open_options_nofollow();",
+          "    options.read(true);",
+          "    // Attach the retained mark immediately to this one open leaf.",
+          "    let opened = options.open(&real);",
+          "    opened",
+          "};"
+        ],
+        "scope": "The mark owns the final open, not the containing fallback block or helper constructor."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 4,
+      "baseline_index": 176,
+      "baseline_identity": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "function": "write_commit_manifest",
+        "op": "File::open",
+        "ordinal": 1,
+        "fingerprint": "ab107f203a21cbce"
+      },
+      "cfg": "#[cfg(not(unix))]",
+      "original_source": "    let opened = File::open(&dest);",
+      "metadata": {
+        "id": "IR-B0176-I01",
+        "disposition": "out-of-family",
+        "category": "structured-control-record",
+        "reason": "commit manifest JSON read back before rewrite",
+        "item": "ratarmount_compositing::write_overlay::write_commit_manifest",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "Existing manifest input is read before a separately created replacement is published."
+        }
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "#[cfg(not(unix))]",
+          "// Retained mark immediately precedes let opened = File::open(&dest);"
+        ],
+        "scope": "Keep the existing cfg attribute and place the expectation on the read-only File::open statement."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 5,
+      "baseline_index": 181,
+      "baseline_identity": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "function": "open_park_fd",
+        "op": "open_admitted",
+        "ordinal": 1,
+        "fingerprint": "02ae8ac5fbb2546c"
+      },
+      "cfg": "#[cfg(not(target_os = \"linux\"))]",
+      "original_source": "        ratarmount_core::db_inodes::open_admitted(host, park_open_flags(), 0)",
+      "metadata": {
+        "id": "IR-B0181-I01",
+        "disposition": "residual",
+        "family": "payload-admitted-readers",
+        "issue": "#196",
+        "reason": "overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)",
+        "item": "ratarmount_compositing::write_overlay::open_park_fd",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "The non-Linux Unix path parks an admitted existing payload descriptor; no create flags are used."
+        },
+        "category": "overlay-payload"
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "#[cfg(not(target_os = \"linux\"))] {",
+          "    // Retained mark immediately precedes the admitted acquisition let.",
+          "    let fd = ratarmount_core::db_inodes::open_admitted(host, park_open_flags(), 0);",
+          "    fd",
+          "}"
+        ],
+        "scope": "The mark owns only open_admitted; park_open_flags is not itself an inventoried operation."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 6,
+      "baseline_index": 193,
+      "baseline_identity": {
+        "file": "ratarmount-compositing/src/write_overlay.rs",
+        "function": "rebuild_zip_with_overlay",
+        "op": "File::open",
+        "ordinal": 1,
+        "fingerprint": "0ad98e5ced58954f"
+      },
+      "cfg": "#[cfg(not(unix))]",
+      "original_source": "                let opened = File::open(&src_path);",
+      "metadata": {
+        "id": "IR-B0193-I01",
+        "disposition": "residual",
+        "family": "archive-and-member-io",
+        "issue": "#196",
+        "reason": "commit rebuild input (overlay member or plain temp); payload ownership excluded",
+        "item": "ratarmount_compositing::write_overlay::rebuild_zip_with_overlay",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "Existing overlay member input for ZIP reconstruction; output is independently owned."
+        },
+        "category": "archive-input"
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "#[cfg(not(unix))]",
+          "// Retained mark immediately precedes let opened = File::open(&src_path);"
+        ],
+        "scope": "Keep the inactive existing-input source acquisition distinct from ZIP output construction."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 7,
+      "baseline_index": 222,
+      "baseline_identity": {
+        "file": "ratarmount-compress/src/fastcopy.rs",
+        "function": "copy_to_temp",
+        "op": "tempdir",
+        "ordinal": 1,
+        "fingerprint": "e4cc1cc9abca0249"
+      },
+      "cfg": "#[cfg(target_os = \"macos\")]",
+      "original_source": "        let dir = tempfile::tempdir_in(parent)?;",
+      "metadata": {
+        "id": "IR-B0222-I01",
+        "disposition": "output-owner",
+        "mode_policy": "unchanged-from-e6ca64e",
+        "item": "ratarmount_compress::fastcopy::copy_to_temp",
+        "native_observed": false,
+        "creation": {
+          "policy": "private-temporary-directory",
+          "basis": "tempfile::tempdir_in creates the macOS clone staging directory with tempfile private defaults; original unchanged-from-e6ca64e mode provenance is retained."
+        },
+        "category": "compression-staging",
+        "reason": "macOS private clone staging directory"
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "// Inside the existing macOS cfg block:",
+          "// Retained mark immediately precedes let dir = tempfile::tempdir_in(parent)?;"
+        ],
+        "scope": "Mark only the private clone staging directory allocation."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 8,
+      "baseline_index": 223,
+      "baseline_identity": {
+        "file": "ratarmount-compress/src/fastcopy.rs",
+        "function": "copy_to_temp",
+        "op": "tempfile",
+        "ordinal": 1,
+        "fingerprint": "7edcc14f7fc54ca8"
+      },
+      "cfg": "#[cfg(target_os = \"macos\")]",
+      "original_source": "            let tmp = tempfile::NamedTempFile::new_in(parent)?;",
+      "metadata": {
+        "id": "IR-B0223-I01",
+        "disposition": "output-owner",
+        "mode_policy": "unchanged-from-e6ca64e",
+        "item": "ratarmount_compress::fastcopy::copy_to_temp",
+        "native_observed": false,
+        "creation": {
+          "policy": "private-named-temporary-file",
+          "basis": "NamedTempFile allocates a private sibling; the previously cloned file is then renamed over that temporary pathname, retaining the reviewed existing clone flow."
+        },
+        "category": "compression-staging",
+        "reason": "macOS named clone output publication"
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "// Inside the successful fclonefileat branch:",
+          "// Retained mark immediately precedes let tmp = tempfile::NamedTempFile::new_in(parent)?;"
+        ],
+        "scope": "Mark only the named temporary allocation that subsequently receives the cloned file."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 9,
+      "baseline_index": 224,
+      "baseline_identity": {
+        "file": "ratarmount-compress/src/fastcopy.rs",
+        "function": "copy_to_temp",
+        "op": "OpenOptions",
+        "ordinal": 1,
+        "fingerprint": "b9281d4c97ca5f67"
+      },
+      "cfg": "#[cfg(target_os = \"macos\")]",
+      "original_source": "            let file = std::fs::OpenOptions::new()",
+      "metadata": {
+        "id": "IR-B0224-I01",
+        "disposition": "out-of-family",
+        "category": "runtime-resource-or-descriptor-handoff",
+        "reason": "range-copy probe on a private temporary file",
+        "mode_policy": "unchanged-from-e6ca64e",
+        "item": "ratarmount_compress::fastcopy::copy_to_temp",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "The read/write OpenOptions path reopens the already-created temporary clone after rename; it requests no creation."
+        }
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "// Inside the existing macOS clone-success branch:",
+          "let mut options = std::fs::OpenOptions::new();",
+          "options.read(true).write(true);",
+          "// Retained mark immediately precedes this final existing-file open.",
+          "let file = options.open(&temp_path)?;"
+        ],
+        "scope": "The original OpenOptions group is retained on the final read/write reopen; constructor/type support remains separately unapproved while inactive."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 10,
+      "baseline_index": 368,
+      "baseline_identity": {
+        "file": "ratarmount-formats-tar/src/write.rs",
+        "function": "write_file_on_disk",
+        "op": "OpenOptions",
+        "ordinal": 1,
+        "fingerprint": "11864c284a679474"
+      },
+      "cfg": "#[cfg(not(unix))]",
+      "original_source": "    let f = std::fs::OpenOptions::new().read(true).open(path)?;",
+      "metadata": {
+        "id": "IR-B0368-I01",
+        "disposition": "residual",
+        "family": "payload-admitted-readers",
+        "issue": "#196",
+        "reason": "TAR commit helper opens an overlay payload through admission",
+        "mode_policy": "unchanged-from-e6ca64e",
+        "item": "ratarmount_formats_tar::write::write_file_on_disk",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "Read-only fallback opens an existing overlay payload and requests no creation."
+        },
+        "category": "overlay-payload"
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "#[cfg(not(unix))]",
+          "let f = {",
+          "    let mut options = std::fs::OpenOptions::new();",
+          "    options.read(true);",
+          "    // Retained mark immediately precedes this read-only existing-file open.",
+          "    let opened = options.open(path)?;",
+          "    opened",
+          "};"
+        ],
+        "scope": "Do not approve the whole fallback block or infer new constructor/type expectations for inactive syntax."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 11,
+      "baseline_index": 394,
+      "baseline_identity": {
+        "file": "ratarmount-formats-zip/src/lib.rs",
+        "function": "read_file_range_at_into",
+        "op": "try_clone",
+        "ordinal": 1,
+        "fingerprint": "5be508bed6dfd418"
+      },
+      "cfg": "#[cfg(not(any(unix, windows)))]",
+      "original_source": "        let mut f = file.try_clone()?;",
+      "metadata": {
+        "id": "IR-B0394-I01",
+        "disposition": "residual",
+        "family": "factory-and-format-readers",
+        "issue": "#196",
+        "reason": "archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes",
+        "item": "ratarmount_formats_zip::read_file_range_at_into",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "try_clone duplicates the already-held archive descriptor; it opens no pathname."
+        },
+        "category": "archive-input"
+      },
+      "owner_basis": "Reviewed crate-qualified named function owner; no active operation event exists here.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "// Inside cfg(not(any(unix, windows))):",
+          "// Retained mark immediately precedes let mut f = file.try_clone()?;"
+        ],
+        "scope": "Mark the single descriptor duplication, preserving subsequent seek/read behavior."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 12,
+      "baseline_index": 407,
+      "baseline_identity": {
+        "file": "ratarmount-fuse/src/lib.rs",
+        "function": "reopen_parked_readonly",
+        "op": "F_DUPFD_CLOEXEC",
+        "ordinal": 1,
+        "fingerprint": "400bacca0462d773"
+      },
+      "cfg": "#[cfg(not(target_os = \"linux\"))]",
+      "original_source": "        let fd = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };",
+      "metadata": {
+        "id": "IR-B0407-I01",
+        "disposition": "residual",
+        "family": "payload-admitted-readers",
+        "issue": "#196",
+        "reason": "non-Linux duplicate of the parked payload descriptor (no pathname open); overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)",
+        "item": "ratarmount_fuse::reopen_parked_readonly",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "F_DUPFD_CLOEXEC duplicates the already-parked payload descriptor and creates no pathname."
+        },
+        "category": "overlay-payload"
+      },
+      "owner_basis": "Canonical owner observed on the active same-named native sibling operation.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "// Inside cfg(not(target_os = \"linux\")):",
+          "// Retained mark immediately precedes let fd = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };"
+        ],
+        "scope": "The expectation owns the single configured fcntl call, without a command/flag policy table."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    },
+    {
+      "inactive_index": 13,
+      "baseline_index": 453,
+      "baseline_identity": {
+        "file": "ratarmount-index/src/managed_read.rs",
+        "function": "ByteFile::open",
+        "op": "File::open",
+        "ordinal": 1,
+        "fingerprint": "529fa3b1dea7facb"
+      },
+      "cfg": "#[cfg(not(unix))]",
+      "original_source": "            let file = File::open(path)?;",
+      "metadata": {
+        "id": "IR-B0453-I01",
+        "disposition": "managed-read",
+        "reason": "non-Unix backend of ManagedReadCursor (an ordinary private file)",
+        "regression": "regression_internal_cursor_clones_have_independent_offsets",
+        "managed_backend": true,
+        "item": "<ratarmount_index::managed_read::imp::ByteFile>::open",
+        "native_observed": false,
+        "creation": {
+          "policy": "none",
+          "basis": "The non-Unix managed backend opens an existing private input file and validates regular-file type."
+        },
+        "category": "managed-reader-backend"
+      },
+      "owner_basis": "Canonical ByteFile::open defining identity observed as the resolved Unix backend callee; the inactive alternative itself has no native HIR owner/event.",
+      "placement": {
+        "kind": "let",
+        "proposal": [
+          "// Inside cfg(not(unix)) mod imp, ByteFile::open:",
+          "// Retained mark immediately precedes let file = File::open(path)?;"
+        ],
+        "scope": "This is reviewed loaded inactive source metadata, not a native HIR owner observation."
+      },
+      "native_observed": false,
+      "resolved": null,
+      "reviewer": "Codex implementation source review",
+      "provenance": "#201 accepted inactive-target migration; N4 exact file review completed; no synthetic diagnostic or DefId."
+    }
+  ],
+  "rule": "Source expectations remain inactive metadata. Never synthesize a fulfilled expectation or resolved DefId. Additional constructor/type operations in a future target require separate review; a historical builder group grants no blanket authority.",
+  "status": "All13 inactive source marks applied at narrow final acquisition leaves. No synthetic native diagnostic/DefId; additional inactive constructor/type events remain unapproved."
+}

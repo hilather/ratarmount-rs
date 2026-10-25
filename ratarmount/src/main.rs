@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! ratarmount CLI (Phases 0–11 + CLI flag parity).
 
 use std::ffi::OsString;
@@ -1069,13 +1071,25 @@ fn create_tmpfs_overlay_in(
             ));
             continue;
         }
-        match tempfile::Builder::new()
-            .prefix("ratarmount-write-overlay.")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in(parent)
         {
-            Ok(directory) => return Ok(directory),
-            Err(error) => last_error = Some(error),
+            let __inventory_condition_44740 = {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0021-M01","item":"ratarmount::create_tmpfs_overlay_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                    )
+                )]
+                let __inventory_value_0 = tempfile::Builder::new()
+                    .prefix("ratarmount-write-overlay.")
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(parent);
+                __inventory_value_0
+            };
+            match __inventory_condition_44740 {
+                Ok(directory) => return Ok(directory),
+                Err(error) => last_error = Some(error),
+            }
         }
     }
     Err(std::io::Error::other(format!(
@@ -2161,18 +2175,31 @@ fn main() {
 
     let mut passwords = args.passwords.clone();
     if let Some(ref pf) = args.password_file {
-        match std::fs::read_to_string(pf) {
-            Ok(s) => {
-                for line in s.lines() {
-                    let line = line.trim_end_matches(['\r', '\n']);
-                    if !line.is_empty() {
-                        passwords.push(line.to_string());
+        {
+            let __inventory_condition_87856 = {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0022-M01","item":"ratarmount::main","disposition":"out-of-family","category":"configuration-or-credentials","reason":"password file named on the command line","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )
+                )]
+                let __inventory_value_0 = std::fs::read_to_string(pf);
+                __inventory_value_0
+            };
+            match __inventory_condition_87856 {
+                Ok(s) => {
+                    for line in s.lines() {
+                        let line = line.trim_end_matches(['\r', '\n']);
+                        if !line.is_empty() {
+                            passwords.push(line.to_string());
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("error reading --password-file: {e}");
-                std::process::exit(2);
+                Err(e) => {
+                    eprintln!("error reading --password-file: {e}");
+                    std::process::exit(2);
+                }
             }
         }
     }
@@ -2888,6 +2915,13 @@ fn main() {
         None => None,
         Some((_, plan)) => {
             // First durable creation of the accepted mount point.
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0114-M01","item":"ratarmount::main","disposition":"output-owner","category":"mountpoint-directory","reason":"Create the accepted FUSE mountpoint after the guard has validated the mount plan.","creation":{"policy":"recursive-directory","basis":"Only the explicit guarded FUSE path is created; export-only operation supplies no mountpoint and does not reach this leaf."}}"###
+                )
+            )]
             std::fs::create_dir_all(&plan.mp).ok();
             Some(plan.mp.clone())
         }
@@ -3144,6 +3178,13 @@ fn main() {
 /// (disk-backed or tmpfs) for `:temp:`.
 fn overlay_dir_for(args: &Args, w: &Path) -> PathBuf {
     if w.as_os_str() == ":temp:" {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0023-M01","item":"ratarmount::overlay_dir_for","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
         let td = if args.overlay_tmpfs.is_some() {
             create_tmpfs_overlay()
         } else {
@@ -3943,6 +3984,13 @@ fn run_exports(
                     join_export_handles(handles);
                     finish_overlay_serve(overlay_arc, None, interval, commit_exit);
                     if let Err(e) = mount_err {
+                        #[cfg_attr(
+                            internal_read_inventory,
+                            expect(
+                                clippy::disallowed_methods,
+                                reason = r###"internal-read:v1 {"id":"IR-B0024-M01","item":"ratarmount::run_exports","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                            )
+                        )]
                         let _ = std::fs::write(
                             "/tmp/ratarmount-rs-fuse-error.log",
                             format!("mount error: {e}\n"),
@@ -4153,6 +4201,13 @@ fn run_fuse_and_nfs(
             let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
                 Ok(h) => h,
                 Err(e) => {
+                    #[cfg_attr(
+                        internal_read_inventory,
+                        expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0025-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                        )
+                    )]
                     let _ = std::fs::write(
                         "/tmp/ratarmount-rs-nfs-error.log",
                         format!("NFS bind error: {e}\n"),
@@ -4178,6 +4233,13 @@ fn run_fuse_and_nfs(
             let _ = handle.join();
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0026-M01","item":"ratarmount::run_fuse_and_nfs","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                    )
+                )]
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-fuse-error.log",
                     format!("mount error: {e}\n"),
@@ -4298,6 +4360,13 @@ fn run_fuse_only(
             wait_control_reply(&control);
             finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0027-M01","item":"ratarmount::run_fuse_only","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                    )
+                )]
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-fuse-error.log",
                     format!("mount error: {e}\n"),
@@ -4352,17 +4421,49 @@ fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::Writ
     let mut builder = logger_filter_builder(debug, rust_log.as_deref());
     builder.write_style(write_style);
     if let Some(path) = log_file {
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
         {
-            Ok(file) => {
-                let file = std::sync::Mutex::new(file);
-                builder.target(env_logger::Target::Pipe(Box::new(WriteAdapter(file))));
-            }
-            Err(e) => {
-                eprintln!("warning: could not open log file {}: {e}", path.display());
+            let __inventory_condition_172220 = {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_types,
+                        reason = r###"internal-read:v1 {"id":"IR-B0028-T01","item":"ratarmount::init_logger","disposition":"support","category":"builder-type-support","reason":"Builder type support: logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+                    )
+                )]
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0028-M01","item":"ratarmount::init_logger","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"logger output or standard descriptor setup"}"###
+                    )
+                )]
+                let mut __inventory_value_0 = std::fs::OpenOptions::new();
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0115-M01","item":"ratarmount::init_logger","disposition":"output-owner","category":"diagnostic-log","reason":"Configure append-or-create logging for the explicit CLI log file.","creation":{"policy":"append-or-create","basis":"The log file is diagnostic output, preserves existing data, and retains default/umask file permissions."}}"###
+                    )
+                )]
+                let __inventory_value_1 = __inventory_value_0.create(true);
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0028-M02","item":"ratarmount::init_logger","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                    )
+                )]
+                let __inventory_value_2 = __inventory_value_1.append(true).open(path);
+                __inventory_value_2
+            };
+            match __inventory_condition_172220 {
+                Ok(file) => {
+                    let file = std::sync::Mutex::new(file);
+                    builder.target(env_logger::Target::Pipe(Box::new(WriteAdapter(file))));
+                }
+                Err(e) => {
+                    eprintln!("warning: could not open log file {}: {e}", path.display());
+                }
             }
         }
     }
@@ -4881,7 +4982,17 @@ fn is_fuse_mount(path: &Path) -> bool {
 fn mount_table_lists(path: &Path) -> bool {
     let candidates = path_mount_candidates(path);
 
-    if let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") {
+    if let Ok(text) = {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0029-M01","item":"ratarmount::mount_table_lists","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
+        let __inventory_value_0 = std::fs::read_to_string("/proc/self/mountinfo");
+        __inventory_value_0
+    } {
         if text
             .lines()
             .any(|l| candidates.iter().any(|c| l.contains(c.as_str())))
@@ -4947,27 +5058,12 @@ fn mount_output_lists_path(mount_text: &str, candidates: &[String]) -> bool {
 /// Linux-only: `statfs` FUSE_SUPER_MAGIC (`0x65735546`).
 #[cfg(target_os = "linux")]
 fn path_is_fuse_superblock(path: &Path) -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    #[repr(C)]
-    struct Statfs {
-        f_type: i64,
-        _pad: [u8; 128],
-    }
-    const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
-    extern "C" {
-        fn statfs(path: *const libc::c_char, buf: *mut Statfs) -> i32;
-    }
-    let c = match CString::new(path.as_os_str().as_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let mut buf = Statfs {
-        f_type: 0,
-        _pad: [0; 128],
-    };
-    let r = unsafe { statfs(c.as_ptr(), &mut buf) };
-    r == 0 && buf.f_type == FUSE_SUPER_MAGIC
+    rustix::fs::statfs(path).is_ok_and(|stat| fuse_superblock_type(stat.f_type))
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_superblock_type(fs_type: rustix::fs::FsWord) -> bool {
+    fs_type == 0x6573_5546
 }
 
 /// Startup message for a failed `WriteOverlay::new`. Every `Sqlite` error there
@@ -5004,6 +5100,13 @@ fn overlay_open_error(overlay_path: &Path, e: &OverlayError) -> String {
 /// fails: on any error the fd is left as it was.
 fn neutralize_dead_stdio() {
     for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0116-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"standard-descriptor-control","reason":"Determine whether stdin/stdout/stderr is closed before filling vacant standard slots.","creation":{"policy":"none","basis":"F_GETFD queries the standard slot only; no descriptor is opened or duplicated by this operation."}}"###
+            )
+        )]
         let closed = unsafe { libc::fcntl(target, libc::F_GETFD) } == -1
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
         let dead = !closed && {
@@ -5018,15 +5121,36 @@ fn neutralize_dead_stdio() {
         if !(closed || dead) {
             continue;
         }
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0030-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
         if null < 0 {
             continue;
         }
         unsafe {
             if null != target {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0031-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )
+                )]
                 libc::dup2(null, target);
             } else {
                 // `open` reused the closed target; drop O_CLOEXEC like dup2 would.
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0117-M01","item":"ratarmount::neutralize_dead_stdio","disposition":"out-of-family","category":"standard-descriptor-control","reason":"Clear descriptor flags when preparing the already-filled standard slot for process handoff.","creation":{"policy":"none","basis":"F_SETFD updates an existing descriptor; /dev/null acquisition and redirection have their own events."}}"###
+                    )
+                )]
                 libc::fcntl(target, libc::F_SETFD, 0);
             }
         }
@@ -5040,16 +5164,66 @@ fn neutralize_dead_stdio() {
 }
 
 fn redirect_stdio_to_null() -> std::io::Result<()> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-E0118-T01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions locally for standard-stream redirection to /dev/null.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )
+    )]
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
-    let devnull = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/null")?;
+    let devnull = {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_types,
+                reason = r###"internal-read:v1 {"id":"IR-B0032-T01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-type-support","reason":"Builder type support: logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+            )
+        )]
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0032-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"logger output or standard descriptor setup"}"###
+            )
+        )]
+        let mut __inventory_value_0 = OpenOptions::new();
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0032-M02","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"logger output or standard descriptor setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
+        let __inventory_value_1 = __inventory_value_0.read(true).write(true).open("/dev/null");
+        __inventory_value_1
+    }?;
     let fd = devnull.as_raw_fd();
     unsafe {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0033-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         libc::dup2(fd, 0);
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0034-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         libc::dup2(fd, 1);
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0035-M01","item":"ratarmount::redirect_stdio_to_null","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         libc::dup2(fd, 2);
     }
     Ok(())
@@ -5359,6 +5533,28 @@ fn should_auto_readahead(
 mod mount_probe_tests {
     use super::{mount_output_lists_path, path_mount_candidates};
     use std::path::Path;
+
+    /// Regression: replacing the handwritten statfs ABI must preserve success/error
+    /// handling and distinguish the FUSE superblock from other filesystem types.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_typed_statfs_fuse_detection() {
+        use super::{fuse_superblock_type, path_is_fuse_superblock};
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(fuse_superblock_type(0x6573_5546));
+        assert!(!fuse_superblock_type(0));
+        assert!(!fuse_superblock_type(0x0102_1994)); // tmpfs
+        let dir = tempfile::tempdir().unwrap();
+        let stat = rustix::fs::statfs(dir.path()).unwrap();
+        assert_eq!(
+            path_is_fuse_superblock(dir.path()),
+            fuse_superblock_type(stat.f_type)
+        );
+        assert!(!path_is_fuse_superblock(&dir.path().join("missing")));
+        let nul = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/invalid\0path"));
+        assert!(!path_is_fuse_superblock(nul));
+    }
 
     #[test]
     fn mount_output_linux_fuse_line() {

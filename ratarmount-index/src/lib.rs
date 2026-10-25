@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! SQLite index compatible with Python `ratarmountcore.SQLiteIndex` (v0.7.0).
 //!
 //! Portable HTTP/OCI blobs use [`INDEX_MEDIA_TYPE`] (`v1` = this SQLite sidecar
@@ -312,6 +314,13 @@ pub fn archive_edge_hashes(path: &Path) -> Result<(String, String)> {
     use std::io::{Seek, SeekFrom};
 
     // Managed (#151): the archive may be a database open in this process.
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0423-M01","item":"ratarmount_index::archive_edge_hashes","disposition":"managed-read","regression":"regression_archive_fingerprints_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut f = managed_read::ManagedReadCursor::open(path)?;
     let len = f.len()?;
     let mut buf = [0u8; TARSTATS_SAMPLE_BYTES];
@@ -332,6 +341,13 @@ pub fn archive_edge_hashes(path: &Path) -> Result<(String, String)> {
 /// Streams until EOF (no second size cap, no file-sized `Vec`). Policy cap is
 /// the `st_size` gate only — do not change [`TARSTATS_FULL_HASH_MAX`].
 pub fn archive_full_hash(path: &Path) -> Result<Option<String>> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0424-M01","item":"ratarmount_index::archive_full_hash","disposition":"managed-read","regression":"regression_archive_fingerprints_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut f = managed_read::ManagedReadCursor::open(path)?;
     let len = f.len()?;
     if len > TARSTATS_FULL_HASH_MAX {
@@ -914,11 +930,25 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
             Some(format!("cannot snapshot {}: {e}", absolute.display())),
         )
     };
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0425-M01","item":"ratarmount_index::snapshot_connection","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let dir = tempfile::tempdir().map_err(io)?;
     let copy = dir.path().join("snapshot.sqlite");
     // Managed sources (#151): the index and its companions are open in this
     // process. Exclusive-new outputs in the fresh directory with the exact
     // source permissions; a failed copy removes its own output.
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0426-M01","item":"ratarmount_index::snapshot_connection","disposition":"managed-read","regression":"regression_lookup_snapshot_main_copy_keeps_index_lock","mode_policy":"exclusive-new in the private directory with the source mode & !umask; exact source permissions through the handle after the copy","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"exclusive-new in the private directory with the source mode & !umask; exact source permissions through the handle after the copy","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let exclusive = |from: &Path, to: &Path| {
         managed_read::copy_exclusive_new(
             from,
@@ -1112,6 +1142,13 @@ impl SqliteIndex {
         let (conn, path_buf, publish_target) = match path {
             Some(dest) => {
                 if let Some(parent) = dest.parent() {
+                    #[cfg_attr(
+                        internal_read_inventory,
+                        expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-E0058-M01","item":"<ratarmount_index::SqliteIndex>::create_writable","disposition":"output-owner","category":"index-output-directory","reason":"Create the requested writable index parent before initializing the new index.","creation":{"policy":"recursive-directory","basis":"Directory output ownership is explicit in create_writable and keeps current std permissions."}}"###
+                        )
+                    )]
                     std::fs::create_dir_all(parent)?;
                 }
                 // Concurrent readers keep dest's inode; do not remove_file dest.
@@ -1764,6 +1801,13 @@ impl SqliteIndex {
         }
         // Managed sync (#151): the temporary index may be another name of a
         // database open in this process.
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0427-M01","item":"<ratarmount_index::SqliteIndex>::publish_tmp","disposition":"managed-read","regression":"regression_index_publish_sync_keeps_aliased_database_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         managed_read::ManagedReadCursor::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &dest)?;
         self.publish_target = None;

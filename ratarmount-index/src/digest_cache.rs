@@ -133,7 +133,17 @@ fn never_cancelled() -> std::io::Result<()> {
 pub fn cached_archive_digest(path: &Path, index: Option<&Path>) -> Result<String> {
     cached_with(path, index, false, &never_cancelled, |path| {
         // Managed (#151): the archive may be a database open in this process.
-        Ok(sha256_hex_stream(&mut ManagedReadCursor::open(path)?)?)
+        Ok(sha256_hex_stream(&mut {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0419-M01","item":"ratarmount_index::digest_cache::cached_archive_digest","disposition":"managed-read","regression":"regression_archive_digest_and_refresh_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
+            let __inventory_value_0 = ManagedReadCursor::open(path);
+            __inventory_value_0
+        }?)?)
     })
 }
 
@@ -181,7 +191,17 @@ pub fn cached_archive_digest_cancellable(
 pub fn refresh_archive_digest(path: &Path, index: Option<&Path>) -> Result<String> {
     cached_with(path, index, true, &never_cancelled, |path| {
         // Managed (#151): the archive may be a database open in this process.
-        Ok(sha256_hex_stream(&mut ManagedReadCursor::open(path)?)?)
+        Ok(sha256_hex_stream(&mut {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0420-M01","item":"ratarmount_index::digest_cache::refresh_archive_digest","disposition":"managed-read","regression":"regression_archive_digest_and_refresh_keep_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
+            let __inventory_value_0 = ManagedReadCursor::open(path);
+            __inventory_value_0
+        }?)?)
     })
 }
 
@@ -321,11 +341,20 @@ fn open_cache_at(index: PathBuf, create_table: bool) -> Option<Cache> {
 fn open_lock_file(index: &Path) -> Option<fs::File> {
     let mut name = index.as_os_str().to_owned();
     name.push(DIGEST_LOCK_SUFFIX);
-    fs::OpenOptions::new()
-        .create(true)
+    {
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-B0421-T01","item":"ratarmount_index::digest_cache::open_lock_file","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###))]
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0421-M01","item":"ratarmount_index::digest_cache::open_lock_file","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###))]
+let mut __inventory_value_0 = fs::OpenOptions::new();
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0057-M01","item":"ratarmount_index::digest_cache::open_lock_file","disposition":"output-owner","category":"runtime-lock","reason":"Permit creating the per-index digest-hashing advisory lock without truncating an existing lock.","creation":{"policy":"create-or-open","basis":"The lock file uses write/create with truncate(false) and existing default/umask file permissions."}}"###))]
+let __inventory_value_1 = __inventory_value_0
+        .create(true);
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0421-M02","item":"ratarmount_index::digest_cache::open_lock_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###))]
+let __inventory_value_2 = __inventory_value_1
         .truncate(false)
         .write(true)
-        .open(name)
+        .open(name);
+__inventory_value_2
+}
         .ok()
 }
 

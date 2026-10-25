@@ -7,6 +7,13 @@ use ratarmount_compositing::{overlay_fsck, overlay_seal, OverlayMeta};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::ffi::OsString;
+#[cfg_attr(
+    internal_read_inventory,
+    expect(
+        clippy::disallowed_types,
+        reason = r###"internal-read:v1 {"id":"IR-E0136-T01","item":"ratarmount::sandbox::run","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for sandbox run locking and state output.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+    )
+)]
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::os::fd::AsRawFd;
@@ -121,6 +128,13 @@ fn is_runner(pid: u32) -> bool {
     {
         let same_exe =
             fs::read_link(format!("/proc/{pid}/exe")).ok() == std::env::current_exe().ok();
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0117-M01","item":"ratarmount::sandbox::run::is_runner","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let argv = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
         let words: Vec<_> = argv.split(|b| *b == 0).collect();
         same_exe
@@ -136,6 +150,13 @@ fn is_runner(pid: u32) -> bool {
 }
 
 fn process_start(pid: u32) -> Option<String> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0118-M01","item":"ratarmount::sandbox::run::process_start","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // comm can contain spaces and ')'; starttime is field 22.
     let fields = stat.rsplit_once(") ")?.1;
@@ -163,14 +184,44 @@ struct PidRecord {
 struct RunLock(File);
 impl RunLock {
     fn acquire(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
+        let file = {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_types,
+                    reason = r###"internal-read:v1 {"id":"IR-B0119-T01","item":"<ratarmount::sandbox::run::RunLock>::acquire","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+                )
+            )]
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0119-M01","item":"<ratarmount::sandbox::run::RunLock>::acquire","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+                )
+            )]
+            let mut __inventory_value_0 = OpenOptions::new();
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0137-M01","item":"<ratarmount::sandbox::run::RunLock>::acquire","disposition":"output-owner","category":"runtime-lock","reason":"Permit creating the sandbox run coordination lock without truncating its inode.","creation":{"policy":"create-or-open","basis":"The lock uses mode 0600 and NOFOLLOW/CLOEXEC, truncate(false), and a nonblocking exclusive flock retained in RunLock."}}"###
+                )
+            )]
+            let __inventory_value_1 = __inventory_value_0.read(true).write(true).create(true);
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0119-M02","item":"<ratarmount::sandbox::run::RunLock>::acquire","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
+            let __inventory_value_2 = __inventory_value_1
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path);
+            __inventory_value_2
+        }?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::other("another sandbox run owns this top"));
         }
@@ -237,6 +288,13 @@ fn absolute_top(top: &Path) -> io::Result<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("--top needs a parent"))?;
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0138-M01","item":"ratarmount::sandbox::run::absolute_top","disposition":"output-owner","category":"sandbox-parent-directory","reason":"Create the parent of the requested absolute sandbox top before canonicalizing it.","creation":{"policy":"recursive-directory","basis":"The top name must identify a child rather than /; its parent is canonicalized and an existing top is checked against symlink/non-directory substitution."}}"###
+        )
+    )]
     fs::create_dir_all(parent)?;
     let path = parent.canonicalize()?.join(name);
     if let Ok(meta) = fs::symlink_metadata(&path) {
@@ -355,12 +413,26 @@ fn wait_bounded(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> 
     }
 }
 fn runtime_control(record: &PidRecord, verb: &str) -> io::Result<()> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0120-M01","item":"ratarmount::sandbox::run::runtime_control","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut diagnostic = tempfile::tempfile()?;
     let mut command = Command::new(&record.runtime);
     command.arg(verb);
     if verb == "rm" {
         command.arg("-f");
     }
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0121-M01","item":"ratarmount::sandbox::run::runtime_control","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"child stdio setup","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut child = command
         .arg(&record.container)
         .stdin(Stdio::null())
@@ -470,9 +542,30 @@ fn create_run_dir_in(default: &Path) -> io::Result<PathBuf> {
         // `/tmp` is a symlink to `/private/tmp` on macOS; the directory is
         // judged (and later canonicalized) at its resolved, longer path.
         let tmp = Path::new("/tmp");
-        builder.tempdir_in(tmp.canonicalize().as_deref().unwrap_or(tmp))?
+        {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0122-M01","item":"ratarmount::sandbox::run::create_run_dir_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
+            let __inventory_value_0 =
+                builder.tempdir_in(tmp.canonicalize().as_deref().unwrap_or(tmp));
+            __inventory_value_0
+        }?
     } else {
-        builder.tempdir_in(default)?
+        {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0123-M01","item":"ratarmount::sandbox::run::create_run_dir_in","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
+            let __inventory_value_0 = builder.tempdir_in(default);
+            __inventory_value_0
+        }?
     };
     // Created with the umask's mode: restrict it before anything is placed
     // inside (the mode is asserted, not assumed).
@@ -523,6 +616,13 @@ struct Cleanup {
 }
 impl Cleanup {
     fn save(&self) -> io::Result<()> {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0124-M01","item":"<ratarmount::sandbox::run::Cleanup>::save","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
         let mut file = tempfile::NamedTempFile::new_in(self.pid_file.parent().unwrap())?;
         serde_json::to_writer(&mut file, &self.record)?;
         file.as_file().sync_all()?;
@@ -633,6 +733,13 @@ fn cleanup_warning(error: &io::Error, pid_file: &Path) -> String {
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0139-M01","item":"ratarmount::sandbox::run::copy_tree","disposition":"output-owner","category":"sandbox-recovery-directory","reason":"Create the recovery-copy destination before recursively copying the sandbox tree.","creation":{"policy":"recursive-directory","basis":"The recovery copier checks and removes incompatible existing destinations without following their symlinks; directory defaults remain unchanged."}}"###
+        )
+    )]
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -650,7 +757,21 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
         } else if meta.is_dir() {
             copy_tree(&entry.path(), &target)?;
         } else if meta.is_file() {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0125-M01","item":"ratarmount::sandbox::run::copy_tree","disposition":"out-of-family","category":"patch-or-bundle-input","reason":"copy of the run's result tree for the report","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
             fs::copy(entry.path(), &target)?;
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0126-M01","item":"ratarmount::sandbox::run::copy_tree","disposition":"out-of-family","category":"patch-or-bundle-input","reason":"copy of the run's result tree for the report","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
             File::open(&target)?
                 .set_times(std::fs::FileTimes::new().set_modified(meta.modified()?))?;
         } else {
@@ -664,6 +785,13 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 fn recover(pid_file: &Path, top: &Path) -> io::Result<()> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0127-M01","item":"ratarmount::sandbox::run::recover","disposition":"out-of-family","category":"structured-control-record","reason":"sandbox supervisor/run state or attempt log","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let bytes = match fs::read(pid_file) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -871,6 +999,13 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
         .to_string_lossy()
         .into_owned();
     let mountpoint = control_dir.join("mnt");
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0140-M01","item":"ratarmount::sandbox::run::pipeline","disposition":"output-owner","category":"sandbox-mountpoint","reason":"Create the pipeline mountpoint beneath its fresh canonical control directory.","creation":{"policy":"exclusive-directory","basis":"create_dir starts a new child and set_permissions immediately applies 0700 before mount/runtime publication."}}"###
+        )
+    )]
     fs::create_dir(&mountpoint)?;
     fs::set_permissions(
         &mountpoint,
@@ -898,6 +1033,13 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
     cleanup.save()?;
     let journal = sidecar(&top, ".journal.jsonl");
     let overlay = cleanup.record.ram_top.as_deref().unwrap_or(&top);
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0128-M01","item":"ratarmount::sandbox::run::pipeline","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut mount_stderr = tempfile::tempfile()?;
     if !args.json {
         eprintln!(
@@ -914,8 +1056,16 @@ fn pipeline(args: &RunArgs) -> io::Result<Value> {
         ))
         .env("TMPDIR", &control_dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(mount_stderr.try_clone()?))
-        .stderr(Stdio::from(mount_stderr.try_clone()?))
+        .stdout(Stdio::from({
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0129-M01","item":"ratarmount::sandbox::run::pipeline","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"child stdio setup","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+let __inventory_value_0 = mount_stderr.try_clone();
+__inventory_value_0
+}?))
+        .stderr(Stdio::from({
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0130-M01","item":"ratarmount::sandbox::run::pipeline","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"child stdio setup","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+let __inventory_value_0 = mount_stderr.try_clone();
+__inventory_value_0
+}?))
         .spawn()?;
     let control_socket = control_socket_path(&control_dir, child.id());
     cleanup.record.mount_child = Some(ProcessIdentity::new(child.id()));
@@ -1059,14 +1209,35 @@ fn finish(args: &RunArgs, top: &Path, journal: &Path, execution: Execution) -> i
     let changes = overlay_changes::change_set(top, lower, &options)?;
     let hash = overlay_changes::canonical_hash(&changes, &options)?;
     let manifest = sidecar(top, ".manifest.jsonl");
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0131-M01","item":"ratarmount::sandbox::run::finish","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     overlay_changes::write_manifest(&changes, &mut File::create(&manifest)?)?;
     let meta = OverlayMeta::read(top)
         .map_err(io::Error::other)?
         .ok_or_else(|| io::Error::other("overlay metadata missing"))?;
     let summary = if args.journal {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0132-M01","item":"ratarmount::sandbox::run::finish","disposition":"out-of-family","category":"structured-control-record","reason":"operation journal JSONL summarized after the run","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let summary =
             crate::journal_cmd::summarize(BufReader::new(File::open(journal)?), None, None)?;
         let path = sidecar(top, ".journal.summary.json");
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0133-M01","item":"ratarmount::sandbox::run::finish","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
         serde_json::to_writer(File::create(&path)?, &summary)?;
         Some(
             json!({"path":path, "files_read":summary.files_read.len(), "files_read_then_written":summary.files_read_then_written.len(), "files_written_blind":summary.files_written_blind.len()}),

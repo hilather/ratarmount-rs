@@ -151,6 +151,13 @@ pub(super) fn validate_destination(dir: &Path) -> Result<(), String> {
 
 pub fn run(args: &ImportArgs, context: &OverlayRunContext) -> Result<(String, i32), String> {
     validate_destination(&args.directory)?;
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0044-M01","item":"ratarmount::overlay_import::run","disposition":"out-of-family","category":"patch-or-bundle-input","reason":"patch input stream","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let bytes = if args.patch == Path::new("-") {
         read_bounded(io::stdin().lock(), args.max_patch_bytes)
     } else {
@@ -178,6 +185,13 @@ fn import(
     // Claim the destination before opening the DB. Never clean up a directory
     // whose creation/empty check failed (including a symlink destination).
     if !args.directory.exists() {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0122-M01","item":"ratarmount::overlay_import::import","disposition":"output-owner","category":"overlay-import-directory","reason":"Claim the validated overlay import destination before opening its database.","creation":{"policy":"exclusive-directory","basis":"create_dir is called only for a missing destination; cleanup does not remove a directory whose claim/empty check failed."}}"###
+            )
+        )]
         fs::create_dir(&args.directory)
             .map_err(|e| format!("{}: {e}", args.directory.display()))?;
     }
@@ -448,6 +462,13 @@ fn write_entry(
         let fd = overlay
             .create_file(&full, 0o600)
             .map_err(|e| format!("{path}: {e}"))?;
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0045-M01","item":"ratarmount::overlay_import::write_entry","disposition":"residual","reason":"overlay payload descriptor borrowed from create_file for an import write; reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let file = unsafe { fs::File::from_raw_fd(fd) };
         let result = overlay
             .truncate_file(&file, &full, 0)

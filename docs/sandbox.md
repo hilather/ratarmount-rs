@@ -1905,8 +1905,8 @@ there, as an ordinary read would; the copy helpers compare the copied length
 with the length seen at open and refuse, other readers do not. No failure falls back to
 an ordinary file read. On Windows the reader reads an ordinary private file.
 
-Covered (each with a regression test; `packaging/internal-read-inventory.json`
-lists every site): index pointers (`{archive}.index.ptr`); the index blob hash
+Covered (each with a regression test; the reviewed Clippy manifest
+lists the production operation approvals): index pointers (`{archive}.index.ptr`); the index blob hash
 behind pointer ids, snapshot verification and publication; the `snapshot_index_id`
 copy fallback; the compression probe and decompression input of an index; the
 meta-v3 metadata cache (the `$XDG_CACHE_HOME/ratarmount/meta-v3` LRU of whole
@@ -1981,43 +1981,47 @@ connections keep SQLite's default `"unix"` VFS, which on macOS picks the
 locking style per filesystem (auto). Managed byte readers use `"unix"`
 (`"unix-posix"` on macOS) and take no lock.
 
-`python3 -I packaging/test-internal-read-inventory.py` checks the inventory
-(`--self-test` for the scanner's own tests); a new production pathname read,
-copy, create or descriptor conversion fails the check until it is classified,
-and so does a form the scanner cannot follow: an import from `std::fs` or
-`tokio::fs` it cannot resolve, or an `OpenOptions` builder bound to a variable
-that escapes its function. The directory walk skips `target` (Cargo
-build output), `vendor` (third-party crates), `test-harness` (CI fixtures),
-`clients` (language bindings), `benchmarks` (benchmark programs), every
-`build.rs`, and any `tests`, `benches` or `examples` directory. A production
-module whose file exists inside the workspace is scanned wherever it lives
-(`#[path = "tests/reader.rs"]`, `#[path = "../../benchmarks/r.rs"]`,
-`#[path = "../build.rs"]`, a `vendor/` target, and a module that file
-declares). A `#[path]` file's submodules are resolved beside that path
-(rustc does not insert the file stem, and a symlink is not retargeted).
-Raw strings, comments in the attribute, and `#[cfg_attr(not(test), path = "...")]`
-are recognized, including when `path` follows another meta (`allow`, `doc`)
-or is nested (`cfg_attr(not(test), cfg_attr(all(), path = "..."))`). Cooked
-`\u{...}` and `\xHH` escapes are decoded; a raw string is not, and an
-unknown escape is reported. A `#[path]` file the walk already loaded is
-resolved again once that declaration is seen. A nested file named `lib.rs`
-or `main.rs` inserts the stem; only `src/lib.rs`, `src/main.rs`, a top-level
-`lib.rs` or `main.rs`, and `src/bin/*.rs` are crate roots. A `cfg_attr` path whose predicate is unknown for a
-production build is reported; a path that is known is still loaded. A target outside the workspace is reported and not opened. That includes
-an absolute path, a symlink to an outside file, and `..` after a directory
-symlink (`realpath`, not lexical `normpath`). A fifo or other non-regular
-file is not opened either. A production `include!` (such as
-`include!(concat!(env!("OUT_DIR"), ...))`) is reported as unsupported and
-the generated file is not scanned. An integration test, bench, example or
-build script that no production module names stays out of the inventory. Any
-`.create(..)` or `.create_new(..)` argument other than a literal `false`
-counts as a create that needs a mode policy; a managed
-read reaching a raw helper is found through `use .. as` renames of the helper or
-its module; and the pathname opens done inside libgit2 (`Repository::open`),
-libarchive (`archive_read_open_filename`) and lopdf (`Document::load`) are
-recorded as #196 residuals (those libraries own their descriptors).
-`--verify-baseline DIR` (run in CI) checks that every create recorded as
-unchanged from the baseline still exists unchanged there.
+The production inventory uses Clippy's resolved `disallowed_methods`,
+`disallowed_types` and `disallowed_macros` definitions, with the policy in
+[`packaging/internal-read-clippy/`](../packaging/internal-read-clippy/README.md).
+Cargo's selected library and binary targets, with all features and the documented
+feature profiles, define production membership. Tests, examples, benches,
+build scripts and dependency implementations do not acquire inventory obligations
+merely by being build prerequisites. No independent source/module resolver or
+textual operation collector runs in CI.
+
+Each reviewed operation has a narrow production-only `#[expect]` with a literal
+reason and creation policy. Strict Clippy checks stale expectations; a mandatory
+collection pass observes the actual resolved definitions even under source
+`allow` attributes. CI generates a manifest and compares it byte for byte with
+the reviewed manifest. Its identity is the enclosing item path plus complete
+literal reason. Moving a leaf down a file does not change that identity;
+changing the operation, reason, leaf syntax or multiplicity changes the manifest.
+Creation and mode metadata are explicit review decisions, never inferred from
+flags or builder chains.
+
+This lint guards against mistakes in honest repository code. It is not a
+security boundary. Runtime enforcement through openat2 handles and the seccomp
+CI lane is the boundary. Explicit non-goals are proc-macro output, build.rs
+codegen, dlsym tricks, and `?`/`From` retyping of an already-inventoried descriptor.
+Direct configured loader APIs remain banned. A repository proc-macro crate's
+implementation is still a production library. Retyping an inventoried descriptor
+is not another inventory event; explicit raw-descriptor adoption, release and
+duplication APIs retain their review requirements. The old collector's
+transitive managed-reader proofs and mode inference are intentionally retired.
+SQLite/rusqlite pathname opens rely on runtime `checked_open` enforcement;
+broader dependency acquisitions and `read_dir` coverage are follow-up #209.
+
+Only N2–N4 add syntax refusals: every local foreign block and `link_name` must
+belong to the exact reviewed `ratarmount_formats_libarchive::ffi` compiler module;
+repo macros cannot contain cfg/cfg_attr or substituted transcriber attributes;
+and target predicates in the 40 packages whose cross checks failed require an
+exact reviewed-file exception. Those file exceptions have no content hash.
+Changes to inactive target alternatives need ordinary review, and native Linux
+Clippy cannot establish equivalent enforcement of their inactive calls. Macro
+expansion records enforce the configured include ban; CSI has one reviewed
+source-file/item exception. Unused exported macros and arbitrary non-target cfg
+predicates remain documented gaps (#209).
 
 A managed read reports an SQLite allocation failure as out of memory, never as
 the stale `errno` SQLite leaves behind (a metadata-cache entry is kept, not
@@ -2032,47 +2036,6 @@ refusal and a missing file as an evicted entry; any other read error (an
 `EINVAL` included) propagates and keeps the entry. The managed `fsync` of a
 publication asks SQLite for a full sync, which is `F_FULLFSYNC` on macOS as
 before.
-
-The inventory also follows a module alias through a later import
-(`use std::fs as disk; use disk::read as read_index;`), calls with explicit
-generic arguments (`std::fs::read::<_>(p)`, `<File>::open(p)`), helpers
-imported through nested braces or a module glob, and `TempDir` /
-`NamedTempFile` `with_prefix` / `with_suffix` constructors; whitespace inside
-a string literal is part of an entry's fingerprint. A free-function call
-with explicit generic arguments (`helper::<T>(p)`) is followed by the
-mandatory-helper walk. An `unchanged-from-<baseline>` claim must match a
-baseline operation with the same file, function, operation and fingerprint,
-and each baseline operation backs at most one entry: an identical create
-copied into another function, or a second copy in the same function, is not
-a baseline create. The helper walk also follows `crate::helper(p)`,
-`super::helper(p)` and `self::helper(p)` (to any same-crate definition of
-that name) and a call whose name equals its caller's (`util::read_index(p)`
-from `read_index`); generic argument lists are matched balanced
-(`load::<{ 64 * 1024 }>(p)`, `::<fn() -> T>`) and an unbalanced one is
-reported. A test-only match arm ends at its block-like body (`unsafe { .. }`,
-`loop`, `match`, an `if`/`else` chain) as well as at a bare block. Descriptor
-duplication and ownership conversion are operations of their own:
-`try_clone_to_owned`, `libc::dup`/`dup2`/`dup3`, `fcntl(.., F_DUPFD[_CLOEXEC],
-..)` and any `File::from(..)` or `<File>::from(..)` (an `OwnedFd` included;
-closing a duplicate releases this process's locks on the file like any other
-close). `OpenOptions::default()` is a builder like `OpenOptions::new()` (a bare
-`OpenOptions` counts when it is imported from `std::fs`); a value typed by
-`let o: OpenOptions = Default::default()` is not recognised. A test-only
-`if`/`else` arm ends at the last block of its chain even when a branch holds a
-`match`; labeled blocks, `const { .. }` and `async { .. }` bodies end where they
-close; a test-only statement or arm whose span still holds a second top-level
-`=>`, or code after a closed top-level block, is reported as an unsupported
-test-only form instead of hiding what follows. A qualified call
-(`util::load(p)`) also resolves to a definition inside an inline
-`mod util { .. }`.
-A file that a test-only `mod` declaration names is skipped only when no
-production `mod` declaration names it too (`#[cfg(test)] #[path = "util.rs"]
-mod t; mod util;` scans `util.rs`), and the helper walk tells two helpers of
-one name in one file apart (`first::bridge`, `second::bridge`).
-A `mod` declaration inside an inline module resolves below it
-(`mod outer { pub mod util; }` names `outer/util.rs`), and a production `mod`
-declaration that names no file is reported instead of leaving its file
-unscanned.
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE

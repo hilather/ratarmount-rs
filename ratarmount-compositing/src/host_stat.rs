@@ -199,6 +199,13 @@ pub fn chmod_entry_at<Fd: AsFd>(
     {
         use rustix::fs::{Mode, OFlags};
         use std::os::fd::AsRawFd;
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0142-M01","item":"ratarmount_compositing::host_stat::chmod_entry_at","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_PATH pin of an entry whose permissions are changed; no content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let pinned = rustix::fs::openat(
             dir,
             name,

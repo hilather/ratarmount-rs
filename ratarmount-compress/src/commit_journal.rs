@@ -13,8 +13,6 @@
 //! beside the archive's current name when the directory was renamed; a complete
 //! locator (`C`/`D`) whose journal cannot be found is never cleared.
 
-#![allow(clippy::disallowed_methods)]
-
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -262,7 +260,17 @@ pub fn authorize_forced(_: &PendingJournal, _: &fs::Metadata) -> io::Result<()> 
 /// `WriteOverlay::recover_journal`).
 #[doc(hidden)]
 pub fn recover(archive: &Path) -> io::Result<bool> {
-    recover_with(archive, &mut authorize_forced, &mut |_| Ok(()))
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The documented test recovery helper explicitly selects forced authorization"
+    )]
+    let mut authorize = authorize_forced;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The test recovery helper delegates to the journal recovery implementation"
+    )]
+    let recovered = recover_with(archive, &mut authorize, &mut |_| Ok(()));
+    recovered
         .map(|applied| applied.is_some())
         .map_err(RecoverError::into_io)
 }
@@ -282,7 +290,12 @@ pub fn recover_with(
     authorize: Authorize,
     before_unlink: BeforeUnlink,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
-    recover_guarded(archive, &mut || Ok(()), authorize, before_unlink)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The recovery API delegates to its guarded implementation with an empty extra guard"
+    )]
+    let recovered = recover_guarded(archive, &mut || Ok(()), authorize, before_unlink);
+    recovered
 }
 
 /// [`recover_with`] with a `before_write` guard (R10-B): it runs under the
@@ -540,6 +553,13 @@ mod unix {
         }
     }
     fn lock(file: &File) -> io::Result<Lock> {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0212-M01","item":"ratarmount_compress::commit_journal::unix::lock","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let owned = file.try_clone()?;
         if unsafe { libc::flock(owned.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
@@ -552,7 +572,11 @@ mod unix {
             .unwrap_or(Path::new("."))
     }
     fn sync_parent(path: &Path) -> io::Result<()> {
-        File::open(parent(path))?.sync_all()
+        {
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0213-M01","item":"ratarmount_compress::commit_journal::unix::sync_parent","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+let __inventory_value_0 = File::open(parent(path));
+__inventory_value_0
+}?.sync_all()
     }
     /// [`sync_parent`] where a parent that no longer exists has nothing to sync.
     fn sync_parent_if_present(path: &Path) -> io::Result<()> {
@@ -723,10 +747,17 @@ mod unix {
         fault::check("before replace").map_err(refused)?;
         let archive = archive.canonicalize().map_err(refused)?;
         let path = journal_path(&archive);
-        let mut file = fs::OpenOptions::new()
+        let mut file = {
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-B0214-T01","item":"ratarmount_compress::commit_journal::unix::replace","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###))]
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0214-M01","item":"ratarmount_compress::commit_journal::unix::replace","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###))]
+let mut __inventory_value_0 = fs::OpenOptions::new();
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0214-M02","item":"ratarmount_compress::commit_journal::unix::replace","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###))]
+let __inventory_value_1 = __inventory_value_0
             .read(true)
             .write(true)
-            .open(&archive)
+            .open(&archive);
+__inventory_value_1
+}
             .map_err(refused)?;
         // Held until this function returns: the cleanup of a failed attempt
         // runs under the same lock.
@@ -806,6 +837,13 @@ mod unix {
             .checked_add(suffix.metadata()?.len())
             .ok_or_else(|| io::Error::other("suffix length overflow"))?;
         let prefix = fingerprint(file, offset)?;
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0215-M01","item":"ratarmount_compress::commit_journal::unix::run","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
         let mut journal = tempfile::NamedTempFile::new_in(parent(archive))?;
         journal.write_all(MAGIC)?;
         for value in [
@@ -993,6 +1031,13 @@ mod unix {
         fault::check("copy publish")?;
         let archive = archive.canonicalize()?;
         // Read-only: flock needs no write permission.
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0216-M01","item":"ratarmount_compress::commit_journal::unix::guard_copy","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let file = File::open(&archive)?;
         let lock = lock(&file).map_err(|e| {
             io::Error::new(
@@ -1054,6 +1099,13 @@ mod unix {
         authorize: Authorize,
         before_unlink: BeforeUnlink,
     ) -> std::result::Result<Option<Applied>, RecoverError> {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0217-M01","item":"ratarmount_compress::commit_journal::unix::recover","disposition":"residual","reason":"base-archive bytes read by journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let probe = match File::open(archive) {
             Ok(f) if f.metadata().map_err(RecoverError::Journal)?.is_file() => f,
             Ok(_) => return Ok(None),
@@ -1093,10 +1145,17 @@ mod unix {
                 hook();
             }
         }
-        let mut file = fs::OpenOptions::new()
+        let mut file = {
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-B0218-T01","item":"ratarmount_compress::commit_journal::unix::recover","disposition":"support","reason":"Builder type support: base archive opened read-write by journal recovery to lock it and roll back or forward; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"builder-type-support","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###))]
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0218-M01","item":"ratarmount_compress::commit_journal::unix::recover","disposition":"support","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","family":"commit-journal-recovery","issue":"#196","category":"builder-setup","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"residual","baseline_reason":"base archive opened read-write by journal recovery to lock it and roll back or forward; recovery and mutation ownership belong to the excluded broader machinery"}"###))]
+let mut __inventory_value_0 = fs::OpenOptions::new();
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0218-M02","item":"ratarmount_compress::commit_journal::unix::recover","disposition":"residual","reason":"base archive opened read-write by journal recovery to lock it and roll back or forward; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+let __inventory_value_1 = __inventory_value_0
             .read(true)
             .write(true)
-            .open(archive)
+            .open(archive);
+__inventory_value_1
+}
             .map_err(|e| journal_error(&probed, e))?;
         let _lock = lock(&file).map_err(|e| journal_error(&probed, e))?;
         // Another recovering opener may have won, or another opener (through a
@@ -1175,6 +1234,13 @@ mod unix {
     }
 
     pub(super) fn pending(archive: &Path) -> io::Result<Option<PendingJournal>> {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0219-M01","item":"ratarmount_compress::commit_journal::unix::pending","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let probe = match File::open(archive) {
             Ok(f) if f.metadata()?.is_file() => f,
             Ok(_) => return Ok(None),
@@ -1258,11 +1324,15 @@ mod unix {
     /// without closing, a descriptor of the database, which would release
     /// this process's SQLite locks on it.
     fn open_journal(path: &Path) -> io::Result<File> {
-        ratarmount_core::db_inodes::open_admitted(
+        {
+#[cfg_attr(internal_read_inventory, expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0220-M01","item":"ratarmount_compress::commit_journal::unix::open_journal","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###))]
+let __inventory_value_0 = ratarmount_core::db_inodes::open_admitted(
             path,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             0,
-        )
+        );
+__inventory_value_0
+}
         .map(File::from)
     }
 
@@ -1493,6 +1563,10 @@ mod unix {
     }
 }
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Journal regression fixtures directly exercise the restricted implementation APIs"
+)]
 mod tests {
     use super::*;
     use std::io::Write;

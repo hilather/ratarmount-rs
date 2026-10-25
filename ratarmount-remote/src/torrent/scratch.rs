@@ -35,7 +35,17 @@ pub(super) struct Storage(Mutex<Option<Store>>);
 impl Storage {
     pub(super) fn new(dir: &Path, limit: u64) -> anyhow::Result<Self> {
         Ok(Self(Mutex::new(Some(Store {
-            file: tempfile::tempfile_in(dir)?,
+            file: {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0532-M01","item":"<ratarmount_remote::torrent::scratch::Storage>::new","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                    )
+                )]
+                let __inventory_value_0 = tempfile::tempfile_in(dir);
+                __inventory_value_0
+            }?,
             slots: BTreeMap::new(),
             limit,
         }))))
@@ -135,11 +145,40 @@ impl TorrentStorage for Storage {
 }
 
 pub(super) fn mark_owned(dir: &Path) -> std::io::Result<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(dir.join(OWNER))?;
+    let file = {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_types,
+                reason = r###"internal-read:v1 {"id":"IR-B0533-T01","item":"ratarmount_remote::torrent::scratch::mark_owned","disposition":"support","category":"builder-type-support","reason":"Builder type support: torrent scratch ownership marker","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+            )
+        )]
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0533-M01","item":"ratarmount_remote::torrent::scratch::mark_owned","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"torrent scratch ownership marker"}"###
+            )
+        )]
+        let mut __inventory_value_0 = std::fs::OpenOptions::new();
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0090-M01","item":"ratarmount_remote::torrent::scratch::mark_owned","disposition":"output-owner","category":"torrent-scratch-owner","reason":"Configure exclusive creation of the scratch ownership marker before taking its lock.","creation":{"policy":"exclusive-new-file","basis":"The ownership marker is read/write create_new under the newly allocated scratch directory; an existing marker cannot be replaced."}}"###
+            )
+        )]
+        let __inventory_value_1 = __inventory_value_0.read(true).write(true).create_new(true);
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0533-M02","item":"ratarmount_remote::torrent::scratch::mark_owned","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"torrent scratch ownership marker","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
+        let __inventory_value_2 = __inventory_value_1.open(dir.join(OWNER));
+        __inventory_value_2
+    }?;
     file.lock()?;
     Ok(file)
 }
@@ -179,11 +218,32 @@ pub(super) fn sweep(dir: &Path, age: Duration) {
         {
             continue;
         }
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(marker)
-        else {
+        let Ok(file) = ({
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_types,
+                    reason = r###"internal-read:v1 {"id":"IR-B0534-T01","item":"ratarmount_remote::torrent::scratch::sweep","disposition":"support","category":"builder-type-support","reason":"Builder type support: torrent scratch ownership marker","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+                )
+            )]
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0534-M01","item":"ratarmount_remote::torrent::scratch::sweep","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"torrent scratch ownership marker"}"###
+                )
+            )]
+            let mut __inventory_value_0 = std::fs::OpenOptions::new();
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0534-M02","item":"ratarmount_remote::torrent::scratch::sweep","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"torrent scratch ownership marker","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
+            let __inventory_value_1 = __inventory_value_0.read(true).write(true).open(marker);
+            __inventory_value_1
+        }) else {
             continue;
         };
         if file.try_lock().is_err() {

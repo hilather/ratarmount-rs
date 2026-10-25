@@ -534,6 +534,13 @@ fn materialize_fetched_index(path: PathBuf) -> std::result::Result<PathBuf, Stri
 /// may be a meta-v3 cache file another session of this process has open as
 /// its index. A read error is an error, not a mismatch.
 fn blob_matches_index_id(path: &Path, expected: &str) -> std::io::Result<bool> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0539-M01","item":"ratarmount_session::factory::remote_open::blob_matches_index_id","disposition":"managed-read","regression":"regression_remote_index_id_hash_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let got = ratarmount_index::managed_read::sha256_hex(path)?;
     Ok(got.eq_ignore_ascii_case(expected))
 }
@@ -721,10 +728,24 @@ fn try_install_remote_index(
         drop_fetched_sidecar(&fetched);
         return false;
     }
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0540-M01","item":"ratarmount_session::factory::remote_open::try_install_remote_index","disposition":"managed-read","regression":"regression_remote_index_copy_keeps_cached_index_lock","mode_policy":"create-or-truncate with the source mode & !umask, exact source permissions through the handle before any write","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"create-or-truncate with the source mode & !umask, exact source permissions through the handle before any write","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let dest = match cache_dest {
         Some(d) if d != fetched.as_path() => {
             if let Some(parent) = d.parent() {
                 if !parent.as_os_str().is_empty() {
+                    #[cfg_attr(
+                        internal_read_inventory,
+                        expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-E0097-M01","item":"ratarmount_session::factory::remote_open::try_install_remote_index","disposition":"output-owner","category":"remote-index-cache-directory","reason":"Best-effort create the cache destination parent before installing an already-validated remote index.","creation":{"policy":"recursive-directory","basis":"Parent creation failure keeps the fetched sidecar path usable; the managed-source copy owns its separate output."}}"###
+                        )
+                    )]
                     let _ = std::fs::create_dir_all(parent);
                 }
             }
@@ -1748,8 +1769,25 @@ pub(super) fn torrent_nested_reader_fn(
 #[cfg(feature = "bittorrent")]
 fn torrent_index_temp() -> std::io::Result<tempfile::NamedTempFile> {
     let cache_dir = ratarmount_index::platform_cache_root().join("torrent-v1/indexes");
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0098-M01","item":"ratarmount_session::factory::remote_open::torrent_index_temp","disposition":"output-owner","category":"torrent-index-staging-directory","reason":"Create the torrent index cache directory before a named temporary sidecar is allocated.","creation":{"policy":"recursive-directory","basis":"The dedicated torrent-v1/indexes output tree and tempfile behavior keep current permission defaults."}}"###
+        )
+    )]
     std::fs::create_dir_all(&cache_dir)?;
-    tempfile::NamedTempFile::new_in(cache_dir)
+    {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0541-M01","item":"ratarmount_session::factory::remote_open::torrent_index_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
+        let __inventory_value_0 = tempfile::NamedTempFile::new_in(cache_dir);
+        __inventory_value_0
+    }
 }
 
 #[cfg(feature = "bittorrent")]

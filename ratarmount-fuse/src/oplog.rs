@@ -2,6 +2,13 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg_attr(
+    internal_read_inventory,
+    expect(
+        clippy::disallowed_types,
+        reason = r###"internal-read:v1 {"id":"IR-E0049-T01","item":"ratarmount_fuse::oplog","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for append-only filesystem operation logging.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+    )
+)]
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -162,11 +169,42 @@ impl OpLog {
     ) -> io::Result<Arc<Self>> {
         let path = validate_path(&options.path, mount, overlay)?;
         let exclude = ReadOnlyGlobs::new(&options.exclude)?;
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(&path)?;
+        let file = {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_types,
+                    reason = r###"internal-read:v1 {"id":"IR-B0409-T01","item":"<ratarmount_fuse::oplog::OpLog>::open","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+                )
+            )]
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0409-M01","item":"<ratarmount_fuse::oplog::OpLog>::open","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+                )
+            )]
+            let mut __inventory_value_0 = OpenOptions::new();
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0050-M01","item":"<ratarmount_fuse::oplog::OpLog>::open","disposition":"output-owner","category":"operation-log","reason":"Permit creation of the append-only operation journal at the validated log path.","creation":{"policy":"append-or-create","basis":"The log uses append plus CLOEXEC/NONBLOCK/NOFOLLOW, verifies a regular file, and preserves existing permission behavior."}}"###
+                )
+            )]
+            let __inventory_value_1 = __inventory_value_0.append(true).create(true);
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0409-M02","item":"<ratarmount_fuse::oplog::OpLog>::open","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
+            let __inventory_value_2 = __inventory_value_1
+                .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+                .open(&path);
+            __inventory_value_2
+        }?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -233,6 +271,13 @@ impl OpLog {
             return comm.clone();
         }
         #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0410-M01","item":"<ratarmount_fuse::oplog::OpLog>::comm","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .ok()
             .map(|s| s.trim_end_matches('\n').to_owned());

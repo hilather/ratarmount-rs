@@ -58,7 +58,17 @@ fn directory_flags() -> OFlags {
 }
 
 fn open_root(path: &Path) -> io::Result<OwnedFd> {
-    Ok(host::open(path, directory_flags(), Mode::empty())?)
+    Ok({
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0046-M01","item":"ratarmount::overlay_pack::open_root","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
+        let __inventory_value_0 = host::open(path, directory_flags(), Mode::empty());
+        __inventory_value_0
+    }?)
 }
 
 fn regular_flags() -> OFlags {
@@ -69,12 +79,22 @@ fn regular_flags() -> OFlags {
 /// database without closing a descriptor of it (R10-C).
 fn openat_admitted(dir: &OwnedFd, name: &str, flags: OFlags) -> io::Result<OwnedFd> {
     use std::os::fd::AsFd;
-    ratarmount_core::db_inodes::openat_admitted(
-        Some(dir.as_fd()),
-        Path::new(name),
-        flags.bits() as libc::c_int,
-        0,
-    )
+    {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0047-M01","item":"ratarmount::overlay_pack::openat_admitted","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["append_host","pack"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
+        let __inventory_value_0 = ratarmount_core::db_inodes::openat_admitted(
+            Some(dir.as_fd()),
+            Path::new(name),
+            flags.bits() as libc::c_int,
+            0,
+        );
+        __inventory_value_0
+    }
 }
 
 // Each component is opened relative to the previous directory, never via a
@@ -82,15 +102,43 @@ fn openat_admitted(dir: &OwnedFd, name: &str, flags: OFlags) -> io::Result<Owned
 fn parent(root: &OwnedFd, path: &str, create: bool) -> io::Result<(OwnedFd, String)> {
     let mut parts: Vec<_> = path.split('/').collect();
     let name = parts.pop().ok_or_else(|| invalid("empty member path"))?;
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0048-M01","item":"ratarmount::overlay_pack::parent","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut fd = host::openat(root, ".", directory_flags(), Mode::empty())?;
     for part in parts {
         if create {
-            match host::mkdirat(&fd, part, Mode::from_raw_mode(0o700)) {
-                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                Err(e) => return Err(e.into()),
+            {
+                let __inventory_condition_5230 = {
+                    #[cfg_attr(
+                        internal_read_inventory,
+                        expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-E0123-M01","item":"ratarmount::overlay_pack::parent","disposition":"output-owner","category":"bundle-extraction-directory","reason":"Create each extraction parent relative to the previous held directory descriptor.","creation":{"policy":"directory-relative","basis":"mkdirat requests 0700 and each component is then reopened with the no-follow directory flags; collisions are not replacements."}}"###
+                        )
+                    )]
+                    let __inventory_value_0 = host::mkdirat(&fd, part, Mode::from_raw_mode(0o700));
+                    __inventory_value_0
+                };
+                match __inventory_condition_5230 {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
-        fd = host::openat(&fd, part, directory_flags(), Mode::empty())?;
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0049-M01","item":"ratarmount::overlay_pack::parent","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
+        let __inventory_assigned = host::openat(&fd, part, directory_flags(), Mode::empty())?;
+        fd = __inventory_assigned;
     }
     Ok((fd, name.into()))
 }
@@ -124,6 +172,13 @@ fn collect(fd: &OwnedFd, prefix: &str, paths: &mut BTreeSet<String>) -> io::Resu
         }
         let stat = ratarmount_compositing::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0050-M01","item":"ratarmount::overlay_pack::collect","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
             let child = host::openat(fd, name, directory_flags(), Mode::empty())?;
             collect(&child, &path, paths)?;
         }
@@ -209,6 +264,13 @@ fn append_host<W: Write>(
     path: &str,
     replacement: Option<&Path>,
 ) -> io::Result<()> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0051-M01","item":"ratarmount::overlay_pack::append_host","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let (fd, name) = if path.is_empty() {
         (
             host::openat(root, ".", directory_flags(), Mode::empty())?,
@@ -254,11 +316,25 @@ fn append_host<W: Write>(
                 // The layer database's SQLite snapshot, read through a managed
                 // reader (#151): its close keeps this process's locks.
                 Some(copy) => {
+                    #[cfg_attr(
+                        internal_read_inventory,
+                        expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0052-M01","item":"ratarmount::overlay_pack::append_host","disposition":"sqlite-snapshot","regression":"regression_pack_snapshot_output_readers_keep_database_lock","category":"sqlite-snapshot","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                        )
+                    )]
                     let mut file = ratarmount_index::managed_read::ManagedReadCursor::open(copy)?;
                     h.set_size(file.len()?);
                     tar.append_data(&mut h, archive_path, &mut file)
                 }
                 None => {
+                    #[cfg_attr(
+                        internal_read_inventory,
+                        expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0054-M01","item":"ratarmount::overlay_pack::append_host","disposition":"residual","reason":"pack payload branch (None): admitted open of an overlay payload; reverse-order payload ownership needs the excluded coordinator","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["pack"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                        )
+                    )]
                     let mut file =
                         File::from(openat_admitted(&fd, name.as_str(), regular_flags())?);
                     h.set_size(file.metadata()?.len());
@@ -316,10 +392,24 @@ pub fn pack(
              run `overlay unseal --i-know`, then `overlay seal --force-base-mismatch` against this base, then pack",
         ));
     }
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0055-M01","item":"ratarmount::overlay_pack::pack","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut manifest = tempfile::tempfile()?;
     overlay_changes::write_manifest(&changes, &mut manifest)?;
     let mut paths = BTreeSet::new();
     collect(&root, "", &mut paths)?;
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0056-M01","item":"ratarmount::overlay_pack::pack","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut plain = tempfile::tempfile()?;
     // An overlay from an earlier build may hold a credentialed base URL: export
     // a redacted copy of its database; the source is never modified.
@@ -350,6 +440,13 @@ pub fn pack(
                     let copy = staging.path().canonicalize()?.join("index.sqlite");
                     ratarmount_index::snapshot_index_into(&index, &copy)?;
                     // Its bytes through a managed reader (#151).
+                    #[cfg_attr(
+                        internal_read_inventory,
+                        expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-B0057-M01","item":"ratarmount::overlay_pack::pack","disposition":"sqlite-snapshot","regression":"regression_pack_snapshot_output_readers_keep_database_lock","category":"sqlite-snapshot","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                        )
+                    )]
                     let file = ratarmount_index::managed_read::ManagedReadCursor::open(&copy)?;
                     let name = format!(
                         "index/{}",
@@ -364,6 +461,13 @@ pub fn pack(
             }
         }
         if let Some(journal) = &options.include_journal {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0059-M01","item":"ratarmount::overlay_pack::pack","disposition":"out-of-family","category":"structured-control-record","reason":"--include-journal: operation journal JSONL summarized into the bundle (documented residual of the lock guarantee)","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
             let mut file = File::from(host::open(journal, regular_flags(), Mode::empty())?);
             let summary = crate::journal_cmd::summarize(BufReader::new(&mut file), None, None)?;
             append_bytes(
@@ -402,6 +506,13 @@ pub fn pack(
     }
     plain.rewind()?;
     let mut remaining = plain.metadata()?.len();
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0060-M01","item":"ratarmount::overlay_pack::pack","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut encoded = tempfile::Builder::new()
         .prefix(PACK_TEMP_PREFIX)
         .suffix(PACK_TEMP_SUFFIX)
@@ -498,6 +609,13 @@ fn open_bundle_tar(
     limits: Limits,
 ) -> io::Result<(BundleTar, std::rc::Rc<std::cell::Cell<u64>>)> {
     let entries = std::rc::Rc::new(std::cell::Cell::new(0));
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0061-M01","item":"ratarmount::overlay_pack::open_bundle_tar","disposition":"out-of-family","category":"patch-or-bundle-input","reason":"bundle input stream","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let decoder = zstd::stream::read::Decoder::new(File::open(bundle)?)?;
     let archive = tar::Archive::new(CappedDecode {
         inner: decoder,
@@ -607,6 +725,13 @@ fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
 
 fn sentinel_matches(directory: &Path, digest: &str) -> io::Result<bool> {
     let root = open_root(directory)?;
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0062-M01","item":"ratarmount::overlay_pack::sentinel_matches","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["pack"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let fd = match openat_admitted(&root, SENTINEL, regular_flags()) {
         Ok(fd) => fd,
         Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) => {
@@ -683,7 +808,17 @@ fn cleanup_dirs(fd: &OwnedFd) {
             if name.to_bytes() == b"." || name.to_bytes() == b".." {
                 continue;
             }
-            if let Ok(child) = host::openat(fd, name, directory_flags(), Mode::empty()) {
+            if let Ok(child) = {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0064-M01","item":"ratarmount::overlay_pack::cleanup_dirs","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )
+                )]
+                let __inventory_value_0 = host::openat(fd, name, directory_flags(), Mode::empty());
+                __inventory_value_0
+            } {
                 cleanup_dirs(&child);
             }
         }
@@ -706,12 +841,33 @@ fn try_flock(file: &File) -> bool {
 impl StageLock {
     fn beside(stage: &Path) -> io::Result<Self> {
         let path = lock_path(stage);
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0065-M01","item":"<ratarmount::overlay_pack::StageLock>::beside","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+                )
+            )]
+            let mut __inventory_value_0 = File::options();
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0124-M01","item":"<ratarmount::overlay_pack::StageLock>::beside","disposition":"output-owner","category":"bundle-staging-lock","reason":"Permit creation of the adjacent bundle staging lock without truncating a previous lock.","creation":{"policy":"create-or-open","basis":"The read/write lock uses truncate(false); flock plus the current-inode check coordinates the sweeper and publisher."}}"###
+                )
+            )]
+            let __inventory_value_1 = __inventory_value_0.read(true).write(true).create(true);
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0065-M02","item":"<ratarmount::overlay_pack::StageLock>::beside","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
+            let __inventory_value_2 = __inventory_value_1.truncate(false).open(&path);
+            __inventory_value_2
+        }?;
         if !try_flock(&file) {
             return Err(io::Error::other("staging lock is held by another process"));
         }
@@ -772,6 +928,13 @@ impl Stage {
         sweep_stale_stages(parent, sweep_copies);
         let mut last = None;
         for _ in 0..ATTEMPTS {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0066-M01","item":"<ratarmount::overlay_pack::Stage>::new_in_with","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
             let dir = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
             match lock_for(dir.path()) {
                 // The sweeper may also have removed the stage itself.
@@ -866,6 +1029,13 @@ fn sweep_pack_temps_in(dir: &OwnedFd) {
         // Admitted (R10-FIX3): an old temp name that is a hard link of an open
         // overlay database is skipped without a descriptor of it being
         // opened and closed (its flock says nothing about SQLite's locks).
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0067-M01","item":"ratarmount::overlay_pack::sweep_pack_temps_in","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["pack"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let Ok(fd) = name
             .to_str()
             .map_err(io::Error::other)
@@ -1012,7 +1182,17 @@ fn stat_age(stat: &rustix::fs::Stat) -> std::time::Duration {
 /// never following a symlink planted under the name.
 fn open_lock_at(dir: &OwnedFd, name: &str) -> io::Result<File> {
     let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    Ok(File::from(openat_admitted(dir, name, flags)?))
+    Ok(File::from({
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0070-M01","item":"ratarmount::overlay_pack::open_lock_at","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","non_mandatory_callers":["pack"],"category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
+        let __inventory_value_0 = openat_admitted(dir, name, flags);
+        __inventory_value_0
+    }?))
 }
 
 /// Delete everything below `fd` through descriptors only: each child is opened
@@ -1037,7 +1217,18 @@ fn remove_contents(fd: &OwnedFd) {
         )
         .is_ok_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFDIR);
         if is_dir {
-            if let Ok(child) = host::openat(fd, name.as_c_str(), directory_flags(), Mode::empty()) {
+            if let Ok(child) = {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0071-M01","item":"ratarmount::overlay_pack::remove_contents","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )
+                )]
+                let __inventory_value_0 =
+                    host::openat(fd, name.as_c_str(), directory_flags(), Mode::empty());
+                __inventory_value_0
+            } {
                 remove_contents(&child);
             }
             let _ = host::unlinkat(fd, name.as_c_str(), AtFlags::REMOVEDIR);
@@ -1146,8 +1337,14 @@ fn sweep_stale_stages_in(dir: &OwnedFd, sweep_copies: bool) {
                 Err(_) if stat_age(&stat) > day => None,
                 Err(_) => continue,
             };
-            let Ok(child) = host::openat(dir, name.as_str(), directory_flags(), Mode::empty())
-            else {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0072-M01","item":"ratarmount::overlay_pack::sweep_stale_stages_in","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
+            let Ok(child) = host::openat(dir, name.as_str(), directory_flags(), Mode::empty()) else {
                 continue;
             };
             // Still the directory that was checked, not one renamed in under
@@ -1177,6 +1374,13 @@ fn seal_directories(fd: &OwnedFd) -> io::Result<()> {
         }
         let stat = ratarmount_compositing::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0073-M01","item":"ratarmount::overlay_pack::seal_directories","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
             let child = host::openat(fd, name, directory_flags(), Mode::empty())?;
             seal_directories(&child)?;
         }
@@ -1279,13 +1483,41 @@ fn extract_with_limits(bundle: &Path, directory: &Path, limits: Limits) -> io::R
         }
         let (fd, name) = parent(&root, relative, true)?;
         if kind.is_dir() {
-            match host::mkdirat(&fd, name.as_str(), Mode::from_raw_mode(0o700)) {
-                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                Err(e) => return Err(e.into()),
+            {
+                let __inventory_condition_67038 = {
+                    #[cfg_attr(
+                        internal_read_inventory,
+                        expect(
+                            clippy::disallowed_methods,
+                            reason = r###"internal-read:v1 {"id":"IR-E0125-M01","item":"ratarmount::overlay_pack::extract_with_limits","disposition":"output-owner","category":"bundle-extraction-directory","reason":"Create a bundle directory entry relative to its validated parent descriptor.","creation":{"policy":"directory-relative","basis":"mkdirat starts the directory at 0700, then a no-follow open validates it; the saved archive metadata is applied in the extraction flow."}}"###
+                        )
+                    )]
+                    let __inventory_value_0 =
+                        host::mkdirat(&fd, name.as_str(), Mode::from_raw_mode(0o700));
+                    __inventory_value_0
+                };
+                match __inventory_condition_67038 {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0074-M01","item":"ratarmount::overlay_pack::extract_with_limits","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
             host::openat(&fd, name.as_str(), directory_flags(), Mode::empty())?;
             directories.insert(relative.into(), (mode, mtime));
         } else if kind.is_file() {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0075-M01","item":"ratarmount::overlay_pack::extract_with_limits","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
             let child = host::openat(
                 &fd,
                 name.as_str(),
@@ -1376,10 +1608,32 @@ fn finalize_stage(directory: &Path, recorded: Recorded) -> io::Result<()> {
     // Children first, so sealed parent permissions never obstruct this walk.
     for (path, (mode, mtime)) in recorded.directories.into_iter().rev() {
         let fd = if path.is_empty() {
-            host::openat(&root, ".", directory_flags(), Mode::empty())?
+            {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0077-M01","item":"ratarmount::overlay_pack::finalize_stage","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )
+                )]
+                let __inventory_value_0 =
+                    host::openat(&root, ".", directory_flags(), Mode::empty());
+                __inventory_value_0
+            }?
         } else {
             let (fd, name) = parent(&root, &path, false)?;
-            host::openat(&fd, name.as_str(), directory_flags(), Mode::empty())?
+            {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0078-M01","item":"ratarmount::overlay_pack::finalize_stage","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )
+                )]
+                let __inventory_value_0 =
+                    host::openat(&fd, name.as_str(), directory_flags(), Mode::empty());
+                __inventory_value_0
+            }?
         };
         let file = File::from(fd);
         file.set_times(fs::FileTimes::new().set_modified(mtime))?;
@@ -1508,6 +1762,13 @@ fn unpack_impl(bundle: &Path, directory: &Path, limits: Limits) -> io::Result<Un
 /// sealed layer root is read-only. Hold the root by fd so the permission
 /// change follows the renamed inode.
 fn publish_layer(layer: &Path, directory: &Path) -> io::Result<()> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0080-M01","item":"ratarmount::overlay_pack::publish_layer","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let root = host::open(layer, directory_flags(), Mode::empty())?;
     let sealed = ratarmount_compositing::host_stat::fstat_named(&root, layer)?.st_mode;
     host::fchmod(&root, Mode::from_raw_mode(sealed | 0o200))?;
@@ -1563,7 +1824,21 @@ fn run_extract_hook(hook: &'static std::thread::LocalKey<ExtractHook>, stage: &P
 /// everything after reads exactly the hashed bytes and never the original path.
 fn private_copy(bundle: &Path, cache: &Path) -> io::Result<(tempfile::NamedTempFile, String)> {
     use sha2::{Digest, Sha256};
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0081-M01","item":"ratarmount::overlay_pack::private_copy","disposition":"out-of-family","category":"patch-or-bundle-input","reason":"bundle input stream copied privately before extraction","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut source = File::open(bundle)?;
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0082-M01","item":"ratarmount::overlay_pack::private_copy","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut copy = tempfile::Builder::new()
         .prefix(COPY_PREFIX)
         .suffix(".tar.zst")
@@ -1616,18 +1891,65 @@ fn marker_dir(cache: &Path, hex: &str) -> PathBuf {
 fn write_marker(cache: &Path, hex: &str, key: &str) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let dir = marker_dir(cache, hex);
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
-    match File::options()
-        .write(true)
-        .create_new(true)
-        .open(dir.join(key))
     {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e),
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_types,
+                reason = r###"internal-read:v1 {"id":"IR-E0126-T01","item":"ratarmount::overlay_pack::write_marker","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the private verification-marker directory builder.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+            )
+        )]
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0126-M01","item":"ratarmount::overlay_pack::write_marker","disposition":"support","category":"creation-builder","reason":"Construct the private verification-marker directory builder.","creation":{"policy":"none","basis":"Builder setup is separate from the recursive mode-0700 directory creation leaf."}}"###
+            )
+        )]
+        let mut __inventory_value_0 = fs::DirBuilder::new();
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0127-M01","item":"ratarmount::overlay_pack::write_marker","disposition":"output-owner","category":"bundle-verification-directory","reason":"Create the private per-digest verified-marker directory under the bundle cache.","creation":{"policy":"private-recursive-directory","basis":"The recursive DirBuilder requests 0700 and preserves the existing cache verification structure."}}"###
+            )
+        )]
+        let __inventory_value_1 = __inventory_value_0.recursive(true).mode(0o700).create(&dir);
+        __inventory_value_1
+    }?;
+    {
+        let __inventory_condition_87642 = {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0083-M01","item":"ratarmount::overlay_pack::write_marker","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+                )
+            )]
+            let mut __inventory_value_0 = File::options();
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0128-M01","item":"ratarmount::overlay_pack::write_marker","disposition":"output-owner","category":"bundle-verification-marker","reason":"Configure exclusive creation of the verification marker for the checked bundle key.","creation":{"policy":"exclusive-new-file","basis":"create_new never overwrites a marker; AlreadyExists is treated as the existing completed marker and default file permissions remain unchanged."}}"###
+                )
+            )]
+            let __inventory_value_1 = __inventory_value_0.write(true).create_new(true);
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0083-M02","item":"ratarmount::overlay_pack::write_marker","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+                )
+            )]
+            let __inventory_value_2 = __inventory_value_1.open(dir.join(key));
+            __inventory_value_2
+        };
+        match __inventory_condition_87642 {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1638,10 +1960,35 @@ pub(crate) fn cached_lower_in(
     marker_key: Option<&str>,
 ) -> io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(cache)?;
+    {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_types,
+                reason = r###"internal-read:v1 {"id":"IR-E0129-T01","item":"ratarmount::overlay_pack::cached_lower_in","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the private bundle cache-directory builder.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+            )
+        )]
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0129-M01","item":"ratarmount::overlay_pack::cached_lower_in","disposition":"support","category":"creation-builder","reason":"Construct the private bundle cache-directory builder.","creation":{"policy":"none","basis":"This event is setup only; the following create leaf requests a recursive 0700 cache tree."}}"###
+            )
+        )]
+        let mut __inventory_value_0 = fs::DirBuilder::new();
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0130-M01","item":"ratarmount::overlay_pack::cached_lower_in","disposition":"output-owner","category":"bundle-cache-directory","reason":"Create the private bundle cache before making a validated private copy of the supplied bundle.","creation":{"policy":"private-recursive-directory","basis":"The recursive builder requests 0700; copy verification/publication and marker operations have independent approvals."}}"###
+            )
+        )]
+        let __inventory_value_1 = __inventory_value_0
+            .recursive(true)
+            .mode(0o700)
+            .create(cache);
+        __inventory_value_1
+    }?;
     let (copy, hex) = private_copy(bundle, cache)?;
     #[cfg(test)]
     AFTER_COPY.with(|hook| {

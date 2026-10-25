@@ -132,6 +132,13 @@ impl HfRepo {
         // Managed (#151): the staged archive may be a database open in this
         // process; the one reader is sampled, hashed, rewound and kept through
         // the LFS uploads and their retries.
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0509-M01","item":"<ratarmount_remote::hf::HfRepo>::commit_archive","disposition":"managed-read","regression":"regression_hf_archive_upload_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let mut files = vec![UploadFile::new(
             &self.location.path,
             Box::new(ratarmount_index::managed_read::ManagedReadCursor::open(

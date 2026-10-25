@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! Userspace SFTP export of a [`ratarmount_core::MountSource`] (P-10).
 //!
 //! Listen on `127.0.0.1:20222` (unprivileged; well-known 22 is residual).

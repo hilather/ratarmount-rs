@@ -659,6 +659,13 @@ impl SeekableGzip {
                                               // Resolve for -P 0 parity / future concurrent index builders; index path
                                               // does not currently fan out workers.
         let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0229-M01","item":"<ratarmount_compress::gzip_seek::SeekableGzip>::open_with_threads","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let mut file = File::open(&path)?;
         let index = build_index(&mut file, spacing)?;
         Ok(Arc::new(Self {
@@ -691,6 +698,13 @@ impl SeekableGzip {
         let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
         let parsed = try_import_gzip_seek_blob(index_blob)?;
         let spacing = effective_import_spacing(spacing, parsed.spacing);
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0230-M01","item":"<ratarmount_compress::gzip_seek::SeekableGzip>::open_with_imported_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let mut file = File::open(&path)?;
         let index = import_gzip_seek_blob_index(&mut file, &parsed, spacing)?;
         Ok(Arc::new(Self {
@@ -1012,6 +1026,13 @@ pub struct SeekableGzipReader {
 
 impl SeekableGzipReader {
     fn open(gzip: Arc<SeekableGzip>) -> io::Result<Self> {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0231-M01","item":"<ratarmount_compress::gzip_seek::SeekableGzipReader>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let file = match &gzip.backend {
             GzipBackend::Path(p) => CompressedHandle::File(File::open(p)?),
             GzipBackend::Shared(shared) => CompressedHandle::Shared {

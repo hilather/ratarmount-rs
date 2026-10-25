@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! Compositing layers: folder bind, union, recursive auto-mount, write overlay,
 //! file versions, path prefix, path transform, in-FS control folder, OCI overlayfs,
 //! G-3 payload cache.

@@ -219,12 +219,39 @@ pub(crate) struct ProgressToStderr(OwnedFd);
 impl ProgressToStderr {
     pub(crate) fn new() -> io::Result<Self> {
         io::stdout().flush()?;
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0002-M01","item":"<ratarmount::diff::ProgressToStderr>::new","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let fd = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0003-M01","item":"<ratarmount::diff::ProgressToStderr>::new","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let saved = Self(unsafe { OwnedFd::from_raw_fd(fd) });
-        if unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0 {
+        if unsafe {
+            {
+                #[cfg_attr(
+                    internal_read_inventory,
+                    expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0004-M01","item":"<ratarmount::diff::ProgressToStderr>::new","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )
+                )]
+                let __inventory_value_0 = libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO);
+                __inventory_value_0
+            }
+        } < 0
+        {
             return Err(io::Error::last_os_error());
         }
         Ok(saved)
@@ -235,6 +262,13 @@ impl Drop for ProgressToStderr {
     fn drop(&mut self) {
         let _ = io::stdout().flush();
         unsafe {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0005-M01","item":"<ratarmount::diff::ProgressToStderr as core::ops::drop::Drop<ratarmount::diff::ProgressToStderr>>::drop","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"standard descriptor handoff: duplicates or redirects a standard stream descriptor; opens no pathname and reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
             libc::dup2(self.0.as_raw_fd(), libc::STDOUT_FILENO);
         }
     }
@@ -516,10 +550,24 @@ fn execute(args: &DiffArgs, context: &crate::base_identity::OverlayRunContext) -
     let prepared = prepare(args, context)?;
     // Withhold partial output on a limit/error. The spool holds rendered bytes,
     // not all source payloads, and is removed automatically on every error.
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0006-M01","item":"ratarmount::diff::execute","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut spool = tempfile::tempfile()?;
     write_output(&prepared, args, &mut spool)?;
     spool.rewind()?;
     if let Some(path) = &args.output {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0007-M01","item":"ratarmount::diff::execute","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
         let mut out = fs::File::create(path)?;
         io::copy(&mut spool, &mut out)?;
         out.flush()?;

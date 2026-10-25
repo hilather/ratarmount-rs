@@ -20,31 +20,31 @@
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = write!(std::io::stdout().lock(), $($arg)*);
+        use ::std::io::Write as _;
+        let _ = ::std::write!(::std::io::stdout().lock(), $($arg)*);
     }};
 }
 
 #[macro_export]
 macro_rules! println {
     () => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout().lock());
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stdout().lock());
     }};
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout().lock(), $($arg)*);
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stdout().lock(), $($arg)*);
     }};
 }
 
 #[macro_export]
 macro_rules! eprintln {
     () => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr().lock());
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr().lock());
     }};
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr().lock(), $($arg)*);
     }};
 }

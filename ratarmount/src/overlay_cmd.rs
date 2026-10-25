@@ -262,6 +262,13 @@ fn digest_base(args: &DigestBaseArgs) -> Result<(String, i32), String> {
         ("directory", digest, excluded)
     } else {
         // Managed (#151): the base may be a database open in this process.
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0037-M01","item":"ratarmount::overlay_cmd::digest_base","disposition":"managed-read","regression":"regression_digest_base_file_keeps_sqlar_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
         let hex = ratarmount_index::managed_read::sha256_hex(&args.path)
             .map_err(|e| format!("digest-base {}: {e}", args.path.display()))?;
         ("file", format!("sha256:{hex}"), Vec::new())

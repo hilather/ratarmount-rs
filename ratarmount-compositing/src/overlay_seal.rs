@@ -54,7 +54,17 @@ fn directory_flags() -> OFlags {
 }
 
 fn root(dir: &Path) -> io::Result<OwnedFd> {
-    Ok(host::open(dir, directory_flags(), Mode::empty())?)
+    Ok({
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0156-M01","item":"ratarmount_compositing::overlay_seal::root","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
+        let __inventory_value_0 = host::open(dir, directory_flags(), Mode::empty());
+        __inventory_value_0
+    }?)
 }
 
 fn connection(dir: &Path, immutable: bool) -> io::Result<crate::OverlayDb> {
@@ -120,6 +130,13 @@ fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
             continue;
         }
         if kind == libc::S_IFDIR {
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0157-M01","item":"ratarmount_compositing::overlay_seal::chmod_tree","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
             chmod_tree(
                 &host::openat(fd, name, directory_flags(), Mode::empty())?,
                 writable,
@@ -341,6 +358,13 @@ pub(crate) fn seal_impl(
 }
 
 fn write_sentinel(dir: &Path, layer_digest: &str) -> io::Result<()> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0158-M01","item":"ratarmount_compositing::overlay_seal::write_sentinel","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )
+    )]
     let mut sentinel = tempfile::Builder::new()
         .prefix(".ratarmount.overlay.cow-seal-")
         .tempfile_in(dir)?;
@@ -354,12 +378,22 @@ fn write_sentinel(dir: &Path, layer_digest: &str) -> io::Result<()> {
 /// of an open overlay database is refused without closing a descriptor of it.
 fn open_sentinel(root: &OwnedFd) -> io::Result<OwnedFd> {
     use std::os::fd::AsFd;
-    ratarmount_core::db_inodes::openat_admitted(
-        Some(root.as_fd()),
-        Path::new(SENTINEL),
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        0,
-    )
+    {
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0159-M01","item":"ratarmount_compositing::overlay_seal::open_sentinel","disposition":"residual","reason":"overlay payload descriptor (admitted open or borrowed raw descriptor); reverse-order payload ownership needs the excluded coordinator (db_inodes.rs:33)","family":"payload-admitted-readers","issue":"#196","category":"payload-admitted-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
+        let __inventory_value_0 = ratarmount_core::db_inodes::openat_admitted(
+            Some(root.as_fd()),
+            Path::new(SENTINEL),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0,
+        );
+        __inventory_value_0
+    }
 }
 
 /// Finish a seal that was interrupted after its metadata commit: write the

@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! Read-only restic repository snapshot browser (`backendName=ResticMountSource`).
 //!
 //! Local repos only (`restic:/abs/path`). Presentation:

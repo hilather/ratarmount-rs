@@ -47,3 +47,6 @@ futures-lite = { version = "2", optional = true }
 
 [dev-dependencies]
 ratarmount-index = { workspace = true, features = ["test-hooks"] }
+
+[lints]
+workspace = true

@@ -100,10 +100,25 @@ fn file_type(stat: &Stat) -> u32 {
 }
 
 fn open_directory(root: &OwnedFd, path: &str) -> io::Result<OwnedFd> {
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0146-M01","item":"ratarmount_compositing::overlay_fsck::open_directory","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY descriptor of an overlay directory for the no-follow fsck walk; reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let mut fd = fs::openat(root, ".", directory_flags(), Mode::empty())?;
     if !path.is_empty() {
         for part in path.split('/') {
-            fd = fs::openat(&fd, part, directory_flags(), Mode::empty())?;
+            #[cfg_attr(
+                internal_read_inventory,
+                expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0147-M01","item":"ratarmount_compositing::overlay_fsck::open_directory","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY descriptor of an overlay directory for the no-follow fsck walk; reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )
+            )]
+            let __inventory_assigned = fs::openat(&fd, part, directory_flags(), Mode::empty())?;
+            fd = __inventory_assigned;
         }
     }
     Ok(fd)
@@ -161,6 +176,13 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
             "overlay is sealed; fsck --repair is refused",
         ));
     }
+    #[cfg_attr(
+        internal_read_inventory,
+        expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0148-M01","item":"ratarmount_compositing::overlay_fsck::fsck","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY descriptor of the overlay folder (walk root); reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )
+    )]
     let root = fs::open(dir, directory_flags(), Mode::empty())?;
     let flags = if sealed {
         OpenFlags::SQLITE_OPEN_READ_ONLY

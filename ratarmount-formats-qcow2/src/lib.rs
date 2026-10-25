@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! QCOW2 virtual-disk mount source.
 //!
 //! Guest clusters are mapped in-process (QCOW2 v2/v3, uncompressed + zlib

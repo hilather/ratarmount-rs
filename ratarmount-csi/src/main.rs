@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 #[cfg(target_os = "linux")]
 mod linux;
 

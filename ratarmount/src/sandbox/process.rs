@@ -147,6 +147,13 @@ impl Mounter for ProcessMounter {
     fn prepare(&mut self, base: &Base, indexes: &Path, timeout: Duration) -> Result<()> {
         let log = indexes.join("prepare.log");
         let mut command = Command::new(&self.binary);
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0114-M01","item":"<ratarmount::sandbox::process::ProcessMounter as ratarmount::sandbox::process::Mounter<ratarmount::sandbox::process::ProcessMounter>>::prepare","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"child stdio setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
         command
             .args(base_args(base, indexes))
             .args(["--no-mount", "--"])
@@ -179,6 +186,13 @@ impl Mounter for ProcessMounter {
             .expect("attempt root")
             .join("mount.log");
         let mut command = Command::new(&self.binary);
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0115-M01","item":"<ratarmount::sandbox::process::ProcessMounter as ratarmount::sandbox::process::Mounter<ratarmount::sandbox::process::ProcessMounter>>::spawn","disposition":"out-of-family","category":"runtime-resource-or-descriptor-handoff","reason":"child stdio setup","mode_policy":"unchanged-from-e6ca64e","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )
+        )]
         command
             .args(mount_args(base, indexes, attempt, quota, readonly))
             .stdin(Stdio::null())
@@ -302,7 +316,17 @@ fn detach(binary: &Path, path: &Path) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn mountpoints() -> io::Result<Vec<PathBuf>> {
-    Ok(parse_mountinfo(&fs::read("/proc/self/mountinfo")?))
+    Ok(parse_mountinfo(&{
+        #[cfg_attr(
+            internal_read_inventory,
+            expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0116-M01","item":"ratarmount::sandbox::process::mountpoints","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )
+        )]
+        let __inventory_value_0 = fs::read("/proc/self/mountinfo");
+        __inventory_value_0
+    }?))
 }
 
 #[cfg(target_os = "macos")]
