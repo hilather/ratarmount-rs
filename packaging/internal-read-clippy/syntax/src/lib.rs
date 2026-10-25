@@ -43,6 +43,37 @@ fn contains_ident(tokens: TokenStream, name: &str) -> bool {
     })
 }
 
+// Only token-tree fragments can substitute a raw `#`, `!` or bracket group.
+// Typed fragments are opaque to the transcriber, including empty `vis` fragments.
+fn matcher_fragments(
+    tokens: TokenStream,
+    fragments: &mut std::collections::BTreeMap<String, String>,
+) {
+    let tokens: Vec<_> = tokens.into_iter().collect();
+    for window in tokens.windows(4) {
+        if matches!(&window[0], TokenTree::Punct(p) if p.as_char() == '$')
+            && matches!(&window[2], TokenTree::Punct(p) if p.as_char() == ':')
+        {
+            if let (TokenTree::Ident(name), TokenTree::Ident(kind)) = (&window[1], &window[3]) {
+                fragments.insert(normalized_ident(name), normalized_ident(kind));
+            }
+        }
+    }
+    for token in tokens {
+        if let TokenTree::Group(group) = token {
+            matcher_fragments(group.stream(), fragments);
+        }
+    }
+}
+
+// Retain capture identities: repeating one opaque token-tree payload is
+// forwarding, not an attribute prefix assembled by the macro definition.
+type AttributeStates = BTreeSet<(u8, Option<String>, Option<String>)>;
+
+fn no_attribute_prefix() -> AttributeStates {
+    BTreeSet::from([(0, None, None)])
+}
+
 impl Audit {
     fn emit(&mut self, span: Span, policy: &str, detail: &str) {
         self.findings
@@ -51,15 +82,25 @@ impl Audit {
 
     // Token inspection here is restricted to Rust grammar constructs. There is
     // no operation-name, filesystem-symbol, alias, or path-resolution policy.
-    fn tokens(&mut self, tokens: TokenStream, macro_body: bool, transcriber: bool) {
+    fn tokens(
+        &mut self,
+        tokens: TokenStream,
+        macro_body: bool,
+        transcriber: bool,
+        fragments: &std::collections::BTreeMap<String, String>,
+    ) {
+        if transcriber {
+            self.attribute_tokens(tokens.clone(), no_attribute_prefix(), fragments);
+        }
         let tokens: Vec<_> = tokens.into_iter().collect();
         for (i, token) in tokens.iter().enumerate() {
-            if is_ident(token, "macro_rules")
+            if transcriber
+                && is_ident(token, "macro_rules")
                 && matches!(tokens.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
                 && matches!(tokens.get(i + 2), Some(TokenTree::Ident(_)))
             {
                 if let Some(TokenTree::Group(body)) = tokens.get(i + 3) {
-                    self.macro_rules(body.stream());
+                    self.macro_rules(body.stream(), fragments);
                 }
             }
             if macro_body
@@ -67,30 +108,6 @@ impl Audit {
                 && matches!(token, TokenTree::Punct(p) if p.as_char() == '$')
                 && matches!(tokens.get(i + 1), Some(TokenTree::Ident(_)))
             {
-                let prefix_end = i
-                    + 2
-                    + usize::from(
-                        matches!(tokens.get(i + 2), Some(TokenTree::Punct(p)) if p.as_char() == '!'),
-                    );
-                // A substituted `#` can introduce an attribute without a
-                // literal hash. Require an attribute subject after the bracket
-                // to distinguish ordinary `$array[$index]` expressions.
-                let attribute_subject = tokens.get(prefix_end + 1).is_some_and(|t| {
-                    matches!(t, TokenTree::Punct(p) if matches!(p.as_char(), '#' | '$'))
-                        || matches!(t, TokenTree::Ident(id) if matches!(normalized_ident(id).as_str(),
-                            "pub" | "fn" | "mod" | "struct" | "enum" | "union" | "trait" |
-                            "impl" | "const" | "static" | "async" | "unsafe" | "extern" |
-                            "type" | "use" | "macro_rules" | "let"))
-                });
-                if matches!(tokens.get(prefix_end), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket)
-                    && attribute_subject
-                {
-                    self.emit(
-                        token.span(),
-                        "N3",
-                        "metavariable transcriber attribute prefix",
-                    );
-                }
                 let mut next = i + 2;
                 if matches!(tokens.get(next), Some(TokenTree::Literal(_))) {
                     next += 1;
@@ -195,8 +212,8 @@ impl Audit {
                     && is_ident(&tokens[i - 3], "macro_rules")
                     && matches!(&tokens[i - 2], TokenTree::Punct(p) if p.as_char() == '!')
                     && matches!(&tokens[i - 1], TokenTree::Ident(_));
-                if !nested_definition {
-                    self.tokens(group.stream(), macro_body, transcriber);
+                if !nested_definition || !transcriber {
+                    self.tokens(group.stream(), macro_body, transcriber, fragments);
                 }
             }
         }
@@ -211,7 +228,7 @@ impl Audit {
                 && matches!(tokens.get(i + 2), Some(TokenTree::Ident(_)))
             {
                 if let Some(TokenTree::Group(body)) = tokens.get(i + 3) {
-                    self.macro_rules(body.stream());
+                    self.macro_rules(body.stream(), &Default::default());
                     i += 4;
                     continue;
                 }
@@ -223,20 +240,159 @@ impl Audit {
         }
     }
 
-    fn macro_rules(&mut self, tokens: TokenStream) {
-        // Parse the outer macro arm grammar, preserving delimiters. Matching
-        // #[$attr] in a matcher is permitted; emitting it is refused.
-        let tokens: Vec<_> = tokens.clone().into_iter().collect();
-        self.tokens(tokens.iter().cloned().collect(), true, false);
-        for window in tokens.windows(3) {
-            if matches!(&window[0], TokenTree::Punct(p) if p.as_char() == '=')
-                && matches!(&window[1], TokenTree::Punct(p) if p.as_char() == '>')
+    fn macro_rules(
+        &mut self,
+        tokens: TokenStream,
+        inherited: &std::collections::BTreeMap<String, String>,
+    ) {
+        // Preserve each arm's matcher/transcriber boundary and fragment kinds.
+        // Matching #[$attr] is permitted; emitting it is refused.
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        self.tokens(tokens.iter().cloned().collect(), true, false, inherited);
+        for window in tokens.windows(4) {
+            if matches!(&window[1], TokenTree::Punct(p) if p.as_char() == '=')
+                && matches!(&window[2], TokenTree::Punct(p) if p.as_char() == '>')
             {
-                if let TokenTree::Group(body) = &window[2] {
-                    self.tokens(body.stream(), true, true);
+                if let (TokenTree::Group(matcher), TokenTree::Group(body)) =
+                    (&window[0], &window[3])
+                {
+                    let mut fragments = inherited.clone();
+                    matcher_fragments(matcher.stream(), &mut fragments);
+                    self.tokens(body.stream(), true, true, &fragments);
                 }
             }
         }
+    }
+
+    // Recognize the attribute prefix grammar, independent of its subject.
+    // States retain `#`/`#!` and the identities of substituted punctuation.
+    // Repetitions compose these finite states, including nullable boundaries.
+    fn attribute_token(&mut self, token: &TokenTree, states: &AttributeStates) -> AttributeStates {
+        if matches!(token, TokenTree::Punct(p) if p.as_char() == '#') {
+            return BTreeSet::from([(1, None, None)]);
+        }
+        if matches!(token, TokenTree::Punct(p) if p.as_char() == '!') {
+            return states
+                .iter()
+                .map(|(prefix, hash, _)| {
+                    if *prefix == 1 {
+                        (2, hash.clone(), None)
+                    } else {
+                        (0, None, None)
+                    }
+                })
+                .collect();
+        }
+        if let TokenTree::Group(group) = token {
+            if group.delimiter() == Delimiter::Bracket {
+                let substituted = contains_dollar(group.stream());
+                if states.iter().any(|(prefix, hash, bang)| {
+                    *prefix != 0 && (hash.is_some() || bang.is_some() || substituted)
+                }) {
+                    self.emit(
+                        token.span(),
+                        "N3",
+                        "metavariable transcriber attribute prefix",
+                    );
+                }
+            }
+        }
+        no_attribute_prefix()
+    }
+
+    fn attribute_tokens(
+        &mut self,
+        tokens: TokenStream,
+        mut states: AttributeStates,
+        fragments: &std::collections::BTreeMap<String, String>,
+    ) -> AttributeStates {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            if matches!(&tokens[i], TokenTree::Punct(p) if p.as_char() == '$') {
+                if let Some(TokenTree::Ident(name)) = tokens.get(i + 1) {
+                    let name = normalized_ident(name);
+                    match fragments.get(&name).map(String::as_str) {
+                        Some("tt") | None if name != "crate" => {
+                            let mut possible = no_attribute_prefix();
+                            possible.insert((1, Some(name.clone()), None));
+                            for (prefix, hash, bang) in &states {
+                                // One capture cannot be both punctuation and a
+                                // bracket group. Plain tt forwarding stays opaque.
+                                if *prefix != 0
+                                    && hash.as_ref() != Some(&name)
+                                    && bang.as_ref() != Some(&name)
+                                {
+                                    self.emit(
+                                        tokens[i].span(),
+                                        "N3",
+                                        "metavariable transcriber attribute prefix",
+                                    );
+                                }
+                                if *prefix == 1 && hash.as_ref() != Some(&name) {
+                                    possible.insert((2, hash.clone(), Some(name.clone())));
+                                }
+                            }
+                            states = possible;
+                        }
+                        _ => {
+                            states = no_attribute_prefix();
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some(TokenTree::Group(body)) = tokens.get(i + 1) {
+                    if body.delimiter() == Delimiter::Parenthesis {
+                        let mut end = i + 2;
+                        let separator = match tokens.get(end) {
+                            Some(TokenTree::Punct(p)) if matches!(p.as_char(), '?' | '*' | '+') => {
+                                None
+                            }
+                            Some(token) => {
+                                end += 1;
+                                Some(token)
+                            }
+                            None => None,
+                        };
+                        if let Some(TokenTree::Punct(quantifier)) = tokens.get(end) {
+                            if matches!(quantifier.as_char(), '?' | '*' | '+') {
+                                let mut repeated =
+                                    self.attribute_tokens(body.stream(), states.clone(), fragments);
+                                if quantifier.as_char() != '?' {
+                                    let mut reached = repeated.clone();
+                                    loop {
+                                        if let Some(separator) = separator {
+                                            repeated = self.attribute_token(separator, &repeated);
+                                        }
+                                        repeated = self.attribute_tokens(
+                                            body.stream(),
+                                            repeated,
+                                            fragments,
+                                        );
+                                        let previous = reached.len();
+                                        reached.extend(repeated.iter().cloned());
+                                        if reached.len() == previous {
+                                            break;
+                                        }
+                                    }
+                                    repeated = reached;
+                                }
+                                if quantifier.as_char() != '+' {
+                                    repeated.extend(states);
+                                }
+                                states = repeated;
+                                i = end + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            states = self.attribute_token(&tokens[i], &states);
+            i += 1;
+        }
+        states
     }
 }
 
@@ -245,7 +401,7 @@ impl Audit {
 pub fn audit_macro(source: &str) -> Result<Vec<(String, String)>, String> {
     let tokens = source.parse::<TokenStream>().map_err(|e| e.to_string())?;
     let mut audit = Audit::default();
-    audit.macro_rules(tokens);
+    audit.macro_rules(tokens, &Default::default());
     Ok(audit
         .findings
         .into_iter()
@@ -322,6 +478,54 @@ mod tests {
             assert!(policies(src).is_empty(), "{src}");
         }
     }
+    /// Regression: substituted attributes hid reads before non-keyword subjects
+    /// or across nullable repetition boundaries.
+    #[test]
+    fn regression_substituted_attribute_grammar() {
+        for src in [
+            // both-substituted-item
+            "($h:tt $a:tt) => { $h $a pub fn hidden() { let _ = std::fs::read(\"x\"); } }",
+            // substituted-statement
+            "($h:tt $a:meta) => { pub fn visible() { $h [$a] std::fs::read(\"x\").unwrap(); } }",
+            // substituted-block
+            "($h:tt $a:meta) => { pub fn visible() { $h [$a] { let _ = std::fs::read(\"x\"); } } }",
+            // substituted-return
+            "($h:tt $a:meta) => { pub fn visible() { $h [$a] return { let _ = std::fs::read(\"x\"); }; } }",
+            // substituted-if
+            "($h:tt $a:meta) => { pub fn visible() { $h [$a] if true { let _ = std::fs::read(\"x\"); } } }",
+            // repeated-substituted-statement
+            "($($h:tt $a:meta)*) => { pub fn visible() { $($h [$a])* std::fs::read(\"x\").unwrap(); } }",
+            // substituted-field
+            "($h:tt $a:meta) => { pub struct Visible { $h [$a] value: [u8; { let _ = std::fs::read(\"x\"); 1 }] } }",
+            // substituted-variant
+            "($h:tt $a:meta) => { pub enum Visible { Present, $h [$a] Hidden = { let _ = std::fs::read(\"x\"); 1 }, } }",
+            // optional-hash
+            "($($h:tt)?; $a:meta) => { $($h)? [$a] pub fn hidden() { let _=std::fs::read(\"x\"); } }",
+            // optional-bracket
+            "($h:tt; $($a:tt)?) => { $h $($a)? pub fn hidden() { let _=std::fs::read(\"x\"); } }",
+            // optional-both
+            "($($h:tt)?; $($a:tt)?) => { $($h)? $($a)? pub fn hidden() { let _=std::fs::read(\"x\"); } }",
+            // optional-hash-inner
+            "($($h:tt)?; $a:meta) => { mod nested { $($h)? ! [$a] pub fn hidden() { let _=std::fs::read(\"x\"); } } }",
+            // optional-between
+            "($h:tt; $(($b:tt))?; $a:meta) => { $h $($b)? [$a] pub fn hidden() { let _=std::fs::read(\"x\"); } }",
+        ] {
+            assert!(policies(src).iter().any(|p| p == "N3"), "{src}");
+        }
+        for src in [
+            "($($tokens:tt)*) => { $($tokens)* };",
+            "($token:tt) => { $token $token };",
+            "($e:expr) => { macro_rules! inner { () => { $e[0] } } };",
+            "($name:ident) => { $name[0] };",
+        ] {
+            assert!(policies(src).is_empty(), "{src}");
+        }
+        // A tt prefix cannot distinguish a hash from an indexed expression.
+        // Use an expr/ident matcher for the latter, without a subject heuristic.
+        assert!(policies("($array:tt) => { $array[0] };")
+            .iter()
+            .any(|p| p == "N3"));
+    }
     /// Regression: forwarding payloads concealed literal nested macro definitions.
     #[test]
     fn regression_literal_definitions_in_invocation_payloads() {
@@ -352,6 +556,7 @@ mod tests {
     fn regression_cfg_matcher_transcriber_raw_and_nested_macro() {
         for src in [
             "(#[cfg(unix)]) => {};",
+            "(macro_rules! inner { () => { #[cfg(unix)] fn f() {} } }) => {};",
             "() => { #[r#cfg_attr(all(), allow(dead_code))] fn f() {} };",
             "() => { macro_rules! inner { () => { #[cfg(unix)] fn f() {} } } };",
         ] {

@@ -82,6 +82,27 @@ def main():
             run(name, f'macro_rules! m {{ ({matcher}) => {{ {attribute} {hidden_read} }} }} m!({invocation});', reject='N3')
         run('inner-substituted-brackets', 'macro_rules! m { ($a:tt) => { mod hidden { #! $a ' + hidden_read + ' } } } m!([cfg(windows)]);', reject='N3')
         run('inner-substituted-prefix', 'macro_rules! m { ($h:tt $a:meta) => { mod hidden { $h ! [$a] ' + hidden_read + ' } } } m!(# cfg(windows));', reject='N3')
+        # Regression: no subject keyword list may admit substituted attributes
+        # on statements, fields, variants or across repetition boundaries.
+        for name, source in [
+            ('both-substituted-item', 'macro_rules! m { ($h:tt $a:tt) => { $h $a pub fn hidden() { let _ = std::fs::read("x"); } } } m!(# [cfg(windows)]);'),
+            ('substituted-statement', 'macro_rules! m { ($h:tt $a:meta) => { pub fn visible() { $h [$a] std::fs::read("x").unwrap(); } } } m!(# cfg(windows));'),
+            ('substituted-block', 'macro_rules! m { ($h:tt $a:meta) => { pub fn visible() { $h [$a] { let _ = std::fs::read("x"); } } } } m!(# cfg(windows));'),
+            ('substituted-return', 'macro_rules! m { ($h:tt $a:meta) => { pub fn visible() { $h [$a] return { let _ = std::fs::read("x"); }; } } } m!(# cfg(windows));'),
+            ('substituted-if', 'macro_rules! m { ($h:tt $a:meta) => { pub fn visible() { $h [$a] if true { let _ = std::fs::read("x"); } } } } m!(# cfg(windows));'),
+            ('repeated-substituted-statement', 'macro_rules! m { ($($h:tt $a:meta)*) => { pub fn visible() { $($h [$a])* std::fs::read("x").unwrap(); } } } m!(# cfg(windows));'),
+            ('substituted-field', 'macro_rules! m { ($h:tt $a:meta) => { pub struct Visible { $h [$a] value: [u8; { let _ = std::fs::read("x"); 1 }] } } } m!(# cfg(windows));'),
+            ('substituted-variant', 'macro_rules! m { ($h:tt $a:meta) => { pub enum Visible { Present, $h [$a] Hidden = { let _ = std::fs::read("x"); 1 }, } } } m!(# cfg(windows));'),
+            ('optional-hash', 'macro_rules! m { ($($h:tt)?; $a:meta) => { $($h)? [$a] pub fn hidden() { let _=std::fs::read("x"); } } } m!(#; cfg(windows));'),
+            ('optional-bracket', 'macro_rules! m { ($h:tt; $($a:tt)?) => { $h $($a)? pub fn hidden() { let _=std::fs::read("x"); } } } m!(#; [cfg(windows)]);'),
+            ('optional-both', 'macro_rules! m { ($($h:tt)?; $($a:tt)?) => { $($h)? $($a)? pub fn hidden() { let _=std::fs::read("x"); } } } m!(#; [cfg(windows)]);'),
+            ('optional-hash-inner', 'macro_rules! m { ($($h:tt)?; $a:meta) => { mod nested { $($h)? ! [$a] pub fn hidden() { let _=std::fs::read("x"); } } } } m!(#; cfg(windows));'),
+            ('optional-between', 'macro_rules! m { ($h:tt; $(($b:tt))?; $a:meta) => { $h $($b)? [$a] pub fn hidden() { let _=std::fs::read("x"); } } } m!(#; ; cfg(windows));'),
+        ]:
+            run(name, source, reject='N3')
+        run('nested-typed-indexing', 'macro_rules! outer { ($e:expr) => { macro_rules! inner { () => { $e[0] }; } pub fn first() -> u8 { inner!() } } } outer!([7]);')
+        run('typed-ident-indexing', 'macro_rules! m { ($array:ident) => { $array[0] }; } pub fn first(array: [u8; 1]) -> u8 { m!(array) }')
+        run('ambiguous-tt-indexing', 'macro_rules! m { ($array:tt) => { $array[0] }; } pub fn first(array: [u8; 1]) -> u8 { m!(array) }', reject='N3')
         # Regression: literal macro definitions inside invocation payloads must
         # start a fresh matcher/transcriber audit, including nested groups.
         forward = 'macro_rules! pass { ($($t:tt)*) => { $($t)* }; } '

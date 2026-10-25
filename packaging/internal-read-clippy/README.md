@@ -70,8 +70,13 @@ N2 permits foreign blocks/link_name only in the exact compiler module
 `ratarmount_formats_libarchive::ffi`, including a post-expansion HIR check with no
 provenance exception. N3 refuses cfg/cfg_attr anywhere in repo macros and
 metavariable transcriber attributes, including substituted brackets and attribute
-prefixes. Literal nested macro definitions in invocation payloads receive the
-same grammar audit, with generic matchers and other payload data preserved.
+prefixes. Prefix recognition uses matcher fragment kinds and repetition grammar,
+independent of the following item, statement, field or variant. Ambiguous `tt`
+substitutions beside brackets or a distinct capture are refused; typed indexing
+and ordinary macro invocations remain permitted. Repeating one opaque token-tree
+capture retains the documented forwarding gap. Literal nested macro definitions
+in invocation payloads receive the same grammar audit, with generic matchers and
+other payload data preserved.
 Every production root must forbid unused macros. N4 refuses target predicates in
 the 40 reviewed failed-cross-check packages outside exact reviewed files in
 `policy.json`. File exceptions have no
