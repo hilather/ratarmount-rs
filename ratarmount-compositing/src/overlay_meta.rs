@@ -3330,45 +3330,47 @@ mod tests {
         }
     }
 
-    /// Regression: a mount point created inside the base after the digest was
-    /// taken (or mounted over later) changed the weak digest on remount. The
-    /// caller passes it in `weak_exclude`; topmost-new records it.
+    /// Regression: an invocation path the caller passed in `weak_exclude` (a
+    /// journal or a lower layer) created inside the base after the digest was
+    /// taken changed the weak digest on remount. The recorded excluded set
+    /// covers it; topmost-new records it.
     #[test]
-    fn regression_mountpoint_inside_base_is_in_the_recorded_excluded_set() {
+    fn regression_late_created_weak_exclude_is_in_the_recorded_excluded_set() {
         let root = tempfile::tempdir().unwrap();
         let basedir = root.path().join("base");
         fs::create_dir(&basedir).unwrap();
         fs::write(basedir.join("f"), b"one").unwrap();
         let expected = directory_weak_digest(&basedir, &BaseExcludes::default()).unwrap();
-        // Overlay beside the base, mount point inside it, not created yet.
+        // Overlay beside the base, excluded path inside it, not created yet.
         let overlay = root.path().join("overlay");
         let context = OverlayCreateInfo {
-            weak_exclude: vec![basedir.join("mnt")],
+            weak_exclude: vec![basedir.join("j.jsonl")],
             ..info(&basedir)
         };
         drop(open_dir_base(&basedir, &overlay, &context).unwrap());
         assert_eq!(
             meta_of(&overlay).get("base_weak_excludes"),
-            Some(r#"["mnt"]"#)
+            Some(r#"["j.jsonl"]"#)
         );
-        // The mount creates the directory afterwards and writes through it.
-        fs::create_dir(basedir.join("mnt")).unwrap();
+        // The journal is written afterwards and grows.
+        fs::write(basedir.join("j.jsonl"), b"lots of lines").unwrap();
         drop(open_dir_base(&basedir, &overlay, &context).unwrap());
         assert_eq!(meta_of(&overlay).base_digest(), Some(expected.as_str()));
-        // Overlay inside the base as well, mount point in a not-yet-existing parent.
+        // Overlay inside the base as well, excluded path in a not-yet-existing parent.
         let overlay = basedir.join(".ov");
         let context = OverlayCreateInfo {
-            weak_exclude: vec![basedir.join("mounts/m1")],
+            weak_exclude: vec![basedir.join("journals/j1.jsonl")],
             ..info(&basedir)
         };
         drop(open_dir_base(&basedir, &overlay, &context).unwrap());
         assert_eq!(
             meta_of(&overlay).get("base_weak_excludes"),
-            Some(r#"[".ov","mounts"]"#)
+            Some(r#"[".ov","journals"]"#)
         );
-        fs::create_dir_all(basedir.join("mounts/m1")).unwrap();
+        fs::create_dir_all(basedir.join("journals")).unwrap();
+        fs::write(basedir.join("journals/j1.jsonl"), b"j").unwrap();
         drop(open_dir_base(&basedir, &overlay, &context).unwrap());
-        // A journal-free, mount-point-free remount still passes (recorded set).
+        // A journal-free remount still passes (recorded set).
         drop(open_dir_base(&basedir, &overlay, &info(&basedir)).unwrap());
     }
 

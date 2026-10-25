@@ -2300,9 +2300,6 @@ fn main() {
                 &args.lower,
                 args.write_overlay.as_deref(),
                 args.journal.iter().cloned().collect(),
-                // A FUSE mount point inside a directory base is refused by
-                // `mount_guard`, so it is never an exclusion.
-                None,
             ),
             existing_journals: existing_journals_inside_base(
                 inputs.first().map(PathBuf::as_path),
@@ -4828,11 +4825,10 @@ fn split_inputs_mountpoint(paths: &[PathBuf], no_mount: bool) -> (Vec<PathBuf>, 
 }
 
 /// Base-relative exclusions for the A2 walk of a directory base: the paths of
-/// this invocation (journal, mount point, a new `-w` overlay) resolved with the
-/// topmost-new rule, plus the set an existing `-w` overlay already recorded.
+/// this invocation (journal, a new `-w` overlay) resolved with the topmost-new
+/// rule, plus the set an existing `-w` overlay already recorded.
 ///
-/// An invocation-only path (journal, mount point) is excluded only if it is
-/// not in the base yet, is the mount point and an empty directory, or is
+/// An invocation-only path is excluded only if it is not in the base yet or is
 /// already in a recorded excluded set (the top's, added below, or the bottom
 /// lower's, which the walk applies itself). Anything else is base content, so
 /// a change to it is a base change, with or without `-w`.
@@ -4841,21 +4837,12 @@ fn lower_extra_excludes(
     lowers: &[PathBuf],
     overlay: Option<&Path>,
     mut paths: Vec<PathBuf>,
-    mount_point: Option<&Path>,
 ) -> Vec<PathBuf> {
     use ratarmount_compositing::overlay_meta::{resolve_base_excludes, BaseExcludes};
     let Some(base) = base.filter(|b| !lowers.is_empty() && b.is_dir()) else {
         return Vec::new();
     };
     paths.retain(|p| std::fs::symlink_metadata(p).is_err());
-    if let Some(mp) = mount_point {
-        let empty_dir = std::fs::symlink_metadata(mp).map_or(true, |m| {
-            m.is_dir() && std::fs::read_dir(mp).is_ok_and(|mut d| d.next().is_none())
-        });
-        if empty_dir {
-            paths.push(mp.to_path_buf());
-        }
-    }
     let mut out: Vec<PathBuf> = Vec::new();
     if let Some(overlay) = overlay.filter(|o| o.as_os_str() != ":temp:") {
         paths.push(overlay.to_path_buf());
@@ -9047,7 +9034,6 @@ mod lower_extra_excludes_tests {
             &lowers,
             None,
             vec![base.join("new.log"), base.join("fresh/j.jsonl")],
-            None,
         );
         assert_eq!(out, vec![PathBuf::from("fresh")]);
     }
@@ -9063,33 +9049,9 @@ mod lower_extra_excludes_tests {
         std::fs::write(base.join("new.log"), b"x").unwrap();
         let lowers = [dir.path().join("lower")];
         let top = dir.path().join("newtop");
-        let out = lower_extra_excludes(
-            Some(&base),
-            &lowers,
-            Some(&top),
-            vec![base.join("new.log")],
-            None,
-        );
+        let out =
+            lower_extra_excludes(Some(&base), &lowers, Some(&top), vec![base.join("new.log")]);
         assert!(out.is_empty(), "{out:?}");
-    }
-
-    /// An empty mount point directory inside the base is excluded (a repeated
-    /// read-only `--lower` mount keeps working); one with content, or a plain
-    /// file, is base content.
-    #[test]
-    fn regression_mount_point_excluded_only_when_empty_or_new() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base");
-        std::fs::create_dir_all(base.join("mnt")).unwrap();
-        std::fs::create_dir_all(base.join("busy")).unwrap();
-        std::fs::write(base.join("busy/f"), b"x").unwrap();
-        std::fs::write(base.join("file"), b"x").unwrap();
-        let lowers = [dir.path().join("lower")];
-        let run = |mp: PathBuf| lower_extra_excludes(Some(&base), &lowers, None, vec![], Some(&mp));
-        assert_eq!(run(base.join("mnt")), vec![PathBuf::from("mnt")]);
-        assert_eq!(run(base.join("fresh")), vec![PathBuf::from("fresh")]);
-        assert!(run(base.join("busy")).is_empty());
-        assert!(run(base.join("file")).is_empty());
     }
 
     /// A `-w` remount of the same top keeps its journal inside the base: the
@@ -9102,13 +9064,7 @@ mod lower_extra_excludes_tests {
         let top = dir.path().join("top");
         let lowers = [dir.path().join("lower")];
         let journal = base.join("j.log");
-        let first = lower_extra_excludes(
-            Some(&base),
-            &lowers,
-            Some(&top),
-            vec![journal.clone()],
-            None,
-        );
+        let first = lower_extra_excludes(Some(&base), &lowers, Some(&top), vec![journal.clone()]);
         assert_eq!(first, vec![PathBuf::from("j.log")]);
         std::fs::create_dir(&top).unwrap();
         let conn = rusqlite::Connection::open(top.join(ratarmount_compositing::HIDDEN_DB)).unwrap();
@@ -9118,7 +9074,7 @@ mod lower_extra_excludes_tests {
             .unwrap();
         drop(conn);
         std::fs::write(&journal, b"j").unwrap();
-        let again = lower_extra_excludes(Some(&base), &lowers, Some(&top), vec![journal], None);
+        let again = lower_extra_excludes(Some(&base), &lowers, Some(&top), vec![journal]);
         assert!(again.contains(&PathBuf::from("j.log")), "{again:?}");
     }
 }
