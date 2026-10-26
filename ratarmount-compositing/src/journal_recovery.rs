@@ -177,10 +177,11 @@ fn vanished(db: &Path) -> io::Error {
 
 /// A used overlay's database `db` still has its `files` table (read-only).
 fn require_files(db: &Path) -> io::Result<()> {
-    let conn = crate::open_overlay_db(
+    let conn = crate::overlay_db::open_overlay_db_required(
         db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         crate::DbName::Path,
+        true,
     )
     .map_err(|e| io::Error::other(format!("cannot open {}: {e}", db.display())))?;
     // Under the archive lock: never wait on another holder of the database
@@ -232,6 +233,13 @@ fn check_live(dir: &Path, id: Option<(u64, u64)>) -> io::Result<()> {
             dir.display()
         ))),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// After Rows' outer classification, immediately before its inner open.
+    static BEFORE_INNER_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl<'a> Rows<'a> {
@@ -336,11 +344,21 @@ impl<'a> Rows<'a> {
                     // A raw overlay directory: nothing to restamp.
                     return Ok(());
                 }
-                let conn = crate::open_overlay_db(
+                // The latch goes into the acquisition (a required record
+                // must be the non-empty file classified) and comes back.
+                #[cfg(test)]
+                {
+                    let hook = BEFORE_INNER_OPEN.with(|h| h.borrow_mut().take());
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                let conn = crate::overlay_db::open_overlay_db_required(
                     db,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                     crate::DbName::Path,
+                    required_files.get(),
                 )
                 .map_err(|e| {
                     io::Error::other(format!(
@@ -348,6 +366,9 @@ impl<'a> Rows<'a> {
                         db.display()
                     ))
                 })?;
+                if conn.required_record() {
+                    required_files.set(true);
+                }
                 f(&conn, required_files.get())
             }
         }
@@ -1194,4 +1215,139 @@ where
         from.reference(original),
     )
     .map_err(|e| OverlayError::Msg(e.to_string()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    struct BeforeOpenGuard(Option<Box<dyn FnOnce()>>);
+    impl Drop for BeforeOpenGuard {
+        fn drop(&mut self) {
+            BEFORE_INNER_OPEN.with(|h| *h.borrow_mut() = self.0.take());
+        }
+    }
+    type AfterAcquireCallback = Box<dyn FnMut(&Path)>;
+    struct AfterAcquireGuard(Option<AfterAcquireCallback>);
+    impl Drop for AfterAcquireGuard {
+        fn drop(&mut self) {
+            crate::overlay_db::AFTER_ACQUIRE.with(|h| *h.borrow_mut() = self.0.take());
+        }
+    }
+
+    /// Regression: only the inner acquisition observes a newly planted marker.
+    /// Rows retains that requirement after marker removal, including retries
+    /// with missing, empty, and nonempty files-less records.
+    #[test]
+    fn regression_rows_required_latch_raised_by_acquisition() {
+        for loss in ["filesless", "empty", "missing"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().canonicalize().unwrap();
+            let db = dir.join(crate::HIDDEN_DB);
+            Connection::open(&db)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TABLE files (x); CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 INSERT INTO meta VALUES ('sentinel', 'unchanged');",
+                )
+                .unwrap();
+            let rows = Rows::path(&db);
+            let Rows::Path { required_files, .. } = &rows else {
+                unreachable!()
+            };
+            assert!(!required_files.get(), "Rows::path initially sees no marker");
+            let planted = Rc::new(Cell::new(false));
+            let planted_hook = planted.clone();
+            let marker = dir.join(crate::OVERLAY_MARKER);
+            let previous = BEFORE_INNER_OPEN.with(|h| {
+                h.borrow_mut().replace(Box::new(move || {
+                    fs::write(&marker, b"").unwrap();
+                    planted_hook.set(true);
+                }))
+            });
+            let _before = BeforeOpenGuard(previous);
+            let removed = Rc::new(Cell::new(false));
+            let removed_hook = removed.clone();
+            let hook_dir = dir.clone();
+            let mut remove_once = Some(move || {
+                for name in [crate::OVERLAY_MARKER, crate::LEGACY_OVERLAY_MARKER] {
+                    let path = hook_dir.join(name);
+                    if path.exists() {
+                        fs::remove_file(path).unwrap();
+                    }
+                }
+                removed_hook.set(true);
+            });
+            let previous = crate::overlay_db::AFTER_ACQUIRE.with(|h| {
+                h.borrow_mut().replace(Box::new(move |_| {
+                    if let Some(remove) = remove_once.take() {
+                        remove();
+                    }
+                }))
+            });
+            let _after = AfterAcquireGuard(previous);
+            let called = Cell::new(false);
+            rows.with(|conn, required| {
+                assert!(planted.get() && removed.get());
+                assert!(required, "only the acquisition saw the marker");
+                OverlayMeta::from_connection_required(conn, required).map_err(io::Error::other)?;
+                called.set(true);
+                Ok(())
+            })
+            .unwrap();
+            assert!(called.get());
+            assert!(
+                required_files.get(),
+                "acquired requirement must raise Rows' latch"
+            );
+            assert!(crate::write_overlay::overlay_markers(&dir)
+                .unwrap()
+                .is_empty());
+
+            match loss {
+                "filesless" => Connection::open(&db)
+                    .unwrap()
+                    .execute_batch("DROP TABLE files")
+                    .unwrap(),
+                "empty" => fs::write(&db, b"").unwrap(),
+                "missing" => fs::remove_file(&db).unwrap(),
+                _ => unreachable!(),
+            }
+            let mutated = Cell::new(false);
+            let received_required = Cell::new(false);
+            let error = rows
+                .with(|conn, required| {
+                    received_required.set(required);
+                    assert!(required);
+                    OverlayMeta::from_connection_required(conn, required)
+                        .map_err(io::Error::other)?;
+                    conn.execute("UPDATE meta SET value='mutated'", [])
+                        .map_err(io::Error::other)?;
+                    mutated.set(true);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(!mutated.get(), "{loss}: no record-driven write");
+            if loss == "filesless" {
+                assert!(received_required.get());
+                assert_eq!(error.to_string(), crate::overlay_meta::NO_FILES_TABLE);
+                let c = Connection::open(&db).unwrap();
+                assert_eq!(
+                    c.query_row("SELECT value FROM meta WHERE key='sentinel'", [], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .unwrap(),
+                    "unchanged"
+                );
+            } else {
+                assert!(!received_required.get(), "{loss}: callback must not run");
+                if loss == "missing" {
+                    assert!(!db.exists(), "record was not recreated");
+                } else {
+                    assert_eq!(fs::metadata(&db).unwrap().len(), 0);
+                }
+            }
+        }
+    }
 }

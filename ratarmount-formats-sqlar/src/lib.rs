@@ -314,11 +314,10 @@ impl SqlarMountSource {
     }
 }
 
+/// The first 16 bytes (fewer for a shorter file). Managed (#151): the SQLAR
+/// may be open as a database in this process.
 fn read_header(path: &Path) -> Result<Vec<u8>> {
-    let mut f = std::fs::File::open(path)?;
-    let mut buf = [0u8; 16];
-    let n = f.read(&mut buf)?;
-    Ok(buf[..n].to_vec())
+    Ok(ratarmount_index::managed_read::read_prefix(path, 16)?)
 }
 
 fn header_is_sqlite_magic(header: &[u8]) -> bool {
@@ -587,14 +586,11 @@ fn build_name_map(conn: &Connection) -> Result<Option<BTreeMap<String, String>>>
 /// True if path is a plausible SQLAR: SQLite magic + `sqlar` table, or `.sqlar` extension
 /// (encrypted sqlcipher archives omit the magic and store salt in the first 16 bytes).
 pub fn looks_like_sqlar(path: &Path) -> bool {
-    let Ok(mut f) = std::fs::File::open(path) else {
+    // Managed (#151): the probe may hit an SQLAR open in this process.
+    let Ok(magic) = ratarmount_index::managed_read::read_prefix(path, 16) else {
         return false;
     };
-    let mut magic = [0u8; 16];
-    let Ok(n) = std::io::Read::read(&mut f, &mut magic) else {
-        return false;
-    };
-    if n < 16 {
+    if magic.len() < 16 {
         return false;
     }
     if magic.as_slice() != SQLITE_MAGIC {
@@ -1255,5 +1251,78 @@ mod tests {
         assert_eq!(src.lookup("/subdir/nested.bin", 0).unwrap().mode, n.mode);
 
         assert!(src.list_dirents("/hello.txt").is_none());
+    }
+
+    /// Regression: (R11-S7, #151): the SQLAR byte probes (`read_header`,
+    /// `looks_like_sqlar`, `looks_like_encrypted_sqlar`, and through them
+    /// `SqlarMountSource::open`) read the file with a raw `File`; its close
+    /// released the lock of a connection of this process on the SQLAR.
+    #[cfg(unix)]
+    #[test]
+    fn regression_sqlar_header_probes_keep_sqlar_lock() {
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("a.sqlar");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB);
+             INSERT INTO sqlar VALUES ('hello.txt', 33188, 0, 5, 'hello');",
+        )
+        .unwrap();
+        drop(c);
+        let h = Connection::open(&path).unwrap();
+        h.execute_batch("BEGIN").unwrap();
+        let _: i64 = h
+            .query_row("SELECT count(*) FROM sqlar", [], |r| r.get(0))
+            .unwrap();
+        assert!(other_process_sees_lock(&path));
+        assert_eq!(read_header(&path).unwrap(), SQLITE_MAGIC);
+        assert!(looks_like_sqlar(&path));
+        assert!(!looks_like_encrypted_sqlar(&path));
+        let src = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
+        assert!(src.lookup("/hello.txt", 0).is_some());
+        drop(src);
+        assert!(other_process_sees_lock(&path), "the probes kept the lock");
+        drop(std::fs::File::open(&path).unwrap());
+        assert!(!other_process_sees_lock(&path), "oracle check");
+        drop(h);
+    }
+
+    /// Regression: (R11-S7 §6): SQLAR connections keep SQLite's default
+    /// "unix" VFS (auto locking on macOS; no switch to "unix-posix"), plain
+    /// and (with the `sqlcipher` feature) encrypted.
+    #[cfg(unix)]
+    #[test]
+    fn regression_macos_sqlar_connections_keep_auto_vfs() {
+        use ratarmount_index::managed_read::connection_vfs_name;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.sqlar");
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB);
+             INSERT INTO sqlar VALUES ('hello.txt', 33188, 0, 5, 'hello');",
+        )
+        .unwrap();
+        drop(c);
+        let m = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
+        assert_eq!(connection_vfs_name(&m.conn.lock().unwrap()), "unix");
+        #[cfg(feature = "sqlcipher")]
+        {
+            let enc = dir.path().join("enc.sqlar");
+            let c = Connection::open(&enc).unwrap();
+            c.execute_batch(
+                "PRAGMA key = 'foo';
+                 CREATE TABLE sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB);
+                 INSERT INTO sqlar VALUES ('hello.txt', 33188, 0, 5, 'hello');",
+            )
+            .unwrap();
+            drop(c);
+            let opts = OpenOptions {
+                passwords: vec!["foo".into()],
+                ..OpenOptions::default()
+            };
+            let m = SqlarMountSource::open(&enc, &opts).expect("decrypt");
+            assert_eq!(connection_vfs_name(&m.conn.lock().unwrap()), "unix");
+        }
     }
 }

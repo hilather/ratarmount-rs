@@ -15,13 +15,25 @@ default = []
 python = ["dep:pyo3", "dep:secrecy", "dep:ratarmount-remote"]
 # Embedders opt in to interpreter initialization. Wheels use extension-module only.
 embedding = ["python", "pyo3/auto-initialize"]
-extension-module = ["python", "pyo3/extension-module"]
+extension-module = ["python", "pyo3/extension-module", "dep:blake3"]
 
 [dependencies]
 ratarmount-session.workspace = true
+# `checked_open`: the module initializer installs the SQLite system-call
+# wrappers into this artifact's private SQLite before publishing (#151).
+ratarmount-index.workspace = true
 ratarmount-remote = { workspace = true, optional = true }
 pyo3 = { version = "=0.29.2", optional = true, default-features = false, features = ["macros", "abi3-py39"] }
 secrecy = { version = "0.8", optional = true }
+
+# blake3 enables NEON by default on aarch64, which compiles a C kernel and the
+# `#[no_mangle]` FFI shim `blake3_compress_in_place_portable` (blake3
+# src/ffi_neon.rs). A cdylib exports that shim. `no_neon`, only in wheel builds
+# (`extension-module`), removes it so the wheel exports only PyInit__native and
+# the audited dependency symbols. Nothing calls blake3 from this crate; the
+# entry exists only to set the feature on the shared blake3 build.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+blake3 = { version = "=1.8.2", optional = true, features = ["no_neon"] }
 
 [dev-dependencies]
 ratarmount-formats-tar.workspace = true

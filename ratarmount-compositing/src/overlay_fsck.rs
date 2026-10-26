@@ -181,7 +181,7 @@ pub fn fsck(dir: &Path, repair: bool) -> io::Result<FsckReport> {
         .map_err(|e| overlay_error(e.into()))?;
     // Recheck after acquiring the transaction: a seal may have won the race.
     if !sealed
-        && OverlayMeta::from_connection(&conn)
+        && OverlayMeta::from_opened(&conn)
             .map_err(overlay_error)?
             .as_ref()
             .is_some_and(OverlayMeta::layer_sealed)

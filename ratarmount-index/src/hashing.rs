@@ -2,7 +2,6 @@
 //!
 //! Supported algorithms: `crc32`, `md5`, `sha1`, `sha256`.
 
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -254,7 +253,9 @@ pub fn fill_content_hashes(
         return Ok(());
     }
 
-    let mut archive = File::open(archive_path)?;
+    // Managed (#151): the archive may be a database open in this process. An
+    // open failure propagates; per-member failures stay best effort.
+    let mut archive = crate::managed_read::ManagedReadCursor::open(archive_path)?;
     let mut pending: Vec<(i64, String, Vec<u8>)> = Vec::new();
 
     for (offsetheader, offset, size) in rows {

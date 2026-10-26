@@ -654,9 +654,18 @@ fn content_md5_b64(body: &[u8]) -> String {
 }
 
 /// Stream MD5 of a staged file. Does not keep the bytes.
-fn content_md5_path(path: &std::path::Path) -> Result<(String, u64)> {
-    let mut file = std::fs::File::open(path)
+fn content_md5_path(
+    path: &std::path::Path,
+) -> Result<(
+    String,
+    u64,
+    ratarmount_index::managed_read::ManagedReadCursor,
+)> {
+    // Managed (#151): the staged file may be an index open in this process.
+    // The MD5 pass and the body are independent cursors of one owner.
+    let owner = ratarmount_index::managed_read::ManagedReadCursor::open(path)
         .map_err(|e| gcs_err(format!("reading {} for Content-MD5: {e}", path.display())))?;
+    let mut file = owner.independent_cursor();
     let mut hasher = Md5::new();
     let mut buf = [0u8; 64 * 1024];
     let mut len = 0u64;
@@ -668,7 +677,7 @@ fn content_md5_path(path: &std::path::Path) -> Result<(String, u64)> {
         hasher.update(&buf[..n]);
         len += n as u64;
     }
-    Ok((base64_encode(hasher.finalize().as_slice()), len))
+    Ok((base64_encode(hasher.finalize().as_slice()), len, owner))
 }
 
 fn goog1_canonical_resource_object(bucket: &str, object: &str) -> String {
@@ -979,10 +988,15 @@ pub fn put_gcs_object(loc: &GcsLocation, body: &[u8], content_type: &str) -> Res
 pub fn put_gcs_file(loc: &GcsLocation, path: &std::path::Path, content_type: &str) -> Result<()> {
     let auth = resolve_put_auth()?;
     reject_anonymous_put(&auth)?;
-    let (md5, len) = content_md5_path(path)?;
-    let file = std::fs::File::open(path)
-        .map_err(|e| gcs_err(format!("opening {} for PUT: {e}", path.display())))?;
-    send_gcs_put(loc, &auth, &md5, content_type, len, file)
+    let (md5, len, owner) = content_md5_path(path)?;
+    send_gcs_put(
+        loc,
+        &auth,
+        &md5,
+        content_type,
+        len,
+        owner.independent_cursor(),
+    )
 }
 
 enum GcsProbe {
@@ -3049,5 +3063,36 @@ c8kyOVCJusup7SdkiG+QF64=
         let bodies = mock.bodies.lock().unwrap();
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0], payload);
+    }
+
+    /// Regression: (R11-S7, #151): the MD5 pass and the PUT body opened the
+    /// staged file with raw `File`s; their closes released this process's
+    /// lock on it. Both are independent cursors of one managed owner.
+    /// The lock is a VFS-level SHARED lock of this SQLite instance (the same
+    /// per-inode bookkeeping a connection uses; the file need not be a
+    /// database).
+    #[cfg(unix)]
+    #[test]
+    fn regression_gcs_hash_and_upload_keep_index_lock() {
+        use ratarmount_index::managed_read::{lock_probe::other_process_sees_lock, VfsLockHolder};
+        let payload: Vec<u8> = (0u8..=255).cycle().take(300_000).collect();
+        let mock = MockGcs::spawn(MockMode::AcceptPut);
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("GOOGLE_HMAC_KEY", "GOOG1ACCESS");
+        _g.set("GOOGLE_HMAC_SECRET", "supersecret");
+        _g.set(GCS_ENDPOINT_ENV, &mock.base_url);
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let staged = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(staged.path(), &payload).unwrap();
+        let lock = VfsLockHolder::shared(staged.path()).unwrap();
+        assert!(other_process_sees_lock(staged.path()));
+        let loc = parse_gcs_url("gs://bkt/obj.bin").unwrap();
+        put_gcs_file(&loc, staged.path(), "application/octet-stream").unwrap();
+        assert!(other_process_sees_lock(staged.path()), "lock kept");
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log_field(&log, "Content-MD5:"), content_md5_b64(&payload));
+        drop(log);
+        assert_eq!(mock.bodies.lock().unwrap()[0], payload);
+        drop(lock);
     }
 }

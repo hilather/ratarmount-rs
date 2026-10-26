@@ -63,7 +63,9 @@ pub use journal_recovery::{
     MountJournal, MountRecords, Owner, Record,
 };
 pub use oci_whiteout::OciImageMountSource;
-pub use overlay_db::{open_overlay_db, DbName, OverlayDb, OverlayDbError};
+pub use overlay_db::{
+    open_overlay_db, open_overlay_db_with_required_record, DbName, OverlayDb, OverlayDbError,
+};
 pub use overlay_gate::{
     compare_base_identity, ensure_journal_is_for_archive, forced_base_record,
     forced_relocation_record, identity_rows, record_forced_base_rows, shape_verdict, verify_base,

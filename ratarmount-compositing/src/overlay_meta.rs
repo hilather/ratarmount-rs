@@ -129,7 +129,9 @@ fn is_hot_journal(error: &rusqlite::Error) -> bool {
 /// then names `import_incomplete`). Only an unsealed overlay whose database
 /// and directory are writable is touched; a sealed or read-only one gets an
 /// error naming the interrupted write and its journal stays as it is.
-fn recover_hot_journal(dir: &Path, db: &Path) -> Result<()> {
+/// `required` is the caller's latched requirement; the result is that latch
+/// OR'ed with this open's own (a marker seen here is kept for the retry).
+fn recover_hot_journal(dir: &Path, db: &Path, required: bool) -> Result<bool> {
     let journal = PathBuf::from(format!("{}-journal", db.display()));
     let refuse = |why: &str| {
         OverlayError::Msg(format!(
@@ -148,19 +150,21 @@ fn recover_hot_journal(dir: &Path, db: &Path) -> Result<()> {
     if !path_writable(dir) || !path_writable(db) {
         return Err(refuse("the overlay or its directory is read-only"));
     }
-    let conn = crate::open_overlay_db(
+    let conn = crate::overlay_db::open_overlay_db_required(
         &dir.join(HIDDEN_DB),
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         crate::DbName::Path,
+        required,
     )?;
+    let required = required || conn.required_record();
     conn.busy_timeout(std::time::Duration::ZERO)?;
     // Any read takes the shared lock, which plays the journal back.
     match conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
         r.get::<_, i64>(0)
     }) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(required),
         Err(error) if is_hot_journal(&error) => Err(refuse("it could not be rolled back here")),
         Err(error) => Err(error.into()),
     }
@@ -253,6 +257,26 @@ impl OverlayMeta {
         required: bool,
         follow: bool,
     ) -> Result<Option<Self>> {
+        let latched = std::cell::Cell::new(required);
+        Self::read_latched(dir, recover_hot, &latched, follow)
+    }
+
+    /// Read metadata while returning all acquired requirement observations to
+    /// the caller's operation latch, including observations during recovery.
+    pub(crate) fn read_for_operation(
+        dir: &Path,
+        required: &std::cell::Cell<bool>,
+    ) -> Result<Option<Self>> {
+        required.set(required.get() || !crate::write_overlay::overlay_markers(dir)?.is_empty());
+        Self::read_latched(dir, true, required, false)
+    }
+
+    fn read_latched(
+        dir: &Path,
+        recover_hot: bool,
+        latched: &std::cell::Cell<bool>,
+        follow: bool,
+    ) -> Result<Option<Self>> {
         let db = dir.join(HIDDEN_DB);
         let entry = if follow {
             fs::metadata(&db)?
@@ -265,21 +289,28 @@ impl OverlayMeta {
                 db.display()
             )));
         }
+        // The requirement is a latch across the hot-journal recovery and the
+        // retry: a marker any open saw stays required (S3 skeptic #2).
         let read = || -> Result<Option<Self>> {
-            let conn = crate::open_overlay_db(
+            let conn = crate::overlay_db::open_overlay_db_required(
                 &db,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 crate::DbName::Path,
+                latched.get(),
             )?;
+            latched.set(latched.get() || conn.required_record());
             conn.busy_timeout(std::time::Duration::ZERO)?;
             // One read transaction: the `files` check and the `meta` rows
             // describe the same database state.
             let tx = conn.unchecked_transaction()?;
-            Self::from_connection_required(&tx, required)
+            Self::from_connection_required(&tx, latched.get())
         };
         let result = match read() {
             Err(OverlayError::Sqlite(error)) if recover_hot && is_hot_journal(&error) => {
-                recover_hot_journal(dir, &db).and_then(|()| read())
+                recover_hot_journal(dir, &db, latched.get()).and_then(|required| {
+                    latched.set(required);
+                    read()
+                })
             }
             other => other,
         };
@@ -314,6 +345,12 @@ impl OverlayMeta {
         // Read-only: dropping the transaction rolls it back.
         let tx = conn.unchecked_transaction()?;
         Self::from_transaction_required(&tx, required)
+    }
+
+    /// [`Self::from_connection_required`] of a validated open, with the
+    /// requirement it latched ([`crate::OverlayDb::required_record`]).
+    pub fn from_opened(db: &crate::OverlayDb) -> Result<Option<Self>> {
+        Self::from_connection_required(db, db.required_record())
     }
 
     /// [`Self::from_connection_required`] inside a transaction the caller
@@ -789,7 +826,11 @@ pub fn directory_digest_excluding(root: &Path, excludes: &BaseExcludes) -> Resul
         let (size, content) = if meta.is_dir() {
             (0, String::new())
         } else if meta.is_file() {
-            (meta.len(), sha256_hex_stream(&mut fs::File::open(&path)?)?)
+            // Managed (#151): a base file may be a database open here.
+            (
+                meta.len(),
+                ratarmount_index::managed_read::sha256_hex(&path)?,
+            )
         } else if meta.is_symlink() {
             let target = fs::read_link(&path)?;
             let bytes = target.as_os_str().as_encoded_bytes();
@@ -891,7 +932,9 @@ impl PendingBase {
                     }
                 }
                 test_hash_seam(path);
-                sha256_hex_stream(&mut Checked(fs::File::open(path)?, check))
+                // Managed (#151): the archive may be a database open here.
+                let cursor = ratarmount_index::managed_read::ManagedReadCursor::open(path)?;
+                sha256_hex_stream(&mut Checked(cursor, check))
             })
             .map_err(|e| {
                 OverlayError::Msg(format!("cannot hash base {}: {e}", self.path.display()))
@@ -910,6 +953,11 @@ impl PendingBase {
 /// release instead of a timed delay; capped at 60 s so a lost test cannot hang).
 #[cfg(any(test, feature = "test-hooks"))]
 fn test_hash_seam(path: &Path) {
+    #[cfg(test)]
+    if let Some(hook) = DURING_PENDING_HASH.with(|s| s.borrow_mut().take()) {
+        hook();
+    }
+
     use std::io::Write;
     if let Some(log) = std::env::var_os("RATARMOUNT_TEST_HASH_LOG") {
         if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log) {
@@ -963,13 +1011,28 @@ pub fn test_pack_hold() {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DURING_PENDING_HASH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Compare-and-set a pending digest to `strong`. A no-op (`false`) unless the
 /// kind is still `pending` and the recorded stamp still equals `pending`'s, so
 /// a supplied digest, a forced reopen or a commit that moved the stamp wins.
 pub fn record_base_digest(conn: &Connection, pending: &PendingBase, digest: &str) -> Result<bool> {
+    record_base_digest_required(conn, pending, digest, false)
+}
+
+pub(crate) fn record_base_digest_required(
+    conn: &Connection,
+    pending: &PendingBase,
+    digest: &str,
+    required: bool,
+) -> Result<bool> {
     conn.execute_batch("SAVEPOINT overlay_record_base_digest")?;
     let result = (|| -> Result<bool> {
-        let meta = OverlayMeta::from_connection(conn)?;
+        let meta = OverlayMeta::from_connection_required(conn, required)?;
         let Some(meta) = meta.filter(|m| m.base_digest_kind() == Some("pending")) else {
             return Ok(false);
         };
@@ -1024,7 +1087,15 @@ pub(crate) fn resolve_pending_base_digest_for(
     conn: &Connection,
     base: Option<&crate::ClassifiedBase>,
 ) -> Result<bool> {
-    let Some(meta) = OverlayMeta::from_connection(conn)? else {
+    resolve_pending_base_digest_required(conn, base, false)
+}
+
+pub(crate) fn resolve_pending_base_digest_required(
+    conn: &Connection,
+    base: Option<&crate::ClassifiedBase>,
+    required: bool,
+) -> Result<bool> {
+    let Some(meta) = OverlayMeta::from_connection_required(conn, required)? else {
         return Ok(false);
     };
     let Some(mut pending) = PendingBase::from_meta(&meta)? else {
@@ -1044,7 +1115,7 @@ pub(crate) fn resolve_pending_base_digest_for(
         }
     }
     let digest = pending.hash(&|| Ok(()))?;
-    record_base_digest(conn, &pending, &digest)
+    record_base_digest_required(conn, &pending, &digest, required)
 }
 
 pub(crate) fn timestamp() -> String {
@@ -1482,7 +1553,8 @@ pub(crate) fn verify_base_path(dir: &Path, base: &Path) -> BaseCheck {
         }
     } else if base_meta.is_file() {
         match kind {
-            Some("strong") => fs::File::open(base)
+            // Managed (#151): the base may be a database open here.
+            Some("strong") => ratarmount_index::managed_read::ManagedReadCursor::open(base)
                 .and_then(|mut f| {
                     test_hash_seam(base);
                     sha256_hex_stream(&mut f)
@@ -3530,5 +3602,336 @@ mod tests {
         let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
         assert_eq!(meta.format_version().unwrap(), Some(2));
         assert_eq!(meta.get("import_in_progress"), Some("1:2"));
+    }
+
+    /// Build `dir/HIDDEN_DB` with a hot rollback journal: a table-less
+    /// database (no `files`) copied together with its `-journal` while a
+    /// writer's spilled transaction is open.
+    fn table_less_db_with_hot_journal(dir: &Path) {
+        let scratch = tempfile::tempdir().unwrap();
+        let src = scratch.path().join("src.sqlite");
+        let conn = Connection::open(&src).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE; CREATE TABLE t(x BLOB); \
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 64) \
+             INSERT INTO t SELECT zeroblob(4096) FROM n;",
+        )
+        .unwrap();
+        // A tiny cache spills the open transaction: journal synced, pages
+        // written into the database file.
+        conn.execute_batch(
+            "PRAGMA cache_size=1; BEGIN; UPDATE t SET x = zeroblob(4000); \
+             INSERT INTO t SELECT x FROM t;",
+        )
+        .unwrap();
+        let journal = PathBuf::from(format!("{}-journal", src.display()));
+        assert!(fs::metadata(&journal).unwrap().len() > 0, "spilled journal");
+        let db = dir.join(HIDDEN_DB);
+        fs::copy(&src, &db).unwrap();
+        fs::copy(&journal, format!("{}-journal", db.display())).unwrap();
+        drop(conn);
+    }
+
+    /// Regression: (S3 skeptic #2): the required-record latch is kept across
+    /// the hot-journal recovery and the retry. A marker present when the
+    /// first read's open classified the database (after the caller's own
+    /// marker check) and removed after the acquisition made that attempt
+    /// required; the read hit `SQLITE_READONLY_ROLLBACK`, recovery rolled
+    /// the journal back, and the retry used the caller's original `false`,
+    /// so a table-less record read as "unrecorded" (`Ok(None)`).
+    #[test]
+    fn regression_required_latch_survives_hot_journal_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        table_less_db_with_hot_journal(dir.path());
+        let marker = dir.path().join(crate::write_overlay::OVERLAY_MARKER);
+        fs::write(&marker, b"").unwrap();
+        let journal = PathBuf::from(format!("{}-journal", dir.path().join(HIDDEN_DB).display()));
+
+        let opens = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let counted = opens.clone();
+        let removed = marker.clone();
+        crate::overlay_db::AFTER_ACQUIRE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                counted.set(counted.get() + 1);
+                if counted.get() == 1 {
+                    fs::remove_file(&removed).unwrap();
+                }
+            }))
+        });
+        // The caller's own marker check ran before the marker appeared.
+        let result = OverlayMeta::read_with_required(dir.path(), true, false, false);
+        crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
+
+        assert_eq!(opens.get(), 3, "read, recovery, retry");
+        assert!(!journal.exists(), "the hot journal was rolled back");
+        match result {
+            Err(OverlayError::Msg(msg)) => assert_eq!(msg, NO_FILES_TABLE),
+            other => panic!("a required table-less record must refuse: {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // R11-S7 (#151): base hashing reads through managed readers.
+    // ---------------------------------------------------------------------
+
+    #[cfg(unix)]
+    use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+
+    /// An SQLite database (an SQLAR or an index) at `path`; its bytes.
+    #[cfg(unix)]
+    fn s7_database(path: &Path) -> Vec<u8> {
+        let c = Connection::open(path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB);
+             INSERT INTO sqlar VALUES ('a', 33188, 0, 3, randomblob(150000));",
+        )
+        .unwrap();
+        drop(c);
+        fs::read(path).unwrap()
+    }
+
+    /// A connection of this process holding SHARED on `path`.
+    #[cfg(unix)]
+    fn s7_holder(path: &Path) -> Connection {
+        let c = Connection::open(path).unwrap();
+        c.execute_batch("BEGIN").unwrap();
+        let _: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert!(other_process_sees_lock(path));
+        c
+    }
+
+    /// A file base with a supplied strong digest of `bytes`.
+    #[cfg(unix)]
+    fn s7_strong_overlay(root: &Path, archive: &Path, bytes: &[u8]) -> PathBuf {
+        let overlay = root.join("strong-overlay");
+        let mut request = info(archive);
+        request.base_digest =
+            BaseDigestRequest::Supplied(format!("sha256:{:x}", Sha256::digest(bytes)));
+        drop(WriteOverlay::new_with_create_info_for_tests(base(root), &overlay, &request).unwrap());
+        overlay
+    }
+
+    /// Regression: the strong directory digest hashed every file with a raw
+    /// `File`, releasing the lock of a connection of this process on an SQLAR
+    /// inside the base directory.
+    #[cfg(unix)]
+    #[test]
+    fn regression_directory_strong_digest_keeps_sqlar_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let basedir = root.path().canonicalize().unwrap().join("base");
+        fs::create_dir(&basedir).unwrap();
+        let db = basedir.join("a.sqlar");
+        s7_database(&db);
+        let h = s7_holder(&db);
+        directory_digest(&basedir).unwrap();
+        assert!(other_process_sees_lock(&db), "lock kept");
+        drop(fs::File::open(&db).unwrap());
+        assert!(!other_process_sees_lock(&db), "oracle check");
+        drop(h);
+    }
+
+    /// Regression: resolving a pending archive digest (the mount's background
+    /// hasher and `resolve_pending_base_digest`) hashed the archive raw while
+    /// a connection of this process had it open (the archive here is an
+    /// ordinary index with a `files` table).
+    #[cfg(unix)]
+    #[test]
+    fn regression_pending_base_hash_keeps_index_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let archive = root.join("a.tar");
+        {
+            let mut idx = ratarmount_index::SqliteIndex::create_writable(Some(&archive)).unwrap();
+            idx.publish_tmp().unwrap();
+        }
+        let (overlay, pending) = pending_overlay(&root, &archive, "overlay");
+        let h = {
+            let c = Connection::open(&archive).unwrap();
+            c.execute_batch("BEGIN").unwrap();
+            let _: i64 = c
+                .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+                .unwrap();
+            c
+        };
+        assert!(other_process_sees_lock(&archive));
+        let digest = pending.hash(&|| Ok(())).unwrap();
+        assert!(digest.starts_with("sha256:"));
+        assert!(
+            other_process_sees_lock(&archive),
+            "PendingBase::hash kept it"
+        );
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        resolve_pending_base_digest(&conn).unwrap();
+        assert!(other_process_sees_lock(&archive), "resolution kept it");
+        drop(h);
+    }
+
+    /// Regression: `overlay verify`'s strong base check hashed the base raw
+    /// (an SQLAR another connection of this process has open).
+    #[cfg(unix)]
+    #[test]
+    fn regression_strong_base_verification_keeps_sqlar_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let archive = root.join("a.sqlar");
+        let bytes = s7_database(&archive);
+        let overlay = s7_strong_overlay(&root, &archive, &bytes);
+        let h = s7_holder(&archive);
+        assert!(matches!(
+            verify_base_path(&overlay, &archive),
+            BaseCheck::Matches {
+                strength: BaseStrength::Strong,
+                ..
+            }
+        ));
+        assert!(other_process_sees_lock(&archive), "lock kept");
+        drop(h);
+    }
+
+    /// Regression: a failed strong base hash must stay `Skipped` (the CLI
+    /// keeps its exit status and reports `base_ok: null`), never `Matches`.
+    #[cfg(unix)]
+    #[test]
+    fn regression_verify_base_hash_failure_stays_skipped() {
+        use ratarmount_index::managed_read::{seams, Seam};
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let archive = root.join("a.sqlar");
+        let bytes = s7_database(&archive);
+        let overlay = s7_strong_overlay(&root, &archive, &bytes);
+        for seam in [Seam::AfterOpen, Seam::BeforeRead] {
+            let got = seams::with(
+                move |s| {
+                    if s == seam {
+                        Err(io::Error::other("injected"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || verify_base_path(&overlay, &archive),
+            );
+            match got {
+                BaseCheck::Skipped { reason } => assert!(reason.contains("injected"), "{reason}"),
+                other => panic!("{seam:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Regression: (live caller of the digest refresh, `refresh_archive_digest`
+    /// through `refresh_committed_base`): refreshing the committed base's
+    /// digest hashed an archive that is an SQLAR open in this process raw.
+    #[cfg(unix)]
+    #[test]
+    fn regression_archive_digest_and_refresh_keep_sqlar_lock_live_caller() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let archive = root.join("a.sqlar");
+        let bytes = s7_database(&archive);
+        let overlay = s7_strong_overlay(&root, &archive, &bytes);
+        let h = s7_holder(&archive);
+        let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+        refresh_committed_base(&conn, None, &archive).unwrap();
+        assert!(other_process_sees_lock(&archive), "refresh kept the lock");
+        drop(h);
+    }
+
+    /// Set by the creation-mode test for its child.
+    #[cfg(unix)]
+    const S7_MODE_CHILD_ENV: &str = "RATARMOUNT_TEST_S7_MODE_CHILD";
+
+    /// The child half of the creation-mode test (a no-op unless spawned):
+    /// under the given umask, a real overlay creation and an index build and
+    /// publication; reports every mode.
+    #[cfg(unix)]
+    #[test]
+    fn s7_mode_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(arg) = std::env::var_os(S7_MODE_CHILD_ENV) else {
+            return;
+        };
+        let arg = arg.to_string_lossy().into_owned();
+        let (umask, dir) = arg.split_once(':').unwrap();
+        let umask = u32::from_str_radix(umask, 8).unwrap();
+        // SAFETY: a single-threaded child.
+        unsafe { libc::umask(umask as libc::mode_t) };
+        let dir = PathBuf::from(dir);
+        let mode_of = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let want = 0o644 & !umask;
+        let mut report = Vec::new();
+        // Overlay creation (SQLite creates the database).
+        let archive = dir.join("a.tar");
+        fs::write(&archive, b"abc").unwrap();
+        let overlay = dir.join("overlay");
+        let ov =
+            WriteOverlay::new_with_create_info_for_tests(base(&dir), &overlay, &info(&archive))
+                .unwrap();
+        let db = overlay.join(HIDDEN_DB);
+        assert_eq!(mode_of(&db), want, "overlay database");
+        for side in ["-wal", "-shm", "-journal"] {
+            let p = PathBuf::from(format!("{}{side}", db.display()));
+            if p.exists() {
+                assert_eq!(mode_of(&p), mode_of(&db), "overlay {side}");
+                report.push(side.to_owned());
+            }
+        }
+        drop(ov);
+        // Cold index: temporary database, publication, companions.
+        let dest = dir.join("idx").join("a.tar.index.sqlite");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let mut idx = ratarmount_index::SqliteIndex::create_writable(Some(&dest)).unwrap();
+        let tmp = fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p != &dest && p.is_file() && !p.to_string_lossy().ends_with("-journal"))
+            .expect("temporary index");
+        assert_eq!(mode_of(&tmp), want, "temporary index");
+        idx.publish_tmp().unwrap();
+        assert_eq!(
+            mode_of(&dest),
+            want,
+            "published index (rename keeps the mode)"
+        );
+        for side in ["-wal", "-shm"] {
+            let p = PathBuf::from(format!("{}{side}", dest.display()));
+            if p.exists() {
+                assert_eq!(mode_of(&p), want, "index {side}");
+                report.push(format!("index{side}"));
+            }
+        }
+        drop(idx);
+        fs::write(dir.join("result"), format!("ok {}", report.join(","))).unwrap();
+    }
+
+    /// Regression: (R11-S7 §7): the overlay database and the cold index keep
+    /// SQLite's `0644 & !umask` creation mode; publication's rename keeps the
+    /// temporary database's mode; companions take the database's mode.
+    /// Umasks 002, 022, 077, each in a fresh child.
+    #[cfg(unix)]
+    #[test]
+    fn regression_exclusive_create_preserves_overlay_and_published_index_modes() {
+        for umask in ["002", "022", "077"] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().canonicalize().unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "overlay_meta::tests::s7_mode_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(S7_MODE_CHILD_ENV, format!("{umask}:{}", dir.display()))
+                .output()
+                .unwrap();
+            let got = fs::read_to_string(dir.join("result")).unwrap_or_default();
+            assert!(
+                out.status.success() && got.starts_with("ok"),
+                "umask {umask}: {got:?}\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }

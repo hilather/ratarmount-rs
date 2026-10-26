@@ -1433,6 +1433,12 @@ mod tests {
                 ".ratarmount-sealed",
                 crate::OVERLAY_MARKER,
             ] {
+                // The root's marker stays a regular file (it is still skipped
+                // as one): a non-regular marker there makes every database
+                // open refuse (the overlay classifier fails closed, #151).
+                if parent == dir && name == crate::OVERLAY_MARKER {
+                    continue;
+                }
                 if parent.join(name).is_file() {
                     fs::remove_file(parent.join(name)).unwrap();
                 }

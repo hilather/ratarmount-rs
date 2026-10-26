@@ -104,7 +104,8 @@ JSON-encoded `lower_layers`), plus the numeric `overlay-stats` fields
 `files_dir_writable`, and `db_opens_read_only`. Overlay files live directly in
 the overlay directory, so its permissions determine `files_dir_writable`.
 Success exits 0. Missing or damaged databases fail without being created or
-repaired. A mounted overlay's exclusive database lock is reported as "in use".
+repaired. A mounted overlay's exclusive database lock is reported as "in use"
+(a foreground `-f` mount; a daemonized mount holds no lock, #183).
 
 | Key | Meaning |
 |---|---|
@@ -535,7 +536,8 @@ ratarmount --lower prepared --overlay-tmpfs=2G source.tar scratch/
 
 Lower layers must have `sealed_at` metadata. `--allow-unsealed-lower` also accepts
 unsealed and legacy overlays; these open read-only without SQLite's immutable
-option and may fail with “in use” if another mount holds the database. They use
+option and may fail with “in use” if another mount holds the database
+(a foreground `-f` mount; a daemonized mount holds no lock, #183). They use
 a construction-time row snapshot, so stop writers before using them. Sealed
 lowers use immutable SQLite and can be shared by concurrent mounts.
 
@@ -585,7 +587,8 @@ metadata for such an overlay without inventing a base identity; keep supplying
 BASE to verify it.
 
 Seal refuses a database held by another mount (“in use by another ratarmount
-process”). It runs fsck without repair under a writer reservation and refuses
+process”) (a foreground `-f` mount; a daemonized mount holds no lock, #183).
+It runs fsck without repair under a writer reservation and refuses
 inconsistencies with an `overlay fsck --repair` hint. The digest is the canonical
 SHA-256 change hash against the composed lower view, with exact bytes, modes,
 no excludes, and `.git` included. `--json` prints `layer_digest` and `sealed_at`;
@@ -671,7 +674,8 @@ mount-relative parent, not a host absolute path.
 
 Unsealed checks record `fsck_at` and `fsck_result` (`ok`, `errors:N`, or
 `repaired:N`). Sealed overlays can be checked without modifying any metadata;
-`--repair` is refused. A database locked by a mount returns “in use”. Repairs
+`--repair` is refused. A database locked by a mount returns “in use”
+(a foreground `-f` mount; a daemonized mount holds no lock, #183). Repairs
 hold an exclusive SQLite transaction, but host changes and SQLite are not one
 atomic transaction: stop direct host writers and rerun after an interrupted
 repair. A consistency check does not verify content hashes.
@@ -697,7 +701,8 @@ base and a note goes to stderr. Repeat `--lower DIR` in bottom-to-top order, or
 omit it to use `meta.lower_layers`. Sealed lowers open immutable; other lowers
 open read-only. `--strict` refuses any unsealed top or lower. Without it, unsealed
 and legacy overlays produce warnings. Stop writers before comparing: offline
-diff refuses a database locked by a mount, and files/SQLite are separate stores.
+diff refuses a database locked by a mount (a foreground `-f` mount; a
+daemonized mount holds no lock, #183), and files/SQLite are separate stores.
 
 Choose one output mode (default `--patch`):
 
@@ -1228,7 +1233,26 @@ files, publishes the completed bundle atomically, and prints `layer_digest`.
 Packing the same layer with the same optional inputs produces identical bytes.
 Paths are sorted, archive uid/gid are zero, and layer modes, mtimes and symlink
 targets are preserved. File content is streamed; symlinks are never followed.
-In-use markers and COW/spool temporary files are excluded.
+In-use markers and COW/spool temporary files are excluded. The database member
+and the optional index are copies SQLite writes (`VACUUM INTO`) in a private
+staging directory, never the live files read directly (closing such a read
+would release this process's SQLite locks on them, #156): their rows are the
+layer's and the sidecar's, their bytes need not be, so two packs are
+byte-identical only with the same ratarmount build (the SQLite version is part
+of the copy). `--include-index` copies an index only when it has no companion
+files or both `-wal` and `-shm` (a live writer); any other set (a rollback
+`-journal`, a `-wal` without `-shm`), a symlink, a file substituted during the
+open (on Unix; see the same-inode limit under "Not covered" below), or an
+index SQLite cannot read fails the pack instead of being shipped raw. On
+Windows only the type of the name is checked (a regular file, not a symlink),
+so a regular file substituted there is copied. The companion set is checked by
+name before the open. In every allowed layout the mutable index is opened
+through checked, ordinary locking SQLite (read-only, no CREATE), including
+when no companion exists yet. SQLite's locks and change detection govern the
+snapshot if a rollback or WAL writer starts after classification; there is no
+immutable shortcut based on the absence of companions. The generated overlay
+database snapshot is validated for its earlier required-record observation
+before redaction or publication.
 
 The ordinary TAR layout is:
 
@@ -1774,20 +1798,276 @@ blocks only the request that opens it, never another overlay-database open.
 Not covered: a payload descriptor opened before its inode is first opened as
 a database in this process (no mount path does this: the database is opened
 before anything is served), files read by generic folder sources or
-backing extents of non-overlay sources, and an overlay database swapped away
-and back at its path during its own open (the registered inode is the one at
-the path right after SQLite's open, not proved to be SQLite's descriptor).
-Nor are these opens, which do not go through the check: `overlay seal`'s
-permission walk (`chmod_tree`, #149), the removal of a database that a failed
-create just made (#160), the database copy `overlay pack` reads (#156), the
-optional journal and index files `overlay pack --include-journal` /
-`--include-index` reads, and the commit journal's opens of the archive
-itself. The seal walk runs while seal's own connection is open (#149); for the
-others no CLI path keeps another lock-holding connection to that database
-open. Of the checked sites, the ZIP commit reader, the
-read-only layer, live diff, the seal sentinels, the pack member, sentinel and
-lock reads and the macOS park share the tested helper but have no test of
-their own.
+backing extents of non-overlay sources, a rename or truncation of the
+database after its open (the open proves which file it got, not that the name
+keeps pointing at it), and descriptors SQLite itself closes while an open is
+still failing, before the database is registered. Identity is `(device,
+inode)` on Unix: a file deleted and replaced between the classification and
+the open (of an overlay database or of the `overlay pack --include-index`
+snapshot) by one that gets the same inode number from the filesystem counts
+as the same file; some filesystems (ext4, for example) reuse freed inode
+numbers. Nor are these opens, which
+do not go through the check: the journal file `overlay pack --include-journal`
+reads (a JSON log, not a database) and the commit journal's opens of the
+archive itself. Opens that used to bypass the check no longer open a data
+descriptor at all: `overlay seal`'s and `unseal`'s permission walk and the
+unpack stage's mode pass change modes through an `O_PATH` pin on Linux (by
+name with `AT_SYMLINK_NOFOLLOW` elsewhere, where a swap of the name between the
+check and the change is not detected) (#149); a failed first open leaves an
+existing 0-byte database to SQLite's rollback instead of truncating it (#160);
+and `overlay pack` ships SQLite copies of the layer database and of the base
+index (#156). Of the checked sites, the ZIP commit reader, the
+read-only layer, live diff, the seal sentinels, the pack sentinel and lock
+reads and the macOS park share the tested helper but have no test of their
+own. Pack payload append has a direct registered-alias refusal/lock regression.
+
+These protections keep the SQLite locks of a process that holds the database
+for its whole life: a foreground mount or export server (`-f`; `sandbox run`
+and the sandbox supervisor run ratarmount that way), or a library or Python
+user. A daemonized ratarmount (the default without `-f`, for a FUSE mount and
+for an export server alike) currently holds no kernel lock on its overlay
+database at all: the database is opened and locked before the fork, POSIX
+locks are not inherited by the child, and the parent's exit releases them
+(#183). Until that is fixed, run with `-f` when another process may open the
+same overlay.
+
+
+A required-record observation is a **one-way session latch**. Once an overlay
+has been required in a held connection, recovery rows, or metadata/verb retry
+operation, deleting current or legacy markers never makes it optional again.
+For example, removing markers and dropping `files` after a required open
+refuses with “the overlay database has no files table (the record of a used
+overlay is lost)” before digest updates, seal writes, recovery, or bundle
+publication. The mount's base-digest updater explicitly requires its initialized
+record even when the mount originally created a fresh unmarked database. The
+latch is operation-owned, not a global pathname map or a new persisted field.
+
+
+### Checked overlay-database opens by platform
+
+Every overlay-database open goes through a checked SQLite open (#151): wrappers
+around the `open` and `stat` calls of ratarmount's bundled SQLite judge the
+descriptor SQLite actually opened (or the parked one it reuses), so a name
+swapped to another file and back during the open (another database, an empty
+file, a FIFO, a symlink to `/dev/null`) is refused instead of read as the
+overlay. Which guarantee a process gets depends on the platform and on how the
+wrappers could be installed:
+
+| Platform / host | Installation | Checked open |
+|---|---|---|
+| Linux CLI and Rust test binaries (64-bit little-endian x86_64/aarch64, glibc) | Load-time constructor, only when the process has exactly one thread | `"unix"` VFS; SQLite's own descriptor and every reuse are checked. An unknown thread count (no `/proc`) or a thread started before the constructor leaves the wrappers uninstalled, and checked opens refuse |
+| Linux Python wheel (`_native`) | Constructor, or the module installs into its private SQLite before it publishes anything | As above. `import ratarmount_rs` raises `ImportError` if neither can install ([Python](python.md#import-and-checked-sqlite-opens)) |
+| Linux Rust program embedding the library | Constructor only | As above; a thread started before the library loads leaves checked opens refusing |
+| macOS CLI and test binaries (arm64/x86_64) | Constructor (task thread count) | `"unix-posix"` VFS (POSIX locks only, no fallback to other locking styles); descriptor and reuse checked |
+| macOS Python wheel | Constructor or private install, as on Linux | As above |
+| Windows library builds | None | The path is checked to be a regular file (no symlink under `SQLITE_OPEN_NOFOLLOW`) before and after SQLite's open; no file identity, so no swap-back detection. Commit-journal recovery needs Linux or macOS |
+| Any other Unix ABI (musl, 32-bit, big-endian, BSD) | None | Refused (`UnsupportedAbi` / `UnsupportedPlatform`): every `-w` mount and overlay verb that opens an overlay database fails, rather than falling back to pathname checks |
+
+Ordinary index, SQLAR, digest-cache and publication connections are not checked
+opens: they keep SQLite's default `"unix"` VFS (auto locking on macOS). The
+checked `overlay pack --include-index` snapshot uses the checked family above
+(`"unix-posix"` on macOS). Managed byte readers are not connections; see
+[Internal reads of index and database files](#internal-reads-of-index-and-database-files).
+
+The optional `sqlcipher` feature links SQLCipher's SQLite (older than 3.46.0),
+which is checked the same way. One difference: when its read-write open is
+refused, its read-only retry calls `open` again instead of reusing a parked
+descriptor (SQLite 3.46.0 and later reuse one), and the wrappers refuse that
+second `open` before it reaches the file.
+
+When threads are already running at import, so the Python wheel installs
+into its private SQLite instead of through the load-time constructor (which
+does not run this check), on Linux it first reads
+every exported dynamic symbol of its own image and refuses on any `sqlite3*`
+name, or when it cannot read the symbol table completely; on macOS it checks
+only `sqlite3_libversion`. Neither check can see an entry point that other
+code obtained and handed out before the module finished initializing (for
+example from a dependency's initializer). Proving that for an arbitrary
+shared object is not possible from these observations (#192), so it stays the
+caller contract of the private-instance path.
+
+Every checked open first checks that SQLite's VFS (`"unix"`, and
+`"unix-posix"` on macOS) and its `open` and `stat` slots still hold what the
+installation left. If other code replaced them, the open refuses with
+`HooksReplaced` naming what changed, repairs nothing, and the installation
+status keeps reporting the original installation; restoring the exact state
+lets later opens proceed. This is a diagnostic: a replacement that is undone
+between two opens, or one made concurrently with an open, is not seen.
+Reconfiguring SQLite (`sqlite3_config`, `sqlite3_shutdown`, another VFS or
+syscall hook) after the installation remains unsupported.
+
+`ratarmount_rs._native._checked_open_status()` reports the installation in a
+Python process. Python's own `sqlite3` module and `_native` may be separate
+SQLite instances; opening one database file through both at once in one
+process is unsupported (#154, see [Python](python.md#import-and-checked-sqlite-opens)).
+
+### Internal reads of index and database files
+
+The same POSIX rule applies to ratarmount's own reads of a file that is open as
+a database in this process: an index read through its pointer, a hash of an
+archive that is an SQLAR, a copy of a cached index blob, the HTTP index
+sidecar. Closing an ordinary `File` of that inode released the connection's
+locks (#151). These internal reads now go through a managed byte reader that
+opens the file through the bundled SQLite's own VFS as a read-only main-database
+byte file (`"unix"`; `"unix-posix"` on macOS). SQLite registers the descriptor
+in its per-inode bookkeeping and, on close, parks it instead of closing it while
+any connection of this SQLite instance holds a lock on the inode; a later read
+reuses the parked descriptor. The byte reader opens no SQL connection, takes no
+lock, never touches `-wal`/`-shm` and never reads the bytes as a database. Each
+read is bounded by the current length (and 128 KiB); a short read from SQLite
+(which zero-fills the rest of its buffer) is an error, so a zero-filled tail is
+never hashed or copied. A file that shrinks between two reads simply ends early
+there, as an ordinary read would; the copy helpers compare the copied length
+with the length seen at open and refuse, other readers do not. No failure falls back to
+an ordinary file read. On Windows the reader reads an ordinary private file.
+
+Covered (each with a regression test; `packaging/internal-read-inventory.json`
+lists every site): index pointers (`{archive}.index.ptr`); the index blob hash
+behind pointer ids, snapshot verification and publication; the `snapshot_index_id`
+copy fallback; the compression probe and decompression input of an index; the
+meta-v3 metadata cache (the `$XDG_CACHE_HOME/ratarmount/meta-v3` LRU of whole
+sidecar downloads: header, blob digest, install copy); the remote index id
+comparison and the copy of a fetched or meta-v3 blob to the local cache name;
+the HTTP sidecar endpoint; index publication (snapshot bytes, atomic copy, Hub
+body) and live-commit publication (Hub, S3, GCS, Azure: sidecar and staged
+archive bodies, multipart parts, MD5 passes); archive digests and their refresh
+after a commit, tarstats edge/full hashes and content hashes; strong directory
+digests, pending-base hashing, `overlay verify`'s strong check and
+`overlay digest-base`; the remote spool fingerprints of a live commit; the
+bytes of `overlay pack`'s database snapshot and `--include-index` snapshot;
+SQLAR byte probes; export-index inputs; shard artifact hashes; the private
+lookup copy of an index with a hot journal; and the sync of a published index.
+
+Not covered, by design of this slice (#196; each site has a residual entry with
+its reason, and the list is open): generic folder reads and backing extents,
+overlay payload descriptors (admitted opens) and the TAR commit helper, the
+plain TAR backend, the HF payload cache and its repository backing, the range
+and payload caches (the payload-v1 header read and staging reopen included),
+the HTTP body spool, the factory's format probe chain and every other format or
+compression reader (protecting SQLAR's own probes does not protect earlier
+probes of the chain), foreign-library readers (libgit2, libarchive, PDF),
+commit-journal recovery and splice sources (`open_copy_source`, the zstd
+splices), the local-index-v1 cache headers of 0.7.x sidecars, the HF
+tree-listing cache, the torrent checksum cache and `.torrent` metainfo, and
+SQLite's own auxiliary files (`-wal`, `-shm`, `-journal` locking and
+lifetime). Configuration and credential files, `/proc` and mount tables,
+daemon state and journal records, patch and bundle input streams, logger and
+stdio setup and directory handles are outside the internal-read families.
+
+Before every managed open on a Unix target, vacant standard descriptors 0-2
+are filled with `/dev/null` (SQLite's `robust_open` closes a new descriptor
+that lands below 3, which would release a lock); if that fails the open is
+refused before SQLite's `xOpen`. Another thread emptying a standard slot
+between that check and the open violates the host contract, as for checked
+opens. On a macOS FAT or exFAT volume SQLite writes an `S` byte into an empty
+file when it registers it; on the read-only descriptor that fails, so a managed
+read of an empty file there is an error.
+
+Failure handling: a read error is never a successful result. Tarstats hashes
+stay best effort (size and mtime are still stored; a failed hash is omitted),
+an index pointer still records partial archive stats, `overlay verify` reports
+a failed strong hash as skipped (`base_ok: null`, exit status unchanged),
+content hashing skips a member whose read failed (no partial digest) but fails
+when the archive cannot be opened, managed meta-v3 header/hash read errors keep the cache entry
+(no refetch; a missing or malformed entry, or a blob evicted by another
+process, is still a miss). The inherited blob-stat branch still invalidates
+on every stat error and may refetch. A remote id-hash error is not a mismatch (the blob
+stays, that candidate is not used), and a failed upload body aborts a
+multipart upload without completing it.
+
+Copies: the private lookup copies and the meta-v3 `.part` staging file are
+created exclusively (`O_EXCL`) with the source's mode under the umask, get the
+source's exact permissions through the handle after the copy, refuse a source
+that changed during the copy, and remove the output name on failure. This cleanup
+requires a caller-owned destination namespace: concurrent replacement at that
+name is not protected by an inode check. The copy of a fetched index to the local cache name keeps create-or-truncate
+semantics (an existing, possibly empty, destination is filled): it is opened
+with the source's mode and gets the source's exact permissions (0600 for a
+fetched blob) through the handle before the first byte is written; on a read
+error the fetched path is used and the partial destination stays. These
+streaming copies keep bytes and Unix mode bits only: on macOS they do not carry
+the ACLs, extended attributes, resource forks or clones that `std::fs::copy`
+may carry. Other creates keep their modes: SQLite creates the overlay database
+and the cold index `0644 & !umask`, publication's rename keeps the temporary
+database's mode, companions take the database's mode, temporary files stay
+`0600 & !umask`.
+
+Connections and VFSes: checked overlay-database opens and the checked
+`snapshot_index_into` source use `"unix"` on Linux and `"unix-posix"` on macOS
+(POSIX locks only). Ordinary index, SQLAR, digest-cache and publication-snapshot
+connections keep SQLite's default `"unix"` VFS, which on macOS picks the
+locking style per filesystem (auto). Managed byte readers use `"unix"`
+(`"unix-posix"` on macOS) and take no lock.
+
+`python3 -I packaging/test-internal-read-inventory.py` checks the inventory
+(`--self-test` for the scanner's own tests); a new production pathname read,
+copy, create or descriptor conversion fails the check until it is classified,
+and so does a form the scanner cannot follow: an import from `std::fs` or
+`tokio::fs` it cannot resolve, or an `OpenOptions` builder bound to a variable
+that escapes its function. Any `.create(..)` or `.create_new(..)` argument other
+than a literal `false` counts as a create that needs a mode policy; a managed
+read reaching a raw helper is found through `use .. as` renames of the helper or
+its module; and the pathname opens done inside libgit2 (`Repository::open`),
+libarchive (`archive_read_open_filename`) and lopdf (`Document::load`) are
+recorded as #196 residuals (those libraries own their descriptors).
+`--verify-baseline DIR` (run in CI) checks that every create recorded as
+unchanged from the baseline still exists unchanged there.
+
+A managed read reports an SQLite allocation failure as out of memory, never as
+the stale `errno` SQLite leaves behind (a metadata-cache entry is kept, not
+dropped and refetched as if it had been evicted). A whole-file managed read
+reserves its buffer fallibly: a file larger than the process may allocate is
+an out-of-memory error, not an abort. A managed read accepts only a regular
+file, checked before opening: a FIFO, a block or character device, a socket
+or a directory at an internal-read name is refused (where an ordinary read
+blocked on a FIFO or read the device); a FIFO swapped in between the check
+and the open still blocks in `open`. For managed header/hash reads, the metadata cache treats only that
+refusal and a missing file as an evicted entry; any other managed read error (an
+`EINVAL` included) propagates and keeps the entry. Blob-stat errors retain the
+inherited miss behavior described above. The managed `fsync` of a
+publication asks SQLite for a full sync, which is `F_FULLFSYNC` on macOS as
+before.
+
+The inventory also follows a module alias through a later import
+(`use std::fs as disk; use disk::read as read_index;`), calls with explicit
+generic arguments (`std::fs::read::<_>(p)`, `<File>::open(p)`), helpers
+imported through nested braces or a module glob, and `TempDir` /
+`NamedTempFile` `with_prefix` / `with_suffix` constructors; whitespace inside
+a string literal is part of an entry's fingerprint. A free-function call
+with explicit generic arguments (`helper::<T>(p)`) is followed by the
+mandatory-helper walk. An `unchanged-from-<baseline>` claim must match a
+baseline operation with the same file, function, operation and fingerprint,
+and each baseline operation backs at most one entry: an identical create
+copied into another function, or a second copy in the same function, is not
+a baseline create. The helper walk also follows `crate::helper(p)`,
+`super::helper(p)` and `self::helper(p)` (to any same-crate definition of
+that name) and a call whose name equals its caller's (`util::read_index(p)`
+from `read_index`); generic argument lists are matched balanced
+(`load::<{ 64 * 1024 }>(p)`, `::<fn() -> T>`) and an unbalanced one is
+reported. A test-only match arm ends at its block-like body (`unsafe { .. }`,
+`loop`, `match`, an `if`/`else` chain) as well as at a bare block. Descriptor
+duplication and ownership conversion are operations of their own:
+`try_clone_to_owned`, `libc::dup`/`dup2`/`dup3`, `fcntl(.., F_DUPFD[_CLOEXEC],
+..)` and any `File::from(..)` or `<File>::from(..)` (an `OwnedFd` included;
+closing a duplicate releases this process's locks on the file like any other
+close). `OpenOptions::default()` is a builder like `OpenOptions::new()` (a bare
+`OpenOptions` counts when it is imported from `std::fs`); a value typed by
+`let o: OpenOptions = Default::default()` is not recognised. A test-only
+`if`/`else` arm ends at the last block of its chain even when a branch holds a
+`match`; labeled blocks, `const { .. }` and `async { .. }` bodies end where they
+close; a test-only statement or arm whose span still holds a second top-level
+`=>`, or code after a closed top-level block, is reported as an unsupported
+test-only form instead of hiding what follows. A qualified call
+(`util::load(p)`) also resolves to a definition inside an inline
+`mod util { .. }`.
+A file that a test-only `mod` declaration names is skipped only when no
+production `mod` declaration names it too (`#[cfg(test)] #[path = "util.rs"]
+mod t; mod util;` scans `util.rs`), and the helper walk tells two helpers of
+one name in one file apart (`first::bridge`, `second::bridge`).
+A `mod` declaration inside an inline module resolves below it
+(`mod outer { pub mod util; }` names `outer/util.rs`), and a production `mod`
+declaration that names no file is reported instead of leaving its file
+unscanned.
 
 Linux and arm64 Linux binaries are packaged. Offline subcommands also build
 on macOS through the existing macFUSE build; the binary still depends on FUSE

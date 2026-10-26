@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::debug;
 use serde::{Deserialize, Serialize};
 
+use crate::managed_read::{self, is_not_regular_file, CopyDigest, CopySourcePermissions};
 use crate::sha256_hex;
 
 /// Whole-sidecar blob cap (bytes). Larger downloads stay tempfiles.
@@ -63,6 +64,27 @@ impl MetaCache {
         }
     }
 
+    /// A cache in `dir` with `budget` bytes (tests).
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_dir(dir: PathBuf, budget: u64) -> Self {
+        Self {
+            dir,
+            budget: Some(budget),
+        }
+    }
+
+    /// [`Self::install`] for `backend_url` (tests).
+    #[cfg(all(test, unix))]
+    pub(crate) fn install_for(&self, backend_url: &str, src: &Path) -> io::Result<PathBuf> {
+        self.install(&sha256_hex(backend_url.as_bytes()), src, None)
+    }
+
+    /// The blob path of `backend_url` (tests).
+    #[cfg(all(test, unix))]
+    pub(crate) fn blob_path_for(&self, backend_url: &str) -> PathBuf {
+        self.blob_path(&sha256_hex(backend_url.as_bytes()))
+    }
+
     /// Canonical cache identity: `backend|url` (no etag, no auth headers).
     pub fn identity(backend: &str, url: &str) -> String {
         cache_identity(backend, url)
@@ -100,7 +122,10 @@ impl MetaCache {
             return fetch().map(|(p, _)| p);
         }
         let key = sha256_hex(backend_url.as_bytes());
-        if let Some(path) = self.lookup(&key, pointer_etag) {
+        // Managed header/hash read errors propagate (the entry stays; no
+        // refetch). Missing or malformed entries are a miss; the inherited
+        // blob-stat failure branch below also remains a miss.
+        if let Some(path) = self.lookup(&key, pointer_etag)? {
             return Ok(path);
         }
         debug!(
@@ -133,44 +158,55 @@ impl MetaCache {
         url.starts_with("file://") || url.eq_ignore_ascii_case(":memory:")
     }
 
-    fn lookup(&self, key: &str, pointer_etag: Option<&str>) -> Option<PathBuf> {
+    fn lookup(&self, key: &str, pointer_etag: Option<&str>) -> io::Result<Option<PathBuf>> {
         let blob = self.blob_path(key);
         let hdr = match self.read_header(key) {
             Ok(h) => h,
+            // A missing header, or something that is no regular file at its
+            // name, is a miss like a malformed one; other I/O (an `EINVAL`
+            // from a read included) propagates and keeps the entry.
+            Err(HeaderError::Io(e)) if !is_cache_miss(&e) => return Err(e),
             Err(_) => {
                 self.invalidate_key(key);
-                return None;
+                return Ok(None);
             }
         };
         let meta = match fs::metadata(&blob) {
             Ok(m) if m.is_file() => m,
             _ => {
                 self.invalidate_key(key);
-                return None;
+                return Ok(None);
             }
         };
         if meta.len() != hdr.len || hdr.len == 0 || hdr.sha256.is_empty() {
             debug!("V-3 meta cache corrupt {key} (len mismatch, empty, or missing sha256)");
             self.invalidate_key(key);
-            return None;
+            return Ok(None);
         }
         match blob_sha256(&blob) {
             Ok(got) if got == hdr.sha256 => {}
-            _ => {
+            Ok(_) => {
                 debug!("V-3 meta cache corrupt {key} (sha256 mismatch)");
                 self.invalidate_key(key);
-                return None;
+                return Ok(None);
             }
+            // Evicted by another process after the metadata check: the
+            // existing missing-entry path (invalidate, refetch).
+            Err(e) if is_cache_miss(&e) => {
+                self.invalidate_key(key);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
         }
         if let Some(etag) = pointer_etag {
             if hdr.etag != etag {
                 debug!("V-3 meta cache etag mismatch {key}");
-                return None;
+                return Ok(None);
             }
         }
         self.touch(key, &hdr);
         debug!("V-3 meta cache hit {key} -> {}", blob.display());
-        Some(blob)
+        Ok(Some(blob))
     }
 
     fn install(&self, key: &str, src: &Path, etag: Option<&str>) -> io::Result<PathBuf> {
@@ -191,29 +227,31 @@ impl MetaCache {
         self.ensure_dir()?;
         self.evict_until(budget.saturating_sub(len), Some(key))?;
         let dest = self.blob_path(key);
-        if src != dest.as_path() {
+        let sha256 = if src != dest.as_path() {
             let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
             let part = self
                 .dir
                 .join(format!("{key}.{}.{seq}.part", std::process::id()));
-            if let Err(e) = fs::copy(src, &part) {
-                let _ = fs::remove_file(&part);
-                return Err(e);
-            }
-            if let Ok(f) = File::open(&part) {
-                let _ = f.sync_all();
-            }
+            // Managed source (#151), exclusive-new staging with the source's
+            // exact permissions, digest computed while copying. A failure
+            // before the rename removes only this staging file (the helper
+            // does) and leaves an existing blob unchanged.
+            let copy = managed_read::copy_exclusive_new(
+                src,
+                &part,
+                CopySourcePermissions::Exact,
+                CopyDigest::Sha256,
+            )?;
+            let _ = copy.file.sync_all();
+            drop(copy.file);
             if let Err(e) = fs::rename(&part, &dest) {
                 let _ = fs::remove_file(&part);
                 return Err(e);
             }
-        }
-        let sha256 = match blob_sha256(&dest) {
-            Ok(h) => h,
-            Err(e) => {
-                self.invalidate_key(key);
-                return Err(e);
-            }
+            copy.sha256.expect("digest requested")
+        } else {
+            // Re-hash of the installed blob itself: an error keeps the blob.
+            blob_sha256(&dest)?
         };
         let now = unix_now();
         let hdr = MetaHeader {
@@ -255,9 +293,9 @@ impl MetaCache {
         self.dir.join(format!("{key}.hdr"))
     }
 
-    fn read_header(&self, key: &str) -> io::Result<MetaHeader> {
-        let bytes = fs::read(self.hdr_path(key))?;
-        serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    fn read_header(&self, key: &str) -> Result<MetaHeader, HeaderError> {
+        let bytes = managed_read::read(&self.hdr_path(key)).map_err(HeaderError::Io)?;
+        serde_json::from_slice(&bytes).map_err(HeaderError::Malformed)
     }
 
     fn write_header(&self, key: &str, hdr: &MetaHeader) -> io::Result<()> {
@@ -387,9 +425,23 @@ pub fn invalidate_meta_cache_identity(backend: &str, url: &str) {
     MetaCache::from_env().invalidate_key(&key);
 }
 
+/// A managed-read error that means the entry is gone: the name is missing or
+/// holds no regular file. Any other error (an injected or real `EINVAL`
+/// while reading included) is I/O that must propagate and keep the entry.
+fn is_cache_miss(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound || is_not_regular_file(e)
+}
+
 fn blob_sha256(path: &Path) -> io::Result<String> {
-    let mut f = File::open(path)?;
-    crate::sha256_hex_stream(&mut f)
+    managed_read::sha256_hex(path)
+}
+
+/// Why a header could not be read: I/O (a missing header is a miss, any other
+/// error propagates) or malformed JSON (a miss).
+#[derive(Debug)]
+enum HeaderError {
+    Io(io::Error),
+    Malformed(#[allow(dead_code)] serde_json::Error),
 }
 
 fn identity_url(backend_url: &str) -> &str {

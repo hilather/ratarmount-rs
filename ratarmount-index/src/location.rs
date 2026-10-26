@@ -13,7 +13,6 @@
 //! [`resolve_index_location`] is unchanged (`oci:{digest}` cache stays first
 //! among folder candidates).
 
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -201,13 +200,12 @@ pub fn parse_index_pointer_json(s: &str) -> Result<IndexPointer> {
 
 /// Load `{archive}.index.ptr`. Missing file → `Ok(None)`. Invalid schema / id → `Err`.
 pub fn load_index_pointer(path: &Path) -> Result<Option<IndexPointer>> {
-    let mut f = match File::open(path) {
-        Ok(f) => f,
+    // Managed (#151): the pointer may be a name of a file open as a database.
+    let s = match crate::managed_read::read_to_string(path) {
+        Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let mut s = String::new();
-    f.read_to_string(&mut s)?;
     parse_index_pointer_json(&s)
         .map(Some)
         .map_err(|e| IndexError::Invalid(format!("index pointer {}: {e}", path.display())))
@@ -384,7 +382,7 @@ pub fn publish_index_pointer(
     Ok(ptr)
 }
 
-fn atomic_copy_file(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn atomic_copy_file(src: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -398,8 +396,7 @@ fn atomic_copy_file(src: &Path, dest: &Path) -> Result<()> {
         None => builder.tempfile_in(".")?,
     };
     {
-        let mut in_f = File::open(src)?;
-        std::io::copy(&mut in_f, &mut tmp)?;
+        crate::managed_read::copy_into(src, &mut tmp)?;
         tmp.flush()?;
         tmp.as_file().sync_all()?;
     }
@@ -408,8 +405,7 @@ fn atomic_copy_file(src: &Path, dest: &Path) -> Result<()> {
 }
 
 fn sha256_file_hex(path: &Path) -> Result<String> {
-    let mut f = File::open(path)?;
-    crate::hashing::sha256_hex_stream(&mut f).map_err(IndexError::from)
+    crate::managed_read::sha256_hex(path).map_err(IndexError::from)
 }
 
 fn list_index_id_snapshots(archive: &Path) -> Vec<(String, PathBuf)> {
@@ -993,12 +989,8 @@ pub fn materialize_index_file(path: &Path) -> Result<PathBuf> {
         _ => return Ok(path.to_path_buf()),
     };
 
-    let mut header = [0u8; 16];
-    let n = {
-        let mut f = File::open(path)?;
-        f.read(&mut header)?
-    };
-    let header = &header[..n];
+    let header = crate::managed_read::read_prefix(path, 16)?;
+    let header = header.as_slice();
 
     // Uncompressed SQLite: open as-is.
     if header.starts_with(SQLITE_MAGIC) {
@@ -1072,7 +1064,7 @@ fn detect_index_compression(path: &Path, header: &[u8]) -> Option<IndexCompressi
 }
 
 fn decompress_index_to_temp(path: &Path, fmt: IndexCompression) -> Result<PathBuf> {
-    let input = File::open(path).map_err(|e| {
+    let input = crate::managed_read::ManagedReadCursor::open(path).map_err(|e| {
         IndexError::Invalid(format!(
             "cannot open {}-compressed index {}: {e}",
             fmt.name(),
@@ -1435,6 +1427,7 @@ pub fn test_writable_dir(dir: &Path) -> bool {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::fs::File;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};

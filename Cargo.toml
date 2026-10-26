@@ -49,6 +49,7 @@ members = [
     "ratarmount-smb",
     "ratarmount-9p",
     "ratarmount-sftp",
+    "test-harness/ratarmount-checked-open-fixture",
 ]
 default-members = ["ratarmount"]
 

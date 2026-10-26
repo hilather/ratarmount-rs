@@ -647,6 +647,7 @@ fn database_error(dir: &Path, error: rusqlite::Error) -> io::Error {
     )
 }
 
+#[allow(dead_code)] // Retained main helper; checked overlay callers construct their URI internally.
 pub(crate) fn immutable_uri(path: &Path) -> String {
     use std::fmt::Write;
     let mut uri = String::from("file:");
