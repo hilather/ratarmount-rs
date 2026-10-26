@@ -639,11 +639,23 @@ mod tests {
     struct AcquireGuard(Option<AcquireCallback>);
     impl AcquireGuard {
         fn at(db: PathBuf, occurrence: usize, f: impl FnOnce() + 'static) -> Self {
+            // The shared open resolves the directory for NOFOLLOW and immutable
+            // opens (macOS temp dirs are under /var -> /private/var), so the
+            // seam may see either spelling; compare resolved directories.
+            fn resolved(path: &Path) -> PathBuf {
+                match (path.parent(), path.file_name()) {
+                    (Some(dir), Some(file)) => dir
+                        .canonicalize()
+                        .map_or_else(|_| path.to_path_buf(), |dir| dir.join(file)),
+                    _ => path.to_path_buf(),
+                }
+            }
+            let db = resolved(&db);
             let mut count = 0;
             let mut action = Some(f);
             let previous = crate::overlay_db::AFTER_ACQUIRE.with(|s| {
                 s.replace(Some(Box::new(move |path| {
-                    if path != db {
+                    if resolved(path) != db {
                         return;
                     }
                     count += 1;
