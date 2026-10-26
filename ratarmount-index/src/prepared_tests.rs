@@ -304,3 +304,25 @@ fn regression_prepared_index_identity_peek_refuses_incomplete_state() {
     assert!(error.contains("digest lookup failed"), "{error}");
     assert_eq!(snapshot(dir.path()), before);
 }
+
+/// Regression (#221 CI fix): a symlinked read-only index whose link name has a
+/// dangling nonempty -wal must be refused, not validated past the WAL.
+#[cfg(unix)]
+#[test]
+fn regression_finalize_refuses_read_only_alias_with_leftover_wal() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real.sqlite");
+    let archive = dir.path().join("a.tar");
+    std::fs::write(&archive, b"x").unwrap();
+    fixture(&real, &archive);
+    let alias = dir.path().join("alias.sqlite");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    std::fs::write(dir.path().join("alias.sqlite-wal"), b"uncheckpointed").unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let error = SqliteIndex::finalize_prepared(&alias)
+        .unwrap_err()
+        .to_string();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(error.contains("leftover WAL/journal state"), "{error}");
+}

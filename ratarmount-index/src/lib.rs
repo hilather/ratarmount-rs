@@ -960,17 +960,34 @@ impl SqliteIndex {
         }
         // Only checkpoint when there is something to finish: a -journal, a
         // nonempty -wal, or an empty -wal on a writable artifact (removed on
-        // close). A complete read-only artifact is validated, never written.
+        // close). Companions are probed next to BOTH the given path (SQLite
+        // may keep an alias spelling) and the canonical path. A complete
+        // read-only artifact is validated, never written; a read-only one
+        // with leftover WAL/journal state is refused.
         let absolute = path.canonicalize()?;
-        let companion = |suffix: &str| {
-            let mut companion = absolute.as_os_str().to_owned();
-            companion.push(suffix);
-            std::fs::symlink_metadata(PathBuf::from(companion)).ok()
-        };
+        let mut leftover = false;
+        let mut empty_wal = false;
+        for base in [path, absolute.as_path()] {
+            for suffix in ["-journal", "-wal"] {
+                let mut companion = base.as_os_str().to_owned();
+                companion.push(suffix);
+                if let Ok(meta) = std::fs::symlink_metadata(PathBuf::from(companion)) {
+                    if suffix == "-journal" || meta.len() != 0 {
+                        leftover = true;
+                    } else {
+                        empty_wal = true;
+                    }
+                }
+            }
+        }
         let read_only = std::fs::metadata(&absolute)?.permissions().readonly();
-        let pending = companion("-journal").is_some()
-            || companion("-wal").is_some_and(|wal| wal.len() != 0 || !read_only);
-        if !pending {
+        if leftover && read_only {
+            return Err(IndexError::Invalid(format!(
+                "prepared index {} is read-only but has leftover WAL/journal state;                  preparation incomplete; finish checkpointing with a writable index before workers start",
+                path.display()
+            )));
+        }
+        if !leftover && (!empty_wal || read_only) {
             Self::open_catalog_prepared(path)?;
             return Ok(());
         }
