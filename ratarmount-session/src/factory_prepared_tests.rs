@@ -898,3 +898,15 @@ fn regression_prepared_index_discarded_minimum_has_no_artifact() {
     assert!(bundle.prepared_artifacts.is_empty());
     assert_eq!(read_member(bundle.source.as_ref(), "/member"), b"payload");
 }
+
+/// Inventory (#220/#221): the seekable-body materialization tempfile
+/// (`materialize_seekable_body_for_path_backends_with_index`) is classified
+/// `mode_policy: 0600`; pin the real mode `NamedTempFile::new()` creates.
+#[cfg(unix)]
+#[test]
+fn regression_materialize_tempfile_is_created_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o600, "{mode:o}");
+}
