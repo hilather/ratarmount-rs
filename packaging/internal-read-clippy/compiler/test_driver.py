@@ -122,6 +122,29 @@ def main():
         ]:
             rows=run(name,attribute+' pub fn visible(){}',native_baseline=True,reject='N2')
             assert any(row.get('policy')=='N2' and row.get('detail')=='link_name outside reviewed module' for row in rows)
+        # Regression: boolean cfg_attr predicates failed Meta parsing and hid
+        # link_name from N2 even in unrestricted packages, where N4 is inactive.
+        package_before=env.get('CARGO_PKG_NAME')
+        env['CARGO_PKG_NAME']='ratarmount-core'
+        assert env['CARGO_PKG_NAME'] not in config['restricted_packages']
+        for scope,prefix in [('crate-root','#!['),('item','#[')]:
+            for name,arguments in [
+                ('false','false,link_name="arbitrary"'),
+                ('nested-false','all(),cfg_attr(false,link_name="arbitrary")'),
+                ('outer-false','false,cfg_attr(all(),link_name="arbitrary")'),
+                ('nested-true','false,cfg_attr(true,link_name="arbitrary")'),
+                ('outer-true','true,cfg_attr(false,link_name="arbitrary")'),
+                ('multiple-attributes','false,allow(dead_code),link_name="arbitrary"'),
+            ]:
+                rows=run(scope+'-boolean-link-name-'+name,prefix+'cfg_attr('+arguments+')] pub fn visible(){}',
+                    native_baseline=True,reject='N2',extra_flags=['-Dwarnings'])
+                assert any(row.get('policy')=='N2' and row.get('detail')=='link_name outside reviewed module' for row in rows)
+            for predicate in ['false','true']:
+                run(scope+'-boolean-without-link-name-'+predicate,
+                    prefix+'cfg_attr('+predicate+',allow(dead_code))] pub fn visible(){}',
+                    native_baseline=True,extra_flags=['-Dwarnings'])
+        if package_before is None:env.pop('CARGO_PKG_NAME')
+        else:env['CARGO_PKG_NAME']=package_before
         run('extern-root','unsafe extern "C"{pub fn mkostemp(p:*mut u8)->i32;}',reject='N2')
         config['allowed_extern_module']='control::ffi'
         run('extern-exact','pub mod ffi{unsafe extern "C"{pub fn mkostemp(p:*mut u8)->i32;}}')

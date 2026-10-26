@@ -50,8 +50,17 @@ fn name(path: &syn::Path) -> String {
         .map(|s| s.ident.to_string().trim_start_matches("r#").to_owned())
         .unwrap_or_default()
 }
-fn parts(tokens: proc_macro2::TokenStream) -> syn::Result<Vec<Meta>> {
-    Punctuated::<Meta, Token![,]>::parse_terminated
+fn cfg_attr_attributes(tokens: proc_macro2::TokenStream) -> syn::Result<Vec<Meta>> {
+    let parser = |input: syn::parse::ParseStream<'_>| {
+        // The predicate can be a boolean literal, which is not syn::Meta.
+        // N2 inspects the attributes regardless of the predicate's value.
+        while !input.is_empty() && !input.peek(Token![,]) {
+            input.parse::<proc_macro2::TokenTree>()?;
+        }
+        input.parse::<Token![,]>()?;
+        Punctuated::<Meta, Token![,]>::parse_terminated(input)
+    };
+    parser
         .parse2(tokens)
         .map(|p| p.into_iter().collect())
 }
@@ -70,7 +79,7 @@ fn contains_link_name(meta: &Meta) -> bool {
     if name(meta.path()) == "link_name" {
         return true;
     }
-    matches!(meta,Meta::List(l) if name(&l.path)=="cfg_attr" && parts(l.tokens.clone()).is_ok_and(|parts| parts.iter().skip(1).any(contains_link_name)))
+    matches!(meta,Meta::List(l) if name(&l.path)=="cfg_attr" && cfg_attr_attributes(l.tokens.clone()).is_ok_and(|attrs| attrs.iter().any(contains_link_name)))
 }
 
 #[derive(Default)]
