@@ -326,3 +326,65 @@ fn regression_finalize_refuses_read_only_alias_with_leftover_wal() {
     std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(error.contains("leftover WAL/journal state"), "{error}");
 }
+
+/// Classifier cases that run on every OS (#221).
+#[test]
+fn regression_classify_companion_each_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let lstat = |name: &str| std::fs::symlink_metadata(dir.path().join(name));
+    assert_eq!(
+        classify_companion(&lstat("missing")),
+        CompanionState::Absent
+    );
+    std::fs::write(dir.path().join("empty"), b"").unwrap();
+    assert_eq!(
+        classify_companion(&lstat("empty")),
+        CompanionState::EmptyRegular
+    );
+    std::fs::write(dir.path().join("full"), b"wal").unwrap();
+    assert_eq!(classify_companion(&lstat("full")), CompanionState::Leftover);
+    std::fs::create_dir(dir.path().join("dir")).unwrap();
+    assert_eq!(classify_companion(&lstat("dir")), CompanionState::Leftover);
+    let denied = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    assert_eq!(classify_companion(&denied), CompanionState::Leftover);
+}
+
+/// An lstat of a symlink companion, even to an empty regular file, is leftover.
+#[cfg(unix)]
+#[test]
+fn regression_classify_companion_symlink_is_leftover() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("target"), b"").unwrap();
+    std::os::unix::fs::symlink(dir.path().join("target"), dir.path().join("link")).unwrap();
+    let meta = std::fs::symlink_metadata(dir.path().join("link"));
+    assert_eq!(classify_companion(&meta), CompanionState::Leftover);
+}
+
+/// Regression (#221): alias.sqlite -> real.sqlite (read-only) with
+/// alias.sqlite-wal -> pending.wal must be refused. Windows variant not added:
+/// the CI runner's symlink privilege is unverified; the classifier tests above
+/// cover the decision on every OS.
+#[cfg(unix)]
+#[test]
+fn regression_finalize_refuses_read_only_alias_with_symlinked_wal() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real.sqlite");
+    let archive = dir.path().join("a.tar");
+    std::fs::write(&archive, b"x").unwrap();
+    fixture(&real, &archive);
+    let alias = dir.path().join("alias.sqlite");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    std::fs::write(dir.path().join("pending.wal"), b"").unwrap();
+    std::os::unix::fs::symlink(
+        dir.path().join("pending.wal"),
+        dir.path().join("alias.sqlite-wal"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let error = SqliteIndex::finalize_prepared(&alias)
+        .unwrap_err()
+        .to_string();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(error.contains("leftover WAL/journal state"), "{error}");
+}

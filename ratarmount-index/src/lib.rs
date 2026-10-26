@@ -800,6 +800,35 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// State of one SQLite -wal/-journal companion, from lstat.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CompanionState {
+    /// NotFound.
+    Absent,
+    /// A regular, non-symlink file of length 0.
+    EmptyRegular,
+    /// Anything else (symlink, reparse point, other non-regular file,
+    /// nonzero length, any metadata error but NotFound): fail closed.
+    Leftover,
+}
+
+/// Classify a companion's `symlink_metadata` result. Only `Absent` and
+/// `EmptyRegular` permit the read-only finalize shortcut.
+pub(crate) fn classify_companion(meta: &std::io::Result<std::fs::Metadata>) -> CompanionState {
+    match meta {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CompanionState::Absent,
+        Err(_) => CompanionState::Leftover,
+        Ok(meta) => {
+            let kind = meta.file_type();
+            if kind.is_file() && !kind.is_symlink() && meta.len() == 0 {
+                CompanionState::EmptyRegular
+            } else {
+                CompanionState::Leftover
+            }
+        }
+    }
+}
+
 /// Open a self-contained prepared SQLite artifact without recovery or companion writes.
 /// The preparer must have checkpointed every writer before this call.
 pub fn open_prepared_connection(path: &Path) -> Result<Connection> {
@@ -958,9 +987,9 @@ impl SqliteIndex {
                 path.display()
             )));
         }
-        // Only checkpoint when there is something to finish: a -journal, a
-        // nonempty -wal, or an empty -wal on a writable artifact (removed on
-        // close). Companions are probed next to BOTH the given path (SQLite
+        // Only checkpoint when there is something to finish: any companion
+        // that classify_companion calls Leftover, or an empty -wal on a
+        // writable artifact (removed on close). Companions are probed next to BOTH the given path (SQLite
         // may keep an alias spelling) and the canonical path. A complete
         // read-only artifact is validated, never written; a read-only one
         // with leftover WAL/journal state is refused.
@@ -971,19 +1000,17 @@ impl SqliteIndex {
             for suffix in ["-journal", "-wal"] {
                 let mut companion = base.as_os_str().to_owned();
                 companion.push(suffix);
-                if let Ok(meta) = std::fs::symlink_metadata(PathBuf::from(companion)) {
-                    if suffix == "-journal" || meta.len() != 0 {
-                        leftover = true;
-                    } else {
-                        empty_wal = true;
-                    }
+                match classify_companion(&std::fs::symlink_metadata(PathBuf::from(companion))) {
+                    CompanionState::Absent => {}
+                    CompanionState::EmptyRegular => empty_wal |= suffix == "-wal",
+                    CompanionState::Leftover => leftover = true,
                 }
             }
         }
         let read_only = std::fs::metadata(&absolute)?.permissions().readonly();
         if leftover && read_only {
             return Err(IndexError::Invalid(format!(
-                "prepared index {} is read-only but has leftover WAL/journal state;                  preparation incomplete; finish checkpointing with a writable index before workers start",
+                "prepared index {} is read-only but has leftover WAL/journal state; preparation incomplete; finish checkpointing with a writable index before workers start",
                 path.display()
             )));
         }
