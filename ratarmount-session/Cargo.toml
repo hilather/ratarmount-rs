@@ -119,6 +119,7 @@ ratarmount-formats-wim = { workspace = true, optional = true }
 ratarmount-formats-xar = { workspace = true, optional = true }
 
 [dev-dependencies]
+ratarmount-index = { workspace = true, features = ["test-hooks"] }
 git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
 url = "2"
 rusqlite.workspace = true

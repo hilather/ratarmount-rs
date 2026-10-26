@@ -9197,6 +9197,50 @@ mod tests {
             },
         );
     }
+
+    /// Regression: (R11-S7, #151; live callers of the SQLAR byte probes,
+    /// factory `FormatBackend::Sqlar`: `looks_like_sqlar` and
+    /// `SqlarMountSource::open`): the factory's SQLAR probe read the file raw
+    /// and released the lock of a connection of this process on it. Only this
+    /// backend's own probes are covered, not earlier probes of the full chain.
+    #[cfg(all(unix, feature = "sqlar"))]
+    #[test]
+    fn regression_sqlar_header_probes_keep_sqlar_lock_factory() {
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("a.sqlar");
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB);
+             INSERT INTO sqlar VALUES ('hello.txt', 33188, 0, 5, 'hello');",
+        )
+        .unwrap();
+        drop(c);
+        let h = rusqlite::Connection::open(&path).unwrap();
+        h.execute_batch("BEGIN").unwrap();
+        let _: i64 = h
+            .query_row("SELECT count(*) FROM sqlar", [], |r| r.get(0))
+            .unwrap();
+        assert!(other_process_sees_lock(&path));
+        let src = try_open_format_backend(
+            &path,
+            FormatBackend::Sqlar,
+            None,
+            &OpenOptions::default(),
+            false,
+        )
+        .unwrap()
+        .expect("SQLAR backend");
+        assert!(src.lookup("/hello.txt", 0).is_some());
+        drop(src);
+        assert!(
+            other_process_sees_lock(&path),
+            "factory probes kept the lock"
+        );
+        assert!(!ratarmount_formats_sqlar::looks_like_encrypted_sqlar(&path));
+        assert!(other_process_sees_lock(&path));
+        drop(h);
+    }
 }
 
 #[cfg(all(test, feature = "tensors"))]

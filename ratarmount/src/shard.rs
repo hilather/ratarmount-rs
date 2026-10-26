@@ -12,7 +12,6 @@ use clap::{ArgAction, Parser, ValueEnum};
 use ratarmount_compress::{ZstdFrameWriter, DEFAULT_REPACK_FRAME_SIZE};
 use ratarmount_session::{IndexJob, IndexPolicy, OpenRequest, Recreate, SourceSpec};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -412,9 +411,8 @@ pub(super) fn index_request(archive: &Path, index: &Path) -> OpenRequest {
     }
 }
 pub(super) fn sha256(path: &Path) -> Result<String> {
-    let mut hash = Sha256::new();
-    io::copy(&mut File::open(path)?, &mut hash)?;
-    Ok(format!("{:x}", hash.finalize()))
+    // Managed (#151): an artifact may be an index open in this process.
+    Ok(ratarmount_index::managed_read::sha256_hex(path)?)
 }
 
 fn parallel_map<T: Sync, U: Send>(
@@ -973,5 +971,33 @@ pub(super) mod tests {
             b"original"
         );
         assert!(!output.join("shards.json").exists());
+    }
+
+    /// Regression: (R11-S7, #151): artifact SHA-256 opened the file raw; an
+    /// artifact that is another name of a database open in this process lost
+    /// its lock.
+    #[cfg(unix)]
+    #[test]
+    fn regression_shard_artifact_hash_keeps_aliased_database_lock() {
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("a.tar.index.sqlite");
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch("CREATE TABLE t(x BLOB); INSERT INTO t VALUES (randomblob(70000));")
+            .unwrap();
+        drop(c);
+        let want = format!("{:x}", Sha256::digest(fs::read(&db).unwrap()));
+        let alias = temp.path().join("alias");
+        fs::hard_link(&db, &alias).unwrap();
+        let holder = rusqlite::Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN").unwrap();
+        let _: i64 = holder
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert!(other_process_sees_lock(&db));
+        assert_eq!(sha256(&alias).unwrap(), want);
+        assert!(other_process_sees_lock(&db), "lock kept");
+        drop(holder);
     }
 }

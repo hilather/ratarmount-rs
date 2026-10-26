@@ -857,6 +857,20 @@ fn install_hf_live_commit(
     Ok(())
 }
 
+/// The staged `.tar.zst`'s `zstdblocks` pairs, read through a managed reader
+/// (the staged file may be open as a database in this process; a raw `File`
+/// close would release that connection's locks).
+fn staged_zstd_blocks(staged: &Path) -> Result<Vec<(i64, i64)>, String> {
+    let mut cursor = ratarmount_index::managed_read::ManagedReadCursor::open(staged)
+        .map_err(|e| e.to_string())?;
+    let blocks = ratarmount_compress::export_zstd_blocks_from_reader(&mut cursor)
+        .map_err(|e| e.to_string())?;
+    Ok(blocks
+        .into_iter()
+        .map(|(c, d)| (c as i64, d as i64))
+        .collect())
+}
+
 fn publish_hf(
     state: &mut HfLiveCommit,
     opts: &OpenOptions,
@@ -908,12 +922,7 @@ fn publish_hf(
         .store_tarstats_for_path(&req.staged)
         .map_err(|e| retryable(e.to_string()))?;
     if url_is_tar_zst(&state.repo.location.path) {
-        let blocks = ratarmount_compress::export_zstd_blocks(&req.staged)
-            .map_err(|e| retryable(e.to_string()))?;
-        let blocks: Vec<_> = blocks
-            .into_iter()
-            .map(|(c, d)| (c as i64, d as i64))
-            .collect();
+        let blocks = staged_zstd_blocks(&req.staged).map_err(retryable)?;
         index
             .set_zstd_blocks(&blocks)
             .map_err(|e| retryable(e.to_string()))?;
@@ -932,7 +941,9 @@ fn publish_hf(
     let pointer = IndexPointer::for_blob(&sidecar, Some(&req.staged))
         .map_err(|e| retryable(e.to_string()))?;
     let json = index_pointer_to_json(&pointer).map_err(|e| retryable(e.to_string()))?;
-    let blob = std::fs::read(&sidecar).map_err(|e| retryable(e.to_string()))?;
+    // Managed (#151): the sidecar is the mount's own index.
+    let blob =
+        ratarmount_index::managed_read::read(&sidecar).map_err(|e| retryable(e.to_string()))?;
     let blob_path = format!(
         "{}.index.{}.sqlite",
         state.repo.location.path, pointer.index_id
@@ -1122,7 +1133,8 @@ fn publish_s3(
             etag.unwrap_or("-")
         );
         let put = if len <= S3_PUT_SINGLE_MAX {
-            let body = std::fs::read(&req.staged)
+            // Managed (#151): the staged archive may be a database open here.
+            let body = ratarmount_index::managed_read::read(&req.staged)
                 .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
             ratarmount_remote::put_s3_object(&loc, &body, etag, Some("application/octet-stream"))
         } else {
@@ -1308,7 +1320,8 @@ fn publish_gcs(
             return Ok(());
         }
     };
-    let blob = match std::fs::read(&sidecar) {
+    // Managed (#151): the sidecar is the mount's own index.
+    let blob = match ratarmount_index::managed_read::read(&sidecar) {
         Ok(b) => b,
         Err(e) => {
             log::warn!("gcs index blob read failed after object replace: {e}");
@@ -3182,6 +3195,353 @@ mod tests {
             "PutObject HTTP 500: body mentions HTTP 412".into(),
         ));
         assert!(matches!(retry, RemotePublishError::Retryable(_)), "{retry}");
+    }
+
+    // ---------------------------------------------------------------------
+    // R11-S7 (#151): live-commit publication reads index and archive bytes
+    // through managed readers.
+    // ---------------------------------------------------------------------
+
+    type Publish = fn(&str, &OpenOptions, &RemotePublishRequest) -> Result<(), RemotePublishError>;
+
+    /// Publish `a.tar` to `{scheme}://bucket/a.tar` while session A keeps the
+    /// mount's WAL index open (an idle connection: WAL keeps its main-file
+    /// SHARED lock for the connection's life; an open read transaction would
+    /// block the sidecar patch's checkpoint). The session's lock survives the
+    /// publish, and every managed read of the index and the staged archive
+    /// keeps a lock taken on the file it reads.
+    #[cfg(unix)]
+    fn s7_object_store_publish(scheme: &str, publish: Publish) {
+        use crate::publish_index::tests::{publish_tar, PublishEnv, PublishServer};
+        use ratarmount_index::managed_read::{
+            lock_probe::other_process_sees_lock, with_close_probes,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("a.tar");
+        std::fs::write(&tar, publish_tar()).unwrap();
+        let sidecar = dir.path().join("index.sqlite");
+        let mut build = OpenOptions {
+            index_file_path: Some(sidecar.clone()),
+            ..Default::default()
+        };
+        drop(
+            crate::factory::build_mount_source(
+                std::slice::from_ref(&tar),
+                &mut build,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let server = PublishServer::new(publish_tar(), false, false);
+        let _env = PublishEnv::new(&[
+            ("AWS_ACCESS_KEY_ID", "test"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_ENDPOINT_URL", &server.url),
+            ("AWS_REGION", "us-east-1"),
+            ("RATARMOUNT_S3_ANONYMOUS", "0"),
+            ("AWS_ANONYMOUS", "0"),
+            ("RATARMOUNT_GCS_ENDPOINT", &server.url),
+            ("GOOGLE_OAUTH_ACCESS_TOKEN", "test"),
+            ("RATARMOUNT_GCS_ANONYMOUS", "0"),
+            ("AZURE_STORAGE_ACCOUNT", "test"),
+            ("AZURE_STORAGE_KEY", "c2VjcmV0"),
+            ("AZURE_STORAGE_ENDPOINT", &server.url),
+            ("RATARMOUNT_AZURE_ANONYMOUS", "0"),
+        ]);
+        let session = rusqlite::Connection::open(&sidecar).unwrap();
+        let _: i64 = session
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            other_process_sees_lock(&sidecar),
+            "an idle WAL connection keeps its main-file lock"
+        );
+        let stats = ratarmount_index::tar_stats_from_path(&tar).unwrap();
+        let req = RemotePublishRequest {
+            staged: tar.clone(),
+            prefix_compressed_bytes: 0,
+            etag_at_download: None,
+            window: ratarmount_compositing::IndexPatchWindow {
+                window_start: 0,
+                from_frame: None,
+                offsets_shifted: false,
+            },
+            skip_object_put: false,
+            presplice_len: stats.st_size,
+            presplice_sha256: stats.full_sha256.clone().unwrap(),
+            presplice_prefix512_sha256: stats.prefix512_sha256.clone().unwrap(),
+            presplice_suffix512_sha256: stats.suffix512_sha256.clone().unwrap(),
+            commit_generation: 1,
+        };
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar.clone()),
+            index_in_memory: false,
+            ..Default::default()
+        };
+        let url = format!("{scheme}://bucket/a.tar");
+        let (got, probes) = with_close_probes(|_| true, || publish(&url, &opts, &req));
+        got.unwrap_or_else(|e| panic!("{scheme}: {e}"));
+        assert!(
+            probes
+                .iter()
+                .any(|(p, _)| *p == sidecar.canonicalize().unwrap()),
+            "{scheme}: the index was read through a managed reader: {probes:?}"
+        );
+        assert!(
+            probes
+                .iter()
+                .any(|(p, _)| *p == tar.canonicalize().unwrap()),
+            "{scheme}: the staged archive was read through a managed reader: {probes:?}"
+        );
+        assert!(probes.iter().all(|(_, kept)| *kept), "{scheme}: {probes:?}");
+        let puts = server
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(m, _, _)| m == "PUT")
+            .count();
+        assert!(puts >= 2, "{scheme}: archive and pointer were put");
+        assert!(
+            other_process_sees_lock(&sidecar),
+            "{scheme}: session A's lock on the index survived the publish"
+        );
+        drop(session);
+    }
+
+    /// Regression: (R11-S7-FIX2, #151): the Hub live commit exported the staged
+    /// `.tar.zst`'s `zstdblocks` through `export_zstd_blocks`, a raw `File`
+    /// whose close released every POSIX lock this process held on the file.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_zstd_blocks_keep_staged_lock() {
+        use ratarmount_index::managed_read::{lock_probe::other_process_sees_lock, VfsLockHolder};
+        let dir = tempfile::tempdir().unwrap();
+        let zst = dir.path().join("a.tar.zst");
+        let mut body = Vec::new();
+        for chunk in [&b"first frame"[..], &b"second frame"[..]] {
+            body.extend(zstd::encode_all(chunk, 3).unwrap());
+        }
+        std::fs::write(&zst, body).unwrap();
+        let holder = VfsLockHolder::shared(&zst).unwrap();
+        assert!(other_process_sees_lock(&zst));
+        let blocks = staged_zstd_blocks(&zst).unwrap();
+        assert!(
+            other_process_sees_lock(&zst),
+            "the zstdblocks export kept this process's lock on the staged file"
+        );
+        drop(holder);
+        let want: Vec<(i64, i64)> = ratarmount_compress::export_zstd_blocks(&zst)
+            .unwrap()
+            .into_iter()
+            .map(|(c, d)| (c as i64, d as i64))
+            .collect();
+        assert_eq!(blocks, want);
+        assert_eq!(
+            blocks.len(),
+            3,
+            "two frames and the EOF sentinel: {blocks:?}"
+        );
+    }
+
+    /// Regression: (R11-S7, #151): the S3 live commit read the staged archive
+    /// (single PutObject body) and the mount's index (pointer hash, sibling
+    /// body) through raw `File`s.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_s3_reads_keep_index_lock() {
+        s7_object_store_publish("s3", publish_s3);
+    }
+
+    /// Regression: (R11-S7-FIX12, #151): the S3 single PutObject body was read
+    /// with `std::fs::read`, whose close released every POSIX lock this
+    /// process held on the staged archive. The test above still passed with
+    /// that raw read (other managed reads of the archive satisfied its probe
+    /// and nothing locked the archive), so this one holds a lock on the
+    /// staged archive, takes the single-PUT path with no sidecar (no other
+    /// read of the archive), and checks that the lock survives and the PUT
+    /// carried the archive's bytes.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_s3_single_put_body_keeps_archive_lock() {
+        use crate::publish_index::tests::{publish_tar, PublishEnv, PublishServer};
+        use ratarmount_index::managed_read::{lock_probe::other_process_sees_lock, VfsLockHolder};
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("a.tar");
+        std::fs::write(&tar, publish_tar()).unwrap();
+        let server = PublishServer::new(publish_tar(), false, false);
+        let _env = PublishEnv::new(&[
+            ("AWS_ACCESS_KEY_ID", "test"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_ENDPOINT_URL", &server.url),
+            ("AWS_REGION", "us-east-1"),
+            ("RATARMOUNT_S3_ANONYMOUS", "0"),
+            ("AWS_ANONYMOUS", "0"),
+        ]);
+        let stats = ratarmount_index::tar_stats_from_path(&tar).unwrap();
+        let req = RemotePublishRequest {
+            staged: tar.clone(),
+            prefix_compressed_bytes: 0,
+            etag_at_download: None,
+            window: ratarmount_compositing::IndexPatchWindow {
+                window_start: 0,
+                from_frame: None,
+                offsets_shifted: false,
+            },
+            skip_object_put: false,
+            presplice_len: stats.st_size,
+            presplice_sha256: stats.full_sha256.clone().unwrap(),
+            presplice_prefix512_sha256: stats.prefix512_sha256.clone().unwrap(),
+            presplice_suffix512_sha256: stats.suffix512_sha256.clone().unwrap(),
+            commit_generation: 1,
+        };
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let holder = VfsLockHolder::shared(&tar).unwrap();
+        assert!(other_process_sees_lock(&tar));
+        publish_s3("s3://bucket/a.tar", &opts, &req).unwrap();
+        assert!(
+            other_process_sees_lock(&tar),
+            "the single-PUT body read kept this process's lock on the staged archive"
+        );
+        drop(holder);
+        let state = server.state.lock().unwrap();
+        let puts: Vec<_> = state
+            .requests
+            .iter()
+            .filter(|(m, _, _)| m == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 1, "one PutObject, no pointer: {puts:?}");
+        assert_eq!(
+            puts[0].2,
+            publish_tar(),
+            "the PUT body is the staged archive"
+        );
+    }
+
+    /// Regression: (R11-S7, #151): the GCS live commit read the staged archive
+    /// (MD5 + body) and the index blob through raw `File`s.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_gcs_reads_keep_index_lock() {
+        s7_object_store_publish("gs", publish_gcs);
+    }
+
+    /// Regression: (R11-S7, #151): the Azure live commit read the staged archive
+    /// and the index (pointer hash, sibling body) through raw `File`s.
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_azure_reads_keep_index_lock() {
+        s7_object_store_publish("az", publish_azure);
+    }
+
+    /// Regression: (R11-S7, #151): the Hub live commit read the fresh sidecar's
+    /// body and the staged archive (pointer tarstats, LFS upload) through raw
+    /// `File`s; every managed read keeps a lock taken on the file it reads.
+    /// R11-S7-FIX14: the close probes alone were satisfied by the pointer
+    /// hash's read of the sidecar, so a raw body read after it passed; a lock
+    /// is now held on the sidecar from its first managed open to the end of
+    /// the tick and probed at every later managed open of another file (the
+    /// LFS upload's open of the staged archive comes after the body read).
+    #[cfg(unix)]
+    #[test]
+    fn regression_live_commit_hf_reads_keep_index_lock() {
+        use crate::publish_index::tests::{PublishEnv, PublishServer};
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        use ratarmount_index::managed_read::{seams, Seam, VfsLockHolder};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let dir = tempfile::tempdir().unwrap();
+        let server = PublishServer::live(hf_test_archive(true));
+        let _env = PublishEnv::new(&[
+            ("HF_ENDPOINT", &server.url),
+            ("HF_TOKEN", "hf-test"),
+            ("HF_HUB_OFFLINE", "0"),
+            ("RATARMOUNT_HF_SHARE_CACHE", "0"),
+            ("RATARMOUNT_PAYLOAD_CACHE_BYTES", "0"),
+            ("XDG_CACHE_HOME", dir.path().join("cache").to_str().unwrap()),
+            (
+                "RATARMOUNT_HF_TREE_CACHE",
+                dir.path().join("trees").to_str().unwrap(),
+            ),
+        ]);
+        let url = "hf://datasets/org/data@main/a.tar.zst";
+        let overlay = hf_test_overlay(url, &dir.path().join("ov"), false);
+        std::fs::write(overlay.root().join("hello.txt"), b"new bytes").unwrap();
+        // Every managed open takes a lock that its close is probed against
+        // (`with_close_probes`); the sidecar's first open also takes one held
+        // to the end of the tick, probed at each later open of another file.
+        type Held = Rc<RefCell<Vec<(PathBuf, VfsLockHolder)>>>;
+        let per_open: Held = Rc::default();
+        let sidecar: Held = Rc::default();
+        let closes: Rc<RefCell<Vec<(PathBuf, bool)>>> = Rc::default();
+        let later: Rc<RefCell<Vec<(PathBuf, bool)>>> = Rc::default();
+        let (h2, s2, c2, l2) = (
+            Rc::clone(&per_open),
+            Rc::clone(&sidecar),
+            Rc::clone(&closes),
+            Rc::clone(&later),
+        );
+        let got = seams::with(
+            move |s| {
+                let Some(path) = seams::opened_path() else {
+                    return Ok(());
+                };
+                match s {
+                    Seam::AfterOpen => {
+                        let mut held = s2.borrow_mut();
+                        match held.first() {
+                            None if path.file_name().is_some_and(|n| n == "index.sqlite") => {
+                                held.push((path.clone(), VfsLockHolder::shared(&path)?));
+                            }
+                            Some((index, _)) if *index != path => {
+                                l2.borrow_mut()
+                                    .push((path.clone(), other_process_sees_lock(index)));
+                            }
+                            _ => {}
+                        }
+                        h2.borrow_mut()
+                            .push((path.clone(), VfsLockHolder::shared(&path)?));
+                    }
+                    Seam::AfterClose => {
+                        let mut held = h2.borrow_mut();
+                        if let Some(i) = held.iter().rposition(|(p, _)| *p == path) {
+                            let (p, lock) = held.remove(i);
+                            c2.borrow_mut()
+                                .push((p.clone(), other_process_sees_lock(&p)));
+                            drop(lock);
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+            || hf_test_tick(&overlay, url),
+        );
+        per_open.borrow_mut().clear();
+        sidecar.borrow_mut().clear();
+        assert_eq!(got.unwrap(), CommitOutcome::DidWork);
+        let closes = closes.borrow();
+        assert!(
+            closes
+                .iter()
+                .any(|(p, _)| p.file_name().unwrap() == "index.sqlite"),
+            "the sidecar was read through a managed reader: {closes:?}"
+        );
+        assert!(closes.iter().all(|(_, kept)| *kept), "{closes:?}");
+        let later = later.borrow();
+        assert!(
+            !later.is_empty(),
+            "a managed open (the LFS upload) follows the sidecar body read"
+        );
+        assert!(
+            later.iter().all(|(_, kept)| *kept),
+            "the sidecar body read kept this process's lock on the sidecar: {later:?}"
+        );
     }
 }
 

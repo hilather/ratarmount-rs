@@ -143,36 +143,66 @@ fn header(mode: u32, mtime: i64, size: u64, kind: tar::EntryType) -> tar::Header
     h
 }
 
-/// Copy of the layer database with credentials removed from its URL-bearing
-/// `meta` values, or `None` when it already holds none. The source is only
-/// read (immutable, read-only); the copy lives in `staging`.
-fn sanitized_db(
+/// Copy of the layer database, with credentials removed from its URL-bearing
+/// `meta` values. The bundle's database member is always this copy, made by
+/// SQLite (`VACUUM INTO`) in `staging`, never the live file read through a
+/// descriptor of our own: closing that would release every fcntl lock this
+/// process holds on the database (#156). The source is only read (immutable,
+/// read-only); the copy is opened again without `SQLITE_OPEN_CREATE`.
+fn staged_db(
     directory: &Path,
     staging: &Path,
     meta: &OverlayMeta,
     packed: &OverlayMeta,
-) -> io::Result<Option<PathBuf>> {
-    let clean = packed.redacted_values();
-    if &clean == meta.values() {
-        return Ok(None);
-    }
-    let source = directory.join(HIDDEN_DB).canonicalize()?;
-    let mut uri =
-        url::Url::from_file_path(&source).map_err(|()| invalid("invalid database path"))?;
-    uri.set_query(Some("mode=ro&immutable=1"));
-    let conn = ratarmount_compositing::open_overlay_db(
+    previously_required: bool,
+) -> io::Result<PathBuf> {
+    // The overlay's own name (the open classifies it with its markers); the
+    // checked open resolves the directory and builds the immutable URI.
+    let source = directory.join(HIDDEN_DB);
+    #[cfg(test)]
+    run_pack_record_hook(&BEFORE_STAGED_DB_ACQUIRE);
+    let conn = ratarmount_compositing::open_overlay_db_with_required_record(
         &source,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        ratarmount_compositing::DbName::Uri(uri.as_str()),
+        ratarmount_compositing::DbName::Immutable,
+        previously_required,
     )?;
+    let required = previously_required || conn.required_record();
     // VACUUM INTO opens its target with this connection's flags, so NOFOLLOW
     // rejects a symlink in any component of the staging path (every macOS temp
     // dir lives under /var -> /private/var): hand SQLite the resolved path.
     let copy = staging.canonicalize()?.join(HIDDEN_DB);
-    conn.execute("VACUUM INTO ?1", [copy.to_string_lossy().as_ref()])
-        .map_err(io::Error::other)?;
+    ratarmount_index::vacuum_into(&conn, &copy).map_err(io::Error::other)?;
     drop(conn);
-    let conn = rusqlite::Connection::open(&copy).map_err(io::Error::other)?;
+    // VACUUM INTO cannot run inside a transaction. Validate the snapshot it
+    // actually made before redaction or publication, retaining the operation's
+    // requirement even when the source's markers disappeared between opens.
+    let validation = (|| {
+        let snapshot = rusqlite::Connection::open_with_flags(
+            &copy,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(io::Error::other)?;
+        OverlayMeta::from_connection_required(&snapshot, required)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| invalid("overlay snapshot has no metadata"))?;
+        Ok::<_, io::Error>(())
+    })();
+    if let Err(error) = validation {
+        let _ = fs::remove_file(&copy);
+        return Err(error);
+    }
+    let clean = packed.redacted_values();
+    if &clean == meta.values() {
+        return Ok(copy);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &copy,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(io::Error::other)?;
     // Overwrite freed pages and compact, so the old text is not left behind.
     conn.execute_batch("PRAGMA secure_delete=ON;")
         .map_err(io::Error::other)?;
@@ -193,7 +223,7 @@ fn sanitized_db(
     }
     conn.execute_batch("VACUUM;").map_err(io::Error::other)?;
     drop(conn);
-    Ok(Some(copy))
+    Ok(copy)
 }
 
 fn append_host<W: Write>(
@@ -242,13 +272,22 @@ fn append_host<W: Write>(
             )
         }
         0o100000 => {
-            let mut file = match replacement {
-                Some(copy) => File::open(copy)?,
-                None => File::from(openat_admitted(&fd, name.as_str(), regular_flags())?),
-            };
             h.set_entry_type(tar::EntryType::Regular);
-            h.set_size(file.metadata()?.len());
-            tar.append_data(&mut h, archive_path, &mut file)
+            match replacement {
+                // The layer database's SQLite snapshot, read through a managed
+                // reader (#151): its close keeps this process's locks.
+                Some(copy) => {
+                    let mut file = ratarmount_index::managed_read::ManagedReadCursor::open(copy)?;
+                    h.set_size(file.len()?);
+                    tar.append_data(&mut h, archive_path, &mut file)
+                }
+                None => {
+                    let mut file =
+                        File::from(openat_admitted(&fd, name.as_str(), regular_flags())?);
+                    h.set_size(file.metadata()?.len());
+                    tar.append_data(&mut h, archive_path, &mut file)
+                }
+            }
         }
         _ => Err(invalid(format!("unsupported layer entry {path}"))),
     }
@@ -268,7 +307,7 @@ pub fn pack(
     options: &PackOptions,
 ) -> io::Result<String> {
     let root = open_root(directory)?;
-    let meta = checked_meta(directory)?;
+    let (meta, required) = checked_meta_with_requirement(directory)?;
     let digest = meta.get("layer_digest").expect("checked digest").to_owned();
     let output_parent = bundle
         .parent()
@@ -313,7 +352,7 @@ pub fn pack(
         Some(rows) => meta.with_rows(rows),
         None => meta.clone(),
     };
-    let sanitized = sanitized_db(directory, staging.path(), &meta, &packed)?;
+    let staged = staged_db(directory, staging.path(), &meta, &packed, required)?;
     {
         let mut tar = tar::Builder::new(BufWriter::new(&mut plain));
         // Top-level members and all layer entries use bytewise sorted paths.
@@ -321,8 +360,20 @@ pub fn pack(
             // The local archive the classified base is (None for any other kind).
             if let Some(base) = options.base.as_deref().filter(|p| p.is_file()) {
                 let index = ratarmount_index::default_index_path(base);
-                if index.is_file() {
-                    let file = File::from(host::open(&index, regular_flags(), Mode::empty())?);
+                // `symlink_metadata`: a symlinked (or dangling) index reaches
+                // the snapshot, which refuses it by name, instead of being
+                // followed here or skipped silently.
+                if std::fs::symlink_metadata(&index).is_ok() {
+                    // A SQLite copy, never the live file read through a
+                    // descriptor of our own: a session of this process may
+                    // hold the index open, and that close would release its
+                    // locks (#156). The snapshot refuses a symlink (also one
+                    // substituted after this check) and an index it could
+                    // not copy without a raw read of the live files.
+                    let copy = staging.path().canonicalize()?.join("index.sqlite");
+                    ratarmount_index::snapshot_index_into(&index, &copy)?;
+                    // Its bytes through a managed reader (#151).
+                    let file = ratarmount_index::managed_read::ManagedReadCursor::open(&copy)?;
                     let name = format!(
                         "index/{}",
                         index
@@ -330,7 +381,7 @@ pub fn pack(
                             .ok_or_else(|| invalid("index name"))?
                             .to_string_lossy()
                     );
-                    let mut h = header(0o444, 0, file.metadata()?.len(), tar::EntryType::Regular);
+                    let mut h = header(0o444, 0, file.len()?, tar::EntryType::Regular);
                     tar.append_data(&mut h, name, file)?;
                 }
             }
@@ -349,9 +400,7 @@ pub fn pack(
         }
         append_host(&mut tar, &root, "", None)?;
         for path in paths {
-            let replacement = (path == HIDDEN_DB)
-                .then_some(sanitized.as_deref())
-                .flatten();
+            let replacement = (path == HIDDEN_DB).then_some(staged.as_path());
             append_host(&mut tar, &root, &path, replacement)?;
         }
         manifest.rewind()?;
@@ -544,14 +593,22 @@ fn bundle_meta(bundle: &Path, limits: Limits) -> io::Result<BTreeMap<String, Str
 }
 
 fn checked_meta(directory: &Path) -> io::Result<OverlayMeta> {
-    let meta = immutable_meta(directory)?;
+    checked_meta_with_requirement(directory).map(|(meta, _)| meta)
+}
+
+fn checked_meta_with_requirement(directory: &Path) -> io::Result<(OverlayMeta, bool)> {
+    let (meta, required) = immutable_meta_with_requirement(directory)?;
     if !sentinel_matches(directory, meta.get("layer_digest").expect("checked digest"))? {
         return Err(invalid("sentinel digest does not match metadata"));
     }
-    Ok(meta)
+    Ok((meta, required))
 }
 
 fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
+    immutable_meta_with_requirement(directory).map(|(meta, _)| meta)
+}
+
+fn immutable_meta_with_requirement(directory: &Path) -> io::Result<(OverlayMeta, bool)> {
     let root = open_root(directory)?;
     // A stat, never an open: closing a descriptor of the database would
     // release this process's fcntl locks on it (R7-H1, R10-FIX9).
@@ -560,17 +617,16 @@ fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(invalid("layer database is not a regular file"));
     }
-    // URL encoding prevents SQLite URI syntax in a host filename from changing
-    // the immutable/read-only parameters.
-    let db = directory.join(HIDDEN_DB).canonicalize()?;
-    let mut uri = url::Url::from_file_path(&db).map_err(|()| invalid("invalid database path"))?;
-    uri.set_query(Some("mode=ro&immutable=1"));
+    // The checked open percent-encodes the path into the immutable URI, so
+    // SQLite URI syntax in a host filename cannot change its parameters.
     let conn = ratarmount_compositing::open_overlay_db(
-        &db,
+        &directory.join(HIDDEN_DB),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        ratarmount_compositing::DbName::Uri(uri.as_str()),
+        ratarmount_compositing::DbName::Immutable,
     )?;
-    let meta = OverlayMeta::from_connection(&conn)
+    #[cfg(test)]
+    run_pack_record_hook(&AFTER_IMMUTABLE_META_ACQUIRE);
+    let meta = OverlayMeta::from_opened(&conn)
         .map_err(io::Error::other)?
         .filter(OverlayMeta::layer_sealed)
         .ok_or_else(|| invalid("overlay is not sealed"))?;
@@ -579,7 +635,25 @@ fn immutable_meta(directory: &Path) -> io::Result<OverlayMeta> {
         .ok_or_else(|| invalid("missing layer_digest"))?;
     valid_digest(digest)?;
     check_hash_format(|key| meta.get(key))?;
-    Ok(meta)
+    Ok((meta, conn.required_record()))
+}
+
+#[cfg(test)]
+type PackRecordHook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_IMMUTABLE_META_ACQUIRE: PackRecordHook = const { std::cell::RefCell::new(None) };
+    static BEFORE_STAGED_DB_ACQUIRE: PackRecordHook = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_pack_record_hook(hook: &'static std::thread::LocalKey<PackRecordHook>) {
+    // Take before calling: the callback may open another database itself.
+    let callback = hook.with(|slot| slot.borrow_mut().take());
+    if let Some(callback) = callback {
+        callback();
+    }
 }
 
 fn sentinel_matches(directory: &Path, digest: &str) -> io::Result<bool> {
@@ -1335,13 +1409,20 @@ fn finalize_stage(directory: &Path, recorded: Recorded) -> io::Result<()> {
     let root = open_root(directory)?;
     for (path, mode) in &recorded.files {
         let (fd, name) = parent(&root, path, false)?;
-        let child = host::openat(
+        let name = std::ffi::CString::new(name).map_err(|_| invalid("NUL in member path"))?;
+        let stat = ratarmount_compositing::host_stat::statat(
             &fd,
-            name.as_str(),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
+            name.as_c_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
         )?;
-        host::fchmod(&child, Mode::from_raw_mode(raw_mode(mode & !0o222)))?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        // Never a data descriptor (#149): its close would release this
+        // process's locks on a database open in it.
+        ratarmount_compositing::host_stat::chmod_entry_at(&fd, &name, &stat, |_| {
+            raw_mode(mode & !0o222)
+        })?;
     }
     // Children first, so sealed parent permissions never obstruct this walk.
     for (path, (mode, mtime)) in recorded.directories.into_iter().rev() {
@@ -1764,9 +1845,7 @@ pub(crate) mod tests {
             .unwrap();
         let meta = OverlayMeta::from_connection(&conn).unwrap().unwrap();
         drop(conn);
-        let copy = sanitized_db(&dir, &link.join("stage"), &meta, &meta)
-            .unwrap()
-            .unwrap();
+        let copy = staged_db(&dir, &link.join("stage"), &meta, &meta, false).unwrap();
         let bytes = fs::read(copy).unwrap();
         assert!(!bytes.windows(6).any(|w| w == b"s3cr3t"));
     }
@@ -1895,9 +1974,11 @@ pub(crate) mod tests {
             fs::read_link(restored.join("link")).unwrap(),
             Path::new("../outside")
         );
+        // The member is a copy SQLite made (#156): the same rows, not
+        // necessarily the same bytes.
         assert_eq!(
-            fs::read(restored.join(HIDDEN_DB)).unwrap(),
-            fs::read(f.dir.join(HIDDEN_DB)).unwrap()
+            db_rows(&restored.join(HIDDEN_DB)),
+            db_rows(&f.dir.join(HIDDEN_DB))
         );
         assert_eq!(
             fs::metadata(restored.join("sub/file"))
@@ -2120,6 +2201,477 @@ pub(crate) mod tests {
             assert!(paths.iter().any(|p| p == name), "{paths:?}");
         }
         assert!(!paths.iter().any(|p| omitted(p)));
+    }
+
+    /// Every row of every table of the database at `path` (read-only), by
+    /// table name, rows sorted.
+    fn db_rows(path: &Path) -> BTreeMap<String, Vec<Vec<String>>> {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut statement = conn
+                    .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
+                    .unwrap();
+                let columns = statement.column_count();
+                let mut rows: Vec<Vec<String>> = statement
+                    .query_map([], |r| {
+                        (0..columns)
+                            .map(|i| r.get_ref(i).map(|v| format!("{v:?}")))
+                            .collect()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                rows.sort();
+                (table, rows)
+            })
+            .collect()
+    }
+
+    fn with_pack_record_hook<T>(
+        hook: &'static std::thread::LocalKey<PackRecordHook>,
+        callback: impl FnOnce() + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore {
+            hook: &'static std::thread::LocalKey<PackRecordHook>,
+            previous: Option<Box<dyn FnOnce()>>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                self.hook.with(|slot| {
+                    *slot.borrow_mut() = self.previous.take();
+                });
+            }
+        }
+        let _restore = Restore {
+            hook,
+            previous: hook.with(|slot| slot.replace(Some(Box::new(callback)))),
+        };
+        run()
+    }
+
+    const PACK_NO_FILES_TABLE: &str =
+        "the overlay database has no files table (the record of a used overlay is lost)";
+    const PACK_USED_MARKERS: [&str; 2] = [
+        ".ratarmount-overlay.used",
+        ".ratarmount.overlay.sqlite.used",
+    ];
+
+    fn prepare_record_loss(f: &Fixture) {
+        // Corruption must work without root, and production must leave these
+        // deliberately prepared modes unchanged after refusing.
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(f.dir.join(HIDDEN_DB), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(PACK_USED_MARKERS
+            .iter()
+            .any(|name| f.dir.join(name).exists()));
+    }
+
+    fn lose_pack_record(directory: &Path, remove_markers: bool, table: &str) {
+        if remove_markers {
+            for name in PACK_USED_MARKERS {
+                match fs::remove_file(directory.join(name)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("remove marker {name}: {error}"),
+                }
+            }
+        }
+        // An independent connection to the same nonempty inode.
+        let other = rusqlite::Connection::open(directory.join(HIDDEN_DB)).unwrap();
+        other
+            .execute_batch(match table {
+                "files" => "DROP TABLE files",
+                "meta" => "DROP TABLE meta",
+                _ => unreachable!("only record tables are corrupted"),
+            })
+            .unwrap();
+    }
+
+    fn record_modes(directory: &Path) -> BTreeMap<PathBuf, u32> {
+        fn collect(root: &Path, path: &Path, modes: &mut BTreeMap<PathBuf, u32>) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            modes.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                metadata.mode() & 0o7777,
+            );
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    collect(root, &entry.unwrap().path(), modes);
+                }
+            }
+        }
+        let mut modes = BTreeMap::new();
+        collect(directory, directory, &mut modes);
+        modes
+    }
+
+    fn assert_pack_record_loss_preserved(
+        f: &Fixture,
+        mut rows: BTreeMap<String, Vec<Vec<String>>>,
+        mut modes: BTreeMap<PathBuf, u32>,
+        sentinel: &[u8],
+        remove_markers: bool,
+        lost_table: &str,
+    ) {
+        rows.remove(lost_table);
+        assert_eq!(db_rows(&f.dir.join(HIDDEN_DB)), rows);
+        if remove_markers {
+            for name in PACK_USED_MARKERS {
+                modes.remove(Path::new(name));
+            }
+        }
+        assert_eq!(record_modes(&f.dir), modes);
+        assert_eq!(fs::read(f.dir.join(SENTINEL)).unwrap(), sentinel);
+    }
+
+    /// Regression: removing markers after the immutable metadata acquisition
+    /// weakened pack's required-record read, accepting a lost files table.
+    #[test]
+    fn regression_pack_required_record_marker_removal_refuses() {
+        for public_pack in [false, true] {
+            let f = Fixture::new(true);
+            prepare_record_loss(&f);
+            let rows = db_rows(&f.dir.join(HIDDEN_DB));
+            let modes = record_modes(&f.dir);
+            let sentinel = fs::read(f.dir.join(SENTINEL)).unwrap();
+            let output = f.tmp.path().join("output");
+            fs::create_dir(&output).unwrap();
+            let bundle = output.join("refused.tar.zst");
+            let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+            let count = fired.clone();
+            let directory = f.dir.clone();
+            let error = with_pack_record_hook(
+                &AFTER_IMMUTABLE_META_ACQUIRE,
+                move || {
+                    count.set(count.get() + 1);
+                    lose_pack_record(&directory, true, "files");
+                },
+                || {
+                    if public_pack {
+                        pack(&f.dir, &bundle, f.base.clone(), &PackOptions::default()).map(|_| ())
+                    } else {
+                        immutable_meta(&f.dir).map(|_| ())
+                    }
+                },
+            )
+            .unwrap_err();
+            assert_eq!(fired.get(), 1, "the caller acquisition hook ran once");
+            assert_eq!(error.to_string(), PACK_NO_FILES_TABLE);
+            assert_pack_record_loss_preserved(&f, rows, modes, &sentinel, true, "files");
+            assert!(!bundle.exists());
+            assert_eq!(fs::read_dir(&output).unwrap().count(), 0, "no staging");
+        }
+    }
+
+    /// Regression: pack's later source acquisition/snapshot forgot the
+    /// earlier required record, publishing a snapshot without files.
+    /// A snapshot with a lost metadata table must also refuse publication.
+    #[test]
+    fn regression_pack_required_record_lost_before_snapshot_refuses() {
+        for (remove_markers, table) in [(false, "files"), (true, "files"), (false, "meta")] {
+            let f = Fixture::new(true);
+            prepare_record_loss(&f);
+            let rows = db_rows(&f.dir.join(HIDDEN_DB));
+            let modes = record_modes(&f.dir);
+            let sentinel = fs::read(f.dir.join(SENTINEL)).unwrap();
+            let output = f.tmp.path().join("output");
+            fs::create_dir(&output).unwrap();
+            let bundle = output.join("refused.tar.zst");
+            let fired = std::rc::Rc::new(std::cell::Cell::new(0));
+            let count = fired.clone();
+            let directory = f.dir.clone();
+            let error = with_pack_record_hook(
+                &BEFORE_STAGED_DB_ACQUIRE,
+                move || {
+                    count.set(count.get() + 1);
+                    lose_pack_record(&directory, remove_markers, table);
+                },
+                || pack(&f.dir, &bundle, f.base.clone(), &PackOptions::default()),
+            )
+            .unwrap_err();
+            assert_eq!(fired.get(), 1, "the later source acquisition was reached");
+            assert_eq!(
+                error.to_string(),
+                if table == "files" {
+                    PACK_NO_FILES_TABLE
+                } else {
+                    "overlay snapshot has no metadata"
+                }
+            );
+            assert_pack_record_loss_preserved(&f, rows, modes, &sentinel, remove_markers, table);
+            assert!(!bundle.exists());
+            assert_eq!(fs::read_dir(&output).unwrap().count(), 0, "stage cleaned");
+        }
+    }
+
+    /// Regression: append_host's ordinary payload path must retain admission
+    /// of a registered database alias before any data descriptor is opened.
+    #[test]
+    fn regression_pack_payload_db_alias_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = temp.path().join("layer");
+        fs::create_dir(&layer).unwrap();
+        let database = temp.path().join("held.sqlite");
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (x); INSERT INTO files VALUES (1)")
+            .unwrap();
+        fs::hard_link(&database, layer.join("payload")).unwrap();
+        let holder = ratarmount_compositing::open_overlay_db(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            ratarmount_compositing::DbName::Path,
+        )
+        .unwrap();
+        holder.execute_batch("BEGIN; SELECT * FROM files").unwrap();
+        assert!(other_process_sees_lock(&database));
+        let root = open_root(&layer).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let error = append_host(&mut builder, &root, "payload", None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(other_process_sees_lock(&database), "holder lock retained");
+        holder.execute_batch("COMMIT").unwrap();
+    }
+
+    /// Regression: finalization opened a data descriptor just to chmod a
+    /// staged alias, releasing an independently held database's SHARED lock.
+    #[test]
+    fn regression_finalize_stage_chmod_keeps_db_alias_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        let database = temp.path().join("held.sqlite");
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1)")
+            .unwrap();
+        let alias = stage.join("alias");
+        fs::hard_link(&database, &alias).unwrap();
+        let before = fs::metadata(&alias).unwrap();
+        let holder = rusqlite::Connection::open(&database).unwrap();
+        holder.execute_batch("BEGIN; SELECT * FROM t").unwrap();
+        assert!(other_process_sees_lock(&database));
+        finalize_stage(
+            &stage,
+            Recorded {
+                files: [("alias".into(), 0o666)].into(),
+                directories: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        let after = fs::metadata(&alias).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.mode() & 0o777, 0o444);
+        assert!(other_process_sees_lock(&database), "chmod kept the lock");
+        drop(holder);
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// Set by [`other_process_sees_lock`] for the child it spawns.
+    const GETLK_PROBE_ENV: &str = "RATARMOUNT_TEST_PACK_GETLK_PROBE";
+
+    /// The child half of [`other_process_sees_lock`]: `F_GETLK` for a write
+    /// lock over SQLite's lock bytes (PENDING, RESERVED and the SHARED range
+    /// at `0x40000000`) on a read-only descriptor. A no-op unless spawned.
+    #[test]
+    fn pack_getlk_probe_child() {
+        use std::os::fd::AsRawFd;
+        let Some(db) = std::env::var_os(GETLK_PROBE_ENV) else {
+            return;
+        };
+        let file = File::open(db).unwrap();
+        // SAFETY: a zeroed `flock` is a valid argument; F_GETLK only fills it.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        lock.l_start = 0x4000_0000;
+        lock.l_len = 512;
+        // SAFETY: `file` is open and `lock` lives across the call.
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) },
+            0,
+            "F_GETLK: {}",
+            io::Error::last_os_error()
+        );
+        // `F_UNLCK` is a `c_short` on Apple platforms, a `c_int` on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        let unlocked = i32::from(lock.l_type) == libc::F_UNLCK as i32;
+        println!("GETLK:{}", if unlocked { "unlocked" } else { "locked" });
+    }
+
+    /// Does another process see any SQLite lock this process holds on `db`
+    /// (SHARED included, which `BEGIN IMMEDIATE` cannot see; read-only files
+    /// too)? The child must exit successfully.
+    fn other_process_sees_lock(db: &Path) -> bool {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "overlay_pack::tests::pack_getlk_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(GETLK_PROBE_ENV, db)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "probe child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if stdout.contains("GETLK:locked") {
+            return true;
+        }
+        assert!(stdout.contains("GETLK:unlocked"), "probe child: {stdout}");
+        false
+    }
+
+    /// Regression: (#156): `overlay pack` read the layer database through a
+    /// descriptor of its own whenever no credential had to be redacted;
+    /// closing it released every fcntl lock this process held on the database
+    /// (here a plain read transaction of another connection, so another
+    /// process could write under it). The database member is now always a
+    /// copy SQLite makes in the staging directory, and the bundle still
+    /// unpacks and verifies.
+    #[test]
+    fn regression_pack_keeps_in_process_db_lock() {
+        let f = Fixture::new(true);
+        let db = f.dir.join(HIDDEN_DB);
+        // A sealed layer (database and directory) is read-only, so the holder
+        // only reads; the index test below has a holder that writes after.
+        let holder =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        holder
+            .execute_batch("BEGIN; SELECT count(*) FROM files;")
+            .unwrap();
+        assert!(other_process_sees_lock(&db), "the holder's SHARED lock");
+        let bundle = f.tmp.path().join("held.tar.zst");
+        pack(&f.dir, &bundle, f.base.clone(), &PackOptions::default()).unwrap();
+        assert!(
+            other_process_sees_lock(&db),
+            "pack's read of the database released the holder's lock"
+        );
+        holder
+            .execute_batch("SELECT count(*) FROM files; COMMIT;")
+            .unwrap();
+        drop(holder);
+        let report = unpack(&bundle, &f.tmp.path().join("held-restored")).unwrap();
+        assert!(report.ok && report.verified);
+    }
+
+    /// Regression: (#156): `overlay pack --include-index` read the base's
+    /// index through a descriptor of its own; closing it released every
+    /// fcntl lock this process held on the index, a session's included (a
+    /// WAL connection keeps SHARED on the file for its whole life, which is
+    /// what stops another process from checkpointing and deleting the WAL
+    /// under it). The member is now a `VACUUM INTO` copy with the same rows.
+    #[test]
+    fn regression_pack_include_index_keeps_session_lock() {
+        let f = Fixture::new(true);
+        let base = f.tmp.path().join("base.tar");
+        let mut tar = tar::Builder::new(File::create(&base).unwrap());
+        append_bytes(&mut tar, "hello", b"base").unwrap();
+        tar.finish().unwrap();
+        let index = ratarmount_index::default_index_path(&base);
+        ratarmount_session::IndexJob::run(
+            crate::shard::index_request(&base, &index),
+            Default::default(),
+        )
+        .unwrap();
+        let holder = rusqlite::Connection::open(&index).unwrap();
+        let rows: i64 = holder
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert!(other_process_sees_lock(&index), "the session's SHARED lock");
+        let bundle = f.tmp.path().join("indexed.tar.zst");
+        pack(
+            &f.dir,
+            &bundle,
+            f.base.clone(),
+            &PackOptions {
+                include_index: true,
+                base: Some(base.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            other_process_sees_lock(&index),
+            "pack's read of the index released the session's lock"
+        );
+        holder
+            .execute_batch("CREATE TABLE after_pack (x); DROP TABLE after_pack;")
+            .unwrap();
+        let body = ratarmount_compress::open_seekable_zstd(&bundle).unwrap();
+        let mut archive = tar::Archive::new(body.open_reader().unwrap());
+        let shipped = f.tmp.path().join("shipped.sqlite");
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().to_string_lossy() == "index/base.tar.index.sqlite" {
+                io::copy(&mut entry, &mut File::create(&shipped).unwrap()).unwrap();
+            }
+        }
+        let copy = rusqlite::Connection::open(&shipped).unwrap();
+        let copied: i64 = copy
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(copied, rows);
+    }
+
+    /// Regression: (R11-S5-FIX7): `--include-index` tested the index with
+    /// `is_file()`, which follows a symlink, so a dangling symlinked index was
+    /// skipped without a word. A symlink at the index name (dangling or not)
+    /// now reaches the snapshot, which refuses it by name.
+    #[cfg(unix)]
+    #[test]
+    fn regression_pack_include_index_refuses_symlinked_index() {
+        let f = Fixture::new(true);
+        let base = f.tmp.path().join("base.tar");
+        let mut tar = tar::Builder::new(File::create(&base).unwrap());
+        append_bytes(&mut tar, "hello", b"base").unwrap();
+        tar.finish().unwrap();
+        let index = ratarmount_index::default_index_path(&base);
+        let real = f.tmp.path().join("real.index.sqlite");
+        rusqlite::Connection::open(&real)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x);")
+            .unwrap();
+        for target in [real.clone(), f.tmp.path().join("missing.sqlite")] {
+            let _ = std::fs::remove_file(&index);
+            std::os::unix::fs::symlink(&target, &index).unwrap();
+            let bundle = f.tmp.path().join("symlinked.tar.zst");
+            let err = pack(
+                &f.dir,
+                &bundle,
+                f.base.clone(),
+                &PackOptions {
+                    include_index: true,
+                    base: Some(base.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not a regular file"),
+                "{}: {err:#}",
+                target.display()
+            );
+            assert!(!bundle.exists());
+        }
     }
 
     /// Re-tar `bundle` with the payload of one member replaced (same seal
@@ -3896,5 +4448,60 @@ pub(crate) mod tests {
             Err("stop".into())
         });
         assert!(reached.get(), "a local recorded base must be classified");
+    }
+
+    /// Regression: (R11-S7, #151): the bundle's database member (the layer
+    /// database's `VACUUM INTO` copy) and the `--include-index` member (the
+    /// index's checked snapshot) were read through raw `File`s; a lock taken
+    /// on those output inodes before the read was released by its close.
+    /// Here a lock of this SQLite instance is taken on each snapshot output at
+    /// the managed open (the consumption seam) and checked right after the
+    /// managed close.
+    #[cfg(unix)]
+    #[test]
+    fn regression_pack_snapshot_output_readers_keep_database_lock() {
+        use ratarmount_index::managed_read::with_close_probes;
+        let f = Fixture::new(true);
+        let base = f.tmp.path().join("base.tar");
+        let mut tar = tar::Builder::new(File::create(&base).unwrap());
+        append_bytes(&mut tar, "hello", b"base").unwrap();
+        tar.finish().unwrap();
+        let index = ratarmount_index::default_index_path(&base);
+        ratarmount_session::IndexJob::run(
+            crate::shard::index_request(&base, &index),
+            Default::default(),
+        )
+        .unwrap();
+        let bundle = f.tmp.path().join("snap.tar.zst");
+        let staging = |p: &Path| {
+            let name = p.file_name().unwrap_or_default();
+            name == HIDDEN_DB || name == "index.sqlite"
+        };
+        let (got, probes) = with_close_probes(staging, || {
+            pack(
+                &f.dir,
+                &bundle,
+                f.base.clone(),
+                &PackOptions {
+                    include_index: true,
+                    base: Some(base.clone()),
+                    ..Default::default()
+                },
+            )
+        });
+        got.unwrap();
+        assert!(
+            probes
+                .iter()
+                .any(|(p, _)| p.file_name().unwrap() == HIDDEN_DB),
+            "database snapshot read through a managed reader: {probes:?}"
+        );
+        assert!(
+            probes
+                .iter()
+                .any(|(p, _)| p.file_name().unwrap() == "index.sqlite"),
+            "included index snapshot read through a managed reader: {probes:?}"
+        );
+        assert!(probes.iter().all(|(_, kept)| *kept), "{probes:?}");
     }
 }

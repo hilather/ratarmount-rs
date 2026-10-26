@@ -11,11 +11,15 @@
 //! stays `"0.7.0"`. Normal [`SqliteIndex::create_writable`] / cold index does
 //! **not** create `"files_fts"`.
 
+pub mod checked_open;
 mod digest_cache;
 mod dirent_order;
 mod hashing;
+#[cfg(all(test, unix))]
+mod internal_reads_tests;
 mod local_cache;
 mod location;
+pub mod managed_read;
 mod mem;
 mod meta_cache;
 mod nested;
@@ -307,8 +311,9 @@ pub fn tar_stats_from_metadata(meta: &std::fs::Metadata) -> TarStats {
 pub fn archive_edge_hashes(path: &Path) -> Result<(String, String)> {
     use std::io::{Seek, SeekFrom};
 
-    let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
+    // Managed (#151): the archive may be a database open in this process.
+    let mut f = managed_read::ManagedReadCursor::open(path)?;
+    let len = f.len()?;
     let mut buf = [0u8; TARSTATS_SAMPLE_BYTES];
     let prefix_len = TARSTATS_SAMPLE_BYTES.min(len as usize);
     let prefix_hex = hashing::sha256_hex_window(&mut f, &mut buf, prefix_len)?;
@@ -327,8 +332,8 @@ pub fn archive_edge_hashes(path: &Path) -> Result<(String, String)> {
 /// Streams until EOF (no second size cap, no file-sized `Vec`). Policy cap is
 /// the `st_size` gate only — do not change [`TARSTATS_FULL_HASH_MAX`].
 pub fn archive_full_hash(path: &Path) -> Result<Option<String>> {
-    let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
+    let mut f = managed_read::ManagedReadCursor::open(path)?;
+    let len = f.len()?;
     if len > TARSTATS_FULL_HASH_MAX {
         return Ok(None);
     }
@@ -760,9 +765,148 @@ pub(crate) fn open_lookup_connection(path: &Path) -> rusqlite::Result<Connection
     snapshot_connection(&absolute)
 }
 
+/// Write a consistent copy of the index at `path` to `dest` (which must not
+/// exist) with `VACUUM INTO`. For a caller that ships the index (`overlay pack
+/// --include-index`): reading the live file through a descriptor of its own
+/// would, on close, release every fcntl lock this process holds on it, a
+/// session's included (#156).
+///
+/// Only SQLite opens the index, through the checked acquisition
+/// ([`checked_open::open_checked`]): the final component is never followed
+/// (`SQLITE_OPEN_NOFOLLOW`), and SQLite's own descriptor must be the regular
+/// file classified here. On Unix the identity is `(device, inode)`: a symlink
+/// or another file substituted between the classification and the open is
+/// refused, except a file that replaces the index after it was deleted and
+/// gets the same inode number from the filesystem, which counts as the same
+/// file and is copied. On Windows there is no identity: the final component
+/// is checked only for type (a regular file, not a symlink), so any regular
+/// file substituted at the name is copied. Unlike a lookup
+/// ([`open_lookup_connection`]) there is no snapshot fallback, which copies
+/// the live files raw. The checked source always uses the ordinary locking
+/// SQLite path, even when no companions exist: a writer may start after
+/// classification. Both `-wal` and `-shm` are permitted (a live writer); any
+/// other set is refused (a `-wal` without `-shm`, a lone `-shm`, or a
+/// `-journal`). `dest` may be any byte string (non-UTF-8 included).
+pub fn snapshot_index_into(path: &Path, dest: &Path) -> std::io::Result<()> {
+    use checked_open::{AcquireError, Expect, NameMode};
+    use std::io;
+    let resolved = match (path.parent(), path.file_name()) {
+        (Some(dir), Some(file)) if !dir.as_os_str().is_empty() => dir.canonicalize()?.join(file),
+        _ => std::path::absolute(path)?,
+    };
+    let metadata = std::fs::symlink_metadata(&resolved)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "index {} is not a regular file (a symlink is never followed)",
+                resolved.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    let id = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    // Off Unix there is no identity (`WindowsPathTypeOnly`).
+    #[cfg(not(unix))]
+    let id = (0, 0);
+    let side = |suffix: &str| {
+        let mut name = resolved.clone().into_os_string();
+        name.push(suffix);
+        std::fs::symlink_metadata(PathBuf::from(name)).is_ok()
+    };
+    match (side("-wal"), side("-shm"), side("-journal")) {
+        (false, false, false) | (true, true, false) => {}
+        (wal, shm, journal) => {
+            return Err(io::Error::other(format!(
+                "index {} has an incomplete set of companion files (-wal {wal}, -shm {shm}, \
+                 -journal {journal}); it is not copied: only SQLite may read it, and SQLite \
+                 would create or replay the missing files beside it",
+                resolved.display()
+            )))
+        }
+    };
+    #[cfg(test)]
+    SNAPSHOT_AFTER_CLASSIFY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()
+        }
+    });
+    let acquired = checked_open::open_checked(
+        &resolved,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        NameMode::Path,
+        Expect::Existing {
+            id,
+            require_nonempty: true,
+        },
+    )
+    .map_err(|refusal| match refusal.error {
+        AcquireError::Sqlite(e) => {
+            io::Error::other(format!("cannot open index {}: {e}", resolved.display()))
+        }
+        _ => io::Error::other(format!("index {}: {refusal}", resolved.display())),
+    })?;
+    #[cfg(test)]
+    SNAPSHOT_VFS
+        .with(|v| *v.borrow_mut() = Some(managed_read::connection_vfs_name(&acquired.conn)));
+    vacuum_into(&acquired.conn, dest)
+        .map_err(|e| io::Error::other(format!("cannot copy index {}: {e}", resolved.display())))
+}
+
+/// `VACUUM INTO dest`, with `dest` bound as the bytes of the path (a
+/// non-UTF-8 path is not mangled by a lossy conversion).
+///
+/// `dest` must be absolute. The bundled SQLite is built with
+/// `SQLITE_USE_URI`, so a relative name starting with `file:` is parsed as a
+/// URI: `file:x?mode=memory` writes nothing and reports success, and
+/// `file:y?mode=rwc` writes `y`. An absolute path never starts with `file:`.
+pub fn vacuum_into(conn: &Connection, dest: &Path) -> rusqlite::Result<()> {
+    use rusqlite::types::{ToSqlOutput, ValueRef};
+    if !dest.is_absolute() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(format!(
+                "VACUUM INTO destination {} is not absolute (a relative `file:` name \
+                 would be read as a URI)",
+                dest.display()
+            )),
+        ));
+    }
+    let name = ToSqlOutput::Borrowed(ValueRef::Text(dest.as_os_str().as_encoded_bytes()));
+    conn.execute("VACUUM INTO ?1", [name])?;
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// The private lookup copies' names and modes, before they are opened.
+    pub(crate) static SNAPSHOT_COPY_MODES: std::cell::RefCell<Vec<(String, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The VFS of the last checked connection [`snapshot_index_into`] opened.
+    pub(crate) static SNAPSHOT_VFS: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once in [`snapshot_index_into`], between the classification and
+    /// the open.
+    pub(crate) static SNAPSHOT_AFTER_CLASSIFY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Copy the index and its existing companions into a private temporary
 /// directory and open the copy (read-write there: recovery of a hot journal
-/// and creation of `-shm` happen on the copy).
+/// and of the WAL happen on the copy).
 fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
     let io = |e: std::io::Error| {
         rusqlite::Error::SqliteFailure(
@@ -772,18 +916,56 @@ fn snapshot_connection(absolute: &Path) -> rusqlite::Result<Connection> {
     };
     let dir = tempfile::tempdir().map_err(io)?;
     let copy = dir.path().join("snapshot.sqlite");
-    std::fs::copy(absolute, &copy).map_err(io)?;
+    // Managed sources (#151): the index and its companions are open in this
+    // process. Exclusive-new outputs in the fresh directory with the exact
+    // source permissions; a failed copy removes its own output.
+    let exclusive = |from: &Path, to: &Path| {
+        managed_read::copy_exclusive_new(
+            from,
+            to,
+            managed_read::CopySourcePermissions::Exact,
+            managed_read::CopyDigest::None,
+        )
+        .map(drop)
+    };
+    exclusive(absolute, &copy).map_err(io)?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut from = absolute.as_os_str().to_owned();
         from.push(suffix);
         let mut to = copy.as_os_str().to_owned();
         to.push(suffix);
-        match std::fs::copy(PathBuf::from(from), PathBuf::from(to)) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        let from = PathBuf::from(from);
+        // `-shm` is copied with `-wal` only so the pair the classifier saw
+        // stays a pair; the first connection to the copy rebuilds its
+        // wal-index from `-wal` (no other connection shares it).
+        // A missing SOURCE companion is fine; a destination collision is not.
+        match std::fs::symlink_metadata(&from) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            _ => {}
+        }
+        match exclusive(&from, Path::new(&to)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !from.exists() => {}
             Err(e) => return Err(io(e)),
         }
     }
+    #[cfg(all(test, unix))]
+    SNAPSHOT_COPY_MODES.with(|m| {
+        use std::os::unix::fs::PermissionsExt;
+        *m.borrow_mut() = std::fs::read_dir(dir.path())
+            .map(|it| {
+                it.flatten()
+                    .map(|e| {
+                        let mode = e.metadata().map(|m| m.permissions().mode() & 0o7777);
+                        (
+                            e.file_name().to_string_lossy().into_owned(),
+                            mode.unwrap_or(0),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    });
     let conn = Connection::open_with_flags(
         &copy,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1580,10 +1762,9 @@ impl SqliteIndex {
             let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
             *guard = Connection::open_in_memory()?;
         }
-        {
-            let f = std::fs::File::open(&tmp)?;
-            f.sync_all()?;
-        }
+        // Managed sync (#151): the temporary index may be another name of a
+        // database open in this process.
+        managed_read::ManagedReadCursor::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &dest)?;
         self.publish_target = None;
         self.path = Some(dest.clone());

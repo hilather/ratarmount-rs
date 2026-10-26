@@ -193,6 +193,23 @@ pub fn overlay_db_entry(dir: &Path) -> Result<DbEntry> {
     })
 }
 
+/// [`overlay_db_entry`] of the database file `db` itself (Fable r11 N2): the
+/// overlay directory's classification when `db` is named [`HIDDEN_DB`] (its
+/// markers count), else the type of `db` alone, never marked (a staging copy,
+/// a test's `real.sqlite`).
+pub(crate) fn overlay_db_entry_for(db: &Path) -> Result<DbEntry> {
+    if db.file_name() == Some(std::ffi::OsStr::new(HIDDEN_DB)) {
+        return overlay_db_entry(db.parent().unwrap_or(Path::new("")));
+    }
+    Ok(match overlay_db_regular(db, false)? {
+        None => DbEntry::Absent,
+        Some(metadata) => DbEntry::Present {
+            marked: false,
+            metadata,
+        },
+    })
+}
+
 /// Nothing at all is at `dir`'s overlay database path and no marker says the
 /// overlay was used ([`DbEntry::Absent`]). A symlink (dangling or not), a
 /// directory, a FIFO, an entry that cannot be statted (R7-E2, R10-B) or a lost
@@ -221,6 +238,14 @@ thread_local! {
     /// database in [`overlay_db_regular`] on this thread fails with this errno.
     pub(crate) static FOLLOWED_STAT_ERRNO: std::cell::Cell<Option<i32>> =
         const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (#160 fix round): when set, a `-w` open runs it once in its
+    /// schema step and then fails there, taking the failed-open cleanup.
+    pub(crate) static FAIL_SCHEMA_STEP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The `stat` through the database entry ([`FOLLOWED_STAT_ERRNO`] in tests).
@@ -1210,7 +1235,13 @@ impl WriteOverlay {
             DbEntry::Lost { markers, .. } => return Err(lost_record_error(&root, &markers)),
             DbEntry::Present { metadata, .. } => Some(metadata.len()),
         };
-        let opened = crate::open_overlay_db(&db_path, OpenFlags::default(), crate::DbName::Path)?;
+        let opened = crate::overlay_db::open_overlay_db_required(
+            &db_path,
+            OpenFlags::default(),
+            crate::DbName::Path,
+            marker,
+        )?;
+        let required = marker || opened.required_record();
         let db_id = opened.id();
         let (mut conn, db_registration) = opened.into_parts();
         let had_files = conn
@@ -1221,7 +1252,7 @@ impl WriteOverlay {
             )
             .optional()?
             .is_some();
-        if !had_files && (marker || db_len.is_some_and(|n| n > 0)) {
+        if !had_files && (required || db_len.is_some_and(|n| n > 0)) {
             drop(conn);
             return Err(OverlayError::Msg(format!(
                 "overlay database {} has no files table; its deletions would be lost \
@@ -1241,24 +1272,29 @@ impl WriteOverlay {
         // Marker before SCHEMA: a brand-new overlay whose marker cannot be
         // written must not leave a `files` table behind (the next open would
         // take the backfill path and run unmarked).
-        // Remove a database file this call created, so a failed first open
-        // leaves the folder as it was (not "non-empty DB without files").
+        // Remove a database file that was absent before this call (a stat
+        // before SQLite's open; an empty file planted between that stat and
+        // the open is indistinguishable, see `Expect::Fresh`), so a failed
+        // first open leaves the folder as it was (not "non-empty DB without
+        // files"); only while the name still holds the inode SQLite opened.
+        // A database that existed (0 bytes included) is left to SQLite's own
+        // rollback: truncating it through a descriptor of our own would close
+        // that descriptor, which releases every fcntl lock this process holds
+        // on the file, another connection's included (#160). If that rollback
+        // itself fails, the database is left non-empty without `files`, and
+        // the next open refuses it (#96) instead of starting over.
         let undo_new_db = |conn: Connection| {
             drop(conn);
-            match db_len {
-                None => {
-                    for suf in ["", "-journal", "-shm", "-wal"] {
-                        let _ = fs::remove_file(root.join(format!("{HIDDEN_DB}{suf}")));
-                    }
+            let still_ours = || match (db_id, fs::symlink_metadata(&db_path)) {
+                (Some(id), Ok(m)) => crate::overlay_db::file_id(&m) == Some(id),
+                // Off Unix there is no identity to compare.
+                (None, Ok(_)) => true,
+                (_, Err(_)) => false,
+            };
+            if db_len.is_none() && still_ours() {
+                for suf in ["", "-journal", "-shm", "-wal"] {
+                    let _ = fs::remove_file(root.join(format!("{HIDDEN_DB}{suf}")));
                 }
-                // It was 0 bytes: put it back that way.
-                Some(0) => {
-                    let _ = fs::OpenOptions::new()
-                        .write(true)
-                        .open(&db_path)
-                        .and_then(|f| f.set_len(0));
-                }
-                Some(_) => {}
             }
         };
         // A legacy-named marker is migrated: `rm .ratarmount.overlay.sqlite*`
@@ -1287,6 +1323,11 @@ impl WriteOverlay {
             }
         }
         let opened = (|| -> Result<HashSet<String>> {
+            #[cfg(test)]
+            if let Some(hook) = FAIL_SCHEMA_STEP.with(|seam| seam.borrow_mut().take()) {
+                hook();
+                return Err(OverlayError::Msg("test: schema step failed".into()));
+            }
             conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
             let transaction = conn.transaction()?;
             transaction.execute_batch(SCHEMA)?;
@@ -3148,7 +3189,7 @@ impl WriteOverlay {
     /// digest is no longer `pending` for `pending`'s stamp.
     pub fn record_base_digest(&self, pending: &crate::PendingBase, digest: &str) -> Result<bool> {
         let db = self.db.lock().expect("overlay db");
-        crate::record_base_digest(&db, pending, digest)
+        crate::overlay_meta::record_base_digest_required(&db, pending, digest, true)
     }
 
     /// Record one overlay-level `meta` key (for example `readonly_rules`).
@@ -7187,14 +7228,17 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
         )));
     }
     let conn = if db_regular {
-        let conn = crate::open_overlay_db(
+        let conn = crate::overlay_db::open_overlay_db_required(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             crate::DbName::Path,
+            marker.is_some(),
         )?;
         // A used overlay's database without its `files` table is a lost
         // record (R10-B): refuse with its path, never plan without deletions.
-        if marker.is_some() && !crate::overlay_meta::has_files_table(&conn)? {
+        if (marker.is_some() || conn.required_record())
+            && !crate::overlay_meta::has_files_table(&conn)?
+        {
             return Err(OverlayError::Msg(format!(
                 "{}: {}; refusing to commit without its deletions",
                 db_path.display(),
@@ -8539,8 +8583,9 @@ fn remote_on_exit_timeout_err() -> OverlayError {
 const REMOTE_ON_EXIT_EXTRA_DEFAULT: Duration = Duration::from_secs(120);
 
 fn file_sha256(path: &Path) -> Result<String> {
-    let mut f = File::open(path)?;
-    ratarmount_index::sha256_hex_stream(&mut f).map_err(|e| OverlayError::Msg(e.to_string()))
+    // Managed (#151): a remote spool may be another name of a database open
+    // in this process.
+    ratarmount_index::managed_read::sha256_hex(path).map_err(|e| OverlayError::Msg(e.to_string()))
 }
 
 /// Bytes of the downloaded object before `persist_by_format`.
@@ -12316,6 +12361,68 @@ pub(crate) mod tests {
         (dir, overlay)
     }
 
+    /// Regression: the mounted updater must require its initialized record even
+    /// when its original acquisition was fresh and optional (Sweep 4: corrupt
+    /// through the mount's own EXCLUSIVE connection, never another connection).
+    #[test]
+    fn regression_background_base_digest_required_record_lost_refuses() {
+        for already_marked in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let archive = tmp.path().join("base.tar");
+            fs::write(&archive, b"uncached base digest bytes").unwrap();
+            let overlay = tmp.path().join("overlay");
+            let info = crate::overlay_meta::OverlayCreateInfo {
+                base_url: archive.to_str().unwrap().into(),
+                ..Default::default()
+            };
+            let open = || {
+                WriteOverlay::new_with_create_info_for_tests(Arc::new(KeepBase), &overlay, &info)
+                    .unwrap()
+            };
+            if already_marked {
+                drop(open());
+            }
+            assert_eq!(overlay.join(OVERLAY_MARKER).exists(), already_marked);
+            let mounted = open();
+            let pending = mounted
+                .pending_base()
+                .unwrap()
+                .expect("pending archive digest");
+            let digest = pending.hash(&|| Ok(())).unwrap();
+            let rows = |db: &Connection| -> Vec<(String, String)> {
+                db.prepare("SELECT key,value FROM meta ORDER BY key")
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let before = {
+                let db = mounted.db.lock().unwrap();
+                let before = rows(&db);
+                assert!(before
+                    .iter()
+                    .any(|(k, v)| k == "base_digest_kind" && v == "pending"));
+                db.execute_batch("DROP TABLE files").unwrap();
+                before
+            };
+            for marker in overlay_markers(&overlay).unwrap() {
+                fs::remove_file(marker).unwrap();
+            }
+            let error = mounted.record_base_digest(&pending, &digest).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                crate::overlay_meta::NO_FILES_TABLE,
+                "already_marked={already_marked}"
+            );
+            assert_eq!(
+                rows(&mounted.db.lock().unwrap()),
+                before,
+                "no digest/stack update"
+            );
+        }
+    }
+
     fn reopen_keep_overlay(overlay: &Path) -> Result<WriteOverlay> {
         WriteOverlay::new_for_tests(Arc::new(KeepBase) as Arc<dyn MountSource>, overlay)
     }
@@ -12764,6 +12871,84 @@ pub(crate) mod tests {
             assert!(ov.join(OVERLAY_MARKER).is_file(), "{}", ov.display());
             assert!(has_files_table(&ov.join(HIDDEN_DB)));
         }
+    }
+
+    /// Regression: (#160): a failed first open of a folder holding a 0-byte
+    /// database "put it back" by truncating the file through a descriptor of
+    /// its own. Closing that descriptor released every fcntl lock this
+    /// process held on the file, so another connection's SHARED lock was gone
+    /// (another process could then take EXCLUSIVE under it). The holder keeps
+    /// its lock, the file stays 0 bytes (SQLite's rollback), and the holder
+    /// still reads and writes.
+    #[test]
+    fn regression_failed_open_cleanup_keeps_empty_db_holders_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().canonicalize().unwrap().join("zero");
+        fs::create_dir(&overlay).unwrap();
+        let db = overlay.join(HIDDEN_DB);
+        fs::write(&db, b"").unwrap();
+        let holder = Connection::open(&db).unwrap();
+        holder
+            .execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;")
+            .unwrap();
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&db),
+            "the holder's SHARED lock"
+        );
+        // The schema commit needs EXCLUSIVE, which the holder's SHARED lock
+        // refuses: the open fails and takes the cleanup path.
+        let error = msg_of(reopen_keep_overlay(&overlay));
+        assert!(
+            error.contains("locked") || error.contains("busy"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::metadata(&db).unwrap().len(),
+            0,
+            "rolled back to 0 bytes"
+        );
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&db),
+            "the failed open's cleanup released the holder's lock"
+        );
+        holder
+            .execute_batch("SELECT count(*) FROM sqlite_master; COMMIT; CREATE TABLE t (x);")
+            .unwrap();
+    }
+
+    /// Regression: (#160 fix round): the failed first open removed the
+    /// database name whenever a stat before SQLite's open found nothing, even
+    /// when the name held another file by the time of the cleanup. A new
+    /// database the open created is removed; a file put at the name after
+    /// SQLite's open is left alone.
+    #[test]
+    fn regression_failed_first_open_removes_only_the_database_it_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().canonicalize().unwrap().join("fresh");
+        fs::create_dir(&fresh).unwrap();
+        FAIL_SCHEMA_STEP.with(|seam| *seam.borrow_mut() = Some(Box::new(|| {})));
+        let error = msg_of(reopen_keep_overlay(&fresh));
+        assert!(error.contains("schema step failed"), "{error}");
+        assert!(!fresh.join(HIDDEN_DB).exists(), "the new database stayed");
+
+        let swapped = dir.path().canonicalize().unwrap().join("swapped");
+        fs::create_dir(&swapped).unwrap();
+        let db = swapped.join(HIDDEN_DB);
+        let other = dir.path().join("other.sqlite");
+        fs::write(&other, b"another file").unwrap();
+        let (hook_db, hook_other) = (db.clone(), other.clone());
+        FAIL_SCHEMA_STEP.with(|seam| {
+            *seam.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&hook_other, &hook_db).unwrap();
+            }))
+        });
+        let error = msg_of(reopen_keep_overlay(&swapped));
+        assert!(error.contains("schema step failed"), "{error}");
+        assert_eq!(
+            fs::read(&db).unwrap(),
+            b"another file",
+            "the cleanup removed a file it never opened"
+        );
     }
 
     /// Overlays created before the marker existed get it on their next open.
@@ -19395,5 +19580,37 @@ pub(crate) mod tests {
         }
         assert!(!is_control_reserved_path("/sub/.ratarmount-control/x"));
         assert!(!is_control_reserved_path("/.ratarmount-controlx"));
+    }
+
+    /// Regression: (R11-S7, #151): the remote spool fingerprint and comparison
+    /// (`file_sha256`, `presplice_fingerprint`, both operands of
+    /// `files_same_len_and_hash`) hashed with raw `File`s; a spool that is
+    /// another name of a database open in this process lost its lock.
+    #[cfg(unix)]
+    #[test]
+    fn regression_remote_spool_hash_keeps_aliased_database_lock() {
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let db = dir.join("spool.sqlite");
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch("CREATE TABLE t(x BLOB); INSERT INTO t VALUES (randomblob(100000));")
+            .unwrap();
+        drop(c);
+        let alias = dir.join("alias");
+        fs::hard_link(&db, &alias).unwrap();
+        let h = Connection::open(&db).unwrap();
+        h.execute_batch("BEGIN").unwrap();
+        let _: i64 = h
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert!(other_process_sees_lock(&db));
+        let fp = presplice_fingerprint(&alias).unwrap();
+        assert_eq!(fp.sha256, file_sha256(&db).unwrap());
+        assert!(files_same_len_and_hash(&db, &alias).unwrap());
+        assert!(other_process_sees_lock(&db), "lock kept");
+        drop(fs::File::open(&alias).unwrap());
+        assert!(!other_process_sees_lock(&db), "oracle check");
+        drop(h);
     }
 }

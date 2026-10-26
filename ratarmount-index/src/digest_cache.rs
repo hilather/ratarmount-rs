@@ -1,5 +1,6 @@
 //! Full base digests, cached only in an existing writable archive index.
 
+use crate::managed_read::ManagedReadCursor;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -131,7 +132,8 @@ fn never_cancelled() -> std::io::Result<()> {
 /// optional optimizations; neither a missing index nor its parent is created.
 pub fn cached_archive_digest(path: &Path, index: Option<&Path>) -> Result<String> {
     cached_with(path, index, false, &never_cancelled, |path| {
-        Ok(sha256_hex_stream(&mut fs::File::open(path)?)?)
+        // Managed (#151): the archive may be a database open in this process.
+        Ok(sha256_hex_stream(&mut ManagedReadCursor::open(path)?)?)
     })
 }
 
@@ -178,7 +180,8 @@ pub fn cached_archive_digest_cancellable(
 /// Unlike `cached_archive_digest`, this never trusts a pre-commit cache hit.
 pub fn refresh_archive_digest(path: &Path, index: Option<&Path>) -> Result<String> {
     cached_with(path, index, true, &never_cancelled, |path| {
-        Ok(sha256_hex_stream(&mut fs::File::open(path)?)?)
+        // Managed (#151): the archive may be a database open in this process.
+        Ok(sha256_hex_stream(&mut ManagedReadCursor::open(path)?)?)
     })
 }
 
@@ -259,6 +262,16 @@ fn open_cache_read_only(index: Option<&Path>) -> Option<Cache> {
 
 /// `create_table`: false for a read-only peek, which must not wait out another
 /// mount creating the table (a missing table is simply a miss).
+/// The VFS names of the cache's writable and read-only connections (tests).
+#[cfg(all(test, unix))]
+pub(crate) fn cache_vfs_names(index: &Path) -> (Option<String>, Option<String>) {
+    let vfs = |c: Cache| crate::managed_read::connection_vfs_name(&c.conn);
+    (
+        open_cache(Some(index), true).map(vfs),
+        open_cache_read_only(Some(index)).map(vfs),
+    )
+}
+
 fn open_cache(index: Option<&Path>, create_table: bool) -> Option<Cache> {
     open_cache_at(cache_target(index)?, create_table)
 }
