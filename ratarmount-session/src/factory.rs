@@ -2254,6 +2254,13 @@ impl MountSource for KeepAliveMount {
 /// Preflight the preparer's supported persisted seek-state profile before it writes.
 /// Ordinary single-user mounts retain their single-block bzip2 decode fallback.
 pub fn validate_worker_preparation(path: &Path) -> Result<(), String> {
+    let input = path.to_string_lossy();
+    let local = if ratarmount_remote::remote_url_scheme(&input).as_deref() == Some("file") {
+        Some(ratarmount_remote::resolve_to_local(&input).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let path = local.as_ref().map_or(path, |local| local.path());
     if !path.is_file() {
         return Ok(());
     }
@@ -5495,6 +5502,11 @@ pub fn build_mount_source_with_bindings(
                 &mut folder_opener,
             )?;
             let served = served_from_remote(&input, &opened);
+            if let Some(artifact) = &opened.actual_artifact {
+                if !prepared_artifacts.contains(artifact) {
+                    prepared_artifacts.push(artifact.clone());
+                }
+            }
             (opened.path, opened.source, served)
         } else {
             let local_path = p.clone();

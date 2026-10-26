@@ -1833,6 +1833,8 @@ preparation to exit before starting workers, and manages readiness and failed
 batch cleanup. Each worker owns a distinct overlay and mountpoint; the base
 archive and prepared indexes are shared immutable inputs. Unindexed binds,
 such as ordinary files, need no sidecar.
+Local archive paths and `file://` URLs use the same preparation and strict-worker
+checks, including archives supplied with `--bind`.
 
 The direct CLI equivalent below is **Bash**. It assumes
 `/srv/keystone/base.tar` already exists and these absolute paths do not overlap.

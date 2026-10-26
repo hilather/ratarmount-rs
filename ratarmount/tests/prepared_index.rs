@@ -230,6 +230,63 @@ fn regression_prepared_index_no_mount_finishes_before_workers() {
     assert!(!PathBuf::from(format!("{}-wal", index.display())).exists());
 }
 
+/// Regression: CLI file URL preparation must checkpoint primary and bind indexes.
+#[test]
+fn regression_prepared_index_file_url_no_mount_finishes_before_workers() {
+    for classified in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("temporary.tar");
+        tar(&plain);
+        let compressed = zstd::encode_all(fs::File::open(&plain).unwrap(), 1).unwrap();
+        fs::remove_file(plain).unwrap();
+        let base = dir.path().join("base # input.tar.zst");
+        let bound = dir.path().join("bound # input.tar.zst");
+        fs::write(&base, &compressed).unwrap();
+        fs::write(&bound, &compressed).unwrap();
+        let input = url::Url::from_file_path(&base).unwrap().to_string();
+        let binding = format!("/other={}", url::Url::from_file_path(&bound).unwrap());
+        let cache = dir.path().join("indexes");
+        fs::create_dir(&cache).unwrap();
+        let overlay = dir.path().join("overlay");
+        let mut args = vec![
+            "--no-mount",
+            "--no-file-versions",
+            "--index-folders",
+            cache.to_str().unwrap(),
+            "--bind",
+            &binding,
+        ];
+        if classified {
+            args.extend(["-w", overlay.to_str().unwrap()]);
+        }
+        args.push(&input);
+        let out = run(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let before = snapshot(&cache);
+        assert_eq!(
+            before
+                .keys()
+                .filter(|p| p.extension().is_some_and(|e| e == "sqlite"))
+                .count(),
+            2
+        );
+        let base_before = snapshot(dir.path());
+        args.insert(0, "--no-recreate-index");
+        let out = run(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(snapshot(&cache), before);
+        assert_eq!(snapshot(dir.path()), base_before);
+    }
+}
+
 /// Regression: direct find uses only prepared catalog/FTS state and never cold-builds.
 #[test]
 fn regression_prepared_index_find_uses_only_prepared_state() {
@@ -318,28 +375,60 @@ fn regression_prepared_index_find_uses_only_prepared_state() {
 /// Regression: a single-block bzip2 preparation cannot claim a reusable worker index.
 #[test]
 fn regression_prepared_index_single_block_bzip2_preparation_refuses_unchanged() {
+    assert_single_block_bzip2_preparation_refuses_unchanged(false, false);
+}
+
+/// Regression: file URLs must not bypass the preparer's single-block bzip2 refusal.
+#[test]
+fn regression_prepared_index_single_block_bzip2_file_url_refuses_unchanged() {
+    assert_single_block_bzip2_preparation_refuses_unchanged(true, false);
+}
+
+/// Regression: a file URL bind must be preflighted before any index is changed.
+#[test]
+fn regression_prepared_index_single_block_bzip2_file_url_bind_refuses_unchanged() {
+    assert_single_block_bzip2_preparation_refuses_unchanged(true, true);
+}
+
+fn assert_single_block_bzip2_preparation_refuses_unchanged(file_url: bool, bind: bool) {
     // Fixed bzip2 streams for b"payload" and a USTAR containing member.txt.
     for (name, hex) in [
         ("single.bz2", "425a68393141592653591d1b8a0d00000281802404c0202000221868300958130bb9229c28480e8dc50680"),
         ("single.tar.bz2", "425a6839314159265359d87d6d51000071fb80c98000084001578001007606de600808200054429a64d3047a99193d43ca092440d34d0001a1f7701c841a5084223d4ac318c2b4086062a93c4f611939030a1c41dbb34cc3b233be5843c78af6a2aa2ecf211100fc5dc914e1424361f5b544"),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join(name);
+        // Spaces and '#' also require URL decoding before probing the local file.
+        let base = dir.path().join(format!("local # {name}"));
         let index = dir.path().join("prepared.sqlite");
         let bytes: Vec<_> = hex.as_bytes().as_chunks::<2>().0.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
         fs::write(&base, bytes).unwrap();
-        fs::write(&index, b"existing artifact must not be touched").unwrap();
-        let before = snapshot(dir.path());
-        let out = run(&["--no-mount", "--index-file", index.to_str().unwrap(), base.to_str().unwrap()]);
-        assert!(!out.status.success());
-        let error = String::from_utf8_lossy(&out.stderr);
-        assert!(error.contains("single-block bzip2 cannot be prepared for read-only workers"), "{error}");
-        assert_eq!(snapshot(dir.path()), before);
-        fs::remove_file(&index).unwrap();
-        let before = snapshot(dir.path());
-        let out = run(&["--no-mount", "--index-file", index.to_str().unwrap(), base.to_str().unwrap()]);
-        assert!(!out.status.success());
-        assert_eq!(snapshot(dir.path()), before);
-        assert!(!index.exists());
+        let input = if file_url {
+            url::Url::from_file_path(&base).unwrap().to_string()
+        } else {
+            base.to_str().unwrap().to_owned()
+        };
+        let primary = dir.path().join("primary.tar");
+        tar(&primary);
+        let binding = format!("/other={input}");
+        for existing in [true, false] {
+            if existing {
+                fs::write(&index, b"existing artifact must not be touched").unwrap();
+            } else {
+                fs::remove_file(&index).unwrap();
+            }
+            let before = snapshot(dir.path());
+            let mut args = vec!["--no-mount", "--index-file", index.to_str().unwrap()];
+            if bind {
+                args.extend(["--bind", &binding, primary.to_str().unwrap()]);
+            } else {
+                args.push(&input);
+            }
+            let out = run(&args);
+            let error = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{name}, existing={existing}: {error}");
+            assert!(error.contains("single-block bzip2 cannot be prepared for read-only workers"), "{name}, existing={existing}: {error}");
+            assert_eq!(snapshot(dir.path()), before);
+            assert_eq!(index.exists(), existing);
+        }
     }
 }

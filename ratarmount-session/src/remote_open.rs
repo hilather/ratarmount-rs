@@ -928,6 +928,8 @@ pub(super) struct RemoteOpened {
     /// The body was downloaded to a temporary local copy.
     pub fetched: bool,
     pub index: IndexUsed,
+    /// The persistent local artifact selected by a `file://` open.
+    pub actual_artifact: Option<PathBuf>,
 }
 
 impl RemoteOpened {
@@ -938,6 +940,7 @@ impl RemoteOpened {
             kind: ServedKind::Folder,
             local: false,
             fetched: false,
+            actual_artifact: None,
             index: IndexUsed {
                 location: ratarmount_index::IndexLocation::Memory,
                 discovered_from: None,
@@ -961,6 +964,7 @@ impl RemoteOpened {
             local,
             fetched: !local,
             index: opened.index,
+            actual_artifact: if local { opened.actual_artifact } else { None },
         }
     }
 }

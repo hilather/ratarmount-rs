@@ -84,6 +84,74 @@ fn read_member(source: &dyn MountSource, name: &str) -> Vec<u8> {
         .unwrap();
     got
 }
+
+/// Regression: file URLs must retain each selected local index for preparation finalization.
+#[test]
+fn regression_prepared_index_file_urls_finalize_primary_and_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("indexes");
+    std::fs::create_dir(&cache).unwrap();
+    let primary = dir.path().join("base.tar.zst");
+    let bound = dir.path().join("bound.tar.zst");
+    for (path, bytes) in [
+        (&primary, b"primary payload".as_slice()),
+        (&bound, b"bound payload".as_slice()),
+    ] {
+        std::fs::write(path, Codec::Zstd.encode(&tar_bytes("payload", bytes))).unwrap();
+    }
+    let paths = [PathBuf::from(format!("file://{}", primary.display()))];
+    let bindings = || SourceBindings {
+        binds: vec![format!("/bound=file://{}", bound.display())
+            .parse()
+            .unwrap()],
+        ..Default::default()
+    };
+    let mut options = OpenOptions {
+        index_folders: vec![cache],
+        ..Default::default()
+    };
+    let bundle = build_mount_source_with_bindings(
+        &paths,
+        &mut options,
+        false,
+        Default::default(),
+        bindings(),
+    )
+    .unwrap();
+    let artifacts = bundle.prepared_artifacts.clone();
+    drop(bundle);
+    for artifact in &artifacts {
+        SqliteIndex::finalize_prepared(artifact).unwrap();
+    }
+    let before = snapshot(dir.path());
+    options.read_only_index = true;
+    options.write_index = false;
+    let bundle = build_mount_source_with_bindings(
+        &paths,
+        &mut options,
+        false,
+        Default::default(),
+        bindings(),
+    )
+    .unwrap();
+    assert_eq!(
+        artifacts.len(),
+        2,
+        "preparer lost a selected local URL index"
+    );
+    assert_eq!(
+        read_member(bundle.source.as_ref(), "/payload"),
+        b"primary payload"
+    );
+    assert_eq!(
+        read_member(bundle.source.as_ref(), "/bound/payload"),
+        b"bound payload"
+    );
+    assert_eq!(snapshot(dir.path()), before);
+    drop(bundle);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     path: PathBuf,
