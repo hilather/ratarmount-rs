@@ -668,6 +668,7 @@ impl SeekableZstd {
             ..options
         };
         let (frames, uncompressed_size) = frames_from_zstd_blocks(blocks)?;
+        // Inventory: residual / #196 / factory-and-format-readers (read-only archive body).
         validate_zstd_blocks_terminal(&mut File::open(&path)?, blocks)?;
         Ok(Arc::new(Self {
             path: path.clone(),
