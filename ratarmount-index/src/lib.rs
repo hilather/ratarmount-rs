@@ -958,15 +958,18 @@ impl SqliteIndex {
                 path.display()
             )));
         }
-        // An artifact with no pending -wal/-journal is already complete: only
-        // validate it, never open it for writing (it may be reused read-only).
+        // Only checkpoint when there is something to finish: a -journal, a
+        // nonempty -wal, or an empty -wal on a writable artifact (removed on
+        // close). A complete read-only artifact is validated, never written.
         let absolute = path.canonicalize()?;
-        let pending = ["-wal", "-journal"].iter().any(|suffix| {
+        let companion = |suffix: &str| {
             let mut companion = absolute.as_os_str().to_owned();
             companion.push(suffix);
-            std::fs::symlink_metadata(PathBuf::from(companion))
-                .is_ok_and(|meta| *suffix == "-journal" || meta.len() != 0)
-        });
+            std::fs::symlink_metadata(PathBuf::from(companion)).ok()
+        };
+        let read_only = std::fs::metadata(&absolute)?.permissions().readonly();
+        let pending = companion("-journal").is_some()
+            || companion("-wal").is_some_and(|wal| wal.len() != 0 || !read_only);
         if !pending {
             Self::open_catalog_prepared(path)?;
             return Ok(());
