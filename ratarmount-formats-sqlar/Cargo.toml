@@ -23,6 +23,7 @@ sqlcipher = [
 
 [dependencies]
 ratarmount-core.workspace = true
+ratarmount-index.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 log.workspace = true

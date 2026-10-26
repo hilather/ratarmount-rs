@@ -12,12 +12,18 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing · `[x]` Rust-only = beyond
 
 ## CLI mount options
 
+For a shared prepared base/index, `--no-recreate-index -w OVERLAY` keeps writes
+in that worker's overlay. Missing state and detected preparation failures are
+errors; there is no writable-cache or top-level memory rebuild fallback. A
+normal `-w` without this flag retains its create/rebuild/commit behavior. See
+the [N-worker recipe and compatibility limits](sandbox.md#prepare-once-n-writable-workers).
+
 | Option | Python | Rust | Status |
 |--------|--------|------|--------|
 | `-u` / `--unmount` | yes | yes | `[x]` |
 | `-f` / `--foreground` (default daemonize) | yes | yes | `[x]` |
 | `-c` / `--recreate-index` | yes | yes | `[x]` |
-| `--no-recreate-index` | yes | **added** | `[x]` |
+| `--no-recreate-index` | yes | **added** (existing prepared indexes only; immutable reads, no rebuild/repair/index writes or archive commits; supervisor workers use it automatically) | `[x]` |
 | `--recreate-index-on-errors` | yes | default behavior only | `~` |
 | `--no-mount` | yes | yes | `[x]` |
 | `-r` / `--recursive` | yes | yes | `[x]` |

@@ -5307,6 +5307,7 @@ dependencies = [
  "log",
  "pbkdf2 0.12.2",
  "ratarmount-core",
+ "ratarmount-index",
  "rusqlite",
  "sha2 0.10.9",
  "tempfile",
@@ -5565,6 +5566,8 @@ dependencies = [
 name = "ratarmount-session"
 version = "0.1.35"
 dependencies = [
+ "bzip2",
+ "flate2",
  "git2",
  "libc",
  "log",
@@ -5609,6 +5612,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "url",
+ "zip",
+ "zstd",
 ]
 
 [[package]]

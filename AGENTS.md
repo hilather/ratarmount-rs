@@ -37,6 +37,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Symptom / fix | Commands |
 |---------------|----------|
+| Keystone: N writable workers over one prepared immutable base/index (builder/open/codec/identity/search/recovery/CLI/supervisor refusal and isolation) | `CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount-index --lib prepared_index` · repeat for `ratarmount-compress`, `ratarmount-compositing`, `ratarmount-session`; `CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --bin ratarmount prepared_index` · `CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --test prepared_index` · `CARGO_BUILD_JOBS=2 flock /tmp/muse-cargo.lock cargo test -p ratarmount --test sandbox prepared_index` (three-worker test requires FUSE; a skip is not concurrency evidence) |
 | BIG fixture builder missing tar.lz4 / multi-frame zstd | `./benchmarks/test-compare-fixtures.sh` |
 | Vector-wave fixture builder missing catalog tars | `./benchmarks/test-compare-vector-wave.sh` |
 | Format sweep fixture builder: missing-producer skips, corrupt or count-mismatched reads, `PREPARE_ONLY` / `NO_FUSE` regressions (AI-FMTBENCH) | `./benchmarks/test-compare-formats.sh` |

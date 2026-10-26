@@ -44,8 +44,15 @@ ratarmount -c archive.tar mnt/                     # rebuild the index
 ratarmount --no-mount -c archive.tar               # only build the index, no FUSE
 ratarmount --index-file /nvme/idx/a.sqlite a.tar mnt/   # choose where the index lives
 ratarmount --index-file :memory: a.tar mnt/        # never touch the disk
-ratarmount --no-recreate-index a.tar mnt/          # fail instead of scanning if no index exists
+ratarmount --no-recreate-index a.tar mnt/          # require a prepared index; fail instead of scanning
 ```
+
+`--no-recreate-index` requires a complete prepared index for an indexed source:
+missing state and detected schema, backend, fingerprint or seek-map failures
+produce an error instead of a scan, rebuild or repair. It also refuses archive
+commits and explicit index writes. For independent writable attempts, prepare
+once and give each process its own overlay and mountpoint; see the
+[N-worker recipe](sandbox.md#prepare-once-n-writable-workers) and its format limits.
 
 Indexes use the same schema as Python ratarmount, so either tool can open the
 other's. If you want to bind a mount to one exact index snapshot, publish it
@@ -163,6 +170,11 @@ including the safety rules and what happens on a crash, is in
 [Sandboxes](sandbox.md).
 
 ### Agent attempts and grading
+
+For a fleet sharing one immutable base/index, the Linux supervisor prepares it
+once at `create-base` and starts independent strict workers at `new --count N`.
+The [prepare-once recipe](sandbox.md#prepare-once-n-writable-workers) also shows
+direct CLI mounts and a remount without preparation.
 
 A committed Git tree can become a portable base; sealed preparation layers can
 then be shared across independent writable attempts:

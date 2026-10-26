@@ -1368,6 +1368,45 @@ pub fn resolve_index_location(
     }
 }
 
+/// Resolve only existing prepared local artifacts in configured candidate order.
+/// Explicit paths are authoritative. Never probes writability or materializes a copy.
+pub fn resolve_prepared_index_location(
+    archive: &Path,
+    explicit: Option<&str>,
+    folders: &[PathBuf],
+) -> Result<IndexLocation> {
+    let refusal = |path: &Path| {
+        IndexError::Invalid(format!(
+        "prepared index {} is unavailable; --no-recreate-index forbids creating or rebuilding it; stop workers and prepare the base/index before retrying", path.display()
+    ))
+    };
+    if let Some(explicit) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        if explicit == MEMORY_INDEX || is_index_url(explicit) {
+            return Err(refusal(Path::new(explicit)));
+        }
+        let path = expand_user(Path::new(explicit));
+        return if path_is_usable_existing_index(&path) {
+            Ok(IndexLocation::Path(path))
+        } else {
+            Err(refusal(&path))
+        };
+    }
+    let folders = if folders.is_empty() {
+        default_index_folders()
+    } else {
+        folders.to_vec()
+    };
+    let candidates = possible_index_paths(archive, &folders);
+    for candidate in &candidates {
+        if path_is_usable_existing_index(candidate) {
+            return Ok(IndexLocation::Path(candidate.clone()));
+        }
+    }
+    Err(refusal(
+        candidates.first().map(PathBuf::as_path).unwrap_or(archive),
+    ))
+}
+
 fn try_materialize_existing_index(path: &Path) -> Option<PathBuf> {
     if !path_is_usable_existing_index(path) {
         return None;
