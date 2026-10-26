@@ -958,6 +958,19 @@ impl SqliteIndex {
                 path.display()
             )));
         }
+        // An artifact with no pending -wal/-journal is already complete: only
+        // validate it, never open it for writing (it may be reused read-only).
+        let absolute = path.canonicalize()?;
+        let pending = ["-wal", "-journal"].iter().any(|suffix| {
+            let mut companion = absolute.as_os_str().to_owned();
+            companion.push(suffix);
+            std::fs::symlink_metadata(PathBuf::from(companion))
+                .is_ok_and(|meta| *suffix == "-journal" || meta.len() != 0)
+        });
+        if !pending {
+            Self::open_catalog_prepared(path)?;
+            return Ok(());
+        }
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
