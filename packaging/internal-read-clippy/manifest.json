@@ -917,7 +917,8 @@
     },
     {
       "item": "<ratarmount_compositing::overlay_layer::ReadOnlyOverlayLayer>::open_host",
-      "leaf_digest": "21c8b982d9f2913c59d4531c714c89e61b06d6854b7f924a2bf31c4fcdb594fb",
+      "leaf_digest": "8ee7069d9250886e5cd4a93ade2d5475fb28f9ddd9060518822f29db24a9f19d",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -968,7 +969,8 @@
     },
     {
       "item": "<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open",
-      "leaf_digest": "afbcb67aeacdd4339eba9457d02bfac3f6f67d5d2dcf477671face2dde2d7a3c",
+      "leaf_digest": "d9af744960177b31326bf1d0ab17dc67e4b437bd1aa7af0bae93acbcd4ed0b4d",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -1578,7 +1580,8 @@
     },
     {
       "item": "<ratarmount_compositing::write_overlay::WriteOverlay>::truncate",
-      "leaf_digest": "a2a5af81304f52ed74eee58dd18c7935576b67a94780c16abbe44bc2e0624210",
+      "leaf_digest": "400f1f0f4e9cc20a12c07e9bcb6088b3a087030245a134463a5e17483782494c",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -4458,30 +4461,6 @@
       "reason": "internal-read:v1 {\"id\":\"IR-E0076-M01\",\"item\":\"<ratarmount_index::managed_read::VfsLockHolder>::shared\",\"disposition\":\"managed-read\",\"category\":\"feature-test-hook\",\"reason\":\"Construct the test-hook shared-lock holder using the managed ByteFile reader.\",\"creation\":{\"policy\":\"none\",\"basis\":\"The helper opens existing content and then takes the SQLite shared lock; it does not create an input.\"}}",
       "resolved": "<ratarmount_index::managed_read::imp::ByteFile>::open",
       "rule_reason": "inventory-op:managed-read-wrapper"
-    },
-    {
-      "item": "<ratarmount_index::managed_read::imp::ByteFile>::open",
-      "leaf_digest": "6323e3a730a8fe1831cfa46c86049b1e7788e0fcde2c03c5094e4f44654ef145",
-      "metadata": {
-        "category": "managed-reader-backend",
-        "creation": {
-          "basis": "The non-Unix managed backend opens an existing private input file and validates regular-file type.",
-          "policy": "none"
-        },
-        "disposition": "managed-read",
-        "id": "IR-B0453-I01",
-        "item": "<ratarmount_index::managed_read::imp::ByteFile>::open",
-        "managed_backend": true,
-        "native_observed": false,
-        "reason": "non-Unix backend of ManagedReadCursor (an ordinary private file)",
-        "regression": "regression_internal_cursor_clones_have_independent_offsets"
-      },
-      "native_observed": false,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0453-I01\",\"disposition\":\"managed-read\",\"reason\":\"non-Unix backend of ManagedReadCursor (an ordinary private file)\",\"regression\":\"regression_internal_cursor_clones_have_independent_offsets\",\"managed_backend\":true,\"item\":\"<ratarmount_index::managed_read::imp::ByteFile>::open\",\"native_observed\":false,\"creation\":{\"policy\":\"none\",\"basis\":\"The non-Unix managed backend opens an existing private input file and validates regular-file type.\"},\"category\":\"managed-reader-backend\"}"
     },
     {
       "configured_path": "std::fs::create_dir_all",
@@ -11934,7 +11913,8 @@
     },
     {
       "item": "ratarmount_compositing::write_overlay::open_park_fd",
-      "leaf_digest": "c73dbd9529e510c023a9c4ff36d5e18893968fa036c10f1bdab55fb53af0243e",
+      "leaf_digest": "09776f0a21c509834b9e2d99e4aeafcfe2246dc0de9ae9e7969bf95e2e39430b",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -12149,7 +12129,8 @@
     },
     {
       "item": "ratarmount_compositing::write_overlay::rebuild_zip_with_overlay",
-      "leaf_digest": "7651349fa4e2ac175d18949f031f51af965eeadf22dd622ead6ba2d33fd60294",
+      "leaf_digest": "9a67e4cf62f8b7ba43f3d25bd8008b3bd2fcbd03209de234cca61bbb366b8129",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "archive-input",
         "creation": {
@@ -12336,7 +12317,8 @@
     },
     {
       "item": "ratarmount_compositing::write_overlay::write_commit_manifest",
-      "leaf_digest": "ed1521b6c635fc30e109dd4d5c48106c47da1312ef2d94c6b784e9478c1bbe09",
+      "leaf_digest": "3f27b87158ff660ea2126d1e470eb8ac613c41c46458d272b6a3dcd16688a2d8",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "structured-control-record",
         "creation": {
@@ -13069,7 +13051,8 @@
     },
     {
       "item": "ratarmount_compress::fastcopy::copy_to_temp",
-      "leaf_digest": "aa3c1d60de2a3fce518a3ae55388311cd88f7466db278772977c67dad78898f8",
+      "leaf_digest": "eb410756778893b41d7bb0326d5c7160762b1d17ea9a5025a458d5d726c0ce7f",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "compression-staging",
         "creation": {
@@ -13092,7 +13075,8 @@
     },
     {
       "item": "ratarmount_compress::fastcopy::copy_to_temp",
-      "leaf_digest": "a5c15ca3a6b6906808d87f7290475c00e70f4da2e8d9fba6f32d32e6cfa74efb",
+      "leaf_digest": "c81399898ad725f678d720680e2a8707555dbd95046d0c32edd427895c5df212",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "compression-staging",
         "creation": {
@@ -13115,7 +13099,8 @@
     },
     {
       "item": "ratarmount_compress::fastcopy::copy_to_temp",
-      "leaf_digest": "49dde39743553e605daf4cd0d182b9a751d13353a06e4b3d538d42c1fa828204",
+      "leaf_digest": "2d4d37ccb8e9392a5de8ed9ee88362864744b6020f17b41fab98f675d0117f0d",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "runtime-resource-or-descriptor-handoff",
         "creation": {
@@ -15825,7 +15810,8 @@
     },
     {
       "item": "ratarmount_formats_tar::write::write_file_on_disk",
-      "leaf_digest": "167a1373b7649b8fff371a364e6541b709b4f4b59a6c22f086fdb5d188ae42c2",
+      "leaf_digest": "2c7fa1757142f28085dc6dc87ac3d4c033555c4b9179751e1c38fc37efdec602",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -16520,7 +16506,8 @@
     },
     {
       "item": "ratarmount_formats_zip::read_file_range_at_into",
-      "leaf_digest": "0e8abdb8ec419b34eb5b535c0b29994b6b316eb2ce097e047768befb41238c56",
+      "leaf_digest": "53731e607dc34473240a70790021615fd93e867ce8dcdfc4696ad18c36792360",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "archive-input",
         "creation": {
@@ -16814,7 +16801,8 @@
     },
     {
       "item": "ratarmount_fuse::reopen_parked_readonly",
-      "leaf_digest": "89f744c5dc665b8893c4860b8b10f69427de1f66dd536580cfb9442e8fe7f5e4",
+      "leaf_digest": "beaedb32379d95d31e15b3234051338bd1d5006e090234412197652f93669663",
+      "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "overlay-payload",
         "creation": {
@@ -21134,12 +21122,12 @@
     }
   ],
   "policy": {
-    "configuration": "537187ebd86f7ab8994a53020bdac01cf6da90d37a9cc1ddb23055516320ccf3",
+    "configuration": "6e2570b5629ec3c8786d5f154ed8e35f944667df4d7419e48daa94f45c430469",
     "profiles": "f04aa50122d4ae1f0504b6411c5b47cacf3a97a9e3080e175166f3b744aa4bd8",
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
       "component_digest": "6fdbc2122f41ca9f892fe09782f4f3b6e18f23d60483a3403d3e5e0da119a0f2",
-      "patch_digest": "36782c56c35274ee13dfa0fd461040485b7507f5797ebb188abc736d735b3871",
+      "patch_digest": "080ae69e2394f99e5efc6dd4e64340fba3e25e0be460fb3bbab77cac834a6246",
       "schema": 1,
       "source_digest": "5a9993673ce40804e6b50300df59ecb3d13942c1c89cd11e76acf705b331f982"
     }

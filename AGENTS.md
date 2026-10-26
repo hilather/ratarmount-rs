@@ -25,7 +25,9 @@ the disallowed-item lints with `allow`/`warn` or wrap their expectations in
 unmanifested expectation or an approval without a matching expectation fails.
 Every protected-lint source expectation is checked regardless of cfg activity
 or reason text; journal exemptions require an explicit reviewed manifest flag
-and exact operation identity.
+and exact operation identity. Expectations retain their own compiler item
+identity; copying a reason cannot select another item's exemption, and
+conflicting observations fail closed.
 The generator writes a candidate; CI never refreshes approvals. N2–N4 are syntax
 refusals only, with no textual operation, path/reexport, creation-flag or foreign-symbol resolver.
 Production membership is whatever Clippy compiles for the selected lib/bin
@@ -47,8 +49,11 @@ review. Inventory enforcement is Linux-only; inactive native alternatives remain
 out of scope and require ordinary review. N4 structurally refuses any target
 predicate in cfg/cfg_attr at any nesting level, regardless of other predicates
 or parent cfg activity, outside reviewed files. Syntax audits also inspect
-inactive item bodies. cfg! returns a boolean and is permitted. N3 refuses nested
-macro_rules! definitions in restricted macro transcribers.
+inactive item bodies. cfg! returns a boolean and is permitted. In restricted
+crates, N3 recursively scans every raw token stream, including invocation
+arguments, attributes and macro bodies. It refuses the macro_rules identifier
+outside directly written definitions handled by the ordinary body audit, and
+refuses metavariable macro-invocation heads (`$x !`).
 Unparseable cfg_attr predicates and clippy/not(clippy) stripping are refused in
 restricted packages, including reviewed files. Linux production Clippy uses
 `-D clippy::disallowed_methods -F unused_macros -D warnings`, preserving reviewed
@@ -85,6 +90,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 |---------------|----------|
 | #201: Clippy resolved definitions, N2–N4 syntax, narrow expectations and manifest diff; quiet-print shadowing; typed statfs | `python3 -I packaging/internal-read-clippy/test_policy.py` · `python3 -I packaging/internal-read-clippy/controls/run.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver"` · `python3 -I packaging/internal-read-clippy/policy.py` · `cargo test -p ratarmount --bin ratarmount regression_typed_statfs` |
 | #201 r10b: false/release/feature cfg hid syntax, macro generators hid attributes, and inactive/shadowed expectations escaped manifest review | `python3 -I packaging/internal-read-clippy/syntax/test_compiled.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-syntax` · `python3 -I packaging/internal-read-clippy/test_manifest.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-manifest` |
+| #201 r11: substituted macro-definition heads, copied journal reasons, and crate-root link_name escaped review | `python3 -I packaging/internal-read-clippy/syntax/test_compiled.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-syntax` · `python3 -I packaging/internal-read-clippy/test_manifest.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-manifest` · `python3 -I packaging/internal-read-clippy/compiler/test_driver.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-compiler` |
 | BIG fixture builder missing tar.lz4 / multi-frame zstd | `./benchmarks/test-compare-fixtures.sh` |
 | Vector-wave fixture builder missing catalog tars | `./benchmarks/test-compare-vector-wave.sh` |
 | Format sweep fixture builder: missing-producer skips, corrupt or count-mismatched reads, `PREPARE_ONLY` / `NO_FUSE` regressions (AI-FMTBENCH) | `./benchmarks/test-compare-formats.sh` |

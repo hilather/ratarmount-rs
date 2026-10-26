@@ -114,6 +114,14 @@ def main():
         except policy_module.PolicyError:pass
         else:raise AssertionError('multiple reviewed includes must fail actual manifest generation')
         config['include_exceptions']=[]
+        # Regression: inactive crate-root link_name attributes bypassed N2
+        # because check_attributes sees only their configured spelling.
+        for name,attribute in [
+            ('crate-root-inactive-link-name', '#![cfg_attr(any(),link_name="arbitrary")]'),
+            ('crate-root-nested-inactive-link-name', '#![cfg_attr(all(),cfg_attr(any(),link_name="arbitrary"))]'),
+        ]:
+            rows=run(name,attribute+' pub fn visible(){}',native_baseline=True,reject='N2')
+            assert any(row.get('policy')=='N2' and row.get('detail')=='link_name outside reviewed module' for row in rows)
         run('extern-root','unsafe extern "C"{pub fn mkostemp(p:*mut u8)->i32;}',reject='N2')
         config['allowed_extern_module']='control::ffi'
         run('extern-exact','pub mod ffi{unsafe extern "C"{pub fn mkostemp(p:*mut u8)->i32;}}')

@@ -71,6 +71,14 @@ reasons without the inventory prefix. Independent journal exemptions need an
 explicit `journal_exemption: true` manifest entry for the exact item, literal
 reason, lint and resolved/configured rule identity; prose alone grants no
 exemption.
+Source expectations keep their own compiler item identity. A copied journal
+reason cannot select another item's exemption, and conflicting observations
+cannot replace or erase an expectation during profile merging.
+Exact compiler item spans and enclosing module body spans supply canonical
+scope; inactive children append only their declared item names. An inactive
+whole impl without a compiler-resolved owner fails closed. Compiler-unloaded
+external modules remain outside the selected Linux compilation and require
+ordinary review.
 
 `policy.py --collect` writes `target/internal-read-manifest.json` as a review
 candidate. Review before copying it to `manifest.json`; CI never refreshes it.
@@ -95,10 +103,12 @@ and ordinary macro invocations remain permitted. A repetition that can supply an
 unknown attribute prefix before fixed syntax is refused, including `*`, `+` and
 `?` forms. Whole-item forwarding, opaque trailing arguments without an active
 attribute prefix, and harmless separator-delimited repetitions remain permitted.
-Literal nested macro definitions in invocation payloads receive the same
-grammar audit, with generic matchers and other payload data preserved.
-Restricted macro transcribers cannot define nested macro_rules! macros:
-macro-generating macros are refused without auditing generated grammar.
+In restricted crates, every raw token stream is scanned recursively, including
+invocation arguments, attributes, matchers and transcribers. The `macro_rules`
+identifier is refused except for the head of a directly written definition
+whose body receives the ordinary audit; metavariable invocation heads (`$x !`)
+are also refused. This fails closed on macro generation without interpreting
+generated grammar, even when a macro would discard its input.
 CI supplies `-F unused_macros`; the root `forbid` attributes document that rule.
 There is no root-attribute source check. N4 refuses target predicates in stripping
 `cfg`/`cfg_attr` attributes in the 40 reviewed restricted packages outside exact

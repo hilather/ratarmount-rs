@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 use syn::{Meta, Token, parse::Parser, punctuated::Punctuated};
 
 use crate::internal_read_grammar::{
-    audit_macro_payload_with_lints, audit_macro_with_lints, clippy_attribute, inventory_attribute,
-    suppression_attribute_with_lints, target_attribute,
+    audit_macro_payload_with_lints, audit_macro_with_lints, audit_raw_tokens, clippy_attribute,
+    inventory_attribute, suppression_attribute_with_lints, target_attribute,
 };
 
 pub fn register(_: &Session, store: &mut LintStore) {
@@ -80,9 +80,33 @@ struct Syntax {
     leaf_emitted: BTreeSet<(u32, u32)>,
     targets: BTreeSet<(u32, u32)>,
     module_spans: Vec<Span>,
+    source_owners: Vec<(String, Span)>,
 }
 impl_lint_pass!(Syntax => []);
 impl Syntax {
+    fn child_owner(&self, name: &str) -> String {
+        match self.source_owners.last() {
+            Some((parent, _)) if !parent.is_empty() => format!("{parent}::{name}"),
+            _ => name.to_owned(),
+        }
+    }
+    fn raw_attribute(&mut self, cx: &EarlyContext<'_>, attr: &ast::Attribute) {
+        self.raw_tokens(cx, attr.span, &pprust::attribute_to_string(attr));
+    }
+    fn raw_tokens(&mut self, cx: &EarlyContext<'_>, span: Span, text: &str) {
+        if self.restricted() {
+            match audit_raw_tokens(text) {
+                Ok(findings) => {
+                    for (policy, detail) in findings {
+                        self.report(cx, span, &policy, &detail);
+                    }
+                }
+                Err(detail) => {
+                    self.report(cx, span, "N3", &format!("raw token parse failed: {detail}"))
+                }
+            }
+        }
+    }
     fn report(&mut self, cx: &EarlyContext<'_>, span: Span, policy: &str, detail: &str) {
         if self
             .emitted
@@ -124,14 +148,7 @@ impl Syntax {
             .is_some_and(|p| p.iter().any(|p| p["file"].as_str() == Some(&file)));
         self.restricted() && !reviewed
     }
-    fn leaf(
-        &mut self,
-        cx: &EarlyContext<'_>,
-        attrs: &[ast::Attribute],
-        span: Span,
-        kind: &str,
-        text: String,
-    ) {
+    fn leaf(&mut self, cx: &EarlyContext<'_>, attrs: &[ast::Attribute], span: Span, kind: &str) {
         for attr in attrs {
             let Some(meta) = parsed(attr) else {
                 continue;
@@ -144,13 +161,31 @@ impl Syntax {
                     {
                         continue;
                     }
-                    crate::internal_read::register_leaf(&reason, attr.span, span, kind);
-                    let tokens = text
-                        .parse::<proc_macro2::TokenStream>()
-                        .map(|s| s.to_string())
-                        .unwrap_or(text.clone());
+                    let (owner, owner_span) = self
+                        .source_owners
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), span));
+                    let scope_span = self
+                        .source_owners
+                        .first()
+                        .map(|(_, span)| *span)
+                        .unwrap_or(owner_span);
+                    crate::internal_read::register_leaf(
+                        &reason,
+                        attr.span,
+                        span,
+                        kind,
+                        owner_span,
+                        scope_span,
+                        &owner,
+                        &self.source_owners,
+                    );
+                    // The compiler leaf span excludes its attributes. Use that
+                    // same token source in both pre-expansion and HIR reports.
+                    let tokens = crate::internal_read::normalized_leaf(cx.sess(), span);
                     crate::internal_read::emit(
-                        json!({"schema":1,"kind":"expectation","reason":reason,"lint":lint,"span":crate::internal_read::span(cx.sess(),attr.span),"leaf":{"span":crate::internal_read::span(cx.sess(),span),"kind":kind,"tokens":tokens},"source":true}),
+                        json!({"schema":1,"kind":"expectation","source_lexical_owner":owner,"owner_span":crate::internal_read::span(cx.sess(),owner_span),"reason":reason,"lint":lint,"span":crate::internal_read::span(cx.sess(),attr.span),"leaf":{"span":crate::internal_read::span(cx.sess(),span),"kind":kind,"tokens":tokens},"source":true}),
                     );
                     if matches!(kind, "fn" | "mod" | "impl" | "closure" | "block" | "item") {
                         self.report(
@@ -191,7 +226,15 @@ impl EarlyLintPass for Syntax {
         // Audit that compiler-owned syntax before conditional lint attributes
         // can become indistinguishable from direct approvals.
         for attr in &krate.attrs {
+            self.raw_attribute(cx, attr);
             let Some(meta) = parsed(attr) else { continue };
+            if contains_link_name(&meta) {
+                crate::internal_read::n2_raw_pending(
+                    attr.span,
+                    "link_name outside reviewed module",
+                    None,
+                );
+            }
             if self.restricted() {
                 if let Err(detail) = suppression_attribute_with_lints(&meta, &self.protected_lints)
                 {
@@ -236,6 +279,9 @@ impl EarlyLintPass for Syntax {
         }
     }
     fn check_attributes(&mut self, cx: &EarlyContext<'_>, attrs: &[ast::Attribute]) {
+        for attr in attrs {
+            self.raw_attribute(cx, attr);
+        }
         if self.restricted() {
             for attr in attrs {
                 let Some(meta) = parsed(attr) else {
@@ -316,6 +362,19 @@ impl EarlyLintPass for Syntax {
         }
     }
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &ast::Item) {
+        // This pass is recreated for each compiler-loaded external module.
+        // Keep an AST-declared suffix relative to this traversal root; HIR
+        // module spans provide the canonical scope after expansion.
+        let owner = match item.kind.ident() {
+            Some(ident) => self.child_owner(ident.name.as_str()),
+            None if matches!(item.kind, ItemKind::Impl(_)) => self.child_owner("<unresolved-impl>"),
+            None => self
+                .source_owners
+                .last()
+                .map(|(name, _)| name.clone())
+                .unwrap_or_default(),
+        };
+        self.source_owners.push((owner, item.span));
         let kind = match &item.kind {
             ItemKind::Fn(_) => "fn",
             ItemKind::Mod(..) => "mod",
@@ -324,13 +383,7 @@ impl EarlyLintPass for Syntax {
             ItemKind::TyAlias(_) => "type",
             _ => "item",
         };
-        self.leaf(
-            cx,
-            &item.attrs,
-            item.span,
-            kind,
-            pprust::item_to_string(item),
-        );
+        self.leaf(cx, &item.attrs, item.span, kind);
         if matches!(item.kind, ItemKind::Mod(..)) {
             self.module_spans.push(item.span);
         }
@@ -343,9 +396,32 @@ impl EarlyLintPass for Syntax {
         }
     }
     fn check_item_post(&mut self, _: &EarlyContext<'_>, item: &ast::Item) {
+        self.source_owners.pop();
         if matches!(item.kind, ItemKind::Mod(..)) {
             self.module_spans.pop();
         }
+    }
+    fn check_impl_item(&mut self, _: &EarlyContext<'_>, item: &ast::AssocItem) {
+        let owner = item
+            .kind
+            .ident()
+            .map(|ident| self.child_owner(ident.name.as_str()))
+            .unwrap_or_else(|| {
+                self.source_owners
+                    .last()
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_default()
+            });
+        self.source_owners.push((owner, item.span));
+    }
+    fn check_impl_item_post(&mut self, _: &EarlyContext<'_>, _: &ast::AssocItem) {
+        self.source_owners.pop();
+    }
+    fn check_trait_item(&mut self, cx: &EarlyContext<'_>, item: &ast::AssocItem) {
+        self.check_impl_item(cx, item);
+    }
+    fn check_trait_item_post(&mut self, cx: &EarlyContext<'_>, item: &ast::AssocItem) {
+        self.check_impl_item_post(cx, item);
     }
     fn check_stmt(&mut self, cx: &EarlyContext<'_>, stmt: &ast::Stmt) {
         let kind = match stmt.kind {
@@ -353,13 +429,7 @@ impl EarlyLintPass for Syntax {
             StmtKind::Expr(_) | StmtKind::Semi(_) => "statement",
             _ => return,
         };
-        self.leaf(
-            cx,
-            stmt.attrs(),
-            stmt.span,
-            kind,
-            pprust::stmt_to_string(stmt),
-        );
+        self.leaf(cx, stmt.attrs(), stmt.span, kind);
     }
     fn check_expr(&mut self, cx: &EarlyContext<'_>, expr: &ast::Expr) {
         let kind = match expr.kind {
@@ -367,19 +437,14 @@ impl EarlyLintPass for Syntax {
             ast::ExprKind::Closure(..) => "closure",
             _ => "expression",
         };
-        self.leaf(
-            cx,
-            &expr.attrs,
-            expr.span,
-            kind,
-            pprust::expr_to_string(expr),
-        );
+        self.leaf(cx, &expr.attrs, expr.span, kind);
     }
     fn check_mac_def(&mut self, cx: &EarlyContext<'_>, def: &ast::MacroDef) {
+        let text = pprust::tts_to_string(&def.body.tokens);
         if !def.macro_rules {
+            self.raw_tokens(cx, def.body.dspan.entire(), &text);
             return;
         }
-        let text = pprust::tts_to_string(&def.body.tokens);
         match audit_macro_with_lints(&text, self.restricted(), &self.protected_lints) {
             Ok(findings) => {
                 for (policy, detail) in findings {
@@ -404,9 +469,8 @@ impl EarlyLintPass for Syntax {
     }
     fn check_mac(&mut self, cx: &EarlyContext<'_>, mac: &ast::MacCall) {
         let macro_tokens = pprust::tts_to_string(&mac.args.tokens);
-        // Invocation tokens are otherwise opaque: only literal nested macro
-        // definitions have Rust matcher/transcriber grammar at this stage.
-        // Inspect them before expansion can erase cfg-gated transcribers.
+        // Inspect every invocation payload before expansion, even if the macro
+        // discards it. Restricted raw streams cannot construct new definitions.
         match audit_macro_payload_with_lints(
             &macro_tokens,
             self.restricted(),

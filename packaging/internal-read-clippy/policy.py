@@ -245,6 +245,7 @@ def manifest(reports, header, journal_exemptions=()):
                      tomllib.loads((ROOT / "clippy.toml").read_text())["disallowed-methods"]
                      if not r["reason"].startswith("inventory-op:")}
     journal = {}
+    reason_owners = {}
     for approval in journal_exemptions:
         if approval.get("journal_exemption") is not True:
             raise PolicyError("journal exemption requires an explicit manifest flag")
@@ -258,13 +259,28 @@ def manifest(reports, header, journal_exemptions=()):
         key = (approval["item"], approval["reason"])
         if key in journal:
             raise PolicyError("duplicate journal exemption item/reason")
+        if approval["reason"] in reason_owners and reason_owners[approval["reason"]] != approval["item"]:
+            raise PolicyError("duplicate expectation reason on different items")
+        reason_owners[approval["reason"]] = approval["item"]
         journal[key] = approval
     active_marks = set()
     observed_marks = set()
     for profile, report in reports:
         seen_source = set()
         seen_operations = set()
-        for row in validate_report(report):
+        rows = validate_report(report)
+        owner_bindings = {}
+        for row in rows:
+            if row["kind"] != "source_owner":
+                continue
+            span = row.get("span", {})
+            span_key = (span.get("file"), span.get("lo"), span.get("hi"))
+            if not isinstance(row.get("owner"), str) or not row["owner"]:
+                raise PolicyError("source item has no compiler owner")
+            if span_key in owner_bindings and owner_bindings[span_key] != row["owner"]:
+                raise PolicyError("conflicting compiler source item owners")
+            owner_bindings[span_key] = row["owner"]
+        for row in rows:
             if row["kind"] not in {"operation", "expectation", "include_exception"}:
                 continue
             source_mark = row["kind"] == "expectation" and (
@@ -273,12 +289,13 @@ def manifest(reports, header, journal_exemptions=()):
                 # Every pre-pruning source expectation needs approval, including
                 # active marks which HIR may shadow with another lint level.
                 # HIR and resolved operations still supply active ownership.
-                matches = [approval for approval in journal.values()
-                           if approval["reason"] == row.get("reason")
-                           and approval["lint"] == row.get("lint")]
-                if len(matches) > 1:
-                    raise PolicyError("ambiguous inactive journal expectation owner")
-                owner = matches[0]["item"] if matches else metadata_reason(row.get("reason"))["item"]
+                owner_span = row.get("owner_span", {})
+                owner_key = (owner_span.get("file"), owner_span.get("lo"), owner_span.get("hi"))
+                owner = owner_bindings.get(owner_key, row.get("owner"))
+                if not isinstance(owner, str) or not owner:
+                    raise PolicyError("source expectation has no compiler item owner")
+                if "<unresolved-impl>" in owner:
+                    raise PolicyError("source expectation requires a resolved compiler impl owner")
                 row = dict(row, active=False, owner=owner,
                            leaf_digest=digest(row["leaf"]["tokens"].encode()))
             if row["kind"] == "operation":
@@ -294,6 +311,9 @@ def manifest(reports, header, journal_exemptions=()):
                 reason = row.get("reason")
                 owner = row["owner"]
                 key = (owner, reason)
+                if reason in reason_owners and reason_owners[reason] != owner:
+                    raise PolicyError(f"duplicate expectation reason on different items: {owner}")
+                reason_owners[reason] = owner
                 approval = journal.get(key)
                 if row.get("broad", False):
                     raise PolicyError(f"broad inventory expectation: {owner}: {reason}")
@@ -322,6 +342,7 @@ def manifest(reports, header, journal_exemptions=()):
                         raise PolicyError(f"duplicate expectation id: {review['id']}")
                     ids[review["id"]] = key
                     value = {"item": owner, "reason": reason, "metadata": review,
+                             "lint": row.get("lint"),
                              "native_observed": row["kind"] == "operation", "profiles": [],
                              "leaf_digest": row["leaf_digest"]}
                     if row["kind"] == "operation":
@@ -341,12 +362,24 @@ def manifest(reports, header, journal_exemptions=()):
             seen.add(key)
             if key in entries:
                 previous = {k: v for k, v in entries[key].items() if k != "profiles"}
-                if previous.get("native_observed") is False and value.get("native_observed") is True:
-                    entries[key] = value
-                elif previous.get("native_observed") is True and value.get("native_observed") is False:
-                    continue
-                elif previous != {k: v for k, v in value.items() if k != "profiles"}:
+                current = {k: v for k, v in value.items() if k != "profiles"}
+                # A source mark and its native lookup may reconcile only after
+                # every shared identity/leaf field agrees. Never replace or
+                # drop a conflicting source observation merely because the
+                # other row has a native operation.
+                if any(previous[k] != current[k] for k in previous.keys() & current.keys()
+                       if k != "native_observed"):
                     raise PolicyError(f"conflicting compiler observations for {key[0]}")
+                if previous.get("native_observed") is True and current.get("native_observed") is False:
+                    continue  # Identity and leaf equality were checked above.
+                profiles = (entries[key]["profiles"] if previous.get("native_observed") == current.get("native_observed")
+                            else [])
+                merged = dict(previous, **current)
+                if "native_observed" in previous or "native_observed" in current:
+                    merged["native_observed"] = (previous.get("native_observed", False)
+                                                 or current.get("native_observed", False))
+                merged["profiles"] = profiles
+                entries[key] = merged
             else:
                 entries[key] = value
             entries[key]["profiles"].append(profile)

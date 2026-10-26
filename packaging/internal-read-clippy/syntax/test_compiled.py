@@ -72,6 +72,39 @@ def main():
             (args.output / f'{name}.jsonl').write_text(report.read_text() if report.exists() else '')
             results.append({'name': name, 'compiled': native, 'exit': done.returncode, 'expected': reject or 'accept', 'observed': sorted(str(x) for x in observed)})
             return events
+        # Regression: substituting the macro_rules keyword must not generate an
+        # unaudited macro whose substituted attribute hides a fixed read.
+        for predicate, suffix in [('not(clippy)', 'not-clippy'), ('windows', 'windows')]:
+            run('substituted-macro-keyword-' + suffix, '''macro_rules! make {
+                ($kw:ident $d:tt) => {
+                    $kw! hidden {
+                        ($d h:tt $d a:tt) => {
+                            $d h $d a pub fn hidden() { let _ = std::fs::read("x"); }
+                        }
+                    }
+                }
+            }
+            make!(macro_rules $);
+            hidden!(# [cfg(''' + predicate + ''')]);''', reject='N3',
+                reject_detail='metavariable macro invocation head')
+        # A directly written definition still receives the ordinary body audit.
+        run('literal-top-level-macro-definition',
+            'macro_rules! visible { () => { pub fn visible() -> u8 { 7 } }; } visible!();')
+        # Every opaque token stream is checked, even if a macro discards it.
+        for name, payload in [('bare-keyword', 'macro_rules'),
+                              ('nested-keyword', '(macro_rules)'),
+                              ('substituted-head', '$head ! ()')]:
+            run('discarded-' + name,
+                'macro_rules! ignore { ($($t:tt)*) => {}; } ignore! { ' + payload + ' }',
+                reject='N3')
+        run('discarded-keyword-in-inactive-body',
+            '#[cfg(any())] pub fn hidden() { ignore!(macro_rules); }', reject='N3')
+        run('keyword-in-root-attribute', '#![doc = stringify!(macro_rules)]', reject='N3')
+        run('keyword-in-item-attribute', '#[doc = stringify!(macro_rules)] pub fn visible() {}', reject='N3')
+        run('keyword-in-declarative-macro-body',
+            '#![feature(decl_macro)] pub macro ignored($($t:tt)*) { stringify!(macro_rules) }', reject='N3')
+        run('substituted-declarative-macro-head',
+            '#![feature(decl_macro)] pub macro invoke($head:ident) { $head ! () }', reject='N3')
         # Regression: -D must permit reviewed direct expects, but source cannot
         # lower the acquisition lint or hide an approval in cfg_attr.
         for reviewed in (False, True):
@@ -190,24 +223,24 @@ def main():
         }
         make!($);
         hidden!(# [cfg(windows)]);''', reject='N3',
-            reject_detail='nested macro_rules definition in transcriber')
+            reject_detail='macro_rules token outside literal definition')
         run('typed-ident-indexing', 'macro_rules! m { ($array:ident) => { $array[0] }; } pub fn first(array: [u8; 1]) -> u8 { m!(array) }')
         run('ambiguous-tt-indexing', 'macro_rules! m { ($array:tt) => { $array[0] }; } pub fn first(array: [u8; 1]) -> u8 { m!(array) }', reject='N3')
-        # Regression: literal macro definitions inside invocation payloads must
-        # start a fresh matcher/transcriber audit, including nested groups.
+        # Regression: raw invocation payloads cannot carry macro definitions,
+        # including generic matchers and definitions inside nested groups.
         forward = 'macro_rules! pass { ($($t:tt)*) => { $($t)* }; } '
         nested_cfg = 'macro_rules! hidden { () => { #[cfg(windows)] ' + hidden_read + ' } } hidden!();'
         run('payload-nested-cfg-macro', forward + 'pass! { ' + nested_cfg + ' }', reject='N3')
         run('payload-grouped-nested-cfg-macro', forward + 'pass! { mod nested { ' + nested_cfg + ' } }', reject='N3')
         run('payload-nested-substituted-attribute', forward + 'pass! { macro_rules! hidden { ($a:meta) => { #[$a] ' + hidden_read + ' } } hidden!(cfg(windows)); }', reject='N3')
         run('payload-nested-substituted-brackets', forward + 'pass! { macro_rules! hidden { ($a:tt) => { # $a ' + hidden_read + ' } } hidden!([cfg(windows)]); }', reject='N3')
-        run('payload-nested-generic-matcher', forward + 'pass! { macro_rules! visible { (#[$a:meta]) => { pub fn visible() {} } } visible!(#[allow(dead_code)]); }')
+        run('payload-nested-generic-matcher', forward + 'pass! { macro_rules! visible { (#[$a:meta]) => { pub fn visible() {} } } visible!(#[allow(dead_code)]); }', reject='N3')
         run('opaque-payload-cfg', 'macro_rules! ignore { ($($t:tt)*) => {}; } ignore! { #[cfg(windows)] ' + hidden_read + ' }')
         run('opaque-payload-extern', 'macro_rules! ignore { ($($t:tt)*) => {}; } ignore! { unsafe extern { fn arbitrary(); } }')
         payload_foreign = 'macro_rules! foreign { () => { unsafe extern { pub fn arbitrary(); } } } foreign!();'
-        run('payload-nested-foreign-macro', forward + 'pass! { ' + payload_foreign + ' }', reject='N2')
-        run('payload-nested-foreign-exact-owner', forward + 'pub mod ffi { pass! { ' + payload_foreign + ' } }', allow_ffi=True)
-        run('payload-nested-foreign-sibling-owner', forward + 'pub mod sibling { pass! { ' + payload_foreign + ' } }', reject='N2', allow_ffi=True)
+        run('payload-nested-foreign-macro', forward + 'pass! { ' + payload_foreign + ' }', reject='N3')
+        run('payload-nested-foreign-exact-owner', forward + 'pub mod ffi { pass! { ' + payload_foreign + ' } }', allow_ffi=True, reject='N3')
+        run('payload-nested-foreign-sibling-owner', forward + 'pub mod sibling { pass! { ' + payload_foreign + ' } }', reject='N3', allow_ffi=True)
         # N2 does not inspect a foreign declaration's name or optional ABI text.
         for name, matcher, head, args_text in [
             ('optional-abi', '$kw:ident $($abi:literal)?', 'unsafe $kw $($abi)?', 'extern "C"'),

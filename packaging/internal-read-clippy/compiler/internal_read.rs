@@ -10,14 +10,31 @@ struct SourceLeaf {
     reason: String,
     attribute: Span,
     leaf: Span,
+    owner: Span,
+    scope: Span,
+    owner_suffix: String,
+    ancestors: Vec<(String, Span)>,
     broad: bool,
 }
 static SOURCE_LEAVES: Mutex<Vec<SourceLeaf>> = Mutex::new(Vec::new());
-pub fn register_leaf(reason: &str, attribute: Span, leaf: Span, kind: &str) {
+pub fn register_leaf(
+    reason: &str,
+    attribute: Span,
+    leaf: Span,
+    kind: &str,
+    owner: Span,
+    scope: Span,
+    owner_suffix: &str,
+    ancestors: &[(String, Span)],
+) {
     SOURCE_LEAVES.lock().unwrap().push(SourceLeaf {
         reason: reason.to_owned(),
         attribute,
         leaf,
+        owner,
+        scope,
+        owner_suffix: owner_suffix.to_owned(),
+        ancestors: ancestors.to_vec(),
         broad: matches!(kind, "fn" | "mod" | "impl" | "closure" | "block" | "item"),
     });
 }
@@ -585,6 +602,96 @@ pub fn finish(tcx: TyCtxt<'_>) {
                 }
             }
         }
+    }
+    // Exact item spans bind active leaves to canonical HIR owners, including
+    // impl identities. For inactive children, anchor the traversal's first
+    // item span to the compiler's enclosing module range, then append only
+    // the AST-declared lexical suffix. Loaded external modules start fresh
+    // pre-expansion passes; neither filenames nor reasons select their scope.
+    let mut item_owners = Vec::new();
+    for own in tcx.hir_crate_items(()).owners() {
+        let id = tcx.local_def_id_to_hir_id(own.def_id);
+        let item_span = match tcx.hir_node(id) {
+            Node::Item(item) => item.span,
+            Node::ImplItem(item) => item.span,
+            Node::TraitItem(item) => item.span,
+            _ => continue,
+        };
+        item_owners.push((item_span, own.def_id));
+    }
+    let source_leaves = SOURCE_LEAVES.lock().unwrap().clone();
+    for leaf in source_leaves {
+        let mut bound = None;
+        let mut ambiguous = false;
+        // Nearest active compiler ancestor wins. This also binds an inactive
+        // method through its active impl without reconstructing any type path.
+        for (suffix, ancestor_span) in leaf.ancestors.iter().rev() {
+            let exact = item_owners
+                .iter()
+                .filter(|(span, _)| span == ancestor_span)
+                .map(|(_, id)| *id)
+                .collect::<Vec<_>>();
+            if exact.len() > 1 {
+                tcx.dcx()
+                    .span_err(*ancestor_span, "source item has ambiguous compiler owners");
+                ambiguous = true;
+                break;
+            }
+            if let Some(id) = exact.first() {
+                let tail = leaf
+                    .owner_suffix
+                    .strip_prefix(suffix)
+                    .filter(|tail| tail.is_empty() || tail.starts_with("::"))
+                    .expect("compiler lexical ancestry must preserve its declared suffix");
+                let prefix = if tail.is_empty() {
+                    owner(tcx, id.to_def_id())
+                } else {
+                    // An enclosing impl is a scope, not the leaf owner; two
+                    // inherent impl blocks may share the same canonical type.
+                    identity(tcx, id.to_def_id())
+                };
+                bound = Some(format!("{prefix}{tail}"));
+                break;
+            }
+        }
+        if ambiguous {
+            continue;
+        }
+        let canonical = if let Some(owner) = bound {
+            owner
+        } else {
+            let mut scopes = module_ranges
+                .iter()
+                .filter(|(span, _)| span.contains(leaf.scope))
+                .collect::<Vec<_>>();
+            scopes.sort_by_key(|(span, _)| span.hi().0 - span.lo().0);
+            let Some((scope_span, scope_id)) = scopes.first().copied() else {
+                tcx.dcx()
+                    .span_err(leaf.owner, "source item has no compiler module scope");
+                continue;
+            };
+            if scopes
+                .iter()
+                .filter(|(span, _)| {
+                    span.hi().0 - span.lo().0 == scope_span.hi().0 - scope_span.lo().0
+                })
+                .count()
+                != 1
+            {
+                tcx.dcx().span_err(
+                    leaf.owner,
+                    "source item has ambiguous compiler module scopes",
+                );
+                continue;
+            }
+            let scope = identity(tcx, scope_id.to_def_id());
+            if leaf.owner_suffix.is_empty() {
+                scope
+            } else {
+                format!("{scope}::{}", leaf.owner_suffix)
+            }
+        };
+        emit(json!({"kind":"source_owner","span":span(tcx.sess,leaf.owner),"owner":canonical}));
     }
     emit(json!({"kind":"hir_complete"}));
     let mut seen_expectations = std::collections::HashSet::new();

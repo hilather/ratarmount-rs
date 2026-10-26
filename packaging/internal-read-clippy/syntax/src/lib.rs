@@ -100,6 +100,34 @@ impl Audit {
             .insert((span.start().line, policy.into(), detail.into()));
     }
 
+    // Inspect every raw stream recursively, without interpreting an invocation's
+    // payload or generated grammar. The adapter supplies literal definitions as
+    // bodies, so only their already-audited outer `macro_rules` head is absent.
+    fn raw_tokens(&mut self, tokens: TokenStream) {
+        if !self.restricted {
+            return;
+        }
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            if is_ident(token, "macro_rules") {
+                self.emit(
+                    token.span(),
+                    "N3",
+                    "macro_rules token outside literal definition",
+                );
+            }
+            if matches!(token, TokenTree::Punct(p) if p.as_char() == '$')
+                && matches!(tokens.get(i + 1), Some(TokenTree::Ident(_)))
+                && matches!(tokens.get(i + 2), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+            {
+                self.emit(token.span(), "N3", "metavariable macro invocation head");
+            }
+            if let TokenTree::Group(group) = token {
+                self.raw_tokens(group.stream());
+            }
+        }
+    }
+
     // Token inspection here is restricted to Rust grammar constructs. There is
     // no operation-name, filesystem-symbol, alias, or path-resolution policy.
     fn tokens(
@@ -118,16 +146,7 @@ impl Audit {
                 && is_ident(token, "macro_rules")
                 && matches!(tokens.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
             {
-                if self.restricted {
-                    // Outer substitution can change the generated matcher's
-                    // grammar (for example make!($)). Refuse generation rather
-                    // than auditing an unexpanded nested macro definition.
-                    self.emit(
-                        token.span(),
-                        "N3",
-                        "nested macro_rules definition in transcriber",
-                    );
-                } else if matches!(tokens.get(i + 2), Some(TokenTree::Ident(_))) {
+                if !self.restricted && matches!(tokens.get(i + 2), Some(TokenTree::Ident(_))) {
                     if let Some(TokenTree::Group(body)) = tokens.get(i + 3) {
                         self.macro_rules(body.stream(), fragments);
                     }
@@ -466,6 +485,21 @@ impl Audit {
     }
 }
 
+/// Audit a raw attribute stream in a restricted crate without assigning it
+/// matcher/transcriber grammar. Literals remain opaque token trees.
+pub fn audit_raw_tokens(source: &str) -> Result<Vec<(String, String)>, String> {
+    let mut audit = Audit {
+        restricted: true,
+        ..Audit::default()
+    };
+    audit.raw_tokens(source.parse::<TokenStream>().map_err(|e| e.to_string())?);
+    Ok(audit
+        .findings
+        .into_iter()
+        .map(|(_, policy, detail)| (policy, detail))
+        .collect())
+}
+
 /// Audit one compiler-observed `macro_rules!` body. N2 findings remain pending
 /// until the adapter applies the single exact compiler-module exception.
 pub fn audit_macro(source: &str) -> Result<Vec<(String, String)>, String> {
@@ -489,6 +523,7 @@ pub fn audit_macro_with_lints(
         suppression_lint_names: protected_lints.clone(),
         ..Audit::default()
     };
+    audit.raw_tokens(tokens.clone());
     audit.macro_rules(tokens, &Default::default());
     Ok(audit
         .findings
@@ -498,8 +533,8 @@ pub fn audit_macro_with_lints(
 }
 
 /// Audit literal nested definitions in a compiler-observed invocation payload.
-/// Other payload tokens are data: only discovered `macro_rules!` definitions
-/// enter the N2/N3 grammar audit, with their own matcher/transcriber boundaries.
+/// Restricted packages also refuse macro-generation tokens in every raw stream,
+/// even when an invocation discards them rather than expanding them as Rust.
 pub fn audit_macro_payload(source: &str) -> Result<Vec<(String, String)>, String> {
     audit_macro_payload_scoped(source, false)
 }
@@ -524,6 +559,7 @@ pub fn audit_macro_payload_with_lints(
         suppression_lint_names: protected_lints.clone(),
         ..Audit::default()
     };
+    audit.raw_tokens(tokens.clone());
     audit.macro_payload(tokens);
     Ok(audit
         .findings
@@ -556,10 +592,10 @@ mod tests {
             assert!(policies(src).iter().any(|p| p == "N3"), "{src}");
         }
         assert!(policies("(#[$guard:meta]) => { pub fn fine() {} };").is_empty());
-        assert!(
-            policies("() => { macro_rules! inner { (#[$guard:meta]) => { pub fn fine() {} }; } };")
-                .is_empty()
-        );
+        assert!(policies(
+            "() => { macro_rules! inner { (#[$guard:meta]) => { pub fn fine() {} }; } };"
+        )
+        .is_empty());
     }
     /// Regression: make!($) changes a generated macro's attribute grammar after
     /// the pre-expansion audit. Restricted transcribers cannot define macros.
@@ -576,7 +612,7 @@ mod tests {
                     .unwrap()
                     .iter()
                     .any(|(policy, detail)| policy == "N3"
-                        && detail == "nested macro_rules definition in transcriber"),
+                        && detail == "macro_rules token outside literal definition"),
                 "{source}"
             );
             let payload = format!("macro_rules! outer {{ {source} }}");
@@ -585,17 +621,48 @@ mod tests {
                     .unwrap()
                     .iter()
                     .any(|(policy, detail)| policy == "N3"
-                        && detail == "nested macro_rules definition in transcriber"),
+                        && detail == "macro_rules token outside literal definition"),
                 "{source}"
             );
         }
         let harmless = "() => { macro_rules! inner { () => { 7 } } };";
         assert!(audit_macro_scoped(harmless, false).unwrap().is_empty());
-        assert!(
-            audit_macro_scoped("() => { pub fn visible() {} };", true)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(audit_macro_scoped("() => { pub fn visible() {} };", true)
+            .unwrap()
+            .is_empty());
+    }
+    /// Regression: callers could substitute the macro_rules keyword and create
+    /// unaudited definitions. Every raw token stream now fails closed.
+    #[test]
+    fn regression_raw_macro_generation_tokens() {
+        for source in [
+            "macro_rules",
+            "(macro_rules $)",
+            "r#macro_rules",
+            "ignore! { nested!(macro_rules) }",
+            "($kw:ident $d:tt) => { $kw! hidden { ($d h:tt $d a:tt) => { $d h $d a } } }",
+            "$head ! ()",
+        ] {
+            for findings in [
+                audit_macro_scoped(source, true).unwrap(),
+                audit_macro_payload_scoped(source, true).unwrap(),
+            ] {
+                assert!(
+                    findings.iter().any(|(policy, _)| policy == "N3"),
+                    "{source}"
+                );
+            }
+        }
+        for source in ["() => { 7 }", "stringify!(\"macro_rules $head!\")"] {
+            assert!(
+                audit_macro_scoped(source, true).unwrap().is_empty(),
+                "{source}"
+            );
+            assert!(
+                audit_macro_payload_scoped(source, true).unwrap().is_empty(),
+                "{source}"
+            );
+        }
     }
     /// Regression: substituted attribute delimiters/prefixes hid target-gated reads.
     #[test]
@@ -667,11 +734,9 @@ mod tests {
         }
         // A tt prefix cannot distinguish a hash from an indexed expression.
         // Use an expr/ident matcher for the latter, without a subject heuristic.
-        assert!(
-            policies("($array:tt) => { $array[0] };")
-                .iter()
-                .any(|p| p == "N3")
-        );
+        assert!(policies("($array:tt) => { $array[0] };")
+            .iter()
+            .any(|p| p == "N3"));
     }
     /// Regression: different repetition iterations assembled an attribute that
     /// pruned a fixed read, while same-name capture identities hid the prefix.
@@ -716,14 +781,12 @@ mod tests {
         ] {
             assert!(audit_macro_payload(src).unwrap().is_empty(), "{src}");
         }
-        assert!(
-            audit_macro_payload(
-                "macro_rules! ffi { () => { unsafe extern { fn arbitrary(); } }; }"
-            )
-            .unwrap()
-            .iter()
-            .any(|(policy, _)| policy == "N2")
-        );
+        assert!(audit_macro_payload(
+            "macro_rules! ffi { () => { unsafe extern { fn arbitrary(); } }; }"
+        )
+        .unwrap()
+        .iter()
+        .any(|(policy, _)| policy == "N2"));
     }
     #[test]
     fn regression_cfg_matcher_transcriber_raw_and_nested_macro() {
@@ -796,7 +859,7 @@ fn inventory_lint(path: &syn::Path) -> bool {
 }
 
 fn meta_parts(tokens: TokenStream) -> Result<Vec<syn::Meta>, String> {
-    use syn::{Token, parse::Parser, punctuated::Punctuated};
+    use syn::{parse::Parser, punctuated::Punctuated, Token};
     Punctuated::<syn::Meta, Token![,]>::parse_terminated
         .parse2(tokens)
         .map(|parts| parts.into_iter().collect())
@@ -951,7 +1014,7 @@ fn attribute_predicate(
     meta: &syn::Meta,
     predicate: fn(TokenStream) -> bool,
 ) -> Result<bool, String> {
-    use syn::{Token, parse::Parser, punctuated::Punctuated};
+    use syn::{parse::Parser, punctuated::Punctuated, Token};
     let syn::Meta::List(list) = meta else {
         return Ok(false);
     };
@@ -1074,16 +1137,14 @@ mod expectation_attribute_tests {
                 "{source}"
             );
         }
-        assert!(
-            inventory_attribute(
-                &syn::parse_str(
-                    "cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))"
-                )
-                .unwrap()
+        assert!(inventory_attribute(
+            &syn::parse_str(
+                "cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))"
             )
             .unwrap()
-            .is_none()
-        );
+        )
+        .unwrap()
+        .is_none());
     }
 
     /// Regression: reason text cannot discard an inactive protected expectation.
@@ -1171,24 +1232,18 @@ mod expectation_attribute_tests {
         }
         let body = "() => { #[allow(synthetic::approved_group)] pub fn load() {} };";
         assert!(audit_macro_scoped(body, true).unwrap().is_empty());
-        assert!(
-            audit_macro_with_lints(body, true, &protected)
-                .unwrap()
-                .iter()
-                .any(|(policy, _)| policy == "EXPECT")
-        );
-        assert!(
-            audit_macro_with_lints(body, false, &protected)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(audit_macro_with_lints(body, true, &protected)
+            .unwrap()
+            .iter()
+            .any(|(policy, _)| policy == "EXPECT"));
+        assert!(audit_macro_with_lints(body, false, &protected)
+            .unwrap()
+            .is_empty());
         let payload = format!("macro_rules! load {{ {body} }}");
-        assert!(
-            audit_macro_payload_with_lints(&payload, true, &protected)
-                .unwrap()
-                .iter()
-                .any(|(policy, _)| policy == "EXPECT")
-        );
+        assert!(audit_macro_payload_with_lints(&payload, true, &protected)
+            .unwrap()
+            .iter()
+            .any(|(policy, _)| policy == "EXPECT"));
     }
 
     /// Regression: a literal transcriber allow must not lower native -D either.
@@ -1196,24 +1251,18 @@ mod expectation_attribute_tests {
     fn regression_macro_suppression_refusal_keeps_package_scope() {
         let body = "() => { #[allow(clippy::disallowed_methods)] pub fn load() {} };";
         assert!(audit_macro(body).unwrap().is_empty());
-        assert!(
-            audit_macro_scoped(body, true)
-                .unwrap()
-                .iter()
-                .any(|(policy, detail)| policy == "EXPECT"
-                    && detail == "allow/warn of disallowed lint is refused")
-        );
+        assert!(audit_macro_scoped(body, true)
+            .unwrap()
+            .iter()
+            .any(|(policy, detail)| policy == "EXPECT"
+                && detail == "allow/warn of disallowed lint is refused"));
         let payload = format!("macro_rules! load {{ {body} }}");
-        assert!(
-            audit_macro_payload_scoped(&payload, true)
-                .unwrap()
-                .iter()
-                .any(|(policy, _)| policy == "EXPECT")
-        );
-        assert!(
-            audit_macro_payload_scoped(&payload, false)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(audit_macro_payload_scoped(&payload, true)
+            .unwrap()
+            .iter()
+            .any(|(policy, _)| policy == "EXPECT"));
+        assert!(audit_macro_payload_scoped(&payload, false)
+            .unwrap()
+            .is_empty());
     }
 }

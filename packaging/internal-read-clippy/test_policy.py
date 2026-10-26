@@ -29,7 +29,7 @@ class Contract(unittest.TestCase):
             "reason": "internal-read:v1 " + json.dumps(self.metadata),
             "lint": "clippy::disallowed_methods", "resolved": "std::fs::read",
             "configured_path": "probe::alias", "rule_reason": "inventory-op:fs::read",
-            "leaf_digest": "a" * 64,
+            "leaf_digest": policy.digest(b"let _ = std::fs::read(input);"),
             "source_leaf_observed": True,
             "source_leaf_span": {"file": "src/a.rs", "lo": 5, "hi": 25},
             "span": {"file": "src/a.rs", "lo": 10, "hi": 20},
@@ -136,7 +136,7 @@ class Contract(unittest.TestCase):
                 manifest([("default", path)], {}, [approval])
 
     def test_regression_inactive_noninventory_reason_requires_manifest(self):
-        row = {"schema": 1, "kind": "expectation", "native_active": False,
+        row = {"schema": 1, "kind": "expectation", "native_active": False, "owner": self.journal["owner"],
                "lint": "clippy::disallowed_methods", "reason": self.journal["reason"],
                "leaf": {"tokens": "let _ = journal();"}}
         path = self.report([row, self.complete])
@@ -146,11 +146,11 @@ class Contract(unittest.TestCase):
         self.assertTrue(entry["journal_exemption"])
         self.assertFalse(entry["native_observed"])
         ambiguous = dict(self.exemption, item="probe::other")
-        with self.assertRaisesRegex(PolicyError, "ambiguous inactive journal"):
+        with self.assertRaisesRegex(PolicyError, "duplicate expectation reason on different items"):
             manifest([("default", path)], {}, [self.exemption, ambiguous])
 
     def test_regression_active_shadowed_source_expectation_cannot_disappear(self):
-        row = {"schema": 1, "kind": "expectation", "source": True,
+        row = {"schema": 1, "kind": "expectation", "source": True, "owner": self.operation["owner"],
                "lint": "clippy::disallowed_methods", "reason": "unreviewed shadowed approval",
                "leaf": {"tokens": "let _ = std::fs::read(input);"}}
         path = self.report([row, self.complete])
@@ -164,6 +164,78 @@ class Contract(unittest.TestCase):
         path = self.report([row, row, self.complete])
         with self.assertRaisesRegex(PolicyError, "multiple operations/marks"):
             manifest([("default", path)], {})
+
+    def test_regression_copied_journal_reason_keeps_inactive_item_owner(self):
+        """Regression: an inactive journal-reason copy merged into the approved item."""
+        copied = {"schema": 1, "kind": "expectation", "source": True,
+                  "owner": "probe::hidden", "lint": self.journal["lint"],
+                  "reason": self.journal["reason"],
+                  "leaf": {"tokens": "let _ = std::fs::read(input);"}}
+        owned = self.report([self.journal, self.complete], "owned.jsonl")
+        hidden = self.report([copied, self.complete], "hidden.jsonl")
+        for reports in ([("default", hidden)],
+                        [("default", owned), ("all-features", hidden)],
+                        [("default", hidden), ("all-features", owned)]):
+            with self.assertRaisesRegex(PolicyError, "duplicate expectation reason on different items"):
+                manifest(reports, {}, [self.exemption])
+        for rows in ([self.journal, copied], [copied, self.journal]):
+            with self.assertRaisesRegex(PolicyError, "duplicate expectation reason on different items"):
+                manifest([("default", self.report([*rows, self.complete]))], {}, [self.exemption])
+
+    def test_regression_source_native_merge_collisions_fail_in_both_orders(self):
+        """Regression: native observations overwrote conflicting source leaves."""
+        source = {"schema": 1, "kind": "expectation", "source": True,
+                  "owner": self.operation["owner"], "lint": self.operation["lint"],
+                  "reason": self.operation["reason"], "leaf": {"tokens": "different source leaf"}}
+        for operation, exemptions in ((self.operation, []), (self.journal, [self.exemption])):
+            source["reason"] = operation["reason"]
+            op = self.report([operation, self.complete], "native.jsonl")
+            mark = self.report([source, self.complete], "source.jsonl")
+            for reports in ([("default", op), ("all-features", mark)],
+                            [("default", mark), ("all-features", op)]):
+                with self.assertRaisesRegex(PolicyError, "conflicting compiler observations"):
+                    manifest(reports, {}, exemptions)
+            for rows in ([operation, source], [source, operation]):
+                with self.assertRaisesRegex(PolicyError, "conflicting compiler observations"):
+                    manifest([("default", self.report([*rows, self.complete]))], {}, exemptions)
+
+    def test_regression_source_native_lint_collisions_fail_in_both_orders(self):
+        """Regression: source/native merges lost the source protected-lint identity."""
+        source = {"schema": 1, "kind": "expectation", "source": True,
+                  "owner": self.operation["owner"], "lint": "clippy::disallowed_types",
+                  "reason": self.operation["reason"],
+                  "leaf": {"tokens": "let _ = std::fs::read(input);"}}
+        native = self.report([self.operation, self.complete], "native.jsonl")
+        mark = self.report([source, self.complete], "source.jsonl")
+        for reports in ([("default", native), ("all-features", mark)],
+                        [("default", mark), ("all-features", native)]):
+            with self.assertRaisesRegex(PolicyError, "conflicting compiler observations"):
+                manifest(reports, {})
+        for rows in ([self.operation, source], [source, self.operation]):
+            with self.assertRaisesRegex(PolicyError, "conflicting compiler observations"):
+                manifest([("default", self.report([*rows, self.complete]))], {})
+
+    def test_regression_source_owner_cannot_come_from_reason_metadata(self):
+        source = {"schema": 1, "kind": "expectation", "source": True,
+                  "owner": "probe::hidden", "lint": self.operation["lint"],
+                  "reason": self.operation["reason"], "leaf": {"tokens": "unused"}}
+        with self.assertRaisesRegex(PolicyError, "declared owner differs"):
+            manifest([("default", self.report([source, self.complete]))], {})
+        del source["owner"]
+        with self.assertRaisesRegex(PolicyError, "no compiler item owner"):
+            manifest([("default", self.report([source, self.complete]))], {})
+
+    def test_regression_unresolved_source_impl_owner_fails_closed(self):
+        source = {"schema": 1, "kind": "expectation", "source": True,
+                  "owner": "probe::<unresolved-impl>::acquire", "lint": self.operation["lint"],
+                  "reason": self.operation["reason"], "leaf": {"tokens": "let _ = std::fs::read(input);"},
+                  "owner_span": {"file": "src/a.rs", "lo": 1, "hi": 30}}
+        with self.assertRaisesRegex(PolicyError, "requires a resolved compiler impl owner"):
+            manifest([("default", self.report([source, self.complete]))], {})
+        binding = {"schema": 1, "kind": "source_owner", "owner": self.operation["owner"],
+                   "span": source["owner_span"]}
+        candidate = manifest([("default", self.report([source, binding, self.operation, self.complete]))], {})
+        self.assertEqual(candidate["entries"][0]["item"], self.operation["owner"])
 
     def test_regression_stale_and_broad_journal_expectations_fail(self):
         row = dict(self.journal, kind="expectation", active=True)
