@@ -58,6 +58,14 @@ fn root(dir: &Path) -> io::Result<OwnedFd> {
 }
 
 fn connection(dir: &Path, immutable: bool) -> io::Result<crate::OverlayDb> {
+    connection_required(dir, immutable, false)
+}
+
+fn connection_required(
+    dir: &Path,
+    immutable: bool,
+    required: bool,
+) -> io::Result<crate::OverlayDb> {
     let path = dir.join(HIDDEN_DB);
     if !fs::symlink_metadata(&path)?.is_file() {
         return Err(io::Error::other("overlay database must be a regular file"));
@@ -65,16 +73,18 @@ fn connection(dir: &Path, immutable: bool) -> io::Result<crate::OverlayDb> {
     // NOFOLLOW rejects a symlink in any component; the shared open resolves
     // the directory.
     let conn = if immutable {
-        crate::open_overlay_db(
+        crate::open_overlay_db_with_required_record(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             crate::DbName::Immutable,
+            required,
         )
     } else {
-        crate::open_overlay_db(
+        crate::open_overlay_db_with_required_record(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             crate::DbName::Path,
+            required,
         )
     }
     .map_err(|e| e.into_io_with(sql_error))?;
@@ -119,21 +129,15 @@ fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
         if kind == libc::S_IFLNK {
             continue;
         }
-        let flags = if kind == libc::S_IFDIR {
-            directory_flags()
-        } else {
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC
-        };
-        let child = host::openat(fd, name, flags, Mode::empty())?;
         if kind == libc::S_IFDIR {
-            chmod_tree(&child, writable)?;
-        } else {
-            host::fchmod(
-                &child,
-                change(
-                    crate::host_stat::fstat_named(&child, name.to_string_lossy().as_ref())?.st_mode,
-                ),
+            chmod_tree(
+                &host::openat(fd, name, directory_flags(), Mode::empty())?,
+                writable,
             )?;
+        } else {
+            // Never a data descriptor: closing one would release this
+            // process's locks on the overlay database (#149).
+            crate::host_stat::chmod_entry_at(fd, name, &stat, |mode| change(mode).as_raw_mode())?;
         }
     }
     if !writable {
@@ -242,7 +246,10 @@ pub(crate) fn seal_impl(
     lower_view: Arc<dyn MountSource>,
 ) -> io::Result<SealOutcome> {
     let root = root(dir)?;
-    let meta = OverlayMeta::read(dir).map_err(overlay_error)?;
+    let required = std::cell::Cell::new(false);
+    let meta = OverlayMeta::read_for_operation(dir, &required).map_err(overlay_error)?;
+    #[cfg(test)]
+    fire_once(&AFTER_INITIAL_READ);
     if let Some(meta) = meta.filter(OverlayMeta::layer_sealed) {
         check_hash_format(|key| meta.get(key))?;
         let layer_digest: String = meta
@@ -256,14 +263,18 @@ pub(crate) fn seal_impl(
             already_sealed: true,
         });
     }
-    let conn = connection(dir, false)?;
+    let conn = connection_required(dir, false, required.get())?;
+    required.set(required.get() || conn.required_record());
     // A sealed layer is never `pending`: hash the base first, outside the
     // write transaction (a cache hit is free).
-    crate::overlay_meta::resolve_pending_base_digest_for(&conn, identity).map_err(overlay_error)?;
+    crate::overlay_meta::resolve_pending_base_digest_required(&conn, identity, required.get())
+        .map_err(overlay_error)?;
+    #[cfg(test)]
+    fire_once(&AFTER_PENDING_RESOLVER);
     // Readers can still take snapshots for canonical hashing. Competing writers,
     // including mounts in exclusive locking mode, cannot enter this interval.
     conn.execute_batch("BEGIN IMMEDIATE").map_err(sql_error)?;
-    if OverlayMeta::from_connection(&conn)
+    if OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
         .is_some_and(|m| m.layer_sealed())
     {
@@ -290,7 +301,7 @@ pub(crate) fn seal_impl(
         // overlay recorded no kind: the seal writes it now (no digest). An
         // accepted move to another place (a local copy of a remote archive)
         // is recorded too, so the sealed layer names the base it was sealed on.
-        let meta = OverlayMeta::from_connection(&conn).map_err(overlay_error)?;
+        let meta = OverlayMeta::from_opened(&conn).map_err(overlay_error)?;
         if !matches!(
             crate::overlay_gate::Recorded::from_meta(meta.as_ref()),
             crate::overlay_gate::Recorded::Nothing | crate::overlay_gate::Recorded::Unknown
@@ -318,7 +329,7 @@ pub(crate) fn seal_impl(
         )
         .map_err(sql_error)?;
     }
-    if OverlayMeta::from_connection(&conn)
+    if OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
         .is_none_or(|m| m.format_version().ok().flatten().is_none())
     {
@@ -403,12 +414,25 @@ fn finish_sealed(dir: &Path, root: &OwnedFd, layer_digest: &str) -> io::Result<(
     chmod_tree(root, false)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs in [`unseal`] right after its permission walk (tests only).
+    static AFTER_UNSEAL_WALK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Remove seal metadata and restore owner write permission. Mode overrides stay.
 pub fn unseal(dir: &Path) -> io::Result<()> {
     let root = root(dir)?;
     // Probe before touching permissions, so a mounted overlay is never changed.
     OverlayMeta::read(dir).map_err(overlay_error)?;
     chmod_tree(&root, true)?;
+    #[cfg(test)]
+    AFTER_UNSEAL_WALK.with(|hook| {
+        if let Some(f) = hook.borrow_mut().as_mut() {
+            f()
+        }
+    });
     let conn = connection(dir, false)?;
     conn.execute_batch("BEGIN EXCLUSIVE").map_err(sql_error)?;
     conn.execute_batch(crate::overlay_meta::META_SCHEMA)
@@ -452,8 +476,14 @@ pub fn check_hash_format<'a>(get: impl Fn(&str) -> Option<&'a str>) -> io::Resul
 /// and cannot authorize a seal or a create, so it needs no classified base.
 pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<VerifyReport> {
     let root = root(dir)?;
-    let conn = connection(dir, true)?;
-    let meta = OverlayMeta::from_connection(&conn)
+    let required = std::cell::Cell::new(
+        !crate::write_overlay::overlay_markers(dir)
+            .map_err(overlay_error)?
+            .is_empty(),
+    );
+    let conn = connection_required(dir, true, required.get())?;
+    required.set(required.get() || conn.required_record());
+    let meta = OverlayMeta::from_opened(&conn)
         .map_err(overlay_error)?
         .filter(OverlayMeta::layer_sealed)
         .ok_or_else(|| io::Error::other("overlay is not sealed"))?;
@@ -501,6 +531,23 @@ pub fn verify(dir: &Path, lower_view: Arc<dyn MountSource>) -> io::Result<Verify
         sentinel_ok,
         mismatched,
     })
+}
+
+#[cfg(test)]
+type OnceHook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_INITIAL_READ: OnceHook = const { std::cell::RefCell::new(None) };
+    static AFTER_PENDING_RESOLVER: OnceHook = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn fire_once(seam: &'static std::thread::LocalKey<OnceHook>) {
+    let hook = seam.with(|s| s.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[cfg(test)]
@@ -570,6 +617,296 @@ mod tests {
                 let _ = chmod_tree(&root, true);
             }
         }
+    }
+
+    struct OnceGuard {
+        key: &'static std::thread::LocalKey<OnceHook>,
+        previous: Option<Box<dyn FnOnce()>>,
+    }
+    impl OnceGuard {
+        fn set(key: &'static std::thread::LocalKey<OnceHook>, f: impl FnOnce() + 'static) -> Self {
+            let previous = key.with(|s| s.replace(Some(Box::new(f))));
+            Self { key, previous }
+        }
+    }
+    impl Drop for OnceGuard {
+        fn drop(&mut self) {
+            self.key.with(|s| s.replace(self.previous.take()));
+        }
+    }
+
+    type AcquireCallback = Box<dyn FnMut(&Path)>;
+    struct AcquireGuard(Option<AcquireCallback>);
+    impl AcquireGuard {
+        fn at(db: PathBuf, occurrence: usize, f: impl FnOnce() + 'static) -> Self {
+            // The shared open resolves the directory for NOFOLLOW and immutable
+            // opens (macOS temp dirs are under /var -> /private/var), so the
+            // seam may see either spelling; compare resolved directories.
+            fn resolved(path: &Path) -> PathBuf {
+                match (path.parent(), path.file_name()) {
+                    (Some(dir), Some(file)) => dir
+                        .canonicalize()
+                        .map_or_else(|_| path.to_path_buf(), |dir| dir.join(file)),
+                    _ => path.to_path_buf(),
+                }
+            }
+            let db = resolved(&db);
+            let mut count = 0;
+            let mut action = Some(f);
+            let previous = crate::overlay_db::AFTER_ACQUIRE.with(|s| {
+                s.replace(Some(Box::new(move |path| {
+                    if resolved(path) != db {
+                        return;
+                    }
+                    count += 1;
+                    if count == occurrence {
+                        action.take().unwrap()();
+                    }
+                })))
+            });
+            Self(previous)
+        }
+    }
+    impl Drop for AcquireGuard {
+        fn drop(&mut self) {
+            crate::overlay_db::AFTER_ACQUIRE.with(|s| s.replace(self.0.take()));
+        }
+    }
+
+    fn lose_files(dir: &Path) {
+        for marker in crate::write_overlay::overlay_markers(dir).unwrap() {
+            fs::remove_file(marker).unwrap();
+        }
+        rusqlite::Connection::open(dir.join(HIDDEN_DB))
+            .unwrap()
+            .execute_batch("DROP TABLE files")
+            .unwrap();
+    }
+
+    type RecordState = (Vec<(String, String)>, Vec<String>, BTreeMap<String, u32>);
+
+    fn rows_and_modes(dir: &Path) -> RecordState {
+        let conn = rusqlite::Connection::open(dir.join(HIDDEN_DB)).unwrap();
+        let rows = conn
+            .prepare("SELECT key,value FROM meta ORDER BY key")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let tables = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name != 'files' ORDER BY name").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let mut modes = BTreeMap::new();
+        walk_modes(&root(dir).unwrap(), "", &mut modes).unwrap();
+        for name in ["", HIDDEN_DB, SENTINEL] {
+            if let Ok(meta) = fs::symlink_metadata(dir.join(name)) {
+                modes.insert(name.to_owned(), meta.permissions().mode());
+            }
+        }
+        modes.retain(|path, _| {
+            ![
+                crate::OVERLAY_MARKER,
+                crate::write_overlay::LEGACY_OVERLAY_MARKER,
+            ]
+            .contains(&path.as_str())
+        });
+        (rows, tables, modes)
+    }
+
+    fn pending_fixture() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("uncached.tar");
+        fs::write(&archive, b"fresh archive bytes for pending hash").unwrap();
+        let base_dir = tmp.path().join("base");
+        fs::create_dir(&base_dir).unwrap();
+        let base: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&base_dir).unwrap());
+        let dir = tmp.path().join("overlay");
+        let info = crate::overlay_meta::OverlayCreateInfo {
+            base_url: archive.to_str().unwrap().into(),
+            ..Default::default()
+        };
+        drop(WriteOverlay::new_with_create_info_for_tests(base.clone(), &dir, &info).unwrap());
+        assert_eq!(
+            OverlayMeta::read(&dir).unwrap().unwrap().base_digest_kind(),
+            Some("pending")
+        );
+        Fixture {
+            _tmp: tmp,
+            dir,
+            base,
+        }
+    }
+
+    fn refusal(result: io::Result<SealOutcome>, before: &RecordState, f: &Fixture) {
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            crate::overlay_meta::NO_FILES_TABLE
+        );
+        assert_eq!(
+            &rows_and_modes(&f.dir),
+            before,
+            "metadata/schema/modes mutated"
+        );
+        assert!(!f.dir.join(SENTINEL).exists(), "no seal sentinel published");
+    }
+
+    /// Regression: seal validates the acquired requirement before a pending hash or digest write.
+    #[test]
+    fn regression_seal_pending_required_record_after_acquire_refuses_before_digest_write() {
+        let f = pending_fixture();
+        let before = rows_and_modes(&f.dir);
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (dir, flag) = (f.dir.clone(), ran.clone());
+        let _guard = AcquireGuard::at(f.dir.join(HIDDEN_DB), 2, move || {
+            flag.set(flag.get() + 1);
+            lose_files(&dir);
+        });
+        let hashes = ratarmount_index::sha256_stream_calls_this_thread();
+        refusal(seal(&f.dir, f.base.clone()), &before, &f);
+        assert_eq!(ran.get(), 1);
+        assert_eq!(
+            ratarmount_index::sha256_stream_calls_this_thread(),
+            hashes,
+            "hashing not reached"
+        );
+    }
+
+    /// Regression: losing markers between seal opens cannot clear the operation's requirement.
+    #[test]
+    fn regression_seal_required_record_lost_between_opens_refuses() {
+        for loss in ["files", "empty", "missing"] {
+            let f = pending_fixture();
+            let before = rows_and_modes(&f.dir);
+            let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+            let (dir, flag) = (f.dir.clone(), ran.clone());
+            let _guard = OnceGuard::set(&AFTER_INITIAL_READ, move || {
+                flag.set(flag.get() + 1);
+                lose_files(&dir);
+                match loss {
+                    "empty" => fs::OpenOptions::new()
+                        .write(true)
+                        .open(dir.join(HIDDEN_DB))
+                        .unwrap()
+                        .set_len(0)
+                        .unwrap(),
+                    "missing" => fs::remove_file(dir.join(HIDDEN_DB)).unwrap(),
+                    _ => (),
+                }
+            });
+            let hashes = ratarmount_index::sha256_stream_calls_this_thread();
+            let result = seal(&f.dir, f.base.clone());
+            assert_eq!(ran.get(), 1);
+            assert_eq!(
+                ratarmount_index::sha256_stream_calls_this_thread(),
+                hashes,
+                "{loss}: hashing must not be reached"
+            );
+            if loss == "files" {
+                refusal(result, &before, &f);
+            } else {
+                let error = result.expect_err("lost record accepted");
+                if loss == "empty" {
+                    assert!(error.to_string().contains("the recorded database is empty (lost record)"),
+                        "the second acquisition must retain the requirement, before its reader: {error}");
+                }
+                assert_eq!(f.dir.join(HIDDEN_DB).exists(), loss == "empty");
+                if loss == "empty" {
+                    assert_eq!(fs::metadata(f.dir.join(HIDDEN_DB)).unwrap().len(), 0);
+                }
+                assert!(!f.dir.join(SENTINEL).exists());
+            }
+        }
+    }
+
+    /// Regression: the digest CAS revalidates required files inside its savepoint after hashing.
+    #[test]
+    fn regression_seal_pending_required_record_lost_during_hash_refuses_before_digest_write() {
+        let f = pending_fixture();
+        let before = rows_and_modes(&f.dir);
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (dir, flag) = (f.dir.clone(), ran.clone());
+        let _guard = OnceGuard::set(&crate::overlay_meta::DURING_PENDING_HASH, move || {
+            flag.set(flag.get() + 1);
+            lose_files(&dir);
+        });
+        let hashes = ratarmount_index::sha256_stream_calls_this_thread();
+        refusal(seal(&f.dir, f.base.clone()), &before, &f);
+        assert_eq!(ran.get(), 1, "hash boundary reached");
+        assert!(ratarmount_index::sha256_stream_calls_this_thread() > hashes);
+    }
+
+    /// Regression: transaction-entry seal validation retains requirement after resolver completion.
+    #[test]
+    fn regression_seal_required_record_marker_removal_refuses() {
+        let f = Fixture::new();
+        let before = rows_and_modes(&f.dir);
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (dir, flag) = (f.dir.clone(), ran.clone());
+        let _guard = OnceGuard::set(&AFTER_PENDING_RESOLVER, move || {
+            flag.set(flag.get() + 1);
+            lose_files(&dir);
+        });
+        refusal(seal(&f.dir, f.base.clone()), &before, &f);
+        assert_eq!(ran.get(), 1);
+    }
+
+    /// Regression: fsck's second acquisition refuses the lost files record before repair writes.
+    #[test]
+    fn regression_fsck_required_record_marker_removal_refuses() {
+        let f = Fixture::new();
+        let before = rows_and_modes(&f.dir);
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (dir, flag) = (f.dir.clone(), ran.clone());
+        let _guard = AcquireGuard::at(f.dir.join(HIDDEN_DB), 2, move || {
+            flag.set(flag.get() + 1);
+            lose_files(&dir);
+        });
+        let error = crate::overlay_fsck::fsck(&f.dir, true).unwrap_err();
+        assert_eq!(error.to_string(), crate::overlay_meta::NO_FILES_TABLE);
+        assert_eq!(ran.get(), 1);
+        assert_eq!(rows_and_modes(&f.dir), before);
+        assert!(!f.dir.join(SENTINEL).exists());
+    }
+
+    /// Regression: verify refuses lost files immediately after acquisition, before digest traversal.
+    #[test]
+    fn regression_verify_required_record_marker_removal_refuses() {
+        let f = Fixture::new();
+        seal(&f.dir, f.base.clone()).unwrap();
+        // Prepare fixture modes before arming corruption, including for an unprivileged runner.
+        chmod_tree(&root(&f.dir).unwrap(), true).unwrap();
+        let before = rows_and_modes(&f.dir);
+        let sentinel = fs::read(f.dir.join(SENTINEL)).unwrap();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (dir, flag) = (f.dir.clone(), ran.clone());
+        let _guard = AcquireGuard::at(f.dir.join(HIDDEN_DB), 1, move || {
+            flag.set(flag.get() + 1);
+            lose_files(&dir);
+        });
+        struct NoTraversal;
+        impl MountSource for NoTraversal {
+            fn is_immutable(&self) -> bool {
+                true
+            }
+            fn lookup(&self, _: &str, _: i32) -> Option<ratarmount_core::FileInfo> {
+                panic!("verify traversed lower view");
+            }
+            fn list(&self, _: &str) -> Option<ratarmount_core::ListResult> {
+                panic!("verify traversed lower view");
+            }
+            fn open(
+                &self,
+                _: &ratarmount_core::FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                panic!("verify traversed lower view");
+            }
+        }
+        let error = verify(&f.dir, Arc::new(NoTraversal)).unwrap_err();
+        assert_eq!(error.to_string(), crate::overlay_meta::NO_FILES_TABLE);
+        assert_eq!(ran.get(), 1);
+        assert_eq!(rows_and_modes(&f.dir), before);
+        assert_eq!(fs::read(f.dir.join(SENTINEL)).unwrap(), sentinel);
     }
 
     fn visible(source: &dyn MountSource) -> Vec<(String, u32)> {
@@ -715,6 +1052,89 @@ mod tests {
         fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o400)).unwrap();
         assert!(seal(&f.dir, f.base.clone()).is_err());
         assert_eq!(fs::read(&sentinel).unwrap(), b"wrong digest\n");
+    }
+
+    /// A connection of this process holding SHARED on the overlay database
+    /// (a read transaction), as a mount or library user in the same process
+    /// would.
+    fn shared_holder(dir: &Path) -> crate::OverlayDb {
+        let holder = crate::open_overlay_db(
+            &dir.join(HIDDEN_DB),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            crate::DbName::Path,
+        )
+        .unwrap();
+        holder
+            .execute_batch("BEGIN; SELECT count(*) FROM files;")
+            .unwrap();
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&dir.join(HIDDEN_DB)),
+            "the holder's SHARED lock"
+        );
+        holder
+    }
+
+    /// Regression: (#149): re-running `seal` on a sealed overlay re-applies the
+    /// read-only modes. The permission walk opened every regular file,
+    /// the overlay database included, to `fchmod` it, and closing that
+    /// descriptor released every fcntl lock this process held on the
+    /// database: another process could then write under a holder's read.
+    #[test]
+    fn regression_reseal_keeps_shared_db_lock() {
+        let f = Fixture::new();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let holder = shared_holder(&f.dir);
+        assert!(seal(&f.dir, f.base.clone()).unwrap().already_sealed);
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&f.dir.join(HIDDEN_DB)),
+            "the reseal's permission walk released the holder's lock"
+        );
+        assert_eq!(writable_entries(&f.dir), Vec::<String>::new());
+        holder
+            .execute_batch("SELECT count(*) FROM files; COMMIT;")
+            .unwrap();
+    }
+
+    /// Regression: (#149): `unseal` makes the tree writable before it opens
+    /// the database; when that open then fails (busy: another connection
+    /// holds SHARED), the walk must not have released that connection's lock.
+    /// The lock is probed right after the walk: unseal's own failed
+    /// `BEGIN EXCLUSIVE` downgrades through SHARED, which re-takes a released
+    /// read lock and would hide the bug from a probe made afterwards.
+    #[test]
+    fn regression_unseal_failure_keeps_shared_db_lock() {
+        let f = Fixture::new();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let holder = shared_holder(&f.dir);
+        let db = f.dir.join(HIDDEN_DB);
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let record = seen.clone();
+        AFTER_UNSEAL_WALK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                record.set(Some(crate::overlay_db::other_process_sees_lock(&db)))
+            }))
+        });
+        let result = unseal(&f.dir);
+        AFTER_UNSEAL_WALK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            seen.get(),
+            Some(true),
+            "unseal's permission walk released the holder's lock"
+        );
+        let error = result.expect_err("busy while the holder reads");
+        assert!(
+            error.to_string().contains("locked") || error.kind() == io::ErrorKind::WouldBlock,
+            "{error}"
+        );
+        assert!(
+            crate::overlay_db::other_process_sees_lock(&f.dir.join(HIDDEN_DB)),
+            "unseal's permission walk released the holder's lock"
+        );
+        holder
+            .execute_batch("SELECT count(*) FROM files; COMMIT;")
+            .unwrap();
+        drop(holder);
+        unseal(&f.dir).unwrap();
     }
 
     /// Regression: chmod -w changed lookup and readdir modes, and leaked the sentinel.

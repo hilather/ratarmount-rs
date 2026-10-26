@@ -35,9 +35,15 @@ linked shared libraries (`uv pip install --python
 ratarmount-python/.venv/bin/python patchelf`). The version comes from the Rust
 workspace. The Python wheels workflow builds abi3 wheels for manylinux_2_28
 x86_64/aarch64 and macOS 14+ arm64, plus an sdist, and tests installed wheels in
-fresh venvs on Linux x86_64 and macOS arm64. Linux wheels require glibc 2.28+;
+fresh venvs on Linux x86_64 and aarch64 and macOS arm64. Linux wheels require glibc 2.28+;
 linked libraries such as libarchive are bundled by maturin on Linux and
-delocate on macOS. Library reads need no FUSE; optional mounting uses a separate CLI.
+delocate on macOS. Library reads need no FUSE; optional mounting uses a separate CLI. On aarch64 (Linux and
+macOS), builds with the `extension-module` feature (the wheels and `maturin
+develop`/`build` source installs) compute BLAKE3 without NEON: the portable
+code gives the same digests, more slowly (canonical hashing of overlay change
+sets in the Python module; not measured). NEON's C kernel needs a `#[no_mangle]`
+FFI shim that a Python extension would export; the CLI, default and
+`embedding` builds keep NEON.
 The workflow uploads build artifacts only; PyPI publishing is not enabled, so
 `pip install ratarmount-rs` is not yet the installation path.
 The Python crate is outside the workspace's default build members and no
@@ -185,6 +191,58 @@ raise `ValueError`; directory reads raise `IsADirectoryError`. Unsupported
 formats, corrupt indexes, cancellation, write-permission and other engine
 errors raise `RatarmountError` with the engine detail. Standard Python I/O
 and mmap errors retain their usual types.
+
+### Import and checked SQLite opens
+
+Overlay databases are opened through checked SQLite opens, which need
+wrappers around the `open` and `stat` calls of the SQLite bundled in
+`_native` (#151). The wrappers are installed when the module loads. If the
+process has one thread at that point, a load-time constructor installs them.
+If other threads are already running, the module installs them into its
+private SQLite as its first step, before it publishes anything. That is safe
+only if the wheel exports no `sqlite3_*` symbol (the wheels workflow audits
+every repaired wheel for that, `packaging/audit_native_exports.py`) and
+nothing obtains and calls an entry point of the module before it finishes
+initializing (no check can prove that second condition, #192).
+On Linux and macOS (64-bit x86_64/aarch64, glibc or macOS), if neither path
+can install the wrappers, `import ratarmount_rs` raises `ImportError` naming
+the reason; nothing from the module is usable then. On Windows and other
+platforms the module imports, and checked opens refuse or use the Windows
+path-type check. A Rust program that embeds the rlib (`--features embedding`)
+gets only the load-time constructor; threads started before it loads leave
+checked opens refusing, and if that program also registers `_native` (for
+example through `wrap_pymodule!` or the inittab), its import raises the same
+`ImportError`. A wheel you build yourself from the sdist is not audited.
+Before it installs into its private SQLite (only when threads were already
+running at import; a single-threaded import installs through the load-time
+constructor and does not run this check), the module also checks its own
+image at run time. On Linux (glibc, 64-bit x86_64/aarch64) it reads every
+defined, externally visible dynamic symbol of `_native` and refuses (the
+import raises `ImportError`) if any name starts with `sqlite3` (any case),
+or if the dynamic symbol table cannot be read completely (a malformed table,
+a pointer it cannot place, a work limit). On macOS the check refuses only an
+image that itself exports `sqlite3_libversion`; the wheel audit is the full
+check there. Neither check sees an entry point that something else published
+before the module initialized; that is still the caller contract of the
+private-instance path (#192).
+
+Python's own `sqlite3` module may load a different SQLite library than the
+one inside `_native`; the wheel's SQLite is private, so the two are separate
+SQLite instances. Do not open the same database file (an overlay database, an
+index sidecar) through both at the same time in one process (#154): each
+instance keeps its own lock bookkeeping, and closing a connection of one can
+release the POSIX locks the other holds ([SQLite: multiple copies of SQLite
+in one application](https://www.sqlite.org/howtocorrupt.html#multiple_copies_of_sqlite_linked_into_the_same_application)).
+Hiding `_native`'s symbols keeps the checked-open wrappers out of the other
+instance; it does not make the two share locks. See the platform table in
+[sandbox.md](sandbox.md#checked-overlay-database-opens-by-platform).
+
+`ratarmount_rs._native._checked_open_status()` is a diagnostic. It returns a
+dict with `installed`, `why` (`"SingleThread"` or `"PrivateInstance"`),
+`threads_at_install`, `exports_checked` (how many exported symbols the Linux
+private-instance check read; `None` for the single-thread constructor and on
+macOS), `status`, `detail` and `constructor` (what the load-time constructor
+saw, such as `"AbstainedThreads(Some(2))"`). It installs nothing.
 
 ## Mount from Python
 

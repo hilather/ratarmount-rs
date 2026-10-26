@@ -530,14 +530,12 @@ fn materialize_fetched_index(path: PathBuf) -> std::result::Result<PathBuf, Stri
     }
 }
 
-fn blob_matches_index_id(path: &Path, expected: &str) -> bool {
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
-    match sha256_hex_stream(&mut f) {
-        Ok(got) => got.eq_ignore_ascii_case(expected),
-        Err(_) => false,
-    }
+/// Whether the blob's SHA-256 is the pointer's id. Managed (#151): the blob
+/// may be a meta-v3 cache file another session of this process has open as
+/// its index. A read error is an error, not a mismatch.
+fn blob_matches_index_id(path: &Path, expected: &str) -> std::io::Result<bool> {
+    let got = ratarmount_index::managed_read::sha256_hex(path)?;
+    Ok(got.eq_ignore_ascii_case(expected))
 }
 
 fn fetch_http_index_wire(index_url: &str) -> std::io::Result<PathBuf> {
@@ -589,13 +587,21 @@ fn try_fetch_http_index(
         }
     };
     if let Some(id) = expected_id {
-        if !blob_matches_index_id(&path, id) {
-            log::warn!("index blob sha256 != pointer {id}; continue discovery");
-            invalidate_meta_cache_identity("http", index_url);
-            if !is_meta_cache_path(&path) {
-                let _ = std::fs::remove_file(&path);
+        match blob_matches_index_id(&path, id) {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!("index blob sha256 != pointer {id}; continue discovery");
+                invalidate_meta_cache_identity("http", index_url);
+                if !is_meta_cache_path(&path) {
+                    let _ = std::fs::remove_file(&path);
+                }
+                return false;
             }
-            return false;
+            // Not a mismatch: the blob stays; this candidate is not used.
+            Err(e) => {
+                log::warn!("cannot hash index blob for pointer {id}: {e}; continue discovery");
+                return false;
+            }
         }
     }
     let (prefix, suffix, full) = http_fingerprint(archive_url, archive_size);
@@ -653,13 +659,20 @@ fn try_fetch_object_store_index(
         }
     };
     if let Some(id) = expected_id {
-        if !blob_matches_index_id(&path, id) {
-            log::warn!("index blob sha256 != pointer {id}; continue discovery");
-            invalidate_meta_cache_identity("object-store", index_url);
-            if !is_meta_cache_path(&path) {
-                let _ = std::fs::remove_file(&path);
+        match blob_matches_index_id(&path, id) {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!("index blob sha256 != pointer {id}; continue discovery");
+                invalidate_meta_cache_identity("object-store", index_url);
+                if !is_meta_cache_path(&path) {
+                    let _ = std::fs::remove_file(&path);
+                }
+                return false;
             }
-            return false;
+            Err(e) => {
+                log::warn!("cannot hash index blob for pointer {id}: {e}; continue discovery");
+                return false;
+            }
         }
     }
     let (prefix, suffix, full) = object_store_fingerprint(archive_url, archive_size);
@@ -715,7 +728,12 @@ fn try_install_remote_index(
                     let _ = std::fs::create_dir_all(parent);
                 }
             }
-            match std::fs::copy(&fetched, d) {
+            // Managed source (#151): the fetched blob may be a meta-v3 file
+            // another session has open. Create-or-truncate (an existing,
+            // possibly 0-byte, destination is fine) with the source's exact
+            // mode applied before any byte is written; on error the fetched
+            // path is used and a partial destination may remain.
+            match ratarmount_index::managed_read::copy_create_or_truncate(&fetched, d) {
                 Ok(_) => {
                     // Keep the V-3 XDG blob so a remount without the local
                     // well-known copy (and without `.ptr`) still cache-hits.
@@ -1129,13 +1147,19 @@ fn apply_hf_index_discovery(
             invalidate_meta_cache_identity("hf", &candidate);
             continue;
         };
-        if expected
-            .as_ref()
-            .is_some_and(|id| !blob_matches_index_id(&path, id))
-        {
-            invalidate_meta_cache_identity("hf", &candidate);
-            drop_fetched_sidecar(&path);
-            continue;
+        if let Some(id) = expected.as_ref() {
+            match blob_matches_index_id(&path, id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    invalidate_meta_cache_identity("hf", &candidate);
+                    drop_fetched_sidecar(&path);
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("cannot hash index blob for pointer {id}: {e}");
+                    continue;
+                }
+            }
         }
         let mut reader = repo
             .open_file(&repo.location.path)
@@ -4922,6 +4946,362 @@ mod tests {
                 panic!("UserCache must not write flattened XDG {}", p.display());
             }
         });
+    }
+
+    // ---------------------------------------------------------------------
+    // R11-S7 (#151): managed reads of fetched / meta-v3 index blobs.
+    // ---------------------------------------------------------------------
+
+    /// The meta-v3 blob files (not headers or staging) under `XDG_CACHE_HOME`,
+    /// canonicalized: `managed_read::seams::opened_path()` reports the
+    /// canonical path, and on macOS the temp dir sits under the `/var` symlink
+    /// (Regression R11-CI, #199: the seams never matched there).
+    #[cfg(unix)]
+    fn meta_v3_blobs() -> Vec<PathBuf> {
+        let dir = PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap())
+            .join("ratarmount")
+            .join("meta-v3");
+        let mut out: Vec<PathBuf> = fs::read_dir(&dir)
+            .map(|it| {
+                it.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        let n = p.file_name().unwrap().to_string_lossy();
+                        n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                    .map(|p| p.canonicalize().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// A connection holding SHARED on `path` (an open read transaction).
+    #[cfg(unix)]
+    fn s7_holder(path: &Path) -> rusqlite::Connection {
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute_batch("BEGIN").unwrap();
+        let _: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        c
+    }
+
+    /// The remote fingerprints of the 1024-byte `S` archive of [`s7_discovered`].
+    #[cfg(unix)]
+    fn s7_fingerprints() -> (String, String, String) {
+        let bytes = vec![b'S'; 1024];
+        (
+            ratarmount_index::sha256_hex(&bytes[..512]),
+            ratarmount_index::sha256_hex(&bytes[512..]),
+            ratarmount_index::sha256_hex(&bytes),
+        )
+    }
+
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Serve an archive with a pointer and its blob; run discovery once so
+    /// the blob lands in meta-v3. Returns (server, url, blob bytes, opts,
+    /// the folder destination, the meta-v3 blob).
+    #[cfg(unix)]
+    fn s7_discovered(dir: &Path) -> (IndexHttp, String, Vec<u8>, Vec<PathBuf>, PathBuf, PathBuf) {
+        let archive = dir.join("archive.tar");
+        let archive_bytes = vec![b'S'; 1024];
+        fs::write(&archive, &archive_bytes).unwrap();
+        let index_bytes = make_sidecar_for(&archive);
+        let id = ratarmount_index::sha256_hex(&index_bytes);
+        let mut objects = std::collections::HashMap::new();
+        objects.insert(
+            "/archive.tar.index.ptr".into(),
+            pointer_json_for_blob(&index_bytes),
+        );
+        objects.insert(
+            format!("/archive.tar.index.{id}.sqlite"),
+            index_bytes.clone(),
+        );
+        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
+        let url = format!("http://{}/archive.tar", http.addr);
+        let folders = empty_index_folders(dir);
+        let mut opts = OpenOptions {
+            index_folders: folders.clone(),
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(&url, &mut opts, false, 1024, None).unwrap();
+        let dest = opts.index_file_path.clone().expect("first discovery");
+        let blobs = meta_v3_blobs();
+        assert_eq!(blobs.len(), 1, "one meta-v3 blob: {blobs:?}");
+        (http, url, index_bytes, folders, dest, blobs[0].clone())
+    }
+
+    /// Regression: comparing a fetched/meta-v3 blob with the pointer's id
+    /// hashed it through a raw `File`, releasing the lock of a session that
+    /// has that blob open as its index. Through discovery: session A holds
+    /// the meta-v3 blob open as its index while session B's discovery hashes
+    /// (and copies) the same inode.
+    #[cfg(unix)]
+    #[test]
+    fn regression_remote_index_id_hash_keeps_index_lock() {
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (_http, url, bytes, folders, dest, blob) = s7_discovered(&dir);
+        let id = ratarmount_index::sha256_hex(&bytes);
+        fs::remove_file(&dest).unwrap();
+        let a = s7_holder(&blob);
+        assert!(other_process_sees_lock(&blob));
+        assert!(blob_matches_index_id(&blob, &id).unwrap());
+        assert!(!blob_matches_index_id(&blob, &"0".repeat(64)).unwrap());
+        assert!(other_process_sees_lock(&blob), "direct hash kept the lock");
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(&url, &mut opts, false, 1024, None).unwrap();
+        assert_eq!(opts.index_file_path.as_deref(), Some(dest.as_path()));
+        assert!(
+            other_process_sees_lock(&blob),
+            "session B's discovery released session A's lock"
+        );
+        drop(fs::File::open(&blob).unwrap());
+        assert!(!other_process_sees_lock(&blob), "oracle check");
+        drop(a);
+    }
+
+    /// Regression: installing the fetched/meta-v3 blob at the local cache
+    /// name used `std::fs::copy` (a raw read of a blob another session has
+    /// open as its index).
+    #[cfg(unix)]
+    #[test]
+    fn regression_remote_index_copy_keeps_cached_index_lock() {
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (_http, _url, bytes, _folders, dest, blob) = s7_discovered(&dir);
+        fs::remove_file(&dest).unwrap();
+        let a = s7_holder(&blob);
+        let mut opts = OpenOptions::default();
+        let (p, x, f) = s7_fingerprints();
+        assert!(try_install_remote_index(
+            &mut opts,
+            blob.clone(),
+            1024,
+            Some(&p),
+            Some(&x),
+            Some(&f),
+            Some(&dest)
+        ));
+        assert_eq!(opts.index_file_path.as_deref(), Some(dest.as_path()));
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        assert!(other_process_sees_lock(&blob), "copy kept the lock");
+        drop(a);
+    }
+
+    /// Regression: a read error while hashing the blob for the pointer's id
+    /// was treated as a mismatch (blob invalidated and removed). It is not a
+    /// mismatch: the meta-v3 entry stays, the candidate is not selected.
+    #[cfg(unix)]
+    #[test]
+    fn regression_remote_index_hash_error_is_not_mismatch() {
+        use ratarmount_index::managed_read::{seams, Seam};
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (_http, url, bytes, folders, dest, blob) = s7_discovered(&dir);
+        let id = ratarmount_index::sha256_hex(&bytes);
+        fs::remove_file(&dest).unwrap();
+        let hdr = PathBuf::from(format!("{}.hdr", blob.display()));
+        let hdr_before = fs::read(&hdr).unwrap();
+        // Direct: a read error is Err, never Ok(false).
+        let b2 = blob.clone();
+        let got = seams::with(
+            move |s| {
+                if s == Seam::BeforeRead && seams::opened_path().as_deref() == Some(b2.as_path()) {
+                    return Err(std::io::Error::other("injected"));
+                }
+                Ok(())
+            },
+            || blob_matches_index_id(&blob, &id),
+        );
+        assert!(got.is_err());
+        // Through discovery: the meta-v3 lookup's hash (first open of the
+        // blob) and the materialization probe (second) pass; the pointer
+        // comparison (third) fails.
+        let (b2, mut opens) = (blob.clone(), 0);
+        let injected = std::rc::Rc::new(std::cell::Cell::new(false));
+        let inj = std::rc::Rc::clone(&injected);
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        seams::with(
+            move |s| {
+                if s == Seam::AfterOpen && seams::opened_path().as_deref() == Some(b2.as_path()) {
+                    opens += 1;
+                    if opens == 3 {
+                        inj.set(true);
+                        return Err(std::io::Error::other("injected"));
+                    }
+                }
+                Ok(())
+            },
+            || apply_remote_index_discovery(&url, &mut opts, false, 1024, None),
+        )
+        .unwrap();
+        assert!(injected.get(), "the pointer comparison ran");
+        assert!(opts.index_file_path.is_none(), "candidate not selected");
+        assert_eq!(fs::read(&blob).unwrap(), bytes, "meta-v3 blob kept");
+        let hdr_after = fs::read(&hdr).expect("header kept");
+        assert_eq!(
+            hdr_after.len(),
+            hdr_before.len(),
+            "same entry (only last_hit moves)"
+        );
+        assert!(!dest.exists());
+    }
+
+    /// Regression: the remote index's local copy keeps the fetched blob's
+    /// exact mode (0600) from creation, and a pre-existing 0-byte destination
+    /// admitted by discovery is filled, gets the exact mode before any byte,
+    /// and is the selected index.
+    #[cfg(unix)]
+    #[test]
+    fn regression_internal_copy_preserves_source_mode_remote_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (_http, url, bytes, folders, dest, blob) = s7_discovered(&dir);
+        assert_eq!(mode_of(&blob), 0o600, "fetched blobs are 0600");
+        assert_eq!(
+            mode_of(&dest),
+            0o600,
+            "absent destination: exact source mode"
+        );
+        fs::remove_file(&dest).unwrap();
+        fs::write(&dest, b"").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(&url, &mut opts, false, 1024, None).unwrap();
+        assert_eq!(opts.index_file_path.as_deref(), Some(dest.as_path()));
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        assert_eq!(
+            mode_of(&dest),
+            0o600,
+            "pre-existing destination: exact source mode"
+        );
+    }
+
+    /// Regression: a read error while copying the blob to the local cache
+    /// name falls back to the fetched path; the final name may be partially
+    /// written (with the source's exact mode) and is not removed.
+    #[cfg(unix)]
+    #[test]
+    fn regression_internal_copy_destination_failures_remote_final_name() {
+        use ratarmount_index::managed_read::{seams, Seam};
+        use std::os::unix::fs::PermissionsExt;
+        let _env = EnvGuard::acquire_with_isolated_xdg(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (_http, _url, bytes, _folders, dest, blob) = s7_discovered(&dir);
+        fs::remove_file(&dest).unwrap();
+        let mut opts = OpenOptions::default();
+        let mut reads = 0;
+        let ok = seams::with(
+            move |s| {
+                // The blob (~100 KiB) is one read: fail it.
+                if s == Seam::BeforeRead {
+                    reads += 1;
+                    if reads == 1 {
+                        return Err(std::io::Error::other("injected"));
+                    }
+                }
+                Ok(())
+            },
+            || {
+                let (p, x, f) = s7_fingerprints();
+                try_install_remote_index(
+                    &mut opts,
+                    blob.clone(),
+                    1024,
+                    Some(&p),
+                    Some(&x),
+                    Some(&f),
+                    Some(&dest),
+                )
+            },
+        );
+        assert!(ok);
+        assert_eq!(
+            opts.index_file_path.as_deref(),
+            Some(blob.as_path()),
+            "fetched-path fallback"
+        );
+        let partial = fs::metadata(&dest).expect("the final name stays").len();
+        assert!(partial < bytes.len() as u64, "partial destination");
+        assert_eq!(mode_of(&dest), 0o600);
+
+        // Destination-permission failures: the source's mode cannot be
+        // applied (injected), or the existing final name is not writable
+        // (mode 000). Both fall back to the fetched path, write nothing
+        // and leave the final name as it was.
+        for case in ["chmod", "unwritable"] {
+            let _ = fs::remove_file(&dest);
+            fs::write(&dest, b"").unwrap();
+            let mode = if case == "unwritable" { 0o000 } else { 0o644 };
+            fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).unwrap();
+            if case == "unwritable" && fs::OpenOptions::new().write(true).open(&dest).is_ok() {
+                eprintln!("skip: running as root, a mode-000 file is writable");
+                continue;
+            }
+            let mut opts = OpenOptions::default();
+            let ok = seams::with(
+                move |s| {
+                    if case == "chmod" && s == Seam::BeforePermissions {
+                        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                    }
+                    Ok(())
+                },
+                || {
+                    let (p, x, f) = s7_fingerprints();
+                    try_install_remote_index(
+                        &mut opts,
+                        blob.clone(),
+                        1024,
+                        Some(&p),
+                        Some(&x),
+                        Some(&f),
+                        Some(&dest),
+                    )
+                },
+            );
+            assert!(ok, "{case}");
+            assert_eq!(
+                opts.index_file_path.as_deref(),
+                Some(blob.as_path()),
+                "{case}: fetched-path fallback"
+            );
+            assert_eq!(
+                fs::metadata(&dest).unwrap().len(),
+                0,
+                "{case}: nothing written"
+            );
+            assert_eq!(mode_of(&dest), mode, "{case}: final name untouched");
+        }
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
 

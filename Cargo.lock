@@ -4925,6 +4925,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratarmount-checked-open-fixture"
+version = "0.1.35"
+dependencies = [
+ "libc",
+ "ratarmount-index",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "ratarmount-compositing"
 version = "0.1.35"
 dependencies = [
@@ -5469,10 +5479,13 @@ dependencies = [
 name = "ratarmount-http"
 version = "0.1.35"
 dependencies = [
+ "libc",
  "log",
  "ratarmount-compositing",
  "ratarmount-core",
  "ratarmount-export-core",
+ "ratarmount-index",
+ "rusqlite",
  "tempfile",
 ]
 
@@ -5522,8 +5535,10 @@ dependencies = [
 name = "ratarmount-python"
 version = "0.1.35"
 dependencies = [
+ "blake3",
  "pyo3",
  "ratarmount-formats-tar",
+ "ratarmount-index",
  "ratarmount-remote",
  "ratarmount-session",
  "secrecy",

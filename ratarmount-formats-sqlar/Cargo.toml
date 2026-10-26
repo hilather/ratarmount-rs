@@ -34,3 +34,4 @@ sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+ratarmount-index = { workspace = true, features = ["test-hooks"] }

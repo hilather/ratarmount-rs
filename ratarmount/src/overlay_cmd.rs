@@ -261,9 +261,8 @@ fn digest_base(args: &DigestBaseArgs) -> Result<(String, i32), String> {
             .collect();
         ("directory", digest, excluded)
     } else {
-        let mut file = std::fs::File::open(&args.path)
-            .map_err(|e| format!("digest-base {}: {e}", args.path.display()))?;
-        let hex = ratarmount_index::sha256_hex_stream(&mut file)
+        // Managed (#151): the base may be a database open in this process.
+        let hex = ratarmount_index::managed_read::sha256_hex(&args.path)
             .map_err(|e| format!("digest-base {}: {e}", args.path.display()))?;
         ("file", format!("sha256:{hex}"), Vec::new())
     };
@@ -1155,5 +1154,42 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(forced.forced.unwrap()["base_digest"], other);
+    }
+
+    /// Regression: (R11-S7, #151): `overlay digest-base FILE` hashed the file
+    /// raw; a base that is an SQLAR open in this process lost its lock.
+    #[cfg(unix)]
+    #[test]
+    fn regression_digest_base_file_keeps_sqlar_lock() {
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("a.sqlar");
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB);
+             INSERT INTO sqlar VALUES ('a', 33188, 0, 3, randomblob(90000));",
+        )
+        .unwrap();
+        drop(c);
+        let want = format!(
+            "sha256:{}",
+            ratarmount_index::sha256_hex(&std::fs::read(&path).unwrap())
+        );
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN").unwrap();
+        let _: i64 = holder
+            .query_row("SELECT count(*) FROM sqlar", [], |r| r.get(0))
+            .unwrap();
+        assert!(other_process_sees_lock(&path));
+        let args = DigestBaseArgs {
+            path: path.clone(),
+            exclude_overlay: Vec::new(),
+            json: false,
+        };
+        let (out, code) = digest_base(&args).unwrap();
+        assert_eq!(code, 0);
+        assert!(out.contains(&want), "{out}");
+        assert!(other_process_sees_lock(&path), "lock kept");
+        drop(holder);
     }
 }

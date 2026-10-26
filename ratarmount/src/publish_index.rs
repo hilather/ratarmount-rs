@@ -280,7 +280,8 @@ fn publish_remote(
     }
     let pointer_bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
     if let Some(repo) = target_repo {
-        let blob = fs::read(tmp.path()).map_err(|e| e.to_string())?;
+        // Managed (#151): the snapshot is read through SQLite's VFS.
+        let blob = ratarmount_index::managed_read::read(tmp.path()).map_err(|e| e.to_string())?;
         let blob_path = format!("{}.index.{}.sqlite", repo.location.path, pointer.index_id);
         let pointer_path = format!("{}.index.ptr", repo.location.path);
         let result = repo
@@ -346,8 +347,8 @@ fn atomic_copy(src: &Path, dest: &Path) -> io::Result<()> {
         None => builder.tempfile_in(".")?,
     };
     {
-        let mut in_f = fs::File::open(src)?;
-        io::copy(&mut in_f, &mut tmp)?;
+        // Managed (#151): the source is an index that may be open here.
+        ratarmount_index::managed_read::copy_into(src, &mut tmp)?;
         tmp.flush()?;
     }
     tmp.persist(dest).map_err(|e| e.error)?;
@@ -604,7 +605,7 @@ pub(crate) mod tests {
         join: Option<std::thread::JoinHandle<()>>,
     }
     impl PublishServer {
-        fn new(archive: Vec<u8>, fail_blob: bool, fail_pointer: bool) -> Self {
+        pub(crate) fn new(archive: Vec<u8>, fail_blob: bool, fail_pointer: bool) -> Self {
             Self::with_live(archive, fail_blob, fail_pointer, false)
         }
         pub(crate) fn live(archive: Vec<u8>) -> Self {
@@ -1257,5 +1258,134 @@ pub(crate) mod tests {
             .query_row("SELECT value FROM marker", [], |r| r.get(0))
             .unwrap();
         assert_eq!(value, "committed WAL");
+    }
+
+    /// A connection holding SHARED on a WAL index `path` (read transaction).
+    #[cfg(unix)]
+    fn s7_wal_holder(path: &Path) -> rusqlite::Connection {
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.execute_batch("BEGIN").unwrap();
+        let _: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert!(ratarmount_index::managed_read::lock_probe::other_process_sees_lock(path));
+        c
+    }
+
+    /// Regression: (R11-S7, #151): publication snapshots the live sidecar with
+    /// `VACUUM INTO` (committed WAL pages included, ordinary connection policy)
+    /// and must not release the session's lock on the source.
+    #[cfg(unix)]
+    #[test]
+    fn regression_publish_index_snapshot_keeps_source_lock() {
+        use ratarmount_index::managed_read::lock_probe::other_process_sees_lock;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.sqlite");
+        let c = rusqlite::Connection::open(&src).unwrap();
+        c.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE marker(value TEXT); INSERT INTO marker VALUES ('committed WAL');",
+        )
+        .unwrap();
+        let holder = s7_wal_holder(&src);
+        let dest = dir.path().join("snapshot.sqlite");
+        snapshot_sidecar(&src, &dest).unwrap();
+        assert!(other_process_sees_lock(&src), "source lock kept");
+        let value: String = rusqlite::Connection::open(&dest)
+            .unwrap()
+            .query_row("SELECT value FROM marker", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "committed WAL");
+        drop(holder);
+        drop(c);
+    }
+
+    /// Regression: (R11-S7, #151): publication read its index bytes (the local
+    /// atomic copy's source, the snapshot's pointer hash and object-store
+    /// sibling body, the Hub body) through raw `File`s. The local copy keeps
+    /// the session's lock on the live sidecar; every managed read of the
+    /// remote publication keeps a lock taken on the file it reads.
+    #[cfg(unix)]
+    #[test]
+    fn regression_publish_index_readers_keep_index_lock() {
+        use ratarmount_index::managed_read::{
+            lock_probe::other_process_sees_lock, with_close_probes,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("live.index.sqlite");
+        let c = rusqlite::Connection::open(&src).unwrap();
+        c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let holder = s7_wal_holder(&src);
+        atomic_copy(&src, &dir.path().join("copy.sqlite")).unwrap();
+        assert!(other_process_sees_lock(&src), "local copy kept the lock");
+        drop(holder);
+        drop(c);
+
+        // Object store (S3): pointer hash and sibling body of the snapshot.
+        let tar = dir.path().join("a.tar");
+        fs::write(&tar, publish_tar()).unwrap();
+        let server = PublishServer::new(publish_tar(), false, false);
+        let _env = PublishEnv::new(&[
+            ("AWS_ACCESS_KEY_ID", "test"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_ENDPOINT_URL", &server.url),
+            ("AWS_REGION", "us-east-1"),
+            ("RATARMOUNT_S3_ANONYMOUS", "0"),
+            ("AWS_ANONYMOUS", "0"),
+            ("HF_ENDPOINT", &server.url),
+            ("HF_TOKEN", "hf-test"),
+            ("HF_HUB_OFFLINE", "0"),
+            ("XDG_CACHE_HOME", dir.path().join("cache").to_str().unwrap()),
+            (
+                "RATARMOUNT_HF_TREE_CACHE",
+                dir.path().join("trees").to_str().unwrap(),
+            ),
+        ]);
+        let url = "s3://bucket/a.tar";
+        let remote_sidecar = dir.path().join("remote.sqlite");
+        let mut remote_opts = ratarmount_core::OpenOptions {
+            index_file_path: Some(remote_sidecar.clone()),
+            ..Default::default()
+        };
+        drop(
+            crate::factory::build_mount_source(
+                &[PathBuf::from(url)],
+                &mut remote_opts,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let opts = PublishIndexOpts {
+            archive: Path::new(url),
+            sidecar: &remote_sidecar,
+            dest: None,
+            no_recreate_index: false,
+        };
+        let (got, probes) =
+            with_close_probes(|_| true, || publish_validated_index(opts, None, false));
+        got.unwrap();
+        assert!(probes.len() >= 2, "pointer hash and blob body: {probes:?}");
+        assert!(probes.iter().all(|(_, kept)| *kept), "{probes:?}");
+
+        // Hub: the snapshot's body.
+        let hf = "hf://datasets/org/data@main/a.tar";
+        let sidecar = dir.path().join("built.sqlite");
+        drop(build_publish_index(
+            hf,
+            &sidecar,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ));
+        let opts = PublishIndexOpts {
+            archive: Path::new(hf),
+            sidecar: &sidecar,
+            dest: None,
+            no_recreate_index: false,
+        };
+        let (got, probes) =
+            with_close_probes(|_| true, || publish_validated_index(opts, None, false));
+        got.unwrap();
+        assert!(probes.len() >= 2, "pointer hash and Hub body: {probes:?}");
+        assert!(probes.iter().all(|(_, kept)| *kept), "{probes:?}");
     }
 }

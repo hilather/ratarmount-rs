@@ -123,6 +123,7 @@ flate2 = "1"
 bzip2 = "0.5"
 zstd = "0.13"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+ratarmount-index = { workspace = true, features = ["test-hooks"] }
 git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
 url = "2"
 rusqlite.workspace = true
