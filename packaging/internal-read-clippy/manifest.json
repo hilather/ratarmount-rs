@@ -12685,14 +12685,14 @@
       "rule_reason": "inventory-op:fs::write"
     },
     {
-      "configured_path": "std::fs::File::open",
+      "configured_path": "ratarmount_core::db_inodes::open_admitted",
       "item": "ratarmount_compress::commit_journal::unix::guard_copy",
-      "leaf_digest": "7d3787d8232e8476c74ac31166147b2930ed49760c6cb46137412e55ca860984",
+      "leaf_digest": "78bd880e67a8c4ee623ce4bded78928eabcff84adfb74ab6f763484eeab05df9",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "commit-journal-recovery",
         "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
+          "basis": "Open an existing admitted archive read-only with CLOEXEC for flock and fstat; no creation flags are requested, and registered database aliases are refused without a lock-dropping close.",
           "policy": "none"
         },
         "disposition": "residual",
@@ -12700,7 +12700,7 @@
         "id": "IR-B0216-M01",
         "issue": "#196",
         "item": "ratarmount_compress::commit_journal::unix::guard_copy",
-        "reason": "base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery"
+        "reason": "Acquire the archive flock for source construction, sealing and commit publication through admitted open; Regression: refusing a registered database alias must preserve its existing POSIX locks, including source-open error paths."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -12708,9 +12708,9 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0216-M01\",\"item\":\"ratarmount_compress::commit_journal::unix::guard_copy\",\"disposition\":\"residual\",\"reason\":\"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
-      "resolved": "<std::fs::File>::open",
-      "rule_reason": "inventory-op:File::open"
+      "reason": "internal-read:v1 {\"id\":\"IR-B0216-M01\",\"item\":\"ratarmount_compress::commit_journal::unix::guard_copy\",\"disposition\":\"residual\",\"reason\":\"Acquire the archive flock for source construction, sealing and commit publication through admitted open; Regression: refusing a registered database alias must preserve its existing POSIX locks, including source-open error paths.\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Open an existing admitted archive read-only with CLOEXEC for flock and fstat; no creation flags are requested, and registered database aliases are refused without a lock-dropping close.\"}}",
+      "resolved": "ratarmount_core::db_inodes::unix::open_admitted",
+      "rule_reason": "inventory-op:open_admitted"
     },
     {
       "configured_path": "std::fs::File::try_clone",

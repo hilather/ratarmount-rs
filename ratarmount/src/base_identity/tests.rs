@@ -1,5 +1,137 @@
 use super::*;
 
+/// Regression: #238 a commit between the factory's source acquisition and
+/// token minting paired an old TAR index/descriptor with the new path stamp.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn regression_238_v3_commit_during_open_cannot_certify_old_source() {
+    use ratarmount_compositing::{BaseDigestRequest, CreateOptions, OverlayMetadata, WriteOverlay};
+    use ratarmount_compress::commit_journal;
+    use std::io::{Read, Seek, SeekFrom};
+
+    struct CommitDuringOpen<'a> {
+        factory: FactoryOpener<'a>,
+        archive: PathBuf,
+        staged: PathBuf,
+        replace: bool,
+    }
+    impl OpenBase for CommitDuringOpen<'_> {
+        fn open_base(&mut self) -> Result<Opened, String> {
+            let opened = self.factory.open_base()?;
+            let original = std::fs::metadata(&self.archive).unwrap();
+            if self.replace {
+                let _guard = commit_journal::guard_copy(&self.archive, &original).unwrap();
+                std::fs::rename(&self.staged, &self.archive).unwrap();
+            } else {
+                let mut suffix = std::fs::File::open(&self.staged).unwrap();
+                commit_journal::replace_suffix_if_unchanged_with(
+                    &self.archive,
+                    0,
+                    &mut suffix,
+                    &original,
+                    &mut || Ok(()),
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+            }
+            Ok(opened)
+        }
+    }
+
+    for replace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        let staged = dir.path().join("new.tar");
+        write_tar_file(&archive);
+        write_tar_file(&staged);
+        // Keep the same layout; changing the inherited payload exposes a
+        // stale digest even when an in-place source keeps the same offsets.
+        let mut newer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&staged)
+            .unwrap();
+        newer.seek(SeekFrom::Start(512)).unwrap();
+        std::io::Write::write_all(&mut newer, b"y").unwrap();
+        drop(newer);
+        let initial = fixtures::classify(&archive);
+        let overlay_dir = dir.path().join("overlay");
+        let overlay = WriteOverlay::open(
+            &initial,
+            initial.source(),
+            &overlay_dir,
+            &CreateOptions {
+                base_digest: BaseDigestRequest::None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        overlay
+            .set_metadata(
+                "/f",
+                &OverlayMetadata {
+                    mode: Some(0o600),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        drop(overlay);
+        drop(initial);
+        let mut options = OpenOptions {
+            index_in_memory: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let factory = FactoryOpener::new(
+            vec![archive.to_string_lossy().into_owned()],
+            vec![archive.clone()],
+            &mut options,
+            false,
+            Default::default(),
+            Default::default(),
+            false,
+        );
+        let token = ClassifiedBase::open(&mut CommitDuringOpen {
+            factory,
+            archive: archive.clone(),
+            staged,
+            replace,
+        })
+        .unwrap();
+        if replace {
+            let source = token.source();
+            let info = source.lookup("/f", 0).unwrap();
+            let mut bytes = Vec::new();
+            source
+                .open(&info, 0)
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert_eq!(
+                bytes, b"x",
+                "the fixture must retain the old TAR descriptor"
+            );
+        }
+        let result =
+            ratarmount_compositing::overlay_seal::seal(&overlay_dir, &token, token.source());
+        // Keep a failing red control removable even if it published a seal.
+        if result.is_ok() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let error = result.expect_err("commit during open must not certify an obsolete source");
+        assert!(
+            error.to_string().contains("base view was opened"),
+            "{error}"
+        );
+        assert!(!OverlayMeta::read(&overlay_dir)
+            .unwrap()
+            .unwrap()
+            .layer_sealed());
+        assert!(!overlay_dir.join(".ratarmount-sealed").exists());
+    }
+}
+
 /// Regression: classification is the factory open a verb already needs and
 /// nothing else: no directory walk, no digest, and (for an archive) no
 /// hashing or stamp comparison. A big directory and a plain archive are

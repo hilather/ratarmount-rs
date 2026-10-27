@@ -651,6 +651,12 @@ pub fn same_stamp(a: &fs::Metadata, b: &fs::Metadata) -> bool {
 pub struct CopyGuard {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     _lock: unix::Lock,
+    // `lock` duplicates this descriptor. Closing the original before returning
+    // the guard would drop ALL of this process's POSIX fcntl locks on the
+    // inode, including a SQLAR source's SQLite locks. Keep both descriptors
+    // alive until the guarded operation has finished.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    _file: File,
     metadata: fs::Metadata,
 }
 
@@ -658,6 +664,17 @@ impl CopyGuard {
     /// The validated stamp of the archive protected by this guard.
     pub fn metadata(&self) -> &fs::Metadata {
         &self.metadata
+    }
+
+    /// End archive exclusion without closing either descriptor. An opener can
+    /// retain this guard alongside the source after indexing: closing a raw
+    /// descriptor while its SQLAR connection lives would release that
+    /// connection's POSIX locks. The metadata is an acquisition snapshot after
+    /// this call, rather than the stamp of an archive still protected by flock.
+    pub fn release_lock(&mut self) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self._lock.release()?;
+        Ok(())
     }
 }
 
@@ -670,7 +687,27 @@ pub fn guard_seal(archive: &Path) -> io::Result<CopyGuard> {
     let source = fs::metadata(archive)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        unix::guard_copy(archive, &source)
+        unix::guard_copy(archive, &source, true)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Ok(CopyGuard { metadata: source })
+    }
+}
+
+/// Exclude archive commits while constructing a source and its index. Recovery
+/// must run before this acquisition. Read-only journal state is checked on the
+/// locked descriptor: unlike publication and sealing, an ordinary open may
+/// inspect a complete journal's finished bytes before the mount's identity
+/// gate authorizes recovery. Completed locators and unrelated sibling journals
+/// are also accepted; an incomplete journal of this inode is refused.
+/// After construction, release the flock and retain the descriptors alongside
+/// the source with [`CopyGuard::release_lock`].
+pub fn guard_source_open(archive: &Path) -> io::Result<CopyGuard> {
+    let source = fs::metadata(archive)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix::guard_copy(archive, &source, false)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -686,7 +723,7 @@ pub fn guard_seal(archive: &Path) -> io::Result<CopyGuard> {
 pub fn guard_copy(archive: &Path, source: &fs::Metadata) -> io::Result<CopyGuard> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        unix::guard_copy(archive, source)
+        unix::guard_copy(archive, source, true)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -712,11 +749,17 @@ mod unix {
     const XATTR: &std::ffi::CStr = c"user.ratarmount.commit-journal";
 
     pub(crate) struct Lock(File);
+    impl Lock {
+        pub(super) fn release(&self) -> io::Result<()> {
+            if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
     impl Drop for Lock {
         fn drop(&mut self) {
-            unsafe {
-                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-            }
+            let _ = self.release();
         }
     }
     fn lock(file: &File, wait: bool) -> io::Result<Lock> {
@@ -1207,15 +1250,26 @@ __inventory_value_1
     }
 
     /// Lock for a copy fallback (see [`super::guard_copy`]).
-    pub(super) fn guard_copy(archive: &Path, source: &fs::Metadata) -> io::Result<CopyGuard> {
-        fault::check("copy publish")?;
+    pub(super) fn guard_copy(
+        archive: &Path,
+        source: &fs::Metadata,
+        refuse_pending: bool,
+    ) -> io::Result<CopyGuard> {
+        if refuse_pending {
+            fault::check("copy publish")?;
+        }
         let archive = archive.canonicalize()?;
         // Read-only: flock needs no write permission.
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0216-M01","item":"ratarmount_compress::commit_journal::unix::guard_copy","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-B0216-M01","item":"ratarmount_compress::commit_journal::unix::guard_copy","disposition":"residual","reason":"Acquire the archive flock for source construction, sealing and commit publication through admitted open; Regression: refusing a registered database alias must preserve its existing POSIX locks, including source-open error paths.","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Open an existing admitted archive read-only with CLOEXEC for flock and fstat; no creation flags are requested, and registered database aliases are refused without a lock-dropping close."}}"###
         )]
-        let file = File::open(&archive)?;
+        let file = ratarmount_core::db_inodes::open_admitted(
+            &archive,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+        )?;
+        let file = File::from(file);
         let lock = lock(&file, true).map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -1225,10 +1279,46 @@ __inventory_value_1
                 ),
             )
         })?;
-        if let Some(e) =
-            pending_refusal(&journal_path(&archive), &file, "the copy was not published")?
-        {
-            return Err(e);
+        if refuse_pending {
+            if let Some(e) =
+                pending_refusal(&journal_path(&archive), &file, "the copy was not published")?
+            {
+                return Err(e);
+            }
+        } else {
+            // Incomplete own journals cannot supply a stable source. Complete
+            // journals may be inspected before the mount's recovery gate;
+            // offline verbs refuse those in their earlier read-only precheck.
+            // Use the retained fd: reopening it for this probe would release
+            // a live SQLAR connection's POSIX locks when the probe closes.
+            match probe_file(&archive, &file)? {
+                JournalProbe::Pending(journal)
+                    if !journal.complete && journal.ino == file.metadata()?.ino() =>
+                {
+                    return Err(io::Error::other(format!(
+                        "{} carries a pending commit journal from an interrupted commit; \
+                         recover it first (`ratarmount --no-mount {}` rolls the interrupted \
+                         append back or forward)",
+                        archive.display(),
+                        archive.display()
+                    )));
+                }
+                JournalProbe::Missing(phase @ (b'A' | b'C'), path) => {
+                    return Err(recovery_error(
+                        &path,
+                        format!(
+                            "{} carries a {} commit-journal locator but its journal is \
+                             missing or moved",
+                            archive.display(),
+                            if phase == b'A' { "active" } else { "complete" }
+                        ),
+                    ));
+                }
+                JournalProbe::NotRegular => {
+                    return Err(io::Error::other("commit journal is not a regular file"));
+                }
+                _ => {}
+            }
         }
         let metadata = file.metadata()?;
         if !same_stamp(source, &metadata) || !same_stamp(&metadata, &fs::metadata(&archive)?) {
@@ -1238,6 +1328,7 @@ __inventory_value_1
         }
         Ok(CopyGuard {
             _lock: lock,
+            _file: file,
             metadata,
         })
     }
@@ -1431,10 +1522,16 @@ __inventory_value_1
             }
             Err(e) => return Err(e),
         };
-        let marker = get_marker(&file)?;
+        probe_file(archive, &file)
+    }
+
+    /// Probe a descriptor already retained by the archive guard. Reopening
+    /// and closing the archive here would release process-wide POSIX locks.
+    pub(super) fn probe_file(archive: &Path, file: &File) -> io::Result<JournalProbe> {
+        let marker = get_marker(file)?;
         let phase = marker.as_ref().map(|(state, _)| *state);
         let complete = phase.is_some_and(|state| matches!(state, b'C' | b'D'));
-        let (path, present) = locate(archive, &file, marker.map(|(_, p)| p))?;
+        let (path, present) = locate(archive, file, marker.map(|(_, p)| p))?;
         let missing = |phase: Option<u8>| match phase {
             Some(p) => JournalProbe::Missing(p, path.clone()),
             None => JournalProbe::None,

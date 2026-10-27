@@ -1480,3 +1480,97 @@ fn regression_238_prewrite_guard_runs_under_lock() {
     assert!(!journal_path(&path).exists());
     assert!(same_stamp(&original, &fs::metadata(&path).unwrap()));
 }
+
+/// Regression: #238 sealing must not close a raw descriptor while a SQLAR
+/// source holds SQLite's process-wide POSIX read lock on the same inode.
+#[test]
+fn regression_238_v3_seal_preserves_posix_locks() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
+
+    const PROBE_PATH: &str = "RATARMOUNT_TEST_238_V3_POSIX_PROBE";
+    const EXPECT_LOCKED: &str = "RATARMOUNT_TEST_238_V3_POSIX_LOCKED";
+    let lock_range = |kind| libc::flock {
+        l_type: kind,
+        l_whence: libc::SEEK_SET as _,
+        // SQLite's SHARED lock range, deliberately independent of flock.
+        l_start: 0x4000_0002,
+        l_len: 510,
+        l_pid: 0,
+    };
+    if let Some(path) = std::env::var_os(PROBE_PATH) {
+        let file = File::open(path).unwrap();
+        let mut query = lock_range(libc::F_WRLCK as _);
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut query) },
+            0
+        );
+        assert_eq!(
+            query.l_type != libc::F_UNLCK as _,
+            std::env::var(EXPECT_LOCKED).unwrap() == "yes",
+            "external process observed the wrong POSIX lock state"
+        );
+        return;
+    }
+    let probe = |path: &Path, locked| {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commit_journal::tests::regression_238_v3_seal_preserves_posix_locks",
+                "--nocapture",
+            ])
+            .env(PROBE_PATH, path)
+            .env(EXPECT_LOCKED, if locked { "yes" } else { "no" })
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "lock probe failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    for acquire in [guard_seal, guard_source_open] {
+        for through_alias in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sqlar.sqlite");
+            let alias = dir.path().join("alias");
+            fs::write(&path, b"archive bytes").unwrap();
+            fs::hard_link(&path, &alias).unwrap();
+            let holder = File::open(&path).unwrap();
+            let shared = lock_range(libc::F_RDLCK as _);
+            assert_eq!(
+                unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLK, &shared) },
+                0
+            );
+            probe(&path, true);
+            let mut guard = acquire(if through_alias { &alias } else { &path }).unwrap();
+            probe(&path, true);
+            guard.release_lock().unwrap();
+            probe(&path, true);
+            drop(guard);
+            // Negative control: closing the raw guard after sealing releases
+            // the POSIX lock even though its original holder remains open.
+            probe(&path, false);
+            // A registered overlay-database inode is refused before source
+            // construction too. The refusal must not close a raw archive fd,
+            // even when the selected pathname is a hardlink alias.
+            assert_eq!(
+                unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLK, &shared) },
+                0
+            );
+            let meta = holder.metadata().unwrap();
+            let registration =
+                ratarmount_core::db_inodes::register_db_inode((meta.dev(), meta.ino()), &path);
+            probe(&path, true);
+            let Err(error) = acquire(if through_alias { &alias } else { &path }) else {
+                panic!("registered database alias must be refused");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            probe(&path, true);
+            drop(registration);
+            drop(holder);
+        }
+    }
+}

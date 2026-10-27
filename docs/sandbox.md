@@ -595,6 +595,23 @@ no excludes, and `.git` included. `--json` prints `layer_digest` and `sealed_at`
 plain output is the digest. Repeating seal prints the recorded digest and exits
 0 even if the base is no longer available; use verify to check integrity.
 
+For a single-file local archive, source acquisition takes the same exclusive
+archive flock as commit before reading or building its index. The token retains the locked
+descriptor's acquisition stamp; seal checks it under that archive's lock before
+resolving or hashing, and holds the lock through seal publication. A commit
+between acquisition and sealing therefore requires reopening the base. Raw lock
+descriptors remain alive through sealing (and acquisition descriptors through
+the source's lifetime), because an unrelated close on the same inode releases
+this process's SQLite/POSIX locks. This exclusion applies to the selected
+archive inode: byte-identical copies accepted as bases have separate locks.
+Concurrent seal and commit of the same overlay using different copies remains
+unsupported and can invalidate the seal; serialize those operations.
+
+Split archives have no single-inode acquisition snapshot and cannot authorize
+a seal; join the parts into one archive first. Custom `OpenBase` implementations
+must report an acquisition snapshot in `Opened::source_metadata` to seal a local
+archive.
+
 Before chmod, the same transaction records per-path hashes in `seal_rows`,
 `sealed_at`, `layer_digest`, and each materialized entry's permission bits in
 `overlay_metadata.mode` where no override exists. Thus lookup and directory

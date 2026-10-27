@@ -313,6 +313,7 @@ fn regression_remote_base_without_scheme_creates_without_digest_lookup() {
             sidecar_candidate: None,
             read_only_index: false,
             fetched: false,
+            source_metadata: None,
             keep_alive: Box::new(()),
         })
         .unwrap();
@@ -895,6 +896,7 @@ fn regression_repo_stable_over_main_updates_base_url() {
             sidecar_candidate: None,
             read_only_index: false,
             fetched: false,
+            source_metadata: None,
             keep_alive: Box::new(()),
         })
         .unwrap()
@@ -923,6 +925,7 @@ fn regression_repo_stable_over_main_updates_base_url() {
         sidecar_candidate: None,
         read_only_index: false,
         fetched: false,
+        source_metadata: None,
         keep_alive: Box::new(()),
     })
     .unwrap();
@@ -1661,6 +1664,7 @@ fn regression_accepted_archive_move_repoints_base_index_path() {
                 sidecar_candidate: None,
                 read_only_index: false,
                 fetched: false,
+                source_metadata: fs::metadata(archive).ok(),
                 keep_alive: Box::new(()),
             })
             .unwrap()
@@ -6334,6 +6338,7 @@ impl PreparedIdentityFixture {
             sidecar_candidate: Some(self.index.clone()),
             read_only_index: strict,
             fetched: false,
+            source_metadata: fs::metadata(&self.archive).ok(),
             keep_alive: Box::new(()),
         })
         .unwrap()

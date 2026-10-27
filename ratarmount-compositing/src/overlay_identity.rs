@@ -73,6 +73,11 @@ pub struct Opened {
     pub read_only_index: bool,
     /// The first source was fetched to a temporary local copy.
     pub fetched: bool,
+    /// Local archive stamp captured from the acquisition descriptor before
+    /// reading, under the archive commit lock. The opener must exclude commits
+    /// throughout source/index construction and validate the pathname against
+    /// that descriptor while locked. `None` cannot authorize an archive seal.
+    pub source_metadata: Option<std::fs::Metadata>,
     /// Keeps fetched temporary files alive for as long as the token lives.
     pub keep_alive: Box<dyn Any + Send + Sync>,
 }
@@ -338,6 +343,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -367,6 +373,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -396,6 +403,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -425,6 +433,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -455,6 +464,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -494,6 +504,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -526,6 +537,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -555,6 +567,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -584,6 +597,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -613,6 +627,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -642,6 +657,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -672,6 +688,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -705,6 +722,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -733,6 +751,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -774,6 +793,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -802,6 +822,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -832,6 +853,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -859,6 +881,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -890,6 +913,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -917,6 +941,7 @@ impl Inner {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -943,6 +968,14 @@ fn canonical_or_same(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+#[cfg(test)]
+fn fixture_metadata(location: &Option<ServedLocation>) -> Option<std::fs::Metadata> {
+    match location {
+        Some(ServedLocation::Local(path)) => std::fs::metadata(path).ok(),
+        _ => None,
+    }
+}
+
 impl ClassifiedBase {
     /// Open through `opener` and classify what it reports.
     pub fn open(opener: &mut dyn OpenBase) -> std::result::Result<Self, String> {
@@ -961,6 +994,7 @@ impl ClassifiedBase {
             sidecar_candidate,
             read_only_index,
             fetched: _,
+            source_metadata,
             keep_alive,
         } = opened;
         let raw_first = inputs.first().map(String::as_str).unwrap_or("");
@@ -1021,10 +1055,14 @@ impl ClassifiedBase {
             (BaseKind::Archive, Some(BaseLocation::Local(path))) => Some(path.clone()),
             _ => None,
         };
-        let source_metadata = local_archive
-            .as_deref()
-            .and_then(|path| std::fs::metadata(path).ok());
-        let file_id = source_metadata.as_ref().and_then(FileId::from_metadata);
+        // Source provenance comes from acquisition, never a later path stat:
+        // a commit may replace the archive between open_base and mint. A
+        // pathname identity is still useful for identity-only commit tokens,
+        // whose UnopenedSource deliberately supplies no source snapshot.
+        let file_id = source_metadata
+            .as_ref()
+            .and_then(FileId::from_metadata)
+            .or_else(|| local_archive.as_deref().and_then(FileId::of));
         let typed_named = local_archive
             .as_ref()
             .filter(|_| !raw_first.contains("://"))
@@ -1096,6 +1134,7 @@ impl ClassifiedBase {
         kind: ServedKind,
         location: Option<ServedLocation>,
     ) -> Self {
+        let source_metadata = fixture_metadata(&location);
         Self::mint(Opened {
             source,
             kind,
@@ -1105,6 +1144,7 @@ impl ClassifiedBase {
             sidecar_candidate: None,
             read_only_index: false,
             fetched: false,
+            source_metadata,
             keep_alive: Box::new(()),
         })
         .expect("test token")
@@ -1119,6 +1159,7 @@ impl ClassifiedBase {
         location: Option<ServedLocation>,
         typed: &Path,
     ) -> Self {
+        let source_metadata = fixture_metadata(&location);
         Self::mint(Opened {
             source,
             kind,
@@ -1128,6 +1169,7 @@ impl ClassifiedBase {
             sidecar_candidate: None,
             read_only_index: false,
             fetched: false,
+            source_metadata,
             keep_alive: Box::new(()),
         })
         .expect("test token")
@@ -1157,6 +1199,7 @@ impl ClassifiedBase {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -1191,6 +1234,7 @@ impl ClassifiedBase {
 /// #             sidecar_candidate: None,
 /// #             read_only_index: false,
 /// #             fetched: false,
+/// #             source_metadata: None,
 /// #             keep_alive: Box::new(()),
 /// #         })
 /// #     }
@@ -1276,6 +1320,7 @@ mod tests {
             sidecar_candidate: None,
             read_only_index: false,
             fetched: false,
+            source_metadata: None,
             keep_alive: Box::new(()),
         }
     }
@@ -1505,6 +1550,19 @@ mod tests {
         }
     }
 
+    /// Regression: #238 a pathname stat at mint cannot supply missing source
+    /// provenance, even if that pathname still names an existing archive.
+    #[test]
+    fn regression_238_v3_missing_acquisition_snapshot_is_not_invented() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        std::fs::write(&archive, b"archive bytes").unwrap();
+        let mut report = opened(dir.path(), ServedKind::Archive, &[]);
+        report.location = Some(ServedLocation::Local(archive.clone()));
+        let token = ClassifiedBase::mint(report).unwrap();
+        assert!(!token.source_matches_archive(&std::fs::metadata(archive).unwrap()));
+    }
+
     /// Regression: every `repointed` hop kept its predecessor alive, so
     /// interval commits grew a chain and dropping it recursed once per commit.
     #[test]
@@ -1529,6 +1587,7 @@ mod tests {
             sidecar_candidate: None,
             read_only_index: false,
             fetched: false,
+            source_metadata: None,
             keep_alive: Box::new(Sentinel(drops.clone())),
         })
         .unwrap();

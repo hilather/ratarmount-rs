@@ -221,6 +221,9 @@ disk speeds. Full methodology, CSV and caveats:
 
 ## Known limits
 
+Sealing an overlay over a split local archive is refused because it lacks a
+single-inode acquisition snapshot. Join the parts into one archive first.
+
 The complete status against the Python original is in the
 [parity checklist](parity-todo.md). The practical limits by area:
 

@@ -2180,14 +2180,23 @@ fn open_split_set(
     Ok(Arc::new(KeepAliveMount { inner, _tmp: tmp }))
 }
 
-pub(crate) struct KeepAliveMount {
+pub(crate) struct KeepAliveMount<T = tempfile::NamedTempFile> {
     pub(crate) inner: Arc<dyn MountSource>,
-    pub(crate) _tmp: tempfile::NamedTempFile,
+    // Declaration order matters: the source (including SQLAR connections)
+    // drops before its temporary file or retained acquisition descriptors.
+    pub(crate) _tmp: T,
 }
 
-impl MountSource for KeepAliveMount {
+impl<T: Send + Sync> MountSource for KeepAliveMount<T> {
     fn list(&self, path: &str) -> Option<ratarmount_core::ListResult> {
         self.inner.list(path)
+    }
+    fn list_with(
+        &self,
+        path: &str,
+        need: ratarmount_core::ListNeed,
+    ) -> Option<ratarmount_core::ListResult> {
+        self.inner.list_with(path, need)
     }
     fn list_mode(&self, path: &str) -> Option<ratarmount_core::ListModeResult> {
         self.inner.list_mode(path)
@@ -2216,6 +2225,33 @@ impl MountSource for KeepAliveMount {
     ) -> std::io::Result<Vec<u8>> {
         self.inner.read(file_info, size, offset)
     }
+    fn supports_backing_extents(&self) -> bool {
+        self.inner.supports_backing_extents()
+    }
+    fn backing_extent(
+        &self,
+        file_info: &ratarmount_core::FileInfo,
+    ) -> Option<ratarmount_core::BackingExtent> {
+        self.inner.backing_extent(file_info)
+    }
+    fn member_seek_is_cheap(&self, file_info: &ratarmount_core::FileInfo) -> bool {
+        self.inner.member_seek_is_cheap(file_info)
+    }
+    fn content_generation(&self) -> u64 {
+        self.inner.content_generation()
+    }
+    fn versions(&self, path: &str) -> u32 {
+        self.inner.versions(path)
+    }
+    fn statfs(&self) -> ratarmount_core::StatFs {
+        self.inner.statfs()
+    }
+    fn list_xattr(&self, file_info: &ratarmount_core::FileInfo) -> Vec<String> {
+        self.inner.list_xattr(file_info)
+    }
+    fn get_xattr(&self, file_info: &ratarmount_core::FileInfo, key: &str) -> Option<Vec<u8>> {
+        self.inner.get_xattr(file_info, key)
+    }
     fn is_immutable(&self) -> bool {
         self.inner.is_immutable()
     }
@@ -2224,6 +2260,11 @@ impl MountSource for KeepAliveMount {
     }
     fn is_dir(&self, path: &str) -> bool {
         self.inner.is_dir(path)
+    }
+    fn close(&mut self) {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.close();
+        }
     }
 }
 
@@ -2289,6 +2330,9 @@ pub(crate) struct PathOpened {
     pub location: PathBuf,
     pub index: IndexUsed,
     pub actual_artifact: Option<PathBuf>,
+    /// Acquisition descriptor's stamp, captured before reading under the
+    /// archive lock. Split sets have no single-inode snapshot.
+    pub source_metadata: Option<std::fs::Metadata>,
 }
 
 impl PathOpened {
@@ -2299,6 +2343,7 @@ impl PathOpened {
             location: location.to_path_buf(),
             index,
             actual_artifact: None,
+            source_metadata: None,
         }
     }
 }
@@ -2376,6 +2421,7 @@ fn open_path_impl(
                 location: git_path.to_path_buf(),
                 index: IndexUsed::none(),
                 actual_artifact: None,
+                source_metadata: None,
             });
         }
     }
@@ -2405,6 +2451,7 @@ fn open_path_impl(
                 location: path.to_path_buf(),
                 index: IndexUsed::none(),
                 actual_artifact: None,
+                source_metadata: None,
             })
             .map_err(|e| e.to_string());
     }
@@ -2420,6 +2467,13 @@ fn open_path_impl(
         }
     }
 
+    // Recovery above may itself need the archive lock. Acquire only after it
+    // finishes, then exclude commits throughout detection and index building.
+    // Every backend opens the pathname while this descriptor's inode is
+    // locked; validate the pathname again before releasing that lock.
+    let mut acquisition =
+        ratarmount_compress::commit_journal::guard_source_open(path).map_err(|e| e.to_string())?;
+    let source_metadata = acquisition.metadata().clone();
     let compression = detect_compression(path).map_err(|e| e.to_string())?;
     // Ordinary callers retain historical candidate resolution. Strict callers
     // resolve lazily only after a matched backend requires a shared artifact.
@@ -2602,6 +2656,19 @@ fn open_path_impl(
     } else {
         None
     };
+    if !ratarmount_compress::commit_journal::same_stamp(
+        &source_metadata,
+        &std::fs::metadata(path).map_err(|e| e.to_string())?,
+    ) {
+        return Err("archive changed while opening its base view; reopen it and retry".into());
+    }
+    acquisition.release_lock().map_err(|e| e.to_string())?;
+    // Unlock without closing either acquisition fd: closing a raw fd could
+    // release POSIX locks held by an SQLAR/SQLite source just opened above.
+    let source = Arc::new(KeepAliveMount {
+        inner: source,
+        _tmp: acquisition,
+    });
     let mut opened = PathOpened::archive(
         source,
         path,
@@ -2612,6 +2679,7 @@ fn open_path_impl(
         },
     );
     opened.actual_artifact = actual_artifact;
+    opened.source_metadata = Some(source_metadata);
     Ok(opened)
 }
 
@@ -4577,6 +4645,8 @@ pub struct Served {
     pub sidecar_candidate: Option<PathBuf>,
     /// The first source was fetched to a temporary local copy.
     pub fetched: bool,
+    /// Stamp supplied by local archive acquisition, never a later path stat.
+    pub source_metadata: Option<std::fs::Metadata>,
 }
 
 /// What the factory would serve for `path`, answered without opening it: no
@@ -4605,6 +4675,7 @@ pub fn served_without_indexing(path: &Path, index_folders: &[PathBuf]) -> Result
                 index: IndexProvenance::None,
                 sidecar_candidate: None,
                 fetched: false,
+                source_metadata: None,
             });
         }
         if ratarmount_remote::remote_url_scheme(&typed).as_deref() != Some("file") {
@@ -4643,6 +4714,7 @@ pub fn served_without_indexing(path: &Path, index_folders: &[PathBuf]) -> Result
         index: IndexProvenance::None,
         sidecar_candidate,
         fetched: false,
+        source_metadata: None,
     })
 }
 
@@ -5396,6 +5468,7 @@ pub fn build_mount_source_with_bindings(
             index: IndexProvenance::None,
             sidecar_candidate: None,
             fetched: false,
+            source_metadata: None,
         })
     } else {
         None
@@ -5451,6 +5524,7 @@ pub fn build_mount_source_with_bindings(
                     index: IndexProvenance::None,
                     sidecar_candidate: None,
                     fetched: false,
+                    source_metadata: None,
                 });
             }
             let src = apply_compositing(
@@ -5504,6 +5578,7 @@ pub fn build_mount_source_with_bindings(
                 index: index_provenance(&opened.index),
                 sidecar_candidate: opened.index.sidecar_candidate.clone(),
                 fetched: false,
+                source_metadata: opened.source_metadata,
             };
             let src = opened.source;
             if plain_tar
@@ -5587,6 +5662,7 @@ fn served_from_remote(input: &str, opened: &remote_open::RemoteOpened) -> Served
         index: index_provenance(&opened.index),
         sidecar_candidate: opened.index.sidecar_candidate.clone(),
         fetched: opened.fetched,
+        source_metadata: opened.source_metadata.clone(),
     }
 }
 
