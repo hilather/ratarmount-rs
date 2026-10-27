@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixes
+
+- `--commit-overlay` on a sealed overlay is refused before the archive is touched, with the same message as `-w` (exit 1, also under `--force-base-mismatch`); it used to rewrite the archive, fail on the read-only database and break the seal (#234).
+
 ## 0.1.36
 
 ### Changes

@@ -7217,7 +7217,20 @@ pub fn commit_overlay(
             )))
         }
         DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
-        DbEntry::Present { .. } => {}
+        DbEntry::Present { marked, .. } => {
+            // A sealed layer is immutable (#234): refuse before the base gate,
+            // any journal recovery or the splice touches the archive, with the
+            // `-w` refusal's text. `--force-base-mismatch` does not waive it.
+            if crate::OverlayMeta::read_no_recovery_required_followed(write_overlay, marked)?
+                .as_ref()
+                .is_some_and(crate::OverlayMeta::layer_sealed)
+            {
+                return Err(OverlayError::Msg(format!(
+                    "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
+                    write_overlay.display()
+                )));
+            }
+        }
     }
     if let Err(refusal) =
         crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
