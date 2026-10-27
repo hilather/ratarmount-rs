@@ -40,20 +40,32 @@ plus every later statement that configures a bound builder. An
 literal `false` is a create (it needs a mode policy). A test-only match arm
 ends at its block or block-like body (`unsafe`, `loop`, `match`, `if`/`else`).
 The helper walk follows same-crate free-function calls transitively, through
-`use .. as` renames of a function or a module, `crate::`/`super::`/`self::`
+`use .. as` renames of a function or a module, including a chain
+(`use crate::util as u; use u::load as read_index`), `crate::`/`super::`/`self::`
 paths (any same-crate definition) and calls of the caller's own name in
-another module. Generic argument lists (`::<..>`) are matched balanced; an
-unbalanced one is reported. Descriptor duplication and ownership conversion
+another module. Main's helper resolver runs unchanged; a separate alias-chain
+pass adds reports, and their union preserves every report from main. In the
+extra pass, only the first segment of a relative path expands through aliases;
+rooted paths keep their roots. Cycles, unknown targets, and ambiguous or
+unsupported scoped bindings fail closed. Every production `pub use` (including
+restricted visibility) must be reviewed in
+`packaging/internal-read-reexport-allowlist.json`; a tokenized use-tree and its
+repo-relative file identify each entry. Cfg exclusion uses comment-stripped
+tokens, retaining literal values. Any `use` inside a macro invocation payload
+or macro_rules body requires the same allowlist review, regardless of visibility;
+the gate does not expand macros. Missing, stale and duplicate entries fail
+closed, even when the extra pass could resolve the re-export.
+Generic argument lists (`::<..>`) are matched balanced; an unbalanced one is
+reported. Descriptor duplication and ownership conversion
 (`try_clone_to_owned`, `dup`/`dup2`/`dup3`, `F_DUPFD[_CLOEXEC]`, `File::from`)
 are operations.
 Pathname opens inside foreign libraries (libgit2 `Repository::open`,
 libarchive `archive_read_open_filename`, lopdf `Document::load`) are
 operations of their own.
 
-Known limits: a renamed crate root (`use std as s`), a glob import of a local
-module that re-exports an fs function, a `pub use .. as` re-export called
-through its new path, openers of other crates (`nix`) and foreign openers not
-listed above, method and cross-crate calls in the helper walk.
+Known limits: a renamed crate root (`use std as s`), helper paths through
+allowlisted re-exports, openers of other crates (`nix`) and
+foreign openers not listed above, method and cross-crate calls in the helper walk.
 
 Usage:
   test-internal-read-inventory.py            check the workspace (exit 0/1)
@@ -85,6 +97,7 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST = os.path.join(ROOT, "packaging", "internal-read-inventory.json")
+REEXPORT_ALLOWLIST = "packaging/internal-read-reexport-allowlist.json"
 
 DISPOSITIONS = (
     "managed-read",
@@ -1064,6 +1077,7 @@ def check(root, manifest):
     """Return a list of error strings (empty: clean)."""
     errors = []
     ops, texts, fns = scan(root, errors)
+    errors.extend(reexport_errors(root))
     entries = manifest.get("entries", [])
     by_key = {}
     for e in entries:
@@ -1084,7 +1098,7 @@ def check(root, manifest):
     for k, e in by_key.items():
         if k not in scanned:
             errors.append("stale manifest entry (operation is gone): %s %s %s#%d" % k)
-    errors.extend(helper_errors(entries, scanned, texts, fns))
+    errors.extend(union_helper_errors(entries, scanned, texts, fns))
     return errors
 
 
@@ -1291,6 +1305,657 @@ def helper_errors(entries, scanned, texts, fns):
     return sorted(set(errs))
 
 
+# Separate #198 pass. Main resolution above is intentionally kept verbatim.
+
+
+def chain_use_leaves(text, preserve_roots=False):
+    """Every `use` declaration flattened to (path segments, local name) with
+    its offset; `*` leaves have local name `*`. Helper resolution preserves
+    initial `self` and an empty segment for leading `::` when requested."""
+    out = []
+    for m in re.finditer(r"(?<![\w:])use\s+([^;]*);", text):
+        toks = re.findall(r"::|[A-Za-z_]\w*|[{},*]", m.group(1))
+        pos = [0]
+
+        def peek():
+            return toks[pos[0]] if pos[0] < len(toks) else None
+
+        def take():
+            pos[0] += 1
+            return toks[pos[0] - 1]
+
+        def tree(prefix):
+            path = list(prefix)
+            while True:
+                t = peek()
+                if t is None:
+                    return
+                if t == "::":
+                    take()
+                    if preserve_roots and not path:
+                        path = [""]
+                    continue
+                if t == "{":
+                    take()
+                    while peek() not in ("}", None):
+                        tree(path)
+                        if peek() == ",":
+                            take()
+                    if peek() == "}":
+                        take()
+                    return
+                if t == "*":
+                    take()
+                    out.append((path, "*", m.start()))
+                    return
+                if t in (",", "}"):
+                    return
+                take()
+                if t == "self" and (path or not preserve_roots):
+                    seg_path = path
+                else:
+                    seg_path = path + [t]
+                if peek() == "::":
+                    path = seg_path
+                    continue
+                alias = seg_path[-1] if seg_path else t
+                if peek() == "as":
+                    take()
+                    alias = take() if peek() not in (None, ",", "}") else alias
+                out.append((seg_path, alias, m.start()))
+                return
+
+        while peek() is not None:
+            tree([])
+            if peek() == ",":
+                take()
+            elif peek() is not None:
+                take()
+    return out
+
+
+PATH_ROOTS = ("", "crate", "self", "super")
+
+
+class ChainBindings(dict):
+    """Extra-pass aliases only. Never change main's resolver or its reports.
+
+    The chain pass cannot model Rust lexical visibility. Refuse
+    an attempted expansion if its binding is ambiguous or outside file scope;
+    keep test-only bindings as ambiguity evidence, rather than letting them
+    redirect a production call. Failures are collected even for excused reads.
+    """
+
+    def __init__(self, text, crate, free):
+        super().__init__()
+        self.bad = []
+        leaves = chain_use_leaves(text, preserve_roots=True)
+        declarations = [(m.group(1), m.start()) for m in
+                        re.finditer(r"\bmod\s+([A-Za-z_]\w*)\s*[;{]", text)]
+        self.known = {stem(rel) for (c, _), defs in free.items() if c == crate
+                      for rel, _, _ in defs}
+        self.known.update(name for c, name in free if c == crate)
+        self.known.update(name for name, _ in declarations)
+        # A scope is its stack of opening braces; import-tree braces are
+        # harmless because the `use` offset precedes them.
+        positions = sorted({at for _, _, at in leaves} | {at for _, at in declarations}, reverse=True)
+        scopes, stack = {}, []
+        for m in re.finditer(r"[{}]", text):
+            while positions and positions[-1] < m.start():
+                scopes[positions.pop()] = tuple(stack)
+            if m.group() == "{":
+                stack.append(m.start())
+            elif stack:
+                stack.pop()
+        for at in positions:
+            scopes[at] = tuple(stack)
+        # Cfg-distinct imports may share braces. A test-only item is still a
+        # separate binding context, and no binding may silently win by order.
+        test_ranges, _ = test_spans(text, text)
+        for at in scopes:
+            if any(a <= at <= b for a, b in test_ranges):
+                scopes[at] += ("test-only",)
+        self.scopes = {}
+        self.targets = {}
+        for name, at in declarations + [(alias, at) for _, alias, at in leaves if alias != "*"]:
+            self.scopes.setdefault(name, set()).add(scopes[at])
+        for path, alias, _ in leaves:
+            self.targets.setdefault(alias, set()).add(tuple(path))
+            if path and alias not in ("*", "_", path[-1]):
+                self[alias] = path
+
+    def refuse(self, name, reason):
+        self.bad.append((name, reason))
+        return None
+
+    def resolve(self, path):
+        seen = set()
+        while path and path[0] not in PATH_ROOTS and path[0] in self:
+            name = path[0]
+            scopes = self.scopes[name]
+            if len(scopes) > 1:
+                return self.refuse(name, "alias name is bound in more than one scope")
+            if len(self.targets[name]) > 1:
+                return self.refuse(name, "alias name has more than one target")
+            if next(iter(scopes)):
+                return self.refuse(name, "scoped alias visibility cannot be resolved")
+            if name in seen:
+                return self.refuse(name, "cycle")
+            seen.add(name)
+            target = self[name]
+            # Validate the alias target before adding a call/import suffix:
+            # u -> missing must fail for u::load as well as for `use u as v`.
+            if len(target) == 1 and target[0] not in PATH_ROOTS and target[0] not in self and target[0] not in self.known:
+                return self.refuse(name, "unknown target `%s`" % target[0])
+            path = target + path[1:]
+        return path
+
+
+def chain_renamed_imports(text, crate, free):
+    """Resolve relative first-segment alias chains in a separate extra pass."""
+    bindings = ChainBindings(text, crate, free)
+    fns = {}
+    for original, alias, at in chain_use_leaves(text, preserve_roots=True):
+        if not original or alias in ("*", "_", original[-1]):
+            continue
+        path = bindings.resolve(original)
+        if path and (crate, path[-1]) in free:
+            hint = path[-2] if len(path) >= 2 and path[-2] not in PATH_ROOTS else None
+            fns[alias] = (path[-1], hint)
+    return fns, bindings, bindings.bad
+
+
+def chain_resolves(rel, text, prefix, callee, target, hint=None, mods=None, owners=()):
+    """Whether a call `prefix callee(` in `rel` may name `callee` in `target`:
+    the same file for a bare call (or a file whose module the caller imports
+    the name from, through an alias chain: `use u::load` where `u` is
+    `util`), the named module for a qualified call (through a renamed
+    module import too, `use u as v; v::load`); `hint` is the module a
+    renamed function import names, after that chain is resolved.
+    `owners` are the inline modules (`mod util { .. }`) around the definition:
+    each is a module name of it as well as the file's (R11-S7-FIX14)."""
+    names = {stem(target)} | set(owners)
+    mods = mods if mods is not None else ChainBindings(text, "", {})
+    segs = mods.resolve(prefix.split("::")[:-1] if prefix else [])
+    if segs is None:
+        return False  # aliases_of reports the unresolved chain.
+    if segs and segs[-1] not in PATH_ROOTS:
+        return segs[-1] in names
+    if segs:
+        # `crate::helper(p)`, `super::helper(p)`, `self::helper(p)`: no module
+        # is named, so any same-crate definition (over-reporting is safe).
+        return True
+    if hint is not None:
+        return hint == "" or hint in names
+    if target == rel:
+        return True
+    # Any import form: `use crate::m::leaf;`, nested braces
+    # (`use crate::{m::leaf, ..}`), or a glob of the module (`use crate::m::*;`),
+    # including one whose module is itself an alias (`use u::load;`, `use u::*;`).
+    for original, alias, at in chain_use_leaves(text, preserve_roots=True):
+        path = mods.resolve(original)
+        if not path:
+            continue
+        if alias == "*":
+            if path[-1] in names or (path != original and path[-1] in PATH_ROOTS):
+                return True
+        elif len(path) >= 2 and path[-1] == callee:
+            if path[-2] in names or (path != original and path[-2] in PATH_ROOTS):
+                return True
+    return False
+
+
+def chain_helper_errors(entries, scanned, texts, fns):
+    """Walk the extra #198 call graph independently of main's helper pass.
+
+    Keep the same managed roots, helper exemptions and report format; add
+    chain resolution and explicit refusals for unsupported alias paths.
+    """
+    errs = []
+    by_key = {key(e): e for e in entries}
+    managed_fns = {}
+    for e in entries:
+        if e.get("disposition") in ("managed-read", "sqlite-snapshot"):
+            managed_fns.setdefault(e["file"], set()).add(e["function"])
+    raw_by_fn = {}
+    for o in scanned.values():
+        if o["op"] in MANAGED_OPS:
+            continue
+        if "::" not in o["function"]:
+            raw_by_fn.setdefault((crate_of(o["file"]), o["function"]), []).append(o)
+    # Free functions by (crate, name): [(file, start, end)].
+    free, owners = {}, {}
+    for rel, lst in fns.items():
+        inl = inline_mods(texts[rel]) if rel in texts else []
+        for a, b, qual in lst:
+            if "::" not in qual:
+                free.setdefault((crate_of(rel), qual), []).append((rel, a, b))
+                owners[(rel, a)] = tuple(n for n, o, c in inl if o < a < c)
+
+    renames = {}
+    def aliases_of(rel):
+        if rel not in renames:
+            fn_alias, mod_alias, _ = chain_renamed_imports(texts[rel], crate_of(rel), free)
+            renames[rel] = (fn_alias, mod_alias)
+        return renames[rel]
+
+    def callees(rel, a, b):
+        text = texts[rel]
+        body = text[a:b]
+        fn_alias, mod_alias = aliases_of(rel)
+        out = []
+        for m in CALL_RE.finditer(body):
+            prefix, callee = m.group(1), m.group(2)
+            hint = None
+            if not prefix and callee in fn_alias:
+                # `use crate::m::read_index as legacy_read; legacy_read(p)`.
+                # A `crate::`/`self::`/`super::` path names no module: any
+                # same-crate definition (over-reporting is safe).
+                if mod_alias.resolve([callee]) is None:
+                    continue
+                callee, hint = fn_alias[callee]
+                hint = hint or ""
+            if text[max(0, a + m.start() - 3):a + m.start()].endswith("fn "):
+                continue
+            if prefix:
+                path = mod_alias.resolve(prefix.split("::")[:-1] + [callee])
+                if path is None:
+                    continue
+            for target, ta, tb in free.get((crate_of(rel), callee), []):
+                # A call of the same name is followed unless it is the caller
+                # itself (`other::read_index(p)` from `read_index`).
+                if (target, ta) == (rel, a):
+                    continue
+                if chain_resolves(rel, text, prefix, callee, target, hint, mod_alias, owners[(target, ta)]):
+                    out.append((callee, target, ta, tb))
+        return out
+
+    for rel, names in managed_fns.items():
+        text = texts.get(rel)
+        if text is None:
+            continue
+        for a, b, qual in fns.get(rel, []):
+            if qual not in names:
+                continue
+            # Breadth-first over the call graph; `via` is the direct caller.
+            queue = [(qual, callee, target, ta, tb) for callee, target, ta, tb in callees(rel, a, b)]
+            visited = set()
+            while queue:
+                via, callee, target, ta, tb = queue.pop(0)
+                # A definition is its file and offset: two `bridge`s in one
+                # file (`first::bridge`, `second::bridge`) are both walked
+                # (R11-S7-FIX15).
+                if (target, ta) in visited:
+                    continue
+                visited.add((target, ta))
+                for o in raw_by_fn.get((crate_of(rel), callee), []):
+                    if o["file"] != target:
+                        continue
+                    ent = by_key.get(key(o))
+                    if ent is None or ent.get("disposition") in ("managed-read", "sqlite-snapshot", "output-owner"):
+                        continue
+                    excused = ent.get("non_mandatory_callers") or []
+                    if qual in excused or via in excused:
+                        continue
+                    if ent.get("category") == "directory-handle-or-durability":
+                        continue  # a directory handle reads no file content
+                    chain = "" if via == qual else " via %s" % via
+                    errs.append("managed function %s (%s) reaches helper %s%s with a non-managed read (%s %s#%d)"
+                                % (qual, rel, callee, chain, o["file"], o["op"], o["ordinal"]))
+                for nxt in callees(target, ta, tb):
+                    queue.append((callee,) + nxt)
+    for rel, (_, bindings) in renames.items():
+        for alias, reason in bindings.bad:
+            errs.append("unresolved use-alias chain (fail closed): %s `%s`: %s" % (rel, alias, reason))
+    return sorted(set(errs))
+
+
+def union_helper_errors(entries, scanned, texts, fns):
+    """Union main's unchanged helper walk with the independent chain pass."""
+    return sorted(set(helper_errors(entries, scanned, texts, fns)) |
+                  set(chain_helper_errors(entries, scanned, texts, fns)))
+
+
+def rust_tokens(src, literals=False):
+    """Rust tokens and offsets, omitting comments and complete literals.
+
+    Re-export detection uses tokens from the original source, independently of
+    the helper resolvers. Nested comments, escaped strings, byte/C strings,
+    raw strings (any hash count), chars and raw identifiers cannot introduce
+    fake `pub use` tokens. Lifetimes retain their identifier tokens. The cfg
+    gate can retain each literal as one opaque token, never its contents.
+    """
+    raw_re = re.compile(r'(?:br|cr|r)(#*)"')
+    quoted_re = re.compile(r'(?:b|c)?"')
+    char_re = re.compile(r"b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'")
+    token_re = re.compile(r"r#\w+|[^\W\d]\w*|::|[^\s]")
+    i, n = 0, len(src)
+    while i < n:
+        if src[i].isspace():
+            i += 1
+            continue
+        if src.startswith("//", i):
+            end = src.find("\n", i + 2)
+            i = n if end < 0 else end
+            continue
+        if src.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if src.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif src.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            continue
+        raw = raw_re.match(src, i)
+        if raw:
+            close = '"' + raw.group(1)
+            end = src.find(close, raw.end())
+            stop = n if end < 0 else end + len(close)
+            if literals:
+                yield src[i:stop], i
+            i = stop
+            continue
+        quoted = quoted_re.match(src, i)
+        if quoted:
+            start = i
+            i = quoted.end()
+            while i < n:
+                if src[i] == "\\":
+                    i += 2
+                elif src[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+            if literals:
+                yield src[start:i], start
+            continue
+        char = char_re.match(src, i)
+        if char:
+            if literals:
+                yield char.group(), i
+            i = char.end()
+            continue
+        token = token_re.match(src, i)
+        yield token.group(), i
+        i = token.end()
+
+
+def macro_payload_indices(tokens):
+    """Indices inside invocation/definition payloads, before parsing visibility.
+
+    Macro tokens are arbitrary syntax: even a private `use` may expand to a
+    public import. Include macro_rules bodies and all nested delimiter kinds.
+    """
+    closes, stack = {}, []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for i, (token, _) in enumerate(tokens):
+        if token in pairs:
+            stack.append(i)
+        elif stack and token == pairs[tokens[stack[-1]][0]]:
+            closes[stack.pop()] = i
+    payload = set()
+    for i, (token, _) in enumerate(tokens):
+        if token != "!" or not i or not re.fullmatch(r"(?:r#)?[^\W\d]\w*", tokens[i - 1][0]):
+            continue
+        j = i + 1
+        if tokens[i - 1][0] == "macro_rules":
+            j += 1  # macro_rules! name { ... }
+        if j in closes:
+            payload.update(range(j + 1, closes[j]))
+    return payload
+
+
+def macro_use_trees(tokens, payload):
+    """Review every `use` in opaque macro payloads, without visibility parsing."""
+    out = []
+    for i in sorted(payload):
+        if tokens[i][0] != "use":
+            continue
+        tree, j = [], i + 1
+        while j in payload and tokens[j][0] != ";":
+            tree.append(tokens[j][0])
+            j += 1
+        out.append((" ".join(tree), tokens[i][1]))
+    return out
+
+
+def public_use_trees(src, tokens=None, payload=None):
+    """(normalized use-tree, pub offset) for every visibility-qualified use.
+
+    Consume visibility forwards, including balanced multiline `pub(in ..)`;
+    never infer visibility from text before a use or its imported names.
+    """
+    tokens = list(rust_tokens(src)) if tokens is None else tokens
+    payload = macro_payload_indices(tokens) if payload is None else payload
+    out = []
+    i = 0
+    while i < len(tokens):
+        token, at = tokens[i]
+        i += 1
+        if token != "pub" or i - 1 in payload:
+            continue
+        if i < len(tokens) and tokens[i][0] == "(":
+            depth = 1
+            i += 1
+            while i < len(tokens) and depth:
+                if tokens[i][0] == "(":
+                    depth += 1
+                elif tokens[i][0] == ")":
+                    depth -= 1
+                i += 1
+        if i >= len(tokens) or tokens[i][0] != "use":
+            continue
+        i += 1
+        tree = []
+        while i < len(tokens) and tokens[i][0] != ";":
+            tree.append(tokens[i][0])
+            i += 1
+        out.append((" ".join(tree), at))
+    return out
+
+
+def reexport_cfg_test_only(tokens):
+    """Conservative test-only cfg policy, evaluated solely on Rust tokens.
+
+    Comments have already gone and literals are opaque tokens. In particular,
+    a comment saying `test` cannot become an all()/any() predicate argument.
+    Unknown or unsupported predicates remain production source.
+    """
+    pos = 0
+
+    def take():
+        nonlocal pos
+        token = tokens[pos]
+        pos += 1
+        return token
+
+    def expr():
+        name = take()
+        if not re.fullmatch(r"[^\W\d]\w*", name):
+            raise ValueError("unsupported cfg atom")
+        if pos < len(tokens) and tokens[pos] == "(":
+            take()
+            args = []
+            while tokens[pos] != ")":
+                args.append(expr())
+                if tokens[pos] != ",":
+                    break
+                take()
+            if take() != ")" or name not in ("all", "any", "not"):
+                raise ValueError("unsupported cfg predicate")
+            if name == "all":
+                return any(args)
+            if name == "any":
+                return bool(args) and all(args)
+            return False
+        if pos < len(tokens) and tokens[pos] == "=":
+            take()
+            return take() == '"test-hooks"' and name == "feature"
+        return name == "test"
+
+    try:
+        result = expr()
+        return result and pos == len(tokens)
+    except (IndexError, ValueError):
+        return False
+
+
+def reexport_token_views(src, tokens, payload):
+    """Offset-preserving syntax and literal views made only from Rust tokens.
+
+    Decide cfg exclusion here. Normalize attributes to #[test] or #[] before
+    reusing main's span-boundary helper, so it never reinterprets raw cfg text.
+    Literal values are retained separately only for module #[path] extraction.
+    Attributes inside macro payloads are opaque and cannot exclude a use.
+    """
+    code = ["\n" if ch == "\n" else " " for ch in src]
+    literal_code = code.copy()
+    literal_tokens = list(rust_tokens(src, literals=True))
+    for token, at in literal_tokens:
+        literal_code[at:at + len(token)] = token
+    for token, at in tokens:
+        code[at:at + len(token)] = token
+    macro_offsets = {tokens[i][1] for i in payload}
+    i = 0
+    while i + 1 < len(literal_tokens):
+        token, at = literal_tokens[i]
+        if token != "#" or literal_tokens[i + 1][0] != "[":
+            i += 1
+            continue
+        j, depth = i + 2, 1
+        while j < len(literal_tokens) and depth:
+            if literal_tokens[j][0] == "[":
+                depth += 1
+            elif literal_tokens[j][0] == "]":
+                depth -= 1
+            j += 1
+        if depth:
+            break  # Unsupported syntax stays visible; it cannot exclude code.
+        body = [t for t, _ in literal_tokens[i + 2:j - 1]]
+        test_only = body in (["test"], ["tokio", "::", "test"])
+        if len(body) >= 3 and body[:2] == ["cfg", "("] and body[-1] == ")":
+            test_only = reexport_cfg_test_only(body[2:-1])
+        if at in macro_offsets:
+            test_only = False
+        end = literal_tokens[j - 1][1] + 1
+        for k in range(at, end):
+            if code[k] != "\n":
+                code[k] = " "
+        replacement = "#[test]" if test_only else "#[]"
+        code[at:at + len(replacement)] = replacement
+        i = j
+    # Span/module helpers accept conventional visibility spelling. Never
+    # interpret visibility inside an arbitrary macro token payload.
+    for i, (token, at) in enumerate(tokens):
+        if token != "pub" or i in payload:
+            continue
+        j, depth = i + 1, 0
+        if j < len(tokens) and tokens[j][0] == "(":
+            while j < len(tokens):
+                if tokens[j][0] == "(":
+                    depth += 1
+                elif tokens[j][0] == ")":
+                    depth -= 1
+                    if not depth:
+                        j += 1
+                        break
+                j += 1
+        for k in range(at, tokens[j][1] if j < len(tokens) else len(src)):
+            if code[k] != "\n":
+                code[k] = " "
+    return "".join(code), "".join(literal_code)
+
+
+def reexport_sources(root):
+    """Tokenized sources outside test-only modules, independent of scan().
+
+    Literal text cannot fabricate a cfg/module declaration that excludes a
+    production file. Evaluate cfg predicates on the comment-stripped tokens;
+    a file shared by production and test declarations remains production.
+    """
+    sources, decls = {}, {}
+    for rel in rust_files(root):
+        with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+        tokens = list(rust_tokens(src))
+        payload = macro_payload_indices(tokens)
+        text, literal_text = reexport_token_views(src, tokens, payload)
+        spans, _ = test_spans(text)
+        decls[rel] = mod_decls(text, literal_text)
+        sources[rel] = (src, tokens, spans)
+
+    def target(rel, name, chain):
+        if not isinstance(name, tuple):
+            return module_file(rel, name, root, chain)
+        directory = os.path.dirname(rel)
+        if chain and os.path.basename(rel) not in ("lib.rs", "main.rs", "mod.rs"):
+            directory = os.path.join(directory, os.path.basename(rel)[:-3])
+        return os.path.normpath(os.path.join(directory, *chain, name[1])).replace(os.sep, "/")
+
+    test_files = set()
+    while True:
+        production, test_targets = set(), set()
+        for rel, (_, _, spans) in sources.items():
+            for at, name, chain in decls[rel]:
+                targets = (test_targets if rel in test_files or any(a <= at <= b for a, b in spans)
+                           else production)
+                targets.add(target(rel, name, chain))
+        added = (test_targets - production) - test_files
+        if not added:
+            break
+        test_files.update(added)
+    return {rel: source for rel, source in sources.items() if rel not in test_files}
+
+
+def reexport_errors(root):
+    """Require review for every production public import and macro-payload use.
+
+    An allowlisted use is permitted without claiming the chain pass follows
+    its exported names. No visibility, owner or name-matching exemptions apply.
+    """
+    errors, present = [], {}
+    for rel, (src, tokens, spans) in reexport_sources(root).items():
+        payload = macro_payload_indices(tokens)
+        uses = public_use_trees(src, tokens, payload) + macro_use_trees(tokens, payload)
+        for tree, at in uses:
+            if not any(a <= at <= b for a, b in spans):
+                present[(rel, tree)] = src.count("\n", 0, at) + 1
+    try:
+        allowlist = load(os.path.join(root, REEXPORT_ALLOWLIST))
+    except FileNotFoundError:
+        allowlist = {"version": 1, "entries": []}
+    except (ValueError, OSError) as e:
+        return ["re-export allowlist (fail closed): cannot read %s: %s" % (REEXPORT_ALLOWLIST, e)]
+    if (not isinstance(allowlist, dict) or allowlist.get("version") != 1
+            or not isinstance(allowlist.get("entries"), list)):
+        return ["re-export allowlist (fail closed): expected version 1 and entries list"]
+    allowed = set()
+    for entry in allowlist["entries"]:
+        if (not isinstance(entry, dict) or not isinstance(entry.get("file"), str)
+                or not isinstance(entry.get("use"), str)):
+            errors.append("re-export allowlist (fail closed): entry needs file and use strings")
+            continue
+        tree = " ".join(t for t, _ in rust_tokens(entry["use"]))
+        ident = (entry["file"], tree)
+        if ident in allowed:
+            errors.append("re-export allowlist (fail closed): duplicate entry %s %s" % ident)
+        allowed.add(ident)
+        if not tree or tree != entry["use"]:
+            errors.append("re-export allowlist (fail closed): use-tree must be token whitespace normalized: %s %s" % ident)
+        if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
+            errors.append("re-export allowlist (fail closed): entry needs a reason: %s %s" % ident)
+        if ident not in present:
+            errors.append("re-export allowlist (fail closed): stale entry %s %s" % ident)
+    for (rel, tree), line in sorted(present.items()):
+        if (rel, tree) not in allowed:
+            errors.append("re-export allowlist (fail closed): unreviewed pub use or macro use: %s:%d use %s;"
+                          % (rel, line, tree))
+    return errors
+
+
 # --------------------------------------------------------------------------
 # Main.
 # --------------------------------------------------------------------------
@@ -1394,7 +2059,10 @@ def main(argv):
         for e in bad:
             print("inventory: not a baseline create: %s:%d %s %s#%d"
                   % (e["file"], e["line"], e["function"], e["op"], e["ordinal"]))
-        return 1 if bad else 0
+        errors = reexport_errors(ROOT)
+        for error in errors:
+            print("inventory: " + error)
+        return 1 if bad or errors else 0
     if argv[1:] == ["--write"]:
         print("wrote %d entries" % write(ROOT, MANIFEST))
         return 0
@@ -2204,17 +2872,711 @@ def regression_inventory_helper_walk_visits_same_named_helpers_by_definition():
     expect(check(root, m) == [], check(root, m))
 
 
+def regression_inventory_helper_walk_resolves_chained_use_aliases():
+    """Regression: (#198): a raw helper reached only through a chain of `use`
+    aliases (`use crate::util as u; use u::load as read_index`, call
+    `read_index(p)`) was not a callee, so the mandatory-helper check passed.
+    An alias cycle is reported instead of skipped."""
+    leaf = "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n"
+    body = "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; %s; }\n"
+    cases = (
+        ("mod util;\nuse crate::util as u;\nuse u::load as read_index;\n", "read_index(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse u::{load as read_index};\n", "read_index(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse u as v;\nuse v::load as read_index;\n", "read_index(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse u::load;\n", "load(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse u::*;\n", "load(p)", True),
+        ("mod util;\nuse crate::util as u;\nuse u as v;\n", "v::load(p)", True),
+        # A rooted path uses the actual module name, without alias expansion.
+        ("mod util;\nuse crate::util as u;\nuse self::util::load as read_index;\n", "read_index(p)", True),
+        ("mod util {\n    pub fn load(p: &Path) { let _ = std::fs::read(p); }\n}\n"
+         "use self::util as u;\nuse u::load as read_index;\n", "read_index(p)", False),
+        ("pub fn load(p: &Path) { let _ = std::fs::read(p); }\nuse self as s;\nuse s::load as read_index;\n",
+         "read_index(p)", False),
+        ("pub fn load(p: &Path) { let _ = std::fs::read(p); }\nuse self as s;\n", "s::load(p)", False),
+    )
+    for imp, call, separate in cases:
+        files = {"c/src/lib.rs": imp + body % call}
+        if separate:
+            files["c/src/util.rs"] = leaf
+        root = fake(files)
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF})
+        errs = check(root, m)
+        expect(any("reaches helper load" in e for e in errs), (imp, call, errs))
+        m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                            ("load", "fs::read"): dict(OOF, non_mandatory_callers=["hash"])})
+        expect(check(root, m) == [], (imp, call, check(root, m)))
+    # A chain that names another module is not this helper.
+    root = fake({"c/src/lib.rs": "mod util;\nmod other;\nuse crate::other as o;\nuse o::load as read_index;\n"
+                                 + body % "read_index(p)",
+                 "c/src/util.rs": leaf, "c/src/other.rs": "pub fn load(p: &Path) {}\n"})
+    m = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF})
+    expect(check(root, m) == [], check(root, m))
+    # A cycle never names a module. The previous scanner reported nothing.
+    root = fake({"c/src/lib.rs": "mod util;\nuse a as b;\nuse b as a;\n" + body % "b::load(p)",
+                 "c/src/util.rs": leaf})
+    errs = check(root, classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF}))
+    expect(any("unresolved use-alias chain" in e for e in errs), errs)
+
+
+def regression_inventory_helper_walk_rejects_unknown_alias_target():
+    """Regression: an ungrounded alias chain guessed a module name and
+    silently skipped the raw helper instead of refusing fail-closed."""
+    for imports in ("use missing as u;\nuse u::load as read_index;\n",
+                    "use missing as u;\nuse u as v;\nuse v::load as read_index;\n"):
+        root = fake({"c/src/lib.rs": (
+            "mod util;\n" + imports
+            + "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; read_index(p); }\n"),
+            "c/src/util.rs": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n"})
+        errs = check(root, classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                                           ("load", "fs::read"): OOF}))
+        expect(any("unresolved use-alias chain" in e and "unknown target `missing`" in e for e in errs), errs)
+
+
+def regression_inventory_helper_walk_rewrites_only_first_relative_segment():
+    """Regression: rooted calls or a later path segment were rewritten
+    through an unrelated local alias and selected a decoy module."""
+    text = "use crate::util as a;\n"
+    free = {("c", "load"): [("c/src/a.rs", 0, 1), ("c/src/util.rs", 0, 1)]}
+    _, mods, bad = chain_renamed_imports(text, "c", free)
+    expect(bad == [], bad)
+    for prefix in ("crate::a::", "super::a::", "self::a::", "::a::", "outer::a::"):
+        expect(chain_resolves("c/src/caller.rs", text, prefix, "load", "c/src/a.rs", mods=mods), prefix)
+        expect(not chain_resolves("c/src/caller.rs", text, prefix, "load", "c/src/util.rs", mods=mods), prefix)
+    for prefix in ("crate::a", "super::a", "self::a", "::a", "outer::a"):
+        for leaf, call in (("load as read_index", "read_index"), ("load", "load"), ("*", "load")):
+            imports = text + "use %s::%s;\n" % (prefix, leaf)
+            fns, mods, bad = chain_renamed_imports(imports, "c", free)
+            expect(bad == [], (imports, bad))
+            callee, hint = fns.get(call, (call, None))
+            expect(chain_resolves("c/src/caller.rs", imports, "", callee, "c/src/a.rs", hint, mods), imports)
+            expect(not chain_resolves("c/src/caller.rs", imports, "", callee, "c/src/util.rs", hint, mods), imports)
+
+
+def check_compiled_alias_fixture(modules, imports, call, raw_module, test_cfg=False):
+    """Type-check a real Rust fixture, then check its exact raw-helper report."""
+    import subprocess
+
+    files = {
+        "c/src/lib.rs": (
+            "#![allow(dead_code, unused_imports, unused_variables)]\n"
+            "pub struct ManagedReadCursor;\n"
+            "impl ManagedReadCursor {\n"
+            "    pub fn open(_: &std::path::Path) -> Self { Self }\n"
+            "}\n"
+            "mod caller;\n" + "".join("mod %s;\n" % name for name in modules)),
+        "c/src/caller.rs": (
+            "use std::path::Path;\nuse crate::ManagedReadCursor;\n" + imports
+            + "fn hash(p: &Path) { let _c = ManagedReadCursor::open(p); %s; }\n" % call),
+    }
+    for name, body in modules.items():
+        files["c/src/%s.rs" % name] = "use std::path::Path;\n" + body
+    root = fake(files)
+    cmd = ["rustc", "--crate-name", "inventory_alias_fixture", "--crate-type", "lib",
+           "--edition=2021", "--emit=metadata", "--out-dir", root, "c/src/lib.rs"]
+    for cfg in ([], ["--cfg", "test"]) if test_cfg else ([],):
+        try:
+            compiled = subprocess.run(cmd + cfg, cwd=root, capture_output=True, text=True, timeout=30)
+        except OSError as e:
+            raise AssertionError("rustc is required for the alias fixture: %s" % e) from e
+        expect(compiled.returncode == 0, (imports, call, compiled.stderr))
+    rules = {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF}
+    errors = check(root, classify(root, rules))
+    expected = ("managed function hash (c/src/caller.rs) reaches helper load "
+                "with a non-managed read (c/src/%s.rs fs::read#1)" % raw_module)
+    expect(errors == [expected], (imports, call, errors))
+    rules[("load", "fs::read")] = dict(OOF, non_mandatory_callers=["hash"])
+    expect(check(root, classify(root, rules)) == [], (imports, call, check(root, classify(root, rules))))
+
+
+def regression_inventory_helper_walk_keeps_rooted_renamed_import():
+    """Regression: a local module alias rewrote `crate::a::load as read_index`
+    to an empty decoy instead of reporting a::load's raw std::fs::read."""
+    check_compiled_alias_fixture(
+        {"a": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "util": "pub fn load(_: &Path) {}\n"},
+        "use crate::util as a;\nuse crate::a::load as read_index;\n",
+        "read_index(p)", "a")
+
+
+def regression_inventory_helper_walk_keeps_rooted_bare_import():
+    """Regression: a local module alias rewrote the parent of `use crate::a::load`
+    and hid the raw helper behind an empty decoy."""
+    check_compiled_alias_fixture(
+        {"a": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "util": "pub fn load(_: &Path) {}\n"},
+        "use crate::util as a;\nuse crate::a::load;\n", "load(p)", "a")
+
+
+def regression_inventory_helper_walk_keeps_rooted_glob_import():
+    """Regression: a local module alias rewrote `use crate::a::*` to an empty
+    decoy and hid the raw std::fs::read reached through load(p)."""
+    check_compiled_alias_fixture(
+        {"a": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "util": "pub fn load(_: &Path) {}\n"},
+        "use crate::util as a;\nuse crate::a::*;\n", "load(p)", "a")
+
+
+def regression_inventory_helper_walk_test_alias_does_not_rewrite_rooted_import():
+    """Regression: an alias inside #[cfg(test)] mod tests poisoned the
+    production import `use crate::a::load as read_index`."""
+    check_compiled_alias_fixture(
+        {"a": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "util": "pub fn load(_: &Path) {}\n"},
+        "use crate::a::load as read_index;\n"
+        "#[cfg(test)] mod tests { use crate::util as a; }\n",
+        "read_index(p)", "a", test_cfg=True)
+
+
+def regression_inventory_helper_walk_qualified_alias_stops_at_rooted_target():
+    """Regression: o::load followed o -> util -> outer across two absolute
+    imports and selected an empty decoy instead of util::load's raw read."""
+    check_compiled_alias_fixture(
+        {"util": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "outer": "pub fn load(_: &Path) {}\n"},
+        "use crate::util as o;\nuse crate::outer as util;\n", "o::load(p)", "util")
+
+
+def regression_inventory_helper_walk_absolute_alias_name_swap_is_not_cycle():
+    """Regression: absolute foo/bar name-swapped imports were falsely
+    reported as a cycle instead of following bar::load to foo::load."""
+    check_compiled_alias_fixture(
+        {"foo": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "bar": "pub fn load(_: &Path) {}\n"},
+        "use crate::foo as bar;\nuse crate::bar as foo;\n", "bar::load(p)", "foo")
+
+
+SCOPE_IMPORTS = (
+    ("use a::load;\n", "load(p)"),
+    ("use a::load as read_index;\n", "read_index(p)"),
+    ("use a::*;\n", "load(p)"),
+    ("use a::{load};\n", "load(p)"),
+    ("use a::{load as read_index};\n", "read_index(p)"),
+)
+SCOPE_ALIASES = {
+    "nested": "mod nested { use crate::util as a; }\n",
+    "test": "#[cfg(test)] mod tests { use crate::util as a; }\n",
+    "function": "fn other() { use crate::util as a; }\n",
+}
+UTIL_IMPORTS = (
+    ("use util::load;\n", "load(p)"),
+    ("use util::load as read_index;\n", "read_index(p)"),
+    ("use util::*;\n", "load(p)"),
+)
+
+
+def check_compiled_scope_fixture(imports, call, raw_file, local_a=False, test_cfg=False,
+                                 refusal_reason=None):
+    """Compile a scope collision, then require main's raw report or refusal."""
+    import subprocess
+
+    files = {
+        "c/src/lib.rs": (
+            "#![allow(dead_code, unused_imports, unused_variables)]\n"
+            "pub struct ManagedReadCursor;\n"
+            "impl ManagedReadCursor {\n"
+            "    pub fn open(_: &std::path::Path) -> Self { Self }\n"
+            "}\n"
+            "mod caller;\npub mod util;\nmod decoy;\n"),
+        "c/src/caller.rs": (
+            "use std::path::Path;\nuse crate::ManagedReadCursor;\n"
+            + ("mod a;\n" if local_a else "use crate::util;\n") + imports
+            + "fn hash(p: &Path) { let _c = ManagedReadCursor::open(p); %s; }\n" % call),
+        "c/src/util.rs": "use std::path::Path;\npub fn load(p: &Path) { %s }\n" % (
+            "let _ = std::fs::read(p);" if raw_file == "c/src/util.rs" else ""),
+        "c/src/decoy.rs": "pub fn load(_: &std::path::Path) {}\n",
+    }
+    if local_a:
+        files["c/src/caller/a.rs"] = (
+            "pub fn load(p: &std::path::Path) { let _ = std::fs::read(p); }\n")
+    root = fake(files)
+    cmd = ["rustc", "--crate-name", "inventory_scope_fixture", "--crate-type", "lib",
+           "--edition=2021", "--emit=metadata", "--out-dir", root, "c/src/lib.rs"]
+    for cfg in ([], ["--cfg", "test"]) if test_cfg else ([],):
+        try:
+            compiled = subprocess.run(cmd + cfg, cwd=root, capture_output=True, text=True, timeout=30)
+        except OSError as e:
+            raise AssertionError("rustc is required for the scope fixture: %s" % e) from e
+        expect(compiled.returncode == 0, (imports, call, compiled.stderr))
+    rules = {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF}
+    errors = check(root, classify(root, rules))
+    expected = ("managed function hash (c/src/caller.rs) reaches helper load "
+                "with a non-managed read (%s fs::read#1)" % raw_file)
+    refusal = [e for e in errors if "unresolved use-alias chain (fail closed)" in e
+               or "re-export allowlist (fail closed)" in e]
+    expect(expected in errors or refusal, (imports, call, errors))
+    expect(all(e == expected or e in refusal for e in errors), (imports, call, errors))
+    if refusal_reason:
+        expect(any(refusal_reason in e for e in refusal), (imports, call, errors))
+    # Exempting the actual helper may remove its report, but cannot excuse
+    # an unsupported alias: refusal must still be explicit.
+    rules[("load", "fs::read")] = dict(OOF, non_mandatory_callers=["hash"])
+    excused = check(root, classify(root, rules))
+    expect(all("unresolved use-alias chain (fail closed)" in e
+               or "re-export allowlist (fail closed)" in e for e in excused), excused)
+    if refusal_reason:
+        expect(any(refusal_reason in e for e in excused), excused)
+
+
+def regression_inventory_helper_walk_nested_alias_does_not_hide_relative_imports():
+    """Regression: a sibling module's alias hid five forms of a::load import."""
+    for imports, call in SCOPE_IMPORTS:
+        check_compiled_scope_fixture(SCOPE_ALIASES["nested"] + imports, call,
+                                     "c/src/caller/a.rs", local_a=True,
+                                     refusal_reason="bound in more than one scope")
+
+
+def regression_inventory_helper_walk_test_alias_does_not_hide_relative_imports():
+    """Regression: a test module's alias hid five production a::load imports."""
+    for imports, call in SCOPE_IMPORTS:
+        check_compiled_scope_fixture(SCOPE_ALIASES["test"] + imports, call,
+                                     "c/src/caller/a.rs", local_a=True, test_cfg=True,
+                                     refusal_reason="bound in more than one scope")
+
+
+def regression_inventory_helper_walk_function_alias_does_not_hide_relative_imports():
+    """Regression: an unrelated function's alias hid five a::load imports."""
+    for imports, call in SCOPE_IMPORTS:
+        check_compiled_scope_fixture(SCOPE_ALIASES["function"] + imports, call,
+                                     "c/src/caller/a.rs", local_a=True,
+                                     refusal_reason="bound in more than one scope")
+
+
+def regression_inventory_helper_walk_test_alias_does_not_hide_util_imports():
+    """Regression: test-only util -> decoy hid a production util::load read."""
+    alias = "#[cfg(test)] mod tests { use crate::decoy as util; }\n"
+    for imports, call in UTIL_IMPORTS:
+        check_compiled_scope_fixture(alias + imports, call, "c/src/util.rs", test_cfg=True,
+                                     refusal_reason="bound in more than one scope")
+
+
+def regression_inventory_helper_walk_function_alias_does_not_hide_util_imports():
+    """Regression: a function-local util -> decoy hid a production raw helper."""
+    alias = "fn other() { use crate::decoy as util; }\n"
+    for imports, call in UTIL_IMPORTS:
+        check_compiled_scope_fixture(alias + imports, call, "c/src/util.rs",
+                                     refusal_reason="bound in more than one scope")
+
+
+def regression_inventory_helper_walk_reexport_reports_raw_helper_or_refuses():
+    """Regression: outer::a::load silently lost the raw pub-use target."""
+    check_compiled_scope_fixture("mod outer { pub use crate::util as a; }\n",
+                                 "outer::a::load(p)", "c/src/util.rs",
+                                 refusal_reason="re-export allowlist")
+
+
+def regression_inventory_helper_walk_pub_function_reexport_refuses():
+    """Regression: outer::load skipped an unsupported pub-use function binding."""
+    check_compiled_scope_fixture("mod outer { pub use crate::util::load; }\n",
+                                 "outer::load(p)", "c/src/util.rs",
+                                 refusal_reason="re-export allowlist")
+
+
+def regression_inventory_helper_walk_pub_glob_reexport_refuses():
+    """Regression: outer::load skipped an unsupported pub-use glob binding."""
+    check_compiled_scope_fixture("mod outer { pub use crate::util::*; }\n",
+                                 "outer::load(p)", "c/src/util.rs",
+                                 refusal_reason="re-export allowlist")
+
+
+
+def regression_inventory_helper_walk_rooted_reexport_owners_refuse():
+    """Regression: self/super re-export owners silently lost a renamed helper."""
+    import subprocess
+
+    for exported, scope, call in (
+        ("pub use util::load as l;\n", "", "self::l(p)"),
+        ("", "mod outer { pub use crate::util::load as l; %s }\n", "self::l(p)"),
+        ("pub use util::load as l;\n", "mod outer { use super::*; %s }\n", "super::l(p)"),
+    ):
+        body = ("fn hash(p: &std::path::Path) { let _ = crate::ManagedReadCursor::open(p); %s; }\n" % call)
+        files = {
+            "c/src/lib.rs": (
+                "#![allow(dead_code, unused_imports)]\n"
+                "pub struct ManagedReadCursor;\n"
+                "impl ManagedReadCursor { pub fn open(_: &std::path::Path) -> Self { Self } }\n"
+                "pub mod util;\n" + exported + (scope % body if scope else body)),
+            "c/src/util.rs": "pub fn load(p: &std::path::Path) { let _ = std::fs::read(p); }\n",
+        }
+        root = fake(files)
+        compiled = subprocess.run(
+            ["rustc", "--crate-name", "inventory_rooted_reexport", "--crate-type", "lib",
+             "--edition=2021", "--emit=metadata", "--out-dir", root, "c/src/lib.rs"],
+            cwd=root, capture_output=True, text=True, timeout=30)
+        expect(compiled.returncode == 0, compiled.stderr)
+        errs = check(root, classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                                           ("load", "fs::read"): OOF}))
+        expect(any("re-export allowlist (fail closed)" in e for e in errs), (exported, scope, call, errs))
+
+
+
+def write_reexport_fixture_allowlist(root, entries):
+    path = os.path.join(root, REEXPORT_ALLOWLIST)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"version": 1, "entries": entries}, fh)
+
+
+def regression_inventory_reexport_allowlist_tokenizes_visibility_and_trees():
+    """Regression: comments, literals and multiline visibility hid public uses."""
+    # Literal contents, nested comments and raw identifiers are not keywords.
+    # Include more raw-string hashes than mask()'s lookahead, and lifetimes.
+    hashes = "#" * 100
+    literals = ('const S: &str = "pub use decoy::string;";\n'
+                'const B: &[u8] = b"pub use decoy::bytes;";\n'
+                'const C: &std::ffi::CStr = c"pub use decoy::c;";\n'
+                'const R: &str = r' + hashes + '"pub use decoy::raw;"' + hashes + ';\n'
+                'const ATTR: &str = r' + hashes + '"x" #[cfg(test)] mod hidden { "y"' + hashes + ';\n'
+                'const BR: &[u8] = br##"pub use decoy::raw_bytes;"##;\n'
+                'const CR: &std::ffi::CStr = cr#"pub use decoy::raw_c;"#;\n'
+                "const CH: char = '\\'';\nconst BC: u8 = b'\\x70';\n"
+                "fn lifetime<'a>(p: &'a str) -> &'a str { p }\n"
+                "fn r#pub() {}\n// pub use decoy::line;\n"
+                "/* outer /* pub use decoy::nested; */ pub use decoy::block; */\n")
+    trees = ("util :: load", "util :: { load as read_index , other , }", "util :: *")
+    uses = ("pub\nuse util::load;\n",
+            "pub(\ncrate\n)\nuse util::{load as read_index, /* split */ other,};\n",
+            "pub ( super ) use util::*;\n")
+    for declaration, tree in zip(uses, trees):
+        src = literals + declaration
+        root = fake({"c/src/lib.rs": src})
+        errors = check(root, {"entries": []})
+        expect(len(errors) == 1 and "re-export allowlist" in errors[0], errors)
+        expect("use %s;" % tree in errors[0], errors)
+        write_reexport_fixture_allowlist(root, [{"file": "c/src/lib.rs", "use": tree,
+                                                "reason": "Fixture public API."}])
+        expect(check(root, {"entries": []}) == [], check(root, {"entries": []}))
+
+
+def regression_inventory_reexport_allowlist_cannot_exempt_resolved_or_unused_use():
+    """Regression: resolvable or unused re-exports bypassed the refusal gate."""
+    root = fake({"c/src/lib.rs": "mod util { pub fn load() {} }\npub use util::load as l;\n"})
+    errors = check(root, {"entries": []})
+    expect(any("re-export allowlist" in e for e in errors), errors)
+
+
+def regression_inventory_reexport_allowlist_skips_only_test_source():
+    """Regression: test-only exports required review or hid production ones."""
+    root = fake({
+        "c/src/lib.rs": ('#[cfg(test)] mod tests;\n'
+                         '#[cfg(test)] pub use decoy::load;\n'
+                         '#[cfg(test)] mod inline { pub use decoy::load; }\n'),
+        "c/src/tests.rs": "pub use decoy::load;\n",
+    })
+    expect(check(root, {"entries": []}) == [], check(root, {"entries": []}))
+    with open(os.path.join(root, "c/src/lib.rs"), "a", encoding="utf-8") as fh:
+        fh.write('#[cfg(any(test, feature = "production"))]\npub use util::load;\n')
+    errors = check(root, {"entries": []})
+    expect(len(errors) == 1 and "re-export allowlist" in errors[0], errors)
+
+
+def regression_inventory_reexport_allowlist_stale_entry_refuses():
+    """Regression: an obsolete allowlist entry silently authorized old code."""
+    root = fake({"c/src/lib.rs": ""})
+    write_reexport_fixture_allowlist(root, [{"file": "c/src/lib.rs", "use": "util :: load",
+                                            "reason": "Removed fixture API."}])
+    errors = check(root, {"entries": []})
+    expect(any("re-export allowlist" in e and "stale entry" in e for e in errors), errors)
+
+
+def regression_inventory_reexport_allowlist_duplicate_entry_refuses():
+    """Regression: duplicate review keys obscured the authoritative reason."""
+    root = fake({"c/src/lib.rs": "pub use util::load;\n"})
+    entry = {"file": "c/src/lib.rs", "use": "util :: load", "reason": "Fixture API."}
+    # Normalize before checking duplicates, including differently spaced keys.
+    for duplicate in (entry, dict(entry, use="util::load")):
+        write_reexport_fixture_allowlist(root, [entry, duplicate])
+        errors = check(root, {"entries": []})
+        expect(any("re-export allowlist" in e and "duplicate entry" in e for e in errors), errors)
+
+
+def regression_inventory_reexport_allowlist_requires_reason_and_schema():
+    """Regression: malformed or reasonless allowlists permitted public imports."""
+    root = fake({"c/src/lib.rs": "pub use util::load;\n"})
+    path = os.path.join(root, REEXPORT_ALLOWLIST)
+    for entry in ({"file": "c/src/lib.rs", "use": "util :: load"},
+                  {"file": "c/src/lib.rs", "use": "util :: load", "reason": " "},
+                  {"file": "c/src/lib.rs", "use": "util :: load", "reason": 42},
+                  {"file": "c/src/lib.rs"}):
+        write_reexport_fixture_allowlist(root, [entry])
+        errors = check(root, {"entries": []})
+        expect(any("re-export allowlist" in e for e in errors), errors)
+    for contents in ('{', '[]', '{"entries": []}', '{"version": 1, "entries": {}}'):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(contents)
+        errors = check(root, {"entries": []})
+        expect(any("re-export allowlist" in e for e in errors), errors)
+
+
+def compiled_reexport_fixture(files, test_cfg=False, extra_cfg=()):
+    """Build a real Rust fixture and return its classified inventory errors."""
+    import subprocess
+
+    bootstrap = (
+        "#![allow(dead_code, unused_imports, unused_variables)]\n"
+        "pub struct ManagedReadCursor;\n"
+        "impl ManagedReadCursor { pub fn open(_: &std::path::Path) -> Self { Self } }\n")
+    files = dict(files)
+    files["c/src/lib.rs"] = bootstrap + files["c/src/lib.rs"]
+    root = fake(files)
+    cmd = ["rustc", "--crate-name", "inventory_reexport_fixture", "--crate-type", "lib",
+           "--edition=2021", "--emit=metadata", "--out-dir", root, "c/src/lib.rs"]
+    for value in extra_cfg:
+        cmd.extend(["--cfg", value])
+    for cfg in ([], ["--cfg", "test"]) if test_cfg else ([],):
+        try:
+            compiled = subprocess.run(cmd + cfg, cwd=root, capture_output=True, text=True, timeout=30)
+        except OSError as e:
+            raise AssertionError("rustc is required for the re-export fixture: %s" % e) from e
+        expect(compiled.returncode == 0, (files, compiled.stderr))
+    manifest = classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                               ("load", "fs::read"): OOF})
+    return check(root, manifest)
+
+
+REEXPORT_RAW = "pub fn load(p: &std::path::Path) { let _ = std::fs::read(p); }\n"
+REEXPORT_HASH = ("fn hash(p: &std::path::Path) { "
+                 "let _c = crate::ManagedReadCursor::open(p); %s; }\n")
+
+
+def regression_inventory_reexport_allowlist_raw_string_cannot_hide_module():
+    """Regression: a cfg/mod decoy in a raw string excluded a production file."""
+    hashes = "#" * 100
+    for declaration in ("mod a;\n", '#[path = "a.rs"] pub ( crate ) mod a;\n'):
+        errors = compiled_reexport_fixture({
+            "c/src/lib.rs": ('const S: &str = r' + hashes
+                             + '"x"\n#[cfg(test)] mod a;\n"' + hashes + ';\n'
+                             + declaration),
+            "c/src/a.rs": "pub use std::fs::read;\n",
+        })
+        expect(any("re-export allowlist" in e and "c/src/a.rs" in e for e in errors), errors)
+
+
+def regression_inventory_reexport_allowlist_root_imports_refuse():
+    """Regression: root pub-use load imports bypassed the re-export heuristic."""
+    for imports in ("use crate::load;\n", "use crate::{load};\n", "use super::load;\n"):
+        errors = compiled_reexport_fixture({
+            "c/src/lib.rs": "pub mod util;\npub use util::load;\nmod caller;\n",
+            "c/src/util.rs": REEXPORT_RAW,
+            "c/src/caller.rs": imports + REEXPORT_HASH % "load(p)",
+        })
+        expect(any("re-export allowlist" in e for e in errors), (imports, errors))
+
+
+def regression_inventory_reexport_allowlist_path_module_refuses():
+    """Regression: #[path] and globs of its module bypassed file-stem owners."""
+    for imports, call in (
+        ("", "crate::helpers::load(p)"),
+        ("use crate::helpers::load;\n", "load(p)"),
+        ("use crate::helpers::*;\n", "load(p)"),
+        ("use helpers::a as b;\nuse crate::helpers;\n", "b::load(p)"),
+    ):
+        exported = ("pub use crate::util as a;\n" if "b::" in call
+                    else "pub use crate::util::load;\n")
+        errors = compiled_reexport_fixture({
+            "c/src/lib.rs": 'pub mod util;\n#[path = "bridge.rs"]\nmod helpers;\nmod caller;\n',
+            "c/src/util.rs": REEXPORT_RAW,
+            "c/src/bridge.rs": exported,
+            "c/src/caller.rs": imports + REEXPORT_HASH % call,
+        })
+        expect(any("re-export allowlist" in e for e in errors), (imports, call, errors))
+
+
+def regression_inventory_reexport_allowlist_unrenamed_and_glob_refuse():
+    """Regression: unrenamed and glob imports skipped re-export validation."""
+    for exported, imports, call in (
+        ("pub use crate::util as a;\n", "use crate::outer::a;\n", "a::load(p)"),
+        ("pub use crate::util as a;\n", "use crate::outer::*;\n", "a::load(p)"),
+        ("pub use crate::util::load as read_index;\n", "use crate::outer::read_index;\n", "read_index(p)"),
+        ("pub use crate::util::load as read_index;\n", "use crate::outer::*;\n", "read_index(p)"),
+        ("pub use crate::util::load;\n", "use crate::outer::load;\n", "load(p)"),
+        ("pub use crate::util::load;\n", "use crate::outer::*;\n", "load(p)"),
+    ):
+        errors = compiled_reexport_fixture({
+            "c/src/lib.rs": "pub mod util;\nmod outer;\nmod caller;\n",
+            "c/src/util.rs": REEXPORT_RAW,
+            "c/src/outer.rs": exported,
+            "c/src/caller.rs": imports + REEXPORT_HASH % call,
+        })
+        expect(any("re-export allowlist" in e for e in errors), (exported, imports, errors))
+
+
+def regression_inventory_reexport_allowlist_long_visibility_refuses():
+    """Regression: a long pub(in path) visibility escaped the look-behind."""
+    ancestor = "ancestor_" + "long_" * 20 + "scope"
+    body = ("pub mod %s {\nmod outer {\n" % ancestor
+            + "pub(in crate::%s)\nuse crate::util::load as l;\n" % ancestor
+            + REEXPORT_HASH % "self::l(p)" + "}\n}\n")
+    errors = compiled_reexport_fixture({"c/src/lib.rs": "pub mod util;\n" + body,
+                                        "c/src/util.rs": REEXPORT_RAW})
+    expect(any("re-export allowlist" in e for e in errors), errors)
+
+
+def regression_inventory_reexport_allowlist_decoy_name_refuses():
+    """Regression: a same-name decoy function exempted the real re-export."""
+    errors = compiled_reexport_fixture({
+        "c/src/lib.rs": ("pub mod util;\npub use util::load as read_index;\n"
+                          "mod decoy { pub fn read_index(_: &std::path::Path) {} }\n"
+                          + REEXPORT_HASH % "crate::read_index(p)"),
+        "c/src/util.rs": REEXPORT_RAW,
+    })
+    expect(any("re-export allowlist" in e for e in errors), errors)
+
+
+def regression_inventory_helper_walk_cfg_distinct_alias_bindings_refuse():
+    """Regression: a test-only same-scope alias overwrote the production target."""
+    for imports, call in (
+        ("", "u::load(p)"),
+        ("use u::load as read_index;\n", "read_index(p)"),
+        ("use u::load;\n", "load(p)"),
+        ("use u::*;\n", "load(p)"),
+    ):
+        errors = compiled_reexport_fixture({
+            "c/src/lib.rs": "pub mod util;\nmod decoy;\nmod caller;\n",
+            "c/src/util.rs": REEXPORT_RAW,
+            "c/src/decoy.rs": "pub fn load(_: &std::path::Path) {}\n",
+            "c/src/caller.rs": (
+                "#[cfg(not(test))]\nuse crate::util as u;\n"
+                "#[cfg(test)]\nuse crate::decoy as u;\n" + imports
+                + REEXPORT_HASH % call),
+        }, test_cfg=True)
+        expect(any("unresolved use-alias chain (fail closed)" in e for e in errors), (imports, call, errors))
+
+
+def regression_inventory_reexport_allowlist_cfg_comments_cannot_hide_production():
+    """Regression: a comment's `test` hid production exports and modules."""
+    attr = '#[cfg(all(feature = "production", /* test */))]\n'
+    cases = (
+        {"c/src/lib.rs": attr + "pub use std::fs::read;\n"},
+        {"c/src/lib.rs": attr + "mod a { pub use std::fs::read; }\n"},
+        {"c/src/lib.rs": attr + "mod a;\n",
+         "c/src/a.rs": "pub use std::fs::read;\n"},
+        {"c/src/lib.rs": attr + '#[path = "exports.rs"] mod a;\n',
+         "c/src/exports.rs": "pub use std::fs::read;\n"},
+    )
+    for files in cases:
+        errors = compiled_reexport_fixture(files, extra_cfg=('feature="production"',))
+        expect(any("re-export allowlist (fail closed)" in e for e in errors), (files, errors))
+
+
+def regression_inventory_reexport_allowlist_macro_payloads_cannot_hide_use():
+    """Regression: macro visibility tokens hid a public use inside the payload."""
+    unwrap = ('macro_rules! unwrap_pub {\n'
+              '    (pub($($item:item)*)) => {$($item)*}\n'
+              '}\n')
+    invocations = (
+        "unwrap_pub! { pub(pub use std::fs::read;) }\n",
+        "unwrap_pub!(pub(pub use std::fs::read;));\n",
+        "unwrap_pub![pub(pub use std::fs::read;)];\n",
+        ('macro_rules! nested { ($($t:tt)*) => { unwrap_pub! { $($t)* } } }\n'
+         'nested! { pub(pub use std::fs::read;) }\n'),
+    )
+    for invocation in invocations:
+        errors = compiled_reexport_fixture({"c/src/lib.rs": unwrap + invocation})
+        expect(any("re-export allowlist (fail closed)" in e for e in errors), (invocation, errors))
+
+
+def regression_inventory_reexport_allowlist_macro_private_use_refuses():
+    """Regression: non-public use in a macro payload bypassed public-use checks."""
+    item_macro = 'macro_rules! items { ($($item:item)*) => {$($item)*} }\n'
+    invocations = (
+        "items! { use std::fs::read as read_index; }\n",
+        "items!(use std::fs::read as read_index;);\n",
+        "items![use std::fs::read as read_index;];\n",
+    )
+    for invocation in invocations:
+        errors = compiled_reexport_fixture({"c/src/lib.rs": item_macro + invocation})
+        expect(any("re-export allowlist (fail closed)" in e for e in errors), (invocation, errors))
+
+
+def regression_inventory_reexport_allowlist_macro_definition_use_refuses():
+    """Regression: a macro definition could introduce an unchecked import."""
+    source = ('macro_rules! read_macro {\n'
+              '    () => {{ use std::fs::read as read_index; }}\n'
+              '}\n'
+              'fn invoke() { read_macro!(); }\n')
+    errors = compiled_reexport_fixture({"c/src/lib.rs": source})
+    expect(any("re-export allowlist (fail closed)" in e for e in errors), errors)
+
+
+def regression_inventory_reexport_allowlist_macro_use_requires_review():
+    """Regression: macro imports need the same reviewed key as public imports."""
+    source = ('macro_rules! read_macro {\n'
+              '    () => {{ use std::fs::read as read_index; }}\n'
+              '}\n')
+    root = fake({"c/src/lib.rs": source})
+    errors = check(root, {"entries": []})
+    expect(any("re-export allowlist (fail closed)" in e for e in errors), errors)
+    write_reexport_fixture_allowlist(root, [{
+        "file": "c/src/lib.rs", "use": "std :: fs :: read as read_index",
+        "reason": "Fixture macro imports the file reader.",
+    }])
+    expect(check(root, {"entries": []}) == [], check(root, {"entries": []}))
+
+
 def self_test():
+    global check, fake
+
     tests = [v for k, v in sorted(globals().items()) if k.startswith("regression_") and callable(v)]
     failed = 0
-    for t in tests:
-        try:
-            t()
-            print("ok   " + t.__name__)
-        except AssertionError as e:
-            failed += 1
-            print("FAIL %s: %s" % (t.__name__, e))
-    print("%d passed, %d failed" % (len(tests) - failed, failed))
+    checked = [0]
+    checked_roots, fixture_roots = set(), set()
+    scan_only = 0
+    corpus_errors = []
+    original_check = check
+    original_fake = fake
+
+    def compare_helper_passes(root, entries, ops, texts, fns):
+        scanned = {key(o): o for o in ops}
+        main_errors = set(helper_errors(entries, scanned, texts, fns))
+        union_errors = set(union_helper_errors(entries, scanned, texts, fns))
+        if not main_errors <= union_errors:
+            corpus_errors.append((root, "union dropped main reports", sorted(main_errors - union_errors)))
+
+    def capture_fixture(files):
+        root = original_fake(files)
+        fixture_roots.add(root)
+        return root
+
+    def regression_inventory_helper_walk_union_preserves_main_corpus(root, manifest):
+        """Regression: the chain pass must never remove a main-pass report.
+
+        Check every fixture invocation, including loop variants and exemptions,
+        with identical scanned inputs for main alone and the two-pass union;
+        scan-only fixture roots are checked after the corpus finishes.
+        """
+        ops, texts, fns = scan(root)
+        compare_helper_passes(root, manifest.get("entries", []), ops, texts, fns)
+        checked[0] += 1
+        checked_roots.add(root)
+        return original_check(root, manifest)
+
+    check = regression_inventory_helper_walk_union_preserves_main_corpus
+    fake = capture_fixture
+    try:
+        for t in tests:
+            try:
+                t()
+                print("ok   " + t.__name__)
+            except AssertionError as e:
+                failed += 1
+                print("FAIL %s: %s" % (t.__name__, e))
+        for root in sorted(fixture_roots - checked_roots):
+            ops, texts, fns = scan(root)
+            entries = [dict(o, **(MANAGED if o["op"] in MANAGED_OPS else OOF)) for o in ops]
+            compare_helper_passes(root, entries, ops, texts, fns)
+            scan_only += 1
+    finally:
+        check = original_check
+        fake = original_fake
+    try:
+        expect(checked[0] > 0, "no fixtures checked")
+        expect(not corpus_errors, corpus_errors)
+        print("ok   regression_inventory_helper_walk_union_preserves_main_corpus "
+              "(%d fixture checks + %d scan-only roots)" % (checked[0], scan_only))
+    except AssertionError as e:
+        failed += 1
+        print("FAIL regression_inventory_helper_walk_union_preserves_main_corpus: %s" % e)
+    print("%d passed, %d failed" % (len(tests) + 1 - failed, failed))
     return 1 if failed else 0
 
 

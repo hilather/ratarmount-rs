@@ -2007,9 +2007,24 @@ and so does a form the scanner cannot follow: an import from `std::fs` or
 that escapes its function. Any `.create(..)` or `.create_new(..)` argument other
 than a literal `false` counts as a create that needs a mode policy; a managed
 read reaching a raw helper is found through `use .. as` renames of the helper or
-its module; and the pathname opens done inside libgit2 (`Repository::open`),
-libarchive (`archive_read_open_filename`) and lopdf (`Document::load`) are
-recorded as #196 residuals (those libraries own their descriptors).
+its module, including a chain of aliases (`use crate::util as u; use u::load as
+read_index`). The original helper resolver runs unchanged alongside an extra
+chain pass, and the inventory reports their union. The extra pass expands only
+the first segment of a relative path; `crate::`, `super::`, `self::` and `::`
+paths keep their roots. Cycles, unknown targets, alias names bound in multiple
+scopes, conflicting alias targets, and unsupported scoped bindings are
+reported as fail-closed errors. Every production `pub use` (including restricted
+visibility) requires a reviewed entry with a reason in
+`packaging/internal-read-reexport-allowlist.json`, keyed by repo-relative file
+and token whitespace normalized use-tree. Missing, stale and duplicate entries
+fail closed, including re-exports the extra pass can resolve. Cfg exclusions
+are evaluated on comment-stripped tokens. Every `use` in a macro invocation
+payload or macro_rules body requires the same allowlist review; visibility
+inside these opaque payloads is not interpreted. The pathname opens
+done inside
+libgit2 (`Repository::open`), libarchive (`archive_read_open_filename`) and
+lopdf (`Document::load`) are recorded as #196 residuals (those libraries own
+their descriptors).
 `--verify-baseline DIR` (run in CI) checks that every create recorded as
 unchanged from the baseline still exists unchanged there.
 
