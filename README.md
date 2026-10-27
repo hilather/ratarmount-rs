@@ -122,7 +122,10 @@ Each attempt gets a private top over the same snapshot and optional sealed
 `--lower` layers. The runner executes a container, cleans up the mount, and
 reports its exit status, strict patch hash, manifest and journal summary as JSON.
 Offline commands import patches, seal and verify layers, compare attempts, and
-pack portable bundles. The supervisor API manages fleets of attempts.
+pack portable bundles. The supervisor API manages fleets of attempts. Registration
+prepares the shared base/index once; its writable workers use immutable prepared
+indexes and refuse detected preparation failures instead of rebuilding them.
+See the [prepare-once, N-worker recipe](docs/sandbox.md#prepare-once-n-writable-workers).
 [Sandbox guide and offline worked example](docs/sandbox.md) · [SWE-bench recipe](docs/recipes/swe-bench-sandboxes.md) · [rootfs + repository](docs/recipes/sandbox-rootfs.md)
 
 ### Shards for training
@@ -306,7 +309,10 @@ overlay until you commit them: offline into gzip, bzip2, xz TAR and ZIP, or
 live while the mount is served for uncompressed TAR and `.tar.zst`, where only
 the last zstd frame is rewritten. `--overlay-readonly`, `--overlay-quota` and
 `--sandbox` turn an overlay into a guard rail for untrusted code.
-[Writing into archives](docs/write-overlay.md) · [sandbox controls](docs/sandbox.md)
+For concurrent attempts over one base, use a separate overlay and mountpoint
+per process with `--no-recreate-index` and one prepared index. This disables
+shared index writes and archive commits while each overlay remains writable.
+[Writing into archives](docs/write-overlay.md) · [prepare-once workers](docs/sandbox.md#prepare-once-n-writable-workers)
 
 | Agent workflow | Python ratarmount | Rust ratarmount |
 |---|---|---|

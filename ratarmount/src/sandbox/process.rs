@@ -83,6 +83,7 @@ pub fn mount_args(
     readonly: &[String],
 ) -> Vec<OsString> {
     let mut args = base_args(base, indexes);
+    args.push("--no-recreate-index".into());
     args.extend([
         "--sandbox-inspection-socket".into(),
         super::inspection::socket_path(attempt).into_os_string(),

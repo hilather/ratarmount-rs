@@ -52,7 +52,13 @@ impl Daemon {
         daemon
     }
 
-    fn call(&self, mut request: Value) -> Value {
+    fn call(&self, request: Value) -> Value {
+        let response = self.envelope(request);
+        assert_eq!(response["ok"], true, "{response}");
+        response["result"].clone()
+    }
+
+    fn envelope(&self, mut request: Value) -> Value {
         request["version"] = json!(1);
         let mut stream = UnixStream::connect(&self.socket).unwrap();
         stream
@@ -61,9 +67,7 @@ impl Daemon {
         writeln!(stream, "{request}").unwrap();
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).unwrap();
-        let response: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(response["ok"], true, "{response}");
-        response["result"].clone()
+        serde_json::from_str(&line).unwrap()
     }
 
     fn base(&self) {
@@ -71,17 +75,30 @@ impl Daemon {
         let mut file = fs::File::create(&tar).unwrap();
         write_ustar_members(
             &mut file,
-            &[UstarMember {
-                path: "base.txt",
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                mtime: 0,
-                xattrs: &[],
-                payload: UstarPayload::File {
-                    bytes: b"original\n",
+            &[
+                UstarMember {
+                    path: "delete-me.txt",
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    xattrs: &[],
+                    payload: UstarPayload::File {
+                        bytes: b"delete me\n",
+                    },
                 },
-            }],
+                UstarMember {
+                    path: "base.txt",
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    xattrs: &[],
+                    payload: UstarPayload::File {
+                        bytes: b"original\n",
+                    },
+                },
+            ],
         )
         .unwrap();
         write_tar_eof(&mut file).unwrap();
@@ -301,4 +318,375 @@ fn regression_sandbox_eight_mounts_isolate_writes_and_diffs() {
 #[ignore = "requires /dev/fuse; benchmark for orchestrator"]
 fn sandbox_64_attempt_setup_teardown_timing() {
     mounts(64);
+}
+
+fn shared_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.file_name().unwrap() != "prepare.log")
+                .then(|| (path.file_name().unwrap().into(), fs::read(path).unwrap()))
+        })
+        .collect()
+}
+
+fn prepared_fuse_check(required: bool, device: bool, helper: bool) -> Result<bool, &'static str> {
+    let reason = if !device {
+        Some("/dev/fuse")
+    } else if !helper {
+        Some("fusermount3")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) if required => Err(reason),
+        Some(reason) => {
+            eprintln!("skip: prepared-index mount integration requires {reason}");
+            Ok(false)
+        }
+        None => Ok(true),
+    }
+}
+
+/// Regression: the required Linux acceptance mode must fail instead of skipping mounts.
+#[test]
+fn regression_prepared_index_fuse_requirement_refuses_skip() {
+    for (device, helper) in [(false, false), (false, true), (true, false)] {
+        assert!(prepared_fuse_check(true, device, helper).is_err());
+        assert!(!prepared_fuse_check(false, device, helper).unwrap());
+    }
+    assert!(prepared_fuse_check(true, true, true).unwrap());
+}
+
+/// Regression: three simultaneous -w processes must isolate same-member writes.
+#[test]
+fn regression_prepared_index_three_writable_workers_are_isolated() {
+    let required = std::env::var_os("RATARMOUNT_REQUIRE_PREPARED_INDEX_FUSE").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    if !prepared_fuse_check(
+        required,
+        Path::new("/dev/fuse").exists(),
+        Command::new("fusermount3")
+            .arg("--version")
+            .output()
+            .is_ok(),
+    )
+    .expect("required prepared-index FUSE acceptance prerequisite missing")
+    {
+        return;
+    }
+    let daemon = Daemon::start();
+    daemon.base();
+    let root = daemon.root.as_ref().unwrap().path();
+    let base = root.join("base.tar");
+    let cache = root.join("state/indexes/task");
+    let original = fs::read(&base).unwrap();
+    let before = shared_snapshot(&cache);
+    let attempts = daemon.call(json!({"op":"new", "base":"task", "count":3, "overlay":"disk"}));
+    let attempts = attempts.as_array().unwrap();
+    assert_eq!(attempts.len(), 3);
+    let mut paths = std::collections::BTreeSet::new();
+    let mut overlays = std::collections::BTreeSet::new();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut writers = Vec::new();
+    for (i, attempt) in attempts.iter().enumerate() {
+        assert_eq!(attempt["status"], "ready");
+        let path = PathBuf::from(attempt["path"].as_str().unwrap());
+        assert!(path.is_absolute());
+        assert!(paths.insert(path.clone()));
+        assert!(overlays.insert(attempt["overlay_dir"].as_str().unwrap()));
+        let barrier = barrier.clone();
+        let tx = tx.clone();
+        writers.push(thread::spawn(move || {
+            barrier.wait();
+            fs::write(path.join("base.txt"), format!("worker-{i}\n")).unwrap();
+            fs::write(
+                path.join(format!("worker-{i}.txt")),
+                format!("addition-{i}\n"),
+            )
+            .unwrap();
+            if i == 0 {
+                fs::remove_file(path.join("delete-me.txt")).unwrap();
+            }
+            tx.send(i).unwrap();
+        }));
+    }
+    drop(tx);
+    for _ in 0..3 {
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("concurrent FUSE writes timed out");
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    for (i, attempt) in attempts.iter().enumerate() {
+        let path = Path::new(attempt["path"].as_str().unwrap());
+        assert_eq!(
+            fs::read(path.join("base.txt")).unwrap(),
+            format!("worker-{i}\n").as_bytes()
+        );
+        assert_eq!(
+            fs::read(path.join(format!("worker-{i}.txt"))).unwrap(),
+            format!("addition-{i}\n").as_bytes()
+        );
+        assert_eq!(path.join("delete-me.txt").exists(), i != 0);
+        for j in 0..3 {
+            assert_eq!(path.join(format!("worker-{j}.txt")).exists(), i == j);
+        }
+        let diff = daemon.call(json!({"op":"diff", "id":attempt["id"], "git":true}));
+        let patch = diff["patch"].as_str().unwrap();
+        assert!(patch.contains(&format!("+worker-{i}\n")), "{patch}");
+        let stats = daemon.call(json!({"op":"stats", "id":attempt["id"]}));
+        assert_eq!(stats["files_present"], 2, "{stats}");
+    }
+    assert_eq!(fs::read(&base).unwrap(), original);
+    assert_eq!(
+        shared_snapshot(&cache),
+        before,
+        "shared index changed while workers alive"
+    );
+    daemon.call(json!({"op":"destroy", "base":"task"}));
+    assert_eq!(daemon.call(json!({"op":"list"})), json!([]));
+    for path in paths {
+        assert!(!path.exists());
+    }
+    assert_eq!(shared_snapshot(&cache), before);
+    // Remount the same preparation with another independent batch.
+    let remount = daemon.call(json!({"op":"new", "base":"task", "count":1}));
+    let path = Path::new(remount[0]["path"].as_str().unwrap());
+    assert_eq!(fs::read(path.join("base.txt")).unwrap(), b"original\n");
+    assert!(path.join("delete-me.txt").exists());
+    daemon.call(json!({"op":"destroy", "base":"task"}));
+    assert_eq!(shared_snapshot(&cache), before);
+    assert_eq!(fs::read(&base).unwrap(), original);
+}
+
+/// Regression: detected invalid cache preparation must fail before FUSE, unchanged.
+#[test]
+fn regression_prepared_index_sandbox_worker_refuses_invalid_cache() {
+    for fault in ["missing", "corrupt", "size", "backend", "wal", "journal"] {
+        let daemon = Daemon::start();
+        daemon.base();
+        let root = daemon.root.as_ref().unwrap().path();
+        let cache = root.join("state/indexes/task");
+        let base = root.join("base.tar");
+        let index = fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "sqlite"))
+            .unwrap();
+        let writer = if fault == "wal" {
+            let writer = rusqlite::Connection::open(&index).unwrap();
+            writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO metadata(key,value) VALUES('pending','not checkpointed')").unwrap();
+            Some(writer)
+        } else {
+            match fault {
+                "missing" => fs::remove_file(&index).unwrap(),
+                "corrupt" => fs::write(&index, b"invalid prepared SQLite index").unwrap(),
+                "journal" => fs::write(
+                    format!("{}-journal", index.display()),
+                    b"unfinished journal",
+                )
+                .unwrap(),
+                "size" | "backend" => {
+                    let writer = rusqlite::Connection::open(&index).unwrap();
+                    if fault == "size" {
+                        writer.execute("UPDATE metadata SET value = json_set(value, '$.st_size', 1) WHERE key = 'tarstats'", []).unwrap();
+                    } else {
+                        writer.execute("UPDATE metadata SET value = 'wrong-backend' WHERE key = 'backendName'", []).unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            None
+        };
+        let before = shared_snapshot(&cache);
+        let original = fs::read(&base).unwrap();
+        let response = daemon.envelope(json!({"op":"new", "base":"task", "count":1}));
+        assert_eq!(response["ok"], false, "{fault}: {response}");
+        assert_eq!(
+            response["error"]["code"], "mount_failed",
+            "{fault}: {response}"
+        );
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("index") || message.contains("prepar"),
+            "{fault}: {message}"
+        );
+        assert!(!message.contains("/dev/fuse"), "{fault}: {message}");
+        assert_eq!(daemon.call(json!({"op":"list"})), json!([]));
+        assert_eq!(
+            shared_snapshot(&cache),
+            before,
+            "{fault}: invalid shared state was changed"
+        );
+        assert_eq!(fs::read(&base).unwrap(), original);
+        drop(writer);
+    }
+}
+
+fn strict_no_mount(base: &Path, cache: &Path, bind: &str) {
+    let out = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args([
+            "--no-mount",
+            "--no-recreate-index",
+            "--no-file-versions",
+            "--index-folders",
+        ])
+        .arg(serde_json::to_string(&[cache]).unwrap())
+        .args(["--bind", bind])
+        .arg(base)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn tiny_tar(path: &Path, payload: &[u8]) {
+    let mut file = fs::File::create(path).unwrap();
+    write_ustar_members(
+        &mut file,
+        &[UstarMember {
+            path: "content",
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            xattrs: &[],
+            payload: UstarPayload::File { bytes: payload },
+        }],
+    )
+    .unwrap();
+    write_tar_eof(&mut file).unwrap();
+}
+
+/// Regression: the actual supervisor preparer must finalize every selected artifact.
+#[test]
+fn regression_prepared_index_prepare_finalizes_each_selected_source() {
+    let daemon = Daemon::start();
+    let root = daemon.root.as_ref().unwrap().path();
+    let base = root.join("base.tar.zst");
+    let second = root.join("second.tar.zst");
+    for path in [&base, &second] {
+        let plain = root.join("temporary.tar");
+        tiny_tar(&plain, b"prepared source\n");
+        fs::write(
+            path,
+            zstd::encode_all(fs::File::open(&plain).unwrap(), 1).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(plain).unwrap();
+    }
+    let cache = root.join("state/indexes/multi");
+    fs::create_dir_all(&cache).unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+    let unrelated = rusqlite::Connection::open(cache.join("unrelated.sqlite")).unwrap();
+    unrelated.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE untouched(value TEXT); INSERT INTO untouched VALUES('pending unrelated WAL')").unwrap();
+    let unrelated_before = shared_snapshot(&cache);
+    let bind = format!("/other={}", second.display());
+    daemon.call(
+        json!({"op":"create_base", "name":"multi", "source":base, "options":{"binds":[bind]}}),
+    );
+    let cache = root.join("state/indexes/multi");
+    let before = shared_snapshot(&cache);
+    for (name, bytes) in &unrelated_before {
+        assert_eq!(
+            before.get(name),
+            Some(bytes),
+            "unrelated SQLite changed during preparation"
+        );
+    }
+    assert_eq!(
+        before
+            .keys()
+            .filter(|p| p.extension().is_some_and(|e| e == "sqlite")
+                && p.file_name().unwrap() != "unrelated.sqlite")
+            .count(),
+        2
+    );
+    for path in before
+        .keys()
+        .filter(|p| !p.to_string_lossy().starts_with("unrelated.sqlite"))
+    {
+        if path.extension().is_some_and(|e| e == "sqlite") {
+            let db = ratarmount_index::SqliteIndex::open_prepared(cache.join(path)).unwrap();
+            assert!(db.file_count().unwrap() > 0);
+        }
+        assert!(!path.to_string_lossy().ends_with("-wal"));
+    }
+    strict_no_mount(&base, &cache, &bind);
+    assert_eq!(shared_snapshot(&cache), before);
+    // Classified no-mount preparation exercises the second artifact handoff arm.
+    let out = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .args(["--no-mount", "--no-file-versions", "--index-folders"])
+        .arg(serde_json::to_string(&[&cache]).unwrap())
+        .args(["--bind", &bind, "-w"])
+        .arg(root.join("classified-overlay"))
+        .arg(&base)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    strict_no_mount(&base, &cache, &bind);
+    assert_eq!(shared_snapshot(&cache), before);
+    drop(unrelated);
+}
+
+/// Regression: an unindexed bind must require/finalize no sidecar of its own.
+#[test]
+fn regression_prepared_index_mixed_tar_and_unindexed_bind() {
+    let daemon = Daemon::start();
+    let root = daemon.root.as_ref().unwrap().path();
+    let base = root.join("base.tar");
+    let plain = root.join("plain.txt");
+    tiny_tar(&base, b"base\n");
+    fs::write(&plain, b"plain bind bytes\n").unwrap();
+    let candidate = PathBuf::from(format!("{}.index.sqlite", plain.display()));
+    fs::write(&candidate, b"unrelated candidate must stay untouched").unwrap();
+    let bind = format!("/plain={}", plain.display());
+    daemon.call(
+        json!({"op":"create_base", "name":"mixed", "source":base, "options":{"binds":[bind]}}),
+    );
+    let cache = root.join("state/indexes/mixed");
+    let before = shared_snapshot(&cache);
+    assert_eq!(before.len(), 1);
+    strict_no_mount(&base, &cache, &bind);
+    let mut options = ratarmount_core::OpenOptions {
+        read_only_index: true,
+        write_index: false,
+        index_folders: vec![cache.clone()],
+        ..Default::default()
+    };
+    let bundle = ratarmount_session::factory::build_mount_source_with_bindings(
+        std::slice::from_ref(&base),
+        &mut options,
+        false,
+        Default::default(),
+        ratarmount_session::factory::SourceBindings {
+            binds: vec![bind.parse().unwrap()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    use std::io::Read;
+    let info = bundle.source.lookup("/plain/plain.txt", 0).unwrap();
+    let mut reader = bundle.source.open(&info, 0).unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"plain bind bytes\n");
+    drop(reader);
+    drop(bundle);
+    assert_eq!(shared_snapshot(&cache), before);
+    assert_eq!(
+        fs::read(candidate).unwrap(),
+        b"unrelated candidate must stay untouched"
+    );
 }
