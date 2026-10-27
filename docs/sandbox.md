@@ -2017,7 +2017,10 @@ reported as fail-closed errors. Every production `pub use` (including restricted
 visibility) requires a reviewed entry with a reason in
 `packaging/internal-read-reexport-allowlist.json`, keyed by repo-relative file
 and token whitespace normalized use-tree. Missing, stale and duplicate entries
-fail closed, including re-exports the extra pass can resolve. The pathname opens
+fail closed, including re-exports the extra pass can resolve. Cfg exclusions
+are evaluated on comment-stripped tokens. Every `use` in a macro invocation
+payload or macro_rules body requires the same allowlist review; visibility
+inside these opaque payloads is not interpreted. The pathname opens
 done inside
 libgit2 (`Repository::open`), libarchive (`archive_read_open_filename`) and
 lopdf (`Document::load`) are recorded as #196 residuals (those libraries own

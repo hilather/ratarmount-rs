@@ -705,6 +705,21 @@
       "file": "ratarmount/src/sandbox/mod.rs",
       "use": "inspection :: start as start_inspection",
       "reason": "Sandbox module exposes its inspection-thread startup entry point."
+    },
+    {
+      "file": "ratarmount-compositing/src/quiet_print.rs",
+      "use": "std :: io :: Write as _",
+      "reason": "Commit quiet-print macros import Write for stdout/stderr writes."
+    },
+    {
+      "file": "ratarmount-core/src/quiet_print.rs",
+      "use": "std :: io :: Write as _",
+      "reason": "Exported quiet-print macros import Write for stdout/stderr writes."
+    },
+    {
+      "file": "ratarmount/src/quiet_print.rs",
+      "use": "std :: io :: Write as _",
+      "reason": "Binary quiet-print macros import Write for stdout/stderr writes."
     }
   ]
 }

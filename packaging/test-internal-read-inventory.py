@@ -50,8 +50,11 @@ rooted paths keep their roots. Cycles, unknown targets, and ambiguous or
 unsupported scoped bindings fail closed. Every production `pub use` (including
 restricted visibility) must be reviewed in
 `packaging/internal-read-reexport-allowlist.json`; a tokenized use-tree and its
-repo-relative file identify each entry. Missing, stale and duplicate entries
-fail closed, even when the extra pass could resolve the re-export.
+repo-relative file identify each entry. Cfg exclusion uses comment-stripped
+tokens, retaining literal values. Any `use` inside a macro invocation payload
+or macro_rules body requires the same allowlist review, regardless of visibility;
+the gate does not expand macros. Missing, stale and duplicate entries fail
+closed, even when the extra pass could resolve the re-export.
 Generic argument lists (`::<..>`) are matched balanced; an unbalanced one is
 reported. Descriptor duplication and ownership conversion
 (`try_clone_to_owned`, `dup`/`dup2`/`dup3`, `F_DUPFD[_CLOEXEC]`, `File::from`)
@@ -1613,13 +1616,14 @@ def union_helper_errors(entries, scanned, texts, fns):
                   set(chain_helper_errors(entries, scanned, texts, fns)))
 
 
-def rust_tokens(src):
+def rust_tokens(src, literals=False):
     """Rust tokens and offsets, omitting comments and complete literals.
 
     Re-export detection uses tokens from the original source, independently of
     the helper resolvers. Nested comments, escaped strings, byte/C strings,
     raw strings (any hash count), chars and raw identifiers cannot introduce
-    fake `pub use` tokens. Lifetimes retain their identifier tokens.
+    fake `pub use` tokens. Lifetimes retain their identifier tokens. The cfg
+    gate can retain each literal as one opaque token, never its contents.
     """
     raw_re = re.compile(r'(?:br|cr|r)(#*)"')
     quoted_re = re.compile(r'(?:b|c)?"')
@@ -1648,10 +1652,14 @@ def rust_tokens(src):
         if raw:
             close = '"' + raw.group(1)
             end = src.find(close, raw.end())
-            i = n if end < 0 else end + len(close)
+            stop = n if end < 0 else end + len(close)
+            if literals:
+                yield src[i:stop], i
+            i = stop
             continue
         quoted = quoted_re.match(src, i)
         if quoted:
+            start = i
             i = quoted.end()
             while i < n:
                 if src[i] == "\\":
@@ -1661,9 +1669,13 @@ def rust_tokens(src):
                     break
                 else:
                     i += 1
+            if literals:
+                yield src[start:i], start
             continue
         char = char_re.match(src, i)
         if char:
+            if literals:
+                yield char.group(), i
             i = char.end()
             continue
         token = token_re.match(src, i)
@@ -1671,19 +1683,59 @@ def rust_tokens(src):
         i = token.end()
 
 
-def public_use_trees(src, tokens=None):
+def macro_payload_indices(tokens):
+    """Indices inside invocation/definition payloads, before parsing visibility.
+
+    Macro tokens are arbitrary syntax: even a private `use` may expand to a
+    public import. Include macro_rules bodies and all nested delimiter kinds.
+    """
+    closes, stack = {}, []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for i, (token, _) in enumerate(tokens):
+        if token in pairs:
+            stack.append(i)
+        elif stack and token == pairs[tokens[stack[-1]][0]]:
+            closes[stack.pop()] = i
+    payload = set()
+    for i, (token, _) in enumerate(tokens):
+        if token != "!" or not i or not re.fullmatch(r"(?:r#)?[^\W\d]\w*", tokens[i - 1][0]):
+            continue
+        j = i + 1
+        if tokens[i - 1][0] == "macro_rules":
+            j += 1  # macro_rules! name { ... }
+        if j in closes:
+            payload.update(range(j + 1, closes[j]))
+    return payload
+
+
+def macro_use_trees(tokens, payload):
+    """Review every `use` in opaque macro payloads, without visibility parsing."""
+    out = []
+    for i in sorted(payload):
+        if tokens[i][0] != "use":
+            continue
+        tree, j = [], i + 1
+        while j in payload and tokens[j][0] != ";":
+            tree.append(tokens[j][0])
+            j += 1
+        out.append((" ".join(tree), tokens[i][1]))
+    return out
+
+
+def public_use_trees(src, tokens=None, payload=None):
     """(normalized use-tree, pub offset) for every visibility-qualified use.
 
     Consume visibility forwards, including balanced multiline `pub(in ..)`;
     never infer visibility from text before a use or its imported names.
     """
     tokens = list(rust_tokens(src)) if tokens is None else tokens
+    payload = macro_payload_indices(tokens) if payload is None else payload
     out = []
     i = 0
     while i < len(tokens):
         token, at = tokens[i]
         i += 1
-        if token != "pub":
+        if token != "pub" or i - 1 in payload:
             continue
         if i < len(tokens) and tokens[i][0] == "(":
             depth = 1
@@ -1705,11 +1757,123 @@ def public_use_trees(src, tokens=None):
     return out
 
 
+def reexport_cfg_test_only(tokens):
+    """Conservative test-only cfg policy, evaluated solely on Rust tokens.
+
+    Comments have already gone and literals are opaque tokens. In particular,
+    a comment saying `test` cannot become an all()/any() predicate argument.
+    Unknown or unsupported predicates remain production source.
+    """
+    pos = 0
+
+    def take():
+        nonlocal pos
+        token = tokens[pos]
+        pos += 1
+        return token
+
+    def expr():
+        name = take()
+        if not re.fullmatch(r"[^\W\d]\w*", name):
+            raise ValueError("unsupported cfg atom")
+        if pos < len(tokens) and tokens[pos] == "(":
+            take()
+            args = []
+            while tokens[pos] != ")":
+                args.append(expr())
+                if tokens[pos] != ",":
+                    break
+                take()
+            if take() != ")" or name not in ("all", "any", "not"):
+                raise ValueError("unsupported cfg predicate")
+            if name == "all":
+                return any(args)
+            if name == "any":
+                return bool(args) and all(args)
+            return False
+        if pos < len(tokens) and tokens[pos] == "=":
+            take()
+            return take() == '"test-hooks"' and name == "feature"
+        return name == "test"
+
+    try:
+        result = expr()
+        return result and pos == len(tokens)
+    except (IndexError, ValueError):
+        return False
+
+
+def reexport_token_views(src, tokens, payload):
+    """Offset-preserving syntax and literal views made only from Rust tokens.
+
+    Decide cfg exclusion here. Normalize attributes to #[test] or #[] before
+    reusing main's span-boundary helper, so it never reinterprets raw cfg text.
+    Literal values are retained separately only for module #[path] extraction.
+    Attributes inside macro payloads are opaque and cannot exclude a use.
+    """
+    code = ["\n" if ch == "\n" else " " for ch in src]
+    literal_code = code.copy()
+    literal_tokens = list(rust_tokens(src, literals=True))
+    for token, at in literal_tokens:
+        literal_code[at:at + len(token)] = token
+    for token, at in tokens:
+        code[at:at + len(token)] = token
+    macro_offsets = {tokens[i][1] for i in payload}
+    i = 0
+    while i + 1 < len(literal_tokens):
+        token, at = literal_tokens[i]
+        if token != "#" or literal_tokens[i + 1][0] != "[":
+            i += 1
+            continue
+        j, depth = i + 2, 1
+        while j < len(literal_tokens) and depth:
+            if literal_tokens[j][0] == "[":
+                depth += 1
+            elif literal_tokens[j][0] == "]":
+                depth -= 1
+            j += 1
+        if depth:
+            break  # Unsupported syntax stays visible; it cannot exclude code.
+        body = [t for t, _ in literal_tokens[i + 2:j - 1]]
+        test_only = body in (["test"], ["tokio", "::", "test"])
+        if len(body) >= 3 and body[:2] == ["cfg", "("] and body[-1] == ")":
+            test_only = reexport_cfg_test_only(body[2:-1])
+        if at in macro_offsets:
+            test_only = False
+        end = literal_tokens[j - 1][1] + 1
+        for k in range(at, end):
+            if code[k] != "\n":
+                code[k] = " "
+        replacement = "#[test]" if test_only else "#[]"
+        code[at:at + len(replacement)] = replacement
+        i = j
+    # Span/module helpers accept conventional visibility spelling. Never
+    # interpret visibility inside an arbitrary macro token payload.
+    for i, (token, at) in enumerate(tokens):
+        if token != "pub" or i in payload:
+            continue
+        j, depth = i + 1, 0
+        if j < len(tokens) and tokens[j][0] == "(":
+            while j < len(tokens):
+                if tokens[j][0] == "(":
+                    depth += 1
+                elif tokens[j][0] == ")":
+                    depth -= 1
+                    if not depth:
+                        j += 1
+                        break
+                j += 1
+        for k in range(at, tokens[j][1] if j < len(tokens) else len(src)):
+            if code[k] != "\n":
+                code[k] = " "
+    return "".join(code), "".join(literal_code)
+
+
 def reexport_sources(root):
     """Tokenized sources outside test-only modules, independent of scan().
 
     Literal text cannot fabricate a cfg/module declaration that excludes a
-    production file. Reuse the inventory's module/cfg policy on tokenized code;
+    production file. Evaluate cfg predicates on the comment-stripped tokens;
     a file shared by production and test declarations remains production.
     """
     sources, decls = {}, {}
@@ -1717,26 +1881,10 @@ def reexport_sources(root):
         with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as fh:
             src = fh.read()
         tokens = list(rust_tokens(src))
-        code = ["\n" if ch == "\n" else " " for ch in src]
-        for token, at in tokens:
-            code[at:at + len(token)] = token
-        # The cfg/module helpers accept conventional visibility spelling.
-        # Blank visibility tokens so whitespace/comments in `pub (crate)`
-        # cannot confuse test-only span or module-file classification.
-        for i, (token, at) in enumerate(tokens):
-            if token != "pub":
-                continue
-            j = i + 1
-            if j < len(tokens) and tokens[j][0] == "(":
-                while j < len(tokens) and tokens[j][0] != ")":
-                    j += 1
-                j += 1
-            for k in range(at, tokens[j][1] if j < len(tokens) else len(src)):
-                if code[k] != "\n":
-                    code[k] = " "
-        text = "".join(code)
-        spans, _ = test_spans(text, src)
-        decls[rel] = mod_decls(text, src)
+        payload = macro_payload_indices(tokens)
+        text, literal_text = reexport_token_views(src, tokens, payload)
+        spans, _ = test_spans(text)
+        decls[rel] = mod_decls(text, literal_text)
         sources[rel] = (src, tokens, spans)
 
     def target(rel, name, chain):
@@ -1763,14 +1911,16 @@ def reexport_sources(root):
 
 
 def reexport_errors(root):
-    """Require a reviewed allowlist entry for every production public import.
+    """Require review for every production public import and macro-payload use.
 
     An allowlisted use is permitted without claiming the chain pass follows
     its exported names. No visibility, owner or name-matching exemptions apply.
     """
     errors, present = [], {}
     for rel, (src, tokens, spans) in reexport_sources(root).items():
-        for tree, at in public_use_trees(src, tokens):
+        payload = macro_payload_indices(tokens)
+        uses = public_use_trees(src, tokens, payload) + macro_use_trees(tokens, payload)
+        for tree, at in uses:
             if not any(a <= at <= b for a, b in spans):
                 present[(rel, tree)] = src.count("\n", 0, at) + 1
     try:
@@ -1801,7 +1951,7 @@ def reexport_errors(root):
             errors.append("re-export allowlist (fail closed): stale entry %s %s" % ident)
     for (rel, tree), line in sorted(present.items()):
         if (rel, tree) not in allowed:
-            errors.append("re-export allowlist (fail closed): unreviewed pub use: %s:%d use %s;"
+            errors.append("re-export allowlist (fail closed): unreviewed pub use or macro use: %s:%d use %s;"
                           % (rel, line, tree))
     return errors
 
@@ -3157,7 +3307,7 @@ def regression_inventory_reexport_allowlist_requires_reason_and_schema():
         expect(any("re-export allowlist" in e for e in errors), errors)
 
 
-def compiled_reexport_fixture(files, test_cfg=False):
+def compiled_reexport_fixture(files, test_cfg=False, extra_cfg=()):
     """Build a real Rust fixture and return its classified inventory errors."""
     import subprocess
 
@@ -3170,6 +3320,8 @@ def compiled_reexport_fixture(files, test_cfg=False):
     root = fake(files)
     cmd = ["rustc", "--crate-name", "inventory_reexport_fixture", "--crate-type", "lib",
            "--edition=2021", "--emit=metadata", "--out-dir", root, "c/src/lib.rs"]
+    for value in extra_cfg:
+        cmd.extend(["--cfg", value])
     for cfg in ([], ["--cfg", "test"]) if test_cfg else ([],):
         try:
             compiled = subprocess.run(cmd + cfg, cwd=root, capture_output=True, text=True, timeout=30)
@@ -3288,6 +3440,77 @@ def regression_inventory_helper_walk_cfg_distinct_alias_bindings_refuse():
                 + REEXPORT_HASH % call),
         }, test_cfg=True)
         expect(any("unresolved use-alias chain (fail closed)" in e for e in errors), (imports, call, errors))
+
+
+def regression_inventory_reexport_allowlist_cfg_comments_cannot_hide_production():
+    """Regression: a comment's `test` hid production exports and modules."""
+    attr = '#[cfg(all(feature = "production", /* test */))]\n'
+    cases = (
+        {"c/src/lib.rs": attr + "pub use std::fs::read;\n"},
+        {"c/src/lib.rs": attr + "mod a { pub use std::fs::read; }\n"},
+        {"c/src/lib.rs": attr + "mod a;\n",
+         "c/src/a.rs": "pub use std::fs::read;\n"},
+        {"c/src/lib.rs": attr + '#[path = "exports.rs"] mod a;\n',
+         "c/src/exports.rs": "pub use std::fs::read;\n"},
+    )
+    for files in cases:
+        errors = compiled_reexport_fixture(files, extra_cfg=('feature="production"',))
+        expect(any("re-export allowlist (fail closed)" in e for e in errors), (files, errors))
+
+
+def regression_inventory_reexport_allowlist_macro_payloads_cannot_hide_use():
+    """Regression: macro visibility tokens hid a public use inside the payload."""
+    unwrap = ('macro_rules! unwrap_pub {\n'
+              '    (pub($($item:item)*)) => {$($item)*}\n'
+              '}\n')
+    invocations = (
+        "unwrap_pub! { pub(pub use std::fs::read;) }\n",
+        "unwrap_pub!(pub(pub use std::fs::read;));\n",
+        "unwrap_pub![pub(pub use std::fs::read;)];\n",
+        ('macro_rules! nested { ($($t:tt)*) => { unwrap_pub! { $($t)* } } }\n'
+         'nested! { pub(pub use std::fs::read;) }\n'),
+    )
+    for invocation in invocations:
+        errors = compiled_reexport_fixture({"c/src/lib.rs": unwrap + invocation})
+        expect(any("re-export allowlist (fail closed)" in e for e in errors), (invocation, errors))
+
+
+def regression_inventory_reexport_allowlist_macro_private_use_refuses():
+    """Regression: non-public use in a macro payload bypassed public-use checks."""
+    item_macro = 'macro_rules! items { ($($item:item)*) => {$($item)*} }\n'
+    invocations = (
+        "items! { use std::fs::read as read_index; }\n",
+        "items!(use std::fs::read as read_index;);\n",
+        "items![use std::fs::read as read_index;];\n",
+    )
+    for invocation in invocations:
+        errors = compiled_reexport_fixture({"c/src/lib.rs": item_macro + invocation})
+        expect(any("re-export allowlist (fail closed)" in e for e in errors), (invocation, errors))
+
+
+def regression_inventory_reexport_allowlist_macro_definition_use_refuses():
+    """Regression: a macro definition could introduce an unchecked import."""
+    source = ('macro_rules! read_macro {\n'
+              '    () => {{ use std::fs::read as read_index; }}\n'
+              '}\n'
+              'fn invoke() { read_macro!(); }\n')
+    errors = compiled_reexport_fixture({"c/src/lib.rs": source})
+    expect(any("re-export allowlist (fail closed)" in e for e in errors), errors)
+
+
+def regression_inventory_reexport_allowlist_macro_use_requires_review():
+    """Regression: macro imports need the same reviewed key as public imports."""
+    source = ('macro_rules! read_macro {\n'
+              '    () => {{ use std::fs::read as read_index; }}\n'
+              '}\n')
+    root = fake({"c/src/lib.rs": source})
+    errors = check(root, {"entries": []})
+    expect(any("re-export allowlist (fail closed)" in e for e in errors), errors)
+    write_reexport_fixture_allowlist(root, [{
+        "file": "c/src/lib.rs", "use": "std :: fs :: read as read_index",
+        "reason": "Fixture macro imports the file reader.",
+    }])
+    expect(check(root, {"entries": []}) == [], check(root, {"entries": []}))
 
 
 def self_test():
