@@ -12916,13 +12916,14 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    /// Regression: (#160 fix round): the failed first open removed the
+    /// Regression: (#160 fix round, #196): the failed first open removed the
     /// database name whenever a stat before SQLite's open found nothing, even
     /// when the name held another file by the time of the cleanup. A new
-    /// database the open created is removed; a file put at the name after
-    /// SQLite's open is left alone.
+    /// database the open created is removed. A file put at the name after
+    /// SQLite's open is left alone. The check proves the name still holds the
+    /// inode SQLite opened, not that this open created the file.
     #[test]
-    fn regression_failed_first_open_removes_only_the_database_it_opened() {
+    fn regression_failed_first_open_removes_its_new_database_and_keeps_a_swapped_in_file() {
         let dir = tempfile::tempdir().unwrap();
         let fresh = dir.path().canonicalize().unwrap().join("fresh");
         fs::create_dir(&fresh).unwrap();

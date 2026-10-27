@@ -1789,9 +1789,19 @@ and a message naming the database (logged once per inode). On
 Linux the check runs on an `O_PATH` descriptor, whose close releases nothing,
 and the file is then reopened through `/proc/self/fd`; `O_TRUNC` and the
 create mode apply only after the check. Elsewhere (macOS, or Linux without
-`/proc`) the refused descriptor, or one whose identity could not be read, is
-kept open for the life of the process (one descriptor per refused open).
-Remove the extra link to read the file. The
+`/proc`) the first refused descriptor of an inode, or one whose identity could
+not be read, is kept open for the life of the process. Further opens of that
+inode are refused before `open` once the external-alias epoch cap (one
+descriptor) is reached, including after the database registration is dropped
+and created again; those refusals keep no further descriptor. An exclusive
+create (`O_CREAT` with `O_EXCL`) over an existing name is `EEXIST` and does
+not open, including after the cap. Two opens that
+both pass the check before either is recorded can each keep one descriptor.
+An unidentified descriptor is still kept and does not count toward the cap.
+Linux `O_PATH` refusals do not count. Descriptors are not pooled. Remove the
+extra link to read the file while the database is open; while it is not
+registered the name opens normally, and the next registration of the same
+inode is refused again without another descriptor. The
 check never holds its lock across an open, so a FIFO under a payload name
 blocks only the request that opens it, never another overlay-database open.
 
@@ -1869,6 +1879,20 @@ checked `overlay pack --include-index` snapshot uses the checked family above
 (`"unix-posix"` on macOS). Managed byte readers are not connections; see
 [Internal reads of index and database files](#internal-reads-of-index-and-database-files).
 
+On an unsupported Unix ABI the overlay row above stays a refusal. Index, SQLAR,
+digest-cache and publication connections on that host stay ordinary default-VFS
+opens and are labeled `LegacyUnverified`: no descriptor check, no reuse check,
+and no pathname type check. On Linux glibc, macOS and Windows those same
+non-overlay connections stay ordinary default-VFS opens and are not
+`LegacyUnverified`. Windows overlay opens stay pathname type checks
+(`WindowsPathTypeOnly`). `disk_open_state` is that table (#196):
+
+| Host | Overlay database | Non-overlay disk DB |
+|---|---|---|
+| Verified Unix (64-bit little-endian Linux glibc, macOS) | Checked (`UnixDescriptor` or `UnixReuse`) | Ordinary default VFS |
+| Windows | Pathname type only (`WindowsPathTypeOnly`) | Ordinary default VFS |
+| Unsupported Unix | Refused | `LegacyUnverified` |
+
 The optional `sqlcipher` feature links SQLCipher's SQLite (older than 3.46.0),
 which is checked the same way. One difference: when its read-write open is
 refused, its read-only retry calls `open` again instead of reusing a parked
@@ -1939,7 +1963,11 @@ SQLAR byte probes; export-index inputs; shard artifact hashes; the private
 lookup copy of an index with a hot journal; and the sync of a published index.
 
 Not covered, by design of this slice (#196; each site has a residual entry with
-its reason, and the list is open): generic folder reads and backing extents,
+its reason, and the list is open). The rule for a `.sqlar` in the factory is:
+`FormatBackend::Sqlar`'s own `looks_like_sqlar` and `SqlarMountSource::open` are
+managed reads; every earlier backend's `looks_like_*` of that same file is a
+residual `File::open` (one open and close per backend) and stays uncovered.
+Also uncovered: generic folder reads and backing extents,
 overlay payload descriptors (admitted opens) and the TAR commit helper, the
 plain TAR backend, the HF payload cache and its repository backing, the range
 and payload caches (the payload-v1 header read and staging reopen included),

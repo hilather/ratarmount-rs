@@ -334,6 +334,12 @@ fn ordered_format_backends(use_backends: &[String]) -> Vec<FormatBackend> {
 }
 
 /// Try one format backend; `Ok(None)` means magic/extension check failed (try next).
+///
+/// #196: `FormatBackend::Sqlar`'s `looks_like_sqlar` and `SqlarMountSource::open`
+/// read through the managed byte reader. Every earlier backend's `looks_like_*`
+/// of the same `.sqlar` is a residual `File::open` — one open and close per
+/// backend, before the SQLAR backend runs. Protecting SQLAR's own probes does
+/// not protect those earlier probes of the chain.
 fn try_open_format_backend(
     path: &Path,
     backend: FormatBackend,
@@ -9705,8 +9711,12 @@ mod tests {
     /// Regression: (R11-S7, #151; live callers of the SQLAR byte probes,
     /// factory `FormatBackend::Sqlar`: `looks_like_sqlar` and
     /// `SqlarMountSource::open`): the factory's SQLAR probe read the file raw
-    /// and released the lock of a connection of this process on it. Only this
-    /// backend's own probes are covered, not earlier probes of the full chain.
+    /// and released the lock of a connection of this process on it.
+    ///
+    /// #196: the rule for the rest of the chain is the residual one. This test
+    /// calls only `FormatBackend::Sqlar`. Earlier backends' `looks_like_*`
+    /// (7z, zip, and the others ahead of SQLAR) still use `File::open`, one
+    /// open and close each, and are not covered here.
     #[cfg(all(unix, feature = "sqlar"))]
     #[test]
     fn regression_sqlar_header_probes_keep_sqlar_lock_factory() {
