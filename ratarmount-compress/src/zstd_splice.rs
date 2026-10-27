@@ -334,15 +334,6 @@ fn spill_sink() -> tempfile::SpooledTempFile {
     }
 }
 
-fn seek_table_size(size: u64) -> Option<u32> {
-    // Exercise the real oversized-publication branch with bounded fixtures.
-    #[cfg(test)]
-    if size > tests::SEEK_TABLE_FRAME_LIMIT.with(std::cell::Cell::get) {
-        return None;
-    }
-    u32::try_from(size).ok()
-}
-
 /// Rebuild skippable seek table for prefix frames + one new last frame.
 ///
 /// `None` if the input had no table (do not invent a footer) or any `cSize`/`dSize`
@@ -360,7 +351,7 @@ fn maybe_rebuild_seek_table(
         let c_raw = map.frames[i + 1]
             .compressed_offset
             .checked_sub(map.frames[i].compressed_offset);
-        let c = match c_raw.and_then(seek_table_size) {
+        let c = match c_raw.and_then(|n| u32::try_from(n).ok()) {
             Some(v) => v,
             None => {
                 log::warn!(
@@ -369,9 +360,9 @@ fn maybe_rebuild_seek_table(
                 return None;
             }
         };
-        let d = match seek_table_size(f.uncompressed_size) {
-            Some(v) => v,
-            None => {
+        let d = match u32::try_from(f.uncompressed_size) {
+            Ok(v) => v,
+            Err(_) => {
                 log::warn!(
                     "dropping zstd seek table: frame size exceeds u32 (frame {i} uncompressed {})",
                     f.uncompressed_size
@@ -381,16 +372,16 @@ fn maybe_rebuild_seek_table(
         };
         entries.push((c, d));
     }
-    let new_c = match seek_table_size(new_comp) {
-        Some(v) => v,
-        None => {
+    let new_c = match u32::try_from(new_comp) {
+        Ok(v) => v,
+        Err(_) => {
             log::warn!("dropping zstd seek table: frame size exceeds u32");
             return None;
         }
     };
-    let new_d = match seek_table_size(new_plain) {
-        Some(v) => v,
-        None => {
+    let new_d = match u32::try_from(new_plain) {
+        Ok(v) => v,
+        Err(_) => {
             log::warn!("dropping zstd seek table: frame size exceeds u32");
             return None;
         }

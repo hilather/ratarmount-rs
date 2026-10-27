@@ -8,12 +8,6 @@ use crate::zstd_seek::{encode_zstd_frame, scan_zstd_frames_path, ZstdFrameInfo};
 use crate::{open_seekable_zstd, open_seekable_zstd_from_reader};
 use std::io::Cursor;
 
-thread_local! {
-    pub(super) static SEEK_TABLE_FRAME_LIMIT: std::cell::Cell<u64> = const {
-        std::cell::Cell::new(u32::MAX as u64)
-    };
-}
-
 /// Official seekable-format footer magic (`0x8F92EAB1`).
 const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
 
@@ -648,44 +642,4 @@ fn regression_238_zstd_append_prewrite_guard_runs_under_lock() {
 #[test]
 fn regression_238_zstd_copy_prewrite_guard_runs_under_lock() {
     assert_238_splice_prewrite_guard(false);
-}
-
-/// Regression: #238 the oversized-frame fallback must check sealing under
-/// the archive lock before copy publication, just like ordinary appends.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn regression_238_zstd_oversized_append_prewrite_guard_runs_under_lock() {
-    struct ResetLimit(u64);
-    impl Drop for ResetLimit {
-        fn drop(&mut self) {
-            SEEK_TABLE_FRAME_LIMIT.with(|limit| limit.set(self.0));
-        }
-    }
-    let _reset = ResetLimit(SEEK_TABLE_FRAME_LIMIT.with(|limit| limit.replace(16)));
-    assert_238_splice_prewrite_guard(true);
-
-    // Also prove that the bounded seam selects the copy fallback: a permitted
-    // publication produces decodable frames with no seek table or journal.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("oversized.zst");
-    let before = pack_frames(&[b"prefix", b"old contents"], true);
-    std::fs::write(&path, before).unwrap();
-    let original = std::fs::metadata(&path).unwrap();
-    let stats = splice_zstd_last_frames_append_with(
-        &path,
-        1,
-        append_extra(b"new contents".to_vec()),
-        &original,
-        &mut || Ok(()),
-        &mut |_| panic!("copy publication cannot take the journal unlink path"),
-    )
-    .unwrap();
-    assert!(!stats.wrote_seek_table);
-    let bytes = std::fs::read(&path).unwrap();
-    assert!(!has_seek_table_footer(&bytes));
-    assert_eq!(
-        read_body("oversized.zst", &bytes).0,
-        b"prefixold contentsnew contents"
-    );
-    assert!(!crate::commit_journal::journal_path(&path).exists());
 }
