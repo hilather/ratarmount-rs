@@ -208,7 +208,9 @@ fn digest_rows(
 
 /// Seal against the supplied composed lower view. Legacy overlays get minimal
 /// metadata; callers must supply their base explicitly when none is recorded.
-/// A writer reservation covers fsck, hashing, and the atomic metadata update.
+/// A local archive's exclusive commit lock covers base resolution, hashing,
+/// and the complete seal. The overlay writer reservation is taken second.
+/// Callers whose opened base changed must reopen it and retry.
 /// Seal an overlay that is not sealed yet, over the base the opener served
 /// (`composed` is that base under the `--lower` layers: what the rows hash
 /// against). An overlay that recorded no kind (made by a released build)
@@ -256,12 +258,41 @@ pub(crate) fn seal_impl(
     identity: Option<&crate::ClassifiedBase>,
     lower_view: Arc<dyn MountSource>,
 ) -> io::Result<SealOutcome> {
+    // Every initial seal (CLI, import, upperdir, sandbox and public API) enters
+    // here. Match commit's lock order: archive first, then overlay database.
+    // Keep the guard through pending resolution, row hashing, COMMIT, sentinel
+    // creation and chmod. A DB reservation alone cannot exclude archive writes.
+    let archive =
+        identity.and_then(
+            |base| match (base.actual().kind(), base.actual().location()) {
+                (crate::BaseKind::Archive, Some(crate::BaseLocation::Local(path))) => {
+                    Some((base, path))
+                }
+                _ => None,
+            },
+        );
+    let _archive_guard = archive
+        .map(|(base, path)| {
+            let guard = ratarmount_compress::commit_journal::guard_seal(path)?;
+            if !base.source_matches_archive(guard.metadata()) {
+                return Err(io::Error::other(
+                    "archive changed since its base view was opened; reopen it and retry sealing",
+                ));
+            }
+            Ok(guard)
+        })
+        .transpose()?;
+    crate::write_overlay::test_operation_hold(
+        "RATARMOUNT_TEST_SEAL_LOCK_READY",
+        "RATARMOUNT_TEST_SEAL_LOCK_RELEASE",
+    )
+    .map_err(overlay_error)?;
     let root = root(dir)?;
     let required = std::cell::Cell::new(false);
     let meta = OverlayMeta::read_for_operation(dir, &required).map_err(overlay_error)?;
     #[cfg(test)]
     fire_once(&AFTER_INITIAL_READ);
-    if let Some(meta) = meta.filter(OverlayMeta::layer_sealed) {
+    if let Some(meta) = meta.as_ref().filter(|meta| meta.layer_sealed()) {
         check_hash_format(|key| meta.get(key))?;
         let layer_digest: String = meta
             .get("layer_digest")
@@ -303,6 +334,21 @@ pub(crate) fn seal_impl(
             "overlay has {} inconsistencies; run overlay fsck --repair",
             report.errors()
         )));
+    }
+    if let (Some((_, path)), Some(meta)) = (
+        archive,
+        OverlayMeta::from_opened(&conn).map_err(overlay_error)?,
+    ) {
+        if let Some(stamp) = check_archive_baseline(&meta, path)? {
+            OverlayMeta::set_many(
+                &conn,
+                &[
+                    ("base_size", &stamp.size.to_string()),
+                    ("base_mtime_ns", &stamp.mtime_ns.to_string()),
+                ],
+            )
+            .map_err(overlay_error)?;
+        }
     }
     let mut modes = BTreeMap::new();
     walk_modes(&root, "", &mut modes)?;
@@ -366,6 +412,45 @@ pub(crate) fn seal_impl(
         sealed_at,
         already_sealed: false,
     })
+}
+
+/// Commit releases its archive write guard before refreshing the baseline.
+/// Refuse that interval rather than sealing an old strong digest against a new
+/// archive. Accepted moves retain their caller's supplied-digest semantics.
+fn check_archive_baseline(
+    meta: &OverlayMeta,
+    archive: &Path,
+) -> io::Result<Option<ratarmount_index::ArchiveDigestStamp>> {
+    if meta.base_digest_kind().is_none_or(|kind| kind == "none")
+        || meta.get("base_local_path") != archive.to_str()
+    {
+        return Ok(None);
+    }
+    if let Some((size, mtime_ns)) = meta.get("base_size").zip(meta.get("base_mtime_ns")) {
+        let stamp = ratarmount_index::ArchiveDigestStamp::read(archive)?;
+        if size != stamp.size.to_string() || mtime_ns != stamp.mtime_ns.to_string() {
+            // A caller may have confirmed a byte-identical, retimestamped base
+            // with --base-digest. Preserve that case only after measuring its
+            // current digest under our archive lock; then advance its stamp
+            // in the seal transaction. A stale digest after commit must fail.
+            if meta.base_digest_kind() == Some("strong") {
+                let pending = crate::overlay_meta::PendingBase {
+                    path: archive.into(),
+                    index: meta.get("base_index_path").map(Into::into),
+                    size: stamp.size,
+                    mtime_ns: stamp.mtime_ns,
+                };
+                let digest = pending.hash(&|| Ok(())).map_err(overlay_error)?;
+                if meta.base_digest() == Some(digest.as_str()) {
+                    return Ok(Some(stamp));
+                }
+            }
+            return Err(io::Error::other(
+                "archive changed since its recorded base digest; retry sealing after the commit finishes",
+            ));
+        }
+    }
+    Ok(None)
 }
 
 fn write_sentinel(dir: &Path, layer_digest: &str) -> io::Result<()> {
@@ -444,6 +529,7 @@ thread_local! {
 }
 
 /// Remove seal metadata and restore owner write permission. Mode overrides stay.
+/// This never hashes or resolves the base, so it needs no archive lock.
 pub fn unseal(dir: &Path) -> io::Result<()> {
     let root = root(dir)?;
     // Probe before touching permissions, so a mounted overlay is never changed.
@@ -733,6 +819,106 @@ mod tests {
             .contains(&path.as_str())
         });
         (rows, tables, modes)
+    }
+
+    /// Regression: #238 a commit can finish its archive write before refreshing
+    /// its recorded strong digest. A freshly opened source alone cannot prove
+    /// that the old recorded baseline describes the archive being sealed.
+    #[test]
+    fn regression_238_seal_refuses_stale_strong_baseline() {
+        let f = Fixture::new();
+        let archive = f._tmp.path().join("archive.tar");
+        fs::write(&archive, b"old archive bytes").unwrap();
+        let archive = archive.canonicalize().unwrap();
+        let stamp = ratarmount_index::ArchiveDigestStamp::read(&archive).unwrap();
+        let digest = format!(
+            "sha256:{}",
+            ratarmount_index::sha256_hex(b"old archive bytes")
+        );
+        {
+            let conn = connection(&f.dir, false).unwrap();
+            OverlayMeta::set_many(
+                &conn,
+                &[
+                    ("base_kind", "archive"),
+                    ("base_url", archive.to_str().unwrap()),
+                    ("base_location", &format!("local:{}", archive.display())),
+                    ("base_local_path", archive.to_str().unwrap()),
+                    ("base_size", &stamp.size.to_string()),
+                    ("base_mtime_ns", &stamp.mtime_ns.to_string()),
+                    ("base_digest_kind", "strong"),
+                    ("base_digest", &digest),
+                ],
+            )
+            .unwrap();
+        }
+        // Model the interval after the archive write and before the commit's
+        // digest refresh. Classification happens after the new bytes landed.
+        fs::write(&archive, b"new, longer archive bytes").unwrap();
+        let base = crate::ClassifiedBase::for_tests(
+            f.base.clone(),
+            crate::ServedKind::Archive,
+            Some(crate::ServedLocation::Local(archive.clone())),
+        );
+        assert!(base.source_matches_archive(&fs::metadata(&archive).unwrap()));
+        let before = rows_and_modes(&f.dir);
+        super::seal(&f.dir, &base, f.base.clone())
+            .expect_err("a fresh source must not authorize sealing a stale recorded digest");
+        assert_eq!(
+            rows_and_modes(&f.dir),
+            before,
+            "seal mutated the old baseline"
+        );
+        assert!(!OverlayMeta::read(&f.dir).unwrap().unwrap().layer_sealed());
+        assert!(!f.dir.join(SENTINEL).exists());
+    }
+
+    /// Regression: #238 a changed stamp can still describe identical bytes.
+    /// Recheck the strong digest while locked and refresh the accepted stamp.
+    #[test]
+    fn regression_238_seal_refreshes_stamp_for_matching_strong_digest() {
+        let f = Fixture::new();
+        let archive = f._tmp.path().join("archive.tar");
+        fs::write(&archive, b"unchanged archive bytes").unwrap();
+        let archive = archive.canonicalize().unwrap();
+        let stamp = ratarmount_index::ArchiveDigestStamp::read(&archive).unwrap();
+        let digest = format!(
+            "sha256:{}",
+            ratarmount_index::sha256_hex(b"unchanged archive bytes")
+        );
+        {
+            let conn = connection(&f.dir, false).unwrap();
+            OverlayMeta::set_many(
+                &conn,
+                &[
+                    ("base_kind", "archive"),
+                    ("base_url", archive.to_str().unwrap()),
+                    ("base_location", &format!("local:{}", archive.display())),
+                    ("base_local_path", archive.to_str().unwrap()),
+                    ("base_size", &stamp.size.to_string()),
+                    ("base_mtime_ns", &(stamp.mtime_ns - 1).to_string()),
+                    ("base_digest_kind", "strong"),
+                    ("base_digest", &digest),
+                ],
+            )
+            .unwrap();
+        }
+        let base = crate::ClassifiedBase::for_tests(
+            f.base.clone(),
+            crate::ServedKind::Archive,
+            Some(crate::ServedLocation::Local(archive.clone())),
+        );
+        assert!(base.source_matches_archive(&fs::metadata(&archive).unwrap()));
+        super::seal(&f.dir, &base, f.base.clone()).unwrap();
+        let meta = OverlayMeta::read(&f.dir).unwrap().unwrap();
+        assert!(meta.layer_sealed());
+        assert_eq!(meta.base_digest(), Some(digest.as_str()));
+        assert_eq!(meta.get("base_size"), Some(stamp.size.to_string().as_str()));
+        assert_eq!(
+            meta.get("base_mtime_ns"),
+            Some(stamp.mtime_ns.to_string().as_str())
+        );
+        assert!(f.dir.join(SENTINEL).is_file());
     }
 
     fn pending_fixture() -> Fixture {

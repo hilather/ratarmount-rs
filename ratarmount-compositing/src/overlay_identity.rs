@@ -292,6 +292,9 @@ impl ActualBase {
 
 pub(crate) struct Inner {
     source: Arc<dyn MountSource>,
+    /// The local archive when this source was opened. A refreshed commit token
+    /// changes its identity, but keeps both this snapshot and the stale source.
+    source_metadata: Option<std::fs::Metadata>,
     actual: ActualBase,
     /// Shared with every refreshed token (never chained).
     _keep_alive: Arc<dyn Any + Send + Sync>,
@@ -1018,7 +1021,10 @@ impl ClassifiedBase {
             (BaseKind::Archive, Some(BaseLocation::Local(path))) => Some(path.clone()),
             _ => None,
         };
-        let file_id = local_archive.as_deref().and_then(FileId::of);
+        let source_metadata = local_archive
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).ok());
+        let file_id = source_metadata.as_ref().and_then(FileId::from_metadata);
         let typed_named = local_archive
             .as_ref()
             .filter(|_| !raw_first.contains("://"))
@@ -1039,6 +1045,7 @@ impl ClassifiedBase {
         Ok(Self {
             inner: Arc::new(Inner {
                 source,
+                source_metadata,
                 actual,
                 _keep_alive: Arc::from(keep_alive),
             }),
@@ -1054,6 +1061,15 @@ impl ClassifiedBase {
         &self.inner.actual
     }
 
+    /// Whether the opened source still describes the archive locked for seal.
+    /// Check under the archive lock: identity alone misses in-place commits.
+    pub(crate) fn source_matches_archive(&self, locked: &std::fs::Metadata) -> bool {
+        self.inner
+            .source_metadata
+            .as_ref()
+            .is_some_and(|opened| ratarmount_compress::commit_journal::same_stamp(opened, locked))
+    }
+
     /// The same token pointed at the archive a commit just wrote.
     pub(crate) fn repointed(&self, archive: &Path) -> Self {
         let mut actual = self.inner.actual.clone();
@@ -1064,6 +1080,7 @@ impl ClassifiedBase {
         Self {
             inner: Arc::new(Inner {
                 source: self.inner.source.clone(),
+                source_metadata: self.inner.source_metadata.clone(),
                 actual,
                 // The temporary files, if any, stay with the shared owner
                 // (not with the predecessor token, which would chain).
@@ -1447,6 +1464,45 @@ mod tests {
         );
         assert_eq!(moved.actual().git_tree(), None);
         assert!(Arc::ptr_eq(&cb.source(), &moved.source()));
+    }
+
+    /// Regression: #238 an opened archive source becomes stale after either
+    /// an in-place commit or a copy publication, even if its token is refreshed.
+    #[test]
+    fn regression_238_seal_source_snapshot_rejects_changed_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let archive = root.join("a.tar");
+        for replace in [false, true] {
+            std::fs::write(&archive, b"old archive bytes").unwrap();
+            let token = ClassifiedBase::for_tests(
+                folder(&root),
+                ServedKind::Archive,
+                Some(ServedLocation::Local(archive.clone())),
+            );
+            let original = std::fs::metadata(&archive).unwrap();
+            assert!(token.source_matches_archive(&original));
+            if replace {
+                // Same size and contents still changes the opened inode.
+                let staged = root.join("staged.tar");
+                std::fs::write(&staged, b"old archive bytes").unwrap();
+                std::fs::rename(staged, &archive).unwrap();
+            } else {
+                std::fs::write(&archive, b"new, longer archive bytes").unwrap();
+            }
+            let committed = std::fs::metadata(&archive).unwrap();
+            assert!(
+                !token.source_matches_archive(&committed),
+                "replace={replace}"
+            );
+            let refreshed = token.repointed(&archive);
+            assert!(Arc::ptr_eq(&token.source(), &refreshed.source()));
+            assert!(refreshed.source_matches_archive(&original));
+            assert!(
+                !refreshed.source_matches_archive(&committed),
+                "refreshing the identity must not refresh its stale source: replace={replace}"
+            );
+        }
     }
 
     /// Regression: every `repointed` hop kept its predecessor alive, so

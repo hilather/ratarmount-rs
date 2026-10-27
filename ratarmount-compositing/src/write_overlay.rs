@@ -8100,18 +8100,26 @@ fn confirm_commit(opts: &CommitOverlayOptions) -> Result<bool> {
 /// Explicit confirmation-time synchronization for subprocess regression tests.
 /// The existing exclusive no-follow marker helper avoids another file opener.
 fn test_commit_hold() -> Result<()> {
+    test_operation_hold(
+        "RATARMOUNT_TEST_COMMIT_READY",
+        "RATARMOUNT_TEST_COMMIT_RELEASE",
+    )
+}
+
+/// Bounded, explicit synchronization for subprocess regressions only.
+pub(crate) fn test_operation_hold(ready_env: &str, release_env: &str) -> Result<()> {
+    let _ = (ready_env, release_env);
     #[cfg(any(test, feature = "test-hooks"))]
-    if let (Some(ready), Some(release)) = (
-        std::env::var_os("RATARMOUNT_TEST_COMMIT_READY"),
-        std::env::var_os("RATARMOUNT_TEST_COMMIT_RELEASE"),
-    ) {
+    if let (Some(ready), Some(release)) =
+        (std::env::var_os(ready_env), std::env::var_os(release_env))
+    {
         create_overlay_marker(Path::new(&ready))?;
         let deadline = Instant::now() + Duration::from_secs(60);
         while !Path::new(&release).is_file() {
             if Instant::now() >= deadline {
-                return Err(OverlayError::Msg(
-                    "timed out waiting for commit test release".into(),
-                ));
+                return Err(OverlayError::Msg(format!(
+                    "timed out waiting for {release_env}"
+                )));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -8439,7 +8447,8 @@ fn commit_overlay_tar(
                 &opts.encoding,
                 &crate::journal_recovery::Rows::path(&db),
                 original,
-            &mut || ensure_overlay_unsealed(write_overlay))
+                &mut || ensure_overlay_unsealed(write_overlay),
+            )
         })();
         if canceled {
             return Ok(false);

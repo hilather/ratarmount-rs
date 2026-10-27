@@ -12660,6 +12660,31 @@
       "rule_reason": "recover through ratarmount_compositing::recover_journal_at with an Owner"
     },
     {
+      "configured_path": "std::fs::write",
+      "item": "ratarmount_compress::commit_journal::test_marker",
+      "leaf_digest": "d59414e0f6869d7f0de52e951ebd2f337bb7642bb2cb5a6f42cbd4cc9b1b1e0e",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "feature-test-hook",
+        "creation": {
+          "basis": "The test-hooks marker is explicit instrumentation output written with fs::write and ordinary umask permissions.",
+          "policy": "create-or-truncate"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-238-V2-M01",
+        "item": "ratarmount_compress::commit_journal::test_marker",
+        "reason": "Publish explicit readiness output for archive-lock contention and the prewrite regression hold."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-238-V2-M01\",\"item\":\"ratarmount_compress::commit_journal::test_marker\",\"disposition\":\"out-of-family\",\"category\":\"feature-test-hook\",\"reason\":\"Publish explicit readiness output for archive-lock contention and the prewrite regression hold.\",\"creation\":{\"policy\":\"create-or-truncate\",\"basis\":\"The test-hooks marker is explicit instrumentation output written with fs::write and ordinary umask permissions.\"}}",
+      "resolved": "std::fs::write",
+      "rule_reason": "inventory-op:fs::write"
+    },
+    {
       "configured_path": "std::fs::File::open",
       "item": "ratarmount_compress::commit_journal::unix::guard_copy",
       "leaf_digest": "7d3787d8232e8476c74ac31166147b2930ed49760c6cb46137412e55ca860984",

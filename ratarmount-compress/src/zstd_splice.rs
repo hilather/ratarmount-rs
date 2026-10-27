@@ -189,6 +189,7 @@ where
     let _guard = crate::commit_journal::guard_copy(path, &source)
         .map_err(|e| CompressError::Msg(e.to_string()))?;
     before_write()?;
+    crate::commit_journal::test_prewrite_hold()?;
     tmp.persist(path).map_err(|e| {
         CompressError::Msg(format!(
             "Failed to replace '{}' after zstd splice: {}",
@@ -298,6 +299,7 @@ where
         let _guard = crate::commit_journal::guard_copy(path, &source)
             .map_err(|e| CompressError::Msg(e.to_string()))?;
         before_write()?;
+        crate::commit_journal::test_prewrite_hold()?;
         tmp.persist(path).map_err(|e| e.error)?;
         return Ok(stats);
     }

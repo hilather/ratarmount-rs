@@ -1284,6 +1284,7 @@ pub(crate) fn publish_over(
             base_unusable: false,
         });
     }
+    commit_journal::test_prewrite_hold()?;
     publish().map_err(FailedReplace::from)
 }
 

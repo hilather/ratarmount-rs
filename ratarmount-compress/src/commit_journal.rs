@@ -135,6 +135,45 @@ pub mod fault {
     }
 }
 
+/// Publish an explicit test-hooks readiness marker. Ordinary builds do nothing.
+#[cfg(any(target_os = "linux", target_os = "macos", test, feature = "test-hooks"))]
+fn test_marker(variable: &str) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(path) = std::env::var_os(variable) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-238-V2-M01","item":"ratarmount_compress::commit_journal::test_marker","disposition":"out-of-family","category":"feature-test-hook","reason":"Publish explicit readiness output for archive-lock contention and the prewrite regression hold.","creation":{"policy":"create-or-truncate","basis":"The test-hooks marker is explicit instrumentation output written with fs::write and ordinary umask permissions."}}"###
+        )]
+        fs::write(path, b"ready")?;
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = variable;
+    Ok(())
+}
+
+/// Explicit test-only hold after the sealed check and before archive mutation.
+/// Copy publishers call this while holding their archive guard too.
+#[doc(hidden)]
+pub fn test_prewrite_hold() -> io::Result<()> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let (Some(_), Some(release)) = (
+        std::env::var_os("RATARMOUNT_TEST_PREWRITE_READY"),
+        std::env::var_os("RATARMOUNT_TEST_PREWRITE_RELEASE"),
+    ) {
+        test_marker("RATARMOUNT_TEST_PREWRITE_READY")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !Path::new(&release).is_file() {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "timed out waiting for prewrite test release",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    Ok(())
+}
+
 /// What recovery applied, read from the LOCKED descriptor right before the
 /// journal is unlinked: the only stamp a caller may record for the archive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -612,11 +651,37 @@ pub fn same_stamp(a: &fs::Metadata, b: &fs::Metadata) -> bool {
 pub struct CopyGuard {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     _lock: unix::Lock,
+    metadata: fs::Metadata,
+}
+
+impl CopyGuard {
+    /// The validated stamp of the archive protected by this guard.
+    pub fn metadata(&self) -> &fs::Metadata {
+        &self.metadata
+    }
+}
+
+/// Lock a local archive while resolving and sealing its overlay. This takes
+/// the same exclusive flock as replacement and copy publication, before any
+/// overlay database reservation. Hold it until sealing is complete.
+/// A commit that changes the archive while this waits causes refusal: callers
+/// must reopen the base and retry, rather than hash a stale lower view.
+pub fn guard_seal(archive: &Path) -> io::Result<CopyGuard> {
+    let source = fs::metadata(archive)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix::guard_copy(archive, &source)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Ok(CopyGuard { metadata: source })
+    }
 }
 
 /// Lock `archive` for a copy fallback that read the file `source` describes.
-/// Refused when the lock is busy, a journal or locator is pending, or the
-/// locked file is not exactly `source` (device, inode, length, mtime, ctime).
+/// Waits for an active commit or seal. Refused when a journal or locator is
+/// pending, or the locked file and current pathname are not exactly `source`
+/// (device, inode, length, mtime, ctime).
 /// Hold the guard until the copy has been renamed over the archive.
 pub fn guard_copy(archive: &Path, source: &fs::Metadata) -> io::Result<CopyGuard> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -626,7 +691,9 @@ pub fn guard_copy(archive: &Path, source: &fs::Metadata) -> io::Result<CopyGuard
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (archive, source);
-        Ok(CopyGuard {})
+        Ok(CopyGuard {
+            metadata: source.clone(),
+        })
     }
 }
 
@@ -652,16 +719,29 @@ mod unix {
             }
         }
     }
-    fn lock(file: &File) -> io::Result<Lock> {
+    fn lock(file: &File, wait: bool) -> io::Result<Lock> {
         #[expect(
             clippy::disallowed_methods,
             reason = r###"internal-read:v1 {"id":"IR-B0212-M01","item":"ratarmount_compress::commit_journal::unix::lock","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let owned = file.try_clone()?;
-        if unsafe { libc::flock(owned.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::last_os_error());
+        let mut operation = libc::LOCK_EX | libc::LOCK_NB;
+        loop {
+            if unsafe { libc::flock(owned.as_raw_fd(), operation) } == 0 {
+                return Ok(Lock(owned));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if wait && error.kind() == io::ErrorKind::WouldBlock {
+                fault::check("archive lock contended")?;
+                test_marker("RATARMOUNT_TEST_ARCHIVE_CONTENDED")?;
+                operation = libc::LOCK_EX;
+                continue;
+            }
+            return Err(error);
         }
-        Ok(Lock(owned))
     }
     fn parent(path: &Path) -> &Path {
         path.parent()
@@ -860,19 +940,22 @@ __inventory_value_1
             .map_err(refused)?;
         // Held until this function returns: the cleanup of a failed attempt
         // runs under the same lock.
-        let _lock = lock(&file).map_err(refused)?;
+        let _lock = lock(&file, true).map_err(refused)?;
         if let Some(e) =
             pending_refusal(&path, &file, "recover before preparing a commit").map_err(refused)?
         {
             return Err(refused(e));
         }
         let meta = file.metadata().map_err(refused)?;
-        if original.is_some_and(|old| !same_stamp(old, &meta)) {
+        if !same_stamp(&meta, &fs::metadata(&archive).map_err(refused)?)
+            || original.is_some_and(|old| !same_stamp(old, &meta))
+        {
             return Err(refused(io::Error::other(
                 "archive changed while preparing append; retry with a fresh plan",
             )));
         }
         before_write().map_err(refused)?;
+        test_prewrite_hold().map_err(refused)?;
         let mut attempt = Attempt::default();
         let error = match run(
             &mut file,
@@ -1133,7 +1216,7 @@ __inventory_value_1
             reason = r###"internal-read:v1 {"id":"IR-B0216-M01","item":"ratarmount_compress::commit_journal::unix::guard_copy","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let file = File::open(&archive)?;
-        let lock = lock(&file).map_err(|e| {
+        let lock = lock(&file, true).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!(
@@ -1147,12 +1230,16 @@ __inventory_value_1
         {
             return Err(e);
         }
-        if !same_stamp(source, &file.metadata()?) {
+        let metadata = file.metadata()?;
+        if !same_stamp(source, &metadata) || !same_stamp(&metadata, &fs::metadata(&archive)?) {
             return Err(io::Error::other(
                 "archive changed during the copy fallback; retry",
             ));
         }
-        Ok(CopyGuard { _lock: lock })
+        Ok(CopyGuard {
+            _lock: lock,
+            metadata,
+        })
     }
 
     fn mtime_ns(meta: &fs::Metadata) -> i128 {
@@ -1248,7 +1335,7 @@ let __inventory_value_1 = __inventory_value_0
 __inventory_value_1
 }
             .map_err(|e| journal_error(&probed, e))?;
-        let _lock = lock(&file).map_err(|e| journal_error(&probed, e))?;
+        let _lock = lock(&file, false).map_err(|e| journal_error(&probed, e))?;
         // Another recovering opener may have won, or another opener (through a
         // hard link) may have started a different journal: BOTH the state and
         // the journal path come from the locked descriptor's marker.
