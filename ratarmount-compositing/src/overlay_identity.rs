@@ -68,6 +68,9 @@ pub struct Opened {
     /// Read-only peek target for a cached digest when the index itself stays
     /// in memory (offline verbs).
     pub sidecar_candidate: Option<PathBuf>,
+    /// Shared indexes are prepared immutable inputs; identity reads must obey
+    /// the same policy as the source opener.
+    pub read_only_index: bool,
     /// The first source was fetched to a temporary local copy.
     pub fetched: bool,
     /// Keeps fetched temporary files alive for as long as the token lives.
@@ -142,6 +145,7 @@ pub struct ActualBase {
     pub(crate) git_tree: Option<String>,
     pub(crate) remote_token: Option<String>,
     pub(crate) index_for_peek: Option<PathBuf>,
+    pub(crate) read_only_index: bool,
     /// The index the opener selected (never a credentialed one).
     pub(crate) index_path: Option<PathBuf>,
     /// Device and inode of a local archive when the token was minted (or last
@@ -245,6 +249,10 @@ impl ActualBase {
     pub fn index_for_peek(&self) -> Option<&Path> {
         self.index_for_peek.as_deref()
     }
+    /// Whether selected indexes must be read as immutable prepared artifacts.
+    pub fn read_only_index(&self) -> bool {
+        self.read_only_index
+    }
 
     /// The creation input the overlay database is initialized from. The only
     /// way to build an [`OverlayCreateInfo`]: nothing here names a base the
@@ -270,6 +278,8 @@ impl ActualBase {
                 .index_path
                 .clone()
                 .filter(|_| options.index_writable && !self.credentialed),
+            prepared_index_for_peek: self.index_for_peek.clone(),
+            read_only_index: self.read_only_index,
             git_tree: self.git_tree.clone(),
             remote_token: self
                 .remote_token
@@ -323,6 +333,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -351,6 +362,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -379,6 +391,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -407,6 +420,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -436,6 +450,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -450,6 +465,7 @@ impl Inner {
 ///     git_tree: None,
 ///     remote_token: None,
 ///     index_for_peek: None,
+///     read_only_index: false,
 ///     index_path: None,
 ///     file_id: None,
 ///     typed_named: None,
@@ -473,6 +489,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -504,6 +521,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -532,6 +550,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -560,6 +579,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -588,6 +608,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -616,6 +637,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -645,6 +667,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -677,6 +700,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -704,6 +728,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -744,6 +769,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -771,6 +797,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -800,6 +827,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -826,6 +854,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -856,6 +885,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -882,6 +912,7 @@ impl Inner {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -925,6 +956,7 @@ impl ClassifiedBase {
             location,
             index,
             sidecar_candidate,
+            read_only_index,
             fetched: _,
             keep_alive,
         } = opened;
@@ -977,7 +1009,8 @@ impl ClassifiedBase {
                 IndexProvenance::Local(path) | IndexProvenance::Discovered { path, .. } => {
                     Some(path)
                 }
-                IndexProvenance::None => sidecar_candidate,
+                IndexProvenance::None if !read_only_index => sidecar_candidate,
+                IndexProvenance::None => None,
             },
             _ => None,
         };
@@ -998,6 +1031,7 @@ impl ClassifiedBase {
             git_tree,
             remote_token,
             index_for_peek,
+            read_only_index,
             index_path,
             file_id,
             typed_named,
@@ -1052,6 +1086,7 @@ impl ClassifiedBase {
             location,
             index: IndexProvenance::None,
             sidecar_candidate: None,
+            read_only_index: false,
             fetched: false,
             keep_alive: Box::new(()),
         })
@@ -1074,6 +1109,7 @@ impl ClassifiedBase {
             location,
             index: IndexProvenance::None,
             sidecar_candidate: None,
+            read_only_index: false,
             fetched: false,
             keep_alive: Box::new(()),
         })
@@ -1102,6 +1138,7 @@ impl ClassifiedBase {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -1135,6 +1172,7 @@ impl ClassifiedBase {
 /// #             location: Some(ServedLocation::Local(dir)),
 /// #             index: IndexProvenance::None,
 /// #             sidecar_candidate: None,
+/// #             read_only_index: false,
 /// #             fetched: false,
 /// #             keep_alive: Box::new(()),
 /// #         })
@@ -1219,6 +1257,7 @@ mod tests {
             location: None,
             index: IndexProvenance::None,
             sidecar_candidate: None,
+            read_only_index: false,
             fetched: false,
             keep_alive: Box::new(()),
         }
@@ -1432,6 +1471,7 @@ mod tests {
             location: None,
             index: IndexProvenance::None,
             sidecar_candidate: None,
+            read_only_index: false,
             fetched: false,
             keep_alive: Box::new(Sentinel(drops.clone())),
         })

@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use ratarmount_index::{peek_archive_digest, ArchiveDigestStamp};
+use ratarmount_index::{peek_archive_digest_for_open, ArchiveDigestStamp};
 use rusqlite::Connection;
 
 use crate::overlay_identity::{ActualBase, BaseKind, BaseLocation, ClassifiedBase};
@@ -93,6 +93,9 @@ pub enum Verdict {
     /// Same kind at the same place (or a local move): compare content.
     Content,
     Refuse(String),
+    /// A selected prepared index could not be read safely; this is not a base
+    /// mismatch and cannot be overridden with force-base-mismatch.
+    PreparationError(String),
 }
 
 impl Verdict {
@@ -164,11 +167,21 @@ pub fn shape_verdict(
             Some(supplied) => Some(supplied) == recorded_digest,
             None => match actual.location() {
                 Some(BaseLocation::Local(path)) => {
-                    peek_archive_digest(path, actual.index_for_peek())
-                        .ok()
-                        .flatten()
-                        .as_deref()
-                        == recorded_digest
+                    let cached = peek_archive_digest_for_open(
+                        path,
+                        actual.index_for_peek(),
+                        actual.read_only_index(),
+                    );
+                    let cached = match cached {
+                        Ok(cached) => cached,
+                        Err(error) if actual.read_only_index() => {
+                            return Verdict::PreparationError(format!(
+                                "cannot read prepared base digest cache: {error}"
+                            ));
+                        }
+                        Err(_) => None,
+                    };
+                    cached.as_deref() == recorded_digest
                 }
                 _ => false,
             },
@@ -198,6 +211,7 @@ fn content_probe<'a>(
         git_tree: actual.git_tree(),
         supplied: probe.supplied,
         index: actual.index_for_peek(),
+        read_only_index: actual.read_only_index(),
         extra_excludes: probe.extra_excludes,
     }
 }
@@ -230,6 +244,7 @@ pub fn compare_base_identity(
             ..Default::default()
         }),
         Verdict::Content => overlay_meta::compare_content(meta, &content_probe(actual, probe)),
+        Verdict::PreparationError(reason) => Err(reason),
     }
 }
 
@@ -471,16 +486,20 @@ pub fn verify_base(dir: &Path, base: &ClassifiedBase) -> BaseCheck {
         supplied: None,
         extra_excludes: &[],
     };
-    if let Verdict::Refuse(current) = shape_verdict(meta.as_ref(), actual, &probe) {
-        return BaseCheck::Mismatch {
-            recorded: meta
-                .as_ref()
-                .and_then(|m| m.get("base_kind"))
-                .unwrap_or("unknown")
-                .to_owned(),
-            current,
-            strength: BaseStrength::Strong,
-        };
+    match shape_verdict(meta.as_ref(), actual, &probe) {
+        Verdict::Refuse(current) => {
+            return BaseCheck::Mismatch {
+                recorded: meta
+                    .as_ref()
+                    .and_then(|m| m.get("base_kind"))
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                current,
+                strength: BaseStrength::Strong,
+            };
+        }
+        Verdict::PreparationError(reason) => return BaseCheck::Skipped { reason },
+        _ => {}
     }
     match (actual.kind(), actual.location()) {
         (BaseKind::Git, _) => BaseCheck::Skipped {
@@ -1205,6 +1224,7 @@ mod tests {
             location: Some(ServedLocation::Local(place.archive.clone())),
             index: IndexProvenance::None,
             sidecar_candidate: Some(index),
+            read_only_index: false,
             fetched: false,
             keep_alive: Box::new(()),
         })

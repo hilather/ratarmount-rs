@@ -757,6 +757,8 @@ fn open_base(base: &Base, indexes: &Path) -> Result<factory::MountBundle> {
     let mut options = ratarmount_core::OpenOptions {
         index_folders: vec![indexes.into()],
         write_index: false,
+        read_only_index: true,
+        recover_journals: false,
         git_synthetic_head: base.options.git_synthetic_head,
         recursive: base.options.recursive,
         recursion_depth: base.options.recursive.then_some(-1),

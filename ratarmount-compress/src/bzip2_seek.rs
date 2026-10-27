@@ -676,6 +676,11 @@ fn blocks_from_bzip2_blocks(
             "bzip2blocks map needs at least one block start and an EOS sentinel".into(),
         ));
     }
+    if pairs[0].1 != 0 {
+        return Err(CompressError::Msg(
+            "bzip2blocks requires an initial block at data offset 0".into(),
+        ));
+    }
     for window in pairs.windows(2) {
         let (c0, d0) = window[0];
         let (c1, d1) = window[1];
@@ -691,6 +696,7 @@ fn blocks_from_bzip2_blocks(
         }
     }
 
+    validate_bzip2_blocks_terminal(store, pairs[pairs.len() - 1].0)?;
     let mut header = read_bzh_header_at(store, 0)?;
     let mut blocks = Vec::with_capacity(pairs.len().saturating_sub(1));
     // Last pair is always EOS; only consider starts among pairs[0..len-1].
@@ -725,6 +731,31 @@ fn blocks_from_bzip2_blocks(
     }
     let total_uncomp = pairs[pairs.len() - 1].1;
     Ok((blocks, total_uncomp))
+}
+
+/// Check the exact terminal bit alignment without scanning or decoding blocks.
+fn validate_bzip2_blocks_terminal(store: &CompressedStore, eos_bit: u64) -> Result<()> {
+    let end = eos_bit
+        .checked_add(80)
+        .filter(|n| n.div_ceil(8) <= store.len())
+        .ok_or_else(|| {
+            CompressError::Msg("bzip2blocks terminal EOS/CRC is truncated or out of bounds".into())
+        })?;
+    let first_byte = eos_bit / 8;
+    let count = (end.div_ceil(8) - first_byte) as usize;
+    let mut bytes = [0; 11];
+    store.read_exact_at(first_byte, &mut bytes[..count])?;
+    if read_bits_msb(&bytes[..count], eos_bit % 8, 48) != Some(EOS_MAGIC) {
+        return Err(CompressError::Msg(
+            "bzip2blocks terminal sentinel is not a genuine EOS marker".into(),
+        ));
+    }
+    if read_header_after_eos(store, eos_bit).is_ok() {
+        return Err(CompressError::Msg(
+            "bzip2blocks terminal sentinel omits a following BZh stream".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Read a 4-byte `BZh[1-9]` header at absolute byte `offset`.
@@ -2283,5 +2314,99 @@ mod tests {
         assert!(blocks_from_bzip2_blocks(&[(32, 10), (100, 5)], &store).is_err());
         // Only EOS-like pairs with no real data growth.
         assert!(blocks_from_bzip2_blocks(&[(32, 0), (100, 0)], &store).is_err());
+    }
+
+    fn prepared_bzip2_fixture() -> (Vec<u8>, Vec<(u64, u64)>, Vec<u8>) {
+        let data = multi_block_payload();
+        let bytes = encode_bz2_level(&data, 1);
+        let pairs =
+            export_bzip2_blocks_from_reader(&mut std::io::Cursor::new(bytes.clone())).unwrap();
+        assert!(pairs.len() >= 3);
+        (bytes, pairs, data)
+    }
+
+    fn prepared_bzip2_refuses_both(bytes: &[u8], pairs: &[(u64, u64)], symptom: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prepared.bz2");
+        std::fs::write(&path, bytes).unwrap();
+        let a = SeekableBzip2::open_with_bzip2_blocks(&path, 1, pairs)
+            .err()
+            .expect("path must refuse");
+        let b = SeekableBzip2::open_with_bzip2_blocks_from_reader(
+            std::io::Cursor::new(bytes.to_vec()),
+            1,
+            &path,
+            pairs,
+        )
+        .err()
+        .expect("reader must refuse");
+        for e in [a, b] {
+            assert!(e.to_string().contains(symptom), "{e}");
+        }
+    }
+
+    /// Regression: bzip2 suffix maps expose later data as offset zero.
+    #[test]
+    fn regression_prepared_index_bzip2_usable_state_requires_initial_block() {
+        let (bytes, pairs, _) = prepared_bzip2_fixture();
+        assert_eq!(pairs[0].0, 32);
+        prepared_bzip2_refuses_both(&bytes, &pairs[1..], "initial block");
+        prepared_bzip2_refuses_both(&bytes, &[], "EOS sentinel");
+        let mut unordered = pairs.clone();
+        unordered.swap(1, 2);
+        prepared_bzip2_refuses_both(&bytes, &unordered, "increasing");
+    }
+
+    /// Regression: only a real final EOS with all CRC bits can terminate a bzip2 map.
+    #[test]
+    fn regression_prepared_index_bzip2_requires_genuine_terminal_sentinel() {
+        let (bytes, pairs, _) = prepared_bzip2_fixture();
+        prepared_bzip2_refuses_both(&bytes, &pairs[..pairs.len() - 1], "terminal sentinel");
+        let mut outside = pairs.clone();
+        outside.last_mut().unwrap().0 = u64::MAX;
+        prepared_bzip2_refuses_both(&bytes, &outside, "terminal EOS/CRC");
+        prepared_bzip2_refuses_both(&bytes[..bytes.len() - 3], &pairs, "terminal EOS/CRC");
+        let mut joined = bytes.clone();
+        joined.extend(encode_bz2(b"omitted later stream"));
+        prepared_bzip2_refuses_both(&joined, &pairs, "following BZh stream");
+    }
+
+    /// Regression: valid bit-32 starts and padded concatenated streams retain final bytes.
+    #[test]
+    fn regression_prepared_index_bzip2_terminal_preserves_multistream_tails() {
+        let (base, _, mut data) = prepared_bzip2_fixture();
+        data.extend(b"final member");
+        for tail in [&b""[..], &b"trailing non-BZh bytes"[..]] {
+            let mut bytes = base.clone();
+            bytes.extend([0; 3]);
+            bytes.extend(encode_bz2(b"final member"));
+            bytes.extend([0; 2]);
+            bytes.extend(tail);
+            let pairs =
+                export_bzip2_blocks_from_reader(&mut std::io::Cursor::new(bytes.clone())).unwrap();
+            assert_eq!(pairs[0].0, 32);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tails.bz2");
+            std::fs::write(&path, &bytes).unwrap();
+            let a = SeekableBzip2::open_with_bzip2_blocks(&path, 1, &pairs).unwrap();
+            let b = SeekableBzip2::open_with_bzip2_blocks_from_reader(
+                std::io::Cursor::new(bytes),
+                1,
+                &path,
+                &pairs,
+            )
+            .unwrap();
+            for body in [a, b] {
+                assert_eq!(body.size(), data.len() as u64);
+                let mut got = Vec::new();
+                body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+                assert_eq!(got, data);
+                let mut r = body.open_reader().unwrap();
+                r.seek(SeekFrom::End(-5)).unwrap();
+                let mut last = [0; 5];
+                r.read_exact(&mut last).unwrap();
+                assert_eq!(&last, &data[data.len() - 5..]);
+            }
+        }
     }
 }

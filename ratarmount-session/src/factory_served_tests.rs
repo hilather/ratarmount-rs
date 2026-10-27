@@ -342,6 +342,7 @@ fn regression_served_kind_table_fetched_and_torrent() {
     let source: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(&root).unwrap());
     let opened =
         |path: &str, kind: ServedKind, local: bool, fetched: bool| remote_open::RemoteOpened {
+            actual_artifact: None,
             path: PathBuf::from(path),
             source: source.clone(),
             kind,

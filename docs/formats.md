@@ -144,7 +144,8 @@ names, then a `Link: rel="describedby"` header on the archive, then the
 well-known `{url}.index.sqlite` (also `.gz`, `.zst`, `.xz`, `.bz2`). OCI images
 look up a referrer with media type `application/vnd.ratarmount.index.v1+sqlite`.
 Every candidate is validated against the archive's size and content
-fingerprint before use, so a stale index is rebuilt rather than trusted.
+fingerprint before use. Ordinary mounts can rebuild stale indexes;
+`--no-recreate-index` refuses detected preparation failures instead.
 
 ## Nested archives
 
@@ -253,3 +254,37 @@ The complete status against the Python original is in the
 
 Remote, export and platform limits are listed with their own guides:
 [Remote inputs](phase10-remote.md#not-yet) · [NFS](nfs-export.md) · [other exports](export.md) · [macOS](macos.md).
+
+### Shared prepared indexes
+
+For concurrent writable workers, prepare the local base/index once, then treat
+both as immutable until every worker has stopped. `--no-recreate-index` opens
+self-contained prepared SQLite artifacts immutably: a pending rollback journal
+or nonempty WAL is refused instead of recovered or checkpointed. A zero-length
+WAL and leftover SHM can be ignored without touching them. Native archive
+catalogs require schema validation and matching backend/tarstats identity;
+compression-only shells use matching tarstats and validated codec seek state
+without requiring native `backendName` metadata. These checks detect specific
+preparation failures; they do not validate every possible catalog defect (for
+example, every required `files` column).
+
+Required gzip/zstd/bzip2 seek state must be present and usable. Missing,
+damaged or wrong-codec state fails closed. Imported maps require initial
+coverage; zstd/bzip2 also check a genuine terminal boundary against the source.
+Valid zstd seek-table and
+skippable-frame tails and bzip2 padded multistream/trailing-data tails remain
+supported. Strict G3 gzip uses nonempty prepared RGZI checkpoints with initial
+coverage; it refuses GZIDX to avoid its internal repair fallback. The optional
+rapidgzip importer can use compatible prepared data; prepare and consume with
+compatible selected backends.
+
+Single-block bzip2 cannot currently persist the block map required by strict
+workers: preparation refuses with `single-block bzip2 cannot be prepared for
+read-only workers`. Use multi-block bzip2 or another supported prepared format.
+Compressed non-TAR readers that always build a file table also remain a limit:
+`base.zip.gz` can prepare normally, but a strict worker refuses its required
+reader rebuild. This adds no warm-reader support for those formats. Unindexed
+sources and ordinary-file binds need no external SQLite sidecar. Private nested
+computation is allowed; writes to the shared outer index remain disabled.
+
+See the [prepare-once, N-worker recipe](sandbox.md#prepare-once-n-writable-workers).

@@ -306,6 +306,7 @@ impl SevenZipMountSource {
                         );
                         return Ok(s);
                     }
+                    Err(e) if options.read_only_index => return Err(e),
                     Err(e) => {
                         debug!(
                             "7z open_from_reader: existing index {} unusable ({e}); rebuilding",
@@ -332,7 +333,7 @@ impl SevenZipMountSource {
     ) -> Result<Self> {
         // Index + fingerprint first (same order as TAR/ZIP): reject a sibling
         // index for a replaced archive before paying for header parse.
-        let index = SqliteIndex::open_read_only(index_path)?;
+        let index = SqliteIndex::open_read_only_for_open(index_path, options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
         // Missing tarstats still Ok (legacy indexes).
@@ -1671,6 +1672,96 @@ impl MountSource for SevenZipMountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Small copy-only archive assembled without an external 7z executable.
+    fn prepared_copy_7z() -> Vec<u8> {
+        let payload = b"worker base";
+        let n = payload.len() as u8;
+        let mut header = vec![
+            1, 4, 6, 0, 1, 9, n, 0, 7, 11, 1, 0, 1, 1, 0, 12, n, 0, 0, 5, 1, 17, 21, 0,
+        ];
+        for unit in "hello.txt\0".encode_utf16() {
+            header.extend_from_slice(&unit.to_le_bytes());
+        }
+        header.extend_from_slice(&[0, 0]);
+        let mut start = (payload.len() as u64).to_le_bytes().to_vec();
+        start.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        start.extend_from_slice(&parse::crc32(&header).to_le_bytes());
+        let mut bytes = parse::MAGIC_7Z.to_vec();
+        bytes.extend_from_slice(&[0, 4]);
+        bytes.extend_from_slice(&parse::crc32(&start).to_le_bytes());
+        bytes.extend(start);
+        bytes.extend(payload);
+        bytes.extend(header);
+        bytes
+    }
+
+    /// Regression: a strict warm worker must read members without changing its prepared sidecar.
+    #[test]
+    fn regression_prepared_index_warm_open_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.sevenzip");
+        let index = dir.path().join("index.sqlite");
+        let fixture = prepared_copy_7z();
+        std::fs::write(&archive, &fixture).unwrap();
+        drop(
+            SevenZipMountSource::open(
+                &archive,
+                Some(&index),
+                &OpenOptions::default(),
+                "test",
+                true,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&index).unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let source =
+            SevenZipMountSource::open(&archive, Some(&index), &options, "test", false).unwrap();
+        let member = "/hello.txt".to_owned();
+        let info = source.lookup(&member, 0).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut source.open(&info, 0).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, b"worker base");
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(source);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
+    /// Regression: a detected invalid warm catalog cannot fall through to index rebuilding.
+    #[test]
+    fn regression_prepared_index_invalid_warm_open_refuses_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.sevenzip");
+        let index = dir.path().join("index.sqlite");
+        std::fs::write(&archive, prepared_copy_7z()).unwrap();
+        std::fs::write(&index, b"invalid prepared catalog").unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        assert!(
+            SevenZipMountSource::open(&archive, Some(&index), &options, "test", false).is_err()
+        );
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
     use ratarmount_index::hash_hex;
 
     fn py_fixture(name: &str) -> PathBuf {

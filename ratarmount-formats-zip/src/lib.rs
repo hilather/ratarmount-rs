@@ -750,6 +750,7 @@ impl ZipMountSource {
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
+                        Err(e) if options.read_only_index => return Err(e),
                         Err(e) => eprintln!("info: could not load zip index ({e}); rebuilding"),
                     }
                 }
@@ -769,7 +770,7 @@ impl ZipMountSource {
         index_path: &Path,
         options: &OpenOptions,
     ) -> Result<Self> {
-        let index = SqliteIndex::open_read_only(index_path)?;
+        let index = SqliteIndex::open_read_only_for_open(index_path, options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Reject sibling indexes for a replaced archive (size/mtime fingerprint).
         index.check_tarstats_matches_archive(archive_path)?;
@@ -2537,6 +2538,70 @@ fn days_from_civil(y: i32, m: i32, d: i32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Regression: a strict warm worker must read members without changing its prepared sidecar.
+    #[test]
+    fn regression_prepared_index_warm_open_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.zip");
+        let index = dir.path().join("index.sqlite");
+        let fixture = sample_zip_bytes("hello.txt", b"worker base");
+        std::fs::write(&archive, &fixture).unwrap();
+        drop(
+            ZipMountSource::open(
+                &archive,
+                Some(&index),
+                &OpenOptions::default(),
+                "test",
+                true,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&index).unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let source = ZipMountSource::open(&archive, Some(&index), &options, "test", false).unwrap();
+        let member = "/hello.txt".to_owned();
+        let info = source.lookup(&member, 0).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut source.open(&info, 0).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, b"worker base");
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(source);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
+    /// Regression: a detected invalid warm catalog cannot fall through to index rebuilding.
+    #[test]
+    fn regression_prepared_index_invalid_warm_open_refuses_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.zip");
+        let index = dir.path().join("index.sqlite");
+        std::fs::write(&archive, sample_zip_bytes("hello.txt", b"worker base")).unwrap();
+        std::fs::write(&index, b"invalid prepared catalog").unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        assert!(ZipMountSource::open(&archive, Some(&index), &options, "test", false).is_err());
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
     use std::io::Write;
     use zip::write::SimpleFileOptions;
     use zip::{AesMode, ZipWriter};

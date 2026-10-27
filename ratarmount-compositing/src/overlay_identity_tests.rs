@@ -311,6 +311,7 @@ fn regression_remote_base_without_scheme_creates_without_digest_lookup() {
             location: Some(ServedLocation::Remote(typed.to_owned())),
             index: crate::IndexProvenance::None,
             sidecar_candidate: None,
+            read_only_index: false,
             fetched: false,
             keep_alive: Box::new(()),
         })
@@ -892,6 +893,7 @@ fn regression_repo_stable_over_main_updates_base_url() {
             location: Some(ServedLocation::Local(repo.clone())),
             index: crate::IndexProvenance::None,
             sidecar_candidate: None,
+            read_only_index: false,
             fetched: false,
             keep_alive: Box::new(()),
         })
@@ -919,6 +921,7 @@ fn regression_repo_stable_over_main_updates_base_url() {
         location: Some(ServedLocation::Local(repo.clone())),
         index: crate::IndexProvenance::None,
         sidecar_candidate: None,
+        read_only_index: false,
         fetched: false,
         keep_alive: Box::new(()),
     })
@@ -1656,6 +1659,7 @@ fn regression_accepted_archive_move_repoints_base_index_path() {
                     crate::IndexProvenance::Local(path.to_path_buf())
                 }),
                 sidecar_candidate: None,
+                read_only_index: false,
                 fetched: false,
                 keep_alive: Box::new(()),
             })
@@ -6169,6 +6173,258 @@ fn regression_offline_recovery_follows_a_symlinked_database() {
         &fx.archive,
     )
     .unwrap();
+}
+
+struct PreparedIdentityFixture {
+    _tmp: tempfile::TempDir,
+    prepared: PathBuf,
+    archive: PathBuf,
+    index: PathBuf,
+    overlay: PathBuf,
+    digest: String,
+}
+
+impl PreparedIdentityFixture {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let prepared = tmp.path().join("prepared");
+        fs::create_dir(&prepared).unwrap();
+        let archive = prepared.join("base.tar");
+        let index = prepared.join("base.sqlite");
+        let overlay = tmp.path().join("overlay");
+        write_tar(&archive, &[("first", b"shared immutable member")]);
+        drop(
+            ratarmount_formats_tar::SqliteIndexedTar::create_index(
+                &archive,
+                &archive,
+                Some(&index),
+                &ratarmount_core::OpenOptions::default(),
+                "test",
+                &mut None,
+            )
+            .unwrap(),
+        );
+        let digest = ratarmount_index::cached_archive_digest(&archive, Some(&index)).unwrap();
+        let fixture = Self {
+            _tmp: tmp,
+            prepared,
+            archive,
+            index,
+            overlay,
+            digest,
+        };
+        let base = fixture.token(false, true);
+        drop(
+            WriteOverlay::open(
+                &base,
+                base.source(),
+                &fixture.overlay,
+                &CreateOptions {
+                    index_writable: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        drop(base);
+        assert_eq!(
+            OverlayMeta::read(&fixture.overlay)
+                .unwrap()
+                .unwrap()
+                .base_digest_kind(),
+            Some("strong")
+        );
+        ratarmount_index::SqliteIndex::finalize_prepared(&fixture.index).unwrap();
+        fixture
+    }
+
+    fn token(&self, strict: bool, selected: bool) -> ClassifiedBase {
+        let source = if strict && selected {
+            Arc::new(
+                ratarmount_formats_tar::SqliteIndexedTar::open_with_existing_index(
+                    &self.archive,
+                    &self.archive,
+                    &self.index,
+                    ratarmount_core::OpenOptions {
+                        read_only_index: true,
+                        write_index: false,
+                        ..Default::default()
+                    },
+                    &mut None,
+                )
+                .unwrap(),
+            ) as Arc<dyn MountSource>
+        } else {
+            open_tar(&self.archive)
+        };
+        self.token_with_source(source, strict, selected)
+    }
+
+    fn token_with_source(
+        &self,
+        source: Arc<dyn MountSource>,
+        strict: bool,
+        selected: bool,
+    ) -> ClassifiedBase {
+        ClassifiedBase::mint(crate::Opened {
+            source,
+            kind: ServedKind::Archive,
+            inputs: vec![self.archive.to_string_lossy().into_owned()],
+            location: Some(ServedLocation::Local(self.archive.clone())),
+            index: if selected {
+                crate::IndexProvenance::Local(self.index.clone())
+            } else {
+                crate::IndexProvenance::None
+            },
+            sidecar_candidate: Some(self.index.clone()),
+            read_only_index: strict,
+            fetched: false,
+            keep_alive: Box::new(()),
+        })
+        .unwrap()
+    }
+
+    fn companions(&self) {
+        // SQLite leaves a WAL-mode header after its last producer closes.
+        let main = fs::read(&self.index).unwrap();
+        assert_eq!(&main[18..20], &[2, 2]);
+        fs::write(format!("{}-wal", self.index.display()), []).unwrap();
+        fs::write(format!("{}-shm", self.index.display()), vec![0x5a; 32768]).unwrap();
+    }
+
+    fn snapshot(&self) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+        fs::read_dir(&self.prepared)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+}
+
+/// Regression: reopening a strong overlay must not attach to or truncate the
+/// prepared index's unlocked leftover SHM, even with a WAL-mode main header.
+#[test]
+fn regression_prepared_index_strong_overlay_reopen_is_immutable() {
+    let fixture = PreparedIdentityFixture::new();
+    fixture.companions();
+    let before = fixture.snapshot();
+    let base = fixture.token(true, true);
+    let overlay = open_with(&base, &fixture.overlay, BaseDigestRequest::Compute, false).unwrap();
+    let meta = overlay.meta_for_tests();
+    let comparison = crate::overlay_gate::compare_base_identity(
+        Some(&meta),
+        &base,
+        &crate::overlay_gate::BaseProbe {
+            supplied: None,
+            extra_excludes: &[],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        comparison.cached_digest.as_deref(),
+        Some(fixture.digest.as_str())
+    );
+    assert!(comparison.mismatch.is_none());
+    assert_eq!(read_member(&overlay, "/first"), b"shared immutable member");
+    assert_eq!(fixture.snapshot(), before, "while readers are alive");
+    drop(overlay);
+    drop(base);
+    assert_eq!(fixture.snapshot(), before, "after readers are dropped");
+
+    // Creation may consult a selected prepared digest but must not persist a
+    // writable cache path in a new worker overlay.
+    let base = fixture.token(true, true);
+    let fresh = fixture._tmp.path().join("fresh-overlay");
+    let overlay = open_with(&base, &fresh, BaseDigestRequest::Compute, false).unwrap();
+    let meta = overlay.meta_for_tests();
+    assert_eq!(meta.known_base_digest(), Some(fixture.digest.as_str()));
+    assert_eq!(meta.get("base_index_path"), None);
+    assert_eq!(fixture.snapshot(), before);
+    drop(overlay);
+    drop(base);
+    assert_eq!(fixture.snapshot(), before);
+}
+
+/// Regression: an unfinished selected preparation must remain a preparation
+/// error through real strong-overlay reopen and shape/content identity gates.
+#[test]
+fn regression_prepared_index_identity_peek_refuses_incomplete_state() {
+    for companion in ["-wal", "-journal"] {
+        let fixture = PreparedIdentityFixture::new();
+        let base = fixture.token(true, true);
+        fs::write(
+            format!("{}{companion}", fixture.index.display()),
+            b"pending preparation",
+        )
+        .unwrap();
+        let before = fixture.snapshot();
+        let meta = OverlayMeta::read(&fixture.overlay).unwrap().unwrap();
+        let probe = crate::overlay_gate::BaseProbe {
+            supplied: None,
+            extra_excludes: &[],
+        };
+        let error =
+            crate::overlay_gate::compare_base_identity(Some(&meta), &base, &probe).unwrap_err();
+        assert!(error.contains("prepar"), "{error}");
+        assert!(error.contains(companion), "{error}");
+        let error = match open_with(&base, &fixture.overlay, BaseDigestRequest::Compute, false) {
+            Ok(_) => panic!("unfinished index was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("prepar"), "{error}");
+        assert!(!error.contains("base mismatch"), "{error}");
+        // Even a forced base mismatch cannot authorize SQLite recovery.
+        assert!(open_with(&base, &fixture.overlay, BaseDigestRequest::Compute, true).is_err());
+        assert_eq!(fixture.snapshot(), before);
+
+        // Move the recorded location between local and remote to exercise
+        // shape_verdict's own digest path rather than the content gate.
+        let conn = rusqlite::Connection::open(fixture.overlay.join(HIDDEN_DB)).unwrap();
+        OverlayMeta::set(
+            &conn,
+            "base_location",
+            "remote:https://example.invalid/base.tar",
+        )
+        .unwrap();
+        drop(conn);
+        let meta = OverlayMeta::read(&fixture.overlay).unwrap().unwrap();
+        let verdict = crate::overlay_gate::shape_verdict(Some(&meta), base.actual(), &probe);
+        match verdict {
+            crate::overlay_gate::Verdict::PreparationError(error) => {
+                assert!(error.contains("prepar"), "{error}");
+                assert!(error.contains(companion), "{error}");
+            }
+            other => panic!("expected preparation error, got {other:?}"),
+        }
+        assert!(crate::overlay_gate::compare_base_identity(Some(&meta), &base, &probe).is_err());
+        drop(base);
+        assert_eq!(fixture.snapshot(), before);
+    }
+}
+
+/// Regression: a strict base whose backend uses no external catalog must not
+/// read an unused candidate, even if that candidate names unfinished state.
+#[test]
+fn regression_prepared_index_identity_omits_unused_candidate() {
+    let fixture = PreparedIdentityFixture::new();
+    fs::write(
+        format!("{}-wal", fixture.index.display()),
+        b"unused candidate WAL",
+    )
+    .unwrap();
+    let before = fixture.snapshot();
+    let base = fixture.token(true, false);
+    assert!(base.actual().index_for_peek().is_none());
+    let overlay = fixture._tmp.path().join("candidate-overlay");
+    drop(open_with(&base, &overlay, BaseDigestRequest::Compute, false).unwrap());
+    let meta = OverlayMeta::read(&overlay).unwrap().unwrap();
+    assert_eq!(meta.base_digest_kind(), Some("pending"));
+    assert_eq!(meta.get("base_index_path"), None);
+    assert_eq!(fixture.snapshot(), before);
+    drop(base);
+    assert_eq!(fixture.snapshot(), before);
 }
 
 /// Run an offline `commit_overlay` of `fx` on a thread of its own (the seams
