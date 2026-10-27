@@ -60,9 +60,7 @@ fn cfg_attr_attributes(tokens: proc_macro2::TokenStream) -> syn::Result<Vec<Meta
         input.parse::<Token![,]>()?;
         Punctuated::<Meta, Token![,]>::parse_terminated(input)
     };
-    parser
-        .parse2(tokens)
-        .map(|p| p.into_iter().collect())
+    parser.parse2(tokens).map(|p| p.into_iter().collect())
 }
 fn parsed(attr: &ast::Attribute) -> Option<Meta> {
     if !matches!(attr.kind, AttrKind::Normal(_)) {
@@ -451,7 +449,15 @@ impl EarlyLintPass for Syntax {
     fn check_mac_def(&mut self, cx: &EarlyContext<'_>, def: &ast::MacroDef) {
         let text = pprust::tts_to_string(&def.body.tokens);
         if !def.macro_rules {
-            self.raw_tokens(cx, def.body.dspan.entire(), &text);
+            // Only macro_rules has a fully audited matcher/transcriber grammar.
+            // Refuse decl_macro even when cfg strips it before expansion; its
+            // body may otherwise hide target attributes or foreign blocks.
+            self.report(
+                cx,
+                def.body.dspan.entire(),
+                "N3",
+                "unsupported macro definition grammar",
+            );
             return;
         }
         match audit_macro_with_lints(&text, self.restricted(), &self.protected_lints) {

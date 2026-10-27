@@ -94,8 +94,12 @@ the canonical manifest header.
 
 N2 permits foreign blocks/link_name only in the exact compiler module
 `ratarmount_formats_libarchive::ffi`, including a post-expansion HIR check with no
-provenance exception. N3 refuses cfg/cfg_attr anywhere in repo macros and
-metavariable transcriber attributes, including substituted brackets and attribute
+provenance exception. N3 refuses unsupported `macro`/`pub macro` definitions,
+including inactive bodies, and every `cfg`/`cfg_attr` attribute in invocation
+payloads at any depth. These refusals do not evaluate predicates or model macro
+expansion; non-stripping payload attributes remain permitted. N3 also refuses
+cfg/cfg_attr anywhere in macro_rules bodies and metavariable transcriber
+attributes, including substituted brackets and attribute
 prefixes. Prefix recognition uses matcher fragment kinds and repetition grammar,
 independent of the following item, statement, field or variant. Ambiguous `tt`
 substitutions beside brackets or a distinct capture are refused; typed indexing

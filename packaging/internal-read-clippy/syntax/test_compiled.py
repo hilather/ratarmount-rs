@@ -235,7 +235,9 @@ def main():
         run('payload-nested-substituted-attribute', forward + 'pass! { macro_rules! hidden { ($a:meta) => { #[$a] ' + hidden_read + ' } } hidden!(cfg(windows)); }', reject='N3')
         run('payload-nested-substituted-brackets', forward + 'pass! { macro_rules! hidden { ($a:tt) => { # $a ' + hidden_read + ' } } hidden!([cfg(windows)]); }', reject='N3')
         run('payload-nested-generic-matcher', forward + 'pass! { macro_rules! visible { (#[$a:meta]) => { pub fn visible() {} } } visible!(#[allow(dead_code)]); }', reject='N3')
-        run('opaque-payload-cfg', 'macro_rules! ignore { ($($t:tt)*) => {}; } ignore! { #[cfg(windows)] ' + hidden_read + ' }')
+        # Regression: even discarded payloads refuse stripping attributes.
+        run('opaque-payload-cfg', 'macro_rules! ignore { ($($t:tt)*) => {}; } ignore! { #[cfg(windows)] ' + hidden_read + ' }',
+            reject='N3', reject_detail='cfg/cfg_attr attribute in macro invocation payload')
         run('opaque-payload-extern', 'macro_rules! ignore { ($($t:tt)*) => {}; } ignore! { unsafe extern { fn arbitrary(); } }')
         payload_foreign = 'macro_rules! foreign { () => { unsafe extern { pub fn arbitrary(); } } } foreign!();'
         run('payload-nested-foreign-macro', forward + 'pass! { ' + payload_foreign + ' }', reject='N3')

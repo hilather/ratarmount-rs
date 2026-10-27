@@ -760,40 +760,16 @@ mod split_open_tests {
                 .iter()
                 .map(|b| format!("{b:?}"))
                 .collect();
-            assert_eq!(
-                names,
-                vec![
-                    "SevenZip",
-                    "Zip",
-                    "Asar",
-                    "Ar",
-                    "Cpio",
-                    "Udf",
-                    "Iso",
-                    "Warc",
-                    "Xar",
-                    "Cab",
-                    "Sqlar",
-                    "SquashFs",
-                    "Ext4",
-                    "Fat",
-                    "Exfat",
-                    "Ntfs",
-                    "Dmg",
-                    "Wim",
-                    "Block",
-                    "Qcow2",
-                    "Vhd",
-                    "Vmdk",
-                    "Ogg",
-                    "Pdf",
-                    "Html",
-                    #[cfg(feature = "tensors")]
-                    "Tensors",
-                    "Libarchive",
-                    "Tar",
-                ]
-            );
+            // Keep stripping attributes outside macro payloads for the syntax audit.
+            let mut expected = vec![
+                "SevenZip", "Zip", "Asar", "Ar", "Cpio", "Udf", "Iso", "Warc", "Xar", "Cab",
+                "Sqlar", "SquashFs", "Ext4", "Fat", "Exfat", "Ntfs", "Dmg", "Wim", "Block",
+                "Qcow2", "Vhd", "Vmdk", "Ogg", "Pdf", "Html",
+            ];
+            #[cfg(feature = "tensors")]
+            expected.push("Tensors");
+            expected.extend(["Libarchive", "Tar"]);
+            assert_eq!(names, expected);
         }
 
         #[cfg(feature = "udf")]

@@ -142,14 +142,19 @@ impl Audit {
         }
         let tokens: Vec<_> = tokens.into_iter().collect();
         for (i, token) in tokens.iter().enumerate() {
+            if is_ident(token, "macro")
+                && !matches!(tokens.get(i.wrapping_sub(1)), Some(TokenTree::Punct(p)) if p.as_char() == '$')
+            {
+                self.emit(token.span(), "N3", "unsupported macro definition grammar");
+            }
             if transcriber
                 && is_ident(token, "macro_rules")
                 && matches!(tokens.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                && !self.restricted
+                && matches!(tokens.get(i + 2), Some(TokenTree::Ident(_)))
             {
-                if !self.restricted && matches!(tokens.get(i + 2), Some(TokenTree::Ident(_))) {
-                    if let Some(TokenTree::Group(body)) = tokens.get(i + 3) {
-                        self.macro_rules(body.stream(), fragments);
-                    }
+                if let Some(TokenTree::Group(body)) = tokens.get(i + 3) {
+                    self.macro_rules(body.stream(), fragments);
                 }
             }
             if macro_body
@@ -290,6 +295,41 @@ impl Audit {
         let tokens: Vec<_> = tokens.into_iter().collect();
         let mut i = 0;
         while i < tokens.len() {
+            if is_ident(&tokens[i], "macro")
+                && !matches!(tokens.get(i.wrapping_sub(1)), Some(TokenTree::Punct(p)) if p.as_char() == '$')
+            {
+                self.emit(
+                    tokens[i].span(),
+                    "N3",
+                    "unsupported macro definition grammar",
+                );
+            }
+            // Invocation grammar is opaque: forwarding an attributed expression
+            // can strip it before Clippy sees it. Refuse every cfg/cfg_attr
+            // attribute, even in discarded or nested payloads, without trying
+            // to evaluate the predicate or model the receiving macro.
+            if matches!(&tokens[i], TokenTree::Punct(p) if p.as_char() == '#') {
+                let attr_index = i
+                    + 1
+                    + usize::from(
+                        matches!(tokens.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!'),
+                    );
+                if let Some(TokenTree::Group(group)) = tokens.get(attr_index) {
+                    if group.delimiter() == Delimiter::Bracket
+                        && group
+                            .stream()
+                            .into_iter()
+                            .next()
+                            .is_some_and(|t| is_ident(&t, "cfg") || is_ident(&t, "cfg_attr"))
+                    {
+                        self.emit(
+                            tokens[i].span(),
+                            "N3",
+                            "cfg/cfg_attr attribute in macro invocation payload",
+                        );
+                    }
+                }
+            }
             if is_ident(&tokens[i], "macro_rules")
                 && matches!(tokens.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
                 && matches!(tokens.get(i + 2), Some(TokenTree::Ident(_)))
@@ -547,7 +587,8 @@ pub fn audit_macro_payload_scoped(
     audit_macro_payload_with_lints(source, restricted, &BTreeSet::new())
 }
 
-/// Keep the compiler-provided group identities for nested literal definitions.
+/// Keep compiler-provided lint identities and refuse stripping attributes at
+/// every depth in invocation payloads, including expressions forwarded by vec!.
 pub fn audit_macro_payload_with_lints(
     source: &str,
     restricted: bool,
@@ -775,7 +816,6 @@ mod tests {
         }
         for src in [
             "unsafe extern { fn payload_data(); }",
-            "#[cfg(windows)] pub fn payload_data() {}",
             "macro_rules! inner { (#[$attr:meta]) => { pub fn fine() {} }; }",
             "let text = \"macro_rules! hidden { () => { #[cfg(windows)] fn f() {} }; }\";",
         ] {
@@ -787,6 +827,69 @@ mod tests {
         .unwrap()
         .iter()
         .any(|(policy, _)| policy == "N2"));
+    }
+    /// Regression: attributed vec! elements disappeared before Clippy linting.
+    #[test]
+    fn regression_stripping_attributes_in_invocation_payloads() {
+        for source in [
+            "#[cfg(not(clippy))] std::fs::read(\"x\")",
+            "#[cfg_attr(clippy, cfg(any()))] std::fs::read(\"x\")",
+            "nested!({ [#[r#cfg(all())] 1] })",
+            "mod hidden { #![cfg_attr(false, allow(dead_code))] }",
+            "#[cfg_attr(all(), cfg_attr(clippy, cfg(any())))] 1",
+            "#[cfg(windows)] pub fn payload_data() {}",
+        ] {
+            for restricted in [false, true] {
+                assert!(
+                    audit_macro_payload_scoped(source, restricted)
+                        .unwrap()
+                        .iter()
+                        .any(|(policy, detail)| policy == "N3"
+                            && detail == "cfg/cfg_attr attribute in macro invocation payload"),
+                    "{source}"
+                );
+            }
+        }
+        for source in [
+            "#[allow(unused)] 1",
+            "#[derive(Clone)] pub struct Visible;",
+            "#[doc = \"#[cfg(not(clippy))]\"] pub fn visible() {}",
+            "cfg!(windows)",
+            "r###\"#[cfg(not(clippy))]\"###",
+        ] {
+            assert!(
+                audit_macro_payload_scoped(source, true).unwrap().is_empty(),
+                "{source}"
+            );
+        }
+    }
+    /// Regression: opaque payloads and transcribers hid unsupported definitions.
+    #[test]
+    fn regression_unsupported_macro_definition_payloads() {
+        for source in [
+            "pub macro hidden() {}",
+            "nested! { #[cfg(any())] pub macro hidden() { unsafe extern { fn f(); } } }",
+        ] {
+            for restricted in [false, true] {
+                assert!(
+                    audit_macro_payload_scoped(source, restricted)
+                        .unwrap()
+                        .iter()
+                        .any(|(policy, detail)| policy == "N3"
+                            && detail == "unsupported macro definition grammar"),
+                    "{source}"
+                );
+                let definition = format!("() => {{ {source} }};");
+                assert!(
+                    audit_macro_scoped(&definition, restricted)
+                        .unwrap()
+                        .iter()
+                        .any(|(policy, detail)| policy == "N3"
+                            && detail == "unsupported macro definition grammar"),
+                    "{source}"
+                );
+            }
+        }
     }
     #[test]
     fn regression_cfg_matcher_transcriber_raw_and_nested_macro() {

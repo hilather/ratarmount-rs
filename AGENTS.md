@@ -49,7 +49,10 @@ review. Inventory enforcement is Linux-only; inactive native alternatives remain
 out of scope and require ordinary review. N4 structurally refuses any target
 predicate in cfg/cfg_attr at any nesting level, regardless of other predicates
 or parent cfg activity, outside reviewed files. Syntax audits also inspect
-inactive item bodies. cfg! returns a boolean and is permitted. In restricted
+inactive item bodies. N3 refuses unsupported macro definitions (`macro`/`pub macro`)
+and all cfg/cfg_attr attributes anywhere in invocation payloads, without modeling
+expansion or evaluating predicates. Non-stripping payload attributes remain
+permitted. cfg! returns a boolean and is permitted. In restricted
 crates, N3 recursively scans every raw token stream, including invocation
 arguments, attributes and macro bodies. It refuses the macro_rules identifier
 outside directly written definitions handled by the ordinary body audit, and
@@ -92,6 +95,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | #201 r10b: false/release/feature cfg hid syntax, macro generators hid attributes, and inactive/shadowed expectations escaped manifest review | `python3 -I packaging/internal-read-clippy/syntax/test_compiled.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-syntax` · `python3 -I packaging/internal-read-clippy/test_manifest.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-manifest` |
 | #201 r11: substituted macro-definition heads, copied journal reasons, and crate-root link_name escaped review | `python3 -I packaging/internal-read-clippy/syntax/test_compiled.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-syntax` · `python3 -I packaging/internal-read-clippy/test_manifest.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-manifest` · `python3 -I packaging/internal-read-clippy/compiler/test_driver.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-compiler` |
 | #201 sweep 1: Boolean cfg_attr predicates hid inactive link_name attributes from N2 in unrestricted packages | `python3 -I packaging/internal-read-clippy/compiler/test_driver.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-compiler` |
+| #201 sweep 2: vec! payload attributes stripped reads before Clippy; inactive unsupported macro definitions hid target attributes and foreign blocks | `python3 -I packaging/internal-read-clippy/compiler/test_driver.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-compiler` · `python3 -I packaging/internal-read-clippy/syntax/test_compiled.py --driver "$HOME/.cargo/internal-read-clippy/target/debug/clippy-driver" --output /tmp/rrs201-syntax` |
 | BIG fixture builder missing tar.lz4 / multi-frame zstd | `./benchmarks/test-compare-fixtures.sh` |
 | Vector-wave fixture builder missing catalog tars | `./benchmarks/test-compare-vector-wave.sh` |
 | Format sweep fixture builder: missing-producer skips, corrupt or count-mismatched reads, `PREPARE_ONLY` / `NO_FUSE` regressions (AI-FMTBENCH) | `./benchmarks/test-compare-formats.sh` |

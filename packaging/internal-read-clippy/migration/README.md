@@ -3,7 +3,14 @@
 These files are one-time review evidence. The enforcing runner does not read
 them and no operation collector or baseline matcher runs in CI.
 
-`baseline-inventory.json` preserves all 553 original entries at `584311c1`.
+`baseline-inventory.json` preserves the 553-entry scanner inventory from main
+`40d23578` (#220), byte-for-byte from `packaging/internal-read-inventory.json`.
+The original PR #201 snapshot at `a147e68e` instead preserved the inventory at
+`584311c1`; it differs from this port's baseline in source locations and some
+entry metadata. The remaining JSON files retain the original PR's frozen
+matching and review evidence; they were not regenerated against the #220
+snapshot.
+
 `prior-summary.json`, `prior-inactive-explanations.json` and
 `prior-extra-explanations.json` preserve the earlier 540/260/13 result.
 The renewed match is 527 native operations, 13 accepted descriptor retypings

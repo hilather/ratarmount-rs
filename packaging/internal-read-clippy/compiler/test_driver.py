@@ -86,6 +86,61 @@ def main():
         run('cfg-alias-unrestricted',aliases['simple']+'pub const VALUE:bool=target_cfg!(windows);',native_baseline=True,extra_flags=['-Dwarnings'])
         if package_before is None:env.pop('CARGO_PKG_NAME')
         else:env['CARGO_PKG_NAME']=package_before
+        # Regression: expression forwarding through vec! stripped reads before
+        # Clippy saw them. Refuse stripping attributes in every payload group,
+        # including reviewed files, without evaluating the predicate.
+        package_before=env.get('CARGO_PKG_NAME')
+        env['CARGO_PKG_NAME']='ratarmount-index'
+        config['restricted_packages']=[env['CARGO_PKG_NAME']]
+        for name,attribute in [
+            ('cfg-not-clippy','cfg(not(clippy))'),
+            ('cfg-attr-clippy','cfg_attr(clippy,cfg(any()))'),
+        ]:
+            rows=run('payload-'+name,
+                'pub fn read(){let _:Vec<Result<Vec<u8>,std::io::Error>>=vec![#['+attribute+'] std::fs::read("x")];}',
+                native_baseline=True,reject='N3',extra_flags=['-Dwarnings'])
+            assert any(row.get('policy')=='N3' for row in rows)
+        reviewed_before=config['reviewed_target_files']
+        config['reviewed_target_files']=[{'file':'lib.rs'}]
+        run('payload-reviewed-cfg-attr',
+            'pub fn read(){let _:Vec<Result<Vec<u8>,std::io::Error>>=vec![#[cfg_attr(clippy,cfg(any()))] std::fs::read("x")];}',
+            native_baseline=True,reject='N3',extra_flags=['-Dwarnings'])
+        config['reviewed_target_files']=reviewed_before
+        # Active non-stripping payload attributes remain valid. The thread_local
+        # case preserves the production ratarmount-session spelling.
+        run('payload-thread-local-allow',
+            'thread_local!{#[allow(clippy::missing_const_for_thread_local)] pub static VALUE:std::cell::Cell<u32>=const{std::cell::Cell::new(0)};}',
+            native_baseline=True,extra_flags=['-Dwarnings'])
+        run('payload-vec-allow','pub fn values()->Vec<u32>{vec![#[allow(unused_braces)] {7}]}',
+            native_baseline=True,extra_flags=['-Dwarnings'])
+        run('payload-forwarded-derive',
+            'macro_rules! forward{($($item:item)*)=>{$($item)*};} forward!{#[derive(Debug)] pub struct Value;}',
+            native_baseline=True,extra_flags=['-Dwarnings'])
+        # Regression: inactive decl_macro bodies escaped the macro_rules-only
+        # grammar audit, hiding both target attributes and foreign declarations.
+        # Unsupported definition grammar is refused even without suspect tokens.
+        for name,source in [
+            ('inactive-decl-target','#[cfg(any())] pub macro make(){#[cfg(windows)] pub fn hidden(){}} pub fn visible(){}'),
+            ('inactive-decl-foreign','#[cfg(any())] pub macro make(){unsafe extern "C"{#[link_name="arbitrary"] pub fn hidden();}} pub fn visible(){}'),
+            ('inactive-decl-empty','#[cfg(any())] pub macro make(){} pub fn visible(){}'),
+            ('active-decl-empty','#![feature(decl_macro)] pub macro make(){}'),
+            ('discarded-decl-target','macro_rules! discard{($($token:tt)*)=>{}} discard!{#[cfg(any())] pub macro make(){#[cfg(windows)] pub fn hidden(){}}}'),
+            ('discarded-decl-foreign','macro_rules! discard{($($token:tt)*)=>{}} discard!{#[cfg(any())] pub macro make(){unsafe extern "C"{#[link_name="arbitrary"] pub fn hidden();}}}'),
+            ('exported-decl-transcriber','#[macro_export] macro_rules! define{()=>{pub macro make(){}}}'),
+        ]:
+            rows=run(name,source,native_baseline=True,reject='N3',extra_flags=['-Dwarnings'])
+            assert any(row.get('policy')=='N3' and row.get('detail')=='unsupported macro definition grammar' for row in rows)
+        # A standalone inactive foreign block already follows N2; keep both its
+        # body link_name and block-level refusal covered independently of macros.
+        rows=run('inactive-foreign-link-name',
+            '#[cfg(any())] unsafe extern "C"{#[link_name="arbitrary"] pub fn hidden();} pub fn visible(){}',
+            native_baseline=True,reject='N2',extra_flags=['-Dwarnings'])
+        assert {row.get('detail') for row in rows if row.get('policy')=='N2'} >= {'extern block outside reviewed module','link_name outside reviewed module'}
+        config['restricted_packages']=[]
+        run('unrestricted-inactive-decl-empty','#[cfg(any())] pub macro make(){} pub fn visible(){}',
+            native_baseline=True,reject='N3',extra_flags=['-Dwarnings'])
+        if package_before is None:env.pop('CARGO_PKG_NAME')
+        else:env['CARGO_PKG_NAME']=package_before
         for configured in [['std::include'],['core::include'],['std::include','core::include']]:
             rules='disallowed-macros=['+','.join('{path="'+path+'",reason="review include"}' for path in configured)+']\n'
             for pos in ['item','expression']:
