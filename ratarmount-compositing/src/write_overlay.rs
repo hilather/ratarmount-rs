@@ -755,6 +755,13 @@ pub enum OverlayMutation {
 /// Initialize usage from the overlay folder before installing a policy on an
 /// existing overlay. External host writes are outside this interface.
 pub trait OverlayPolicy: Send + Sync {
+    /// Refresh accounting after the daemon handoff's unlocked window, while
+    /// the serving process holds the database lock and before it serves writes.
+    /// Also used when restoring the lock after a failed fork.
+    fn refresh_after_fork(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()>;
     fn check_write(&self, path: &str, offset: u64, len: u64, current_size: u64) -> io::Result<()>;
     fn bytes_changed(&self, _path: &str, _added: u64, _removed: u64) {}
@@ -852,6 +859,10 @@ pub struct WriteOverlay {
     /// connection that crossed `fork` still believes it holds a lock SQLite
     /// will not take again.
     connection_released_for_fork: AtomicBool,
+    /// The accepted metadata while the original connection still held its
+    /// lock. A competing writer may change payload during the handoff, but
+    /// must not replace the validated base, stack, or seal record.
+    metadata_before_fork: Mutex<Option<crate::OverlayMeta>>,
     /// Mount paths with `deleted = 1` (for example `/dir/file`).
     ///
     /// `is_deleted` checks this set. The `files` table remains the durable
@@ -1441,6 +1452,7 @@ impl WriteOverlay {
             db_id,
             _db_registration: db_registration,
             connection_released_for_fork: AtomicBool::new(false),
+            metadata_before_fork: Mutex::new(None),
             tombstones: Mutex::new(tombstones),
             pending_rows: Mutex::new(Vec::new()),
             commit_gate: RwLock::new(()),
@@ -1582,6 +1594,11 @@ impl WriteOverlay {
         let placeholder = Connection::open_in_memory()?;
         {
             let mut db = self.db.lock().expect("overlay db");
+            *self
+                .metadata_before_fork
+                .lock()
+                .expect("overlay fork metadata") =
+                crate::OverlayMeta::from_connection_required(&db, true)?;
             let old = std::mem::replace(&mut *db, placeholder);
             // Closes the overlay file in this process and drops its fcntl lock.
             drop(old);
@@ -1644,7 +1661,25 @@ impl WriteOverlay {
         // lock is the #126 bug.
         conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
         conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")?;
+        let metadata = crate::OverlayMeta::from_connection_required(&conn, true)?;
+        {
+            let expected = self
+                .metadata_before_fork
+                .lock()
+                .expect("overlay fork metadata");
+            if metadata.as_ref().map(crate::OverlayMeta::values)
+                != expected.as_ref().map(crate::OverlayMeta::values)
+            {
+                return Err(OverlayError::Msg(format!(
+                    "overlay metadata changed before the serving process locked {}; retry the mount",
+                    path.display()
+                )));
+            }
+        }
         let fresh = tombstone_set_from_conn(&conn)?;
+        if let Some(policy) = &self.policy {
+            policy.refresh_after_fork()?;
+        }
         {
             let mut guard = self.db.lock().expect("overlay db");
             let placeholder = std::mem::replace(&mut *guard, conn);
@@ -9238,6 +9273,150 @@ pub(crate) mod tests {
     use std::process::Command as StdCommand;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+    fn handoff_classified_base(kind: crate::ServedKind) -> crate::ClassifiedBase {
+        crate::ClassifiedBase::mint(crate::Opened {
+            source: Arc::new(MemBase::with(&[("/a", b"a")])),
+            kind,
+            inputs: Vec::new(),
+            location: None,
+            index: crate::IndexProvenance::None,
+            sidecar_candidate: None,
+            fetched: false,
+            keep_alive: Box::new(()),
+        })
+        .unwrap()
+    }
+
+    /// Regression: capture the final parent metadata, including startup's own
+    /// rules, and accept payload/tombstone changes when that record is unchanged.
+    #[test]
+    fn regression_183_handoff_accepts_unchanged_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let base: Arc<dyn MountSource> = Arc::new(MemBase::with(&[("/a", b"a")]));
+        let ov = WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap();
+        ov.set_meta("readonly_rules", "[]").unwrap();
+        ov.release_db_before_fork().unwrap();
+        {
+            let other = WriteOverlay::new_for_tests(base, dir.path()).unwrap();
+            other.unlink("/a").unwrap();
+            fs::write(dir.path().join("new"), b"payload").unwrap();
+        }
+        ov.restore_db_after_failed_fork().unwrap();
+        assert!(ov.is_deleted("/a"), "the child must refresh tombstones");
+        assert_eq!(fs::read(dir.path().join("new")).unwrap(), b"payload");
+        let db = ov.db.lock().unwrap();
+        assert_eq!(
+            crate::OverlayMeta::from_connection(&db)
+                .unwrap()
+                .unwrap()
+                .get("readonly_rules"),
+            Some("[]")
+        );
+    }
+
+    /// Regression: a competing forced writer can replace the accepted base
+    /// record on the same inode while the parent has released its lock.
+    #[test]
+    fn regression_183_handoff_refuses_changed_base_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = handoff_classified_base(crate::ServedKind::Folder);
+        let options = crate::CreateOptions {
+            base_digest: crate::BaseDigestRequest::None,
+            ..Default::default()
+        };
+        let ov = WriteOverlay::open(&base, base.source(), dir.path(), &options).unwrap();
+        ov.release_db_before_fork().unwrap();
+        let other = handoff_classified_base(crate::ServedKind::Git {
+            tree: "1".repeat(40),
+        });
+        drop(
+            WriteOverlay::open(
+                &other,
+                other.source(),
+                dir.path(),
+                &crate::CreateOptions {
+                    force_base_mismatch: true,
+                    ..options.clone()
+                },
+            )
+            .unwrap(),
+        );
+        let fresh_error = WriteOverlay::open(&base, base.source(), dir.path(), &options)
+            .err()
+            .expect("a fresh open must refuse the changed base")
+            .to_string();
+        assert!(fresh_error.contains("recorded a git base"), "{fresh_error}");
+        let error = ov
+            .acquire_exclusive_after_fork()
+            .expect_err("the serving child must refuse the changed base record")
+            .to_string();
+        assert!(error.contains("metadata changed"), "{error}");
+    }
+
+    /// Regression: the child must not serve a top that was sealed during the
+    /// unlocked handoff, including the window before seal makes files read-only.
+    #[test]
+    fn regression_183_handoff_refuses_new_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), dir.path()).unwrap();
+        ov.release_db_before_fork().unwrap();
+        {
+            let conn = crate::open_overlay_db(
+                &dir.path().join(HIDDEN_DB),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+                crate::DbName::Path,
+            )
+            .unwrap();
+            conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            crate::OverlayMeta::set(&conn, "sealed_at", "2026-10-26T00:00:00Z").unwrap();
+            crate::OverlayMeta::set(&conn, "layer_digest", &format!("sha256:{}", "1".repeat(64)))
+                .unwrap();
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        let error = ov
+            .acquire_exclusive_after_fork()
+            .expect_err("the serving child must refuse a newly sealed overlay")
+            .to_string();
+        assert!(error.contains("metadata changed"), "{error}");
+    }
+
+    /// Regression: failed-fork recovery must also refuse a stack record that
+    /// another writer changed while this opener did not hold the database.
+    #[test]
+    fn regression_183_handoff_refuses_changed_stack_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let ov = WriteOverlay::new_for_tests(Arc::new(MemBase::with(&[])), dir.path()).unwrap();
+        ov.release_db_before_fork().unwrap();
+        {
+            let conn = crate::open_overlay_db(
+                &dir.path().join(HIDDEN_DB),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+                crate::DbName::Path,
+            )
+            .unwrap();
+            conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            let layers = vec![crate::LowerLayerRecord {
+                path: dir.path().join("lower"),
+                layer_digest: format!("sha256:{}", "1".repeat(64)),
+                sealed_at: "2026-10-26T00:00:00Z".into(),
+            }];
+            crate::OverlayMeta::set(
+                &conn,
+                "lower_layers",
+                &serde_json::to_string(&layers).unwrap(),
+            )
+            .unwrap();
+            crate::OverlayMeta::set(&conn, "stack_digest", &format!("sha256:{}", "2".repeat(64)))
+                .unwrap();
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        let error = ov
+            .restore_db_after_failed_fork()
+            .expect_err("failed-fork recovery must refuse the changed stack record")
+            .to_string();
+        assert!(error.contains("metadata changed"), "{error}");
+    }
 
     /// Regression (#183): the process that serves a daemonized mount must hold
     /// the overlay database's exclusive lock. POSIX locks are not inherited,

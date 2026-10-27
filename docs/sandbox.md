@@ -1829,6 +1829,10 @@ and a library or Python user. POSIX locks are not inherited across `fork`.
 The parent closes its connection before it forks, and the serving child opens
 the database itself and takes the exclusive lock there; the parent's exit is
 not what releases that lock (#183). An export-only server does not fork.
+Before serving, the child refuses overlay metadata changed during the unlocked
+handoff (including base identity, sealing and the lower stack), reloads
+tombstones, and rescans quota usage under its exclusive lock. Quota status uses
+the refreshed counters too.
 
 
 A required-record observation is a **one-way session latch**. Once an overlay

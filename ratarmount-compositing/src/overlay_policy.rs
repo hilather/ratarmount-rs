@@ -572,6 +572,16 @@ impl OverlayQuota {
 }
 
 impl OverlayPolicy for OverlayQuota {
+    fn refresh_after_fork(&self) -> io::Result<()> {
+        let usage = OverlayUsage::scan(&self.root)?;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = QuotaState {
+            bytes: usage.bytes,
+            files: usage.files,
+            ..Default::default()
+        };
+        Ok(())
+    }
+
     fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.cow.mutation(op, paths);
@@ -634,6 +644,13 @@ impl OverlayPolicy for OverlayQuota {
 pub struct CompositeOverlayPolicy(pub Vec<Arc<dyn OverlayPolicy>>);
 
 impl OverlayPolicy for CompositeOverlayPolicy {
+    fn refresh_after_fork(&self) -> io::Result<()> {
+        for policy in &self.0 {
+            policy.refresh_after_fork()?;
+        }
+        Ok(())
+    }
+
     fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()> {
         for policy in &self.0 {
             policy.check_mutation(op, paths)?;
@@ -1204,6 +1221,90 @@ mod tests {
         // Already over quota: no-growth operations and recovery remain possible.
         restart.check_write("/preexisting", 0, 1, 3).unwrap();
         assert!(restart.check_write("/preexisting", 3, 1, 3).is_err());
+    }
+
+    /// Regression: a writer in the daemon handoff gap must consume the file quota,
+    /// including the usage object already shared with control/status callbacks.
+    #[cfg(unix)]
+    #[test]
+    fn regression_fork_handoff_refreshes_file_quota() {
+        for failed_fork in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let base = archive();
+            let mut overlay =
+                crate::WriteOverlay::new_for_tests(base.clone(), root.path()).unwrap();
+            let quota = Arc::new(OverlayQuota::new(root.path(), None, Some(1)).unwrap());
+            overlay.set_policy(Some(Arc::new(CompositeOverlayPolicy(vec![quota.clone()]))));
+            let status_quota = quota.clone();
+            overlay.release_db_before_fork().unwrap();
+            {
+                let writer = crate::WriteOverlay::new_for_tests(base, root.path()).unwrap();
+                let file = new_file(&writer, "/competitor");
+                writer.finish_owned_write_fd(file);
+            }
+            if failed_fork {
+                overlay.restore_db_after_failed_fork().unwrap();
+            } else {
+                overlay.acquire_exclusive_after_fork().unwrap();
+            }
+            denied(
+                overlay.create_file("/overfiles", 0o644),
+                io::ErrorKind::QuotaExceeded,
+            );
+            assert_eq!(status_quota.usage().files, 1);
+            assert!(status_quota
+                .usage()
+                .status_text()
+                .contains("overlay_files 1\n"));
+            assert!(!root.path().join("overfiles").exists());
+        }
+    }
+
+    /// Regression: byte growth by a writer in the daemon handoff gap must be
+    /// included before the serving process authorizes another growing write.
+    #[cfg(unix)]
+    #[test]
+    fn regression_fork_handoff_refreshes_byte_quota() {
+        use std::os::fd::FromRawFd;
+
+        for failed_fork in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let base = archive();
+            let mut overlay =
+                crate::WriteOverlay::new_for_tests(base.clone(), root.path()).unwrap();
+            let file = new_file(&overlay, "/growing");
+            overlay.write_at(&file, "/growing", 0, b"a").unwrap();
+            overlay.finish_owned_write_fd(file);
+            let quota = Arc::new(OverlayQuota::new(root.path(), Some(4), None).unwrap());
+            overlay.set_policy(Some(Arc::new(CompositeOverlayPolicy(vec![quota.clone()]))));
+            let status_quota = quota.clone();
+            overlay.release_db_before_fork().unwrap();
+            {
+                let writer = crate::WriteOverlay::new_for_tests(base, root.path()).unwrap();
+                let file = unsafe {
+                    File::from_raw_fd(writer.open_overlay_fd("/growing", libc::O_RDWR).unwrap())
+                };
+                writer.write_at(&file, "/growing", 1, b"bcd").unwrap();
+                writer.finish_owned_write_fd(file);
+            }
+            if failed_fork {
+                overlay.restore_db_after_failed_fork().unwrap();
+            } else {
+                overlay.acquire_exclusive_after_fork().unwrap();
+            }
+            let file = unsafe {
+                File::from_raw_fd(overlay.open_overlay_fd("/growing", libc::O_RDWR).unwrap())
+            };
+            let result = overlay.write_at(&file, "/growing", 4, b"x");
+            overlay.finish_owned_write_fd(file);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::QuotaExceeded);
+            assert_eq!(status_quota.usage().bytes, 4);
+            assert!(status_quota
+                .usage()
+                .status_text()
+                .contains("overlay_bytes 4\n"));
+            assert_eq!(fs::read(root.path().join("growing")).unwrap(), b"abcd");
+        }
     }
 
     /// Regression: several concurrent writers must never exceed the global quota.
