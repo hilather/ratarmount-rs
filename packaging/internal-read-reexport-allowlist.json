@@ -1,0 +1,710 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "file": "ratarmount-9p/src/lib.rs",
+      "use": "ratarmount_compositing :: WriteOverlay",
+      "reason": "9P API exposes the shared write-overlay type."
+    },
+    {
+      "file": "ratarmount-9p/src/lib.rs",
+      "use": "ratarmount_export_core :: { fill_read , BindError , ExportServerHandle , ExportStop , DEFAULT_NINEP_PORT , DEFAULT_READER_SLOTS , }",
+      "reason": "9P API exposes shared export readers, lifecycle types and defaults."
+    },
+    {
+      "file": "ratarmount-9p/src/lib.rs",
+      "use": "serve :: { parse_ninep_bind , serve_blocking , spawn_ninep_thread , NinepOptions , DEFAULT_NINEP_BIND , }",
+      "reason": "9P bind, options and server startup API."
+    },
+    {
+      "file": "ratarmount-9p/src/lib.rs",
+      "use": "vfs :: Ratarmount9p",
+      "reason": "9P MountSource adapter API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "automount :: { is_archive_filename , is_archive_filename_with , parse_recursive_extensions , strip_archive_extension , AutoMountLayer , AutoMountOptions , NestedOpenContext , OpenNestedFn , OpenNestedReaderFn , RecursiveExtSet , }",
+      "reason": "Recursive archive mounting and extension selection API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "base_sidecars :: is_ratarmount_sidecar_name",
+      "reason": "Shared archive-sidecar name classifier."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "control :: { live_search_tsv , ControlFolderMountSource , ControlFolderOptions , CONTROL_DIR_NAME , CONTROL_DIR_PATH , }",
+      "reason": "Control-folder mounting and live-search API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "empty_archive :: { classify_createable_archive , maybe_create_empty_write_archive , EmptyArchiveKind , EmptyCreateOutcome , }",
+      "reason": "Empty writable archive classification and creation API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "folder :: FolderMountSource",
+      "reason": "Host-folder MountSource API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "journal_recovery :: { authorize_mount_recovery , classify_mount_journal , journal_agrees , recover_journal_at , MountJournal , MountRecords , Owner , Record , }",
+      "reason": "Mount journal classification, authorization and recovery API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "oci_whiteout :: OciImageMountSource",
+      "reason": "OCI whiteout-aware image MountSource API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "overlay_db :: { open_overlay_db , open_overlay_db_with_required_record , DbName , OverlayDb , OverlayDbError , }",
+      "reason": "Overlay database checked-opening API and result types."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "overlay_gate :: { compare_base_identity , ensure_journal_is_for_archive , forced_base_record , forced_relocation_record , identity_rows , record_forced_base_rows , shape_verdict , verify_base , BaseProbe , Recorded , Verdict , }",
+      "reason": "Overlay base verification and relocation-record API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "overlay_identity :: { ActualBase , BaseKind , BaseLocation , ClassifiedBase , CreateOptions , IndexProvenance , OpenBase , Opened , SealedRecord , ServedKind , ServedLocation , }",
+      "reason": "Overlay base classification and identity record types."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "overlay_layer :: { compose_stack , serving_layer , Immutability , LayerIndex , ReadOnlyOverlayLayer , }",
+      "reason": "Lower-stack composition and read-only overlay layer API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "overlay_meta :: { append_base_excludes , base_digest_state , directory_digest , directory_digest_calls_this_thread , directory_digest_excluding , directory_weak_digest , directory_weak_walks_this_thread , record_base_digest , redact_meta_values , resolve_base_excludes , resolve_pending_base_digest , stack_digest , BaseCheck , BaseComparison , BaseDigestRequest , BaseExcludes , BaseStrength , LowerLayerRecord , OverlayMeta , PendingBase , BASE_COMPARISON_KEYS , }",
+      "reason": "Overlay metadata, directory/base digests and comparison API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "overlay_policy :: { parse_overlay_size , CompositeOverlayPolicy , OverlayQuota , OverlayStats , OverlayUsage , QuotaUsage , ReadOnlyGlobs , }",
+      "reason": "Overlay quotas and read-only path policy API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "payload :: { maybe_wrap_payload_cache , PayloadCacheLayer }",
+      "reason": "Payload-cache compositing layer API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "prefix :: { validate_mount_path , PrefixMountSource , SourceBind }",
+      "reason": "Mount-path validation and prefix/bind layer API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "rolling :: { RollPolicy , RollingMountSource , SeriesName }",
+      "reason": "Rolling archive series policy and MountSource API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "transform :: TransformMountSource",
+      "reason": "Path-transform MountSource API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "union :: { UnionMountOptions , UnionMountSource }",
+      "reason": "Union MountSource and options API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "unopened :: UnopenedSource",
+      "reason": "Lazy unopened MountSource API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "versioning :: FileVersionLayer",
+      "reason": "File-version compositing layer API."
+    },
+    {
+      "file": "ratarmount-compositing/src/lib.rs",
+      "use": "write_overlay :: { commit_overlay , commit_overlay_raw_dir , is_control_reserved_path , is_overlay_internal_path , live_commit_is_supported , lost_record_error , name_suggests_tar_zst , overlay_atime , overlay_db_absent , overlay_db_entry , overlay_only_names , patch_sidecar_if_present , sidecar_path_for_patch , CommitKind , CommitMode , CommitOutcome , CommitOverlayOptions , DbEntry , IndexPatchWindow , OverlayError , OverlayMetadata , OverlayMutation , OverlayPolicy , Parked , RawDirCommit , RemoteDownload , RemoteObjectHead , RemotePublishError , RemotePublishRequest , WriteOverlay , HIDDEN_DB , LEGACY_OVERLAY_MARKER , OVERLAY_MARKER , }",
+      "reason": "Write-overlay mutation, commit, sidecar and remote publication API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "split :: { check_for_split_file_in , check_for_split_file_in_folder , is_first_split_extension , joined_base_name , materialize_joined_parts , JoinedFile , SplitFileSet , }",
+      "reason": "Split-file discovery, joining and materialization API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "bzip2_seek :: { export_bzip2_blocks , export_bzip2_blocks_from_reader , open_seekable_bzip2 , open_seekable_bzip2_from_reader , open_seekable_bzip2_with_bzip2_blocks , open_seekable_bzip2_with_bzip2_blocks_from_reader , open_seekable_bzip2_with_threads , open_seekable_bzip2_with_threads_from_reader , SeekableBzip2 , }",
+      "reason": "Seekable bzip2 readers and block-index import/export API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "compress_z_seek :: { open_seekable_compress_z , open_seekable_compress_z_with_threads }",
+      "reason": "Seekable Unix compress (.Z) opener API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "gzip_rapidgzip :: { open_seekable_gzip_rapidgzip , open_seekable_gzip_rapidgzip_fast , open_seekable_gzip_rapidgzip_from_reader , open_seekable_gzip_rapidgzip_from_reader_fast , open_seekable_gzip_rapidgzip_with_imported_index , open_seekable_gzip_rapidgzip_with_imported_index_from_reader , prefer_rapidgzip_gzip_backend , prefer_rapidgzip_gzip_backend_with_env , rapidgzip_no_crc_enabled , rapidgzip_no_crc_from_env_value , RapidgzipReader , SharedRapidgzip , RAPIDGZIP_BACKEND_ENV , RAPIDGZIP_BACKEND_VALUE , RAPIDGZIP_BODY_KIND , RAPIDGZIP_NO_CRC_ENV , RAPIDGZIP_SEEK_CACHE_BYTES , RAPIDGZIP_SEEK_CACHE_CHUNKS , RAPIDGZIP_SEEK_PREFETCH_WINDOWS , }",
+      "reason": "Optional rapidgzip readers, opener policy and seek-cache constants."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "gzip_seek :: { encode_gzip_seek_index_blob , encode_indexed_gzip_index_blob , gzip_seek_points_usable , import_seek_points , import_seek_points_with_mode , open_seekable_gzip , open_seekable_gzip_from_reader , open_seekable_gzip_with_imported_index , open_seekable_gzip_with_imported_index_from_reader , open_seekable_gzip_with_threads , open_seekable_gzip_with_threads_from_reader , parse_gzip_seek_index_blob , parse_indexed_gzip_index_blob , try_import_gzip_seek_blob , try_parallel_multi_member_decode , GzipSeekBlobFormat , GzipSeekIndexBlob , SeekableGzip , SeekableGzipReader , SharedSeekableGzip , DEFAULT_GZIP_SEEK_SPACING , G3_SEEK_CACHE_BYTES , G3_SEEK_CACHE_CHUNKS , GZIP_SEEK_INDEX_MAGIC , GZIP_SEEK_INDEX_VERSION , INDEXED_GZIP_INDEX_MAGIC , INDEXED_GZIP_INDEX_VERSION , INDEXED_GZIP_WINDOW_SIZE , }",
+      "reason": "Seekable gzip readers, checkpoints and seek-index import/export API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "lrzip_seek :: { looks_like_lrzip , lrzip_available , lrzip_cli_available , materialize_lrzip , LRZIP_CLI_MISSING_MSG , LRZIP_MAGIC , }",
+      "reason": "External lrzip detection and materialization API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "lz4_seek :: { open_seekable_lz4 , open_seekable_lz4_with_threads , SeekableLz4 }",
+      "reason": "Seekable LZ4 reader and opener API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "lzip_seek :: { open_seekable_lzip , open_seekable_lzip_with_threads , SeekableLzip }",
+      "reason": "Seekable lzip reader and opener API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "lzma_seek :: { open_seekable_lzma , open_seekable_lzma_with_threads }",
+      "reason": "Seekable LZMA opener API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "lzo_seek :: { lzo_available , open_seekable_lzo , open_seekable_lzo_with_threads , SeekableLzo }",
+      "reason": "LZO availability, seekable reader and opener API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "ratarmount_core :: ParallelizationSpec",
+      "reason": "Compression API exposes the shared parallelization specification."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "repack_seekable :: { repack_seekable , GzipSidecar , RepackAction , RepackOptions , RepackReport , ZstdFrameWriter , DEFAULT_REPACK_FRAME_SIZE , DEFAULT_REPACK_ZSTD_LEVEL , GZIDX_SIDECAR_EXT , RGZI_SIDECAR_EXT , }",
+      "reason": "Seekable repacking, sidecar and zstd frame-writer API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "seekable_body :: { body_looks_like_tar , DecodedBody , SeekRead , SeekableBody , DEFAULT_MEMORY_CAP , }",
+      "reason": "Decoded seekable-body abstraction and TAR detection API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "xz_seek :: { open_seekable_xz , open_seekable_xz_from_reader , open_seekable_xz_with_threads , open_seekable_xz_with_threads_from_reader , }",
+      "reason": "Seekable XZ opener API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "zlib_seek :: { looks_like_zlib_header , open_seekable_zlib , open_seekable_zlib_with_threads }",
+      "reason": "Zlib header detection and seekable opener API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "zstd_seek :: { build_seek_table_skippable , decode_zstd_frames_to , encode_zstd_frame , encode_zstd_frame_to , export_zstd_blocks , export_zstd_blocks_from_reader , open_seekable_zstd , open_seekable_zstd_from_reader , open_seekable_zstd_with_threads , open_seekable_zstd_with_threads_from_reader , open_seekable_zstd_with_zstd_blocks , open_seekable_zstd_with_zstd_blocks_from_reader , scan_zstd_frames , scan_zstd_frames_path , zstd_decode_stats , SeekableZstd , ZstdDecodeStats , ZstdFrameInfo , ZstdFrameMap , ZstdReadOptions , }",
+      "reason": "Zstd readers, frame maps, seek tables and block-index API."
+    },
+    {
+      "file": "ratarmount-compress/src/lib.rs",
+      "use": "zstd_splice :: { splice_zstd_last_frames , splice_zstd_last_frames_append , splice_zstd_last_frames_append_with , splice_zstd_last_frames_replace , write_zstd_splice_suffix , SpliceStats , }",
+      "reason": "Zstd suffix-splicing API and statistics."
+    },
+    {
+      "file": "ratarmount-core/src/db_inodes.rs",
+      "use": "unix :: { admit_fd , open_admitted , openat_admitted , quarantined }",
+      "reason": "Unix payload descriptor admission and quarantine API."
+    },
+    {
+      "file": "ratarmount-core/src/lib.rs",
+      "use": "atomic_update :: { try_update_u64 , try_update_usize }",
+      "reason": "Atomic integer update helpers shared by workspace crates."
+    },
+    {
+      "file": "ratarmount-core/src/lib.rs",
+      "use": "attribute_mapping :: AttributeMapping",
+      "reason": "Core file-attribute mapping type."
+    },
+    {
+      "file": "ratarmount-core/src/lib.rs",
+      "use": "redact :: { redact_base_url , redact_urls_in_text , redacted_display , REDACTED_SCHEMES , UNREDACTED_SCHEMES , }",
+      "reason": "Credential-redacting URL formatting API."
+    },
+    {
+      "file": "ratarmount-csi/src/lib.rs",
+      "use": "service :: Driver",
+      "reason": "CSI driver service API."
+    },
+    {
+      "file": "ratarmount-export-core/src/lib.rs",
+      "use": "bind :: { default_export_bind , export_bind_string , parse_export_bind , BindError , DEFAULT_HTTP_PORT , DEFAULT_NINEP_PORT , DEFAULT_SFTP_PORT , DEFAULT_SMB_PORT , DEFAULT_WEBDAV_PORT , }",
+      "reason": "Shared export bind parsing, formatting and port defaults."
+    },
+    {
+      "file": "ratarmount-export-core/src/lib.rs",
+      "use": "fill :: fill_read",
+      "reason": "Shared export read-fill loop."
+    },
+    {
+      "file": "ratarmount-export-core/src/lib.rs",
+      "use": "inode :: { InodeTable , ROOT_FILEID }",
+      "reason": "Shared export inode table and root identifier."
+    },
+    {
+      "file": "ratarmount-export-core/src/lib.rs",
+      "use": "overlay :: { io_to_errno , overlay_create_file , overlay_mkdir , overlay_rename , overlay_to_io , overlay_truncate , overlay_unlink , }",
+      "reason": "Shared overlay mutation and error-conversion API for exporters."
+    },
+    {
+      "file": "ratarmount-export-core/src/lib.rs",
+      "use": "reader :: { fill_from_state , ReaderLru , SourceReadState , DEFAULT_READER_SLOTS }",
+      "reason": "Shared export reader-state and reader-LRU API."
+    },
+    {
+      "file": "ratarmount-export-core/src/lib.rs",
+      "use": "stop :: { ExportServerHandle , ExportStop , STOP_POLL_INTERVAL }",
+      "reason": "Shared export server lifecycle and stop API."
+    },
+    {
+      "file": "ratarmount-formats-block/src/lib.rs",
+      "use": "table :: { gpt_guid , gpt_signature_at , gpt_type_efi , gpt_type_linux_fs , gpt_type_linux_lvm , gpt_type_microsoft_basic , gpt_type_ms_reserved , mbr_has_usable_partition , mbr_is_protective_gpt , parse_partition_table , Partition , PartitionKind , PartitionScheme , DEFAULT_SECTOR_SIZE , MBR_TYPE_EXTENDED , MBR_TYPE_EXTENDED_LBA , MBR_TYPE_GPT_PROTECTIVE , MBR_TYPE_LINUX_LVM , }",
+      "reason": "GPT/MBR partition-table parsing and classification API."
+    },
+    {
+      "file": "ratarmount-formats-dmg/src/lib.rs",
+      "use": "disk :: DmgDisk",
+      "reason": "DMG virtual-disk reader type."
+    },
+    {
+      "file": "ratarmount-formats-dmg/src/lib.rs",
+      "use": "udif :: { parse_koly , ChunkKind , KolyTrailer , KOLY_SIZE , SECTOR_SIZE }",
+      "reason": "UDIF trailer parser, chunk kinds and layout constants."
+    },
+    {
+      "file": "ratarmount-formats-qcow2/src/lib.rs",
+      "use": "disk :: { looks_like_qcow2 , looks_like_qcow2_reader , parse_qcow2_header , Qcow2Compression , Qcow2Error , Qcow2Header , Qcow2VirtualDisk , Result , MAGIC , }",
+      "reason": "QCOW2 detection, header parsing and virtual-disk API."
+    },
+    {
+      "file": "ratarmount-formats-restic/src/lib.rs",
+      "use": "repo :: { parse_index_json , write_synthetic_repo , write_synthetic_repo_v2 , IndexFile , SyntheticRepo , }",
+      "reason": "Restic index parser and synthetic-repository construction API."
+    },
+    {
+      "file": "ratarmount-formats-restic/src/lib.rs",
+      "use": "url :: parse_restic_url",
+      "reason": "Restic repository URL parser."
+    },
+    {
+      "file": "ratarmount-formats-sevenzip/src/lib.rs",
+      "use": "parse :: { looks_like_7z , SevenZipArchiveInfo , SevenZipError , SevenZipFileEntry }",
+      "reason": "7z header detection, archive metadata and parse errors."
+    },
+    {
+      "file": "ratarmount-formats-tar/src/lib.rs",
+      "use": "write :: { find_first_valid_header_from , find_last_tar_eof , normalize_archive_rel_path , rewrite_tar_suffix , tar_append_offset , window_has_member_boundary , write_tar_eof , write_ustar_members , RewriteTarSuffix , RewriteTarSuffixStats , TarMemberCursor , TarRawMember , UstarMember , UstarPayload , }",
+      "reason": "TAR member writing, suffix rewriting and boundary detection API."
+    },
+    {
+      "file": "ratarmount-formats-vmdk/src/lib.rs",
+      "use": "descriptor :: { parse_vmdk_descriptor , DescriptorExtent , ExtentKind , VmdkDescriptor }",
+      "reason": "VMDK descriptor parser and extent metadata types."
+    },
+    {
+      "file": "ratarmount-formats-vmdk/src/lib.rs",
+      "use": "sparse :: { FLAG_COMPRESS , FLAG_MARKER , FLAG_ZERO_GRAIN , SECTOR , SPARSE_MAGIC }",
+      "reason": "VMDK sparse-image flags, magic and sector-size constants."
+    },
+    {
+      "file": "ratarmount-fuse/src/lib.rs",
+      "use": "passthrough :: { PassthroughMode , PassthroughOptions }",
+      "reason": "FUSE passthrough mode and options API."
+    },
+    {
+      "file": "ratarmount-http/src/lib.rs",
+      "use": "ratarmount_export_core :: { default_export_bind , export_bind_string , parse_export_bind , BindError , ExportServerHandle , ExportStop , DEFAULT_HTTP_PORT , DEFAULT_WEBDAV_PORT , }",
+      "reason": "HTTP/WebDAV API exposes shared export bind and lifecycle helpers."
+    },
+    {
+      "file": "ratarmount-http/src/lib.rs",
+      "use": "serve :: { parse_http_bind , serve_blocking , serve_webdav_blocking , spawn_http_thread , spawn_webdav_thread , HttpOptions , DEFAULT_HTTP_BIND , }",
+      "reason": "HTTP/WebDAV server startup and HTTP options API."
+    },
+    {
+      "file": "ratarmount-http/src/lib.rs",
+      "use": "webdav :: { parse_webdav_bind , webdav_credentials_from_env , WebDavOptions , DEFAULT_WEBDAV_BIND , }",
+      "reason": "WebDAV bind, credentials and options API."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/install.rs",
+      "use": "acquire :: { RealOpen , RealStat }",
+      "reason": "Checked-open hooks share their actual open/stat function signatures."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/mod.rs",
+      "use": "acquire :: { immutable_uri , open_checked , AcquireError , Acquired , DbId , Expect , NameMode , Refusal , Verification , }",
+      "reason": "Checked SQLite acquisition API, identity and refusal types."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/mod.rs",
+      "use": "elf :: { ElfError , SymbolName }",
+      "reason": "Checked-open ELF parser error and symbol-name types."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/mod.rs",
+      "use": "host :: { HostFailure , ImageIdentity }",
+      "reason": "Checked-open host verification failure and image identity types."
+    },
+    {
+      "file": "ratarmount-index/src/checked_open/mod.rs",
+      "use": "install :: { constructor_observation , install_private_instance , installed , CtorObservation , InstallFailure , InstallStatus , InstallWhy , Witness , VERIFIED_TARGET , }",
+      "reason": "Private SQLite hook installation and constructor-observation API."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "digest_cache :: { archive_digest_cache_available , cached_archive_digest , cached_archive_digest_cancellable , cached_archive_digest_with , peek_archive_digest , peek_archive_digest_for_open , refresh_archive_digest , ArchiveDigestStamp , DIGEST_LOCK_SUFFIX , }",
+      "reason": "Archive digest-cache lookup, refresh and stamp API."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "dirent_order :: { cmp_offset_then_name , DirentOrder , VisibleMember }",
+      "reason": "Visible-member ordering API."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "hashing :: { compute_hashes_limited , fill_content_hashes , hash_hex , normalize_algorithm , sha256_hex , sha256_hex_stream , sha256_stream_calls_this_thread , HASH_STREAM_CHUNK , SUPPORTED_HASH_ALGORITHMS , }",
+      "reason": "Content hashing and algorithm-selection API."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "local_cache :: { enforce_local_index_budget_if_path , find_existing_user_cache_index , is_local_index_cache_path , local_index_v1_dir , platform_cache_root , resolve_user_cache_index_location , LocalIndexCache , LOCAL_INDEX_CACHE_BYTES_DEFAULT , LOCAL_INDEX_CACHE_BYTES_ENV , LOCAL_INDEX_DIR_ENV , }",
+      "reason": "Local index-cache location and budget API."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "location :: { archive_base_from_index_path , bind_local_index_id , default_index_folders , default_index_path , expand_user , find_existing_sibling_index , index_id_path , index_pointer_path , index_pointer_path_for_index_file , index_pointer_to_json , is_index_url , load_index_pointer , local_sibling_index_candidates , looks_like_url_archive , materialize_index_file , maybe_fetch_index_url , object_store_sibling_index_candidates , parse_index_folders , parse_index_id , parse_index_pointer_json , parse_link_describedby , path_can_create_index , path_is_usable_existing_index , pick_index_path , possible_index_paths , prune_index_snapshots , publish_index_pointer , resolve_index_id_path , resolve_index_location , resolve_prepared_index_location , resolve_sibling_index_location , sibling_index_candidates , sibling_index_id_candidates , sibling_index_id_url , sibling_index_pointer_url , sibling_index_url , sibling_parent_dir , snapshot_index_id , store_index_pointer_atomic , test_writable_dir , IndexLocation , IndexPointer , INDEX_ID_HEX_LEN , INDEX_LINK_REL , INDEX_MEDIA_TYPE , INDEX_POINTER_KEEP_LAST , INDEX_POINTER_SCHEMA , MEMORY_INDEX , }",
+      "reason": "Index location, pointer, snapshot and publication API."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "meta_cache :: { cache_identity , invalidate_meta_cache_file , invalidate_meta_cache_identity , is_meta_cache_path , MetaCache , META_CACHE_BYTES_DEFAULT , META_CACHE_BYTES_ENV , META_SIDECAR_WHOLE_MAX , }",
+      "reason": "Meta-v3 cache identity, invalidation and configuration API."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "payload_cache :: { is_payload_cache_path , payload_v1_dir , PayloadCache , PAYLOAD_CACHE_BYTES_DEFAULT , PAYLOAD_CACHE_BYTES_ENV , PAYLOAD_CACHE_DIR_ENV , PAYLOAD_CACHE_MEMBER_MAX_DEFAULT , PAYLOAD_CACHE_MEMBER_MAX_ENV , }",
+      "reason": "Payload-cache location, limits and cache type API."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "range_cache :: { ContentToken , RangeCache , RANGE_CACHE_CHUNK_DEFAULT }",
+      "reason": "Range-cache content token, cache type and default chunk size."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "search :: { locate_pattern_matches , FindAfter , SearchHit , SearchQuery , DEFAULT_SEARCH_LIMIT }",
+      "reason": "Index search query, paging and result API."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "mem :: { CompactOpenCookie , IndexDirent , DIR_SHARD_COUNT , DIR_SHARD_THRESHOLD }",
+      "reason": "Compact index cookies, directory entries and shard constants."
+    },
+    {
+      "file": "ratarmount-index/src/lib.rs",
+      "use": "nested :: { DurableNestedBlob , DurableSevenZipArchive , DurableSevenZipCoder , DurableSevenZipFileEntry , DurableSevenZipFolder , DurableSevenZipPackInfo , DurableZipMember , NestedBodyFingerprint , NestedMemberKey , CREATE_NESTED_INDEXES_SQL , NESTED_BLOB_MAGIC , NESTED_BLOB_VERSION , NESTED_FINGERPRINT_SAMPLE , NESTED_FORMAT_AR , NESTED_FORMAT_CPIO , NESTED_FORMAT_SEVENZIP , NESTED_FORMAT_TAR , NESTED_FORMAT_ZIP , NESTED_INDEXES_TABLE , }",
+      "reason": "Durable nested-index structures, fingerprints and format constants."
+    },
+    {
+      "file": "ratarmount-index/src/meta_cache.rs",
+      "use": "ratarmount_core :: META_SIDECAR_WHOLE_MAX",
+      "reason": "Meta-cache module shares the core whole-sidecar size limit."
+    },
+    {
+      "file": "ratarmount-nfs/src/lib.rs",
+      "use": "v4 :: { io_to_fserror , listen_v4_memfs_smoke , serve_v4 , serve_v4_blocking , serve_v4_memfs_smoke , spawn_nfs4_thread , RatarmountNfs4 , }",
+      "reason": "Optional NFSv4 adapter and server API."
+    },
+    {
+      "file": "ratarmount-nfs/src/lib.rs",
+      "use": "bind :: { nfs_bind_string , parse_nfs_bind , BindError , DEFAULT_NFS_BIND }",
+      "reason": "NFS bind parsing and formatting API."
+    },
+    {
+      "file": "ratarmount-nfs/src/lib.rs",
+      "use": "error :: io_to_nfsstat3",
+      "reason": "NFSv3 I/O error conversion helper."
+    },
+    {
+      "file": "ratarmount-nfs/src/lib.rs",
+      "use": "inode :: ROOT_FILEID",
+      "reason": "NFS root file identifier."
+    },
+    {
+      "file": "ratarmount-nfs/src/lib.rs",
+      "use": "nfsserve :: nfs :: nfsstat3",
+      "reason": "NFS API exposes the protocol status type."
+    },
+    {
+      "file": "ratarmount-nfs/src/lib.rs",
+      "use": "reader :: { fill_read_for_nfs , DEFAULT_READER_SLOTS }",
+      "reason": "NFS read-fill loop and reader-slot default."
+    },
+    {
+      "file": "ratarmount-nfs/src/lib.rs",
+      "use": "serve :: { bind_nfs , parse_nfs_vers , serve , serve_blocking , serve_listener , spawn_nfs_thread , NfsOptions , NfsServerHandle , NfsStop , NfsVers , NfsVersError , }",
+      "reason": "NFS server, protocol selection and lifecycle API."
+    },
+    {
+      "file": "ratarmount-nfs/src/lib.rs",
+      "use": "vfs :: RatarmountNfs",
+      "reason": "NFSv3 MountSource adapter API."
+    },
+    {
+      "file": "ratarmount-nfs/src/v4/mod.rs",
+      "use": "adapter :: RatarmountNfs4",
+      "reason": "NFSv4 MountSource adapter API."
+    },
+    {
+      "file": "ratarmount-nfs/src/v4/mod.rs",
+      "use": "error :: io_to_fserror",
+      "reason": "NFSv4 I/O error conversion helper."
+    },
+    {
+      "file": "ratarmount-nfs/src/v4/mod.rs",
+      "use": "serve :: { listen_v4_memfs_smoke , serve_v4 , serve_v4_blocking , serve_v4_memfs_smoke , spawn_nfs4_thread , }",
+      "reason": "NFSv4 server startup and memory-filesystem smoke API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "hf :: { open_hf_range , parse_hf_url , HfLocation , HfMountSource , HfRepo }",
+      "reason": "Hugging Face URL, range-reader and repository API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "hf_cache :: HfCacheMountSource",
+      "reason": "Hugging Face cache MountSource API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "hf_commit :: { HfCommitFile , HfCommitResult }",
+      "reason": "Hugging Face commit request and result types."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "folder :: { try_open_remote_folder , RemoteDirent , RemoteFolderMountSource , RemoteListing }",
+      "reason": "Remote folder listing and MountSource API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "ftp :: { fetch_ftp_to_temp , open_ftp_folder , open_ftp_range , parse_ftp_url , parse_ftp_url_allow_prefix , redact_ftp_url , FtpLocation , FtpRangeFile , FtpScheme , }",
+      "reason": "FTP URL, download, folder and range-reader API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "gcs :: { fetch_gcs_location_to_temp_prefer_range , fetch_gcs_range_bytes , fetch_gcs_to_temp , head_gcs_object , open_gcs_folder , open_gcs_range , parse_gcs_url , put_gcs_file , put_gcs_object , GcsHead , GcsListing , GcsLocation , GcsRangeFile , }",
+      "reason": "GCS URL, listing, object transfer and range-reader API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "azure :: { fetch_azure_location_to_temp_prefer_range , fetch_azure_range_bytes , fetch_azure_to_temp , head_azure_object , open_azure_folder , open_azure_range , parse_azure_url , put_azure_blocks , put_azure_bytes , AzureHead , AzureListing , AzureLocation , AzureRangeFile , }",
+      "reason": "Azure URL, listing, block upload and range-reader API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "rclone :: { find_rclone , open_rclone , open_rclone_folder , parse_rclone_url , rclone_cat_args , rclone_lsjson_args , rclone_lsjson_stat_args , RcloneHandle , RcloneLocation , RCLONE_BIN_ENV , }",
+      "reason": "Rclone discovery, invocation, URL and MountSource API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "oci :: { fetch_oci_image , fetch_oci_index_referrer , list_oci_index_referrers , parse_docker_url , parse_oci_url , OciBlobRangeFile , OciImage , OciLayer , OciLocation , OciReferrer , OCI_DOCKER_CONFIG_ENV , OCI_INDEX_ARTIFACT_TYPE , OCI_PASSWORD_ENV , OCI_USER_ENV , }",
+      "reason": "OCI image, index-referrer, blob-reader and credential API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "ipfs :: { ipfs_api , ipfs_gateway , open_ipfs , open_ipfs_at , open_ipfs_folder , open_ipfs_folder_at , parse_ipfs_url , IpfsHandle , IpfsListing , IpfsLocation , IpfsScheme , DEFAULT_IPFS_API , DEFAULT_IPFS_GATEWAY , IPFS_API_ENV , IPFS_GATEWAY_ENV , }",
+      "reason": "IPFS URL, gateway/API, handle and folder-opening API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "http_pool :: HttpRangeSource",
+      "reason": "Pooled HTTP range-source abstraction."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "ratarmount_index :: ContentToken",
+      "reason": "Remote API exposes the shared range-cache content token."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "azure :: fetch_azure_bytes_capped",
+      "reason": "Crate-internal capped Azure fetch used by index-sibling access."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "dropbox :: { dropbox_api_arg , dropbox_download_url , dropbox_list_ttl_secs , dropbox_path_is_folder , dropbox_rpc_base , fetch_dropbox_location_to_temp , fetch_dropbox_location_to_temp_prefer_range , fetch_dropbox_range_bytes , fetch_dropbox_to_temp , get_dropbox_metadata , list_dropbox_folder , load_dropbox_token , parse_dropbox_url , parse_dropbox_url_allow_root , redact_token , DropboxEntry , DropboxEntryKind , DropboxLocation , DropboxMountSource , DEFAULT_DROPBOX_DOWNLOAD_URL , DEFAULT_DROPBOX_LIST_TTL_SECS , DEFAULT_DROPBOX_RANGE_THRESHOLD , DEFAULT_DROPBOX_RPC_BASE , }",
+      "reason": "Dropbox credentials, URL, listing, transfer and MountSource API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "gcs :: fetch_gcs_bytes_capped",
+      "reason": "Crate-internal capped GCS fetch used by index-sibling access."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "index_sibling :: { fetch_index_sibling_bytes_capped , fetch_index_sibling_to_temp , is_object_store_archive_url , put_object_store_index_siblings , put_s3_index_siblings , S3IndexSiblingPut , }",
+      "reason": "Object-store index-sibling fetch and publication API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "s3 :: fetch_s3_bytes_capped",
+      "reason": "Crate-internal capped S3 fetch used by index-sibling access."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "s3 :: { fetch_s3_location_range_bytes , fetch_s3_location_to_temp , fetch_s3_location_to_temp_prefer_range , fetch_s3_range_bytes , fetch_s3_to_temp , fetch_s3_to_temp_prefer_range , head_s3_object , open_s3_range , parse_s3_url , parse_s3_url_allow_prefix , put_s3_multipart , put_s3_object , S3Head , S3Location , S3RangeFile , DEFAULT_S3_RANGE_THRESHOLD , OBJECT_STORE_IO_TIMEOUT , }",
+      "reason": "S3 URL, metadata, range-reader and object-transfer API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "smb :: { fetch_smb_to_temp , find_smbclient , parse_smb_url , smbclient_download_args , SmbLocation , SMB_CLIENT_DOMAIN_ENV , SMB_CLIENT_PASSWORD_ENV , SMB_CLIENT_USER_ENV , }",
+      "reason": "External smbclient discovery, credentials and download API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "smb_client :: { open_smb_range , try_open_smb_folder , SmbRangeFile }",
+      "reason": "In-process SMB range-reader and folder-opening API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "ssh :: { expand_tilde , fetch_ssh_to_temp , host_line_matches , host_pattern_matches , load_ssh_config , parse_proxy_jump_list , parse_ssh_config_file , parse_ssh_config_reader , parse_ssh_url , resolve_ssh_connect , resolve_ssh_connect_default , ssh_config_path , SshConfig , SshConfigMatch , SshConnectParams , SshLocation , SshProxyHop , SSH_CONFIG_ENV , }",
+      "reason": "SSH/SFTP URL, configuration, jump-host and download API."
+    },
+    {
+      "file": "ratarmount-remote/src/lib.rs",
+      "use": "webdav :: { fetch_webdav_to_temp , parse_getcontentlength , parse_webdav_url , propfind_content_length , WebDavLocation , }",
+      "reason": "WebDAV URL, download and metadata parsing API."
+    },
+    {
+      "file": "ratarmount-remote/src/torrent/mod.rs",
+      "use": "ratarmount_core :: TorrentSwarmPolicy",
+      "reason": "Torrent API exposes the shared network-contact policy."
+    },
+    {
+      "file": "ratarmount-remote/src/torrent/mod.rs",
+      "use": "swarm :: SwarmOptions",
+      "reason": "Torrent swarm configuration type."
+    },
+    {
+      "file": "ratarmount-session/src/http.rs",
+      "use": "ratarmount_http :: DEFAULT_HTTP_BIND",
+      "reason": "Session HTTP module exposes the exporter bind default."
+    },
+    {
+      "file": "ratarmount-session/src/lib.rs",
+      "use": "error :: Error",
+      "reason": "Embedder session error type."
+    },
+    {
+      "file": "ratarmount-session/src/lib.rs",
+      "use": "http :: { HttpHandle , DEFAULT_HTTP_BIND }",
+      "reason": "Optional embedder HTTP handle and bind default."
+    },
+    {
+      "file": "ratarmount-session/src/lib.rs",
+      "use": "index_job :: IndexJob",
+      "reason": "Embedder background index-job API."
+    },
+    {
+      "file": "ratarmount-session/src/lib.rs",
+      "use": "locate :: { query_index , split_fts_pattern , DEFAULT_FIND_PAGE }",
+      "reason": "Embedder index-query and search-pattern API."
+    },
+    {
+      "file": "ratarmount-session/src/lib.rs",
+      "use": "ratarmount_core :: { IndexBuildHooks , IndexBuildTick , ParallelizationSpec }",
+      "reason": "Embedder API exposes shared index hooks and parallelization settings."
+    },
+    {
+      "file": "ratarmount-session/src/lib.rs",
+      "use": "ratarmount_index :: IndexLocation",
+      "reason": "Embedder API exposes the shared index-location type."
+    },
+    {
+      "file": "ratarmount-session/src/lib.rs",
+      "use": "read :: RangeReader",
+      "reason": "Embedder range-reader API."
+    },
+    {
+      "file": "ratarmount-session/src/lib.rs",
+      "use": "resolve :: resolve_index",
+      "reason": "Embedder index-resolution API."
+    },
+    {
+      "file": "ratarmount-session/src/lib.rs",
+      "use": "session :: Session",
+      "reason": "Supported embedder Session API."
+    },
+    {
+      "file": "ratarmount-session/src/lib.rs",
+      "use": "types :: { DirCursor , DirEnt , DirPage , ExtractProgress , ExtractRequest , FindCursor , FindOpts , FindPage , IndexPhase , IndexPolicy , IndexProgress , MemberExtent , OffsetCursor , OffsetPage , OpenRequest , Overwrite , ReadRequest , Recreate , SourceSpec , }",
+      "reason": "Embedder request, progress, directory and paging types."
+    },
+    {
+      "file": "ratarmount-sftp/src/lib.rs",
+      "use": "auth :: { authorized_keys_from_env , host_key_from_env , parse_authorized_keys , resolve_authorized_keys , sftp_password_from_env , AuthPolicyError , AuthorizedKeysSource , }",
+      "reason": "SFTP authorized-key, host-key and password policy API."
+    },
+    {
+      "file": "ratarmount-sftp/src/lib.rs",
+      "use": "ratarmount_compositing :: WriteOverlay",
+      "reason": "SFTP API exposes the shared write-overlay type."
+    },
+    {
+      "file": "ratarmount-sftp/src/lib.rs",
+      "use": "ratarmount_export_core :: { fill_read , BindError , ExportServerHandle , ExportStop , DEFAULT_READER_SLOTS , DEFAULT_SFTP_PORT , }",
+      "reason": "SFTP API exposes shared export readers, lifecycle types and defaults."
+    },
+    {
+      "file": "ratarmount-sftp/src/lib.rs",
+      "use": "serve :: { parse_sftp_bind , serve_blocking , serve_stdio , sftp_russh_compiled , spawn_sftp_thread , SftpOptions , DEFAULT_SFTP_BIND , SFTP_RUSSH_HINT , }",
+      "reason": "SFTP bind, stdio/TCP server startup and options API."
+    },
+    {
+      "file": "ratarmount-sftp/src/lib.rs",
+      "use": "vfs :: RatarmountSftp",
+      "reason": "SFTP MountSource adapter API."
+    },
+    {
+      "file": "ratarmount-smb/src/lib.rs",
+      "use": "ratarmount_compositing :: WriteOverlay",
+      "reason": "SMB API exposes the shared write-overlay type."
+    },
+    {
+      "file": "ratarmount-smb/src/lib.rs",
+      "use": "ratarmount_export_core :: { fill_read , BindError , ExportServerHandle , ExportStop , DEFAULT_READER_SLOTS , DEFAULT_SMB_PORT , }",
+      "reason": "SMB API exposes shared export readers, lifecycle types and defaults."
+    },
+    {
+      "file": "ratarmount-smb/src/lib.rs",
+      "use": "serve :: { parse_smb_bind , serve_blocking , smb_credentials_from_env , spawn_smb_thread , SmbOptions , DEFAULT_SMB_BIND , DEFAULT_SMB_SHARE , }",
+      "reason": "SMB bind, credentials, server startup and options API."
+    },
+    {
+      "file": "ratarmount-smb/src/lib.rs",
+      "use": "vfs :: RatarmountSmb",
+      "reason": "SMB MountSource adapter API."
+    },
+    {
+      "file": "ratarmount/src/main.rs",
+      "use": "ratarmount_compositing :: lower_stack :: MountLowerStack",
+      "reason": "CLI modules share the compositing lower-stack type."
+    },
+    {
+      "file": "ratarmount/src/sandbox/mod.rs",
+      "use": "inspection :: start as start_inspection",
+      "reason": "Sandbox module exposes its inspection-thread startup entry point."
+    }
+  ]
+}

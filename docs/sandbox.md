@@ -2012,8 +2012,13 @@ read_index`). The original helper resolver runs unchanged alongside an extra
 chain pass, and the inventory reports their union. The extra pass expands only
 the first segment of a relative path; `crate::`, `super::`, `self::` and `::`
 paths keep their roots. Cycles, unknown targets, alias names bound in multiple
-scopes, unsupported scoped bindings, and re-exports the extra pass cannot
-follow are reported as fail-closed errors. The pathname opens done inside
+scopes, conflicting alias targets, and unsupported scoped bindings are
+reported as fail-closed errors. Every production `pub use` (including restricted
+visibility) requires a reviewed entry with a reason in
+`packaging/internal-read-reexport-allowlist.json`, keyed by repo-relative file
+and token whitespace normalized use-tree. Missing, stale and duplicate entries
+fail closed, including re-exports the extra pass can resolve. The pathname opens
+done inside
 libgit2 (`Repository::open`), libarchive (`archive_read_open_filename`) and
 lopdf (`Document::load`) are recorded as #196 residuals (those libraries own
 their descriptors).
