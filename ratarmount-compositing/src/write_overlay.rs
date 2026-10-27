@@ -1653,7 +1653,7 @@ impl WriteOverlay {
                 )));
             }
         }
-        let (conn, registration) = opened.into_parts();
+        let (mut conn, registration) = opened.into_parts();
         drop(registration);
         conn.busy_timeout(Duration::ZERO)?;
         // Same lock the first open takes. No schema run and no staging sweep:
@@ -1676,7 +1676,11 @@ impl WriteOverlay {
                 )));
             }
         }
-        let fresh = tombstone_set_from_conn(&conn)?;
+        let mut fresh = tombstone_set_from_conn(&conn)?;
+        // A competing writer may have crashed after publishing a host file
+        // but before clearing its tombstone during the unlocked handoff (#88).
+        // Run the normal-open repair under our new exclusive lock.
+        clear_tombstones_with_host_files(&mut conn, &self.root, &mut fresh)?;
         if let Some(policy) = &self.policy {
             policy.refresh_after_fork()?;
         }
@@ -9313,6 +9317,90 @@ pub(crate) mod tests {
                 .get("readonly_rules"),
             Some("[]")
         );
+    }
+
+    #[cfg(unix)]
+    fn handoff_recovers_tombstones(reacquire: fn(&WriteOverlay) -> Result<()>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = MemBase::with(&[
+            ("/replacement", b"archived"),
+            ("/link", b"archived-link"),
+            ("/missing", b"archived-missing"),
+        ]);
+        base.files.extend(MemBase::with_dir("/sub").files);
+        let base = Arc::new(base) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap();
+        ov.release_db_before_fork().unwrap();
+        {
+            let other = WriteOverlay::new_for_tests(base.clone(), dir.path()).unwrap();
+            other.unlink("/replacement").unwrap();
+            other.unlink("/link").unwrap();
+            other.unlink("/missing").unwrap();
+            other.rmdir("/sub").unwrap();
+            // A writer crashes after publishing a host entry, before clearing
+            // its durable tombstone. Parent directories are not replacements.
+            fs::write(dir.path().join("replacement"), b"replacement bytes").unwrap();
+            std::os::unix::fs::symlink("missing-target", dir.path().join("link")).unwrap();
+            fs::create_dir(dir.path().join("sub")).unwrap();
+            assert!(other.lookup("/replacement", 0).is_none());
+            assert_eq!(deleted_flag(&other, "/replacement"), Some(1));
+            assert_eq!(deleted_flag(&other, "/link"), Some(1));
+        }
+        reacquire(&ov).unwrap();
+        let assert_recovered = |ov: &WriteOverlay| {
+            assert!(
+                !ov.is_deleted("/replacement"),
+                "handoff must recover the replacement file's tombstone"
+            );
+            assert_eq!(deleted_flag(ov, "/replacement"), Some(0));
+            let fi = ov.lookup("/replacement", 0).expect("replacement visible");
+            assert!(is_overlay_fi(&fi));
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut ov.open(&fi, 0).unwrap(), &mut bytes).unwrap();
+            assert_eq!(bytes, b"replacement bytes");
+            assert_eq!(
+                fs::read(dir.path().join("replacement")).unwrap(),
+                b"replacement bytes"
+            );
+            assert!(!ov.is_deleted("/link"));
+            assert_eq!(deleted_flag(ov, "/link"), Some(0));
+            assert_eq!(
+                ov.lookup("/link", 0).expect("symlink visible").linkname,
+                "missing-target"
+            );
+            assert_eq!(
+                fs::read_link(dir.path().join("link")).unwrap(),
+                Path::new("missing-target")
+            );
+            for path in ["/missing", "/sub"] {
+                assert!(ov.is_deleted(path), "{path} must stay tombstoned");
+                assert_eq!(deleted_flag(ov, path), Some(1));
+                assert!(ov.lookup(path, 0).is_none(), "{path} must stay hidden");
+            }
+            assert!(!dir.path().join("missing").exists());
+            assert!(dir.path().join("sub").is_dir());
+        };
+        assert_recovered(&ov);
+        drop(ov);
+        let reopened = WriteOverlay::new_for_tests(base, dir.path()).unwrap();
+        assert_recovered(&reopened);
+    }
+
+    /// Regression: a competing writer's crash during the unlocked handoff
+    /// hid replacement files/symlinks in the serving child. Keep directory
+    /// tombstones and missing-file tombstones, as a cold open does (#88).
+    #[cfg(unix)]
+    #[test]
+    fn regression_183_handoff_child_recovers_tombstones() {
+        handoff_recovers_tombstones(WriteOverlay::acquire_exclusive_after_fork);
+    }
+
+    /// Regression: failed-fork restoration must run the same crash recovery
+    /// before publishing its connection and refreshed tombstone cache (#88).
+    #[cfg(unix)]
+    #[test]
+    fn regression_183_handoff_failed_fork_recovers_tombstones() {
+        handoff_recovers_tombstones(WriteOverlay::restore_db_after_failed_fork);
     }
 
     /// Regression: a competing forced writer can replace the accepted base

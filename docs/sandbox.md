@@ -1831,8 +1831,10 @@ the database itself and takes the exclusive lock there; the parent's exit is
 not what releases that lock (#183). An export-only server does not fork.
 Before serving, the child refuses overlay metadata changed during the unlocked
 handoff (including base identity, sealing and the lower stack), reloads
-tombstones, and rescans quota usage under its exclusive lock. Quota status uses
-the refreshed counters too.
+tombstones, repairs tombstones shadowing host files or symlinks after a competing
+writer's crash (#88), and rescans quota usage under its exclusive lock. Missing-file
+and directory tombstones stay set. Failed-fork restoration runs the same recovery.
+Quota status uses the refreshed counters too.
 
 
 A required-record observation is a **one-way session latch**. Once an overlay
