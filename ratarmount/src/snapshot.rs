@@ -254,6 +254,9 @@ fn export_git(args: &GitSnapshotArgs, output: &mut impl Write) -> Result<i32> {
             crate::shard::index_request(&archive, &index),
             Default::default(),
         )?;
+        // The job drops its readers before returning, but compression metadata
+        // may still be in WAL. Hand consumers a completed immutable artifact.
+        ratarmount_index::SqliteIndex::finalize_prepared(&index)?;
     }
     let archive_digest = format!("sha256:{}", crate::shard::sha256(&archive)?);
     let base_digest = format!("git-tree:{}", source.tree_id());
@@ -734,6 +737,64 @@ mod tests {
         ] {
             assert!(crate::parse_args_from(std::iter::once("ratarmount").chain(args)).is_err());
         }
+    }
+
+    /// Regression: snapshot --with-index must checkpoint seek metadata before strict readers start.
+    #[test]
+    fn regression_prepared_index_snapshot_export_finishes_handoff() {
+        let (temp, spec, _) = export_fixture(1234567890);
+        let archive = temp.path().join("prepared.tar.zst");
+        let index = temp.path().join("prepared.tar.zst.index.sqlite");
+        assert_eq!(
+            run(
+                &parse(&[
+                    &spec,
+                    archive.to_str().unwrap(),
+                    "--with-index",
+                    "--frame-size",
+                    "1K",
+                ]),
+                &mut Vec::new()
+            )
+            .unwrap(),
+            0
+        );
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!PathBuf::from(format!("{}{suffix}", index.display())).exists());
+        }
+        let snapshot = || -> BTreeMap<_, _> {
+            fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.is_file())
+                .map(|path| (path.clone(), fs::read(path).unwrap()))
+                .collect()
+        };
+        let before = snapshot();
+        let catalog = ratarmount_index::SqliteIndex::open_prepared(&index).unwrap();
+        assert!(catalog.get_zstd_blocks().unwrap().len() > 2);
+        let source = ratarmount_session::factory::open_path(
+            &archive,
+            &ratarmount_core::OpenOptions {
+                read_only_index: true,
+                write_index: false,
+                index_file_path: Some(index),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+        let member = source.lookup("/plain", 0).unwrap();
+        let mut bytes = Vec::new();
+        source
+            .open(&member, 0)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, vec![42; 32768]);
+        assert_eq!(snapshot(), before);
+        drop((source, catalog));
+        assert_eq!(snapshot(), before);
     }
 
     /// Regression: indexed snapshots must equal the pinned Git view, preserve modes, and open warm.

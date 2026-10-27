@@ -70,7 +70,7 @@ pub struct Session {
 pub(crate) enum OpenedSource {
     #[allow(dead_code)]
     Local(Arc<dyn MountSource>),
-    Bundle(MountBundle),
+    Bundle(Box<MountBundle>),
 }
 
 impl OpenedSource {
@@ -137,21 +137,35 @@ impl Session {
             matches!(&req.source, SourceSpec::Url(_)) || looks_like_url_archive(&archive_path);
 
         if !remote_archive {
-            ratarmount_compositing::recover_journal_at(
-                &archive_path,
-                None,
-                ratarmount_compositing::Owner::Inode,
-            )
-            .map_err(|e| Error::Internal(e.to_string()))?;
+            if options.read_only_index {
+                ratarmount_compositing::journal_recovery::check_offline_journal(&archive_path)
+                    .map_err(|e| Error::Internal(format!("--no-recreate-index forbids commit recovery; finish preparation first: {e}")))?;
+            } else {
+                ratarmount_compositing::recover_journal_at(
+                    &archive_path,
+                    None,
+                    ratarmount_compositing::Owner::Inode,
+                )
+                .map_err(|e| Error::Internal(e.to_string()))?;
+            }
         }
 
+        if options.read_only_index && matches!(req.index, IndexPolicy::Memory | IndexPolicy::Temp) {
+            return Err(Error::Internal("--no-recreate-index requires a prepared disk index; memory/temporary rebuilds are forbidden".into()));
+        }
         let (loc, mut temp_guard, index_in_memory, index_file_path) = if req.index
-            == IndexPolicy::Sibling
-            && matches!(req.recreate, Recreate::Never)
+            == IndexPolicy::Explicit
+            && options.read_only_index
         {
-            match find_existing_sibling_index(&archive_path, &req.extra_dirs) {
-                Some(p) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
-                None => return Err(Error::NotFound),
+            let path = req.explicit_index.clone().ok_or(Error::NotFound)?;
+            (CatalogLoc::Path(path.clone()), None, false, Some(path))
+        } else if req.index == IndexPolicy::Sibling && matches!(req.recreate, Recreate::Never) {
+            let folders: Vec<PathBuf> = std::iter::once(PathBuf::new())
+                .chain(req.extra_dirs.iter().cloned())
+                .collect();
+            match ratarmount_index::resolve_prepared_index_location(&archive_path, None, &folders) {
+                Ok(IndexLocation::Path(p)) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
+                _ => return Err(Error::NotFound),
             }
         } else if req.index == IndexPolicy::UserCache && matches!(req.recreate, Recreate::Never) {
             match find_existing_user_cache_index(&archive_path, &req.extra_dirs) {
@@ -233,13 +247,13 @@ impl Session {
         .map_err(|e| map_factory_error(e, had_passwords, &archive_path))?;
         bundle.source =
             ratarmount_compositing::maybe_wrap_payload_cache(bundle.source, index_in_memory);
-        let source = OpenedSource::Bundle(bundle);
+        let source = OpenedSource::Bundle(Box::new(bundle));
         if let Some(p) = loc.path() {
             // WHY: allocate evicts before the sqlite body exists; trim after publish.
             enforce_local_index_budget_if_path(p);
         }
 
-        let catalog = open_catalog_if_path(&loc)?;
+        let catalog = open_catalog_for_policy(&loc, options.read_only_index)?;
         if let Some(g) = &mut temp_guard {
             g.disarm();
         }
@@ -590,7 +604,7 @@ fn check_recreate_never(archive: &Path, loc: &CatalogLoc) -> Result<(), Error> {
                 return Err(Error::NotFound);
             }
             let cat =
-                SqliteIndex::open_lookup(p).map_err(|e| Error::CorruptIndex(e.to_string()))?;
+                SqliteIndex::open_prepared(p).map_err(|e| Error::CorruptIndex(e.to_string()))?;
             match cat.check_tarstats_matches_archive(archive) {
                 Ok(()) => Ok(()),
                 Err(IndexError::Mismatch(msg)) => Err(Error::CorruptIndex(msg)),
@@ -600,7 +614,15 @@ fn check_recreate_never(archive: &Path, loc: &CatalogLoc) -> Result<(), Error> {
     }
 }
 
+#[cfg(test)]
 fn open_catalog_if_path(loc: &CatalogLoc) -> Result<Option<SqliteIndex>, Error> {
+    open_catalog_for_policy(loc, false)
+}
+
+fn open_catalog_for_policy(
+    loc: &CatalogLoc,
+    read_only_index: bool,
+) -> Result<Option<SqliteIndex>, Error> {
     #[cfg(test)]
     if INJECT_CATALOG_OPEN_ERR.with(|c| c.replace(false)) {
         return Err(Error::Internal("injected catalog open failure".into()));
@@ -612,9 +634,13 @@ fn open_catalog_if_path(loc: &CatalogLoc) -> Result<Option<SqliteIndex>, Error> 
         return Ok(None);
     }
     // A read: it creates nothing beside the sidecar (see `open_lookup`).
-    SqliteIndex::open_lookup(p)
-        .map(Some)
-        .map_err(|e| Error::Internal(e.to_string()))
+    (if read_only_index {
+        SqliteIndex::open_catalog_prepared(p)
+    } else {
+        SqliteIndex::open_lookup(p)
+    })
+    .map(Some)
+    .map_err(|e| Error::Internal(e.to_string()))
 }
 
 fn will_cold_build(recreate: Recreate, archive: &Path, loc: &CatalogLoc) -> bool {

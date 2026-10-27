@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ratarmount_index::{
-    cached_archive_digest_cancellable, peek_archive_digest, sha256_hex, sha256_hex_stream,
+    cached_archive_digest_cancellable, peek_archive_digest_for_open, sha256_hex, sha256_hex_stream,
     ArchiveDigestStamp,
 };
 use rusqlite::{params, Connection, OpenFlags};
@@ -69,6 +69,10 @@ pub(crate) struct OverlayCreateInfo {
     /// and the typed `base_url` is never read as one (`rclone+r:p`, `restic:/r`).
     pub classified: bool,
     pub index_path: Option<PathBuf>,
+    /// Selected prepared index for immutable creation-time digest reads. This
+    /// is separate from the writable cache path persisted in overlay metadata.
+    pub prepared_index_for_peek: Option<PathBuf>,
+    pub read_only_index: bool,
     /// Tree id of the source actually mounted, after any Git subtree selection.
     pub git_tree: Option<String>,
     /// Cheap remote identity, e.g. ETag or Content-Length + Last-Modified.
@@ -1201,7 +1205,12 @@ impl OverlayCreateInfo {
             // Hashing happens after the mount is serving (spec 1.2): a miss is
             // recorded as `pending` and resolved by the mount's background
             // hasher or by the first verb that needs the digest.
-            let cached = peek_archive_digest(path, self.index_path.as_deref())
+            let index = if self.read_only_index {
+                self.prepared_index_for_peek.as_deref()
+            } else {
+                self.index_path.as_deref()
+            };
+            let cached = peek_archive_digest_for_open(path, index, self.read_only_index)
                 .map_err(|e| OverlayError::Msg(format!("cannot read base digest cache: {e}")))?;
             return Ok(match cached {
                 Some(digest) => (digest, "strong"),
@@ -1639,6 +1648,7 @@ pub(crate) struct ContentProbe<'a> {
     pub supplied: Option<&'a str>,
     /// Index sidecar whose digest cache may already hold the archive's digest.
     pub index: Option<&'a Path>,
+    pub read_only_index: bool,
     /// Base-relative paths of the caller's own overlay, journal and mount
     /// point, left out of the walk in addition to the recorded set.
     pub extra_excludes: &'a [PathBuf],
@@ -1741,7 +1751,12 @@ pub(crate) fn compare_content(
             out.stamp = Some(stamp);
         }
         if probe.supplied.is_none() || (decidable && strong) {
-            out.cached_digest = peek_archive_digest(file, probe.index).ok().flatten();
+            let cached = peek_archive_digest_for_open(file, probe.index, probe.read_only_index);
+            out.cached_digest = if probe.read_only_index {
+                cached.map_err(|e| format!("cannot read prepared base digest cache: {e}"))?
+            } else {
+                cached.ok().flatten()
+            };
         }
         out.compared = recorded_stamp.is_some();
         if let Some(stamp) = &out.stamp {
@@ -1876,6 +1891,7 @@ fn reopen_classified(
             }
             return forced_rows(conn);
         }
+        Verdict::PreparationError(reason) => return Err(OverlayError::Msg(reason)),
         Verdict::Same | Verdict::Confirmed(_) => {}
         Verdict::Content => {
             let mut overridden = false;
@@ -1888,10 +1904,19 @@ fn reopen_classified(
                 // byte-identical copy with another mtime reopens. Anything the
                 // comparator does not accept falls to the stamp/manifest/
                 // exclusion checks of `verify`, which name the mismatch.
-                let confirmed = base.actual().kind() == crate::BaseKind::Archive
+                let confirmed = if base.actual().kind() == crate::BaseKind::Archive
                     && meta.base_digest_kind() == Some("strong")
-                    && crate::overlay_gate::compare_base_identity(Some(meta), base, &probe)
-                        .is_ok_and(|cmp| cmp.mismatch.is_none());
+                {
+                    let comparison =
+                        crate::overlay_gate::compare_base_identity(Some(meta), base, &probe);
+                    if base.actual().read_only_index() {
+                        comparison.map_err(OverlayError::Msg)?.mismatch.is_none()
+                    } else {
+                        comparison.is_ok_and(|cmp| cmp.mismatch.is_none())
+                    }
+                } else {
+                    false
+                };
                 if !confirmed {
                     overridden = verify(conn, meta, info, plan)?;
                 }

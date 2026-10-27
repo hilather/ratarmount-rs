@@ -358,7 +358,7 @@ impl SqliteIndexedTar {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let data_path = data_path.as_ref().to_path_buf();
-        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        let index = SqliteIndex::open_read_only_for_open(index_path.as_ref(), &options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Reject sibling indexes for a replaced archive (size/mtime fingerprint).
         index.check_tarstats_matches_archive(&archive_path)?;
@@ -388,7 +388,7 @@ impl SqliteIndexedTar {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let data_path = gzip.path().to_path_buf();
-        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        let index = SqliteIndex::open_read_only_for_open(index_path.as_ref(), &options)?;
         index.check_backend_name(BACKEND_NAME)?;
         index.check_tarstats_matches_archive(&archive_path)?;
         Ok(Self {
@@ -470,7 +470,7 @@ impl SqliteIndexedTar {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let data_path = body.path().to_path_buf();
-        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        let index = SqliteIndex::open_read_only_for_open(index_path.as_ref(), &options)?;
         index.check_backend_name(BACKEND_NAME)?;
         index.check_tarstats_matches_archive(&archive_path)?;
         Ok(Self {
@@ -653,7 +653,7 @@ impl SqliteIndexedTar {
     {
         let archive_path = archive_label.as_ref().to_path_buf();
         let data_path = archive_path.clone();
-        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        let index = SqliteIndex::open_read_only_for_open(index_path.as_ref(), &options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Virtual labels that are not real paths skip the fingerprint (no host file).
         index.check_tarstats_matches_archive(&archive_path)?;
@@ -3259,6 +3259,59 @@ impl MountSource for SingleFileMountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Regression: strict TAR warm opens preserve the prepared catalog and directory entries.
+    #[test]
+    fn regression_prepared_index_warm_open_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        let index = dir.path().join("index.sqlite");
+        std::fs::write(&archive, synthetic_ustar("hello.txt", b"worker base")).unwrap();
+        let mut materialized = None;
+        drop(
+            SqliteIndexedTar::create_index(
+                &archive,
+                &archive,
+                Some(&index),
+                &OpenOptions::default(),
+                "test",
+                &mut materialized,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&index).unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let source = SqliteIndexedTar::open_with_existing_index(
+            &archive,
+            &archive,
+            &index,
+            options,
+            &mut materialized,
+        )
+        .unwrap();
+        let info = source.lookup("/hello.txt", 0).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut source.open(&info, 0).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, b"worker base");
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(source);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
     use std::io::{Read, Seek, Write};
     use std::process::Command;
 

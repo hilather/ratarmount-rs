@@ -2086,7 +2086,12 @@ daemon serving many mounts (`serve-sandboxes`) remains a design proposal.
 The Linux supervisor manages a fleet of independent attempts without a Python
 binding. Each attempt is a foreground ratarmount process mounting the registered
 base directly, with its own writable overlay and FUSE request worker. The base
-itself is never mounted by the supervisor.
+itself is never mounted by the supervisor. Registration prepares its shared
+indexes once. Every attempt automatically uses `--no-recreate-index`, so its
+base/index reads are immutable while mutations stay in its own overlay.
+A missing index or a detected schema, identity or compression-state preparation
+failure refuses the worker before mounting; it never rebuilds or commits the
+shared index. The same policy applies when API diff reopens the base.
 
 ```sh
 mkdir -m 700 -p "$HOME/.local/state/ratarmount-sandboxes"
@@ -2104,6 +2109,106 @@ ratarmount sandbox destroy --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" A
 ratarmount sandbox destroy --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock" --base task
 ratarmount sandbox shutdown --socket "$XDG_RUNTIME_DIR/ratarmount-sandbox.sock"
 ```
+
+### Prepare once, N writable workers
+
+For an archive fleet, call `sandbox create-base` once with an existing archive,
+then `sandbox new ... --count 3` (or N) for each batch. The supervisor waits for
+preparation to exit before starting workers, and manages readiness and failed
+batch cleanup. Each worker owns a distinct overlay and mountpoint; the base
+archive and prepared indexes are shared immutable inputs. Unindexed binds,
+such as ordinary files, need no sidecar.
+Local archive paths and `file://` URLs use the same preparation and strict-worker
+checks, including archives supplied with `--bind`.
+
+The direct CLI equivalent below is **Bash**. It assumes
+`/srv/keystone/base.tar` already exists and these absolute paths do not overlap.
+Preparation runs once before the worker loop. The trap unmounts and reaps a
+partial batch on a failure or deadline; it never removes backing directories.
+
+```bash
+set -euo pipefail
+mkdir -p /srv/keystone/prepared /srv/keystone/workers
+pids=()
+cleanup() {
+  trap - EXIT INT TERM
+  for n in 1 2 3; do
+    mnt="/srv/keystone/workers/$n/mnt"
+    if mountpoint -q "$mnt"; then
+      ratarmount -u "$mnt" || true
+    fi
+  done
+  for pid in "${pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+wait_ready() {
+  local n=$1 deadline=$((SECONDS + 30))
+  until mountpoint -q "/srv/keystone/workers/$n/mnt"; do
+    if (( SECONDS >= deadline )); then
+      echo "worker $n failed to become ready" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+}
+
+# Exclusive preparer: no workers may be using this base/index.
+ratarmount --no-mount --index-file /srv/keystone/prepared/base.sqlite \
+  /srv/keystone/base.tar
+
+for n in 1 2 3; do
+  mkdir -p "/srv/keystone/workers/$n/mnt"
+  ratarmount --foreground --no-recreate-index \
+    --index-file /srv/keystone/prepared/base.sqlite \
+    -w "/srv/keystone/workers/$n/overlay" \
+    /srv/keystone/base.tar "/srv/keystone/workers/$n/mnt" &
+  pids+=("$!")
+done
+for n in 1 2 3; do wait_ready "$n"; done
+# Run each workload against its own mountpoint here.
+for n in 1 2 3; do ratarmount -u "/srv/keystone/workers/$n/mnt"; done
+for pid in "${pids[@]}"; do wait "$pid"; done
+pids=()
+
+# Reuse the same prepared index and worker 1's overlay without preparation.
+ratarmount --foreground --no-recreate-index \
+  --index-file /srv/keystone/prepared/base.sqlite \
+  -w /srv/keystone/workers/1/overlay \
+  /srv/keystone/base.tar /srv/keystone/workers/1/mnt &
+pids+=("$!")
+wait_ready 1
+# Inspect the retained private edits, then stop the remount.
+ratarmount -u /srv/keystone/workers/1/mnt
+wait "${pids[0]}"
+pids=()
+```
+
+Stop every worker before modifying or preparing the base/index again. The flag
+assumes trusted immutable inputs; it does not prevent an unrelated host process
+from editing them. Ordinary `-w` without `--no-recreate-index` retains its
+create/rebuild/commit behavior. A strict worker rejects explicit index hashing,
+recreation, publication/repacking, rolling or overlay-commit modes, and cannot
+create a missing base. `--no-mount --no-recreate-index` validates prepared state
+without finishing or repairing it. Control search queries existing prepared FTS
+state and refuses missing FTS instead of constructing or refilling it.
+
+Prepared-format limits matter: strict G3 gzip accepts usable RGZI and refuses
+GZIDX's repairing importer; compatible optional rapidgzip imports remain
+available. Single-block bzip2 preparation refuses with
+`single-block bzip2 cannot be prepared for read-only workers`; use a multi-block
+fixture or another supported format. A compressed non-TAR reader that always
+builds its file table, such as `base.zip.gz`, can prepare normally but cannot
+be reopened by a strict worker. See [shared prepared index limits](formats.md#shared-prepared-indexes)
+for native-catalog versus compression-shell validation, codec coverage checks,
+and supported zstd/bzip2 tails. Successful preparation alone does not guarantee
+that every format/backend supports strict reuse.
 
 Client commands print the server's JSON response envelope, including server
 errors (exit 1). Local option and transport errors go to stderr.
@@ -2202,9 +2307,14 @@ errors include a bounded excerpt of the failing mount's log when available.
 
 ### Lifetime, concurrency and recovery
 
-Registration warms `state-dir/indexes/BASE` with `--no-mount`; subsequent
-attempts share that cache, including source-specific indexes for binds. No
-per-attempt archive copy or Git worktree is made. Warm setup still includes
+Registration warms `state-dir/indexes/BASE` with `--no-mount`, releases its
+readers and finishes checkpointing each actual local persistent artifact before
+returning success. Subsequent attempts share that prepared cache, including
+source-specific indexes for binds. Workers, API diff and graceful teardown do
+not rebuild, recover, checkpoint or update the shared index; an unfinished WAL
+or rollback journal is a preparation error. Each worker's own overlay database
+and payloads remain writable. Stop all workers before changing or preparing the
+base/index again. No per-attempt archive copy or Git worktree is made. Warm setup still includes
 process startup, opening the cached index and mounting FUSE; it is not promised
 to take zero time. The ignored 64-attempt test reports measured setup/teardown
 milliseconds per attempt on the orchestrator's host.

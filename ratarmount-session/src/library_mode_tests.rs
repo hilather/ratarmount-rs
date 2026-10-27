@@ -604,6 +604,13 @@ fn regression_parallelization_one_and_four_reads_multiframe_zstd_tar() {
             assert_eq!(read_member(&session, "big", data.len() as u64), data);
             assert_eq!(read_member(&session, "last", 100), b"last frame");
             assert_eq!(session.member_extent("big").unwrap(), None);
+            let location = session.into_index_location();
+            if recreate == Recreate::IfInvalid {
+                // Hand the next strict reader completed preparation after the
+                // ordinary session has released its catalog/source readers.
+                ratarmount_index::SqliteIndex::finalize_prepared(location.as_path().unwrap())
+                    .unwrap();
+            }
         }
     }
 }

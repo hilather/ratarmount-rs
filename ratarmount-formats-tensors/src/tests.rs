@@ -730,7 +730,7 @@ fn warm_index_tarstats_rebuilds_replaced_archive() {
         drop(src);
         assert_eq!(std::fs::read(&index).unwrap(), metadata_before);
         std::fs::write(&path, fixture(b"longer")).unwrap();
-        assert!(TensorsMountSource::existing(&index)
+        assert!(TensorsMountSource::existing(&index, &opts)
             .unwrap()
             .check_tarstats_matches_archive(&path)
             .is_err());
@@ -997,4 +997,96 @@ fn regression_tensor_parent_directories_are_listed_and_looked_up() {
         assert_eq!(read(&src, "/layer/1/weight"), b"efgh");
         assert_eq!(read(&src, "/bias"), b"i");
     }
+}
+
+/// Regression: strict tensor warm opens preserve the prepared catalog and companions.
+#[test]
+fn regression_prepared_index_warm_open_is_immutable() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("base.safetensors");
+    let index = dir.path().join("index.sqlite");
+    std::fs::write(
+        &archive,
+        safetensors(json!({"a":tensor("U8",&[3],0,3)}), b"abc"),
+    )
+    .unwrap();
+    drop(
+        TensorsMountSource::open(
+            &archive,
+            Some(&index),
+            &OpenOptions::default(),
+            "test",
+            true,
+        )
+        .unwrap(),
+    );
+    SqliteIndex::finalize_prepared(&index).unwrap();
+    let snapshot = || -> std::collections::BTreeMap<_, _> {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path();
+                (p.clone(), std::fs::read(p).unwrap())
+            })
+            .collect()
+    };
+    let before = snapshot();
+    let source = TensorsMountSource::open(
+        &archive,
+        Some(&index),
+        &OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        },
+        "test",
+        false,
+    )
+    .unwrap();
+    assert_eq!(read(&source, "/a"), b"abc");
+    assert_eq!(snapshot(), before);
+    drop(source);
+    assert_eq!(snapshot(), before);
+    let reader_index = dir.path().join("reader.sqlite");
+    let content = std::fs::read(&archive).unwrap();
+    drop(
+        TensorsMountSource::open_from_reader(
+            Cursor::new(content.clone()),
+            "nested.safetensors",
+            Some(&reader_index),
+            &OpenOptions::default(),
+            "test",
+        )
+        .unwrap(),
+    );
+    SqliteIndex::finalize_prepared(&reader_index).unwrap();
+    let before = snapshot();
+    let strict = OpenOptions {
+        read_only_index: true,
+        write_index: false,
+        ..Default::default()
+    };
+    let source = TensorsMountSource::open_from_reader(
+        Cursor::new(content.clone()),
+        "nested.safetensors",
+        Some(&reader_index),
+        &strict,
+        "test",
+    )
+    .unwrap();
+    assert_eq!(read(&source, "/a"), b"abc");
+    assert_eq!(snapshot(), before);
+    drop(source);
+    assert_eq!(snapshot(), before);
+    std::fs::write(&reader_index, b"invalid prepared reader catalog").unwrap();
+    let before = snapshot();
+    assert!(TensorsMountSource::open_from_reader(
+        Cursor::new(content),
+        "nested.safetensors",
+        Some(&reader_index),
+        &strict,
+        "test"
+    )
+    .is_err());
+    assert_eq!(snapshot(), before);
 }

@@ -350,6 +350,68 @@ fn catalog_open_silent() {
     assert_eq!(n, 1, "expected one harness line, got {n}: {stdout}");
 }
 
+/// Regression: Recreate::Never must refuse pending archive recovery unchanged.
+#[cfg(unix)]
+#[test]
+fn regression_prepared_index_session_never_recovers_or_writes() {
+    for policy in [IndexPolicy::Explicit, IndexPolicy::Sibling] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.tar");
+        write_tar(&path, &[member_file("old", b"old contents")]);
+        let idx = dir.path().join("archive.tar.index.sqlite");
+        drop(
+            crate::factory::open_path(
+                &path,
+                &OpenOptions {
+                    index_file_path: Some(idx.clone()),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&idx).unwrap();
+        let mut tail = tempfile::tempfile().unwrap();
+        tail.write_all(b"new").unwrap();
+        assert!(
+            ratarmount_compress::commit_journal::replace_suffix_with_hook(
+                &path,
+                0,
+                &mut tail,
+                &mut |step| {
+                    if step == "archive truncate" {
+                        Err(std::io::Error::other("crash"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            )
+            .is_err()
+        );
+        let snapshot = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| {
+                    let path = e.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_owned(),
+                        std::fs::read(&path).unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        let mut req = never_req(path, idx);
+        req.index = policy;
+        let error = match Session::open(req) {
+            Ok(_) => panic!("strict recovery succeeded"),
+            Err(e) => e,
+        };
+        assert!(error.to_string().contains("preparation"), "{error}");
+        assert_eq!(snapshot(), before);
+    }
+}
+
 fn never_req(tar: PathBuf, idx: PathBuf) -> OpenRequest {
     OpenRequest {
         source: SourceSpec::Path(tar),

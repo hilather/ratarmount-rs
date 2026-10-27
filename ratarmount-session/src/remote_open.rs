@@ -958,6 +958,8 @@ pub(super) struct RemoteOpened {
     /// The body was downloaded to a temporary local copy.
     pub fetched: bool,
     pub index: IndexUsed,
+    /// The persistent local artifact selected by a `file://` open.
+    pub actual_artifact: Option<PathBuf>,
 }
 
 impl RemoteOpened {
@@ -968,6 +970,7 @@ impl RemoteOpened {
             kind: ServedKind::Folder,
             local: false,
             fetched: false,
+            actual_artifact: None,
             index: IndexUsed {
                 location: ratarmount_index::IndexLocation::Memory,
                 discovered_from: None,
@@ -991,6 +994,7 @@ impl RemoteOpened {
             local,
             fetched: !local,
             index: opened.index,
+            actual_artifact: if local { opened.actual_artifact } else { None },
         }
     }
 }
@@ -1050,7 +1054,7 @@ fn open_hf_file(
     let mut rebuild = recreate;
     // An explicitly chosen cache path may span moving revisions or different mirrors.
     // Never reuse offsets just because a URL-labelled tarstats check is a no-op.
-    let (_, index_path) = super::remote_index_setup(Path::new(&label), opts, recreate);
+    let (_, index_path) = super::remote_index_setup(Path::new(&label), opts, recreate)?;
     if let Some(path) = index_path.as_ref().filter(|p| path_is_nonempty_file(p)) {
         let identity = SqliteIndex::open_read_only(path)
             .and_then(|i| i.metadata())
@@ -1088,7 +1092,7 @@ fn open_hf_file(
             (path, source)
         }
     };
-    let (_, index_path) = super::remote_index_setup(Path::new(&label), opts, false);
+    let (_, index_path) = super::remote_index_setup(Path::new(&label), opts, false)?;
     if !opts.read_only_index {
         if let Some(path) = index_path.filter(|p| path_is_nonempty_file(p)) {
             let index = SqliteIndex::open_writable(&path).map_err(|e| e.to_string())?;

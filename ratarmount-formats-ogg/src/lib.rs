@@ -239,6 +239,7 @@ impl OggMountSource {
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
+                        Err(e) if options.read_only_index => return Err(e),
                         Err(e) => eprintln!("info: could not load ogg index ({e}); rebuilding"),
                     }
                 }
@@ -257,7 +258,7 @@ impl OggMountSource {
         index_path: &Path,
         options: &OpenOptions,
     ) -> Result<Self> {
-        let index = SqliteIndex::open_read_only(index_path)?;
+        let index = SqliteIndex::open_read_only_for_open(index_path, options)?;
         index.check_backend_name(BACKEND_NAME)?;
         // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
         // Missing tarstats still Ok (legacy indexes).
@@ -470,6 +471,58 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepared_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect()
+    }
+
+    /// Regression: a strict warm worker must read members without changing its prepared sidecar.
+    #[test]
+    fn regression_prepared_index_warm_open_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.ogg");
+        let index = dir.path().join("index.sqlite");
+        let fixture = synthetic_ogg();
+        std::fs::write(&archive, &fixture).unwrap();
+        drop(
+            OggMountSource::open(
+                &archive,
+                Some(&index),
+                &OpenOptions::default(),
+                "test",
+                true,
+            )
+            .unwrap(),
+        );
+        SqliteIndex::finalize_prepared(&index).unwrap();
+        let before = prepared_snapshot(dir.path());
+        let options = OpenOptions {
+            read_only_index: true,
+            write_index: false,
+            ..Default::default()
+        };
+        let source = OggMountSource::open(&archive, Some(&index), &options, "test", false).unwrap();
+        let entry = source
+            .list_dirents("/")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG)
+            .unwrap();
+        let member = format!("/{}", entry.name);
+        let info = source.lookup(&member, 0).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut source.open(&info, 0).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, fixture.as_slice());
+        assert_eq!(prepared_snapshot(dir.path()), before);
+        drop(source);
+        assert_eq!(prepared_snapshot(dir.path()), before);
+    }
+
     use std::io::Cursor;
 
     /// Minimal single-page OggS with a fake vorbis-like identification packet.

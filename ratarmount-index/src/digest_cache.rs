@@ -161,6 +161,47 @@ pub fn peek_archive_digest(path: &Path, index: Option<&Path>) -> Result<Option<S
     Ok(lookup(&cache, path.as_os_str().as_encoded_bytes(), &stamp))
 }
 
+/// A digest peek honoring the prepared-worker policy. Selected-artifact errors
+/// propagate; an absent optional digest table/row remains a cache miss.
+pub fn peek_archive_digest_for_open(
+    path: &Path,
+    index: Option<&Path>,
+    read_only_index: bool,
+) -> Result<Option<String>> {
+    if !read_only_index {
+        return peek_archive_digest(path, index);
+    }
+    let Some(index) = index else {
+        return Ok(None);
+    };
+    let conn = crate::open_prepared_connection(index)?;
+    conn.busy_timeout(Duration::ZERO)?;
+    let has_cache: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='overlay_base_digests')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_cache {
+        return Ok(None);
+    }
+    let path = path.canonicalize()?;
+    let stamp = ArchiveDigestStamp::read(&path)?;
+    lookup_checked(
+        &Cache {
+            conn,
+            index: index.to_path_buf(),
+        },
+        path.as_os_str().as_encoded_bytes(),
+        &stamp,
+    )
+    .map_err(|e| {
+        IndexError::Invalid(format!(
+            "prepared index {} digest lookup failed: {e}; --no-recreate-index requires preparation",
+            index.display()
+        ))
+    })
+}
+
 /// Like [`cached_archive_digest`], but the caller supplies the hashing (for
 /// example a cancellable stream). The result is cached like any other.
 pub fn cached_archive_digest_with(
@@ -437,7 +478,11 @@ fn try_flock(_file: &fs::File) -> std::io::Result<bool> {
 }
 
 fn lookup(cache: &Cache, key: &[u8], stamp: &ArchiveDigestStamp) -> Option<String> {
-    let digest: String = cache
+    lookup_checked(cache, key, stamp).ok().flatten()
+}
+
+fn lookup_checked(cache: &Cache, key: &[u8], stamp: &ArchiveDigestStamp) -> Result<Option<String>> {
+    let digest: Option<String> = cache
         .conn
         .query_row(
             "SELECT sha256 FROM overlay_base_digests
@@ -450,11 +495,10 @@ fn lookup(cache: &Cache, key: &[u8], stamp: &ArchiveDigestStamp) -> Option<Strin
             ],
             |row| row.get(0),
         )
-        .optional()
-        .ok()
-        .flatten()?;
-    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| format!("sha256:{digest}"))
+        .optional()?;
+    Ok(digest
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|digest| format!("sha256:{digest}")))
 }
 
 /// Double-checked: read the cache, and on a miss take the per-archive lock,

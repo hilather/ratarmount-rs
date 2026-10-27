@@ -393,11 +393,15 @@ fn tensors_factory_malformed_headers_report_clear_errors() {
     }
     let unrelated = dir.path().join("plain.txt");
     std::fs::write(&unrelated, b"ordinary data").unwrap();
-    assert!(
-        try_open_format_backend(&unrelated, FormatBackend::Tensors, None, &options, false)
-            .unwrap()
-            .is_none()
-    );
+    assert!(try_open_format_backend(
+        &unrelated,
+        FormatBackend::Tensors,
+        &mut || Ok(None),
+        &options,
+        false
+    )
+    .unwrap()
+    .is_none());
     assert_eq!(
         read_tensor(
             open_path(&unrelated, &options, false).unwrap().as_ref(),

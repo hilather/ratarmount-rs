@@ -574,7 +574,9 @@ pub struct OpenOptions {
     pub passwords: Vec<String>,
     /// Preferred backends (Python `--use-backend`); last has highest priority.
     pub use_backends: Vec<String>,
-    /// Never create/modify indexes (`--no-recreate-index`).
+    /// Require prepared immutable shared indexes (`--no-recreate-index`): no
+    /// persistent rebuild or top-level memory fallback. Private nested indexing
+    /// must first remove shared paths and disable persistent writes.
     pub read_only_index: bool,
     /// Force folder index usage (`--force-folder-index`); folders still bind-mount live.
     pub force_folder_index: bool,

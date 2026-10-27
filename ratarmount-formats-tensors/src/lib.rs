@@ -153,8 +153,18 @@ impl TensorsMountSource {
                 .unwrap_or_else(|| default_index_path(path))
         });
         if !recreate && !options.clear_index_cache {
+            if options.read_only_index {
+                if let Some(ip) = &ip {
+                    let index = Self::existing(ip, options)?;
+                    index.check_tarstats_matches_archive(path)?;
+                    return Ok(Self {
+                        backend: Backend::Path(path.to_path_buf()),
+                        index,
+                    });
+                }
+            }
             if let Some(ip) = &ip {
-                if let Ok(index) = Self::existing(ip) {
+                if let Ok(index) = Self::existing(ip, options) {
                     if index.check_tarstats_matches_archive(path).is_ok() {
                         return Ok(Self {
                             backend: Backend::Path(path.to_path_buf()),
@@ -199,13 +209,22 @@ impl TensorsMountSource {
         } else {
             None
         };
-        let existing = if !options.clear_index_cache {
-            ip.and_then(|ip| Self::existing(ip).ok()).filter(|idx| {
-                idx.metadata()
-                    .ok()
-                    .and_then(|m| m.get("tensorReaderFingerprint").cloned())
-                    == fingerprint
-            })
+        let existing = if let Some(path) =
+            ip.filter(|_| options.read_only_index && !options.clear_index_cache)
+        {
+            let index = Self::existing(path, options)?;
+            if index.metadata()?.get("tensorReaderFingerprint") != fingerprint.as_ref() {
+                return Err(invalid("prepared tensor reader index fingerprint mismatch; --no-recreate-index forbids rebuilding"));
+            }
+            Some(index)
+        } else if !options.clear_index_cache {
+            ip.and_then(|ip| Self::existing(ip, options).ok())
+                .filter(|idx| {
+                    idx.metadata()
+                        .ok()
+                        .and_then(|m| m.get("tensorReaderFingerprint").cloned())
+                        == fingerprint
+                })
         } else {
             None
         };
@@ -230,8 +249,8 @@ impl TensorsMountSource {
         })
     }
 
-    fn existing(path: &Path) -> Result<SqliteIndex> {
-        let index = SqliteIndex::open_read_only(path)?;
+    fn existing(path: &Path, options: &OpenOptions) -> Result<SqliteIndex> {
+        let index = SqliteIndex::open_read_only_for_open(path, options)?;
         index.check_backend_name(BACKEND_NAME)?;
         if index.metadata()?.get("tensorSchema").map(String::as_str) != Some("1") {
             return Err(invalid("unsupported tensor index schema"));

@@ -40,6 +40,7 @@ fn probe<'a>(
         git_tree,
         supplied,
         index,
+        read_only_index: false,
         extra_excludes: &[],
     }
 }

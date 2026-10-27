@@ -64,7 +64,7 @@ use ratarmount_formats_pdf::{looks_like_pdf, PdfMountSource};
 use ratarmount_formats_qcow2::{looks_like_qcow2, looks_like_qcow2_reader, Qcow2MountSource};
 use ratarmount_formats_sevenzip::{looks_like_7z, SevenZipMountSource};
 #[cfg(feature = "sqlar")]
-use ratarmount_formats_sqlar::{looks_like_sqlar, SqlarMountSource};
+use ratarmount_formats_sqlar::SqlarMountSource;
 #[cfg(feature = "squashfs")]
 use ratarmount_formats_squashfs::{
     looks_like_squashfs, looks_like_squashfs_reader, SquashFsMountSource,
@@ -337,7 +337,7 @@ fn ordered_format_backends(use_backends: &[String]) -> Vec<FormatBackend> {
 fn try_open_format_backend(
     path: &Path,
     backend: FormatBackend,
-    index_path: Option<&Path>,
+    resolve_index: &mut dyn FnMut() -> Result<Option<PathBuf>, String>,
     options: &OpenOptions,
     recreate: bool,
 ) -> Result<Option<Arc<dyn MountSource>>, String> {
@@ -346,6 +346,8 @@ fn try_open_format_backend(
             if !looks_like_7z(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 SevenZipMountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -355,6 +357,8 @@ fn try_open_format_backend(
             if !looks_like_zip(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 ZipMountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -365,6 +369,8 @@ fn try_open_format_backend(
             if !looks_like_asar(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 AsarMountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -375,6 +381,8 @@ fn try_open_format_backend(
             if !looks_like_ar(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 ArMountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -385,6 +393,8 @@ fn try_open_format_backend(
             if !looks_like_cpio(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 CpioMountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -404,6 +414,8 @@ fn try_open_format_backend(
             if !looks_like_iso(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 Iso9660MountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -414,6 +426,8 @@ fn try_open_format_backend(
             if !looks_like_warc(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 WarcMountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -424,6 +438,8 @@ fn try_open_format_backend(
             if !looks_like_xar(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 XarMountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -434,6 +450,8 @@ fn try_open_format_backend(
             if !looks_like_cab(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             match CabMountSource::open(path, index_path, options, VERSION, recreate) {
                 Ok(s) => Ok(Some(Arc::new(s))),
                 #[cfg(feature = "libarchive")]
@@ -446,7 +464,9 @@ fn try_open_format_backend(
         }
         #[cfg(feature = "sqlar")]
         FormatBackend::Sqlar => {
-            if !looks_like_sqlar(path) {
+            if !ratarmount_formats_sqlar::looks_like_sqlar_for_open(path, options)
+                .map_err(|e| e.to_string())?
+            {
                 return Ok(None);
             }
             Ok(Some(Arc::new(
@@ -557,6 +577,8 @@ fn try_open_format_backend(
             if !looks_like_ogg(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 OggMountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -568,7 +590,7 @@ fn try_open_format_backend(
                 return Ok(None);
             }
             Ok(Some(Arc::new(
-                PdfMountSource::open(path, index_path, options, VERSION, recreate)
+                PdfMountSource::open(path, None, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
             )))
         }
@@ -578,7 +600,7 @@ fn try_open_format_backend(
                 return Ok(None);
             }
             Ok(Some(Arc::new(
-                HtmlMountSource::open(path, index_path, options, VERSION, recreate)
+                HtmlMountSource::open(path, None, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
             )))
         }
@@ -587,6 +609,8 @@ fn try_open_format_backend(
             if !looks_like_safetensors(path) && !looks_like_gguf(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 TensorsMountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -597,6 +621,8 @@ fn try_open_format_backend(
             if !looks_like_libarchive(path) {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             Ok(Some(Arc::new(
                 LibarchiveMountSource::open(path, index_path, options, VERSION, recreate)
                     .map_err(|e| e.to_string())?,
@@ -610,6 +636,8 @@ fn try_open_format_backend(
             if !looks_like_tar(path).unwrap_or(false) && !by_ext {
                 return Ok(None);
             }
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             let mut mat = None;
             Ok(Some(Arc::new(open_tar(
                 path, path, index_path, options, recreate, &mut mat,
@@ -621,13 +649,14 @@ fn try_open_format_backend(
 /// Open an uncompressed path by probing formats in [`ordered_format_backends`] order.
 fn open_uncompressed_path(
     path: &Path,
-    index_path: Option<&Path>,
+    resolve_index: &mut dyn FnMut() -> Result<Option<PathBuf>, String>,
     options: &OpenOptions,
     recreate: bool,
     plain_tar: &mut bool,
 ) -> Result<Arc<dyn MountSource>, String> {
     for backend in ordered_format_backends(&options.use_backends) {
-        if let Some(src) = try_open_format_backend(path, backend, index_path, options, recreate)? {
+        if let Some(src) = try_open_format_backend(path, backend, resolve_index, options, recreate)?
+        {
             *plain_tar = backend == FormatBackend::Tar;
             return Ok(src);
         }
@@ -851,15 +880,13 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
         // Nested archives must not share the parent's index path.
         let mut opts = options.clone();
         opts.index_file_path = None;
-        opts.index_in_memory = false;
+        opts.index_folders.clear();
+        opts.index_in_memory = true;
+        opts.index_compact_only = true;
+        opts.write_index = false;
+        opts.read_only_index = false;
         opts.clear_index_cache = true;
-        // Nested AutoMount must not share the outer job cancel: outer
-        // `publish_tmp` already ran before compositing.
         opts.index_build.cancel = None;
-        // Always rebuild nested indexes next to the materialised file.
-        let mut idx = path.as_os_str().to_os_string();
-        idx.push(".index.sqlite");
-        opts.index_file_path = Some(PathBuf::from(idx));
         open_path(path, &opts, true).map_err(std::io::Error::other)
     })
 }
@@ -895,6 +922,8 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         // Nested indexes cannot live next to a virtual label. Use compact-only
         // file table (string pool + SoA) — no SQLite `files` store for nested.
         opts.index_file_path = None;
+        opts.index_folders.clear();
+        opts.write_index = false;
         opts.index_in_memory = false;
         opts.index_compact_only = true;
         opts.clear_index_cache = true;
@@ -1295,20 +1324,32 @@ fn try_load_nested_durable(
     key: &NestedMemberKey,
     fingerprint: &NestedBodyFingerprint,
     format: &str,
-) -> Option<DurableNestedBlob> {
-    let path = outer_index_path?;
+    options: &OpenOptions,
+) -> std::io::Result<Option<DurableNestedBlob>> {
+    let Some(path) = outer_index_path else {
+        return Ok(None);
+    };
     if !path.is_file() {
-        return None;
+        if options.read_only_index {
+            return Err(std::io::Error::other(format!(
+                "prepared outer index {} is missing",
+                path.display()
+            )));
+        }
+        return Ok(None);
     }
     // A pure lookup: nothing is created beside the outer index.
-    let idx = match SqliteIndex::open_lookup(path) {
+    let idx = match SqliteIndex::open_lookup_for_open(path, options) {
         Ok(i) => i,
         Err(e) => {
             log::debug!(
                 "nested durable: open outer index {} for load failed: {e}",
                 path.display()
             );
-            return None;
+            if options.read_only_index {
+                return Err(std::io::Error::other(e));
+            }
+            return Ok(None);
         }
     };
     match idx.get_nested_index(key, fingerprint, format) {
@@ -1318,12 +1359,15 @@ fn try_load_nested_durable(
                 key.member_path,
                 path.display()
             );
-            Some(blob)
+            Ok(Some(blob))
         }
-        Ok(None) => None,
+        Ok(None) => Ok(None),
         Err(e) => {
             log::debug!("nested durable: get_nested_index failed: {e}");
-            None
+            if options.read_only_index {
+                return Err(std::io::Error::other(e));
+            }
+            Ok(None)
         }
     }
 }
@@ -1390,7 +1434,8 @@ fn open_nested_zip_with_durable(
         &key,
         &fingerprint,
         NESTED_FORMAT_ZIP,
-    ) {
+        opts,
+    )? {
         match ZipMountSource::open_from_reader_with_durable(reader, label, &blob, opts) {
             Ok(s) => {
                 log::debug!(
@@ -1448,7 +1493,8 @@ fn open_nested_tar_with_durable(
         &key,
         &fingerprint,
         NESTED_FORMAT_TAR,
-    ) {
+        opts,
+    )? {
         match SqliteIndexedTar::open_from_reader_with_durable(reader, label, &blob, opts.clone()) {
             Ok(s) => {
                 log::debug!(
@@ -1506,7 +1552,8 @@ fn open_nested_7z_with_durable(
         &key,
         &fingerprint,
         NESTED_FORMAT_SEVENZIP,
-    ) {
+        opts,
+    )? {
         match SevenZipMountSource::open_from_reader_with_durable(reader, label, &blob, opts) {
             Ok(s) => {
                 log::debug!(
@@ -1564,7 +1611,8 @@ fn open_nested_cpio_with_durable(
         &key,
         &fingerprint,
         NESTED_FORMAT_CPIO,
-    ) {
+        opts,
+    )? {
         match CpioMountSource::open_from_reader_with_durable(reader, label, &blob, opts.clone()) {
             Ok(s) => {
                 log::debug!(
@@ -1622,7 +1670,8 @@ fn open_nested_ar_with_durable(
         &key,
         &fingerprint,
         NESTED_FORMAT_AR,
-    ) {
+        opts,
+    )? {
         match ArMountSource::open_from_reader_with_durable(reader, label, &blob, opts.clone()) {
             Ok(s) => {
                 log::debug!(
@@ -2033,10 +2082,6 @@ fn resolved_index(path: &Path, options: &OpenOptions, recreate: bool) -> IndexLo
     .unwrap_or(IndexLocation::Memory)
 }
 
-fn index_arg(loc: &IndexLocation) -> Option<&Path> {
-    loc.as_path()
-}
-
 /// B-119 / `--index-minimum-file-count`: drop a freshly written on-disk SQLite index
 /// when the archive has strictly fewer indexed members than the threshold.
 ///
@@ -2182,6 +2227,29 @@ impl MountSource for KeepAliveMount {
     }
 }
 
+/// Preflight the preparer's supported persisted seek-state profile before it writes.
+/// Ordinary single-user mounts retain their single-block bzip2 decode fallback.
+pub fn validate_worker_preparation(path: &Path) -> Result<(), String> {
+    let input = path.to_string_lossy();
+    let local = if ratarmount_remote::remote_url_scheme(&input).as_deref() == Some("file") {
+        Some(ratarmount_remote::resolve_to_local(&input).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let path = local.as_ref().map_or(path, |local| local.path());
+    if !path.is_file() {
+        return Ok(());
+    }
+    if detect_compression(path).map_err(|e| e.to_string())? == CompressionFormat::Bzip2 {
+        if let Err(e) = export_bzip2_blocks(path) {
+            if e.to_string().contains("single bzip2 block") {
+                return Err("single-block bzip2 cannot be prepared for read-only workers; use a multi-block bzip2 input".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Open a single path (file archive or directory).
 pub fn open_path(
     path: &Path,
@@ -2220,6 +2288,7 @@ pub(crate) struct PathOpened {
     /// The path actually opened (the repository path for Git).
     pub location: PathBuf,
     pub index: IndexUsed,
+    pub actual_artifact: Option<PathBuf>,
 }
 
 impl PathOpened {
@@ -2229,6 +2298,7 @@ impl PathOpened {
             kind: ServedKind::Archive,
             location: location.to_path_buf(),
             index,
+            actual_artifact: None,
         }
     }
 }
@@ -2240,6 +2310,18 @@ fn open_path_impl(
     allow_split: bool,
     plain_tar: &mut bool,
 ) -> Result<PathOpened, String> {
+    if options.read_only_index
+        && (options.index_in_memory
+            || options.index_compact_only
+            || options.index_file_path.as_deref()
+                == Some(Path::new(ratarmount_index::MEMORY_INDEX)))
+    {
+        return Err("--no-recreate-index requires a prepared on-disk index; top-level memory/compact fallback is forbidden".into());
+    }
+    if options.read_only_index && !ratarmount_index::looks_like_url_archive(path) {
+        ratarmount_compositing::journal_recovery::check_offline_journal(path)
+            .map_err(|e| format!("--no-recreate-index forbids archive journal recovery: {e}"))?;
+    }
     // Resolve inline refs before the normal filesystem existence check.
     #[cfg(feature = "git")]
     {
@@ -2293,10 +2375,14 @@ fn open_path_impl(
                 kind: ServedKind::Git { tree },
                 location: git_path.to_path_buf(),
                 index: IndexUsed::none(),
+                actual_artifact: None,
             });
         }
     }
-    if options.recover_journals && !ratarmount_index::looks_like_url_archive(path) {
+    if !options.read_only_index
+        && options.recover_journals
+        && !ratarmount_index::looks_like_url_archive(path)
+    {
         ratarmount_compositing::recover_journal_at(
             path,
             None,
@@ -2318,6 +2404,7 @@ fn open_path_impl(
                 kind: ServedKind::Folder,
                 location: path.to_path_buf(),
                 index: IndexUsed::none(),
+                actual_artifact: None,
             })
             .map_err(|e| e.to_string());
     }
@@ -2334,78 +2421,188 @@ fn open_path_impl(
     }
 
     let compression = detect_compression(path).map_err(|e| e.to_string())?;
-    let index_loc = resolved_index(path, options, recreate);
-    // Before the clone below drops an explicit index in the in-memory case.
-    let candidate = sidecar_candidate(path, options, &index_loc);
-    // Propagate memory flag so format open() does not fall back to a disk path.
-    let mut options = options.clone();
-    if index_loc.is_memory() {
-        options.index_in_memory = true;
-        options.index_file_path = None;
-    } else if let Some(p) = index_loc.as_path() {
-        options.index_file_path = Some(p.to_path_buf());
-        options.index_in_memory = false;
-    }
-    let index_path = index_arg(&index_loc);
-
-    let source: Arc<dyn MountSource> = match compression {
-        // Outer compression still wins (detect_compression first). Format
-        // backends are reordered via options.use_backends only for plain files.
-        CompressionFormat::None => {
-            open_uncompressed_path(path, index_path, &options, recreate, plain_tar)?
-        }
-        CompressionFormat::Gzip => open_gzip(path, index_path, &options, recreate)?,
-        CompressionFormat::Bzip2 => open_bzip2(path, index_path, &options, recreate)?,
-        CompressionFormat::Xz => {
-            let threads = options.threads_for("xz");
-            open_seekable_codec(path, index_path, &options, recreate, "xz", || {
-                open_seekable_xz_with_threads(path, threads)
-            })?
-        }
-        CompressionFormat::Zstd => open_zstd(path, index_path, &options, recreate)?,
-        CompressionFormat::Lz4 => {
-            let threads = options.threads_for("lz4");
-            open_seekable_codec(path, index_path, &options, recreate, "lz4", || {
-                open_seekable_lz4_with_threads(path, threads)
-            })?
-        }
-        CompressionFormat::Lzip => {
-            let threads = options.threads_for("lzip");
-            open_seekable_codec(path, index_path, &options, recreate, "lzip", || {
-                open_seekable_lzip_with_threads(path, threads)
-            })?
-        }
-        CompressionFormat::Lzo => {
-            let threads = options.threads_for("lzo");
-            open_seekable_codec(path, index_path, &options, recreate, "lzo", || {
-                open_seekable_lzo_with_threads(path, threads)
-            })?
-        }
-        CompressionFormat::CompressZ => {
-            let threads = options.threads_for("Z");
-            open_seekable_codec(path, index_path, &options, recreate, "compress-z", || {
-                open_seekable_compress_z_with_threads(path, threads)
-            })?
-        }
-        CompressionFormat::Lzma => {
-            let threads = options.threads_for("lzma");
-            open_seekable_codec(path, index_path, &options, recreate, "lzma", || {
-                open_seekable_lzma_with_threads(path, threads)
-            })?
-        }
-        CompressionFormat::Zlib => {
-            let threads = options.threads_for("zlib");
-            open_seekable_codec(path, index_path, &options, recreate, "zlib", || {
-                open_seekable_zlib_with_threads(path, threads)
-            })?
-        }
-        CompressionFormat::Lrzip => open_lrzip(path, index_path, &options, recreate)?,
+    // Ordinary callers retain historical candidate resolution. Strict callers
+    // resolve lazily only after a matched backend requires a shared artifact.
+    let mut index_loc = if options.read_only_index {
+        IndexLocation::Memory
+    } else {
+        resolved_index(path, options, recreate)
     };
+    let candidate = if options.read_only_index {
+        None
+    } else {
+        sidecar_candidate(path, options, &index_loc)
+    };
+    let initial_index_path = index_loc.as_path().map(Path::to_path_buf);
+    let mut used_index = false;
+    let mut resolve_index = || -> Result<Option<PathBuf>, String> {
+        if options.read_only_index && !used_index {
+            index_loc = ratarmount_index::resolve_prepared_index_location(
+                path,
+                options
+                    .index_file_path
+                    .as_deref()
+                    .map(|p| {
+                        p.to_str()
+                            .ok_or_else(|| "index path is not UTF-8".to_string())
+                    })
+                    .transpose()?,
+                &options.index_folders,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        used_index = true;
+        Ok(index_loc.as_path().map(Path::to_path_buf))
+    };
+    let persisted_seek_state = matches!(
+        compression,
+        CompressionFormat::Gzip | CompressionFormat::Zstd | CompressionFormat::Bzip2
+    );
+    let selected_compressed_index = if persisted_seek_state {
+        resolve_index()?
+    } else {
+        initial_index_path.clone()
+    };
+    let index_path = selected_compressed_index.as_deref();
+    let mut adjusted = options.clone();
+    if compression != CompressionFormat::None || !options.read_only_index {
+        if let Some(ip) = index_path.or({
+            if !options.read_only_index {
+                initial_index_path.as_deref()
+            } else {
+                None
+            }
+        }) {
+            adjusted.index_file_path = Some(ip.to_path_buf());
+            adjusted.index_in_memory = false;
+        } else if !options.read_only_index {
+            adjusted.index_file_path = None;
+            adjusted.index_in_memory = true;
+        }
+    }
+    let options = &adjusted;
+    let mut body_artifact = None;
+    let source_result = (|| -> Result<Arc<dyn MountSource>, String> {
+        Ok(match compression {
+            // Outer compression still wins (detect_compression first). Format
+            // backends are reordered via options.use_backends only for plain files.
+            CompressionFormat::None => {
+                open_uncompressed_path(path, &mut resolve_index, options, recreate, plain_tar)?
+            }
+            CompressionFormat::Gzip => open_gzip(path, index_path, options, recreate)?,
+            CompressionFormat::Bzip2 => open_bzip2(path, index_path, options, recreate)?,
+            CompressionFormat::Xz => {
+                let threads = options.threads_for("xz");
+                open_seekable_codec(
+                    path,
+                    index_path,
+                    options,
+                    recreate,
+                    "xz",
+                    &mut body_artifact,
+                    || open_seekable_xz_with_threads(path, threads),
+                )?
+            }
+            CompressionFormat::Zstd => open_zstd(path, index_path, options, recreate)?,
+            CompressionFormat::Lz4 => {
+                let threads = options.threads_for("lz4");
+                open_seekable_codec(
+                    path,
+                    index_path,
+                    options,
+                    recreate,
+                    "lz4",
+                    &mut body_artifact,
+                    || open_seekable_lz4_with_threads(path, threads),
+                )?
+            }
+            CompressionFormat::Lzip => {
+                let threads = options.threads_for("lzip");
+                open_seekable_codec(
+                    path,
+                    index_path,
+                    options,
+                    recreate,
+                    "lzip",
+                    &mut body_artifact,
+                    || open_seekable_lzip_with_threads(path, threads),
+                )?
+            }
+            CompressionFormat::Lzo => {
+                let threads = options.threads_for("lzo");
+                open_seekable_codec(
+                    path,
+                    index_path,
+                    options,
+                    recreate,
+                    "lzo",
+                    &mut body_artifact,
+                    || open_seekable_lzo_with_threads(path, threads),
+                )?
+            }
+            CompressionFormat::CompressZ => {
+                let threads = options.threads_for("Z");
+                open_seekable_codec(
+                    path,
+                    index_path,
+                    options,
+                    recreate,
+                    "compress-z",
+                    &mut body_artifact,
+                    || open_seekable_compress_z_with_threads(path, threads),
+                )?
+            }
+            CompressionFormat::Lzma => {
+                let threads = options.threads_for("lzma");
+                open_seekable_codec(
+                    path,
+                    index_path,
+                    options,
+                    recreate,
+                    "lzma",
+                    &mut body_artifact,
+                    || open_seekable_lzma_with_threads(path, threads),
+                )?
+            }
+            CompressionFormat::Zlib => {
+                let threads = options.threads_for("zlib");
+                open_seekable_codec(
+                    path,
+                    index_path,
+                    options,
+                    recreate,
+                    "zlib",
+                    &mut body_artifact,
+                    || open_seekable_zlib_with_threads(path, threads),
+                )?
+            }
+            CompressionFormat::Lrzip => open_lrzip(path, &mut resolve_index, options, recreate)?,
+        })
+    })();
+    let source = source_result.map_err(|error| {
+        if options.read_only_index {
+            let selected = index_loc.as_path().or(options.index_file_path.as_deref()).unwrap_or(path);
+            format!("prepared index {} is unavailable or invalid: {error}; --no-recreate-index forbids creating or rebuilding it; stop workers and prepare the base/index before retrying", selected.display())
+        } else { error }
+    })?;
 
-    // After create + optional compression side-table writes: drop small indexes (B-119).
-    maybe_discard_index_below_minimum(index_path, &options);
-
-    Ok(PathOpened::archive(
+    if let Some(artifact) = body_artifact {
+        index_loc = IndexLocation::Path(artifact);
+        used_index = true;
+    }
+    // Artifact bookkeeping is based on selected backend use, never on a
+    // candidate that an unindexed source ignored. Discarded small indexes are
+    // deliberately not handed to the preparer finalizer.
+    let index_path = index_loc.as_path();
+    if used_index {
+        maybe_discard_index_below_minimum(index_path, options);
+    }
+    let actual_artifact = if used_index {
+        index_path.filter(|p| p.is_file()).map(Path::to_path_buf)
+    } else {
+        None
+    };
+    let mut opened = PathOpened::archive(
         source,
         path,
         IndexUsed {
@@ -2413,7 +2610,9 @@ fn open_path_impl(
             location: index_loc,
             discovered_from: None,
         },
-    ))
+    );
+    opened.actual_artifact = actual_artifact;
+    Ok(opened)
 }
 
 /// The sidecar an in-memory open would have used, for a read-only peek at a
@@ -2449,7 +2648,7 @@ fn sidecar_candidate(
 /// if the CLI is missing / fails, fall back to libarchive (Python pure-RA path).
 fn open_lrzip(
     path: &Path,
-    index_path: Option<&Path>,
+    resolve_index: &mut dyn FnMut() -> Result<Option<PathBuf>, String>,
     options: &OpenOptions,
     recreate: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
@@ -2463,6 +2662,8 @@ fn open_lrzip(
             let data_path = tmp.path().to_path_buf();
             let mut materialised = Some(tmp);
             if looks_like_tar(&data_path).unwrap_or(false) {
+                let selected_index = resolve_index()?;
+                let index_path = selected_index.as_deref();
                 return Ok(Arc::new(open_tar(
                     path,
                     &data_path,
@@ -2486,7 +2687,7 @@ fn open_lrzip(
             }
             if let Some(src) = try_stencil_archives_on_path(
                 &data_path,
-                index_path,
+                resolve_index,
                 options,
                 recreate,
                 &mut materialised,
@@ -2495,6 +2696,8 @@ fn open_lrzip(
             }
             #[cfg(feature = "libarchive")]
             if looks_like_libarchive(&data_path) {
+                let selected_index = resolve_index()?;
+                let index_path = selected_index.as_deref();
                 let keep = materialised
                     .take()
                     .ok_or_else(|| "materialized lrzip missing".to_string())?
@@ -2517,7 +2720,18 @@ fn open_lrzip(
         Err(cli_err) => {
             // Python keeps lrzip on libarchive only; filter_all includes lrzip when built-in.
             #[cfg(feature = "libarchive")]
-            match try_open_lrzip_via_libarchive(path, index_path, options, VERSION, recreate) {
+            let result = {
+                let selected_index = resolve_index()?;
+                try_open_lrzip_via_libarchive(
+                    path,
+                    selected_index.as_deref(),
+                    options,
+                    VERSION,
+                    recreate,
+                )
+            };
+            #[cfg(feature = "libarchive")]
+            match result {
                 Ok(src) => {
                     eprintln!(
                         "lrzip via libarchive (CLI unavailable): {}",
@@ -2590,41 +2804,100 @@ fn open_tar(
     .map_err(|e| e.to_string())
 }
 
+fn prepared_seek_error(
+    index_path: Option<&Path>,
+    codec: &str,
+    reason: impl std::fmt::Display,
+) -> String {
+    format!("prepared {codec} index {} is unavailable or invalid: {reason}; --no-recreate-index forbids rebuilding seek state; stop workers and prepare the base/index before retrying", index_path.map_or_else(|| "<missing>".into(), |p| p.display().to_string()))
+}
+
+fn load_seek_state<T>(
+    index_path: Option<&Path>,
+    archive_path: Option<&Path>,
+    recreate: bool,
+    options: &OpenOptions,
+    codec: &str,
+    load: impl FnOnce(&SqliteIndex) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let result = (|| {
+        if recreate {
+            return Err("recreation requested".to_string());
+        }
+        let ip = index_path.ok_or_else(|| "no selected sidecar".to_string())?;
+        let idx = SqliteIndex::open_lookup_for_open(ip, options).map_err(|e| e.to_string())?;
+        if let Some(ap) = archive_path {
+            if options.read_only_index {
+                idx.check_prepared_tarstats(ap).map_err(|e| e.to_string())?;
+            } else {
+                idx.check_tarstats_matches_archive(ap)
+                    .map_err(|e| e.to_string())?;
+            }
+        } else if options.read_only_index {
+            return Err("missing base identity".into());
+        }
+        load(&idx)
+    })();
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if options.read_only_index => Err(prepared_seek_error(index_path, codec, e)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn require_g3_state(
+    blob: &[u8],
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+) -> Result<(), String> {
+    if !options.read_only_index {
+        return Ok(());
+    }
+    let parsed = ratarmount_compress::try_import_gzip_seek_blob(blob)
+        .map_err(|e| prepared_seek_error(index_path, "gzip RGZI", e))?;
+    if parsed.format != ratarmount_compress::GzipSeekBlobFormat::Rgzi {
+        return Err(prepared_seek_error(index_path, "gzip", "GZIDX cannot be consumed by strict G3 without internal repair; prepare native RGZI with G3"));
+    }
+    if !ratarmount_compress::gzip_seek_points_usable(&parsed.points) {
+        return Err(prepared_seek_error(
+            index_path,
+            "gzip RGZI",
+            "requires nonempty ordered points and an initial checkpoint at uncompressed offset 0",
+        ));
+    }
+    Ok(())
+}
+
 /// Read the first gzip seek-index blob from an on-disk SQLite index, if present.
 ///
 /// Used to hydrate Tier C RGZI checkpoints before a full spacing-based rebuild.
 /// Returns `None` when recreate is set, the path is missing, the table is empty,
 /// or stored `tarstats` does not match `archive_path` (stale index after in-place replace).
+fn load_gzip_index_blob(
+    index_path: Option<&Path>,
+    archive_path: Option<&Path>,
+    recreate: bool,
+    options: &OpenOptions,
+) -> Result<Option<Vec<u8>>, String> {
+    load_seek_state(index_path, archive_path, recreate, options, "gzip", |idx| {
+        idx.get_gzip_index_blobs()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| "missing or empty gzip seek-index blob".into())
+    })
+}
+
+#[cfg(test)]
 fn try_load_gzip_index_blob(
     index_path: Option<&Path>,
     archive_path: Option<&Path>,
     recreate: bool,
 ) -> Option<Vec<u8>> {
-    if recreate {
-        return None;
-    }
-    let ip = index_path?;
-    if !ip.exists() {
-        return None;
-    }
-    let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
-    if !meta_ok {
-        return None;
-    }
-    // Read-only catalog open: no banner (TAR opens the index itself), no file
-    // table in memory, and a sidecar that fails validation is never opened
-    // writable here.
-    let idx = SqliteIndex::open_lookup(ip).ok()?;
-    if let Some(ap) = archive_path {
-        if let Err(e) = idx.check_tarstats_matches_archive(ap) {
-            eprintln!("info: gzip RGZI skipped (index fingerprint: {e})");
-            return None;
-        }
-    }
-    match idx.get_gzip_index_blobs() {
-        Ok(blobs) => blobs.into_iter().next().filter(|b| !b.is_empty()),
-        Err(_) => None,
-    }
+    load_gzip_index_blob(index_path, archive_path, recreate, &OpenOptions::default())
+        .ok()
+        .flatten()
 }
 
 /// Short format label for gzip seek-index side-table blobs (import / fail logs).
@@ -2691,8 +2964,10 @@ fn open_shared_seekable_gzip_path(
     threads: u32,
     index_path: Option<&Path>,
     recreate: bool,
+    policy: &OpenOptions,
 ) -> Result<Arc<SharedSeekableGzip>, String> {
-    if let Some(blob) = try_load_gzip_index_blob(index_path, Some(path), recreate) {
+    if let Some(blob) = load_gzip_index_blob(index_path, Some(path), recreate, policy)? {
+        require_g3_state(&blob, index_path, policy)?;
         let fmt = gzip_seek_index_format_label(&blob);
         match SharedSeekableGzip::open_with_imported_index(path, spacing, threads, &blob) {
             Ok(g) => {
@@ -2706,6 +2981,9 @@ fn open_shared_seekable_gzip_path(
                 return Ok(g);
             }
             Err(e) => {
+                if policy.read_only_index {
+                    return Err(prepared_seek_error(index_path, "gzip import", e));
+                }
                 eprintln!("info: gzip {fmt} import failed ({e}); rebuilding seek checkpoints");
             }
         }
@@ -2733,12 +3011,16 @@ fn try_open_gzip_imported_from_reader<R>(
     threads: u32,
     index_path: Option<&Path>,
     recreate: bool,
-) -> Option<Arc<SharedSeekableGzip>>
+    policy: &OpenOptions,
+) -> Result<Option<Arc<SharedSeekableGzip>>, String>
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
 {
     // Label may be virtual (HTTP); fingerprint only when it resolves to a real path.
-    let blob = try_load_gzip_index_blob(index_path, Some(label), recreate)?;
+    let Some(blob) = load_gzip_index_blob(index_path, Some(label), recreate, policy)? else {
+        return Ok(None);
+    };
+    require_g3_state(&blob, index_path, policy)?;
     let fmt = gzip_seek_index_format_label(&blob);
     match SharedSeekableGzip::open_with_imported_index_from_reader(
         reader, spacing, threads, label, &blob,
@@ -2751,11 +3033,14 @@ where
                 g.checkpoint_count(),
                 threads
             );
-            Some(g)
+            Ok(Some(g))
         }
         Err(e) => {
+            if policy.read_only_index {
+                return Err(prepared_seek_error(index_path, "gzip import", e));
+            }
             eprintln!("info: gzip {fmt} import failed ({e}); rebuilding seek checkpoints");
-            None
+            Ok(None)
         }
     }
 }
@@ -2815,8 +3100,9 @@ fn open_shared_rapidgzip_path(
     threads: u32,
     index_path: Option<&Path>,
     recreate: bool,
+    policy: &OpenOptions,
 ) -> Result<Arc<ratarmount_compress::SharedRapidgzip>, String> {
-    if let Some(blob) = try_load_gzip_index_blob(index_path, Some(path), recreate) {
+    if let Some(blob) = load_gzip_index_blob(index_path, Some(path), recreate, policy)? {
         let fmt = gzip_seek_index_format_label(&blob);
         match ratarmount_compress::SharedRapidgzip::open_with_imported_index(
             path, spacing, threads, &blob,
@@ -2832,6 +3118,9 @@ fn open_shared_rapidgzip_path(
                 return Ok(shared);
             }
             Err(e) => {
+                if policy.read_only_index {
+                    return Err(prepared_seek_error(index_path, "gzip import", e));
+                }
                 eprintln!("info: rapidgzip {fmt} import failed ({e}); rebuilding seek index");
             }
         }
@@ -2930,7 +3219,7 @@ fn open_gzip(
     #[cfg(feature = "gzip-rapidgzip")]
     if ratarmount_compress::prefer_rapidgzip_gzip_backend(&options.use_backends) {
         let rg_threads = rapidgzip_threads(options);
-        match open_shared_rapidgzip_path(path, spacing, rg_threads, index_path, recreate) {
+        match open_shared_rapidgzip_path(path, spacing, rg_threads, index_path, recreate, options) {
             Ok(shared) => {
                 // Keep typed Arc for GZIDX export after body/TAR open (create_index_body
                 // already accepts Arc<dyn SeekableBody>).
@@ -2947,6 +3236,9 @@ fn open_gzip(
                 return Ok(src);
             }
             Err(e) => {
+                if options.read_only_index {
+                    return Err(e);
+                }
                 eprintln!(
                     "info: rapidgzip gzip open failed ({e}); falling back to G3 seekable gzip"
                 );
@@ -2954,7 +3246,8 @@ fn open_gzip(
         }
     }
 
-    let gzip = open_shared_seekable_gzip_path(path, spacing, threads, index_path, recreate)?;
+    let gzip =
+        open_shared_seekable_gzip_path(path, spacing, threads, index_path, recreate, options)?;
 
     let is_tar =
         name_suggests_compressed_tar(path) || body_looks_like_tar_gzip(&gzip).unwrap_or(false);
@@ -2984,7 +3277,7 @@ fn open_gzip(
 )]
 fn try_stencil_archives_on_path(
     data_path: &Path,
-    index_path: Option<&Path>,
+    resolve_index: &mut dyn FnMut() -> Result<Option<PathBuf>, String>,
     options: &OpenOptions,
     recreate: bool,
     materialised: &mut Option<tempfile::NamedTempFile>,
@@ -3009,6 +3302,8 @@ fn try_stencil_archives_on_path(
 
     #[cfg(feature = "iso9660")]
     if looks_like_iso(data_path) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let keep = keep_path(materialised)?;
         return Ok(Some(Arc::new(
             Iso9660MountSource::open(&keep, index_path, options, VERSION, recreate)
@@ -3017,6 +3312,8 @@ fn try_stencil_archives_on_path(
     }
     #[cfg(feature = "warc")]
     if looks_like_warc(data_path) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let keep = keep_path(materialised)?;
         return Ok(Some(Arc::new(
             WarcMountSource::open(&keep, index_path, options, VERSION, recreate)
@@ -3025,6 +3322,8 @@ fn try_stencil_archives_on_path(
     }
     #[cfg(feature = "xar")]
     if looks_like_xar(data_path) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let keep = keep_path(materialised)?;
         return Ok(Some(Arc::new(
             XarMountSource::open(&keep, index_path, options, VERSION, recreate)
@@ -3033,6 +3332,8 @@ fn try_stencil_archives_on_path(
     }
     #[cfg(feature = "cab")]
     if looks_like_cab(data_path) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let keep = keep_path(materialised)?;
         match CabMountSource::open(&keep, index_path, options, VERSION, recreate) {
             Ok(s) => return Ok(Some(Arc::new(s))),
@@ -3091,10 +3392,19 @@ fn open_seekable_codec(
     options: &OpenOptions,
     recreate: bool,
     label: &str,
+    actual_artifact: &mut Option<PathBuf>,
     open_body: impl FnOnce() -> Result<Arc<dyn SeekableBody>, ratarmount_compress::CompressError>,
 ) -> Result<Arc<dyn MountSource>, String> {
     let body = open_body().map_err(|e| e.to_string())?;
-    open_from_seekable_body(path, body, index_path, options, recreate, label)
+    open_from_seekable_body_with_artifact(
+        path,
+        body,
+        index_path,
+        options,
+        recreate,
+        label,
+        actual_artifact,
+    )
 }
 
 /// Convert SQLite `zstdblocks` `(i64, i64)` pairs to `(u64, u64)`.
@@ -3129,38 +3439,37 @@ fn zstd_blocks_u64_to_i64(blocks: &[(u64, u64)]) -> Option<Vec<(i64, i64)>> {
 ///
 /// Returns `None` when recreate is set, the path is missing, the table is empty,
 /// offsets cannot be converted to `u64`, or `tarstats` mismatches `archive_path`.
+fn load_zstd_blocks(
+    index_path: Option<&Path>,
+    archive_path: Option<&Path>,
+    recreate: bool,
+    options: &OpenOptions,
+) -> Result<Option<Vec<(u64, u64)>>, String> {
+    load_seek_state(
+        index_path,
+        archive_path,
+        recreate,
+        options,
+        "zstdblocks",
+        |idx| {
+            let raw = idx.get_zstd_blocks().map_err(|e| e.to_string())?;
+            if raw.is_empty() {
+                return Err("missing or empty zstdblocks map".into());
+            }
+            zstd_blocks_i64_to_u64(&raw).ok_or_else(|| "invalid zstdblocks offsets".into())
+        },
+    )
+}
+
+#[cfg(test)]
 fn try_load_zstd_blocks(
     index_path: Option<&Path>,
     archive_path: Option<&Path>,
     recreate: bool,
 ) -> Option<Vec<(u64, u64)>> {
-    if recreate {
-        return None;
-    }
-    let ip = index_path?;
-    if !ip.exists() {
-        return None;
-    }
-    let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
-    if !meta_ok {
-        return None;
-    }
-    // Reading only, and only the catalog (no file table in memory, no
-    // banner): a sidecar that is merely consulted must not gain WAL files or
-    // schema changes, and one that does not validate read-only is refused,
-    // never retried writable.
-    let idx = SqliteIndex::open_lookup(ip).ok()?;
-    if let Some(ap) = archive_path {
-        if let Err(e) = idx.check_tarstats_matches_archive(ap) {
-            eprintln!("info: zstdblocks skipped (index fingerprint: {e})");
-            return None;
-        }
-    }
-    let raw = match idx.get_zstd_blocks() {
-        Ok(b) if !b.is_empty() => b,
-        _ => return None,
-    };
-    zstd_blocks_i64_to_u64(&raw)
+    load_zstd_blocks(index_path, archive_path, recreate, &OpenOptions::default())
+        .ok()
+        .flatten()
 }
 
 /// Open or create a writable on-disk index for compression side-table writes.
@@ -3251,9 +3560,10 @@ fn open_seekable_zstd_prefer_blocks(
     options: ratarmount_compress::ZstdReadOptions,
     index_path: Option<&Path>,
     recreate: bool,
+    policy: &OpenOptions,
 ) -> Result<(Arc<dyn SeekableBody>, bool), String> {
     let threads = options.threads;
-    if let Some(blocks) = try_load_zstd_blocks(index_path, Some(path), recreate) {
+    if let Some(blocks) = load_zstd_blocks(index_path, Some(path), recreate, policy)? {
         match ratarmount_compress::SeekableZstd::open_with_zstd_blocks_options(
             path, options, &blocks,
         ) {
@@ -3268,6 +3578,9 @@ fn open_seekable_zstd_prefer_blocks(
                 return Ok((body, true));
             }
             Err(e) => {
+                if policy.read_only_index {
+                    return Err(prepared_seek_error(index_path, "zstd import", e));
+                }
                 eprintln!("info: zstdblocks import failed ({e}); rebuilding frame map");
             }
         }
@@ -3287,11 +3600,14 @@ fn try_open_zstd_imported_from_reader<R>(
     threads: u32,
     index_path: Option<&Path>,
     recreate: bool,
-) -> Option<Arc<dyn SeekableBody>>
+    policy: &OpenOptions,
+) -> Result<Option<Arc<dyn SeekableBody>>, String>
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
 {
-    let blocks = try_load_zstd_blocks(index_path, Some(label), recreate)?;
+    let Some(blocks) = load_zstd_blocks(index_path, Some(label), recreate, policy)? else {
+        return Ok(None);
+    };
     match open_seekable_zstd_with_zstd_blocks_from_reader(reader, threads, label, &blocks) {
         Ok(body) => {
             eprintln!(
@@ -3301,11 +3617,14 @@ where
                 body.checkpoint_count(),
                 threads
             );
-            Some(body)
+            Ok(Some(body))
         }
         Err(e) => {
+            if policy.read_only_index {
+                return Err(prepared_seek_error(index_path, "zstd import", e));
+            }
             eprintln!("info: zstdblocks import failed ({e}); rebuilding frame map");
-            None
+            Ok(None)
         }
     }
 }
@@ -3332,6 +3651,7 @@ fn open_zstd(
         },
         index_path,
         recreate,
+        options,
     )?;
     let src = open_from_seekable_body(path, body, index_path, options, recreate, "zstd")?;
     // Index is now on disk (or memory); side-table write only when path exists
@@ -3345,38 +3665,37 @@ fn open_zstd(
 /// Read Python-compatible `bzip2blocks` from an on-disk SQLite index, if present.
 ///
 /// Returns `None` when `tarstats` mismatches `archive_path` (stale after in-place replace).
+fn load_bzip2_blocks(
+    index_path: Option<&Path>,
+    archive_path: Option<&Path>,
+    recreate: bool,
+    options: &OpenOptions,
+) -> Result<Option<Vec<(u64, u64)>>, String> {
+    load_seek_state(
+        index_path,
+        archive_path,
+        recreate,
+        options,
+        "bzip2blocks",
+        |idx| {
+            let raw = idx.get_bzip2_blocks().map_err(|e| e.to_string())?;
+            if raw.is_empty() {
+                return Err("missing or empty bzip2blocks map".into());
+            }
+            zstd_blocks_i64_to_u64(&raw).ok_or_else(|| "invalid bzip2blocks offsets".into())
+        },
+    )
+}
+
+#[cfg(test)]
 fn try_load_bzip2_blocks(
     index_path: Option<&Path>,
     archive_path: Option<&Path>,
     recreate: bool,
 ) -> Option<Vec<(u64, u64)>> {
-    if recreate {
-        return None;
-    }
-    let ip = index_path?;
-    if !ip.exists() {
-        return None;
-    }
-    let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
-    if !meta_ok {
-        return None;
-    }
-    // Reading only, and only the catalog (no file table in memory, no
-    // banner): a sidecar that is merely consulted must not gain WAL files or
-    // schema changes, and one that does not validate read-only is refused,
-    // never retried writable.
-    let idx = SqliteIndex::open_lookup(ip).ok()?;
-    if let Some(ap) = archive_path {
-        if let Err(e) = idx.check_tarstats_matches_archive(ap) {
-            eprintln!("info: bzip2blocks skipped (index fingerprint: {e})");
-            return None;
-        }
-    }
-    let raw = match idx.get_bzip2_blocks() {
-        Ok(b) if !b.is_empty() => b,
-        _ => return None,
-    };
-    zstd_blocks_i64_to_u64(&raw)
+    load_bzip2_blocks(index_path, archive_path, recreate, &OpenOptions::default())
+        .ok()
+        .flatten()
 }
 
 fn store_bzip2_blocks_in_index(
@@ -3449,8 +3768,9 @@ fn open_seekable_bzip2_prefer_blocks(
     threads: u32,
     index_path: Option<&Path>,
     recreate: bool,
+    policy: &OpenOptions,
 ) -> Result<(Arc<dyn SeekableBody>, bool), String> {
-    if let Some(blocks) = try_load_bzip2_blocks(index_path, Some(path), recreate) {
+    if let Some(blocks) = load_bzip2_blocks(index_path, Some(path), recreate, policy)? {
         match open_seekable_bzip2_with_bzip2_blocks(path, threads, &blocks) {
             Ok(body) => {
                 eprintln!(
@@ -3463,6 +3783,9 @@ fn open_seekable_bzip2_prefer_blocks(
                 return Ok((body, true));
             }
             Err(e) => {
+                if policy.read_only_index {
+                    return Err(prepared_seek_error(index_path, "bzip2 import", e));
+                }
                 eprintln!("info: bzip2blocks import failed ({e}); rebuilding bit-block map");
             }
         }
@@ -3478,11 +3801,14 @@ fn try_open_bzip2_imported_from_reader<R>(
     threads: u32,
     index_path: Option<&Path>,
     recreate: bool,
-) -> Option<Arc<dyn SeekableBody>>
+    policy: &OpenOptions,
+) -> Result<Option<Arc<dyn SeekableBody>>, String>
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
 {
-    let blocks = try_load_bzip2_blocks(index_path, Some(label), recreate)?;
+    let Some(blocks) = load_bzip2_blocks(index_path, Some(label), recreate, policy)? else {
+        return Ok(None);
+    };
     match open_seekable_bzip2_with_bzip2_blocks_from_reader(reader, threads, label, &blocks) {
         Ok(body) => {
             eprintln!(
@@ -3492,11 +3818,14 @@ where
                 body.checkpoint_count(),
                 threads
             );
-            Some(body)
+            Ok(Some(body))
         }
         Err(e) => {
+            if policy.read_only_index {
+                return Err(prepared_seek_error(index_path, "bzip2 import", e));
+            }
             eprintln!("info: bzip2blocks import failed ({e}); rebuilding bit-block map");
-            None
+            Ok(None)
         }
     }
 }
@@ -3513,7 +3842,7 @@ fn open_bzip2(
 ) -> Result<Arc<dyn MountSource>, String> {
     let threads = options.threads_for("bzip2");
     let (body, used_blocks) =
-        open_seekable_bzip2_prefer_blocks(path, threads, index_path, recreate)?;
+        open_seekable_bzip2_prefer_blocks(path, threads, index_path, recreate, options)?;
     let src = open_from_seekable_body(path, body, index_path, options, recreate, "bzip2")?;
     if !used_blocks {
         persist_bzip2_blocks_from_path(path, index_path, options);
@@ -3534,6 +3863,21 @@ fn open_from_seekable_body(
     recreate: bool,
     label: &str,
 ) -> Result<Arc<dyn MountSource>, String> {
+    open_from_seekable_body_with_artifact(
+        path, body, index_path, options, recreate, label, &mut None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_from_seekable_body_with_artifact(
+    path: &Path,
+    body: Arc<dyn SeekableBody>,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+    recreate: bool,
+    label: &str,
+    actual_artifact: &mut Option<PathBuf>,
+) -> Result<Arc<dyn MountSource>, String> {
     eprintln!(
         "seekable {label}: {} ({} uncompressed bytes, {} checkpoints, kind={})",
         path.display(),
@@ -3542,24 +3886,56 @@ fn open_from_seekable_body(
         body.kind()
     );
 
+    let mut resolve_index = || -> Result<Option<PathBuf>, String> {
+        let selected = if options.read_only_index {
+            ratarmount_index::resolve_prepared_index_location(
+                path,
+                index_path
+                    .or(options.index_file_path.as_deref())
+                    .map(|p| {
+                        p.to_str()
+                            .ok_or_else(|| "index path is not UTF-8".to_string())
+                    })
+                    .transpose()?,
+                &options.index_folders,
+            )
+            .map_err(|e| e.to_string())?
+            .as_path()
+            .map(Path::to_path_buf)
+        } else {
+            index_path.map(Path::to_path_buf)
+        };
+        *actual_artifact = selected.clone();
+        Ok(selected)
+    };
     let is_tar = name_suggests_compressed_tar(path) || body_looks_like_tar(&body).unwrap_or(false);
 
     if is_tar {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         return Ok(Arc::new(open_tar_body(
             path, body, index_path, options, recreate,
         )?));
     }
 
-    if let Some(src) =
-        try_open_formats_from_seekable_body(path, Arc::clone(&body), index_path, options, recreate)?
-    {
+    if let Some(src) = try_open_formats_from_seekable_body_with_index(
+        path,
+        Arc::clone(&body),
+        &mut resolve_index,
+        options,
+        recreate,
+    )? {
         return Ok(src);
     }
 
     // Residual path-only backends that cannot open from a reader yet.
     if body_needs_path_materialize(&body) {
-        return materialize_seekable_body_for_path_backends(
-            path, body, index_path, options, recreate,
+        return materialize_seekable_body_for_path_backends_with_index(
+            path,
+            body,
+            &mut resolve_index,
+            options,
+            recreate,
         );
     }
 
@@ -3578,6 +3954,22 @@ fn try_open_formats_from_seekable_body(
     label: &Path,
     body: Arc<dyn SeekableBody>,
     index_path: Option<&Path>,
+    options: &OpenOptions,
+    recreate: bool,
+) -> Result<Option<Arc<dyn MountSource>>, String> {
+    try_open_formats_from_seekable_body_with_index(
+        label,
+        body,
+        &mut || Ok(index_path.map(Path::to_path_buf)),
+        options,
+        recreate,
+    )
+}
+
+fn try_open_formats_from_seekable_body_with_index(
+    label: &Path,
+    body: Arc<dyn SeekableBody>,
+    resolve_index: &mut dyn FnMut() -> Result<Option<PathBuf>, String>,
     options: &OpenOptions,
     recreate: bool,
 ) -> Result<Option<Arc<dyn MountSource>>, String> {
@@ -3610,6 +4002,8 @@ fn try_open_formats_from_seekable_body(
 
     // 7z
     if head.len() >= 6 && &head[..6] == b"7z\xBC\xAF'\x1C" {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             SevenZipMountSource::open_from_reader(r, label, index_path, options, VERSION, recreate)
@@ -3619,6 +4013,8 @@ fn try_open_formats_from_seekable_body(
     // Unix ar
     #[cfg(feature = "ar")]
     if head.len() >= 8 && &head[..8] == b"!<arch>\n" {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             ArMountSource::open_from_reader(r, label, index_path, options, VERSION)
@@ -3628,6 +4024,8 @@ fn try_open_formats_from_seekable_body(
     // XAR
     #[cfg(feature = "xar")]
     if head.len() >= 4 && &head[..4] == b"xar!" {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             XarMountSource::open_from_reader(r, label, index_path, options, VERSION)
@@ -3637,6 +4035,8 @@ fn try_open_formats_from_seekable_body(
     // CAB (store/MSZIP; LZX → residual materialize + libarchive)
     #[cfg(feature = "cab")]
     if head.len() >= 4 && &head[..4] == b"MSCF" {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         match CabMountSource::open_from_reader(r, label, index_path, options, VERSION, recreate) {
             Ok(s) => return Ok(Some(Arc::new(s))),
@@ -3659,6 +4059,8 @@ fn try_open_formats_from_seekable_body(
     // CPIO
     #[cfg(feature = "cpio")]
     if head_looks_like_cpio(head) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             CpioMountSource::open_from_reader(r, label, index_path, options, VERSION)
@@ -3668,6 +4070,8 @@ fn try_open_formats_from_seekable_body(
     // WARC
     #[cfg(feature = "warc")]
     if head.len() >= 5 && &head[..5] == b"WARC/" {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             WarcMountSource::open_from_reader(r, label, index_path, options, VERSION)
@@ -3676,6 +4080,15 @@ fn try_open_formats_from_seekable_body(
     }
     // ZIP
     if head.len() >= 4 && &head[..2] == b"PK" {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
+        if options.read_only_index && !options.index_compact_only {
+            return Err(prepared_seek_error(
+                index_path,
+                "compressed ZIP prepared reader",
+                "the reader route requires rebuilding its file table",
+            ));
+        }
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             ZipMountSource::open_from_reader(r, label, index_path, options, VERSION)
@@ -3687,6 +4100,8 @@ fn try_open_formats_from_seekable_body(
         || (head.len() >= 265 && &head[257..263] == b"ustar ")
         || name_suggests_plain_tar(label)
     {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             SqliteIndexedTar::open_from_reader(r, label, index_path, options, VERSION)
@@ -3713,6 +4128,8 @@ fn try_open_formats_from_seekable_body(
             || ratarmount_formats_iso9660::looks_like_iso9660_reader(&mut r);
         let _ = r.seek(SeekFrom::Start(0));
         if looks_iso {
+            let selected_index = resolve_index()?;
+            let index_path = selected_index.as_deref();
             return Ok(Some(Arc::new(
                 Iso9660MountSource::open_from_reader(r, label, index_path, options, VERSION)
                     .map_err(|e| e.to_string())?,
@@ -3722,6 +4139,8 @@ fn try_open_formats_from_seekable_body(
     // ASAR by name
     #[cfg(feature = "asar")]
     if name_suggests_asar(label) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             AsarMountSource::open_from_reader(r, label, index_path, options, VERSION, recreate)
@@ -3731,6 +4150,8 @@ fn try_open_formats_from_seekable_body(
     // Extension fallbacks (magic missed)
     #[cfg(feature = "warc")]
     if name_suggests_ext(label, &["warc"]) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             WarcMountSource::open_from_reader(r, label, index_path, options, VERSION)
@@ -3739,6 +4160,8 @@ fn try_open_formats_from_seekable_body(
     }
     #[cfg(feature = "cpio")]
     if name_suggests_ext(label, &["cpio"]) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             CpioMountSource::open_from_reader(r, label, index_path, options, VERSION)
@@ -3747,6 +4170,8 @@ fn try_open_formats_from_seekable_body(
     }
     #[cfg(feature = "ar")]
     if name_suggests_ext(label, &["ar", "a"]) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             ArMountSource::open_from_reader(r, label, index_path, options, VERSION)
@@ -3755,6 +4180,8 @@ fn try_open_formats_from_seekable_body(
     }
     #[cfg(feature = "xar")]
     if name_suggests_ext(label, &["xar"]) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         return Ok(Some(Arc::new(
             XarMountSource::open_from_reader(r, label, index_path, options, VERSION)
@@ -3763,6 +4190,8 @@ fn try_open_formats_from_seekable_body(
     }
     #[cfg(feature = "cab")]
     if name_suggests_ext(label, &["cab"]) {
+        let selected_index = resolve_index()?;
+        let index_path = selected_index.as_deref();
         let r = open_reader()?;
         match CabMountSource::open_from_reader(r, label, index_path, options, VERSION, recreate) {
             Ok(s) => return Ok(Some(Arc::new(s))),
@@ -3963,10 +4392,27 @@ fn body_needs_path_materialize(body: &Arc<dyn SeekableBody>) -> bool {
 }
 
 /// Materialize a seekable body once for residual path-only backends (EXT4 / SquashFS / libarchive).
+#[cfg(feature = "cab")]
 fn materialize_seekable_body_for_path_backends(
     path: &Path,
     body: Arc<dyn SeekableBody>,
     index_path: Option<&Path>,
+    options: &OpenOptions,
+    recreate: bool,
+) -> Result<Arc<dyn MountSource>, String> {
+    materialize_seekable_body_for_path_backends_with_index(
+        path,
+        body,
+        &mut || Ok(index_path.map(Path::to_path_buf)),
+        options,
+        recreate,
+    )
+}
+
+fn materialize_seekable_body_for_path_backends_with_index(
+    path: &Path,
+    body: Arc<dyn SeekableBody>,
+    resolve_index: &mut dyn FnMut() -> Result<Option<PathBuf>, String>,
     options: &OpenOptions,
     recreate: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
@@ -3975,7 +4421,7 @@ fn materialize_seekable_body_for_path_backends(
     drop(body);
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-B0538-M01","item":"ratarmount_session::factory::materialize_seekable_body_for_path_backends","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-B0538-M01","item":"ratarmount_session::factory::materialize_seekable_body_for_path_backends_with_index","disposition":"output-owner","mode_policy":"0600","category":"output-owner","reason":"Materialize a seekable archive body in a private temporary file for path-only format backends.","creation":{"policy":"0600","basis":"NamedTempFile creates the materialized body with mode 0600; regression_materialize_tempfile_is_created_0600 verifies its creation permissions."}}"###
     )]
     let mut tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
     std::io::copy(&mut reader, &mut tmp).map_err(|e| e.to_string())?;
@@ -4010,10 +4456,16 @@ fn materialize_seekable_body_for_path_backends(
             FatMountSource::open(&keep).map_err(|e| e.to_string())?,
         ));
     }
+    let selected_index = resolve_index()?;
+    let index_path = selected_index.as_deref();
     let mut materialised = Some(tmp);
-    if let Some(src) =
-        try_stencil_archives_on_path(&data_path, index_path, options, recreate, &mut materialised)?
-    {
+    if let Some(src) = try_stencil_archives_on_path(
+        &data_path,
+        &mut || Ok(index_path.map(Path::to_path_buf)),
+        options,
+        recreate,
+        &mut materialised,
+    )? {
         return Ok(src);
     }
     #[cfg(feature = "libarchive")]
@@ -4200,6 +4652,8 @@ pub struct MountBundle {
     /// What the first element in factory order served (`inputs[0]`, else the
     /// first declared source). `None` only when nothing was opened.
     pub served: Option<Served>,
+    /// Actual local persistent artifacts used or produced, excluding unused candidates.
+    pub prepared_artifacts: Vec<PathBuf>,
     /// Provenance from the successful local TAR probe, before compositing.
     /// No remote, split, compressed, recursive, or path-transforming source.
     pub(crate) plain_tar_file: Option<PathBuf>,
@@ -4281,8 +4735,18 @@ fn apply_compositing(
         } else if let Some(ref p) = opts.index_file_path {
             Some(p.clone())
         } else if !archive_path.as_os_str().is_empty() {
-            let loc = resolved_index(archive_path, opts, false);
-            loc.as_path().map(|p| p.to_path_buf())
+            if opts.read_only_index {
+                ratarmount_index::resolve_prepared_index_location(
+                    archive_path,
+                    None,
+                    &opts.index_folders,
+                )
+                .ok()
+                .and_then(|loc| loc.as_path().map(Path::to_path_buf))
+            } else {
+                let loc = resolved_index(archive_path, opts, false);
+                loc.as_path().map(Path::to_path_buf)
+            }
         } else {
             None
         };
@@ -4321,8 +4785,23 @@ fn remote_index_setup(
     label: &Path,
     opts: &OpenOptions,
     recreate: bool,
-) -> (OpenOptions, Option<PathBuf>) {
-    let index_loc = resolved_index(label, opts, recreate);
+) -> Result<(OpenOptions, Option<PathBuf>), String> {
+    let index_loc = if opts.read_only_index {
+        ratarmount_index::resolve_prepared_index_location(
+            label,
+            opts.index_file_path
+                .as_deref()
+                .map(|p| {
+                    p.to_str()
+                        .ok_or_else(|| "index path is not UTF-8".to_string())
+                })
+                .transpose()?,
+            &opts.index_folders,
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        resolved_index(label, opts, recreate)
+    };
     let mut o = opts.clone();
     let index_path = if index_loc.is_memory() {
         o.index_in_memory = true;
@@ -4335,7 +4814,7 @@ fn remote_index_setup(
     } else {
         None
     };
-    (o, index_path)
+    Ok((o, index_path))
 }
 
 /// Result of a successful live-Range open (label path + mount source).
@@ -4365,7 +4844,7 @@ where
     std::io::Seek::seek(&mut range, std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     let kind = probe_archive_magic(&magic[..n]);
     let label = PathBuf::from(input);
-    let (o, index_path) = remote_index_setup(&label, opts, recreate);
+    let (o, index_path) = remote_index_setup(&label, opts, recreate)?;
     let ip = index_path.as_deref();
 
     match kind {
@@ -4427,7 +4906,7 @@ where
             if ratarmount_compress::prefer_rapidgzip_gzip_backend(&o.use_backends) {
                 let rg_threads = rapidgzip_threads(&o);
                 let rg_result: Result<Arc<ratarmount_compress::SharedRapidgzip>, String> =
-                    if let Some(blob) = try_load_gzip_index_blob(ip, Some(&label), recreate) {
+                    if let Some(blob) = load_gzip_index_blob(ip, Some(&label), recreate, &o)? {
                         let fmt = gzip_seek_index_format_label(&blob);
                         match ratarmount_compress::SharedRapidgzip::open_with_imported_index_from_reader(
                             range, spacing, rg_threads, &label, &blob,
@@ -4443,6 +4922,7 @@ where
                                 Ok(shared)
                             }
                             Err(e) => {
+                                if o.read_only_index { return Err(prepared_seek_error(ip, "rapidgzip import", e)); }
                                 eprintln!(
                                     "info: rapidgzip {fmt} import failed ({e}); rebuilding seek index"
                                 );
@@ -4478,6 +4958,9 @@ where
                         return Ok(Some((label, src)));
                     }
                     Err(e) => {
+                        if o.read_only_index {
+                            return Err(e);
+                        }
                         eprintln!(
                             "info: rapidgzip gzip open failed ({e}); falling back to G3 seekable gzip"
                         );
@@ -4492,10 +4975,10 @@ where
             }
 
             // Prefer RGZI/GZIDX import; on failure rebuild with a fresh Range handle.
-            let gzip = if try_load_gzip_index_blob(ip, Some(&label), recreate).is_some() {
+            let gzip = if load_gzip_index_blob(ip, Some(&label), recreate, &o)?.is_some() {
                 match try_open_gzip_imported_from_reader(
-                    range, &label, spacing, threads, ip, recreate,
-                ) {
+                    range, &label, spacing, threads, ip, recreate, &o,
+                )? {
                     Some(g) => g,
                     None => {
                         let reopen_fn = reopen_opt
@@ -4531,8 +5014,9 @@ where
             // `reopen` for post-open export only when the map was rebuilt.
             let mut reopen_opt = Some(reopen);
             let mut used_blocks = false;
-            let body = if try_load_bzip2_blocks(ip, Some(&label), recreate).is_some() {
-                match try_open_bzip2_imported_from_reader(range, &label, threads, ip, recreate) {
+            let body = if load_bzip2_blocks(ip, Some(&label), recreate, &o)?.is_some() {
+                match try_open_bzip2_imported_from_reader(range, &label, threads, ip, recreate, &o)?
+                {
                     Some(b) => {
                         used_blocks = true;
                         b
@@ -4602,8 +5086,9 @@ where
             // `reopen` for post-open export only when the map was rebuilt.
             let mut reopen_opt = Some(reopen);
             let mut used_blocks = false;
-            let body = if try_load_zstd_blocks(ip, Some(&label), recreate).is_some() {
-                match try_open_zstd_imported_from_reader(range, &label, threads, ip, recreate) {
+            let body = if load_zstd_blocks(ip, Some(&label), recreate, &o)?.is_some() {
+                match try_open_zstd_imported_from_reader(range, &label, threads, ip, recreate, &o)?
+                {
                     Some(b) => {
                         used_blocks = true;
                         b
@@ -4828,6 +5313,14 @@ pub fn build_mount_source_with_bindings(
     comp: CompositingOptions,
     bindings: SourceBindings,
 ) -> Result<MountBundle, String> {
+    if options.read_only_index
+        && (options.index_in_memory
+            || options.index_compact_only
+            || options.index_file_path.as_deref()
+                == Some(Path::new(ratarmount_index::MEMORY_INDEX)))
+    {
+        return Err("--no-recreate-index requires a prepared on-disk index; top-level memory/compact fallback is forbidden".into());
+    }
     for bind in &bindings.binds {
         ratarmount_compositing::validate_mount_path(&bind.mount_path)?;
         if bind.source.is_empty() {
@@ -4921,6 +5414,7 @@ pub fn build_mount_source_with_bindings(
         )?);
     }
     let mut remotes = Vec::new();
+    let mut prepared_artifacts = Vec::new();
     let mut plain_tar_file = None;
     // Per-input clone of the CLI options. `read_only_index` may clear write
     // flags on that clone only. A discovered `index_file_path` is copied back
@@ -4989,11 +5483,21 @@ pub fn build_mount_source_with_bindings(
                 &mut folder_opener,
             )?;
             let served = served_from_remote(&input, &opened);
+            if let Some(artifact) = &opened.actual_artifact {
+                if !prepared_artifacts.contains(artifact) {
+                    prepared_artifacts.push(artifact.clone());
+                }
+            }
             (opened.path, opened.source, served)
         } else {
             let local_path = p.clone();
             let mut plain_tar = false;
             let opened = open_path_impl(&local_path, &opts, recreate_src, true, &mut plain_tar)?;
+            if let Some(artifact) = &opened.actual_artifact {
+                if !prepared_artifacts.contains(artifact) {
+                    prepared_artifacts.push(artifact.clone());
+                }
+            }
             let input_served = Served {
                 kind: opened.kind,
                 location: Some(ServedLocation::Local(opened.location)),
@@ -5061,6 +5565,7 @@ pub fn build_mount_source_with_bindings(
         source,
         served,
         plain_tar_file,
+        prepared_artifacts,
         _remotes: remotes,
     })
 }
@@ -7403,7 +7908,7 @@ mod tests {
 
     /// Minimal newc CPIO with one regular file and TRAILER (mirrors formats-cpio tests).
     #[cfg(feature = "cpio")]
-    fn build_newc_cpio(name: &str, data: &[u8], mode: u32) -> Vec<u8> {
+    pub(super) fn build_newc_cpio(name: &str, data: &[u8], mode: u32) -> Vec<u8> {
         fn push_entry(out: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) {
             let namesize = name.len() + 1;
             let filesize = data.len() as u32;
@@ -7443,7 +7948,7 @@ mod tests {
 
     /// Minimal SVR4/GNU `ar` with one regular member (name ends with `/`).
     #[cfg(feature = "ar")]
-    fn synthetic_ar(name: &str, payload: &[u8]) -> Vec<u8> {
+    pub(super) fn synthetic_ar(name: &str, payload: &[u8]) -> Vec<u8> {
         const HEADER_SIZE: usize = 60;
         let mut out = Vec::new();
         out.extend_from_slice(b"!<arch>\n");
@@ -7824,7 +8329,7 @@ mod tests {
 
     /// Always-on synthetic superfloppy exFAT (OEM `"EXFAT   "` + hello.txt).
     #[cfg(feature = "exfat")]
-    fn synthetic_exfat_image() -> Vec<u8> {
+    pub(super) fn synthetic_exfat_image() -> Vec<u8> {
         const BPS: u32 = 512;
         const FAT_OFFSET: u32 = 24;
         const FAT_LENGTH: u32 = 16;
@@ -9205,7 +9710,7 @@ mod tests {
         let src = try_open_format_backend(
             &path,
             FormatBackend::Sqlar,
-            None,
+            &mut || Ok(None),
             &OpenOptions::default(),
             false,
         )
@@ -10032,3 +10537,7 @@ mod source_bind_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "factory_prepared_tests.rs"]
+mod prepared_index_tests;

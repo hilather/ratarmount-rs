@@ -3921,8 +3921,14 @@ pub(crate) mod tests {
             argv.extend_from_slice(extra);
             argv.push("a.tar");
             let args = crate::Args::try_parse_from(argv).unwrap();
-            let key =
-                crate::lower_key_for(&args, false, std::slice::from_ref(&archive), Some(&index));
+            let key = crate::lower_key_for(
+                &args,
+                false,
+                std::slice::from_ref(&archive),
+                Some(&index),
+                false,
+            )
+            .unwrap();
             assert!(key.is_some());
             let before = verify_calls();
             crate::MountLowerStack::open_in(

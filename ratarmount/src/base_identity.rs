@@ -30,6 +30,7 @@ pub struct FactoryOpener<'a> {
     bindings: Option<SourceBindings>,
     /// Resolve a moving Git reference once before the factory opens it.
     pin_git: bool,
+    prepared_artifacts: Vec<PathBuf>,
 }
 
 impl<'a> FactoryOpener<'a> {
@@ -50,7 +51,12 @@ impl<'a> FactoryOpener<'a> {
             comp: Some(comp),
             bindings: Some(bindings),
             pin_git,
+            prepared_artifacts: Vec::new(),
         }
+    }
+    /// Actual local persistent artifacts, retained independently of the sources.
+    pub fn prepared_artifacts(&self) -> &[PathBuf] {
+        &self.prepared_artifacts
     }
 }
 
@@ -72,6 +78,7 @@ impl OpenBase for FactoryOpener<'_> {
             comp,
             bindings,
         )?;
+        self.prepared_artifacts = std::mem::take(&mut bundle.prepared_artifacts);
         let served = bundle
             .served
             .take()
@@ -83,6 +90,7 @@ impl OpenBase for FactoryOpener<'_> {
             location: served.location,
             index: served.index,
             sidecar_candidate: served.sidecar_candidate,
+            read_only_index: self.options.read_only_index,
             fetched: served.fetched,
             keep_alive: bundle.into_keep_alive(),
         })
@@ -172,6 +180,7 @@ impl OpenBase for CommitOpener<'_> {
             location: served.location,
             index: served.index,
             sidecar_candidate: served.sidecar_candidate,
+            read_only_index: false,
             fetched: false,
             keep_alive: Box::new(()),
         })
@@ -376,6 +385,7 @@ pub(crate) mod fixtures {
                 location: self.location.clone(),
                 index: IndexProvenance::None,
                 sidecar_candidate: None,
+                read_only_index: false,
                 fetched: false,
                 keep_alive: Box::new(()),
             })

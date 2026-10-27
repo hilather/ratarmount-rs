@@ -103,7 +103,7 @@ struct Args {
     #[arg(short = 'c', long = "recreate-index", action = ArgAction::SetTrue)]
     recreate_index: bool,
 
-    /// Never create or modify indexes; only use existing ones
+    /// Use only complete prepared indexes; never rebuild, recover, or modify shared state
     #[arg(long = "no-recreate-index", action = ArgAction::SetTrue)]
     no_recreate_index: bool,
 
@@ -1297,6 +1297,42 @@ fn run_repack_seekable_cli(args: &Args) -> Result<(), (i32, String)> {
     }
 }
 
+fn prepared_index_cli_error(args: &Args) -> Option<String> {
+    if !args.no_recreate_index {
+        return None;
+    }
+    let incompatible = if args.recreate_index {
+        Some("-c / --recreate-index")
+    } else if args.hashes.is_some() {
+        Some("--hashes")
+    } else if args.commit_overlay {
+        Some("--commit-overlay")
+    } else if args.roll_every.is_some() {
+        Some("--roll-every")
+    } else if args.commit_overlay_on_exit {
+        Some("--commit-overlay-on-exit")
+    } else if overlay_commit::parse_interval(&args.commit_overlay_interval)
+        .map_or(true, |interval| interval.is_some())
+    {
+        Some("--commit-overlay-interval")
+    } else if args.publish_index {
+        Some("--publish-index")
+    } else if args.publish_index_to.is_some() {
+        Some("--publish-index-to")
+    } else if args.repack_seekable {
+        Some("--repack-seekable")
+    } else if args
+        .index_file
+        .as_deref()
+        .is_some_and(|s| s.trim() == MEMORY_INDEX)
+    {
+        Some("--index-file :memory:")
+    } else {
+        None
+    };
+    incompatible.map(|flag| format!("--no-recreate-index cannot be combined with {flag}; stop workers and prepare the base/index separately"))
+}
+
 fn index_id_cli_error(args: &Args) -> Option<&'static str> {
     args.index_id.as_ref()?;
     if args.recreate_index {
@@ -1320,22 +1356,39 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
 /// the listing options of [`mounted_view_key`] are appended to the digest so a
 /// check made under one listing never serves another.
 /// Computed only when a `--lower` bundle needs it.
+#[cfg(test)]
 fn lower_base_key(
     bases: &[PathBuf],
     index: Option<&Path>,
     lowers: &[PathBuf],
     view_key: &str,
 ) -> Option<String> {
-    let [base] = bases else {
-        return None;
-    };
-    if !lowers.iter().any(|p| p.is_file()) || !base.is_file() {
-        return None;
-    }
-    let digest = ratarmount_index::peek_archive_digest(base, index)
+    lower_base_key_for_open(bases, index, lowers, view_key, false)
         .ok()
-        .flatten()?;
-    Some(format!("{digest}.{view_key}"))
+        .flatten()
+}
+
+fn lower_base_key_for_open(
+    bases: &[PathBuf],
+    index: Option<&Path>,
+    lowers: &[PathBuf],
+    view_key: &str,
+    read_only_index: bool,
+) -> Result<Option<String>, String> {
+    let [base] = bases else { return Ok(None) };
+    if !lowers.iter().any(|p| p.is_file())
+        || !base.is_file()
+        || (read_only_index && index.is_none())
+    {
+        return Ok(None);
+    }
+    let peek = ratarmount_index::peek_archive_digest_for_open(base, index, read_only_index);
+    let digest = if read_only_index {
+        peek.map_err(|e| e.to_string())?
+    } else {
+        peek.ok().flatten()
+    };
+    Ok(digest.map(|digest| format!("{digest}.{view_key}")))
 }
 
 /// The verification marker key for this invocation: `None` unless the mount
@@ -1346,10 +1399,18 @@ fn lower_key_for(
     rolling: bool,
     inputs: &[PathBuf],
     index: Option<&Path>,
-) -> Option<String> {
-    mounted_view_is_default(args, rolling)
-        .then(|| lower_base_key(inputs, index, &args.lower, &mounted_view_key(args)))
-        .flatten()
+    read_only_index: bool,
+) -> Result<Option<String>, String> {
+    if !mounted_view_is_default(args, rolling) {
+        return Ok(None);
+    }
+    lower_base_key_for_open(
+        inputs,
+        index,
+        &args.lower,
+        &mounted_view_key(args),
+        read_only_index,
+    )
 }
 
 /// The options that change which members an archive lists or how their paths
@@ -1615,6 +1676,10 @@ fn main() {
         eprintln!("error: {msg}");
         std::process::exit(2);
     }
+    if let Some(msg) = prepared_index_cli_error(&args) {
+        eprintln!("error: {msg}");
+        std::process::exit(2);
+    }
     if let Some(msg) = index_id_cli_error(&args) {
         eprintln!("error: {msg}");
         std::process::exit(2);
@@ -1877,7 +1942,8 @@ fn main() {
     // for the identity gates (recovered below, after the overlay opened).
     let deferred_journals = recover_mount_journals(&args, &inputs);
 
-    if args.roll_every.is_none()
+    if !args.no_recreate_index
+        && args.roll_every.is_none()
         && args.write_overlay.is_some()
         && inputs.len() == 1
         && args.source_binds.is_empty()
@@ -2127,6 +2193,18 @@ fn main() {
     } else {
         source_paths.clone()
     };
+    if args.no_mount && !open_opts.read_only_index && !open_opts.index_in_memory {
+        for path in factory_paths.iter().cloned().chain(
+            args.source_binds
+                .iter()
+                .map(|bind| PathBuf::from(&bind.source)),
+        ) {
+            if let Err(error) = factory::validate_worker_preparation(&path) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     let factory_comp = factory::CompositingOptions {
         recursive: args.recursive || args.recursion_depth != 0,
         lazy: args.lazy,
@@ -2162,6 +2240,7 @@ fn main() {
         parallel_nested_threads: args.parallel_nested,
     };
     let recreate_index = args.recreate_index && !args.no_recreate_index;
+    let prepared_artifacts;
     let (mut bundle, classified) = if wants_identity {
         let mut opener = base_identity::FactoryOpener::new(
             inputs
@@ -2176,13 +2255,16 @@ fn main() {
             args.source_binds.is_empty(),
         );
         match ratarmount_compositing::ClassifiedBase::open(&mut opener) {
-            Ok(base) => (
-                base_identity::MountedSource {
-                    source: base.source(),
-                    _keep_alive: Box::new(()),
-                },
-                Some(base),
-            ),
+            Ok(base) => {
+                prepared_artifacts = opener.prepared_artifacts().to_vec();
+                (
+                    base_identity::MountedSource {
+                        source: base.source(),
+                        _keep_alive: Box::new(()),
+                    },
+                    Some(base),
+                )
+            }
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -2196,13 +2278,16 @@ fn main() {
             factory_comp,
             bindings,
         ) {
-            Ok(built) => (
-                base_identity::MountedSource {
-                    source: built.source.clone(),
-                    _keep_alive: built.into_keep_alive(),
-                },
-                None,
-            ),
+            Ok(built) => {
+                prepared_artifacts = built.prepared_artifacts.clone();
+                (
+                    base_identity::MountedSource {
+                        source: built.source.clone(),
+                        _keep_alive: built.into_keep_alive(),
+                    },
+                    None,
+                )
+            }
             Err(e) => {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -2338,7 +2423,24 @@ fn main() {
     // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
-    let lower_key = lower_key_for(&args, rolling.is_some(), &inputs, index_sidecar.as_deref());
+    let peek_index = if open_opts.read_only_index {
+        classified
+            .as_ref()
+            .and_then(|base| base.actual().index_for_peek())
+    } else {
+        index_sidecar.as_deref()
+    };
+    let lower_key = lower_key_for(
+        &args,
+        rolling.is_some(),
+        &inputs,
+        peek_index,
+        open_opts.read_only_index,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("error: prepared lower-key identity: {error}");
+        std::process::exit(2);
+    });
     let lower_identity = BaseIdentity::Enforce {
         base: MountedBase {
             extra_excludes: lower_extra_excludes(
@@ -2559,6 +2661,26 @@ fn main() {
         if let Some(flag) = export_incompatible_with_no_mount(&args) {
             eprintln!("error: {flag} cannot be combined with --no-mount");
             std::process::exit(2);
+        }
+        // Only the exclusive preparer finishes publication. Release every
+        // source owner before reopening the actual artifacts for checkpointing.
+        drop(_sandbox_inspector);
+        drop(bundle);
+        drop(classified);
+        drop(lower_identity);
+        drop(overlay_arc);
+        drop(rolling);
+        drop(lower_stack);
+        if !open_opts.read_only_index {
+            for path in &prepared_artifacts {
+                if let Err(error) = SqliteIndex::finalize_prepared(path) {
+                    eprintln!(
+                        "error: incomplete preparation for {}: {error}",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
         return;
     }
@@ -3454,7 +3576,9 @@ fn spawn_interval_if(
     stop: Option<ratarmount_nfs::NfsStop>,
     open_opts: &OpenOptions,
 ) -> Option<thread::JoinHandle<()>> {
-    base_digest::spawn_if_pending(overlay);
+    if !open_opts.read_only_index {
+        base_digest::spawn_if_pending(overlay);
+    }
     match (overlay, live_archive, commit_interval) {
         (Some(ov), Some(archive), Some(dur)) => Some(overlay_commit::spawn_interval_commits(
             Arc::clone(ov),
@@ -5022,6 +5146,17 @@ fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
         if !ratarmount_remote::is_remote_url(&bind.source) {
             members.push(PathBuf::from(&bind.source));
         }
+    }
+    if args.no_recreate_index || args.index_id.is_some() {
+        for member in &members {
+            if let Err(error) =
+                ratarmount_compositing::journal_recovery::check_offline_journal(member)
+            {
+                eprintln!("error: --no-recreate-index forbids commit recovery for {}: {error}; stop workers and finish preparation first", member.display());
+                std::process::exit(2);
+            }
+        }
+        return Vec::new();
     }
     let mut records = MountRecords::default();
     if let Some(top) = args
@@ -7709,6 +7844,80 @@ mod overlay_unmount_drop_tests {
         );
     }
 
+    /// Regression: reopening a pending overlay must not launch shared-index cache writes.
+    #[test]
+    fn regression_prepared_index_worker_leaves_pending_digest_cache_untouched() {
+        let _guard = lock_term_flag();
+        let _reset = ResetTerm;
+        crate::overlay_commit::set_term_flag_for_test(false);
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let index = dir.path().join("index.sqlite");
+        std::fs::write(&archive, b"archive bytes").unwrap();
+        rusqlite::Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files(name TEXT)")
+            .unwrap();
+        let overlay = dir.path().join("overlay");
+        let source = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = crate::base_identity::fixtures::overlay_over(
+            source.clone(),
+            &overlay,
+            archive.to_str().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        ov.set_meta("base_index_path", index.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            ov.pending_base().unwrap().unwrap().index.as_deref(),
+            Some(index.as_path())
+        );
+        drop(ov);
+        let ov = Arc::new(
+            crate::base_identity::fixtures::overlay_over(
+                source,
+                &overlay,
+                archive.to_str().unwrap(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let snapshot = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| {
+                    let p = e.unwrap().path();
+                    p.is_file().then(|| {
+                        (
+                            p.file_name().unwrap().to_owned(),
+                            std::fs::read(&p).unwrap(),
+                        )
+                    })
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        let overlay = Some(ov);
+        assert!(super::spawn_interval_if(
+            &overlay,
+            &None,
+            None,
+            None,
+            &OpenOptions {
+                read_only_index: true,
+                write_index: false,
+                ..Default::default()
+            }
+        )
+        .is_none());
+        crate::base_digest::join();
+        assert!(overlay.as_ref().unwrap().pending_base().unwrap().is_some());
+        assert_eq!(snapshot(), before);
+        drop(overlay);
+        assert_eq!(snapshot(), before);
+    }
+
     /// Regression: the lazy base-digest thread must be joined before the
     /// overlay drops, or `process::exit` strands `WriteOverlay::drop`.
     #[test]
@@ -9243,6 +9452,72 @@ mod lower_marker_key_tests {
             .unwrap();
         let digest = ratarmount_index::cached_archive_digest(&archive, Some(&index)).unwrap();
         (archive, index, digest)
+    }
+
+    /// Regression: lower-bundle identity peeks must preserve prepared WAL companions.
+    #[test]
+    fn regression_prepared_index_lower_key_peek_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (archive, index, digest) = cached_archive(dir.path(), "a.tar", b"archive");
+        let bundle = dir.path().join("lower.tar.zst");
+        std::fs::write(&bundle, b"bundle").unwrap();
+        let db = rusqlite::Connection::open(&index).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(db);
+        let wal = PathBuf::from(format!("{}-wal", index.display()));
+        let shm = PathBuf::from(format!("{}-shm", index.display()));
+        std::fs::write(&wal, b"").unwrap();
+        std::fs::write(&shm, vec![0x5a; 32768]).unwrap();
+        let snapshot = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| {
+                    let p = e.unwrap().path();
+                    (
+                        p.file_name().unwrap().to_owned(),
+                        std::fs::read(&p).unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        let reader = ratarmount_index::open_prepared_connection(&index).unwrap();
+        let key = || {
+            lower_base_key_for_open(
+                std::slice::from_ref(&archive),
+                Some(&index),
+                std::slice::from_ref(&bundle),
+                "view",
+                true,
+            )
+        };
+        assert_eq!(key().unwrap(), Some(format!("{digest}.view")));
+        assert_eq!(snapshot(), before);
+        drop(reader);
+        assert_eq!(snapshot(), before);
+        std::fs::write(&wal, b"pending WAL").unwrap();
+        let bad = snapshot();
+        assert!(key().unwrap_err().contains("prepar"));
+        assert_eq!(snapshot(), bad);
+        assert_eq!(
+            lower_base_key_for_open(
+                std::slice::from_ref(&archive),
+                None,
+                std::slice::from_ref(&bundle),
+                "view",
+                true
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(snapshot(), bad);
+        std::fs::remove_file(&wal).unwrap();
+        std::fs::remove_file(&shm).unwrap();
+        let db = rusqlite::Connection::open(&index).unwrap();
+        db.execute_batch("DROP TABLE overlay_base_digests").unwrap();
+        drop(db);
+        assert_eq!(key().unwrap(), None);
     }
 
     /// Regression: `A.tar B --lower bundle` keyed the verification marker by A's

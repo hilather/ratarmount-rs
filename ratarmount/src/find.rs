@@ -13,8 +13,8 @@ use std::sync::{Arc, Weak};
 use ratarmount_compositing::{live_search_tsv, WriteOverlay};
 use ratarmount_core::{CheapSearchHit, MountSource, OpenOptions};
 use ratarmount_index::{
-    fill_content_hashes, resolve_index_location, SearchHit, SearchQuery, SqliteIndex,
-    DEFAULT_SEARCH_LIMIT, MEMORY_INDEX,
+    fill_content_hashes, resolve_index_location, resolve_prepared_index_location, SearchHit,
+    SearchQuery, SqliteIndex, DEFAULT_SEARCH_LIMIT, MEMORY_INDEX,
 };
 use ratarmount_session::{query_index, split_fts_pattern};
 
@@ -64,7 +64,7 @@ pub fn locate_hits(
     loc: &LocateOptions<'_>,
 ) -> Result<Vec<SearchHit>, String> {
     let idx = open_index_for_find(archive, open_opts)?;
-    query_index_cli(&idx, archive, pattern, loc)
+    query_index_cli(&idx, archive, pattern, loc, open_opts.read_only_index)
 }
 
 /// Search an existing sidecar only (control plane / socket). Does not cold-index.
@@ -75,7 +75,7 @@ pub fn search_existing_sidecar(
     loc: &LocateOptions<'_>,
 ) -> Result<Vec<SearchHit>, String> {
     let idx = open_existing_sidecar(archive, open_opts)?;
-    query_index_cli(&idx, archive, pattern, loc)
+    query_index_cli(&idx, archive, pattern, loc, open_opts.read_only_index)
 }
 
 /// Sidecar-only SearchFn (no overlay / SoA). Live mounts use [`live_search_callback`].
@@ -154,13 +154,26 @@ fn query_index_cli(
     archive: &Path,
     pattern: &str,
     loc: &LocateOptions<'_>,
+    read_only_index: bool,
 ) -> Result<Vec<SearchHit>, String> {
     let (fts, pattern) = split_fts_pattern(pattern, loc.fts);
     if !loc.fill_hashes.is_empty() {
+        if read_only_index {
+            return Err(
+                "--no-recreate-index forbids --hashes; prepare hashes before starting workers"
+                    .into(),
+            );
+        }
         fill_content_hashes(idx, archive, loc.fill_hashes).map_err(|e| e.to_string())?;
     }
     if fts {
-        idx.ensure_fts5().map_err(|e| e.to_string())?;
+        if read_only_index {
+            if !idx.has_files_fts().map_err(|e| e.to_string())? {
+                return Err("--no-recreate-index requires prepared FTS; stop workers and prepare FTS before searching".into());
+            }
+        } else {
+            idx.ensure_fts5().map_err(|e| e.to_string())?;
+        }
     }
     let predicates = loc
         .xattrs
@@ -263,7 +276,29 @@ fn reject_memory(open_opts: &OpenOptions) -> Result<(), String> {
     Ok(())
 }
 
+fn open_prepared_sidecar(archive: &Path, open_opts: &OpenOptions) -> Result<SqliteIndex, String> {
+    reject_memory(open_opts)?;
+    let loc = resolve_prepared_index_location(
+        archive,
+        explicit_index_arg(open_opts).as_deref(),
+        &open_opts.index_folders,
+    )
+    .map_err(|e| e.to_string())?;
+    let path = loc.as_path().ok_or_else(memory_index_error)?;
+    let idx = SqliteIndex::open_read_only_for_open(path, open_opts).map_err(|e| e.to_string())?;
+    idx.check_prepared_tarstats(archive)
+        .map_err(|e| e.to_string())?;
+    // Dispatch verifies the selected backend as well as the archive identity.
+    // No strict path may rescue an invalid catalog with a cold build.
+    silence_stdout(|| ratarmount_session::factory::open_path(archive, open_opts, false))
+        .map_err(|e| e.to_string())?;
+    Ok(idx)
+}
+
 fn open_existing_sidecar(archive: &Path, open_opts: &OpenOptions) -> Result<SqliteIndex, String> {
+    if open_opts.read_only_index {
+        return open_prepared_sidecar(archive, open_opts);
+    }
     reject_memory(open_opts)?;
     let loc = resolve_index_location(
         archive,
@@ -281,6 +316,9 @@ fn open_existing_sidecar(archive: &Path, open_opts: &OpenOptions) -> Result<Sqli
 }
 
 fn open_index_for_find(archive: &Path, open_opts: &OpenOptions) -> Result<SqliteIndex, String> {
+    if open_opts.read_only_index {
+        return open_prepared_sidecar(archive, open_opts);
+    }
     reject_memory(open_opts)?;
     if !archive.exists() {
         return Err(format!("not found: {}", archive.display()));
@@ -426,6 +464,71 @@ mod tests {
         write_ustar_members(&mut out, &members).unwrap();
         write_tar_eof(&mut out).unwrap();
         std::fs::write(path, out).unwrap();
+    }
+
+    /// Regression: live FTS search must query prepared state without populating it.
+    #[test]
+    fn regression_prepared_index_live_search_fts_is_immutable() {
+        for prepared_fts in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.tar");
+            write_fits_tar(&archive);
+            let index = dir.path().join("archive.tar.index.sqlite");
+            let mut options = OpenOptions {
+                index_file_path: Some(index.clone()),
+                ..Default::default()
+            };
+            drop(ratarmount_session::factory::open_path(&archive, &options, false).unwrap());
+            if prepared_fts {
+                let db = SqliteIndex::open_writable(&index).unwrap();
+                db.ensure_fts5().unwrap();
+            }
+            SqliteIndex::finalize_prepared(&index).unwrap();
+            options.read_only_index = true;
+            options.write_index = false;
+            let source = ratarmount_session::factory::open_path(&archive, &options, false).unwrap();
+            let overlay = Arc::new(
+                crate::base_identity::fixtures::overlay_over(
+                    source.clone(),
+                    dir.path().join("overlay"),
+                    archive.to_str().unwrap(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            );
+            let snapshot = || {
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter_map(|e| {
+                        let p = e.unwrap().path();
+                        p.is_file().then(|| {
+                            (
+                                p.file_name().unwrap().to_owned(),
+                                std::fs::read(&p).unwrap(),
+                            )
+                        })
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = snapshot();
+            let callback = live_search_callback(
+                source.clone(),
+                Some(overlay.clone()),
+                archive.clone(),
+                options,
+            );
+            let answer = callback("fts:fits");
+            if prepared_fts {
+                assert!(answer.contains("a.fits"), "{answer}");
+            } else {
+                assert!(answer.contains("prepared FTS"), "{answer}");
+            }
+            assert_eq!(snapshot(), before);
+            drop(callback);
+            drop(overlay);
+            drop(source);
+            assert_eq!(snapshot(), before);
+        }
     }
 
     /// Regression: xattr predicates match index bytes and do not treat missing as !=.

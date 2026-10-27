@@ -4,6 +4,7 @@ use process::{MountState, Mounter};
 use protocol::{ApiError, Attempt, Base};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -22,6 +23,7 @@ struct FakeState {
     mounts: BTreeMap<PathBuf, MountState>,
     fail_spawn: Option<usize>,
     spawns: usize,
+    prepares: usize,
     first_poll_spawns: Option<usize>,
     stuck: bool,
     refuse_cleanup: bool,
@@ -35,6 +37,7 @@ struct Fake(Arc<Mutex<FakeState>>);
 
 impl Mounter for Fake {
     fn prepare(&mut self, _: &Base, _: &Path, _: Duration) -> Result<(), ApiError> {
+        self.0.lock().unwrap().prepares += 1;
         Ok(())
     }
     fn spawn(
@@ -769,4 +772,118 @@ fn regression_sandbox_socket_path_reports_platform_limit() {
         .contains(&format!("shorter than {limit} bytes")));
     let nul = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/a\0b"));
     assert!(super::inspection::validate_socket_path(nul).is_err());
+}
+
+/// Regression: strict worker policy is a parsed option before the source separator.
+#[test]
+fn regression_prepared_index_sandbox_worker_argv() {
+    let (root, mut supervisor, _) = setup(8);
+    supervisor.handle(new(1)).unwrap();
+    let base = &Base {
+        name: "task".into(),
+        source: "/fake.tar".into(),
+        options: BaseOptions::default(),
+    };
+    let attempt = supervisor.attempts.values().next().unwrap();
+    let args = process::mount_args(base, root.path(), attempt, None, &[]);
+    let policy = args
+        .iter()
+        .position(|a| a == "--no-recreate-index")
+        .unwrap();
+    assert!(policy < args.iter().position(|a| a == "--").unwrap());
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(args)).unwrap();
+    assert!(parsed.no_recreate_index);
+    assert!(!parsed.commit_overlay && !parsed.commit_overlay_on_exit);
+    assert_eq!(parsed.commit_overlay_interval, "0");
+    let prepare = process::base_args(base, root.path()).into_iter().chain([
+        OsString::from("--no-mount"),
+        OsString::from("--"),
+        OsString::from(&base.source),
+    ]);
+    let parsed =
+        crate::parse_args_from(std::iter::once(OsString::from("ratarmount")).chain(prepare))
+            .unwrap();
+    assert!(parsed.no_mount);
+    assert!(!parsed.no_recreate_index);
+    assert!(parsed.write_overlay.is_none());
+}
+
+/// Regression: a registered base is prepared once across worker batches and reloads.
+#[test]
+fn regression_prepared_index_sandbox_prepares_once_across_batches() {
+    let (root, mut supervisor, fake) = setup(8);
+    assert_eq!(fake.0.lock().unwrap().prepares, 1);
+    for _ in 0..2 {
+        supervisor.handle(new(3)).unwrap();
+        supervisor.destroy_all().unwrap();
+    }
+    drop(supervisor);
+    let mut supervisor =
+        Supervisor::open(root.path(), 8, Duration::from_secs(1), fake.clone()).unwrap();
+    supervisor.handle(new(3)).unwrap();
+    supervisor.destroy_all().unwrap();
+    assert_eq!(fake.0.lock().unwrap().prepares, 1);
+}
+
+/// Regression: API diff must refuse an invalid selected index without repairing it.
+#[test]
+fn regression_prepared_index_sandbox_diff_refuses_invalid_cache() {
+    use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
+    let root = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let base = root.path().join("base.tar");
+    let mut file = fs::File::create(&base).unwrap();
+    write_ustar_members(
+        &mut file,
+        &[UstarMember {
+            path: "f",
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            xattrs: &[],
+            payload: UstarPayload::File { bytes: b"original" },
+        }],
+    )
+    .unwrap();
+    write_tar_eof(&mut file).unwrap();
+    drop(file);
+    let mut supervisor =
+        Supervisor::open(root.path(), 8, Duration::from_secs(1), Fake::default()).unwrap();
+    supervisor
+        .handle(Operation::CreateBase {
+            name: "task".into(),
+            source: base.to_string_lossy().into(),
+            options: BaseOptions::default(),
+        })
+        .unwrap();
+    let cache = root.path().join("indexes/task");
+    let opts = ratarmount_core::OpenOptions {
+        index_folders: vec![cache.clone()],
+        ..Default::default()
+    };
+    drop(ratarmount_session::factory::open_path(&base, &opts, false).unwrap());
+    let index = fs::read_dir(&cache)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "sqlite"))
+        .unwrap();
+    fs::write(&index, b"invalid prepared catalog").unwrap();
+    let before = fs::read(&index).unwrap();
+    supervisor.handle(new(1)).unwrap();
+    let id = supervisor.attempts.keys().next().unwrap().clone();
+    let error = supervisor
+        .handle(Operation::Diff { id, git: true })
+        .unwrap_err();
+    assert_eq!(error.code, "base_open_failed", "{}", error.message);
+    assert!(
+        error.message.contains("index") || error.message.contains("prepar"),
+        "{}",
+        error.message
+    );
+    assert_eq!(fs::read(index).unwrap(), before);
+    supervisor.destroy_all().unwrap();
 }
