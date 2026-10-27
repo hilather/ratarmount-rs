@@ -27,7 +27,7 @@ use ratarmount_compress::commit_journal::{
 };
 use rusqlite::Connection;
 
-use crate::write_overlay::{DbEntry, OverlayError};
+use crate::write_overlay::{DbEntry, OverlayError, Result};
 
 use crate::overlay_gate::{kind_only, Recorded};
 use crate::overlay_meta::OverlayMeta;
@@ -1149,7 +1149,16 @@ pub(crate) fn replace_committing(
     suffix: &mut fs::File,
     original: &fs::Metadata,
     rows: &Rows<'_>,
+    before_write: &mut dyn FnMut() -> Result<()>,
 ) -> std::result::Result<(), FailedReplace> {
+    let mut refusal = None;
+    let mut checked_write = || {
+        before_write().map_err(|error| {
+            let message = error.to_string();
+            refusal = Some(error);
+            io::Error::other(message)
+        })
+    };
     #[expect(
         clippy::disallowed_methods,
         reason = "The compositing replacement wrapper supplies the checked base and commit restamp hook"
@@ -1159,8 +1168,17 @@ pub(crate) fn replace_committing(
         offset,
         suffix,
         original,
+        &mut checked_write,
         &mut rows.commit_hook(archive),
     );
+    if let Some(error) = refusal {
+        return Err(FailedReplace {
+            error,
+            may_copy: false,
+            rolled_back: None,
+            base_unusable: false,
+        });
+    }
     replaced.map_err(failed_replace)
 }
 
@@ -1171,10 +1189,19 @@ pub(crate) fn splice_append_committing<F>(
     transform: F,
     original: &fs::Metadata,
     rows: &Rows<'_>,
+    before_write: &mut dyn FnMut() -> Result<()>,
 ) -> std::result::Result<ratarmount_compress::SpliceStats, FailedReplace>
 where
     F: FnOnce(&mut dyn ratarmount_compress::SeekRead, u64, &mut dyn io::Write) -> io::Result<()>,
 {
+    let mut refusal = None;
+    let mut checked_write = || {
+        before_write().map_err(|error| {
+            let message = error.to_string();
+            refusal = Some(error);
+            io::Error::other(message)
+        })
+    };
     #[expect(
         clippy::disallowed_methods,
         reason = "The compositing append wrapper supplies the checked base and commit restamp hook"
@@ -1184,8 +1211,17 @@ where
         from_idx,
         transform,
         original,
+        &mut checked_write,
         &mut rows.commit_hook(archive),
     );
+    if let Some(error) = refusal {
+        return Err(FailedReplace {
+            error,
+            may_copy: false,
+            rolled_back: None,
+            base_unusable: false,
+        });
+    }
     appended.map_err(failed_splice)
 }
 
@@ -1227,18 +1263,28 @@ pub(crate) fn recheck_copy_source(
 
 /// Publish a copy over `archive` only while it is still exactly the file the
 /// copy was read from (`source`) and no journal is pending on it, under its
-/// lock (held until `publish` returned).
+/// lock (held until `publish` returned). A before-write refusal retains its
+/// original error and is terminal, including in Auto mode.
 pub(crate) fn publish_over(
     archive: &Path,
     source: &fs::Metadata,
     publish: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
+    before_write: &mut dyn FnMut() -> Result<()>,
+) -> std::result::Result<(), FailedReplace> {
     #[expect(
         clippy::disallowed_methods,
         reason = "The compositing publisher holds the checked-source guard across the publication callback"
     )]
     let _guard = commit_journal::guard_copy(archive, source)?;
-    publish()
+    if let Err(error) = before_write() {
+        return Err(FailedReplace {
+            error,
+            may_copy: false,
+            rolled_back: None,
+            base_unusable: false,
+        });
+    }
+    publish().map_err(FailedReplace::from)
 }
 
 /// The zstd copy splice, read only from a file still exactly the stamp `from`
@@ -1249,10 +1295,19 @@ pub(crate) fn splice_replace_over<F>(
     transform: F,
     original: &fs::Metadata,
     from: &CopyFrom,
+    before_write: &mut dyn FnMut() -> Result<()>,
 ) -> std::result::Result<ratarmount_compress::SpliceStats, OverlayError>
 where
     F: FnOnce(&mut dyn ratarmount_compress::SeekRead, u64, &mut dyn io::Write) -> io::Result<()>,
 {
+    let mut refusal = None;
+    let mut checked_write = || {
+        before_write().map_err(|error| {
+            let message = error.to_string();
+            refusal = Some(error);
+            io::Error::other(message)
+        })
+    };
     #[expect(
         clippy::disallowed_methods,
         reason = "The compositing copy-splice wrapper provides the previously accepted source stamp"
@@ -1262,7 +1317,11 @@ where
         from_idx,
         transform,
         from.reference(original),
+        &mut checked_write,
     );
+    if let Some(error) = refusal {
+        return Err(error);
+    }
     replaced.map_err(|e| OverlayError::Msg(e.to_string()))
 }
 
@@ -1270,6 +1329,147 @@ where
 mod tests {
     use super::*;
     use std::rc::Rc;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_archive_locked(archive: &Path) {
+        use std::os::fd::AsRawFd;
+        let competitor = fs::File::open(archive).unwrap();
+        let result = unsafe { libc::flock(competitor.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(
+            result, -1,
+            "before-write guard must run under the archive lock"
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EWOULDBLOCK)
+        );
+    }
+
+    /// Regression: #238 ordinary copy publication checks sealing under the
+    /// archive lock and refuses before publishing any bytes.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn regression_238_publish_guard_runs_under_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("base.tar");
+        fs::write(&archive, b"before").unwrap();
+        let source = fs::metadata(&archive).unwrap();
+        let published = Cell::new(false);
+        let error = publish_over(
+            &archive,
+            &source,
+            || {
+                published.set(true);
+                fs::write(&archive, b"after")
+            },
+            &mut || {
+                assert_archive_locked(&archive);
+                Err(OverlayError::Msg("sealed refusal".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(!error.may_copy);
+        assert!(
+            matches!(error.error, OverlayError::Msg(ref message) if message == "sealed refusal")
+        );
+        assert!(!published.get());
+        assert_eq!(fs::read(&archive).unwrap(), b"before");
+        assert!(!commit_journal::journal_path(&archive).exists());
+    }
+
+    /// Regression: #238 a prewrite refusal stays the original overlay error
+    /// and cannot trigger Auto mode's copy fallback.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn regression_238_replace_guard_refusal_is_terminal() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("base.tar");
+        fs::write(&archive, b"before").unwrap();
+        let original = fs::metadata(&archive).unwrap();
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(b"after").unwrap();
+        let failed = replace_committing(
+            &archive,
+            0,
+            &mut suffix,
+            &original,
+            &Rows::None,
+            &mut || {
+                assert_archive_locked(&archive);
+                Err(OverlayError::Msg("sealed refusal".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(failed.error, OverlayError::Msg(ref message) if message == "sealed refusal")
+        );
+        assert!(
+            !failed.may_copy,
+            "Auto must not fall back after a guard refusal"
+        );
+        assert!(!failed.base_unusable);
+        assert!(failed.rolled_back.is_none());
+        assert_eq!(fs::read(&archive).unwrap(), b"before");
+        assert!(!commit_journal::journal_path(&archive).exists());
+        assert!(commit_journal::pending(&archive).unwrap().is_none());
+    }
+
+    /// Regression: #238 both zstd persistence wrappers preserve the sealed
+    /// refusal, and an append refusal cannot trigger Auto's copy fallback.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn regression_238_splice_guard_refusal_is_terminal() {
+        for append in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let archive = tmp.path().join("base.tar.zst");
+            let mut before = ratarmount_compress::encode_zstd_frame(b"before", 3).unwrap();
+            before.extend(ratarmount_compress::build_seek_table_skippable(&[(
+                before.len() as u32,
+                6,
+            )]));
+            fs::write(&archive, &before).unwrap();
+            let original = fs::metadata(&archive).unwrap();
+            let mut guard = || {
+                assert_archive_locked(&archive);
+                Err(OverlayError::Msg("sealed refusal".into()))
+            };
+            let transform =
+                |_source: &mut dyn ratarmount_compress::SeekRead,
+                 _offset: u64,
+                 dest: &mut dyn io::Write| dest.write_all(b"after");
+            let error = if append {
+                let failed = splice_append_committing(
+                    &archive,
+                    0,
+                    transform,
+                    &original,
+                    &Rows::None,
+                    &mut guard,
+                )
+                .unwrap_err();
+                assert!(
+                    !failed.may_copy,
+                    "Auto must not fall back after a guard refusal"
+                );
+                failed.error
+            } else {
+                splice_replace_over(
+                    &archive,
+                    0,
+                    transform,
+                    &original,
+                    &CopyFrom::Gate,
+                    &mut guard,
+                )
+                .unwrap_err()
+            };
+            assert!(matches!(error, OverlayError::Msg(ref message) if message == "sealed refusal"));
+            assert_eq!(fs::read(&archive).unwrap(), before);
+            assert!(!commit_journal::journal_path(&archive).exists());
+            assert!(commit_journal::pending(&archive).unwrap().is_none());
+        }
+    }
 
     struct BeforeOpenGuard(Option<Box<dyn FnOnce()>>);
     impl Drop for BeforeOpenGuard {

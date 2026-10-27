@@ -1308,7 +1308,7 @@ fn regression_134_recompress_replace_bare_name_stages_beside_dest() {
             // The replace is gated on the stamp of an existing `dest`.
             fs::write(dest, b"old").unwrap();
             let source = fs::metadata(dest).unwrap();
-            recompress_replace(&plain, Path::new(dest), fmt, &source)
+            recompress_replace(&plain, Path::new(dest), fmt, &source, &mut || Ok(()))
                 .unwrap_or_else(|e| panic!("{dest}: {e}"));
             assert!(fs::metadata(dest).unwrap().len() > 0);
         }
@@ -5494,6 +5494,7 @@ fn regression_provenance_manifest_without_xattrs() {
         Some(&mut hashes),
         &crate::journal_recovery::Rows::None,
         &fs::metadata(&archive).unwrap(),
+        &mut || Ok(()),
     )
     .unwrap();
     let expected = ratarmount_index::sha256_hex_stream(&mut &b"new payload"[..]).unwrap();

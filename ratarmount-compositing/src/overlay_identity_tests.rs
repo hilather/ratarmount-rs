@@ -3121,6 +3121,7 @@ fn regression_commit_gate_judges_and_returns_one_snapshot() {
         512,
         &mut suffix,
         &snapshot,
+        &mut || Ok(()),
         &mut |_| Ok(()),
     );
     assert!(

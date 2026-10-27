@@ -22,8 +22,14 @@ fn append_journal_write_error_rolls_back_immediately() {
             Ok(())
         }
     });
-    let result =
-        replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+    let result = replace_suffix_if_unchanged_with(
+        &path,
+        7,
+        &mut suffix,
+        &original,
+        &mut || Ok(()),
+        &mut |_| Ok(()),
+    );
     fault::clear();
     assert!(
         matches!(result, Err(ReplaceError::RolledBack(..))),
@@ -98,8 +104,14 @@ fn append_journal_completed_cleanup_error_is_success() {
                 Ok(())
             }
         });
-        let result =
-            replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+        let result = replace_suffix_if_unchanged_with(
+            &path,
+            7,
+            &mut suffix,
+            &original,
+            &mut || Ok(()),
+            &mut |_| Ok(()),
+        );
         fault::clear();
         result.unwrap_or_else(|e| panic!("{stop}: {e:?}"));
         assert_eq!(fs::read(&path).unwrap(), b"prefix:new contents");
@@ -153,8 +165,14 @@ fn append_journal_done_locator_without_journal_names_the_escape() {
     let original = fs::metadata(&path).unwrap();
     let mut suffix = tempfile::tempfile().unwrap();
     suffix.write_all(b"more").unwrap();
-    let refused =
-        replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+    let refused = replace_suffix_if_unchanged_with(
+        &path,
+        7,
+        &mut suffix,
+        &original,
+        &mut || Ok(()),
+        &mut |_| Ok(()),
+    );
     let Err(ReplaceError::Refused(e)) = refused else {
         panic!("{refused:?}");
     };
@@ -170,8 +188,14 @@ fn append_journal_done_locator_without_journal_names_the_escape() {
     interrupted(&path, "locator active");
     assert!(journal_path(&path).exists());
     let original = fs::metadata(&path).unwrap();
-    let refused =
-        replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+    let refused = replace_suffix_if_unchanged_with(
+        &path,
+        7,
+        &mut suffix,
+        &original,
+        &mut || Ok(()),
+        &mut |_| Ok(()),
+    );
     let Err(ReplaceError::Refused(e)) = refused else {
         panic!("{refused:?}");
     };
@@ -337,8 +361,14 @@ fn append_journal_rolled_back_reports_the_locked_stamp() {
             }
             Ok(())
         });
-        let result =
-            replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+        let result = replace_suffix_if_unchanged_with(
+            &path,
+            7,
+            &mut suffix,
+            &original,
+            &mut || Ok(()),
+            &mut |_| Ok(()),
+        );
         fault::clear();
         let Err(ReplaceError::RolledBack(_, Some(stamp))) = result else {
             panic!("{step}: {result:?}");
@@ -371,7 +401,15 @@ fn fault_seam_sees_every_replace_step() {
         log.borrow_mut().push(step);
         Ok(())
     });
-    replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(())).unwrap();
+    replace_suffix_if_unchanged_with(
+        &path,
+        7,
+        &mut suffix,
+        &original,
+        &mut || Ok(()),
+        &mut |_| Ok(()),
+    )
+    .unwrap();
     fault::clear();
     assert_eq!(
         *seen.borrow(),
@@ -406,7 +444,14 @@ fn fault_seam_sees_every_replace_step() {
         "rollback mtime" => Err(io::Error::from_raw_os_error(libc::EPERM)),
         _ => Ok(()),
     });
-    let error = replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+    let error = replace_suffix_if_unchanged_with(
+        &path,
+        7,
+        &mut suffix,
+        &original,
+        &mut || Ok(()),
+        &mut |_| Ok(()),
+    );
     fault::clear();
     assert!(
         matches!(error, Err(ReplaceError::RolledBack(..))),
@@ -460,8 +505,14 @@ fn append_journal_stale_preparation_refused() {
     fs::write(&path, b"another commit").unwrap();
     let mut suffix = tempfile::tempfile().unwrap();
     suffix.write_all(b"stale").unwrap();
-    let result =
-        replace_suffix_if_unchanged_with(&path, 0, &mut suffix, &original, &mut |_| Ok(()));
+    let result = replace_suffix_if_unchanged_with(
+        &path,
+        0,
+        &mut suffix,
+        &original,
+        &mut || Ok(()),
+        &mut |_| Ok(()),
+    );
     assert!(
         matches!(result, Err(ReplaceError::Refused(_))),
         "{result:?}"
@@ -606,10 +657,17 @@ fn append_journal_before_unlink_error_keeps_journal_and_marker() {
     let mut suffix = tempfile::tempfile().unwrap();
     suffix.write_all(b"new contents").unwrap();
     let mut stamps = Vec::new();
-    let error = replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |a| {
-        stamps.push(*a);
-        Err(io::Error::other("rows busy"))
-    })
+    let error = replace_suffix_if_unchanged_with(
+        &path,
+        7,
+        &mut suffix,
+        &original,
+        &mut || Ok(()),
+        &mut |a| {
+            stamps.push(*a);
+            Err(io::Error::other("rows busy"))
+        },
+    )
     .unwrap_err();
     assert!(matches!(error, ReplaceError::Committed(_)), "{error:?}");
     // The hook ran for the replacement and again for its cleanup.
@@ -921,10 +979,17 @@ fn append_journal_unpublished_attempt_never_adopts_a_sibling_journal() {
         Ok(())
     });
     let mut hooks = 0;
-    let result = replace_suffix_if_unchanged_with(&a, 7, &mut suffix, &original, &mut |_| {
-        hooks += 1;
-        Ok(())
-    });
+    let result = replace_suffix_if_unchanged_with(
+        &a,
+        7,
+        &mut suffix,
+        &original,
+        &mut || Ok(()),
+        &mut |_| {
+            hooks += 1;
+            Ok(())
+        },
+    );
     fault::clear();
     assert!(
         matches!(result, Err(ReplaceError::RolledBack(..))),
@@ -960,11 +1025,17 @@ fn append_journal_commit_cleanup_retries_then_stays_committed() {
             }
         });
         let mut hooks = 0;
-        let result =
-            replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| {
+        let result = replace_suffix_if_unchanged_with(
+            &path,
+            7,
+            &mut suffix,
+            &original,
+            &mut || Ok(()),
+            &mut |_| {
                 hooks += 1;
                 Ok(())
-            });
+            },
+        );
         fault::clear();
         (dir, path, result, hooks)
     };
@@ -1156,8 +1227,14 @@ fn append_journal_published_journal_replaced_at_the_path_is_unresolved() {
         }
         Ok(())
     });
-    let result =
-        replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| Ok(()));
+    let result = replace_suffix_if_unchanged_with(
+        &path,
+        7,
+        &mut suffix,
+        &original,
+        &mut || Ok(()),
+        &mut |_| Ok(()),
+    );
     fault::clear();
     let error = result.unwrap_err();
     assert!(matches!(error, ReplaceError::Pending(_)), "{error:?}");
@@ -1328,11 +1405,17 @@ fn append_journal_failed_attempt_table() {
             }
         });
         let mut count = 0;
-        let result =
-            replace_suffix_if_unchanged_with(&path, 7, &mut suffix, &original, &mut |_| {
+        let result = replace_suffix_if_unchanged_with(
+            &path,
+            7,
+            &mut suffix,
+            &original,
+            &mut || Ok(()),
+            &mut |_| {
                 count += 1;
                 Ok(())
-            });
+            },
+        );
         fault::clear();
         let got = match result {
             Ok(()) => V::Ok,
@@ -1352,4 +1435,48 @@ fn append_journal_failed_attempt_table() {
             assert_eq!(marker_state(&path), None);
         }
     }
+}
+
+/// Regression: #238 checks refusal under the archive lock before bytes,
+/// locator, or journal can change after confirmation.
+#[test]
+fn regression_238_prewrite_guard_runs_under_lock() {
+    use std::os::fd::AsRawFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive");
+    let before = b"prefix:old contents";
+    fs::write(&path, before).unwrap();
+    let original = fs::metadata(&path).unwrap();
+    let competing = File::open(&path).unwrap();
+    let locator = marker_state(&path);
+    let mut suffix = tempfile::tempfile().unwrap();
+    suffix.write_all(b"changed contents").unwrap();
+    let mut called = false;
+    let result = replace_suffix_if_unchanged_with(
+        &path,
+        7,
+        &mut suffix,
+        &original,
+        &mut || {
+            called = true;
+            assert_eq!(
+                unsafe { libc::flock(competing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                -1,
+                "prewrite guard must run while the archive is locked"
+            );
+            assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+            Err(io::Error::other("sealed guard refusal"))
+        },
+        &mut |_| panic!("refused commit cannot restamp its base"),
+    );
+    assert!(called, "prewrite guard was skipped");
+    assert!(
+        matches!(result, Err(ReplaceError::Refused(ref e)) if e.to_string() == "sealed guard refusal"),
+        "{result:?}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(marker_state(&path), locator);
+    assert!(!journal_path(&path).exists());
+    assert!(same_stamp(&original, &fs::metadata(&path).unwrap()));
 }

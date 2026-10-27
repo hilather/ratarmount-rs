@@ -1799,6 +1799,13 @@ fn main() {
                 std::process::exit(2);
             }
         };
+        if has_db {
+            // Refuse sealed layers before creating or initializing a base (#238).
+            if let Err(e) = ratarmount_compositing::ensure_overlay_unsealed(overlay) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         if !has_db {
             // No recorded base to compare, but a journal started for another
             // file (a copy of the interrupted bytes) must not be rolled in.
