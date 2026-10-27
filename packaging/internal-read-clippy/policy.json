@@ -200,7 +200,7 @@
       "file": "ratarmount-compress/src/fastcopy.rs",
       "reviewer": "#201 implementation review",
       "provenance": "584311c1 target alternatives reviewed during N4 migration",
-      "reason": "Reviewed Linux copy_file_range with io copy fallback and macOS clonefile temporary allocation; three original macOS-only baseline sites retain individual metadata."
+      "reason": "Reviewed Linux copy_file_range with io copy fallback and macOS clonefile temporary allocation; three original macOS-only baseline sites retain individual metadata. Unix archive metadata restoration uses the accepted source stamp and the finished staging fd; non-Unix preserves the existing no-op behavior."
     },
     {
       "file": "ratarmount-compress/src/repack_seekable.rs",

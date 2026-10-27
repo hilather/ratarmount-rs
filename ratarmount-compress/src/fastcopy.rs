@@ -182,6 +182,57 @@ fn copy_io(src: &mut File, src_off: u64, dst: &mut File, dst_off: u64, len: u64)
     Ok(())
 }
 
+/// Restore an accepted regular archive's ownership and permission bits on the
+/// finished staging fd, before its final sync and guarded publication. A final
+/// symlink supplies no metadata; publication retains its existing checks.
+pub fn preserve_archive_metadata(
+    path: &Path,
+    source: &std::fs::Metadata,
+    temp: &File,
+) -> crate::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let named = std::fs::symlink_metadata(path)?;
+        if !named.is_file() || named.dev() != source.dev() || named.ino() != source.ino() {
+            return Ok(());
+        }
+        let fd = temp.as_raw_fd();
+        let root = unsafe { libc::geteuid() } == 0;
+        for (step, uid, gid) in [
+            ("archive metadata owner", source.uid(), !0 as libc::gid_t),
+            ("archive metadata group", !0 as libc::uid_t, source.gid()),
+        ] {
+            let changed = crate::commit_journal::fault::instead(step, || {
+                if unsafe { libc::fchown(fd, uid, gid) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+            if let Err(error) = changed {
+                if root {
+                    return Err(crate::CompressError::ArchiveMetadata(error));
+                }
+                log::debug!("commit: could not restore {step}: {error}");
+            }
+        }
+        crate::commit_journal::fault::instead("archive metadata mode", || {
+            if unsafe { libc::fchmod(fd, (source.mode() & 0o777) as libc::mode_t) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
+        .map_err(crate::CompressError::ArchiveMetadata)?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, source, temp);
+    Ok(())
+}
+
 /// Whole-file copy to a sibling temporary file. macOS cloning creates a new
 /// pathname, so it is attempted here, never for a partial range or an open fd.
 pub fn copy_to_temp(
@@ -239,6 +290,10 @@ pub fn log_commit_copy(len: u64, method: CopyMethod) {
         len as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 }
+
+#[cfg(all(test, unix))]
+#[path = "fastcopy_metadata_tests.rs"]
+mod metadata_tests;
 
 #[cfg(test)]
 mod tests {

@@ -20,6 +20,28 @@ use crate::{CompressError, Result};
 /// Fixed encode level: original frame parameters are unrecoverable (design).
 const SPLICE_ENCODE_LEVEL: i32 = 3;
 
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    static SEEK_TABLE_SIZE_LIMIT: std::cell::Cell<u64> = const { std::cell::Cell::new(u32::MAX as u64) };
+}
+
+/// Restore the previous per-thread seek-table size limit when dropped.
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct SeekTableLimitGuard(u64);
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for SeekTableLimitGuard {
+    fn drop(&mut self) {
+        SEEK_TABLE_SIZE_LIMIT.with(|limit| limit.set(self.0));
+    }
+}
+
+/// Exercise the oversized-frame publication route with a small fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn zstd_splice_seek_table_limit_for_test(limit: u64) -> SeekTableLimitGuard {
+    SeekTableLimitGuard(SEEK_TABLE_SIZE_LIMIT.with(|slot| slot.replace(limit)))
+}
+
 /// Bytes copied / written by [`splice_zstd_last_frames`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpliceStats {
@@ -147,7 +169,7 @@ where
         .unwrap_or(Path::new("."));
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-B0277-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-B0277-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
     )]
     let mut tmp = NamedTempFile::new_in(parent)?;
     crate::commit_journal::fault::point("copy source open")?;
@@ -179,6 +201,7 @@ where
     let method = crate::fastcopy::copy_range(&mut src, 0, tmp.as_file_mut(), 0, prefix)?;
     crate::fastcopy::log_commit_copy(prefix, method);
     let stats = write_zstd_splice_suffix(&mut src, &map, from_idx, transform, tmp.as_file_mut())?;
+    crate::fastcopy::preserve_archive_metadata(path, &source, tmp.as_file())?;
     tmp.as_file().sync_all()?;
     #[expect(
         clippy::disallowed_methods,
@@ -264,7 +287,7 @@ where
         // no-size-refusal rule: publish the staged suffix through copy/rename.
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0281-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-B0281-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
         )]
         let mut tmp = NamedTempFile::new_in(parent)?;
         let method = crate::fastcopy::copy_range(
@@ -277,6 +300,7 @@ where
         crate::fastcopy::log_commit_copy(stats.prefix_compressed_bytes, method);
         tail.as_file_mut().rewind()?;
         io::copy(tail.as_file_mut(), tmp.as_file_mut())?;
+        crate::fastcopy::preserve_archive_metadata(path, &source, tmp.as_file())?;
         tmp.as_file().sync_all()?;
         // Published only over the file the copy was read from, unchanged and
         // with no journal pending, under its lock.
@@ -330,6 +354,10 @@ fn maybe_rebuild_seek_table(
     new_plain: u64,
 ) -> Option<Vec<u8>> {
     map.seek_table.as_ref()?;
+    #[cfg(any(test, feature = "test-hooks"))]
+    if SEEK_TABLE_SIZE_LIMIT.with(|limit| new_comp > limit.get() || new_plain > limit.get()) {
+        return None;
+    }
     let mut entries = Vec::with_capacity(from_idx.saturating_add(1));
     for (i, f) in map.frames[..from_idx].iter().enumerate() {
         // cSize from offset deltas so skippable gaps in the copied prefix stay consistent.
