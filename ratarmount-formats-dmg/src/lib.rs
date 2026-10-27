@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! UDIF DMG block reader (inner FAT/ISO/exFAT/NTFS; HFS+/APFS residual).
 //!
 //! Parses the 512-byte `koly` trailer, XML `blkx` / `mish` maps, and reconstructs
@@ -58,6 +61,10 @@ pub struct DmgMountSource {
 impl DmgMountSource {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0304-M01","item":"<ratarmount_formats_dmg::DmgMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(path)?;
         if udif::looks_like_encrypted_reader(&mut file) {
             return Err(encrypted_residual(path));
@@ -68,6 +75,10 @@ impl DmgMountSource {
                 path.display()
             )));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0305-M01","item":"<ratarmount_formats_dmg::DmgMountSource>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = File::open(path)?;
         Self::from_reader(file, path.to_path_buf())
     }
@@ -307,6 +318,10 @@ fn try_open_inner_fs(disk: DmgDisk, label: &Path) -> Result<Arc<dyn MountSource>
 /// Detect UDIF via a parseable `koly` trailer at EOF. No `.dmg` extension fallback
 /// (raw HFS+ files named `*.dmg` must not be claimed).
 pub fn looks_like_dmg(path: &Path) -> bool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0306-M01","item":"ratarmount_formats_dmg::looks_like_dmg","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(_) => return false,

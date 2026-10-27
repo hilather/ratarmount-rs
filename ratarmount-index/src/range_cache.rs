@@ -6,6 +6,10 @@
 //! exceed the cap. Private directories and no-follow opens protect cache paths.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0080-T01","item":"ratarmount_index::range_cache","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for the range cache no-follow input/output helpers.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+)]
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -259,12 +263,20 @@ impl RangeCache {
     fn open(&self, path: &Path, expected: u64) -> Option<File> {
         check_private_dir(&self.root).ok()?;
         check_cache_dirs(&self.dir, path.parent()?).ok()?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0463-M01","item":"<ratarmount_index::range_cache::RangeCache>::open","disposition":"residual","reason":"range-cache completion owner, header or recency read; needs broader lifecycle work","family":"range-cache","issue":"#196","category":"range-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = open_regular(path).ok()?;
         (file.metadata().ok()?.len() == expected).then_some(file)
     }
 
     fn header(&self, path: &Path) -> Option<Arc<RangeHeader>> {
         let hdr_path = header_path(path);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0464-M01","item":"<ratarmount_index::range_cache::RangeCache>::header","disposition":"residual","reason":"range-cache completion owner, header or recency read; needs broader lifecycle work","family":"range-cache","issue":"#196","category":"range-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = open_regular(&hdr_path).ok()?;
         let stamp = file_stamp(&file).ok()?;
         if let Some((_, header)) = self
@@ -671,6 +683,14 @@ pub(crate) fn check_private_dir(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0081-M01","item":"ratarmount_index::range_cache::ensure_private_dir","disposition":"support","category":"creation-builder","reason":"Construct the builder used to create a private recursive cache directory.","creation":{"policy":"none","basis":"This is setup; the create event separately owns recursive mode-0700 directory creation."}}"###
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = r###"internal-read:v1 {"id":"IR-E0081-T01","item":"ratarmount_index::range_cache::ensure_private_dir","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the builder used to create a private recursive cache directory.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+    )]
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -678,6 +698,10 @@ pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0082-M01","item":"ratarmount_index::range_cache::ensure_private_dir","disposition":"output-owner","category":"range-cache-directory","reason":"Create the range cache directory tree and validate its owner/private permissions.","creation":{"policy":"private-recursive-directory","basis":"The builder requests 0700 on Unix, check_private_dir validates ownership/mode, and permissions are reset to 0700 afterward."}}"###
+    )]
     builder.create(path)?;
     check_private_dir(path)?;
     #[cfg(unix)]
@@ -702,6 +726,14 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(io::Error::other("cache entry is not a regular file"));
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0465-M01","item":"ratarmount_index::range_cache::open_regular","disposition":"support","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","family":"range-cache","issue":"#196","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"residual","baseline_reason":"range-cache completion owner / persisted original open helper"}"###
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = r###"internal-read:v1 {"id":"IR-B0465-T01","item":"ratarmount_index::range_cache::open_regular","disposition":"support","reason":"Builder type support: range-cache completion owner / persisted original open helper","family":"range-cache","issue":"#196","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+    )]
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -709,6 +741,10 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0465-M02","item":"ratarmount_index::range_cache::open_regular","disposition":"residual","reason":"range-cache completion owner / persisted original open helper","family":"range-cache","issue":"#196","mode_policy":"unchanged-from-e6ca64e","category":"range-cache","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("cache entry is not regular"));
@@ -717,7 +753,14 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
 }
 
 pub(crate) fn temporary(dir: &Path) -> io::Result<tempfile::NamedTempFile> {
-    tempfile::Builder::new().prefix(".tmp-").tempfile_in(dir)
+    {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0466-M01","item":"ratarmount_index::range_cache::temporary","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let __inventory_value_0 = tempfile::Builder::new().prefix(".tmp-").tempfile_in(dir);
+        __inventory_value_0
+    }
 }
 
 fn write_header(path: &Path, hdr: &RangeHeader) -> io::Result<()> {
@@ -970,10 +1013,18 @@ impl SharedBudget {
         for (path, hit) in dirty {
             let save = || -> io::Result<()> {
                 check_private_dir(path.parent().unwrap())?;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0467-M01","item":"<ratarmount_index::range_cache::SharedBudget>::flush_recency","disposition":"residual","reason":"range-cache completion owner, header or recency read; needs broader lifecycle work","family":"range-cache","issue":"#196","category":"range-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
                 let mut header: serde_json::Value = serde_json::from_reader(
                     open_regular(&header_path(&path))?.take(MAX_HEADER_BYTES),
                 )?;
-                if open_regular(&path).is_err() {
+                if {
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0468-M01","item":"<ratarmount_index::range_cache::SharedBudget>::flush_recency","disposition":"residual","reason":"range-cache completion owner, header or recency read; needs broader lifecycle work","family":"range-cache","issue":"#196","category":"range-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
+let __inventory_value_0 = open_regular(&path);
+__inventory_value_0
+}.is_err() {
                     return Ok(());
                 }
                 header["last_hit"] = hit.into();
@@ -1062,6 +1113,10 @@ impl SharedBudget {
                     if !is_hex(name.split('.').next().unwrap_or(""), 64) || name.ends_with(".hdr") {
                         continue;
                     }
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0469-M01","item":"<ratarmount_index::range_cache::SharedBudget>::reconcile","disposition":"residual","reason":"range-cache completion owner, header or recency read; needs broader lifecycle work","family":"range-cache","issue":"#196","category":"range-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )]
                     let hit = open_regular(&header_path(&path))
                         .ok()
                         .and_then(|file| {

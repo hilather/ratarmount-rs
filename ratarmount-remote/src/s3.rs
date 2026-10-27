@@ -346,7 +346,14 @@ fn container_auth_headers() -> Vec<(String, String)> {
     if let Some(token) = non_empty_env("AWS_CONTAINER_AUTHORIZATION_TOKEN") {
         out.push(("Authorization".into(), token));
     } else if let Some(path) = non_empty_env("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
-        if let Ok(token) = std::fs::read_to_string(&path) {
+        if let Ok(token) = {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0519-M01","item":"ratarmount_remote::s3::container_auth_headers","disposition":"out-of-family","category":"configuration-or-credentials","reason":"credentials or client configuration file","non_mandatory_callers":["fetch_container_credentials"],"creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = std::fs::read_to_string(&path);
+            __inventory_value_0
+        } {
             let t = token.trim();
             if !t.is_empty() {
                 out.push(("Authorization".into(), t.to_string()));
@@ -1315,6 +1322,10 @@ pub fn put_s3_multipart(
     let ctx = prepare_s3_write(loc);
     // Managed (#151): one reader through every part, retry and the abort;
     // the staged file may be an index open in this process.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0520-M01","item":"ratarmount_remote::s3::put_s3_multipart","disposition":"managed-read","regression":"regression_s3_multipart_reader_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut file = ManagedReadCursor::open(staged)
         .map_err(|e| RemoteError::S3(format!("staged file {}: {e}", staged.display())))?;
     let len = file.len()?;
@@ -1486,6 +1497,10 @@ enum S3Probe {
 }
 
 fn bytes_to_tempfile(bytes: &[u8]) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0521-M01","item":"ratarmount_remote::s3::bytes_to_tempfile","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     tmp.write_all(bytes)?;
     tmp.flush()?;
@@ -1539,6 +1554,10 @@ fn probe_s3_object(loc: &S3Location) -> Result<S3Probe> {
 
 /// Sequential Range materialization into a tempfile.
 fn fetch_s3_via_ranges(loc: &S3Location, size: u64) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0522-M01","item":"ratarmount_remote::s3::fetch_s3_via_ranges","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     if size == 0 {
         tmp.flush()?;
@@ -1600,6 +1619,10 @@ fn fetch_s3_full_get(loc: &S3Location) -> Result<(NamedTempFile, u64)> {
         return Err(s3_status_error(source, status, loc, &body));
     }
     let mut reader = resp.into_reader();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0523-M01","item":"ratarmount_remote::s3::fetch_s3_full_get","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     let n = io::copy(&mut reader, &mut tmp)?;
     tmp.flush()?;

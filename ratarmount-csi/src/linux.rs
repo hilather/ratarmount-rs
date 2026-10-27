@@ -61,10 +61,29 @@ fn stage_dir(parent: &Path) -> io::Result<PathBuf> {
     let mut last = None;
     for _ in 0..16 {
         let dir = parent.join(staging_name());
-        match fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => last = Some(error),
-            Err(error) => return Err(error),
+        {
+            let __inventory_condition_2626 = {
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = r###"internal-read:v1 {"id":"IR-E0034-T01","item":"ratarmount_csi::linux::stage_dir","disposition":"support","category":"builder-type-support","reason":"Builder type support: Construct the mode-aware builder for a fresh CSI socket staging directory.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+                )]
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0034-M01","item":"ratarmount_csi::linux::stage_dir","disposition":"support","category":"creation-builder","reason":"Construct the mode-aware builder for a fresh CSI socket staging directory.","creation":{"policy":"none","basis":"Builder setup only; the distinct create event owns the 0700 directory creation."}}"###
+                )]
+                let mut __inventory_value_0 = fs::DirBuilder::new();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-E0035-M01","item":"ratarmount_csi::linux::stage_dir","disposition":"output-owner","category":"socket-staging-directory","reason":"Create the fresh CSI socket staging directory using its generated collision-retried name.","creation":{"policy":"exclusive-directory","basis":"The builder requests 0700 and retries EEXIST without binding elsewhere; staging cleanup is retained."}}"###
+                )]
+                let __inventory_value_1 = __inventory_value_0.mode(0o700).create(&dir);
+                __inventory_value_1
+            };
+            match __inventory_condition_2626 {
+                Ok(()) => return Ok(dir),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => last = Some(error),
+                Err(error) => return Err(error),
+            }
         }
     }
     Err(last.unwrap_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists)))
@@ -121,10 +140,26 @@ fn bind_staged(dir: &Path, path: &Path, proc_self_fd: &Path) -> io::Result<StdUn
     if staged.as_os_str().as_encoded_bytes().len() <= SUN_PATH_MAX {
         return StdUnixListener::bind(&staged);
     }
-    let handle = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(dir)?;
+    let handle = {
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0289-T01","item":"ratarmount_csi::linux::bind_staged","disposition":"support","category":"builder-type-support","reason":"Builder type support: O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0289-M01","item":"ratarmount_csi::linux::bind_staged","disposition":"support","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"out-of-family","baseline_reason":"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content"}"###
+        )]
+        let mut __inventory_value_0 = fs::OpenOptions::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0289-M02","item":"ratarmount_csi::linux::bind_staged","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY | O_NOFOLLOW handle on the socket staging directory, used only to bind through /proc/self/fd; reads no file content","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_1 = __inventory_value_0
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(dir);
+        __inventory_value_1
+    }?;
     let opened = handle.metadata()?;
     let alias = proc_self_fd.join(handle.as_raw_fd().to_string());
     match fs::metadata(&alias) {
@@ -160,6 +195,10 @@ fn rename_noreplace(staged: &Path, path: &Path) -> io::Result<()> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
     // musl's libc crate bindings may lack renameat2 (musl 1.2.3); call the syscall directly.
     // SAFETY: both pointers are valid NUL-terminated strings for the call.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0036-M01","item":"ratarmount_csi::linux::rename_noreplace","disposition":"out-of-family","category":"socket-publication","reason":"Publish an already-created CSI socket with the renameat2 no-replace syscall.","creation":{"policy":"none","basis":"This syscall renames an existing staged socket with RENAME_NOREPLACE; it acquires no file descriptor or new inode."}}"###
+    )]
     let rc = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
@@ -241,6 +280,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(args.mount_timeout_seconds),
     ));
     let driver = Driver::open(args.node_id, &args.state_dir, &args.target_root, mounter).await?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-E0037-M01","item":"ratarmount_csi::linux::run","disposition":"output-owner","category":"socket-parent-directory","reason":"Create the CSI listening socket parent before staged socket binding.","creation":{"policy":"recursive-directory","basis":"The parent uses existing std directory defaults; fresh staging mode and no-replace publication are separately reviewed."}}"###
+    )]
     std::fs::create_dir_all(path.parent().ok_or("socket has no parent")?)?;
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if !meta.file_type().is_socket() {

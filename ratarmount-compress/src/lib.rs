@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! Compression backends (Phases 3–5 + stream codecs).
 //!
 //! * **gzip** — G3 Tier B seekable checkpoints + Tier C seek-index blob import/export (`gzip_seek`).
@@ -164,6 +167,10 @@ pub enum CompressionFormat {
 
 /// Detect compression from magic bytes, with extension fallback for ambiguous formats.
 pub fn detect_compression(path: &Path) -> Result<CompressionFormat> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0232-M01","item":"ratarmount_compress::detect_compression","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut f = File::open(path)?;
     let mut magic = [0u8; 16];
     let n = f.read(&mut magic)?;
@@ -257,6 +264,10 @@ pub fn detect_compression_extension(path: &Path) -> Option<CompressionFormat> {
 
 /// TAR magic at offset 257: "ustar" or GNU.
 pub fn looks_like_tar(path: &Path) -> Result<bool> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0233-M01","item":"ratarmount_compress::looks_like_tar","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut f = File::open(path)?;
     if f.seek(SeekFrom::Start(257)).is_err() {
         return Ok(false);
@@ -281,6 +292,10 @@ fn materialize_from_reader(
     label: &str,
     path: &Path,
 ) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0234-M01","item":"ratarmount_compress::materialize_from_reader","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     let n = copy(&mut decoder, &mut tmp)?;
     tmp.flush()?;
@@ -297,6 +312,10 @@ fn materialize_from_reader(
 
 /// Decompress gzip into a persistent temp file; returns size.
 pub fn materialize_gzip(path: &Path) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0235-M01","item":"ratarmount_compress::materialize_gzip","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let input = File::open(path)?;
     let decoder = MultiGzDecoder::new(BufReader::new(input));
     materialize_from_reader(decoder, "gzip", path)
@@ -309,6 +328,10 @@ pub fn materialize_gzip(path: &Path) -> Result<(NamedTempFile, u64)> {
 /// which made `--commit-overlay` rewrite only the first TAR and drop later
 /// members.
 pub fn materialize_bzip2(path: &Path) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0236-M01","item":"ratarmount_compress::materialize_bzip2","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let input = File::open(path)?;
     let decoder = MultiBzDecoder::new(BufReader::new(input));
     materialize_from_reader(decoder, "bzip2", path)
@@ -320,6 +343,10 @@ pub fn materialize_bzip2(path: &Path) -> Result<(NamedTempFile, u64)> {
 /// (`cat a.xz b.xz`) are fully decoded. `XzDecoder::new` stops after the
 /// first stream footer, which made `--commit-overlay` drop later TAR members.
 pub fn materialize_xz(path: &Path) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0237-M01","item":"ratarmount_compress::materialize_xz","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let input = File::open(path)?;
     let decoder = XzDecoder::new_multi_decoder(BufReader::new(input));
     materialize_from_reader(decoder, "xz", path)
@@ -352,6 +379,10 @@ pub fn materialize_open(
 
 /// Decompress zstd into a persistent temp file.
 pub fn materialize_zstd(path: &Path) -> Result<(NamedTempFile, u64)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0238-M01","item":"ratarmount_compress::materialize_zstd","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let input = File::open(path)?;
     let decoder = zstd::stream::read::Decoder::new(BufReader::new(input))?;
     materialize_from_reader(decoder, "zstd", path)

@@ -13,30 +13,30 @@
 
 macro_rules! print {
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = write!(std::io::stdout().lock(), $($arg)*);
+        use ::std::io::Write as _;
+        let _ = ::std::write!(::std::io::stdout().lock(), $($arg)*);
     }};
 }
 
 macro_rules! println {
     () => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout().lock());
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stdout().lock());
     }};
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout().lock(), $($arg)*);
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stdout().lock(), $($arg)*);
     }};
 }
 
 macro_rules! eprintln {
     () => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr().lock());
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr().lock());
     }};
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr().lock(), $($arg)*);
     }};
 }
 
@@ -151,5 +151,33 @@ mod tests {
             }
             _ => 6,
         }
+    }
+}
+
+#[cfg(test)]
+mod hygiene_tests {
+    /// Regression: the quiet printers must ignore write/writeln macros defined
+    /// by their caller, for both empty and formatted arms.
+    #[test]
+    fn regression_quiet_print_macro_shadowing() {
+        macro_rules! write {
+            (@mark_used) => {};
+            ($($arg:tt)*) => {
+                compile_error!("quiet print resolved the caller's write macro");
+            };
+        }
+        macro_rules! writeln {
+            (@mark_used) => {};
+            ($($arg:tt)*) => {
+                compile_error!("quiet print resolved the caller's writeln macro");
+            };
+        }
+        write!(@mark_used);
+        writeln!(@mark_used);
+        print!("{}", "");
+        println!();
+        println!("{}", "");
+        eprintln!();
+        eprintln!("{}", "");
     }
 }

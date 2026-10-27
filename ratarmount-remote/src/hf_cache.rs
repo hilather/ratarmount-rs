@@ -1,6 +1,10 @@
 //! Shared huggingface_hub blobs and network-free snapshot mounts.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[expect(
+    clippy::disallowed_types,
+    reason = r###"internal-read:v1 {"id":"IR-E0084-T01","item":"ratarmount_remote::hf_cache","disposition":"support","category":"builder-type-support","reason":"Builder type support: Import OpenOptions for Hub cache admission, publication locking and disk spools.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+)]
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -37,6 +41,10 @@ fn relative(path: &Path) -> bool {
 fn directories(root: &Path, path: &Path, create: bool) -> io::Result<()> {
     let suffix = path.strip_prefix(root).map_err(io::Error::other)?;
     if create {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0085-M01","item":"ratarmount_remote::hf_cache::directories","disposition":"output-owner","category":"hf-cache-directory","reason":"Create the explicitly configured Hub cache root before walking child components.","creation":{"policy":"recursive-directory","basis":"Only the configured root uses create_dir_all; descendants are created and no-follow inspected component by component."}}"###
+        )]
         fs::create_dir_all(root)?;
     }
     let mut current = root.to_path_buf();
@@ -46,10 +54,20 @@ fn directories(root: &Path, path: &Path, create: bool) -> io::Result<()> {
         }
         current.push(part);
         if create {
-            match fs::create_dir(&current) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e),
+            {
+                let __inventory_condition_2766 = {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-E0086-M01","item":"ratarmount_remote::hf_cache::directories","disposition":"output-owner","category":"hf-cache-directory","reason":"Create each validated Hub cache child directory before rejecting symlinks/non-directories.","creation":{"policy":"directory-component","basis":"Components must be Normal and every resulting path is checked with symlink_metadata; existing permission behavior is retained."}}"###
+                    )]
+                    let __inventory_value_0 = fs::create_dir(&current);
+                    __inventory_value_0
+                };
+                match __inventory_condition_2766 {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         if !fs::symlink_metadata(&current)?.is_dir() {
@@ -62,6 +80,14 @@ fn directories(root: &Path, path: &Path, create: bool) -> io::Result<()> {
 }
 
 pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0494-M01","item":"ratarmount_remote::hf_cache::open_regular","disposition":"support","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","family":"hf-payload-cache","issue":"#196","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"residual","baseline_reason":"HF local cache payload open helper"}"###
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = r###"internal-read:v1 {"id":"IR-B0494-T01","item":"ratarmount_remote::hf_cache::open_regular","disposition":"support","reason":"Builder type support: HF local cache payload open helper","family":"hf-payload-cache","issue":"#196","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+    )]
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -69,6 +95,10 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0494-M02","item":"ratarmount_remote::hf_cache::open_regular","disposition":"residual","reason":"HF local cache payload open helper","family":"hf-payload-cache","issue":"#196","mode_policy":"unchanged-from-e6ca64e","category":"hf-payload-cache","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let file = options.open(path)?;
     if !file.metadata()?.is_file() || fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(io::Error::other("Hub cache blob is not a regular file"));
@@ -197,9 +227,16 @@ impl VerifiedBlobs {
 }
 
 fn temporary(dir: &Path) -> io::Result<tempfile::NamedTempFile> {
-    tempfile::Builder::new()
-        .prefix(&format!("{TEMP_PREFIX}{}-", std::process::id()))
-        .tempfile_in(dir)
+    {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0495-M01","item":"ratarmount_remote::hf_cache::temporary","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
+        let __inventory_value_0 = tempfile::Builder::new()
+            .prefix(&format!("{TEMP_PREFIX}{}-", std::process::id()))
+            .tempfile_in(dir);
+        __inventory_value_0
+    }
 }
 
 // Probe the kernel-applied umask without changing the process-global mask.
@@ -208,6 +245,10 @@ fn published_permissions(file: &File, dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0496-M01","item":"ratarmount_remote::hf_cache::published_permissions","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
         let probe = tempfile::Builder::new()
             .prefix(&format!("{TEMP_PREFIX}{}-", std::process::id()))
             .permissions(fs::Permissions::from_mode(0o666))
@@ -223,6 +264,10 @@ fn published_permissions(file: &File, dir: &Path) -> io::Result<()> {
 
 fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0497-M01","item":"ratarmount_remote::hf_cache::sync_dir","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"directory handle opened only to fsync a directory entry","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
     let _ = path;
@@ -353,6 +398,10 @@ impl HubCache {
     }
 
     fn checked(&self, path: &Path, etag: &str, size: Option<u64>, full: bool) -> Option<File> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0498-M01","item":"<ratarmount_remote::hf_cache::HubCache>::checked","disposition":"residual","reason":"huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded","family":"hf-payload-cache","issue":"#196","category":"hf-payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = open_regular(path).ok()?;
         let before = stamp(&file).ok()?;
         if size.is_some_and(|size| size != before.len) {
@@ -480,6 +529,10 @@ impl HubCache {
         let trees = self.repo_dir(location).join("trees");
         let read = || -> Option<BTreeMap<String, String>> {
             directories(&self.root, &trees, false).ok()?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0499-M01","item":"<ratarmount_remote::hf_cache::HubCache>::tree_hashes","disposition":"residual","reason":"huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded","family":"hf-payload-cache","issue":"#196","category":"hf-payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let value: serde_json::Value = serde_json::from_reader(
                 open_regular(&trees.join(format!("{commit}.json")))
                     .ok()?
@@ -523,6 +576,10 @@ impl HubCache {
             .join(path);
         directories(&self.root, meta.parent()?, false).ok()?;
         let mut hash = String::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0500-M01","item":"<ratarmount_remote::hf_cache::HubCache>::copied_hash","disposition":"residual","reason":"huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded","family":"hf-payload-cache","issue":"#196","category":"hf-payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         open_regular(&meta)
             .ok()?
             .take(128)
@@ -560,6 +617,10 @@ impl HubCache {
             .join(&location.revision);
         directories(&self.root, reference.parent()?, false).ok()?;
         let mut value = String::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0501-M01","item":"<ratarmount_remote::hf_cache::HubCache>::observe_ref","disposition":"residual","reason":"huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded","family":"hf-payload-cache","issue":"#196","category":"hf-payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         open_regular(&reference)
             .ok()?
             .take(128)
@@ -613,7 +674,11 @@ impl HubCache {
         size: u64,
     ) -> io::Result<LocalBlob> {
         self.install_with(location, commit, path, etag, size, || {
-            open_regular(complete)
+            {
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0502-M01","item":"<ratarmount_remote::hf_cache::HubCache>::install","disposition":"residual","reason":"huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded","family":"hf-payload-cache","issue":"#196","category":"hf-payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
+let __inventory_value_0 = open_regular(complete);
+__inventory_value_0
+}
         })
     }
 
@@ -739,13 +804,29 @@ impl HubCache {
         directories(&self.root, &blobs, true)?;
         let locks = self.root.join(".locks").join(repo.file_name().unwrap());
         directories(&self.root, &locks, true)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0503-M01","item":"<ratarmount_remote::hf_cache::HubCache>::install_with","disposition":"support","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","family":"hf-payload-cache","issue":"#196","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"residual","baseline_reason":"huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded"}"###
+        )]
+        #[expect(
+            clippy::disallowed_types,
+            reason = r###"internal-read:v1 {"id":"IR-B0503-T01","item":"<ratarmount_remote::hf_cache::HubCache>::install_with","disposition":"support","reason":"Builder type support: huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded","family":"hf-payload-cache","issue":"#196","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+        )]
         let mut options = OpenOptions::new();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0087-M01","item":"<ratarmount_remote::hf_cache::HubCache>::install_with","disposition":"output-owner","category":"hf-cache-lock","reason":"Permit creation of the Hub blob publication lock without truncation.","creation":{"policy":"create-or-open","basis":"The lock builder uses read/write/create and truncate(false), with Unix NOFOLLOW/NONBLOCK and existing permission defaults."}}"###
+        )]
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0503-M02","item":"<ratarmount_remote::hf_cache::HubCache>::install_with","disposition":"residual","reason":"huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded","family":"hf-payload-cache","issue":"#196","mode_policy":"unchanged-from-e6ca64e","category":"hf-payload-cache","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        )]
         let lock = options.open(locks.join(format!("{etag}.lock")))?;
         try_lock(&lock)?;
         #[cfg(test)]
@@ -773,6 +854,10 @@ impl HubCache {
             copy_verified(&mut source, tmp.as_file_mut(), etag, size)?;
             published_permissions(tmp.as_file(), &blobs)?;
             tmp.as_file().sync_all()?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0504-M01","item":"<ratarmount_remote::hf_cache::HubCache>::install_with","disposition":"residual","reason":"huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded","family":"hf-payload-cache","issue":"#196","category":"hf-payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let file = open_regular(tmp.path())?;
             if stamp(&file)? != stamp(tmp.as_file())? {
                 return Err(io::Error::other(
@@ -833,6 +918,10 @@ impl HubCache {
             return sync_dir(parent);
         }
         let mut tmp = temporary(parent)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0505-M01","item":"<ratarmount_remote::hf_cache::HubCache>::snapshot","disposition":"residual","reason":"huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded","family":"hf-payload-cache","issue":"#196","category":"hf-payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut reader = LocalReader {
             file: Arc::new(blob.try_clone()?),
             size: blob.metadata()?.len(),
@@ -871,7 +960,11 @@ impl LocalBlob {
     }
 
     pub(crate) fn backing_file(&self) -> Option<File> {
-        self.file.try_clone().ok()
+        {
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0506-M01","item":"<ratarmount_remote::hf_cache::LocalBlob>::backing_file","disposition":"residual","reason":"HF payload owner clone / backing transfer","family":"hf-payload-cache","issue":"#196","category":"hf-payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
+let __inventory_value_0 = self.file.try_clone();
+__inventory_value_0
+}.ok()
     }
 
     fn reader(&self) -> LocalReader {
@@ -1029,6 +1122,10 @@ impl BufferedBody {
             Self::Disk { file, size } => {
                 #[cfg(unix)]
                 let mut reader = {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = r###"internal-read:v1 {"id":"IR-B0507-M01","item":"<ratarmount_remote::hf_cache::BufferedBody>::write_to","disposition":"residual","reason":"HF payload owner clone / backing transfer","family":"hf-payload-cache","issue":"#196","category":"hf-payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                    )]
                     let file = file.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
                     LocalReader {
                         file: Arc::new(file),
@@ -1274,6 +1371,10 @@ impl HfCacheMountSource {
         }
         let location = parse_hf_url(&format!("hf://{rest}"))?;
         let repo = source.cache.repo_dir(&location);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0508-M01","item":"<ratarmount_remote::hf_cache::HfCacheMountSource>::with_cache","disposition":"residual","reason":"huggingface_hub cache payload, ref or tree file; payload owners, clones and backing transfer are excluded","family":"hf-payload-cache","issue":"#196","category":"hf-payload-cache","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let commit = if is_commit(&location.revision) {
             location.revision.to_ascii_lowercase()
         } else {

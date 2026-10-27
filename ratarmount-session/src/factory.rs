@@ -789,40 +789,16 @@ mod split_open_tests {
                 .iter()
                 .map(|b| format!("{b:?}"))
                 .collect();
-            assert_eq!(
-                names,
-                vec![
-                    "SevenZip",
-                    "Zip",
-                    "Asar",
-                    "Ar",
-                    "Cpio",
-                    "Udf",
-                    "Iso",
-                    "Warc",
-                    "Xar",
-                    "Cab",
-                    "Sqlar",
-                    "SquashFs",
-                    "Ext4",
-                    "Fat",
-                    "Exfat",
-                    "Ntfs",
-                    "Dmg",
-                    "Wim",
-                    "Block",
-                    "Qcow2",
-                    "Vhd",
-                    "Vmdk",
-                    "Ogg",
-                    "Pdf",
-                    "Html",
-                    #[cfg(feature = "tensors")]
-                    "Tensors",
-                    "Libarchive",
-                    "Tar",
-                ]
-            );
+            // Keep stripping attributes outside macro payloads for the syntax audit.
+            let mut expected = vec![
+                "SevenZip", "Zip", "Asar", "Ar", "Cpio", "Udf", "Iso", "Warc", "Xar", "Cab",
+                "Sqlar", "SquashFs", "Ext4", "Fat", "Exfat", "Ntfs", "Dmg", "Wim", "Block",
+                "Qcow2", "Vhd", "Vmdk", "Ogg", "Pdf", "Html",
+            ];
+            #[cfg(feature = "tensors")]
+            expected.push("Tensors");
+            expected.extend(["Libarchive", "Tar"]);
+            assert_eq!(names, expected);
         }
 
         #[cfg(feature = "udf")]
@@ -4416,6 +4392,7 @@ fn body_needs_path_materialize(body: &Arc<dyn SeekableBody>) -> bool {
 }
 
 /// Materialize a seekable body once for residual path-only backends (EXT4 / SquashFS / libarchive).
+#[cfg(feature = "cab")]
 fn materialize_seekable_body_for_path_backends(
     path: &Path,
     body: Arc<dyn SeekableBody>,
@@ -4442,6 +4419,10 @@ fn materialize_seekable_body_for_path_backends_with_index(
     let size = body.size();
     let mut reader = body.open_reader().map_err(|e| e.to_string())?;
     drop(body);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0538-M01","item":"ratarmount_session::factory::materialize_seekable_body_for_path_backends_with_index","disposition":"output-owner","mode_policy":"0600","category":"output-owner","reason":"Materialize a seekable archive body in a private temporary file for path-only format backends.","creation":{"policy":"0600","basis":"NamedTempFile creates the materialized body with mode 0600; regression_materialize_tempfile_is_created_0600 verifies its creation permissions."}}"###
+    )]
     let mut tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
     std::io::copy(&mut reader, &mut tmp).map_err(|e| e.to_string())?;
     let data_path = tmp.path().to_path_buf();

@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 #[cfg(target_os = "linux")]
 mod linux;
 

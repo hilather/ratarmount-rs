@@ -19,3 +19,6 @@ quick-xml = "0.37"
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

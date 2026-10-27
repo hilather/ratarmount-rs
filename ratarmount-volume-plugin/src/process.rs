@@ -139,6 +139,10 @@ impl Mounter for ProcessMounter {
     }
 
     fn reconcile(&mut self, root: &Path) -> Result<(), String> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0552-M01","item":"<ratarmount_volume_plugin::process::ProcessMounter as ratarmount_volume_plugin::Mounter<ratarmount_volume_plugin::process::ProcessMounter>>::reconcile","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut stale: Vec<_> =
             mountpoints(&fs::read("/proc/self/mountinfo").map_err(|_| "cannot read mountinfo")?)
                 .into_iter()
@@ -184,7 +188,11 @@ fn run_bounded(command: &mut Command, timeout: Duration) -> io::Result<bool> {
 }
 
 pub fn is_mounted(path: &Path) -> io::Result<bool> {
-    Ok(mountpoints(&fs::read("/proc/self/mountinfo")?)
+    Ok(mountpoints(&{
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0553-M01","item":"ratarmount_volume_plugin::process::is_mounted","disposition":"out-of-family","category":"kernel-or-process-introspection","reason":"/proc or mount-table introspection","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
+let __inventory_value_0 = fs::read("/proc/self/mountinfo");
+__inventory_value_0
+}?)
         .iter()
         .any(|p| p == path))
 }

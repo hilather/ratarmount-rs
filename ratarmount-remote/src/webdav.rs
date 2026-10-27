@@ -504,6 +504,10 @@ pub fn fetch_webdav_location_to_temp(loc: &WebDavLocation) -> Result<(NamedTempF
         )));
     }
     let mut reader = resp.into_reader();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0527-M01","item":"ratarmount_remote::webdav::fetch_webdav_location_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     let n = io::copy(&mut reader, &mut tmp)?;
     tmp.flush()?;

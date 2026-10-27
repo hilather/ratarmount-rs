@@ -743,6 +743,10 @@ pub(crate) fn walk_host_entries(
         }
         let stat = crate::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0144-M01","item":"ratarmount_compositing::overlay_changes::walk_host_entries","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
             let child = host::openat(fd, name, directory_flags(), Mode::empty())?;
             walk_host_entries(&child, &path, hosts)?;
         }
@@ -854,6 +858,10 @@ pub(crate) fn mentioned_paths_with_immutability(
     }
     #[cfg(unix)]
     {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0145-M01","item":"ratarmount_compositing::overlay_changes::mentioned_paths_with_immutability","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let root = host::open(top, directory_flags(), Mode::empty())?;
         let mut hosts = BTreeMap::new();
         walk_host_entries(&root, "", &mut hosts)?;

@@ -101,3 +101,6 @@ zstd = "0.13"
 [[test]]
 name = "fuse_rename_over"
 path = "../ratarmount-fuse/tests/fuse_rename_over.rs"
+
+[lints]
+workspace = true

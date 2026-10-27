@@ -234,7 +234,14 @@ impl MountSource for FolderMountSource {
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing path userdata"))?;
         let real = self.realpath(vpath);
-        Ok(Box::new(File::open(real)?))
+        Ok(Box::new({
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0140-M01","item":"<ratarmount_compositing::folder::FolderMountSource as ratarmount_core::MountSource<ratarmount_compositing::folder::FolderMountSource>>::open","disposition":"residual","reason":"external folder payload; special-file/symlink semantics and backing-owner migration excluded","family":"generic-folder-reads","issue":"#196","category":"generic-folder-reads","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+            )]
+            let __inventory_value_0 = File::open(real);
+            __inventory_value_0
+        }?))
     }
 
     fn supports_backing_extents(&self) -> bool {
@@ -249,6 +256,10 @@ impl MountSource for FolderMountSource {
             UserData::Other(s) if s.starts_with('/') => Some(s.as_str()),
             _ => None,
         })?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0141-M01","item":"<ratarmount_compositing::folder::FolderMountSource as ratarmount_core::MountSource<ratarmount_compositing::folder::FolderMountSource>>::backing_extent","disposition":"residual","reason":"external folder payload; special-file/symlink semantics and backing-owner migration excluded","family":"generic-folder-reads","issue":"#196","category":"generic-folder-reads","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let file = File::open(self.realpath(path)).ok()?;
         let meta = file.metadata().ok()?;
         if !meta.is_file() {

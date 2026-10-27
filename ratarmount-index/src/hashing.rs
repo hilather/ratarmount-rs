@@ -255,6 +255,10 @@ pub fn fill_content_hashes(
 
     // Managed (#151): the archive may be a database open in this process. An
     // open failure propagates; per-member failures stay best effort.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0422-M01","item":"ratarmount_index::hashing::fill_content_hashes","disposition":"managed-read","regression":"regression_content_hashes_keep_aliased_database_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let mut archive = crate::managed_read::ManagedReadCursor::open(archive_path)?;
     let mut pending: Vec<(i64, String, Vec<u8>)> = Vec::new();
 

@@ -307,6 +307,10 @@ fn parse_ssh_config_file_into(
                 }
             }
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0525-M01","item":"ratarmount_remote::ssh::parse_ssh_config_file_into","disposition":"out-of-family","category":"configuration-or-credentials","reason":"credentials or client configuration file","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let f = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(e) if depth > 0 => {
@@ -885,6 +889,10 @@ fn copy_sftp_and_teardown(
         .open(Path::new(path))
         .map_err(|e| RemoteError::Ssh(format!("open {path}: {e}")))?;
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0526-M01","item":"ratarmount_remote::ssh::copy_sftp_and_teardown","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+    )]
     let mut tmp = NamedTempFile::new()?;
     let n = io::copy(&mut remote, &mut tmp)?;
     tmp.flush()?;

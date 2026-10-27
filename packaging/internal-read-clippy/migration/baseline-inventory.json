@@ -3104,18 +3104,6 @@
   },
   {
    "file": "ratarmount-compress/src/zstd_seek.rs",
-   "function": "SeekableZstd::open_with_zstd_blocks_options",
-   "op": "File::open",
-   "ordinal": 1,
-   "line": 672,
-   "fingerprint": "679ed110101aabfd",
-   "disposition": "residual",
-   "family": "factory-and-format-readers",
-   "issue": "#196",
-   "reason": "read-only open of the mounted base archive body to validate the imported zstdblocks terminal sentinel (same file the path backend reopens); never an index, companion or overlay file"
-  },
-  {
-   "file": "ratarmount-compress/src/zstd_seek.rs",
    "function": "decode_full",
    "op": "File::open",
    "ordinal": 1,
@@ -6189,13 +6177,14 @@
   },
   {
    "file": "ratarmount-session/src/factory.rs",
-   "function": "materialize_seekable_body_for_path_backends_with_index",
+   "function": "materialize_seekable_body_for_path_backends",
    "op": "tempfile",
    "ordinal": 1,
-   "line": 4445,
+   "line": 4000,
    "fingerprint": "d9a68fc6c28ba6f1",
+   "baseline_fingerprint": "d9a68fc6c28ba6f1",
    "disposition": "output-owner",
-   "mode_policy": "0600"
+   "mode_policy": "unchanged-from-e6ca64e"
   },
   {
    "file": "ratarmount-session/src/remote_open.rs",

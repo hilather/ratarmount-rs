@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! CPIO archive support: newc/crc (070701/070702), portable ASCII odc (070707),
 //! and old binary (0x71c7 LE/BE). Random access via [`StenciledFile`].
 //!
@@ -124,7 +127,14 @@ enum ContentBackend {
 impl ContentBackend {
     fn open_reader(&self) -> io::Result<ContentReader> {
         match self {
-            Self::Path(p) => Ok(ContentReader::File(File::open(p)?)),
+            Self::Path(p) => Ok(ContentReader::File({
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0301-M01","item":"<ratarmount_formats_cpio::ContentBackend>::open_reader","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
+                let __inventory_value_0 = File::open(p);
+                __inventory_value_0
+            }?)),
             Self::Shared(s) => Ok(ContentReader::Shared(s.open_reader())),
         }
     }
@@ -350,6 +360,10 @@ impl CpioMountSource {
         );
         let t0 = Instant::now();
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0302-M01","item":"<ratarmount_formats_cpio::CpioMountSource>::create_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(archive_path)?;
         let kind = detect_kind(&mut file)?;
         file.seek(SeekFrom::Start(0))?;
@@ -775,7 +789,14 @@ fn userdata(fi: &FileInfo) -> Option<&SQLiteIndexedTarUserData> {
 
 /// Detect any supported CPIO variant (newc/crc/odc/binary) by magic or extension.
 pub fn looks_like_cpio(path: &Path) -> bool {
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0303-M01","item":"ratarmount_formats_cpio::looks_like_cpio","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = File::open(path);
+        __inventory_value_0
+    } {
         let mut magic = [0u8; 6];
         if let Ok(n) = f.read(&mut magic) {
             if n >= 6 && (&magic == NEWC_MAGIC || &magic == CRC_MAGIC || &magic == ODC_MAGIC) {

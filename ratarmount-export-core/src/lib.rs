@@ -1,3 +1,5 @@
+#![forbid(unused_macros)]
+
 //! Shared bind, stop, inode, fill-loop, and reader LRU for export crates.
 //!
 //! Copied from `ratarmount-nfs` (`parse_nfs_bind`, `DEFAULT_NFS_BIND`

@@ -175,6 +175,10 @@ pub(crate) fn own_handle_symbol(anchor: usize, name: &std::ffi::CStr) -> Option<
         if handle.is_null() {
             return None;
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0056-M01","item":"ratarmount_index::checked_open::host::own_handle_symbol","disposition":"out-of-family","category":"checked-open-host-probe","reason":"Look up the checked-open host-test symbol through the already-loaded image own handle, then release that handle.","creation":{"policy":"none","basis":"dlsym performs the reviewed own_handle_symbol probe, not arbitrary loader use or creation of a pathname resource."}}"###
+        )]
         let found = libc::dlsym(handle, name.as_ptr());
         libc::dlclose(handle);
         (!found.is_null()).then_some(found as usize)

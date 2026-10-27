@@ -201,6 +201,10 @@ pub fn parse_index_pointer_json(s: &str) -> Result<IndexPointer> {
 /// Load `{archive}.index.ptr`. Missing file → `Ok(None)`. Invalid schema / id → `Err`.
 pub fn load_index_pointer(path: &Path) -> Result<Option<IndexPointer>> {
     // Managed (#151): the pointer may be a name of a file open as a database.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0430-M01","item":"ratarmount_index::location::load_index_pointer","disposition":"managed-read","regression":"regression_index_pointer_read_keeps_aliased_database_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let s = match crate::managed_read::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -226,6 +230,10 @@ pub fn store_index_pointer_atomic(path: &Path, ptr: &IndexPointer) -> Result<()>
     let json = index_pointer_to_json(ptr)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0060-M01","item":"ratarmount_index::location::store_index_pointer_atomic","disposition":"output-owner","category":"index-pointer-directory","reason":"Create the index pointer parent before allocating a sibling temporary JSON output.","creation":{"policy":"recursive-directory","basis":"The pointer writer owns this parent tree; tempfile publication and pointer validation remain separate."}}"###
+            )]
             std::fs::create_dir_all(parent)?;
         }
     }
@@ -233,8 +241,22 @@ pub fn store_index_pointer_atomic(path: &Path, ptr: &IndexPointer) -> Result<()>
     builder.prefix(".ratarmount-index-ptr-").suffix(".tmp");
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = match parent {
-        Some(p) => builder.tempfile_in(p)?,
-        None => builder.tempfile_in(".")?,
+        Some(p) => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0431-M01","item":"ratarmount_index::location::store_index_pointer_atomic","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempfile_in(p);
+            __inventory_value_0
+        }?,
+        None => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0432-M01","item":"ratarmount_index::location::store_index_pointer_atomic","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempfile_in(".");
+            __inventory_value_0
+        }?,
     };
     tmp.write_all(json.as_bytes())?;
     tmp.flush()?;
@@ -309,6 +331,10 @@ pub fn snapshot_index_id(archive: &Path, well_known: &Path, id: &str) -> Result<
     }
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0061-M01","item":"ratarmount_index::location::snapshot_index_id","disposition":"output-owner","category":"index-cache-directory","reason":"Create the content-addressed snapshot parent before hard-linking or atomically copying the known index.","creation":{"policy":"recursive-directory","basis":"Only output directories are created; the well-known source is read through separately reviewed paths."}}"###
+            )]
             std::fs::create_dir_all(parent)?;
         }
     }
@@ -385,6 +411,10 @@ pub fn publish_index_pointer(
 pub(crate) fn atomic_copy_file(src: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0062-M01","item":"ratarmount_index::location::atomic_copy_file","disposition":"output-owner","category":"index-output-directory","reason":"Create the destination parent before the atomic managed-source index copy.","creation":{"policy":"recursive-directory","basis":"The destination tree keeps current defaults; the source copy uses managed_read and sibling tempfile publication."}}"###
+            )]
             std::fs::create_dir_all(parent)?;
         }
     }
@@ -392,10 +422,28 @@ pub(crate) fn atomic_copy_file(src: &Path, dest: &Path) -> Result<()> {
     builder.prefix(".ratarmount-index-snap-").suffix(".tmp");
     let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = match parent {
-        Some(p) => builder.tempfile_in(p)?,
-        None => builder.tempfile_in(".")?,
+        Some(p) => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0433-M01","item":"ratarmount_index::location::atomic_copy_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempfile_in(p);
+            __inventory_value_0
+        }?,
+        None => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0434-M01","item":"ratarmount_index::location::atomic_copy_file","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempfile_in(".");
+            __inventory_value_0
+        }?,
     };
     {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0435-M01","item":"ratarmount_index::location::atomic_copy_file","disposition":"managed-read","regression":"regression_index_id_copy_fallback_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         crate::managed_read::copy_into(src, &mut tmp)?;
         tmp.flush()?;
         tmp.as_file().sync_all()?;
@@ -405,7 +453,11 @@ pub(crate) fn atomic_copy_file(src: &Path, dest: &Path) -> Result<()> {
 }
 
 fn sha256_file_hex(path: &Path) -> Result<String> {
-    crate::managed_read::sha256_hex(path).map_err(IndexError::from)
+    {
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0436-M01","item":"ratarmount_index::location::sha256_file_hex","disposition":"managed-read","regression":"regression_index_blob_hash_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###)]
+let __inventory_value_0 = crate::managed_read::sha256_hex(path);
+__inventory_value_0
+}.map_err(IndexError::from)
 }
 
 fn list_index_id_snapshots(archive: &Path) -> Vec<(String, PathBuf)> {
@@ -989,6 +1041,10 @@ pub fn materialize_index_file(path: &Path) -> Result<PathBuf> {
         _ => return Ok(path.to_path_buf()),
     };
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0437-M01","item":"ratarmount_index::location::materialize_index_file","disposition":"managed-read","regression":"regression_index_materialize_probe_keeps_index_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let header = crate::managed_read::read_prefix(path, 16)?;
     let header = header.as_slice();
 
@@ -1064,6 +1120,10 @@ fn detect_index_compression(path: &Path, header: &[u8]) -> Option<IndexCompressi
 }
 
 fn decompress_index_to_temp(path: &Path, fmt: IndexCompression) -> Result<PathBuf> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0438-M01","item":"ratarmount_index::location::decompress_index_to_temp","disposition":"managed-read","regression":"regression_index_decompression_reader_keeps_aliased_database_lock","category":"managed-read","reason":"Use the reviewed managed reader under the existing lock guarantee.","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let input = crate::managed_read::ManagedReadCursor::open(path).map_err(|e| {
         IndexError::Invalid(format!(
             "cannot open {}-compressed index {}: {e}",
@@ -1092,10 +1152,28 @@ fn decompress_index_to_temp(path: &Path, fmt: IndexCompression) -> Result<PathBu
         .prefix("ratarmount-index-")
         .suffix(".tmp.sqlite.index");
     let mut tmp = if let Some(dir) = index_temp_dir() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0063-M01","item":"ratarmount_index::location::decompress_index_to_temp","disposition":"output-owner","category":"index-staging-directory","reason":"Create the explicitly configured index temporary directory before decompression output allocation.","creation":{"policy":"recursive-directory","basis":"The output tempfile builder owns the decoded index; directory permissions preserve current defaults."}}"###
+        )]
         std::fs::create_dir_all(&dir)?;
-        builder.tempfile_in(&dir)?
+        {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0439-M01","item":"ratarmount_index::location::decompress_index_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempfile_in(&dir);
+            __inventory_value_0
+        }?
     } else {
-        builder.tempfile()?
+        {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0440-M01","item":"ratarmount_index::location::decompress_index_to_temp","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempfile();
+            __inventory_value_0
+        }?
     };
 
     let n = std::io::copy(&mut reader, &mut tmp).map_err(|e| {
@@ -1171,10 +1249,28 @@ fn fetch_index_http_uncached(url: &str) -> Result<(PathBuf, Option<String>)> {
         .prefix("ratarmount-index-")
         .suffix(".tmp.sqlite.index");
     let mut tmp = if let Some(dir) = index_temp_dir() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-E0064-M01","item":"ratarmount_index::location::fetch_index_http_uncached","disposition":"output-owner","category":"index-staging-directory","reason":"Create the configured index temporary directory before streaming an HTTP sidecar into a tempfile.","creation":{"policy":"recursive-directory","basis":"This directory supports downloaded output staging and retains current std/umask behavior."}}"###
+        )]
         std::fs::create_dir_all(&dir)?;
-        builder.tempfile_in(&dir)?
+        {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0441-M01","item":"ratarmount_index::location::fetch_index_http_uncached","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempfile_in(&dir);
+            __inventory_value_0
+        }?
     } else {
-        builder.tempfile()?
+        {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0442-M01","item":"ratarmount_index::location::fetch_index_http_uncached","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_0 = builder.tempfile();
+            __inventory_value_0
+        }?
     };
 
     let mut reader = resp.into_reader();
@@ -1438,7 +1534,11 @@ pub fn path_can_create_index(path: &Path) -> bool {
             // relative path in cwd
             return test_writable_dir(Path::new("."));
         }
-        if !parent.exists() && std::fs::create_dir_all(parent).is_err() {
+        if !parent.exists() && {
+#[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-E0065-M01","item":"ratarmount_index::location::path_can_create_index","disposition":"output-owner","category":"writability-probe-directory","reason":"Create a missing prospective index parent as part of the documented index-creation capability probe.","creation":{"policy":"recursive-directory","basis":"The probe rejects URL-shaped paths first; directory creation is intentional and uses existing default permissions."}}"###)]
+let __inventory_value_0 = std::fs::create_dir_all(parent);
+__inventory_value_0
+}.is_err() {
             return false;
         }
         return test_writable_dir(parent);
@@ -1449,16 +1549,36 @@ pub fn path_can_create_index(path: &Path) -> bool {
 /// Probe whether `dir` allows creating a new file (unlink the probe afterwards).
 pub fn test_writable_dir(dir: &Path) -> bool {
     let probe = dir.join(format!(".ratarmount-write-test-{}", std::process::id()));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
     {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
+        let __inventory_condition_60685 = {
+            #[expect(
+                clippy::disallowed_types,
+                reason = r###"internal-read:v1 {"id":"IR-B0443-T01","item":"ratarmount_index::location::test_writable_dir","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###
+            )]
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0443-M01","item":"ratarmount_index::location::test_writable_dir","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###
+            )]
+            let mut __inventory_value_0 = std::fs::OpenOptions::new();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-E0066-M01","item":"ratarmount_index::location::test_writable_dir","disposition":"output-owner","category":"writability-probe","reason":"Configure exclusive creation of the short-lived directory writability probe file.","creation":{"policy":"exclusive-new-file","basis":"create_new prevents replacing a pre-existing name; a successful probe is unlinked immediately and uses default/umask file permissions."}}"###
+            )]
+            let __inventory_value_1 = __inventory_value_0.write(true).create_new(true);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-B0443-M02","item":"ratarmount_index::location::test_writable_dir","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            )]
+            let __inventory_value_2 = __inventory_value_1.open(&probe);
+            __inventory_value_2
+        };
+        match __inventory_condition_60685 {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
         }
-        Err(_) => false,
     }
 }
 

@@ -14,7 +14,6 @@
 //! replacement and copy-guard entry points (`clippy.toml` forbids them
 //! elsewhere): every caller says WHO may apply a journal ([`Owner`]) and a
 //! replacement or copy goes through the wrappers below.
-#![allow(clippy::disallowed_methods)]
 
 use std::cell::Cell;
 use std::fs;
@@ -101,8 +100,22 @@ impl Owner<'_> {
             Owner::Mount { records, member } => {
                 authorize_mount_recovery(records, member, header, locked)
             }
-            Owner::Inode => commit_journal::authorize_owned(header, locked),
-            Owner::Forced => commit_journal::authorize_forced(header, locked),
+            Owner::Inode => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "Owner::Inode is the reviewed authority for applying the locked inode's own journal"
+                )]
+                let result = commit_journal::authorize_owned(header, locked);
+                result
+            }
+            Owner::Forced => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "Owner::Forced represents the caller's explicit force flag"
+                )]
+                let result = commit_journal::authorize_forced(header, locked);
+                result
+            }
             #[cfg(test)]
             Owner::Test(authorize) => authorize(header, locked),
         }
@@ -645,11 +658,21 @@ pub(crate) fn recover_journal(
     };
     let mut authorize =
         |header: &PendingJournal, locked: &fs::Metadata| owner.authorize(header, locked);
-    commit_journal::recover_guarded(archive, &mut before_write, &mut authorize, &mut |applied| {
-        rows.with(|conn, required| {
-            restamp_rows(conn, archive, applied, Restamp::Recovery, required)
-        })
-    })
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The compositing recovery owner supplies authorization, row guards and the before-unlink restamp"
+    )]
+    let recovered = commit_journal::recover_guarded(
+        archive,
+        &mut before_write,
+        &mut authorize,
+        &mut |applied| {
+            rows.with(|conn, required| {
+                restamp_rows(conn, archive, applied, Restamp::Recovery, required)
+            })
+        },
+    );
+    recovered
 }
 
 /// [`recover_journal`] for callers that hold no overlay: the library and mount
@@ -1121,14 +1144,18 @@ pub(crate) fn replace_committing(
     original: &fs::Metadata,
     rows: &Rows<'_>,
 ) -> std::result::Result<(), FailedReplace> {
-    commit_journal::replace_suffix_if_unchanged_with(
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The compositing replacement wrapper supplies the checked base and commit restamp hook"
+    )]
+    let replaced = commit_journal::replace_suffix_if_unchanged_with(
         archive,
         offset,
         suffix,
         original,
         &mut rows.commit_hook(archive),
-    )
-    .map_err(failed_replace)
+    );
+    replaced.map_err(failed_replace)
 }
 
 /// The commit's journaled zstd append splice (see [`replace_committing`]).
@@ -1142,14 +1169,18 @@ pub(crate) fn splice_append_committing<F>(
 where
     F: FnOnce(&mut dyn ratarmount_compress::SeekRead, u64, &mut dyn io::Write) -> io::Result<()>,
 {
-    ratarmount_compress::splice_zstd_last_frames_append_with(
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The compositing append wrapper supplies the checked base and commit restamp hook"
+    )]
+    let appended = ratarmount_compress::splice_zstd_last_frames_append_with(
         archive,
         from_idx,
         transform,
         original,
         &mut rows.commit_hook(archive),
-    )
-    .map_err(failed_splice)
+    );
+    appended.map_err(failed_splice)
 }
 
 /// Open the file a copy fallback reads, refusing unless it is still exactly
@@ -1163,6 +1194,10 @@ pub(crate) fn open_copy_source(
     from: &CopyFrom,
 ) -> io::Result<(fs::File, fs::Metadata)> {
     commit_journal::fault::point("copy source open")?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = r###"internal-read:v1 {"id":"IR-B0143-M01","item":"ratarmount_compositing::journal_recovery::open_copy_source","disposition":"residual","reason":"open_copy_source: source of every commit copy fallback; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+    )]
     let file = fs::File::open(archive)?;
     let source = recheck_copy_source(archive, &file, original, from)?;
     commit_journal::fault::point("copy source opened")?;
@@ -1192,6 +1227,10 @@ pub(crate) fn publish_over(
     source: &fs::Metadata,
     publish: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The compositing publisher holds the checked-source guard across the publication callback"
+    )]
     let _guard = commit_journal::guard_copy(archive, source)?;
     publish()
 }
@@ -1208,13 +1247,17 @@ pub(crate) fn splice_replace_over<F>(
 where
     F: FnOnce(&mut dyn ratarmount_compress::SeekRead, u64, &mut dyn io::Write) -> io::Result<()>,
 {
-    ratarmount_compress::splice_zstd_last_frames_replace(
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The compositing copy-splice wrapper provides the previously accepted source stamp"
+    )]
+    let replaced = ratarmount_compress::splice_zstd_last_frames_replace(
         archive,
         from_idx,
         transform,
         from.reference(original),
-    )
-    .map_err(|e| OverlayError::Msg(e.to_string()))
+    );
+    replaced.map_err(|e| OverlayError::Msg(e.to_string()))
 }
 
 #[cfg(all(test, unix))]

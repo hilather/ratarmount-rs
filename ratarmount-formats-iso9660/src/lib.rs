@@ -1,3 +1,6 @@
+#![forbid(unused_macros)]
+#![cfg_attr(not(internal_read_inventory), allow(unfulfilled_lint_expectations))]
+
 //! ISO 9660 MountSource with random access via extent LBAs (`backendName=ISO9660MountSource`).
 //!
 //! # Nested archives (AutoMount / `open_from_reader`)
@@ -269,6 +272,10 @@ impl Iso9660MountSource {
         );
         let t0 = Instant::now();
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0324-M01","item":"<ratarmount_formats_iso9660::Iso9660MountSource>::create_index","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
         let mut file = File::open(archive_path)?;
         let index = build_iso_index(
             &mut file,
@@ -351,6 +358,10 @@ impl MountSource for Iso9660MountSource {
         })?;
         match &self.backend {
             IsoBackend::Path(path) => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = r###"internal-read:v1 {"id":"IR-B0325-M01","item":"<ratarmount_formats_iso9660::Iso9660MountSource as ratarmount_core::MountSource<ratarmount_formats_iso9660::Iso9660MountSource>>::open","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                )]
                 let file = File::open(path)?;
                 Ok(Box::new(StenciledFile::new(
                     file,
@@ -450,7 +461,14 @@ fn userdata(fi: &FileInfo) -> Option<&SQLiteIndexedTarUserData> {
 }
 
 pub fn looks_like_iso9660(path: &Path) -> bool {
-    if let Ok(mut f) = File::open(path) {
+    if let Ok(mut f) = {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0326-M01","item":"ratarmount_formats_iso9660::looks_like_iso9660","disposition":"residual","reason":"archive/format backend or probe reader of a mounted base; broader backend migration is excluded and SQLAR's own probes do not protect earlier probes","family":"factory-and-format-readers","issue":"#196","category":"factory-and-format-readers","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let __inventory_value_0 = File::open(path);
+        __inventory_value_0
+    } {
         if f.seek(SeekFrom::Start(0x8001)).is_ok() {
             let mut cd = [0u8; 5];
             if f.read(&mut cd).ok() == Some(5) && &cd == b"CD001" {
