@@ -311,7 +311,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "ratarmount-compress"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "bzip2",
  "crc32fast",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-core"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "libc",
  "log",
