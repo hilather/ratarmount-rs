@@ -323,6 +323,16 @@
   },
   {
    "file": "ratarmount/src/main.rs",
+   "function": "acquire_overlay_lock_after_fork",
+   "op": "fs::write",
+   "ordinal": 1,
+   "line": 4916,
+   "fingerprint": "e38b9459b0489e94",
+   "disposition": "output-owner",
+   "mode_policy": "0666 & !umask"
+  },
+  {
+   "file": "ratarmount/src/main.rs",
    "function": "neutralize_dead_stdio",
    "op": "libc::open",
    "ordinal": 1,

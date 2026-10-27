@@ -105,7 +105,7 @@ JSON-encoded `lower_layers`), plus the numeric `overlay-stats` fields
 the overlay directory, so its permissions determine `files_dir_writable`.
 Success exits 0. Missing or damaged databases fail without being created or
 repaired. A mounted overlay's exclusive database lock is reported as "in use"
-(a foreground `-f` mount; a daemonized mount holds no lock, #183).
+(a foreground `-f` mount or the serving child of a daemonized one, #183).
 
 | Key | Meaning |
 |---|---|
@@ -537,7 +537,7 @@ ratarmount --lower prepared --overlay-tmpfs=2G source.tar scratch/
 Lower layers must have `sealed_at` metadata. `--allow-unsealed-lower` also accepts
 unsealed and legacy overlays; these open read-only without SQLite's immutable
 option and may fail with “in use” if another mount holds the database
-(a foreground `-f` mount; a daemonized mount holds no lock, #183). They use
+(a foreground `-f` mount or the serving child of a daemonized one, #183). They use
 a construction-time row snapshot, so stop writers before using them. Sealed
 lowers use immutable SQLite and can be shared by concurrent mounts.
 
@@ -587,7 +587,7 @@ metadata for such an overlay without inventing a base identity; keep supplying
 BASE to verify it.
 
 Seal refuses a database held by another mount (“in use by another ratarmount
-process”) (a foreground `-f` mount; a daemonized mount holds no lock, #183).
+process”) (a foreground `-f` mount or the serving child of a daemonized one, #183).
 It runs fsck without repair under a writer reservation and refuses
 inconsistencies with an `overlay fsck --repair` hint. The digest is the canonical
 SHA-256 change hash against the composed lower view, with exact bytes, modes,
@@ -675,7 +675,7 @@ mount-relative parent, not a host absolute path.
 Unsealed checks record `fsck_at` and `fsck_result` (`ok`, `errors:N`, or
 `repaired:N`). Sealed overlays can be checked without modifying any metadata;
 `--repair` is refused. A database locked by a mount returns “in use”
-(a foreground `-f` mount; a daemonized mount holds no lock, #183). Repairs
+(a foreground `-f` mount or the serving child of a daemonized one, #183). Repairs
 hold an exclusive SQLite transaction, but host changes and SQLite are not one
 atomic transaction: stop direct host writers and rerun after an interrupted
 repair. A consistency check does not verify content hashes.
@@ -701,8 +701,8 @@ base and a note goes to stderr. Repeat `--lower DIR` in bottom-to-top order, or
 omit it to use `meta.lower_layers`. Sealed lowers open immutable; other lowers
 open read-only. `--strict` refuses any unsealed top or lower. Without it, unsealed
 and legacy overlays produce warnings. Stop writers before comparing: offline
-diff refuses a database locked by a mount (a foreground `-f` mount; a
-daemonized mount holds no lock, #183), and files/SQLite are separate stores.
+diff refuses a database locked by a mount (a foreground `-f` mount or the
+serving child of a daemonized one, #183), and files/SQLite are separate stores.
 
 Choose one output mode (default `--patch`):
 
@@ -1822,14 +1822,19 @@ reads and the macOS park share the tested helper but have no test of their
 own. Pack payload append has a direct registered-alias refusal/lock regression.
 
 These protections keep the SQLite locks of a process that holds the database
-for its whole life: a foreground mount or export server (`-f`; `sandbox run`
-and the sandbox supervisor run ratarmount that way), or a library or Python
-user. A daemonized ratarmount (the default without `-f`, for a FUSE mount and
-for an export server alike) currently holds no kernel lock on its overlay
-database at all: the database is opened and locked before the fork, POSIX
-locks are not inherited by the child, and the parent's exit releases them
-(#183). Until that is fixed, run with `-f` when another process may open the
-same overlay.
+for its whole life: a foreground mount (`-f`; `sandbox run` and the sandbox
+supervisor run ratarmount that way), the serving child of a daemonized mount
+(the default without `-f`, including a FUSE mount that also serves an export),
+and a library or Python user. POSIX locks are not inherited across `fork`.
+The parent closes its connection before it forks, and the serving child opens
+the database itself and takes the exclusive lock there; the parent's exit is
+not what releases that lock (#183). An export-only server does not fork.
+Before serving, the child refuses overlay metadata changed during the unlocked
+handoff (including base identity, sealing and the lower stack), reloads
+tombstones, repairs tombstones shadowing host files or symlinks after a competing
+writer's crash (#88), and rescans quota usage under its exclusive lock. Missing-file
+and directory tombstones stay set. Failed-fork restoration runs the same recovery.
+Quota status uses the refreshed counters too.
 
 
 A required-record observation is a **one-way session latch**. Once an overlay

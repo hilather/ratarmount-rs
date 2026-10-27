@@ -88,16 +88,16 @@ fn regression_docs_state_failed_replacement_and_locator_rules() {
     }
 }
 
-/// Regression: R11-S5 (#151, #183): the lock guarantees are scoped to processes that keep
-/// the database open (a daemonized mount holds no lock after its fork), the
+/// Regression: R11-S5 (#151, #183): the lock guarantees cover processes that keep the
+/// database open, including the serving child of a daemonized mount. The
 /// platform table is present, and the swap-back exclusion closed by the
 /// checked open is gone.
 #[test]
 fn regression_docs_scope_lock_claims_and_platform_matrix() {
     let text = read("docs/sandbox.md");
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Every "in use" lock claim is scoped to a foreground mount (#183).
-    const SCOPE: &str = "(a foreground `-f` mount; a daemonized mount holds no lock, #183)";
+    // Every "in use" lock claim names the serving child of a daemonized mount (#183).
+    const SCOPE: &str = "(a foreground `-f` mount or the serving child of a daemonized one, #183)";
     for claim in [
         "A mounted overlay's exclusive database lock is reported as \"in use\"",
         "may fail with “in use” if another mount holds the database",
@@ -129,20 +129,33 @@ fn regression_docs_scope_lock_claims_and_platform_matrix() {
         "docs/python.md lost the #154 paragraph"
     );
     for sentence in [
-        "A daemonized ratarmount (the default without `-f`, for a FUSE mount and for an export server alike) currently holds no kernel lock on its overlay database at all",
-        "(#183). Until that is fixed, run with `-f` when another process may open the same overlay.",
+        "The parent closes its connection before it forks, and the serving child opens the database itself and takes the exclusive lock there",
+        "the parent's exit is not what releases that lock (#183)",
+        "An export-only server does not fork.",
         "| Platform / host | Installation | Checked open |",
         "opening one database file through both at once in one process is unsupported (#154",
     ] {
-        assert!(text.contains(sentence), "docs/sandbox.md lost: {sentence}");
+        assert!(
+            flat.contains(sentence),
+            "docs/sandbox.md lost: {sentence}"
+        );
     }
+    assert!(
+        !flat.contains("holds no kernel lock") && !flat.contains("holds no lock"),
+        "docs/sandbox.md still says a daemonized mount holds no lock"
+    );
     assert!(
         !text.contains("swapped away and back at its path during its own open"),
         "docs/sandbox.md still lists the swap-back exclusion the checked open closed"
     );
     let changelog = read("CHANGELOG.md");
-    assert!(changelog
-        .contains("still holds no kernel lock on its overlay database after it forks (#183)"));
+    assert!(changelog.contains(
+        "takes the overlay database's exclusive lock in the serving child, after `fork`"
+    ));
+    assert!(
+        !changelog.contains("still holds no kernel lock"),
+        "CHANGELOG still says a daemonized mount holds no kernel lock"
+    );
 }
 
 /// Regression: required-session wording and offline no-recovery rules survive reconciliation.
