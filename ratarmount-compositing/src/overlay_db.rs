@@ -102,16 +102,21 @@ pub(crate) fn not_regular_message(db: &Path, metadata: &fs::Metadata) -> String 
             db.display()
         )
     } else if metadata.file_type().is_symlink() {
-        format!(
-            "overlay database {} is a symlink; it must be a regular file",
-            db.display()
-        )
+        symlink_message(db)
     } else {
         format!(
             "overlay database {} is not a regular file; move it aside",
             db.display()
         )
     }
+}
+
+fn symlink_message(db: &Path) -> String {
+    format!(
+        "overlay database {} is a symlink; it must be a regular file \
+         (move the database file into place of the link)",
+        db.display()
+    )
 }
 
 /// How SQLite is pointed at the database.
@@ -313,6 +318,13 @@ pub(crate) fn open_overlay_db_required(
     fire(&AFTER_CLASSIFY, db);
     let acquired = checked_open::open_checked(db, flags, mode, expect).map_err(|refusal| {
         match refusal.error {
+            AcquireError::Sqlite(e)
+                if e.sqlite_error().is_some_and(|error| {
+                    error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+                }) =>
+            {
+                OverlayDbError::NotRegular(symlink_message(db))
+            }
             AcquireError::Sqlite(e) => OverlayDbError::Sqlite(e),
             _ => OverlayDbError::Refused(format!("overlay database {}: {refusal}", db.display())),
         }

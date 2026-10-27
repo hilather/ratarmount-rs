@@ -6109,6 +6109,48 @@ fn regression_required_record_read_is_one_snapshot() {
         .unwrap();
 }
 
+/// Regression: #222 mount recovery with a symlinked database and stale prepare
+/// locator must name the next step without changing the archive or record.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_mount_symlinked_db_stale_prepare_names_next_step() {
+    if !have_gnu_tar() {
+        eprintln!("skip: GNU tar unavailable");
+        return;
+    }
+    let fx = Fixture::new();
+    drop(fx.open(BaseDigestRequest::Compute, false));
+    let db = fx.overlay.join(HIDDEN_DB);
+    let target = fx.archive.with_file_name("real-overlay.sqlite");
+    fs::rename(&db, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &db).unwrap();
+    stale_prepare(&fx.archive);
+    let archive_before = fs::read(&fx.archive).unwrap();
+    let locator_before = locator(&fx.archive);
+    let target_before = fs::read(&target).unwrap();
+    let records = records_of(&fx);
+    let error = crate::recover_journal_at(
+        &fx.archive,
+        Some(&db),
+        crate::Owner::Mount {
+            records: &records,
+            member: &fx.archive,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("is a symlink"), "{error}");
+    assert!(
+        error.contains("move the database file into place of the link"),
+        "{error}"
+    );
+    assert!(error.contains("retry the writable mount"), "{error}");
+    assert!(error.contains("no recovery write was made"), "{error}");
+    assert_eq!(fs::read(&fx.archive).unwrap(), archive_before);
+    assert_eq!(locator(&fx.archive), locator_before);
+    assert_eq!(fs::read(&target).unwrap(), target_before);
+}
+
 /// Regression (R10-FIX7, r10 skeptic #2): offline recovery read its record
 /// with the mount's strict rule, which refuses a database entry that is a
 /// symlink, although the offline gate (and the classifier) accept a symlink

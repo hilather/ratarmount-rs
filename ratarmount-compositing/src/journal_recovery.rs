@@ -822,6 +822,12 @@ fn read_record(dir: &Path, follow: bool) -> io::Result<Option<OverlayMeta>> {
     }
     match fs::symlink_metadata(dir.join(crate::HIDDEN_DB)) {
         Ok(m) if m.is_file() => {}
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(io::Error::other(
+                "the overlay database is a symlink; move the database file into place \
+                 of the link, then retry the writable mount",
+            ))
+        }
         Ok(_) => {
             return Err(io::Error::other(
                 "the overlay database is not a regular file".to_string(),

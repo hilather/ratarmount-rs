@@ -124,3 +124,42 @@ fn overlay_db_path_that_is_a_directory_is_named() {
         "{stderr}"
     );
 }
+
+/// Regression: #222 a writable mount followed a symlinked overlay database
+/// and wrote through the link instead of naming the required next step.
+#[cfg(unix)]
+#[test]
+fn regression_mount_refuses_symlinked_db() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a"), b"a").unwrap();
+    let ov = tmp.path().join("ov");
+    let initial = run_w(&ov, &src);
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let db = ov
+        .canonicalize()
+        .unwrap()
+        .join(".ratarmount.overlay.sqlite");
+    let target = tmp.path().join("real.sqlite");
+    std::fs::rename(&db, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &db).unwrap();
+    let before = std::fs::read(&target).unwrap();
+
+    let out = run_w(&ov, &src);
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let want = format!(
+        "error creating write overlay: overlay database {} is a symlink; \
+         it must be a regular file (move the database file into place of the link); \
+         then retry the writable mount",
+        db.display()
+    );
+    assert!(stderr.lines().any(|line| line == want), "{stderr}");
+    assert_eq!(std::fs::read(&target).unwrap(), before);
+}
