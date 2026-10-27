@@ -43,7 +43,9 @@ The helper walk follows same-crate free-function calls transitively, through
 `use .. as` renames of a function or a module, including a chain
 (`use crate::util as u; use u::load as read_index`), `crate::`/`super::`/`self::`
 paths (any same-crate definition) and calls of the caller's own name in
-another module. An alias cycle (`use a as b; use b as a`) is reported.
+another module. Only the first segment of a relative path expands through
+aliases; rooted paths keep their roots. An alias cycle (`use a as b; use b
+as a`) or unknown alias target is reported.
 Generic argument lists (`::<..>`) are matched balanced; an unbalanced one is
 reported. Descriptor duplication and ownership conversion
 (`try_clone_to_owned`, `dup`/`dup2`/`dup3`, `F_DUPFD[_CLOEXEC]`, `File::from`)
@@ -570,9 +572,10 @@ def enclosing(fns, pos):
 # --------------------------------------------------------------------------
 
 
-def use_leaves(text):
+def use_leaves(text, preserve_roots=False):
     """Every `use` declaration flattened to (path segments, local name) with
-    its offset; `*` leaves have local name `*`."""
+    its offset; `*` leaves have local name `*`. Helper resolution preserves
+    initial `self` and an empty segment for leading `::` when requested."""
     out = []
     for m in re.finditer(r"(?<![\w:])use\s+([^;]*);", text):
         toks = re.findall(r"::|[A-Za-z_]\w*|[{},*]", m.group(1))
@@ -593,6 +596,8 @@ def use_leaves(text):
                     return
                 if t == "::":
                     take()
+                    if preserve_roots and not path:
+                        path = [""]
                     continue
                 if t == "{":
                     take()
@@ -610,7 +615,7 @@ def use_leaves(text):
                 if t in (",", "}"):
                     return
                 take()
-                if t == "self":
+                if t == "self" and (path or not preserve_roots):
                     seg_path = path
                 else:
                     seg_path = path + [t]
@@ -1136,51 +1141,62 @@ def stem(rel):
     return os.path.basename(os.path.dirname(rel)) if base in ("mod", "lib", "main") else base
 
 
+PATH_ROOTS = ("", "crate", "self", "super")
+
+
+def resolve_use_path(path, bindings):
+    """Expand only the first segment of a relative path. Rooted targets stop
+    expansion; `None` means the alias chain is unresolved (including cycles)."""
+    seen = set()
+    while path and path[0] not in PATH_ROOTS and path[0] in bindings:
+        name = path[0]
+        if name in seen or bindings[name] is None:
+            return None
+        seen.add(name)
+        path = bindings[name] + path[1:]
+    return path
+
+
 def renamed_imports(text, crate, free):
     """`use .. as` renames in one file: `{alias: (name, module or None)}` for
     an imported same-crate free function (`use crate::m::read_index as
-    legacy_read`), and `{alias: module}` for a renamed module
-    (`use crate::util as u`). A later import through that alias is rewritten
-    to the module it names, to a fixed point (`use u::load as read_index`,
-    `use u as v; v::load`). `use self as s` has an empty path. A cycle (the
-    chain never leaves the alias set) is returned as unresolved aliases so
-    the walk fails closed instead of skipping the helper (#198)."""
+    legacy_read`), and `{alias: path}` for a renamed module
+    (`use crate::util as u`), retaining the whole bound path. Only the first
+    segment of a relative path is expanded (`use u::load as read_index`,
+    `use u as v; v::load`); rooted paths never chase aliases. A cycle or an
+    unknown single-name target fails closed instead of guessing (#198)."""
     raw = {}
-    leaves = []
-    for path, alias, _ in use_leaves(text):
-        if alias == "*":
+    leaves = use_leaves(text, preserve_roots=True)
+    for path, alias, _ in leaves:
+        if alias == "*" or not path or alias == path[-1]:
             continue
-        # `use self as s` contributes no segment; `use self;` is not a rename.
-        target = "self" if not path else path[-1]
-        if alias == target:
-            continue
-        raw[alias] = target
-        leaves.append((path, alias))
+        raw[alias] = path
 
-    def bottom(name):
-        seen = set()
-        while name in raw and name not in seen:
-            seen.add(name)
-            name = raw[name]
-        return name, name in raw
-
+    known = {stem(rel) for (c, _), defs in free.items() if c == crate for rel, _, _ in defs}
+    known.update(name for c, name in free if c == crate)
+    known.update(re.findall(r"\bmod\s+([A-Za-z_]\w*)\s*[;{]", text))
     mods, bad = {}, []
     for alias in raw:
-        name, cyc = bottom(alias)
-        if cyc:
-            bad.append(alias)
-        else:
-            mods[alias] = name
+        path = resolve_use_path([alias], raw)
+        reason = None
+        if path is None:
+            reason = "cycle"
+        elif len(path) == 1 and path[0] not in PATH_ROOTS and path[0] not in known:
+            reason = "unknown target `%s`" % path[0]
+        if reason:
+            bad.append((alias, reason))
+            path = None
+        mods[alias] = path
     fns = {}
-    for path, alias in leaves:
+    for path, alias, _ in leaves:
+        if alias == "*" or not path or alias == path[-1]:
+            continue
+        path = resolve_use_path(path, mods)
         if not path or (crate, path[-1]) not in free:
             continue
         hint = None
-        if len(path) >= 2 and path[-2] not in ("crate", "self", "super"):
-            parent = mods[path[-2]] if path[-2] in mods else path[-2]
-            # An alias of `self` / `super` / `crate` names no module: any
-            # same-crate definition (over-reporting is safe).
-            hint = "" if parent in ("self", "super", "crate") else parent
+        if len(path) >= 2 and path[-2] not in PATH_ROOTS:
+            hint = path[-2]
         fns[alias] = (path[-1], hint)
     return fns, mods, bad
 
@@ -1202,13 +1218,11 @@ def resolves(rel, text, prefix, callee, target, hint=None, mods=None, owners=())
     each is a module name of it as well as the file's (R11-S7-FIX14)."""
     names = {stem(target)} | set(owners)
     mods = mods or {}
-    segs = [p for p in prefix.split("::") if p]
-    if segs and segs[-1] not in ("self", "super", "crate"):
-        mod = mods.get(segs[-1], segs[-1])
-        # `use self as s; s::load(p)`: the alias names no module.
-        if mod in ("self", "super", "crate") and segs[-1] in mods:
-            return True
-        return mod in names
+    segs = resolve_use_path(prefix.split("::")[:-1] if prefix else [], mods)
+    if segs is None:
+        return False  # aliases_of reports the unresolved chain.
+    if segs and segs[-1] not in PATH_ROOTS:
+        return segs[-1] in names
     if segs:
         # `crate::helper(p)`, `super::helper(p)`, `self::helper(p)`: no module
         # is named, so any same-crate definition (over-reporting is safe).
@@ -1220,19 +1234,15 @@ def resolves(rel, text, prefix, callee, target, hint=None, mods=None, owners=())
     # Any import form: `use crate::m::leaf;`, nested braces
     # (`use crate::{m::leaf, ..}`), or a glob of the module (`use crate::m::*;`),
     # including one whose module is itself an alias (`use u::load;`, `use u::*;`).
-    for path, alias, _ in use_leaves(text):
+    for original, alias, _ in use_leaves(text, preserve_roots=True):
+        path = resolve_use_path(original, mods)
         if not path:
             continue
         if alias == "*":
-            leaf = mods.get(path[-1], path[-1])
-            if leaf in names or (path[-1] in mods and leaf in ("self", "super", "crate")):
+            if path[-1] in names or (path != original and path[-1] in PATH_ROOTS):
                 return True
         elif len(path) >= 2 and path[-1] == callee:
-            parent = path[-2]
-            aliased = parent in mods
-            if aliased:
-                parent = mods[parent]
-            if parent in names or (aliased and parent in ("self", "super", "crate")):
+            if path[-2] in names or (path != original and path[-2] in PATH_ROOTS):
                 return True
     return False
 
@@ -1277,8 +1287,8 @@ def helper_errors(entries, scanned, texts, fns):
         if rel not in renames:
             fn_alias, mod_alias, bad = renamed_imports(texts[rel], crate_of(rel), free)
             renames[rel] = (fn_alias, mod_alias)
-            for alias in bad:
-                alias_errors.append("unresolved use-alias chain (fail closed): %s `%s`" % (rel, alias))
+            for alias, reason in bad:
+                alias_errors.append("unresolved use-alias chain (fail closed): %s `%s`: %s" % (rel, alias, reason))
         return renames[rel]
 
     for rel in fns:
@@ -2283,7 +2293,8 @@ def regression_inventory_helper_walk_resolves_chained_use_aliases():
         ("mod util;\nuse crate::util as u;\nuse u::load;\n", "load(p)", True),
         ("mod util;\nuse crate::util as u;\nuse u::*;\n", "load(p)", True),
         ("mod util;\nuse crate::util as u;\nuse u as v;\n", "v::load(p)", True),
-        ("mod util;\nuse crate::util as u;\nuse self::u::load as read_index;\n", "read_index(p)", True),
+        # A rooted path uses the actual module name, without alias expansion.
+        ("mod util;\nuse crate::util as u;\nuse self::util::load as read_index;\n", "read_index(p)", True),
         ("mod util {\n    pub fn load(p: &Path) { let _ = std::fs::read(p); }\n}\n"
          "use self::util as u;\nuse u::load as read_index;\n", "read_index(p)", False),
         ("pub fn load(p: &Path) { let _ = std::fs::read(p); }\nuse self as s;\nuse s::load as read_index;\n",
@@ -2312,6 +2323,131 @@ def regression_inventory_helper_walk_resolves_chained_use_aliases():
                  "c/src/util.rs": leaf})
     errs = check(root, classify(root, {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF}))
     expect(any("unresolved use-alias chain" in e for e in errs), errs)
+
+
+def regression_inventory_helper_walk_rejects_unknown_alias_target():
+    """Regression: an ungrounded alias chain guessed a module name and
+    silently skipped the raw helper instead of refusing fail-closed."""
+    root = fake({"c/src/lib.rs": (
+        "mod util;\nuse missing as u;\nuse u as v;\nuse v::load as read_index;\n"
+        "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; read_index(p); }\n"),
+        "c/src/util.rs": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n"})
+    errs = check(root, classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                                       ("load", "fs::read"): OOF}))
+    expect(any("unresolved use-alias chain" in e and "unknown target `missing`" in e for e in errs), errs)
+
+
+def regression_inventory_helper_walk_rewrites_only_first_relative_segment():
+    """Regression: rooted calls or a later path segment were rewritten
+    through an unrelated local alias and selected a decoy module."""
+    text = "use crate::util as a;\n"
+    free = {("c", "load"): [("c/src/a.rs", 0, 1), ("c/src/util.rs", 0, 1)]}
+    _, mods, bad = renamed_imports(text, "c", free)
+    expect(bad == [], bad)
+    for prefix in ("crate::a::", "super::a::", "self::a::", "::a::", "outer::a::"):
+        expect(resolves("c/src/caller.rs", text, prefix, "load", "c/src/a.rs", mods=mods), prefix)
+        expect(not resolves("c/src/caller.rs", text, prefix, "load", "c/src/util.rs", mods=mods), prefix)
+    for prefix in ("crate::a", "super::a", "self::a", "::a", "outer::a"):
+        for leaf, call in (("load as read_index", "read_index"), ("load", "load"), ("*", "load")):
+            imports = text + "use %s::%s;\n" % (prefix, leaf)
+            fns, mods, bad = renamed_imports(imports, "c", free)
+            expect(bad == [], (imports, bad))
+            callee, hint = fns.get(call, (call, None))
+            expect(resolves("c/src/caller.rs", imports, "", callee, "c/src/a.rs", hint, mods), imports)
+            expect(not resolves("c/src/caller.rs", imports, "", callee, "c/src/util.rs", hint, mods), imports)
+
+
+def check_compiled_alias_fixture(modules, imports, call, raw_module, test_cfg=False):
+    """Type-check a real Rust fixture, then check its exact raw-helper report."""
+    import subprocess
+
+    files = {
+        "c/src/lib.rs": (
+            "#![allow(dead_code, unused_imports, unused_variables)]\n"
+            "pub struct ManagedReadCursor;\n"
+            "impl ManagedReadCursor {\n"
+            "    pub fn open(_: &std::path::Path) -> Self { Self }\n"
+            "}\n"
+            "mod caller;\n" + "".join("mod %s;\n" % name for name in modules)),
+        "c/src/caller.rs": (
+            "use std::path::Path;\nuse crate::ManagedReadCursor;\n" + imports
+            + "fn hash(p: &Path) { let _c = ManagedReadCursor::open(p); %s; }\n" % call),
+    }
+    for name, body in modules.items():
+        files["c/src/%s.rs" % name] = "use std::path::Path;\n" + body
+    root = fake(files)
+    cmd = ["rustc", "--crate-name", "inventory_alias_fixture", "--crate-type", "lib",
+           "--edition=2021", "--emit=metadata", "--out-dir", root, "c/src/lib.rs"]
+    for cfg in ([], ["--cfg", "test"]) if test_cfg else ([],):
+        try:
+            compiled = subprocess.run(cmd + cfg, cwd=root, capture_output=True, text=True, timeout=30)
+        except OSError as e:
+            raise AssertionError("rustc is required for the alias fixture: %s" % e) from e
+        expect(compiled.returncode == 0, (imports, call, compiled.stderr))
+    rules = {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF}
+    errors = check(root, classify(root, rules))
+    expected = ("managed function hash (c/src/caller.rs) reaches helper load "
+                "with a non-managed read (c/src/%s.rs fs::read#1)" % raw_module)
+    expect(errors == [expected], (imports, call, errors))
+    rules[("load", "fs::read")] = dict(OOF, non_mandatory_callers=["hash"])
+    expect(check(root, classify(root, rules)) == [], (imports, call, check(root, classify(root, rules))))
+
+
+def regression_inventory_helper_walk_keeps_rooted_renamed_import():
+    """Regression: a local module alias rewrote `crate::a::load as read_index`
+    to an empty decoy instead of reporting a::load's raw std::fs::read."""
+    check_compiled_alias_fixture(
+        {"a": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "util": "pub fn load(_: &Path) {}\n"},
+        "use crate::util as a;\nuse crate::a::load as read_index;\n",
+        "read_index(p)", "a")
+
+
+def regression_inventory_helper_walk_keeps_rooted_bare_import():
+    """Regression: a local module alias rewrote the parent of `use crate::a::load`
+    and hid the raw helper behind an empty decoy."""
+    check_compiled_alias_fixture(
+        {"a": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "util": "pub fn load(_: &Path) {}\n"},
+        "use crate::util as a;\nuse crate::a::load;\n", "load(p)", "a")
+
+
+def regression_inventory_helper_walk_keeps_rooted_glob_import():
+    """Regression: a local module alias rewrote `use crate::a::*` to an empty
+    decoy and hid the raw std::fs::read reached through load(p)."""
+    check_compiled_alias_fixture(
+        {"a": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "util": "pub fn load(_: &Path) {}\n"},
+        "use crate::util as a;\nuse crate::a::*;\n", "load(p)", "a")
+
+
+def regression_inventory_helper_walk_test_alias_does_not_rewrite_rooted_import():
+    """Regression: an alias inside #[cfg(test)] mod tests poisoned the
+    production import `use crate::a::load as read_index`."""
+    check_compiled_alias_fixture(
+        {"a": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "util": "pub fn load(_: &Path) {}\n"},
+        "use crate::a::load as read_index;\n"
+        "#[cfg(test)] mod tests { use crate::util as a; }\n",
+        "read_index(p)", "a", test_cfg=True)
+
+
+def regression_inventory_helper_walk_qualified_alias_stops_at_rooted_target():
+    """Regression: o::load followed o -> util -> outer across two absolute
+    imports and selected an empty decoy instead of util::load's raw read."""
+    check_compiled_alias_fixture(
+        {"util": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "outer": "pub fn load(_: &Path) {}\n"},
+        "use crate::util as o;\nuse crate::outer as util;\n", "o::load(p)", "util")
+
+
+def regression_inventory_helper_walk_absolute_alias_name_swap_is_not_cycle():
+    """Regression: absolute foo/bar name-swapped imports were falsely
+    reported as a cycle instead of following bar::load to foo::load."""
+    check_compiled_alias_fixture(
+        {"foo": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n",
+         "bar": "pub fn load(_: &Path) {}\n"},
+        "use crate::foo as bar;\nuse crate::bar as foo;\n", "bar::load(p)", "foo")
 
 
 def self_test():
