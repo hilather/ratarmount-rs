@@ -43,9 +43,11 @@ The helper walk follows same-crate free-function calls transitively, through
 `use .. as` renames of a function or a module, including a chain
 (`use crate::util as u; use u::load as read_index`), `crate::`/`super::`/`self::`
 paths (any same-crate definition) and calls of the caller's own name in
-another module. Only the first segment of a relative path expands through
-aliases; rooted paths keep their roots. An alias cycle (`use a as b; use b
-as a`) or unknown alias target is reported.
+another module. Main's helper resolver runs unchanged; a separate alias-chain
+pass adds reports, and their union preserves every report from main. In the
+extra pass, only the first segment of a relative path expands through aliases;
+rooted paths keep their roots. Cycles, unknown targets, ambiguous or unsupported
+scoped bindings, and re-export paths the extra pass cannot follow fail closed.
 Generic argument lists (`::<..>`) are matched balanced; an unbalanced one is
 reported. Descriptor duplication and ownership conversion
 (`try_clone_to_owned`, `dup`/`dup2`/`dup3`, `F_DUPFD[_CLOEXEC]`, `File::from`)
@@ -55,9 +57,8 @@ libarchive `archive_read_open_filename`, lopdf `Document::load`) are
 operations of their own.
 
 Known limits: a renamed crate root (`use std as s`), a glob import of a local
-module that re-exports an fs function, a `pub use .. as` re-export called
-through its new path, openers of other crates (`nix`) and foreign openers not
-listed above, method and cross-crate calls in the helper walk.
+module that re-exports an fs function, openers of other crates (`nix`) and
+foreign openers not listed above, method and cross-crate calls in the helper walk.
 
 Usage:
   test-internal-read-inventory.py            check the workspace (exit 0/1)
@@ -572,10 +573,9 @@ def enclosing(fns, pos):
 # --------------------------------------------------------------------------
 
 
-def use_leaves(text, preserve_roots=False):
+def use_leaves(text):
     """Every `use` declaration flattened to (path segments, local name) with
-    its offset; `*` leaves have local name `*`. Helper resolution preserves
-    initial `self` and an empty segment for leading `::` when requested."""
+    its offset; `*` leaves have local name `*`."""
     out = []
     for m in re.finditer(r"(?<![\w:])use\s+([^;]*);", text):
         toks = re.findall(r"::|[A-Za-z_]\w*|[{},*]", m.group(1))
@@ -596,8 +596,6 @@ def use_leaves(text, preserve_roots=False):
                     return
                 if t == "::":
                     take()
-                    if preserve_roots and not path:
-                        path = [""]
                     continue
                 if t == "{":
                     take()
@@ -615,7 +613,7 @@ def use_leaves(text, preserve_roots=False):
                 if t in (",", "}"):
                     return
                 take()
-                if t == "self" and (path or not preserve_roots):
+                if t == "self":
                     seg_path = path
                 else:
                     seg_path = path + [t]
@@ -1091,7 +1089,7 @@ def check(root, manifest):
     for k, e in by_key.items():
         if k not in scanned:
             errors.append("stale manifest entry (operation is gone): %s %s %s#%d" % k)
-    errors.extend(helper_errors(entries, scanned, texts, fns))
+    errors.extend(union_helper_errors(entries, scanned, texts, fns))
     return errors
 
 
@@ -1141,64 +1139,21 @@ def stem(rel):
     return os.path.basename(os.path.dirname(rel)) if base in ("mod", "lib", "main") else base
 
 
-PATH_ROOTS = ("", "crate", "self", "super")
-
-
-def resolve_use_path(path, bindings):
-    """Expand only the first segment of a relative path. Rooted targets stop
-    expansion; `None` means the alias chain is unresolved (including cycles)."""
-    seen = set()
-    while path and path[0] not in PATH_ROOTS and path[0] in bindings:
-        name = path[0]
-        if name in seen or bindings[name] is None:
-            return None
-        seen.add(name)
-        path = bindings[name] + path[1:]
-    return path
-
-
 def renamed_imports(text, crate, free):
     """`use .. as` renames in one file: `{alias: (name, module or None)}` for
     an imported same-crate free function (`use crate::m::read_index as
-    legacy_read`), and `{alias: path}` for a renamed module
-    (`use crate::util as u`), retaining the whole bound path. Only the first
-    segment of a relative path is expanded (`use u::load as read_index`,
-    `use u as v; v::load`); rooted paths never chase aliases. A cycle or an
-    unknown single-name target fails closed instead of guessing (#198)."""
-    raw = {}
-    leaves = use_leaves(text, preserve_roots=True)
-    for path, alias, _ in leaves:
+    legacy_read`), and `{alias: module}` for a renamed module
+    (`use crate::util as u`)."""
+    fns, mods = {}, {}
+    for path, alias, _ in use_leaves(text):
         if alias == "*" or not path or alias == path[-1]:
             continue
-        raw[alias] = path
-
-    known = {stem(rel) for (c, _), defs in free.items() if c == crate for rel, _, _ in defs}
-    known.update(name for c, name in free if c == crate)
-    known.update(re.findall(r"\bmod\s+([A-Za-z_]\w*)\s*[;{]", text))
-    mods, bad = {}, []
-    for alias in raw:
-        path = resolve_use_path([alias], raw)
-        reason = None
-        if path is None:
-            reason = "cycle"
-        elif len(path) == 1 and path[0] not in PATH_ROOTS and path[0] not in known:
-            reason = "unknown target `%s`" % path[0]
-        if reason:
-            bad.append((alias, reason))
-            path = None
-        mods[alias] = path
-    fns = {}
-    for path, alias, _ in leaves:
-        if alias == "*" or not path or alias == path[-1]:
-            continue
-        path = resolve_use_path(path, mods)
-        if not path or (crate, path[-1]) not in free:
-            continue
-        hint = None
-        if len(path) >= 2 and path[-2] not in PATH_ROOTS:
-            hint = path[-2]
-        fns[alias] = (path[-1], hint)
-    return fns, mods, bad
+        hint = path[-2] if len(path) >= 2 and path[-2] not in ("crate", "self", "super") else None
+        if (crate, path[-1]) in free:
+            fns[alias] = (path[-1], hint)
+        if path[-1] not in ("crate", "self", "super"):
+            mods[alias] = path[-1]
+    return fns, mods
 
 
 def inline_mods(text):
@@ -1210,19 +1165,14 @@ def inline_mods(text):
 def resolves(rel, text, prefix, callee, target, hint=None, mods=None, owners=()):
     """Whether a call `prefix callee(` in `rel` may name `callee` in `target`:
     the same file for a bare call (or a file whose module the caller imports
-    the name from, through an alias chain: `use u::load` where `u` is
-    `util`), the named module for a qualified call (through a renamed
-    module import too, `use u as v; v::load`); `hint` is the module a
-    renamed function import names, after that chain is resolved.
+    the name from), the named module for a qualified call (through a renamed
+    module import too); `hint` is the module a renamed function import names.
     `owners` are the inline modules (`mod util { .. }`) around the definition:
     each is a module name of it as well as the file's (R11-S7-FIX14)."""
     names = {stem(target)} | set(owners)
-    mods = mods or {}
-    segs = resolve_use_path(prefix.split("::")[:-1] if prefix else [], mods)
-    if segs is None:
-        return False  # aliases_of reports the unresolved chain.
-    if segs and segs[-1] not in PATH_ROOTS:
-        return segs[-1] in names
+    segs = [p for p in prefix.split("::") if p]
+    if segs and segs[-1] not in ("self", "super", "crate"):
+        return (mods or {}).get(segs[-1], segs[-1]) in names
     if segs:
         # `crate::helper(p)`, `super::helper(p)`, `self::helper(p)`: no module
         # is named, so any same-crate definition (over-reporting is safe).
@@ -1232,18 +1182,12 @@ def resolves(rel, text, prefix, callee, target, hint=None, mods=None, owners=())
     if target == rel:
         return True
     # Any import form: `use crate::m::leaf;`, nested braces
-    # (`use crate::{m::leaf, ..}`), or a glob of the module (`use crate::m::*;`),
-    # including one whose module is itself an alias (`use u::load;`, `use u::*;`).
-    for original, alias, _ in use_leaves(text, preserve_roots=True):
-        path = resolve_use_path(original, mods)
-        if not path:
-            continue
-        if alias == "*":
-            if path[-1] in names or (path != original and path[-1] in PATH_ROOTS):
-                return True
-        elif len(path) >= 2 and path[-1] == callee:
-            if path[-2] in names or (path != original and path[-2] in PATH_ROOTS):
-                return True
+    # (`use crate::{m::leaf, ..}`), or a glob of the module (`use crate::m::*;`).
+    for path, alias, _ in use_leaves(text):
+        if alias == "*" and path and path[-1] in names:
+            return True
+        if len(path) >= 2 and path[-1] == callee and path[-2] in names:
+            return True
     return False
 
 
@@ -1253,10 +1197,8 @@ def helper_errors(entries, scanned, texts, fns):
     and must not hold a raw descriptor except around a classified
     non-managed operation on the same line. A helper's entry may excuse a
     caller by listing, in `non_mandatory_callers`, the managed root or the
-    function that calls the helper directly. A `use` alias is followed
-    through later aliases (`use crate::util as u; use u::load as read_index`);
-    a cycle is reported. Limits: methods and associated functions are not
-    followed, nor calls across crates."""
+    function that calls the helper directly. Limits: methods and associated
+    functions are not followed, nor calls across crates."""
     errs = []
     by_key = {key(e): e for e in entries}
     managed_fns = {}
@@ -1281,24 +1223,13 @@ def helper_errors(entries, scanned, texts, fns):
                 owners[(rel, a)] = tuple(n for n, o, c in inl if o < a < c)
 
     renames = {}
-    alias_errors = []
-
-    def aliases_of(rel):
-        if rel not in renames:
-            fn_alias, mod_alias, bad = renamed_imports(texts[rel], crate_of(rel), free)
-            renames[rel] = (fn_alias, mod_alias)
-            for alias, reason in bad:
-                alias_errors.append("unresolved use-alias chain (fail closed): %s `%s`: %s" % (rel, alias, reason))
-        return renames[rel]
-
-    for rel in fns:
-        if rel in texts:
-            aliases_of(rel)
 
     def callees(rel, a, b):
         text = texts[rel]
         body = text[a:b]
-        fn_alias, mod_alias = aliases_of(rel)
+        if rel not in renames:
+            renames[rel] = renamed_imports(text, crate_of(rel), free)
+        fn_alias, mod_alias = renames[rel]
         out = []
         for m in CALL_RE.finditer(body):
             prefix, callee = m.group(1), m.group(2)
@@ -1362,8 +1293,355 @@ def helper_errors(entries, scanned, texts, fns):
                                 % (qual, rel, callee, chain, o["file"], o["op"], o["ordinal"]))
                 for nxt in callees(target, ta, tb):
                     queue.append((callee,) + nxt)
-    errs.extend(alias_errors)
     return sorted(set(errs))
+
+
+# Separate #198 pass. Main resolution above is intentionally kept verbatim.
+
+
+def chain_use_leaves(text, preserve_roots=False):
+    """Every `use` declaration flattened to (path segments, local name) with
+    its offset; `*` leaves have local name `*`. Helper resolution preserves
+    initial `self` and an empty segment for leading `::` when requested."""
+    out = []
+    for m in re.finditer(r"(?<![\w:])use\s+([^;]*);", text):
+        toks = re.findall(r"::|[A-Za-z_]\w*|[{},*]", m.group(1))
+        pos = [0]
+
+        def peek():
+            return toks[pos[0]] if pos[0] < len(toks) else None
+
+        def take():
+            pos[0] += 1
+            return toks[pos[0] - 1]
+
+        def tree(prefix):
+            path = list(prefix)
+            while True:
+                t = peek()
+                if t is None:
+                    return
+                if t == "::":
+                    take()
+                    if preserve_roots and not path:
+                        path = [""]
+                    continue
+                if t == "{":
+                    take()
+                    while peek() not in ("}", None):
+                        tree(path)
+                        if peek() == ",":
+                            take()
+                    if peek() == "}":
+                        take()
+                    return
+                if t == "*":
+                    take()
+                    out.append((path, "*", m.start()))
+                    return
+                if t in (",", "}"):
+                    return
+                take()
+                if t == "self" and (path or not preserve_roots):
+                    seg_path = path
+                else:
+                    seg_path = path + [t]
+                if peek() == "::":
+                    path = seg_path
+                    continue
+                alias = seg_path[-1] if seg_path else t
+                if peek() == "as":
+                    take()
+                    alias = take() if peek() not in (None, ",", "}") else alias
+                out.append((seg_path, alias, m.start()))
+                return
+
+        while peek() is not None:
+            tree([])
+            if peek() == ",":
+                take()
+            elif peek() is not None:
+                take()
+    return out
+
+
+PATH_ROOTS = ("", "crate", "self", "super")
+
+
+class ChainBindings(dict):
+    """Extra-pass aliases only. Never change main's resolver or its reports.
+
+    The chain pass cannot model Rust lexical visibility or re-exports. Refuse
+    an attempted expansion if its binding is ambiguous or outside file scope;
+    keep test-only bindings as ambiguity evidence, rather than letting them
+    redirect a production call. Failures are collected even for excused reads.
+    """
+
+    def __init__(self, text, crate, free, reexports=(), modules=("crate",)):
+        super().__init__()
+        self.bad = []
+        self.reexports = reexports
+        self.modules = modules
+        self.inline = inline_mods(text)
+        leaves = chain_use_leaves(text, preserve_roots=True)
+        declarations = [(m.group(1), m.start()) for m in
+                        re.finditer(r"\bmod\s+([A-Za-z_]\w*)\s*[;{]", text)]
+        self.known = {stem(rel) for (c, _), defs in free.items() if c == crate
+                      for rel, _, _ in defs}
+        self.known.update(name for c, name in free if c == crate)
+        self.known.update(name for name, _ in declarations)
+        # A scope is its stack of opening braces; import-tree braces are
+        # harmless because the `use` offset precedes them.
+        positions = sorted({at for _, _, at in leaves} | {at for _, at in declarations}, reverse=True)
+        scopes, stack = {}, []
+        for m in re.finditer(r"[{}]", text):
+            while positions and positions[-1] < m.start():
+                scopes[positions.pop()] = tuple(stack)
+            if m.group() == "{":
+                stack.append(m.start())
+            elif stack:
+                stack.pop()
+        for at in positions:
+            scopes[at] = tuple(stack)
+        self.scopes = {}
+        for name, at in declarations + [(alias, at) for _, alias, at in leaves if alias != "*"]:
+            self.scopes.setdefault(name, set()).add(scopes[at])
+        for path, alias, _ in leaves:
+            if path and alias not in ("*", "_", path[-1]):
+                self[alias] = path
+
+    def refuse(self, name, reason):
+        self.bad.append((name, reason))
+        return None
+
+    def check_reexports(self, path, at=0):
+        # Normalize roots only for checking the re-export owner; never expand
+        # aliases inside a rooted path. Function and block scopes add no module.
+        if path and path[0] in ("self", "super"):
+            context = list(self.modules) + [name for name, o, c in self.inline if o < at < c]
+            path = list(path)
+            if path[0] == "self":
+                path.pop(0)
+            while path and path[0] == "super":
+                if len(context) > 1:
+                    context.pop()
+                path.pop(0)
+            path = [context[-1]] + path
+        # Match the owning module too: an unrelated re-export of `load`
+        # must not poison a direct call to util::load. Globs have no leaf name.
+        for owner, name in zip(path, path[1:]):
+            if (owner, name) in self.reexports or (owner, "*") in self.reexports:
+                self.refuse(name, "unsupported pub use re-export through `%s`" % owner)
+                return False
+        return True
+
+    def resolve(self, path):
+        seen = set()
+        while path and path[0] not in PATH_ROOTS and path[0] in self:
+            name = path[0]
+            scopes = self.scopes[name]
+            if len(scopes) > 1:
+                return self.refuse(name, "alias name is bound in more than one scope")
+            if next(iter(scopes)):
+                return self.refuse(name, "scoped alias visibility cannot be resolved")
+            if name in seen:
+                return self.refuse(name, "cycle")
+            seen.add(name)
+            target = self[name]
+            # Validate the alias target before adding a call/import suffix:
+            # u -> missing must fail for u::load as well as for `use u as v`.
+            if len(target) == 1 and target[0] not in PATH_ROOTS and target[0] not in self and target[0] not in self.known:
+                return self.refuse(name, "unknown target `%s`" % target[0])
+            path = target + path[1:]
+        return path
+
+
+def chain_renamed_imports(text, crate, free, reexports=(), modules=("crate",)):
+    """Resolve relative first-segment alias chains in a separate extra pass."""
+    bindings = ChainBindings(text, crate, free, reexports, modules)
+    fns = {}
+    for original, alias, at in chain_use_leaves(text, preserve_roots=True):
+        if not original or alias in ("*", "_", original[-1]):
+            continue
+        path = bindings.resolve(original)
+        if path and not bindings.check_reexports(path, at):
+            continue
+        if path and (crate, path[-1]) in free:
+            hint = path[-2] if len(path) >= 2 and path[-2] not in PATH_ROOTS else None
+            fns[alias] = (path[-1], hint)
+    return fns, bindings, bindings.bad
+
+
+def chain_resolves(rel, text, prefix, callee, target, hint=None, mods=None, owners=()):
+    """Whether a call `prefix callee(` in `rel` may name `callee` in `target`:
+    the same file for a bare call (or a file whose module the caller imports
+    the name from, through an alias chain: `use u::load` where `u` is
+    `util`), the named module for a qualified call (through a renamed
+    module import too, `use u as v; v::load`); `hint` is the module a
+    renamed function import names, after that chain is resolved.
+    `owners` are the inline modules (`mod util { .. }`) around the definition:
+    each is a module name of it as well as the file's (R11-S7-FIX14)."""
+    names = {stem(target)} | set(owners)
+    mods = mods if mods is not None else ChainBindings(text, "", {})
+    segs = mods.resolve(prefix.split("::")[:-1] if prefix else [])
+    if segs is None:
+        return False  # aliases_of reports the unresolved chain.
+    if segs and segs[-1] not in PATH_ROOTS:
+        return segs[-1] in names
+    if segs:
+        # `crate::helper(p)`, `super::helper(p)`, `self::helper(p)`: no module
+        # is named, so any same-crate definition (over-reporting is safe).
+        return True
+    if hint is not None:
+        return hint == "" or hint in names
+    if target == rel:
+        return True
+    # Any import form: `use crate::m::leaf;`, nested braces
+    # (`use crate::{m::leaf, ..}`), or a glob of the module (`use crate::m::*;`),
+    # including one whose module is itself an alias (`use u::load;`, `use u::*;`).
+    for original, alias, at in chain_use_leaves(text, preserve_roots=True):
+        path = mods.resolve(original)
+        if not path or not mods.check_reexports(path, at):
+            continue
+        if alias == "*":
+            if path[-1] in names or (path != original and path[-1] in PATH_ROOTS):
+                return True
+        elif len(path) >= 2 and path[-1] == callee:
+            if path[-2] in names or (path != original and path[-2] in PATH_ROOTS):
+                return True
+    return False
+
+
+def chain_helper_errors(entries, scanned, texts, fns):
+    """Walk the extra #198 call graph independently of main's helper pass.
+
+    Keep the same managed roots, helper exemptions and report format; add
+    chain resolution and explicit refusals for unsupported alias paths.
+    """
+    errs = []
+    by_key = {key(e): e for e in entries}
+    managed_fns = {}
+    for e in entries:
+        if e.get("disposition") in ("managed-read", "sqlite-snapshot"):
+            managed_fns.setdefault(e["file"], set()).add(e["function"])
+    raw_by_fn = {}
+    for o in scanned.values():
+        if o["op"] in MANAGED_OPS:
+            continue
+        if "::" not in o["function"]:
+            raw_by_fn.setdefault((crate_of(o["file"]), o["function"]), []).append(o)
+    # Free functions by (crate, name): [(file, start, end)].
+    free, owners = {}, {}
+    for rel, lst in fns.items():
+        inl = inline_mods(texts[rel]) if rel in texts else []
+        for a, b, qual in lst:
+            if "::" not in qual:
+                free.setdefault((crate_of(rel), qual), []).append((rel, a, b))
+                owners[(rel, a)] = tuple(n for n, o, c in inl if o < a < c)
+
+    renames = {}
+    reexports = {}
+    for rel, text in texts.items():
+        inl = inline_mods(text)
+        for _, alias, at in chain_use_leaves(text, preserve_roots=True):
+            if not re.search(r"\bpub(?:\s*\([^)]*\))?\s+$", text[max(0, at - 80):at]):
+                continue
+            enclosing_mods = [(o, name) for name, o, c in inl if o < at < c]
+            owner = max(enclosing_mods)[1] if enclosing_mods else stem(rel)
+            if not enclosing_mods and os.path.basename(rel) in ("lib.rs", "main.rs"):
+                # Root calls already reach any same-crate definition by name.
+                # Only a renamed root export or a glob needs refusal here.
+                if (crate_of(rel), alias) in free:
+                    continue
+                owner = "crate"
+            reexports.setdefault(crate_of(rel), set()).add((owner, alias))
+
+    def aliases_of(rel):
+        if rel not in renames:
+            parts = rel.split("/")[2:]
+            modules = ("crate",) + tuple(parts[:-1])
+            if parts and parts[-1] not in ("lib.rs", "main.rs", "mod.rs"):
+                modules += (parts[-1][:-3],)
+            fn_alias, mod_alias, _ = chain_renamed_imports(
+                texts[rel], crate_of(rel), free, reexports.get(crate_of(rel), set()), modules)
+            renames[rel] = (fn_alias, mod_alias)
+        return renames[rel]
+
+    def callees(rel, a, b):
+        text = texts[rel]
+        body = text[a:b]
+        fn_alias, mod_alias = aliases_of(rel)
+        out = []
+        for m in CALL_RE.finditer(body):
+            prefix, callee = m.group(1), m.group(2)
+            hint = None
+            if not prefix and callee in fn_alias:
+                # `use crate::m::read_index as legacy_read; legacy_read(p)`.
+                # A `crate::`/`self::`/`super::` path names no module: any
+                # same-crate definition (over-reporting is safe).
+                if mod_alias.resolve([callee]) is None:
+                    continue
+                callee, hint = fn_alias[callee]
+                hint = hint or ""
+            if text[max(0, a + m.start() - 3):a + m.start()].endswith("fn "):
+                continue
+            if prefix:
+                path = mod_alias.resolve(prefix.split("::")[:-1] + [callee])
+                if path is None or not mod_alias.check_reexports(path, a + m.start()):
+                    continue
+            for target, ta, tb in free.get((crate_of(rel), callee), []):
+                # A call of the same name is followed unless it is the caller
+                # itself (`other::read_index(p)` from `read_index`).
+                if (target, ta) == (rel, a):
+                    continue
+                if chain_resolves(rel, text, prefix, callee, target, hint, mod_alias, owners[(target, ta)]):
+                    out.append((callee, target, ta, tb))
+        return out
+
+    for rel, names in managed_fns.items():
+        text = texts.get(rel)
+        if text is None:
+            continue
+        for a, b, qual in fns.get(rel, []):
+            if qual not in names:
+                continue
+            # Breadth-first over the call graph; `via` is the direct caller.
+            queue = [(qual, callee, target, ta, tb) for callee, target, ta, tb in callees(rel, a, b)]
+            visited = set()
+            while queue:
+                via, callee, target, ta, tb = queue.pop(0)
+                # A definition is its file and offset: two `bridge`s in one
+                # file (`first::bridge`, `second::bridge`) are both walked
+                # (R11-S7-FIX15).
+                if (target, ta) in visited:
+                    continue
+                visited.add((target, ta))
+                for o in raw_by_fn.get((crate_of(rel), callee), []):
+                    if o["file"] != target:
+                        continue
+                    ent = by_key.get(key(o))
+                    if ent is None or ent.get("disposition") in ("managed-read", "sqlite-snapshot", "output-owner"):
+                        continue
+                    excused = ent.get("non_mandatory_callers") or []
+                    if qual in excused or via in excused:
+                        continue
+                    if ent.get("category") == "directory-handle-or-durability":
+                        continue  # a directory handle reads no file content
+                    chain = "" if via == qual else " via %s" % via
+                    errs.append("managed function %s (%s) reaches helper %s%s with a non-managed read (%s %s#%d)"
+                                % (qual, rel, callee, chain, o["file"], o["op"], o["ordinal"]))
+                for nxt in callees(target, ta, tb):
+                    queue.append((callee,) + nxt)
+    for rel, (_, bindings) in renames.items():
+        for alias, reason in bindings.bad:
+            errs.append("unresolved use-alias chain (fail closed): %s `%s`: %s" % (rel, alias, reason))
+    return sorted(set(errs))
+
+
+def union_helper_errors(entries, scanned, texts, fns):
+    """Union main's unchanged helper walk with the independent chain pass."""
+    return sorted(set(helper_errors(entries, scanned, texts, fns)) |
+                  set(chain_helper_errors(entries, scanned, texts, fns)))
 
 
 # --------------------------------------------------------------------------
@@ -2328,13 +2606,15 @@ def regression_inventory_helper_walk_resolves_chained_use_aliases():
 def regression_inventory_helper_walk_rejects_unknown_alias_target():
     """Regression: an ungrounded alias chain guessed a module name and
     silently skipped the raw helper instead of refusing fail-closed."""
-    root = fake({"c/src/lib.rs": (
-        "mod util;\nuse missing as u;\nuse u as v;\nuse v::load as read_index;\n"
-        "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; read_index(p); }\n"),
-        "c/src/util.rs": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n"})
-    errs = check(root, classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
-                                       ("load", "fs::read"): OOF}))
-    expect(any("unresolved use-alias chain" in e and "unknown target `missing`" in e for e in errs), errs)
+    for imports in ("use missing as u;\nuse u::load as read_index;\n",
+                    "use missing as u;\nuse u as v;\nuse v::load as read_index;\n"):
+        root = fake({"c/src/lib.rs": (
+            "mod util;\n" + imports
+            + "fn hash(p: &Path) { let c = ManagedReadCursor::open(p)?; read_index(p); }\n"),
+            "c/src/util.rs": "pub fn load(p: &Path) { let _ = std::fs::read(p); }\n"})
+        errs = check(root, classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                                           ("load", "fs::read"): OOF}))
+        expect(any("unresolved use-alias chain" in e and "unknown target `missing`" in e for e in errs), errs)
 
 
 def regression_inventory_helper_walk_rewrites_only_first_relative_segment():
@@ -2342,19 +2622,19 @@ def regression_inventory_helper_walk_rewrites_only_first_relative_segment():
     through an unrelated local alias and selected a decoy module."""
     text = "use crate::util as a;\n"
     free = {("c", "load"): [("c/src/a.rs", 0, 1), ("c/src/util.rs", 0, 1)]}
-    _, mods, bad = renamed_imports(text, "c", free)
+    _, mods, bad = chain_renamed_imports(text, "c", free)
     expect(bad == [], bad)
     for prefix in ("crate::a::", "super::a::", "self::a::", "::a::", "outer::a::"):
-        expect(resolves("c/src/caller.rs", text, prefix, "load", "c/src/a.rs", mods=mods), prefix)
-        expect(not resolves("c/src/caller.rs", text, prefix, "load", "c/src/util.rs", mods=mods), prefix)
+        expect(chain_resolves("c/src/caller.rs", text, prefix, "load", "c/src/a.rs", mods=mods), prefix)
+        expect(not chain_resolves("c/src/caller.rs", text, prefix, "load", "c/src/util.rs", mods=mods), prefix)
     for prefix in ("crate::a", "super::a", "self::a", "::a", "outer::a"):
         for leaf, call in (("load as read_index", "read_index"), ("load", "load"), ("*", "load")):
             imports = text + "use %s::%s;\n" % (prefix, leaf)
-            fns, mods, bad = renamed_imports(imports, "c", free)
+            fns, mods, bad = chain_renamed_imports(imports, "c", free)
             expect(bad == [], (imports, bad))
             callee, hint = fns.get(call, (call, None))
-            expect(resolves("c/src/caller.rs", imports, "", callee, "c/src/a.rs", hint, mods), imports)
-            expect(not resolves("c/src/caller.rs", imports, "", callee, "c/src/util.rs", hint, mods), imports)
+            expect(chain_resolves("c/src/caller.rs", imports, "", callee, "c/src/a.rs", hint, mods), imports)
+            expect(not chain_resolves("c/src/caller.rs", imports, "", callee, "c/src/util.rs", hint, mods), imports)
 
 
 def check_compiled_alias_fixture(modules, imports, call, raw_module, test_cfg=False):
@@ -2450,17 +2730,232 @@ def regression_inventory_helper_walk_absolute_alias_name_swap_is_not_cycle():
         "use crate::foo as bar;\nuse crate::bar as foo;\n", "bar::load(p)", "foo")
 
 
+SCOPE_IMPORTS = (
+    ("use a::load;\n", "load(p)"),
+    ("use a::load as read_index;\n", "read_index(p)"),
+    ("use a::*;\n", "load(p)"),
+    ("use a::{load};\n", "load(p)"),
+    ("use a::{load as read_index};\n", "read_index(p)"),
+)
+SCOPE_ALIASES = {
+    "nested": "mod nested { use crate::util as a; }\n",
+    "test": "#[cfg(test)] mod tests { use crate::util as a; }\n",
+    "function": "fn other() { use crate::util as a; }\n",
+}
+UTIL_IMPORTS = (
+    ("use util::load;\n", "load(p)"),
+    ("use util::load as read_index;\n", "read_index(p)"),
+    ("use util::*;\n", "load(p)"),
+)
+
+
+def check_compiled_scope_fixture(imports, call, raw_file, local_a=False, test_cfg=False,
+                                 refusal_reason=None):
+    """Compile a scope collision, then require main's raw report or refusal."""
+    import subprocess
+
+    files = {
+        "c/src/lib.rs": (
+            "#![allow(dead_code, unused_imports, unused_variables)]\n"
+            "pub struct ManagedReadCursor;\n"
+            "impl ManagedReadCursor {\n"
+            "    pub fn open(_: &std::path::Path) -> Self { Self }\n"
+            "}\n"
+            "mod caller;\npub mod util;\nmod decoy;\n"),
+        "c/src/caller.rs": (
+            "use std::path::Path;\nuse crate::ManagedReadCursor;\n"
+            + ("mod a;\n" if local_a else "use crate::util;\n") + imports
+            + "fn hash(p: &Path) { let _c = ManagedReadCursor::open(p); %s; }\n" % call),
+        "c/src/util.rs": "use std::path::Path;\npub fn load(p: &Path) { %s }\n" % (
+            "let _ = std::fs::read(p);" if raw_file == "c/src/util.rs" else ""),
+        "c/src/decoy.rs": "pub fn load(_: &std::path::Path) {}\n",
+    }
+    if local_a:
+        files["c/src/caller/a.rs"] = (
+            "pub fn load(p: &std::path::Path) { let _ = std::fs::read(p); }\n")
+    root = fake(files)
+    cmd = ["rustc", "--crate-name", "inventory_scope_fixture", "--crate-type", "lib",
+           "--edition=2021", "--emit=metadata", "--out-dir", root, "c/src/lib.rs"]
+    for cfg in ([], ["--cfg", "test"]) if test_cfg else ([],):
+        try:
+            compiled = subprocess.run(cmd + cfg, cwd=root, capture_output=True, text=True, timeout=30)
+        except OSError as e:
+            raise AssertionError("rustc is required for the scope fixture: %s" % e) from e
+        expect(compiled.returncode == 0, (imports, call, compiled.stderr))
+    rules = {("hash", "ManagedReadCursor::open"): MANAGED, ("load", "fs::read"): OOF}
+    errors = check(root, classify(root, rules))
+    expected = ("managed function hash (c/src/caller.rs) reaches helper load "
+                "with a non-managed read (%s fs::read#1)" % raw_file)
+    refusal = [e for e in errors if "unresolved use-alias chain (fail closed)" in e]
+    expect(expected in errors or refusal, (imports, call, errors))
+    expect(all(e == expected or e in refusal for e in errors), (imports, call, errors))
+    if refusal_reason:
+        expect(any(refusal_reason in e for e in refusal), (imports, call, errors))
+    # Exempting the actual helper may remove its report, but cannot excuse
+    # an unsupported alias: refusal must still be explicit.
+    rules[("load", "fs::read")] = dict(OOF, non_mandatory_callers=["hash"])
+    excused = check(root, classify(root, rules))
+    expect(all("unresolved use-alias chain (fail closed)" in e for e in excused), excused)
+    if refusal_reason:
+        expect(any(refusal_reason in e for e in excused), excused)
+
+
+def regression_inventory_helper_walk_nested_alias_does_not_hide_relative_imports():
+    """Regression: a sibling module's alias hid five forms of a::load import."""
+    for imports, call in SCOPE_IMPORTS:
+        check_compiled_scope_fixture(SCOPE_ALIASES["nested"] + imports, call,
+                                     "c/src/caller/a.rs", local_a=True,
+                                     refusal_reason="bound in more than one scope")
+
+
+def regression_inventory_helper_walk_test_alias_does_not_hide_relative_imports():
+    """Regression: a test module's alias hid five production a::load imports."""
+    for imports, call in SCOPE_IMPORTS:
+        check_compiled_scope_fixture(SCOPE_ALIASES["test"] + imports, call,
+                                     "c/src/caller/a.rs", local_a=True, test_cfg=True,
+                                     refusal_reason="bound in more than one scope")
+
+
+def regression_inventory_helper_walk_function_alias_does_not_hide_relative_imports():
+    """Regression: an unrelated function's alias hid five a::load imports."""
+    for imports, call in SCOPE_IMPORTS:
+        check_compiled_scope_fixture(SCOPE_ALIASES["function"] + imports, call,
+                                     "c/src/caller/a.rs", local_a=True,
+                                     refusal_reason="bound in more than one scope")
+
+
+def regression_inventory_helper_walk_test_alias_does_not_hide_util_imports():
+    """Regression: test-only util -> decoy hid a production util::load read."""
+    alias = "#[cfg(test)] mod tests { use crate::decoy as util; }\n"
+    for imports, call in UTIL_IMPORTS:
+        check_compiled_scope_fixture(alias + imports, call, "c/src/util.rs", test_cfg=True,
+                                     refusal_reason="bound in more than one scope")
+
+
+def regression_inventory_helper_walk_function_alias_does_not_hide_util_imports():
+    """Regression: a function-local util -> decoy hid a production raw helper."""
+    alias = "fn other() { use crate::decoy as util; }\n"
+    for imports, call in UTIL_IMPORTS:
+        check_compiled_scope_fixture(alias + imports, call, "c/src/util.rs",
+                                     refusal_reason="bound in more than one scope")
+
+
+def regression_inventory_helper_walk_reexport_reports_raw_helper_or_refuses():
+    """Regression: outer::a::load silently lost the raw pub-use target."""
+    check_compiled_scope_fixture("mod outer { pub use crate::util as a; }\n",
+                                 "outer::a::load(p)", "c/src/util.rs",
+                                 refusal_reason="unsupported pub use")
+
+
+def regression_inventory_helper_walk_pub_function_reexport_refuses():
+    """Regression: outer::load skipped an unsupported pub-use function binding."""
+    check_compiled_scope_fixture("mod outer { pub use crate::util::load; }\n",
+                                 "outer::load(p)", "c/src/util.rs",
+                                 refusal_reason="unsupported pub use")
+
+
+def regression_inventory_helper_walk_pub_glob_reexport_refuses():
+    """Regression: outer::load skipped an unsupported pub-use glob binding."""
+    check_compiled_scope_fixture("mod outer { pub use crate::util::*; }\n",
+                                 "outer::load(p)", "c/src/util.rs",
+                                 refusal_reason="unsupported pub use")
+
+
+
+def regression_inventory_helper_walk_rooted_reexport_owners_refuse():
+    """Regression: self/super re-export owners silently lost a renamed helper."""
+    import subprocess
+
+    for exported, scope, call in (
+        ("pub use util::load as l;\n", "", "self::l(p)"),
+        ("", "mod outer { pub use crate::util::load as l; %s }\n", "self::l(p)"),
+        ("pub use util::load as l;\n", "mod outer { use super::*; %s }\n", "super::l(p)"),
+    ):
+        body = ("fn hash(p: &std::path::Path) { let _ = crate::ManagedReadCursor::open(p); %s; }\n" % call)
+        files = {
+            "c/src/lib.rs": (
+                "#![allow(dead_code, unused_imports)]\n"
+                "pub struct ManagedReadCursor;\n"
+                "impl ManagedReadCursor { pub fn open(_: &std::path::Path) -> Self { Self } }\n"
+                "pub mod util;\n" + exported + (scope % body if scope else body)),
+            "c/src/util.rs": "pub fn load(p: &std::path::Path) { let _ = std::fs::read(p); }\n",
+        }
+        root = fake(files)
+        compiled = subprocess.run(
+            ["rustc", "--crate-name", "inventory_rooted_reexport", "--crate-type", "lib",
+             "--edition=2021", "--emit=metadata", "--out-dir", root, "c/src/lib.rs"],
+            cwd=root, capture_output=True, text=True, timeout=30)
+        expect(compiled.returncode == 0, compiled.stderr)
+        errs = check(root, classify(root, {("hash", "ManagedReadCursor::open"): MANAGED,
+                                           ("load", "fs::read"): OOF}))
+        expect(any("unresolved use-alias chain (fail closed)" in e and "unsupported pub use" in e
+                   for e in errs), (exported, scope, call, errs))
+
+
 def self_test():
+    global check, fake
+
     tests = [v for k, v in sorted(globals().items()) if k.startswith("regression_") and callable(v)]
     failed = 0
-    for t in tests:
-        try:
-            t()
-            print("ok   " + t.__name__)
-        except AssertionError as e:
-            failed += 1
-            print("FAIL %s: %s" % (t.__name__, e))
-    print("%d passed, %d failed" % (len(tests) - failed, failed))
+    checked = [0]
+    checked_roots, fixture_roots = set(), set()
+    scan_only = 0
+    corpus_errors = []
+    original_check = check
+    original_fake = fake
+
+    def compare_helper_passes(root, entries, ops, texts, fns):
+        scanned = {key(o): o for o in ops}
+        main_errors = set(helper_errors(entries, scanned, texts, fns))
+        union_errors = set(union_helper_errors(entries, scanned, texts, fns))
+        if not main_errors <= union_errors:
+            corpus_errors.append((root, "union dropped main reports", sorted(main_errors - union_errors)))
+
+    def capture_fixture(files):
+        root = original_fake(files)
+        fixture_roots.add(root)
+        return root
+
+    def regression_inventory_helper_walk_union_preserves_main_corpus(root, manifest):
+        """Regression: the chain pass must never remove a main-pass report.
+
+        Check every fixture invocation, including loop variants and exemptions,
+        with identical scanned inputs for main alone and the two-pass union;
+        scan-only fixture roots are checked after the corpus finishes.
+        """
+        ops, texts, fns = scan(root)
+        compare_helper_passes(root, manifest.get("entries", []), ops, texts, fns)
+        checked[0] += 1
+        checked_roots.add(root)
+        return original_check(root, manifest)
+
+    check = regression_inventory_helper_walk_union_preserves_main_corpus
+    fake = capture_fixture
+    try:
+        for t in tests:
+            try:
+                t()
+                print("ok   " + t.__name__)
+            except AssertionError as e:
+                failed += 1
+                print("FAIL %s: %s" % (t.__name__, e))
+        for root in sorted(fixture_roots - checked_roots):
+            ops, texts, fns = scan(root)
+            entries = [dict(o, **(MANAGED if o["op"] in MANAGED_OPS else OOF)) for o in ops]
+            compare_helper_passes(root, entries, ops, texts, fns)
+            scan_only += 1
+    finally:
+        check = original_check
+        fake = original_fake
+    try:
+        expect(checked[0] > 0, "no fixtures checked")
+        expect(not corpus_errors, corpus_errors)
+        print("ok   regression_inventory_helper_walk_union_preserves_main_corpus "
+              "(%d fixture checks + %d scan-only roots)" % (checked[0], scan_only))
+    except AssertionError as e:
+        failed += 1
+        print("FAIL regression_inventory_helper_walk_union_preserves_main_corpus: %s" % e)
+    print("%d passed, %d failed" % (len(tests) + 1 - failed, failed))
     return 1 if failed else 0
 
 

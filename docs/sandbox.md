@@ -2008,9 +2008,12 @@ that escapes its function. Any `.create(..)` or `.create_new(..)` argument other
 than a literal `false` counts as a create that needs a mode policy; a managed
 read reaching a raw helper is found through `use .. as` renames of the helper or
 its module, including a chain of aliases (`use crate::util as u; use u::load as
-read_index`). Only the first segment of a relative path expands through an
-alias; `crate::`, `super::`, `self::` and `::` paths keep their roots. Cycles
-and unknown alias targets are reported. The pathname opens done inside
+read_index`). The original helper resolver runs unchanged alongside an extra
+chain pass, and the inventory reports their union. The extra pass expands only
+the first segment of a relative path; `crate::`, `super::`, `self::` and `::`
+paths keep their roots. Cycles, unknown targets, alias names bound in multiple
+scopes, unsupported scoped bindings, and re-exports the extra pass cannot
+follow are reported as fail-closed errors. The pathname opens done inside
 libgit2 (`Repository::open`), libarchive (`archive_read_open_filename`) and
 lopdf (`Document::load`) are recorded as #196 residuals (those libraries own
 their descriptors).
