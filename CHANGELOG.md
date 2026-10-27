@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.36
+
 ### Changes
 
 - **Compiler-resolved internal-read approvals (#201):** production library/binary Clippy passes use resolved disallowed-item definitions, narrow reviewed expectations and a stable manifest diff, with N2–N4 syntax refusals. The old collector, transitive helper proofs, flag/mode inference and descriptor-retyping events are retired. Runtime openat2/checked_open/seccomp enforcement remains the boundary; see [the policy](packaging/internal-read-clippy/README.md) and [sandbox notes](docs/sandbox.md).
