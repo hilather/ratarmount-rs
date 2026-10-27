@@ -926,3 +926,47 @@ fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
         }
     }
 }
+
+/// Regression (#234): `--commit-overlay` on a sealed overlay rewrote the
+/// archive and then failed on the read-only database, breaking the seal. It
+/// must refuse with the `-w` sealed message before touching the archive, also
+/// under `--force-base-mismatch`. The fixture needs no GNU tar: the refusal
+/// comes before any commit backend.
+#[test]
+fn regression_commit_overlay_refuses_sealed_overlay() {
+    let env = Env::new();
+    let archive = env.path("base.tar");
+    {
+        let mut builder = tar::Builder::new(fs::File::create(&archive).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "a.txt", &b"a\n"[..])
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    let overlay = env.path("overlay");
+    env.ok(&["--no-mount", "-w", s(&overlay), s(&archive)]);
+    fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+    env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+    let before = fs::read(&archive).unwrap();
+    let expected = format!(
+        "error: overlay {} is sealed; mount it with --lower, or `overlay unseal`",
+        overlay.display()
+    );
+    for extra in [None, Some("--force-base-mismatch")] {
+        let mut args = vec!["--commit-overlay", "-w", s(&overlay), "--yes"];
+        args.extend(extra);
+        args.push(s(&archive));
+        let out = env.run(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.lines().any(|line| line == expected), "{err}");
+        assert!(fs::read(&archive).unwrap() == before, "archive modified");
+    }
+    env.ok(&["overlay", "verify", s(&overlay), s(&archive)]);
+    // Restore write bits so the temporary directory can be removed.
+    env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+}
