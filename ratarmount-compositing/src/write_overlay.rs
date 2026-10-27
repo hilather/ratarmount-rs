@@ -1239,9 +1239,9 @@ impl WriteOverlay {
         let found_marker = overlay_marker(&root)?;
         let marker = found_marker.is_some();
         let marker_path = found_marker.unwrap_or_else(|| root.join(OVERLAY_MARKER));
-        // Follows a symlinked database exactly like `Connection::open` does,
-        // but never reads a dangling symlink as "no database" (R7-E2), nor an
-        // unresolvable one as anything (R10-B).
+        // Classify without treating a dangling symlink as "no database"
+        // (R7-E2), nor an unresolvable one as anything (R10-B). The checked
+        // NOFOLLOW open below refuses symlinks, including a same-inode swap.
         let db_len = match overlay_db_entry(&root)? {
             DbEntry::Absent => None,
             DbEntry::Lost { markers, .. } => return Err(lost_record_error(&root, &markers)),
@@ -1249,10 +1249,16 @@ impl WriteOverlay {
         };
         let opened = crate::overlay_db::open_overlay_db_required(
             &db_path,
-            OpenFlags::default(),
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             crate::DbName::Path,
             marker,
-        )?;
+        )
+        .map_err(|error| match error {
+            crate::OverlayDbError::NotRegular(message) => {
+                OverlayError::Msg(format!("{message}; then retry the writable mount"))
+            }
+            other => other.into(),
+        })?;
         let required = marker || opened.required_record();
         let db_id = opened.id();
         let (mut conn, db_registration) = opened.into_parts();

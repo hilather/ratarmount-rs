@@ -3804,20 +3804,72 @@ fn overlay_open_backfills_marker() {
     assert!(overlay.join(OVERLAY_MARKER).is_file());
 }
 
-/// A symlinked database keeps working across opens (followed like
-/// `Connection::open` does), and the tombstone survives.
+/// Regression: #222 a writable mount followed a symlinked database and wrote
+/// through it instead of refusing with a next step.
+#[cfg(unix)]
 #[test]
-fn overlay_open_follows_symlinked_db_across_opens() {
+fn regression_mount_refuses_symlinked_db() {
     let (dir, overlay) = overlay_with_keep_tombstone();
     let real = dir.path().join("real.sqlite");
     fs::rename(overlay.join(HIDDEN_DB), &real).unwrap();
     std::os::unix::fs::symlink(&real, overlay.join(HIDDEN_DB)).unwrap();
+    let before = fs::read(&real).unwrap();
     for _ in 0..2 {
-        let ov = reopen_keep_overlay(&overlay).unwrap();
-        assert!(ov.lookup("/keep.txt", 0).is_none(), "tombstone kept");
+        let error = msg_of(reopen_keep_overlay(&overlay));
+        assert!(
+            error.contains("is a symlink; it must be a regular file"),
+            "{error}"
+        );
+        assert!(
+            error.contains("move the database file into place of the link"),
+            "{error}"
+        );
+        assert!(error.contains("retry the writable mount"), "{error}");
+        assert_eq!(fs::read(&real).unwrap(), before, "target unchanged");
     }
     fs::remove_file(&real).unwrap();
     assert!(msg_of(reopen_keep_overlay(&overlay)).contains("is missing"));
+}
+
+/// Regression: #222 swapping the classified database for a symlink to the
+/// same inode bypassed identity checks; SQLite must refuse before any write.
+#[cfg(unix)]
+#[test]
+fn regression_mount_refuses_db_swapped_for_symlink_after_classify() {
+    let (dir, overlay) = overlay_with_keep_tombstone();
+    let db = overlay.canonicalize().unwrap().join(HIDDEN_DB);
+    let real = dir.path().join("real.sqlite");
+    let before = fs::read(&db).unwrap();
+    let id = crate::overlay_db::file_id(&fs::metadata(&db).unwrap());
+    let target = real.clone();
+    crate::overlay_db::AFTER_CLASSIFY.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            fs::rename(path, &target).unwrap();
+            std::os::unix::fs::symlink(&target, path).unwrap();
+        }));
+    });
+    let result = reopen_keep_overlay(&overlay);
+    crate::overlay_db::AFTER_CLASSIFY.with(|hook| *hook.borrow_mut() = None);
+    assert!(
+        fs::symlink_metadata(&db).unwrap().file_type().is_symlink(),
+        "seam ran"
+    );
+    assert_eq!(
+        crate::overlay_db::file_id(&fs::metadata(&db).unwrap()),
+        id,
+        "same inode"
+    );
+    let error = msg_of(result);
+    assert!(
+        error.contains("is a symlink; it must be a regular file"),
+        "{error}"
+    );
+    assert!(
+        error.contains("move the database file into place of the link"),
+        "{error}"
+    );
+    assert!(error.contains("retry the writable mount"), "{error}");
+    assert_eq!(fs::read(&real).unwrap(), before, "target unchanged");
 }
 
 /// Regression (r17 skeptic #2, R7-E2): a dangling symlink at the
@@ -3825,7 +3877,7 @@ fn overlay_open_follows_symlinked_db_across_opens() {
 /// open (no marker yet) created a fresh database THROUGH the symlink,
 /// outside the overlay. B7: the offline commit plan was built without the
 /// tombstones. Both refuse; nothing is created at the target. A symlink
-/// to a regular file stays supported (see the test below).
+/// to a regular file stays supported by offline commit only.
 #[cfg(unix)]
 #[test]
 fn regression_dangling_db_symlink_is_not_an_absent_database() {
