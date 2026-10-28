@@ -109,18 +109,28 @@ pub fn is_overlay_state_error(error: &(dyn std::error::Error + 'static)) -> bool
     if error.is::<OverlayStateError>() {
         return true;
     }
+    if let Some(error) = error.downcast_ref::<rusqlite::Error>() {
+        return error
+            .sqlite_error()
+            .is_some_and(|error| error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK);
+    }
     if let Some(error) = error.downcast_ref::<io::Error>() {
         return error
             .get_ref()
             .is_some_and(|error| is_overlay_state_error(error));
     }
-    if let Some(OverlayError::Io(error)) = error.downcast_ref::<OverlayError>() {
-        return is_overlay_state_error(error);
+    if let Some(error) = error.downcast_ref::<OverlayError>() {
+        match error {
+            OverlayError::Io(error) => return is_overlay_state_error(error),
+            OverlayError::Sqlite(error) => return is_overlay_state_error(error),
+            _ => {}
+        }
     }
     if let Some(error) = error.downcast_ref::<OverlayDbError>() {
         match error {
             OverlayDbError::NotRegular(_) => return true,
             OverlayDbError::Io(error) => return is_overlay_state_error(error),
+            OverlayDbError::Sqlite(error) => return is_overlay_state_error(error),
             _ => {}
         }
     }
@@ -448,6 +458,9 @@ pub(crate) fn open_overlay_db_required(
         fs::metadata(db)
     }
     .map_err(|e| {
+        if let Err(error) = checked_open::refuse_symlink(db, flags) {
+            return OverlayDbError::Sqlite(error);
+        }
         OverlayDbError::NotRegular(format!(
             "overlay database {} changed while it was opened: {e}",
             db.display()
@@ -587,9 +600,19 @@ fn acquired_error(db: &Path, refusal: checked_open::Refusal) -> OverlayDbError {
                 error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
             }) =>
         {
+            let message = match e {
+                // Preserve the shared helper's offending companion path;
+                // native SQLite messages still need the overlay diagnosis.
+                rusqlite::Error::SqliteFailure(_, Some(message))
+                    if message.contains("is a symlink; it must be a regular file") =>
+                {
+                    message
+                }
+                _ => symlink_message(db),
+            };
             OverlayDbError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
-                OverlayStateError(symlink_message(db)),
+                OverlayStateError(message),
             ))
         }
         AcquireError::Sqlite(e) => OverlayDbError::Sqlite(e),

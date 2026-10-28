@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ratarmount_index::{
-    cached_archive_digest_cancellable, peek_archive_digest_for_open, sha256_hex, sha256_hex_stream,
-    ArchiveDigestStamp,
+    cached_archive_digest_cancellable, checked_open::refuse_symlink, peek_archive_digest_for_open,
+    sha256_hex, sha256_hex_stream, ArchiveDigestStamp,
 };
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -165,9 +165,15 @@ fn recover_hot_journal(dir: &Path, db: &Path, required: bool) -> Result<bool> {
     let required = required || conn.required_record();
     conn.busy_timeout(std::time::Duration::ZERO)?;
     // Any read takes the shared lock, which plays the journal back.
-    match conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
-        r.get::<_, i64>(0)
-    }) {
+    let read = conn
+        .query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .or_else(|error| {
+            refuse_symlink(db, OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+            Err(error)
+        });
+    match read {
         Ok(_) => Ok(required),
         Err(error) if is_hot_journal(&error) => Err(refuse("it could not be rolled back here")),
         Err(error) => Err(error.into()),
@@ -201,13 +207,52 @@ thread_local! {
 pub(crate) const NO_FILES_TABLE: &str =
     "the overlay database has no files table (the record of a used overlay is lost)";
 
+/// Keep a failed metadata read's symlink policy identity on held connections.
+fn metadata_read<T, E>(
+    conn: &Connection,
+    read: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E>
+where
+    E: From<rusqlite::Error>,
+{
+    read().or_else(|error| {
+        #[cfg(unix)]
+        let path = {
+            use std::os::unix::ffi::OsStrExt;
+            // SAFETY: the borrowed connection is alive and is not mutated
+            // while SQLite's filename is copied. This is the same filename
+            // query as Connection::path, preserving non-UTF-8 Unix names.
+            unsafe {
+                let name = rusqlite::ffi::sqlite3_db_filename(conn.handle(), c"main".as_ptr());
+                if name.is_null() {
+                    None
+                } else {
+                    let bytes = std::ffi::CStr::from_ptr(name).to_bytes();
+                    (!bytes.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let path = conn
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        if let Some(path) = path {
+            refuse_symlink(&path, OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+        }
+        Err(error)
+    })
+}
+
 /// Does `conn` have the `files` table? Plain SQL (no transaction of its own).
 pub(crate) fn has_files_table(conn: &Connection) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files')",
-        [],
-        |row| row.get(0),
-    )
+    metadata_read(conn, || {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files')",
+            [],
+            |row| row.get(0),
+        )
+    })
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -275,20 +320,29 @@ impl OverlayMeta {
         // The requirement is a latch across the hot-journal recovery and the
         // retry: a marker any open saw stays required (S3 skeptic #2).
         let read = || -> Result<Option<Self>> {
-            let conn = crate::overlay_db::open_overlay_db_required(
-                &db,
-                OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-                crate::DbName::Path,
-                latched.get(),
-            )?;
-            latched.set(latched.get() || conn.required_record());
-            conn.busy_timeout(std::time::Duration::ZERO)?;
-            // One read transaction: the `files` check and the `meta` rows
-            // describe the same database state.
-            let tx = conn.unchecked_transaction()?;
-            Self::from_connection_required(&tx, latched.get())
+            let result = (|| {
+                let conn = crate::overlay_db::open_overlay_db_required(
+                    &db,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                        | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                    crate::DbName::Path,
+                    latched.get(),
+                )?;
+                latched.set(latched.get() || conn.required_record());
+                conn.busy_timeout(std::time::Duration::ZERO)?;
+                // One read transaction: the `files` check and the `meta` rows
+                // describe the same database state.
+                let tx = conn.unchecked_transaction()?;
+                Self::from_connection_required(&tx, latched.get())
+            })();
+            // Acquisition may succeed before a late companion causes the
+            // first metadata query to fail. Check before hot-journal recovery
+            // or deferral can replace the refusal, using the original OS path.
+            if result.is_err() {
+                refuse_symlink(&db, OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+            }
+            result
         };
         let result = match read() {
             Err(OverlayError::Sqlite(error)) if recover_hot && is_hot_journal(&error) => {
@@ -324,12 +378,14 @@ impl OverlayMeta {
     /// between two autocommit reads read as "unrecorded"); inside the
     /// caller's transaction, that one covers both reads.
     pub fn from_connection_required(conn: &Connection, required: bool) -> Result<Option<Self>> {
-        if !conn.is_autocommit() {
-            return Self::from_transaction_required(conn, required);
-        }
-        // Read-only: dropping the transaction rolls it back.
-        let tx = conn.unchecked_transaction()?;
-        Self::from_transaction_required(&tx, required)
+        metadata_read(conn, || {
+            if !conn.is_autocommit() {
+                return Self::from_transaction_required(conn, required);
+            }
+            // Read-only: dropping the transaction rolls it back.
+            let tx = conn.unchecked_transaction()?;
+            Self::from_transaction_required(&tx, required)
+        })
     }
 
     /// [`Self::from_connection_required`] of a validated open, with the
@@ -353,27 +409,29 @@ impl OverlayMeta {
     }
 
     pub fn from_connection(conn: &Connection) -> Result<Option<Self>> {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Ok(None);
-        }
-        let mut statement = conn.prepare("SELECT key, value FROM meta ORDER BY key")?;
-        let values = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        let meta = Self { values };
-        let version = meta.format_version()?;
-        if let Some(version) = version.filter(|v| *v > MAX_FORMAT_VERSION) {
-            return Err(OverlayError::Msg(format!(
-                "overlay format_version {version} is newer than this ratarmount supports \
+        metadata_read(conn, || {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(None);
+            }
+            let mut statement = conn.prepare("SELECT key, value FROM meta ORDER BY key")?;
+            let values = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let meta = Self { values };
+            let version = meta.format_version()?;
+            if let Some(version) = version.filter(|v| *v > MAX_FORMAT_VERSION) {
+                return Err(OverlayError::Msg(format!(
+                    "overlay format_version {version} is newer than this ratarmount supports \
                  ({MAX_FORMAT_VERSION}); upgrade ratarmount"
-            )));
-        }
-        Ok(Some(meta))
+                )));
+            }
+            Ok(Some(meta))
+        })
     }
 
     pub fn values(&self) -> &BTreeMap<String, String> {

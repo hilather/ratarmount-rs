@@ -462,13 +462,48 @@ pub(crate) fn request(
 #[derive(Debug)]
 pub(crate) struct Request {
     /// The absolute path of the database.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) path: PathBuf,
     /// What SQLite gets: `path`, or the immutable URI.
     pub(crate) name: PathBuf,
     pub(crate) flags: OpenFlags,
 }
 
-/// Open `path` and prove which inode SQLite acquired.
+/// Recheck a failed nofollow acquisition or metadata read for a named symlink.
+///
+/// Like the writable index opener's refusal check, this inspects names only:
+/// opening and closing an alias could release this process's SQLite locks.
+/// Missing or uninspectable entries do not replace the original failure, and
+/// never prevent inspection of the other literal companion names. Parent
+/// symlinks are permitted; the final component is never resolved.
+pub fn refuse_symlink(path: &Path, flags: OpenFlags) -> rusqlite::Result<()> {
+    if !flags.contains(OpenFlags::SQLITE_OPEN_NOFOLLOW) {
+        return Ok(());
+    }
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let name = Path::new(&name);
+        if std::fs::symlink_metadata(name).is_ok_and(|metadata| metadata.is_symlink()) {
+            let label = if suffix.is_empty() {
+                "database"
+            } else {
+                "database companion"
+            };
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK),
+                Some(format!(
+                    "{label} {} is a symlink; it must be a regular file",
+                    name.display()
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Open `path` and prove which inode SQLite acquired. Every failure rechecks
+/// the named state with [`refuse_symlink`] before returning its refusal.
 pub fn open_checked(
     path: &Path,
     flags: OpenFlags,
@@ -479,34 +514,28 @@ pub fn open_checked(
         error,
         retained_fd: None,
     };
-    let request = request(path, flags, mode, expect).map_err(refuse)?;
-    #[cfg(windows)]
-    let acquired = path_type_only::open(&request, expect);
-    #[cfg(not(windows))]
-    let acquired = {
-        if let Err(status) = super::install::installed() {
-            return Err(refuse(AcquireError::Unavailable(status)));
-        }
-        // F6 (r11 S6): the VFS and the two syscall slots still hold what the
-        // installation left; checked before arming, never repaired.
-        if let Err(reason) = super::install::hooks_intact() {
-            return Err(refuse(AcquireError::Unavailable(
-                super::install::InstallStatus::HooksReplaced(reason),
-            )));
-        }
-        imp::open(&request.name, request.flags, expect)
-    };
-    acquired.map_err(|mut refusal| {
-        if let AcquireError::Sqlite(rusqlite::Error::SqliteFailure(error, _)) = &mut refusal.error {
-            // A symlink planted after SQLite's pathname check can make its
-            // O_NOFOLLOW open report plain CANTOPEN. Recheck the final name
-            // with lstat only: opening an alias could release SQLite locks.
-            if request.flags.contains(OpenFlags::SQLITE_OPEN_NOFOLLOW)
-                && error.code == rusqlite::ErrorCode::CannotOpen
-                && std::fs::symlink_metadata(&request.path).is_ok_and(|m| m.is_symlink())
-            {
-                *error = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK);
+    let acquired = (|| {
+        let request = request(path, flags, mode, expect).map_err(refuse)?;
+        #[cfg(windows)]
+        return path_type_only::open(&request, expect);
+        #[cfg(not(windows))]
+        {
+            if let Err(status) = super::install::installed() {
+                return Err(refuse(AcquireError::Unavailable(status)));
             }
+            // F6 (r11 S6): the VFS and the two syscall slots still hold what the
+            // installation left; checked before arming, never repaired.
+            if let Err(reason) = super::install::hooks_intact() {
+                return Err(refuse(AcquireError::Unavailable(
+                    super::install::InstallStatus::HooksReplaced(reason),
+                )));
+            }
+            imp::open(&request.name, request.flags, expect)
+        }
+    })();
+    acquired.map_err(|mut refusal| {
+        if let Err(error) = refuse_symlink(path, flags) {
+            refusal.error = AcquireError::Sqlite(error);
         }
         refusal
     })

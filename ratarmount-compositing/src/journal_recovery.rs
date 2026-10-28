@@ -190,31 +190,44 @@ fn vanished(db: &Path) -> io::Error {
 
 /// A used overlay's database `db` still has its `files` table (read-only).
 fn require_files(db: &Path) -> io::Result<()> {
-    let conn = crate::overlay_db::open_overlay_db_required(
-        db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        crate::DbName::Path,
-        true,
-    )
-    .map_err(io::Error::from)?;
-    // Under the archive lock: never wait on another holder of the database
-    // (as `read_with`).
-    conn.busy_timeout(Duration::ZERO)
-        .map_err(|e| io::Error::other(format!("cannot read {}: {e}", db.display())))?;
-    match crate::overlay_meta::has_files_table(&conn) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(io::Error::other(format!(
-            "{}: {}; no recovery write was made",
-            db.display(),
-            crate::overlay_meta::NO_FILES_TABLE
-        ))),
-        Err(e) => Err(io::Error::other(format!(
-            "cannot read {}: {e}",
-            db.display()
-        ))),
-    }
+    let result = (|| {
+        let conn = crate::overlay_db::open_overlay_db_required(
+            db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            crate::DbName::Path,
+            true,
+        )
+        .map_err(io::Error::from)?;
+        // Under the archive lock: never wait on another holder of the database
+        // (as `read_with`).
+        conn.busy_timeout(Duration::ZERO)
+            .map_err(|e| io::Error::other(format!("cannot read {}: {e}", db.display())))?;
+        match crate::overlay_meta::has_files_table(&conn) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(io::Error::other(format!(
+                "{}: {}; no recovery write was made",
+                db.display(),
+                crate::overlay_meta::NO_FILES_TABLE
+            ))),
+            Err(error) if crate::overlay_db::is_overlay_state_error(&error) => {
+                Err(io::Error::other(error))
+            }
+            Err(e) => Err(io::Error::other(format!(
+                "cannot read {}: {e}",
+                db.display()
+            ))),
+        }
+    })();
+    result.or_else(|error| {
+        ratarmount_index::checked_open::refuse_symlink(
+            db,
+            rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(io::Error::other)?;
+        Err(error)
+    })
 }
 
 /// Strict named-state admission before the generic followed classification.
@@ -339,53 +352,68 @@ impl<'a> Rows<'a> {
         &self,
         f: impl FnOnce(&Connection, bool) -> io::Result<()>,
     ) -> io::Result<()> {
-        self.validate_state()?;
-        match self {
-            Rows::None => Ok(()),
-            Rows::Shared { db, dir, id } => {
-                check_live(dir, *id)?;
-                f(&db.lock().unwrap_or_else(|e| e.into_inner()), true)
-            }
-            Rows::Path {
-                db,
-                must_exist,
-                required_files,
-            } => {
-                let dir = db_dir(db);
-                let entry = usable_entry(dir)?;
-                self.observe(&entry);
-                if let DbEntry::Absent = entry {
-                    if must_exist.get() || required_files.get() {
-                        return Err(vanished(db));
-                    }
-                    // A raw overlay directory: nothing to restamp.
-                    return Ok(());
+        let result = (|| {
+            self.validate_state()?;
+            match self {
+                Rows::None => Ok(()),
+                Rows::Shared { db, dir, id } => {
+                    check_live(dir, *id)?;
+                    f(&db.lock().unwrap_or_else(|e| e.into_inner()), true)
                 }
-                // The latch goes into the acquisition (a required record
-                // must be the non-empty file classified) and comes back.
-                #[cfg(test)]
-                {
-                    let hook = BEFORE_INNER_OPEN.with(|h| h.borrow_mut().take());
-                    if let Some(hook) = hook {
-                        hook();
-                    }
-                }
-                crate::overlay_db::validate_overlay_state(db)?;
-                let conn = crate::overlay_db::open_overlay_db_required(
+                Rows::Path {
                     db,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-                    crate::DbName::Path,
-                    required_files.get(),
-                )
-                .map_err(io::Error::from)?;
-                if conn.required_record() {
-                    required_files.set(true);
+                    must_exist,
+                    required_files,
+                } => {
+                    let dir = db_dir(db);
+                    let entry = usable_entry(dir)?;
+                    self.observe(&entry);
+                    if let DbEntry::Absent = entry {
+                        if must_exist.get() || required_files.get() {
+                            return Err(vanished(db));
+                        }
+                        // A raw overlay directory: nothing to restamp.
+                        return Ok(());
+                    }
+                    // The latch goes into the acquisition (a required record
+                    // must be the non-empty file classified) and comes back.
+                    #[cfg(test)]
+                    {
+                        let hook = BEFORE_INNER_OPEN.with(|h| h.borrow_mut().take());
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    crate::overlay_db::validate_overlay_state(db)?;
+                    let conn = crate::overlay_db::open_overlay_db_required(
+                        db,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                        crate::DbName::Path,
+                        required_files.get(),
+                    )
+                    .map_err(io::Error::from)?;
+                    if conn.required_record() {
+                        required_files.set(true);
+                    }
+                    f(&conn, required_files.get())
                 }
-                f(&conn, required_files.get())
             }
-        }
+        })();
+        result.or_else(|error| {
+            let db = match self {
+                Rows::None => return Err(error),
+                Rows::Shared { dir, .. } => dir.join(crate::HIDDEN_DB),
+                Rows::Path { db, .. } => db.to_path_buf(),
+            };
+            ratarmount_index::checked_open::refuse_symlink(
+                &db,
+                rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .map_err(io::Error::other)?;
+            Err(error)
+        })
     }
 
     /// The `before_unlink` hook of the commit that wrote the journal
@@ -537,7 +565,7 @@ fn restamp_once(
             ))));
         }
         let meta = OverlayMeta::from_connection(conn)
-            .map_err(|e| RestampError::Other(io::Error::other(e.to_string())))?;
+            .map_err(|e| RestampError::Other(io::Error::other(e)))?;
         // A journal whose target is not the recorded base (a union member, a
         // base that left its recorded place), a kind-only record and a record
         // without a stamp leave the rows alone.
@@ -886,15 +914,19 @@ fn decide(
         };
         let meta = match read_record(dir) {
             Ok(meta) => meta,
-            Err(error) if crate::overlay_db::is_overlay_state_error(&error) => return Err(error),
             Err(e) => {
+                // Path policy outranks journal deferral: force cannot turn a
+                // typed acquisition/metadata refusal into recovery authority.
+                if crate::overlay_db::is_overlay_state_error(&e) {
+                    return Err(e);
+                }
                 return Ok(defer(
                     format!(
                         "has an overlay record ({}) that cannot be read: {e}",
                         dir.display()
                     ),
                     flag,
-                ))
+                ));
             }
         };
         let Some(meta) = meta else { continue };

@@ -701,8 +701,13 @@ pub(crate) fn check_commit_base_with(
     // The recorded kind and the Unknown gate come first, under every digest
     // kind: a `none` directory overlay must not commit into an unrelated
     // archive, and a record with no usable kind never commits without force.
-    let meta = OverlayMeta::from_connection_required(conn, required)
-        .map_err(|e| refuse(format!("cannot read overlay metadata: {e}")))?;
+    let meta = OverlayMeta::from_connection_required(conn, required).map_err(|e| {
+        if crate::overlay_db::is_overlay_state_error(&e) {
+            CommitBaseRefusal::policy(std::io::Error::other(e))
+        } else {
+            refuse(format!("cannot read overlay metadata: {e}"))
+        }
+    })?;
     match Recorded::from_meta(meta.as_ref()) {
         Recorded::Unknown => {
             return Err(refuse(
@@ -913,7 +918,17 @@ pub(crate) fn check_commit_base_offline_with(
                 ))
             })?
             .is_empty();
-    check_commit_base_with(&conn, base, archive, locked, marked)
+    let result = check_commit_base_with(&conn, base, archive, locked, marked);
+    if result.is_err() {
+        // SQLite's Connection::path is UTF-8-only; this boundary retains the
+        // original OS path even when a failed metadata read cannot name it.
+        ratarmount_index::checked_open::refuse_symlink(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|error| CommitBaseRefusal::policy(std::io::Error::other(error)))?;
+    }
+    result
 }
 
 #[cfg(test)]

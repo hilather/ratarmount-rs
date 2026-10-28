@@ -7465,3 +7465,174 @@ fn regression_required_marker_observation_is_monotonic() {
         assert_eq!(locator(&fx.archive), before.2);
     }
 }
+
+/// Regression: #239 metadata reads through an already acquired connection
+/// must retain late companion policy errors, including at the forceable gate.
+#[cfg(unix)]
+#[test]
+fn regression_late_companion_held_metadata_read_preserves_policy() {
+    use std::os::unix::ffi::OsStringExt;
+
+    for suffix in ["-journal", "-wal", "-shm"] {
+        for reader in ["meta", "required", "files", "commit gate"] {
+            for non_utf8 in [false, true] {
+                let mut fx = Fixture::new();
+                if non_utf8 {
+                    fx.overlay = fx
+                        ._tmp
+                        .path()
+                        .join(std::ffi::OsString::from_vec(b"overlay-\xff".to_vec()));
+                }
+                fs::create_dir(&fx.overlay).unwrap();
+                let db = fx.overlay.join(HIDDEN_DB);
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                let mode = if suffix == "-journal" {
+                    "DELETE"
+                } else {
+                    "WAL"
+                };
+                conn.execute_batch(&format!(
+                    "PRAGMA journal_mode={mode}; CREATE TABLE files(path, name, deleted); \
+                 CREATE TABLE meta(key, value)"
+                ))
+                .unwrap();
+                drop(conn);
+                let base = archive_token(&fx.archive);
+                let target = fx._tmp.path().join("companion-target");
+                fs::write(&target, b"nonempty external target").unwrap();
+                let before = (
+                    fs::read(&fx.archive).unwrap(),
+                    fs::read(&db).unwrap(),
+                    fs::read(&target).unwrap(),
+                );
+                let conn = rusqlite::Connection::open_with_flags(
+                    &db,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )
+                .unwrap();
+                assert_eq!(conn.path().is_none(), non_utf8, "fixture path encoding");
+                let mut companion = db.as_os_str().to_os_string();
+                companion.push(suffix);
+                let companion = PathBuf::from(companion);
+                std::os::unix::fs::symlink(&target, &companion).unwrap();
+                let error = match reader {
+                    "meta" => OverlayMeta::from_connection(&conn).unwrap_err(),
+                    "required" => OverlayMeta::from_connection_required(&conn, true).unwrap_err(),
+                    "files" => crate::overlay_meta::has_files_table(&conn)
+                        .unwrap_err()
+                        .into(),
+                    _ => {
+                        let refusal = crate::overlay_gate::check_commit_base_with(
+                            &conn,
+                            &base,
+                            &fx.archive,
+                            None,
+                            true,
+                        )
+                        .unwrap_err();
+                        assert!(refusal.is_policy(), "{suffix} {reader}: {refusal}");
+                        refusal.into_overlay_error()
+                    }
+                };
+                assert!(
+                    crate::overlay_db::is_overlay_state_error(&error),
+                    "{suffix} {reader}: {error}"
+                );
+                let message = error.to_string();
+                assert!(
+                    message.contains(&companion.display().to_string()),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("is a symlink; it must be a regular file"),
+                    "{message}"
+                );
+                assert!(!message.contains("--force"), "{message}");
+                drop(conn);
+                assert_eq!(fs::read(&fx.archive).unwrap(), before.0);
+                assert_eq!(fs::read(&db).unwrap(), before.1);
+                assert_eq!(fs::read(&target).unwrap(), before.2);
+                assert_eq!(fs::read_link(&companion).unwrap(), target);
+            }
+        }
+    }
+}
+
+/// Regression: #239 a failed metadata read must recheck the original OS path
+/// when SQLite cannot report a non-UTF-8 database name through Connection::path.
+#[cfg(unix)]
+#[test]
+fn regression_late_companion_non_utf8_metadata_read_preserves_policy() {
+    use std::os::unix::ffi::OsStringExt;
+
+    for suffix in ["-journal", "-wal", "-shm"] {
+        for reader in ["read", "commit gate"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let archive = tmp.path().join("base.tar");
+            write_tar(&archive, &[("first", b"first member")]);
+            let base = archive_token(&archive);
+            let overlay = tmp
+                .path()
+                .join(std::ffi::OsString::from_vec(b"overlay-\xff".to_vec()));
+            fs::create_dir(&overlay).unwrap();
+            let db = overlay.join(HIDDEN_DB);
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let mode = if suffix == "-journal" {
+                "DELETE"
+            } else {
+                "WAL"
+            };
+            conn.execute_batch(&format!(
+                "PRAGMA journal_mode={mode}; CREATE TABLE files(path, name, deleted)"
+            ))
+            .unwrap();
+            assert!(
+                conn.path().is_none(),
+                "fixture exercises the original OS path"
+            );
+            drop(conn);
+            let target = tmp.path().join("companion-target");
+            fs::write(&target, b"nonempty external target").unwrap();
+            let before = (
+                fs::read(&db).unwrap(),
+                fs::read(&target).unwrap(),
+                fs::read(&archive).unwrap(),
+            );
+            let mut companion = db.as_os_str().to_os_string();
+            companion.push(suffix);
+            let companion = PathBuf::from(companion);
+            let at_acquire = companion.clone();
+            let target_at_acquire = target.clone();
+            crate::overlay_db::AFTER_ACQUIRE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_| {
+                    std::os::unix::fs::symlink(&target_at_acquire, &at_acquire).unwrap();
+                }));
+            });
+            let result = if reader == "read" {
+                OverlayMeta::read_no_recovery_required(&overlay, true).map(|_| ())
+            } else {
+                crate::overlay_gate::check_commit_base_offline(&overlay, &base, &archive)
+                    .map(|_| ())
+                    .map_err(|refusal| refusal.into_overlay_error())
+            };
+            crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
+            let error = result.unwrap_err();
+            assert!(crate::overlay_db::is_overlay_state_error(&error), "{error}");
+            let message = error.to_string();
+            assert!(
+                message.contains(&companion.display().to_string()),
+                "{message}"
+            );
+            assert!(
+                message.contains("is a symlink; it must be a regular file"),
+                "{message}"
+            );
+            assert!(!message.contains("--force"), "{message}");
+            assert_eq!(fs::read(&db).unwrap(), before.0);
+            assert_eq!(fs::read(&target).unwrap(), before.1);
+            assert_eq!(fs::read(&archive).unwrap(), before.2);
+            assert_eq!(fs::read_link(&companion).unwrap(), target);
+        }
+    }
+}
