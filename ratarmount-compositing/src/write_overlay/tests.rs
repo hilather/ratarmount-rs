@@ -1308,8 +1308,14 @@ fn regression_134_recompress_replace_bare_name_stages_beside_dest() {
             // The replace is gated on the stamp of an existing `dest`.
             fs::write(dest, b"old").unwrap();
             let source = fs::metadata(dest).unwrap();
-            recompress_replace(&plain, Path::new(dest), fmt, &source)
-                .unwrap_or_else(|e| panic!("{dest}: {e}"));
+            recompress_replace(
+                &plain,
+                Path::new(dest),
+                fmt,
+                &source,
+                &crate::journal_recovery::Rows::None,
+            )
+            .unwrap_or_else(|e| panic!("{dest}: {e}"));
             assert!(fs::metadata(dest).unwrap().len() > 0);
         }
         return;
@@ -3828,7 +3834,10 @@ fn regression_mount_refuses_symlinked_db() {
         assert_eq!(fs::read(&real).unwrap(), before, "target unchanged");
     }
     fs::remove_file(&real).unwrap();
-    assert!(msg_of(reopen_keep_overlay(&overlay)).contains("is missing"));
+    // Regression: #239 dangling database links have the same policy refusal.
+    assert!(
+        msg_of(reopen_keep_overlay(&overlay)).contains("is a symlink; it must be a regular file")
+    );
 }
 
 /// Regression: #222 swapping the classified database for a symlink to the
@@ -3872,12 +3881,61 @@ fn regression_mount_refuses_db_swapped_for_symlink_after_classify() {
     assert_eq!(fs::read(&real).unwrap(), before, "target unchanged");
 }
 
+/// Regression: #239 a writable mount refuses every companion link, both
+/// at admission and when planted immediately before SQLite acquisition.
+#[cfg(unix)]
+#[test]
+fn regression_mount_refuses_symlinked_companions() {
+    for suffix in ["-wal", "-journal", "-shm"] {
+        for after_classify in [false, true] {
+            let (dir, overlay) = overlay_with_keep_tombstone();
+            let db = overlay.canonicalize().unwrap().join(HIDDEN_DB);
+            let companion = PathBuf::from(format!("{}{suffix}", db.display()));
+            let target = dir.path().join("target");
+            fs::write(&target, b"").unwrap();
+            let before = fs::read(&db).unwrap();
+            let marker_before = fs::read(overlay.join(OVERLAY_MARKER)).unwrap();
+            if after_classify {
+                let companion = companion.clone();
+                let target = target.clone();
+                crate::overlay_db::AFTER_CLASSIFY.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |_| {
+                        std::os::unix::fs::symlink(&target, &companion).unwrap();
+                    }));
+                });
+            } else {
+                std::os::unix::fs::symlink(&target, &companion).unwrap();
+            }
+            let result = reopen_keep_overlay(&overlay);
+            crate::overlay_db::AFTER_CLASSIFY.with(|hook| *hook.borrow_mut() = None);
+            let error = msg_of(result);
+            assert!(
+                error.contains(&companion.display().to_string()),
+                "{suffix} seam={after_classify}: {error}"
+            );
+            assert!(
+                error.contains("is a symlink; it must be a regular file"),
+                "{error}"
+            );
+            assert!(fs::symlink_metadata(&companion)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read(&db).unwrap(), before, "database unchanged");
+            assert_eq!(fs::read(&target).unwrap(), b"", "target unchanged");
+            assert_eq!(
+                fs::read(overlay.join(OVERLAY_MARKER)).unwrap(),
+                marker_before
+            );
+        }
+    }
+}
+
 /// Regression (r17 skeptic #2, R7-E2): a dangling symlink at the
 /// database path was read as "no database" by `fs::metadata`. B8: a first
 /// open (no marker yet) created a fresh database THROUGH the symlink,
 /// outside the overlay. B7: the offline commit plan was built without the
-/// tombstones. Both refuse; nothing is created at the target. A symlink
-/// to a regular file stays supported by offline commit only.
+/// tombstones. Both refuse; nothing is created at the target.
 #[cfg(unix)]
 #[test]
 fn regression_dangling_db_symlink_is_not_an_absent_database() {

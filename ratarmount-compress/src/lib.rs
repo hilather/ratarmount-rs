@@ -114,8 +114,10 @@ pub use zstd_seek::{
     zstd_decode_stats, SeekableZstd, ZstdDecodeStats, ZstdFrameInfo, ZstdFrameMap, ZstdReadOptions,
 };
 pub use zstd_splice::{
-    splice_zstd_last_frames, splice_zstd_last_frames_append, splice_zstd_last_frames_append_with,
-    splice_zstd_last_frames_replace, write_zstd_splice_suffix, SpliceStats,
+    splice_zstd_last_frames, splice_zstd_last_frames_append,
+    splice_zstd_last_frames_append_guarded, splice_zstd_last_frames_append_with,
+    splice_zstd_last_frames_replace, splice_zstd_last_frames_replace_guarded,
+    write_zstd_splice_suffix, SpliceStats,
 };
 
 use std::fs::File;

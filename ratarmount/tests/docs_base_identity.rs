@@ -161,3 +161,29 @@ fn regression_docs_required_record_latch_and_offline_no_recovery() {
         assert!(text.contains(expected), "missing {expected}");
     }
 }
+
+/// Regression: #239 offline DB and companion symlink refusal must replace the obsolete follow/exit-2 promises.
+#[test]
+fn regression_docs_state_offline_symlink_refusal() {
+    require(&[
+        "Offline commit and recovery refuse a symlinked overlay database or any `-wal`, `-journal`, or `-shm` companion with exit 1.",
+        "`--force-base-mismatch` cannot bypass this refusal.",
+        "Before any write, refusal leaves the archive, symlink targets, database and recovery state unchanged.",
+    ]);
+    for file in ["docs/sandbox.md", "CHANGELOG.md", "AGENTS.md"] {
+        let text = read(file);
+        for obsolete in [
+            "A symlink to a regular database file keeps working",
+            "The offline overlay's database may be a symlink to a regular file",
+            "--commit-overlay` with a symlink to a 0-byte database exits 2",
+            "regression_offline_recovery_follows_a_symlinked_database",
+            "empty or a dangling symlink is a lost record",
+            "the offline owner reads through the symlink",
+        ] {
+            assert!(
+                !text.contains(obsolete),
+                "{file} retains obsolete rule: {obsolete}"
+            );
+        }
+    }
+}

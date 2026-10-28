@@ -819,14 +819,14 @@ fn regression_mount_union_member_journal_waits_for_the_gate() {
     assert!(!journal.exists(), "recovered alone");
 }
 
-/// Regression (r17 skeptic #2, R7-E2 B1/B2): A's overlay database is replaced
+/// Regression: #239 (r17 skeptic #2, R7-E2 B1/B2): A's overlay database is replaced
 /// by a dangling symlink, then B with its own journal (torn or complete) is
 /// renamed over A. `overlay.join(DB).exists()` read the dangling symlink as
 /// "no database", so `--commit-overlay -w ov --yes A` ran the inode-only
 /// recovery before any recorded-base gate: B was rolled back (or forward) and
-/// its journal removed. The database path is `lstat`ed: anything there is an
-/// existing database, the commit goes through the database path and is
-/// refused with B, its journal and the symlink target untouched.
+/// its journal removed. Strict admission now `lstat`s the final database
+/// component and refuses the link with exit 1 before classification or recovery,
+/// with B, its journal and the symlink target untouched.
 #[cfg(unix)]
 #[test]
 fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
@@ -846,9 +846,15 @@ fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
         std::os::unix::fs::symlink(&target, &db).unwrap();
         let (bytes, journal, journal_bytes) = rename_b_over_a(&env, &archive, complete);
         let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "complete={complete}: {}",
+            text(&out)
+        );
         assert!(
-            !out.status.success(),
-            "complete={complete}: must refuse: {}",
+            text(&out).contains("is a symlink; it must be a regular file"),
+            "{}",
             text(&out)
         );
         assert!(
@@ -868,14 +874,14 @@ fn regression_offline_commit_dangling_db_symlink_leaves_b_untouched() {
     }
 }
 
-/// Regression (R10-B, #150, v4 T6): `--commit-overlay` with the overlay used
+/// Regression: #239 (R10-B, #150, v4 T6): `--commit-overlay` with the overlay used
 /// (marker kept) and its database deleted, replaced by a symlink to a 0-byte
 /// file, or by a symlink that cannot be resolved
 /// (`plain-file/missing.sqlite`: `ENOTDIR`), with B
 /// (its own torn or complete journal) renamed over A. A deleted database read
 /// as "no database" and the raw-directory branch ran inode-only recovery on B;
-/// the unresolvable one could read as a record. Both exit 2 before any
-/// recovery and B and its journal stay byte-identical.
+/// the unresolvable one could read as a record. Symlinks exit 1; deleted or
+/// empty regular records exit 2. B and its journal stay byte-identical.
 #[cfg(unix)]
 #[test]
 fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
@@ -883,9 +889,7 @@ fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
         eprintln!("skip: GNU tar unavailable");
         return;
     }
-    // R10-FIX2 (v4 T6): a symlink to a 0-byte file is as lost as a deleted
-    // database.
-    for shape in ["deleted", "symlink to empty", "unresolved"] {
+    for shape in ["deleted", "empty", "symlink to empty", "unresolved"] {
         for complete in [false, true] {
             let unresolved = shape == "unresolved";
             let env = Env::new();
@@ -898,6 +902,8 @@ fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
                 let plain = env.path("plain-file");
                 fs::write(&plain, b"plain").unwrap();
                 std::os::unix::fs::symlink(plain.join("missing.sqlite"), &db).unwrap();
+            } else if shape == "empty" {
+                fs::write(&db, b"").unwrap();
             } else if shape == "symlink to empty" {
                 let empty = env.path("empty.sqlite");
                 fs::write(&empty, b"").unwrap();
@@ -906,9 +912,15 @@ fn regression_offline_commit_lost_or_unresolved_db_leaves_b_untouched() {
             let (bytes, journal, journal_bytes) = rename_b_over_a(&env, &archive, complete);
             let out = env.run(&["--commit-overlay", "--yes", "-w", s(&overlay), s(&archive)]);
             let row = format!("{shape} complete={complete}");
-            assert_eq!(out.status.code(), Some(2), "{row}: {}", text(&out));
-            let expect = if unresolved {
-                "cannot resolve the overlay database"
+            let is_link = unresolved || shape == "symlink to empty";
+            assert_eq!(
+                out.status.code(),
+                Some(if is_link { 1 } else { 2 }),
+                "{row}: {}",
+                text(&out)
+            );
+            let expect = if is_link {
+                "is a symlink; it must be a regular file"
             } else {
                 "was used before but its database"
             };
@@ -969,4 +981,314 @@ fn regression_commit_overlay_refuses_sealed_overlay() {
     env.ok(&["overlay", "verify", s(&overlay), s(&archive)]);
     // Restore write bits so the temporary directory can be removed.
     env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn symlink_policy_fixture() -> (Env, PathBuf, PathBuf) {
+    let env = Env::new();
+    let archive = env.path("base.tar");
+    let mut builder = tar::Builder::new(fs::File::create(&archive).unwrap());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(5);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "base.txt", &b"base\n"[..])
+        .unwrap();
+    builder.finish().unwrap();
+    drop(builder);
+    let overlay = env.path("overlay");
+    env.ok(&[
+        "--no-mount",
+        "--index-file",
+        ":memory:",
+        "--base-digest",
+        "none",
+        "-w",
+        s(&overlay),
+        s(&archive),
+    ]);
+    fs::write(overlay.join("added.txt"), b"addition\n").unwrap();
+    (env, archive, overlay)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn policy_locator(archive: &Path) -> Vec<u8> {
+    let mut bytes = vec![0; 4096];
+    match rustix::fs::getxattr(archive, "user.ratarmount.commit-journal", &mut bytes) {
+        Ok(n) => bytes[..n].to_vec(),
+        Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOENT) => Vec::new(),
+        Err(e) => panic!("locator {}: {e}", archive.display()),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn policy_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, (String, Vec<u8>)> {
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        out: &mut std::collections::BTreeMap<PathBuf, (String, Vec<u8>)>,
+    ) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path == root.join(".cache") {
+                continue;
+            }
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let (kind, bytes) = if meta.is_symlink() {
+                (
+                    "link",
+                    fs::read_link(&path)
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_vec(),
+                )
+            } else if meta.is_file() {
+                ("file", fs::read(&path).unwrap())
+            } else {
+                ("dir", Vec::new())
+            };
+            out.insert(
+                path.strip_prefix(root).unwrap().to_owned(),
+                (kind.to_owned(), bytes),
+            );
+            if meta.is_dir() {
+                visit(root, &path, out);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn policy_link(env: &Env, overlay: &Path, suffix: &str, shape: &str) -> PathBuf {
+    let db = overlay.join(ratarmount_compositing::HIDDEN_DB);
+    let mut name = db.as_os_str().to_owned();
+    name.push(suffix);
+    let link = PathBuf::from(name);
+    let target = env.path("external-target");
+    if suffix.is_empty() {
+        fs::rename(&db, env.path("saved-db")).unwrap();
+    }
+    match shape {
+        "regular" if suffix.is_empty() => {
+            fs::copy(env.path("saved-db"), &target).unwrap();
+        }
+        "regular" => {
+            fs::write(&target, b"external target\n").unwrap();
+        }
+        "empty" => {
+            fs::write(&target, b"").unwrap();
+        }
+        "dangling" => {}
+        "loop" => {
+            std::os::unix::fs::symlink(&link, &target).unwrap();
+        }
+        _ => panic!("unknown link shape"),
+    }
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    link
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_policy_refusal(env: &Env, archive: &Path, link: &Path, args: &[&str]) {
+    let before = policy_snapshot(env.root.path());
+    let locator = policy_locator(archive);
+    let out = env.run(args);
+    assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    let canonical_link = link
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(link.file_name().unwrap());
+    assert!(
+        err.contains(&link.display().to_string())
+            || err.contains(&canonical_link.display().to_string()),
+        "{err}"
+    );
+    assert!(
+        err.contains("is a symlink; it must be a regular file"),
+        "{err}"
+    );
+    assert_eq!(
+        policy_snapshot(env.root.path()),
+        before,
+        "{args:?}: state changed: {}",
+        text(&out)
+    );
+    assert_eq!(policy_locator(archive), locator, "locator changed");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn offline_symlink_cases(suffix: &str) {
+    for shape in ["regular", "empty", "dangling", "loop"] {
+        for mode in [None, Some("copy"), Some("append"), Some("auto")] {
+            for force in [false, true] {
+                let (env, archive, overlay) = symlink_policy_fixture();
+                let link = policy_link(&env, &overlay, suffix, shape);
+                let mut args = vec![
+                    "--commit-overlay",
+                    "--yes",
+                    "--index-file",
+                    ":memory:",
+                    "-w",
+                    s(&overlay),
+                ];
+                if let Some(mode) = mode {
+                    args.extend(["--commit-overlay-mode", mode]);
+                }
+                if force {
+                    args.push("--force-base-mismatch");
+                }
+                args.push(s(&archive));
+                assert_policy_refusal(&env, &archive, &link, &args);
+            }
+        }
+    }
+    for missing in [false, true] {
+        for force in [false, true] {
+            let (env, archive, overlay) = symlink_policy_fixture();
+            if missing {
+                fs::remove_file(&archive).unwrap();
+            }
+            let link = policy_link(&env, &overlay, suffix, "regular");
+            let file_url = format!("file://{}", archive.display());
+            let mut args = vec!["--commit-overlay", "--yes", "-w", s(&overlay)];
+            if force {
+                args.push("--force-base-mismatch");
+            }
+            args.push(&file_url);
+            assert_policy_refusal(&env, &archive, &link, &args);
+        }
+    }
+}
+
+/// Regression: #239 offline DB links must refuse before any write, including force and missing bases.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_refuses_symlinked_db() {
+    offline_symlink_cases("");
+}
+
+/// Regression: #239 offline WAL links must refuse before archive publication or SQLite recovery.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_refuses_symlinked_wal() {
+    offline_symlink_cases("-wal");
+}
+
+/// Regression: #239 offline journal links must refuse before archive publication or SQLite recovery.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_refuses_symlinked_journal() {
+    offline_symlink_cases("-journal");
+}
+
+/// Regression: #239 offline SHM links must refuse before archive publication or SQLite recovery.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_refuses_symlinked_shm() {
+    offline_symlink_cases("-shm");
+}
+
+/// Regression: #239 no-mount recovery validates top/lower state before no-journal,
+/// stale locator, torn/complete journal and prepared-index early-return paths.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_no_mount_refuses_symlinked_overlay_state() {
+    for suffix in ["", "-wal", "-journal", "-shm"] {
+        for journal in ["none", "prepare", "torn", "complete", "missing", "prepared"] {
+            for lower in [false, true] {
+                for force in [false, true] {
+                    let (env, archive, overlay) = symlink_policy_fixture();
+                    match journal {
+                        "prepare" => {
+                            let len = fs::metadata(&archive).unwrap().len();
+                            let mut suffix = tempfile::tempfile().unwrap();
+                            std::io::Write::write_all(&mut suffix, &[0; 1536]).unwrap();
+                            let out = ratarmount_compress::commit_journal::replace_suffix_with_hook(
+                                &archive,
+                                len - 1024,
+                                &mut suffix,
+                                &mut |step| {
+                                    if step == "locator prepare" {
+                                        Err(std::io::Error::other("crash"))
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
+                            );
+                            assert!(out.is_err());
+                            let _ = fs::remove_file(
+                                ratarmount_compress::commit_journal::journal_path(&archive),
+                            );
+                            assert_eq!(policy_locator(&archive).get(4), Some(&b'P'));
+                        }
+                        "torn" => interrupt_append(&archive),
+                        "complete" => interrupt_complete(&archive),
+                        "missing" => fs::remove_file(&archive).unwrap(),
+                        _ => {}
+                    }
+                    let link = policy_link(&env, &overlay, suffix, "regular");
+                    let mut args = vec!["--no-mount"];
+                    if journal != "prepared" {
+                        args.extend(["--index-file", ":memory:"]);
+                    }
+                    if lower {
+                        args.extend(["--lower", s(&overlay), "--allow-unsealed-lower"]);
+                    } else {
+                        args.extend(["-w", s(&overlay)]);
+                    }
+                    if force {
+                        args.push(if lower {
+                            "--force-stack-mismatch"
+                        } else {
+                            "--force-base-mismatch"
+                        });
+                    }
+                    if journal == "prepared" {
+                        args.push("--no-recreate-index");
+                    }
+                    args.push(s(&archive));
+                    assert_policy_refusal(&env, &archive, &link, &args);
+                }
+            }
+        }
+    }
+}
+
+/// Regression: #239 regular database and raw-directory commits retain their successful behavior.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_commit_regular_and_raw_controls() {
+    for raw in [false, true] {
+        let (env, archive, overlay) = symlink_policy_fixture();
+        let overlay = if raw {
+            let dir = env.path("raw");
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("added.txt"), b"addition\n").unwrap();
+            dir
+        } else {
+            overlay
+        };
+        env.ok(&[
+            "--commit-overlay",
+            "--commit-overlay-mode",
+            "append",
+            "--yes",
+            "-w",
+            s(&overlay),
+            s(&archive),
+        ]);
+        let mut reader = tar::Archive::new(fs::File::open(&archive).unwrap());
+        assert!(reader
+            .entries()
+            .unwrap()
+            .any(|entry| entry.unwrap().path().unwrap() == Path::new("added.txt")));
+    }
 }

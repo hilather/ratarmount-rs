@@ -1646,7 +1646,7 @@ fn regression_required_latch_survives_hot_journal_retry() {
         }))
     });
     // The caller's own marker check ran before the marker appeared.
-    let result = OverlayMeta::read_with_required(dir.path(), true, false, false);
+    let result = OverlayMeta::read_with_required(dir.path(), true, false);
     crate::overlay_db::AFTER_ACQUIRE.with(|hook| *hook.borrow_mut() = None);
 
     assert_eq!(opens.get(), 3, "read, recovery, retry");

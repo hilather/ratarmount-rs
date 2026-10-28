@@ -1777,13 +1777,19 @@ fn main() {
             _ => archive.clone(),
         };
         let archive = &resolved_archive;
+        if let Err(error) = ratarmount_compositing::overlay_db::validate_overlay_state(
+            &overlay.join(ratarmount_compositing::HIDDEN_DB),
+        ) {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
         // A database overlay recovers a pending commit journal only after its
         // base identity gate (inside the commit): recovery rewrites the archive,
         // and it must not do that to an archive the overlay does not describe.
         // Only a missing entry without a marker is "no database" (R7-E2,
-        // R10-B): a dangling symlink, a directory or anything else there takes
-        // the database path below; a lost record (marker kept, database gone)
-        // or an entry that cannot be classified refuses before any recovery.
+        // R10-B). Named-state policy was checked above; a lost regular record
+        // (marker kept, database gone or empty) still refuses with exit 2
+        // before any recovery.
         let has_db = match ratarmount_compositing::overlay_db_entry(overlay) {
             Ok(ratarmount_compositing::DbEntry::Absent) => false,
             Ok(ratarmount_compositing::DbEntry::Present { .. }) => true,
@@ -1823,7 +1829,7 @@ fn main() {
             );
             if let Err(e) = recovered {
                 eprintln!("error: commit recovery for {}: {e}", archive.display());
-                std::process::exit(2);
+                std::process::exit(overlay_recovery_exit_code(&e));
             }
         }
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
@@ -1940,7 +1946,7 @@ fn main() {
     // Classify every local member's commit journal against the records that
     // vote on it BEFORE any recovery write; members a record does not own wait
     // for the identity gates (recovered below, after the overlay opened).
-    let deferred_journals = recover_mount_journals(&args, &inputs);
+    let (deferred_journals, deferred_records) = recover_mount_journals(&args, &inputs);
 
     if !args.no_recreate_index
         && args.roll_every.is_none()
@@ -2593,11 +2599,15 @@ fn main() {
     // is one: it holds its database exclusively).
     for member in &deferred_journals {
         let recovered = match overlay_arc.as_ref() {
-            Some(ov) => ov.recover_member_journal(member).map_err(|e| e.to_string()),
+            Some(ov) => ov
+                .recover_member_journal_with_records(member, &deferred_records)
+                .map_err(|e| e.to_string()),
             None => ratarmount_compositing::recover_journal_at(
                 member,
                 None,
-                ratarmount_compositing::Owner::Inode,
+                ratarmount_compositing::Owner::AdmittedMount {
+                    records: &deferred_records,
+                },
             )
             .map(|_| ())
             .map_err(|e| e.to_string()),
@@ -5112,6 +5122,33 @@ fn lower_extra_excludes(
     out
 }
 
+fn mount_recovery_records(args: &Args) -> ratarmount_compositing::MountRecords {
+    let mut records = ratarmount_compositing::MountRecords {
+        top: args
+            .write_overlay
+            .as_ref()
+            .filter(|path| path.as_os_str() != ":temp:")
+            .cloned(),
+        ..Default::default()
+    };
+    for lower in &args.lower {
+        if lower.is_dir() {
+            records.lowers.push(lower.clone());
+        } else {
+            records.bundles = true;
+        }
+    }
+    records
+}
+
+fn overlay_recovery_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 {
+    if ratarmount_compositing::overlay_db::is_overlay_state_error(error) {
+        1
+    } else {
+        2
+    }
+}
+
 /// The mount-time journal rule: before any recovery write, compare each
 /// member's journal against every readable overlay record (`-w` top, `--lower`
 /// directories). A journal every record agrees with (or abstains on) is
@@ -5119,10 +5156,32 @@ fn lower_extra_excludes(
 /// left untouched until every gate decided. A torn deferred journal is refused
 /// (nothing can open on a half-written archive); a complete one is returned for
 /// recovery after the gates. The decision is taken again under the archive lock.
-fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
-    use ratarmount_compositing::{
-        classify_mount_journal, recover_journal_at, MountJournal, MountRecords,
-    };
+fn recover_mount_journals(
+    args: &Args,
+    inputs: &[PathBuf],
+) -> (Vec<PathBuf>, ratarmount_compositing::MountRecords) {
+    use ratarmount_compositing::{classify_mount_journal, recover_journal_at, MountJournal};
+    let records = mount_recovery_records(args);
+    for dir in records.top.iter().chain(&records.lowers) {
+        if dir.is_file() {
+            eprintln!(
+                "error creating write overlay: overlay path must be a folder: {}",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if let Err(error) = ratarmount_compositing::overlay_db::validate_overlay_state(
+            &resolved.join(ratarmount_compositing::HIDDEN_DB),
+        ) {
+            if records.top.as_ref() == Some(dir) {
+                eprintln!("error creating write overlay: {error}; then retry the writable mount");
+            } else {
+                eprintln!("error: {error}");
+            }
+            std::process::exit(1);
+        }
+    }
     let mut members: Vec<PathBuf> = Vec::new();
     for input in inputs {
         let typed = input.to_string_lossy();
@@ -5156,22 +5215,7 @@ fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
                 std::process::exit(2);
             }
         }
-        return Vec::new();
-    }
-    let mut records = MountRecords::default();
-    if let Some(top) = args
-        .write_overlay
-        .as_ref()
-        .filter(|w| w.as_os_str() != ":temp:")
-    {
-        records.top = Some(top.clone());
-    }
-    for lower in &args.lower {
-        if lower.is_dir() {
-            records.lowers.push(lower.clone());
-        } else {
-            records.bundles = true;
-        }
+        return (Vec::new(), records);
     }
     let top_db = records
         .top
@@ -5182,7 +5226,7 @@ fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
         match classify_mount_journal(&records, member) {
             Err(e) => {
                 eprintln!("error: commit recovery for {}: {e}", member.display());
-                std::process::exit(2);
+                std::process::exit(overlay_recovery_exit_code(&e));
             }
             Ok(MountJournal::None | MountJournal::Own) => {
                 let owner = ratarmount_compositing::Owner::Mount {
@@ -5191,7 +5235,7 @@ fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
                 };
                 if let Err(e) = recover_journal_at(member, top_db.as_deref(), owner) {
                     eprintln!("error: commit recovery for {}: {e}", member.display());
-                    std::process::exit(2);
+                    std::process::exit(overlay_recovery_exit_code(&e));
                 }
             }
             Ok(MountJournal::Deferred { complete: true, .. }) => deferred.push(member.clone()),
@@ -5212,7 +5256,7 @@ fn recover_mount_journals(args: &Args, inputs: &[PathBuf]) -> Vec<PathBuf> {
             }
         }
     }
-    deferred
+    (deferred, records)
 }
 
 /// `--journal` files that exist already and lie inside a directory base under a

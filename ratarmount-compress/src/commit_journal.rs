@@ -298,31 +298,22 @@ pub fn recover_with(
     recovered
 }
 
-/// [`recover_with`] with a `before_write` guard (R10-B): it runs under the
-/// lock inside the stale-`P` branch (before the parent sync and the locator
-/// clear) and immediately before the rollback, never on the paths that write
-/// nothing (`None`, `D`) or that refuse a missing complete journal (`C`), so
-/// their outcomes keep their error variants.
+/// [`recover_with`] with a `before_write` guard under the archive lock.
+/// Stale-`P` cleanup checks before the parent sync and again before clearing
+/// the locator. Present-journal recovery checks before validation, after
+/// authorization, and before archive, row, journal and locator mutations,
+/// including after their fault seams (#239).
 ///
-/// A guard error on the present-journal path, complete or not, is
-/// [`RecoverError::Refused`]. A lost record beside a complete journal is
-/// therefore `Refused`, not the [`RecoverError::Committed`] a later
-/// `before_unlink` failure on that complete journal would have produced
-/// (#172). A missing `C` journal still returns `Committed` and does not call
-/// the guard. `recover_journal_after_gate` maps `Committed` the same way.
+/// A guard failure before recovery writes is [`RecoverError::Refused`], even
+/// beside a complete journal. Later failures retain the journal or locator
+/// and use [`RecoverError::Committed`] for complete content, or
+/// [`RecoverError::Journal`] for incomplete content. The `before_unlink` hook
+/// revalidates and restamps rows before the journal is removed. These checks
+/// do not provide lifetime isolation against concurrent pathname replacement.
 ///
-/// The guard is not atomic with the first write of a present journal (#173,
-/// r10 design v4 §4; that text is not in this tree). After `before_write`
-/// returns, `rollback` validates and `authorize` runs. A mount owner re-reads
-/// its records there (`authorize_mount_recovery`) and a refusal is `Refused`,
-/// before any write. The first write is `rollback truncate` when the journal
-/// is incomplete and the old bytes are not already in place. A record lost
-/// after that write is caught by the `before_unlink` hook: `Rows::with`
-/// re-classifies the rows about to be restamped (`Rows::None` does not), and
-/// a hook error keeps the journal (`Committed` only when the journal is
-/// complete; an incomplete journal's hook error is `Journal`, after the
-/// truncate). The stale-`P` arm does not classify again between the guard and
-/// `clear_marker`, and it never calls `before_unlink`.
+/// Paths that write nothing (`None`, `D`) and a missing complete journal (`C`)
+/// do not call the guard and keep their existing outcomes. The stale-`P`
+/// branch never calls `before_unlink`.
 pub fn recover_guarded(
     archive: &Path,
     before_write: BeforeWrite,
@@ -512,6 +503,30 @@ pub fn replace_suffix_if_unchanged_with(
     original: &fs::Metadata,
     before_unlink: BeforeUnlink,
 ) -> std::result::Result<(), ReplaceError> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The replacement convenience API delegates with an empty pre-write guard"
+    )]
+    replace_suffix_if_unchanged_guarded(
+        archive,
+        offset,
+        suffix,
+        original,
+        &mut || Ok(()),
+        before_unlink,
+    )
+}
+
+/// Checked replacement with an additional guard under the archive lock, after
+/// preparation seams and before any locator, journal or archive mutation.
+pub fn replace_suffix_if_unchanged_guarded(
+    archive: &Path,
+    offset: u64,
+    suffix: &mut File,
+    original: &fs::Metadata,
+    before_write: BeforeWrite,
+    before_unlink: BeforeUnlink,
+) -> std::result::Result<(), ReplaceError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         unix::replace(
@@ -521,12 +536,19 @@ pub fn replace_suffix_if_unchanged_with(
             Some(original),
             true,
             &mut |_| Ok(()),
-            before_unlink,
+            (before_write, before_unlink),
         )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (archive, offset, suffix, original, before_unlink);
+        let _ = (
+            archive,
+            offset,
+            suffix,
+            original,
+            before_write,
+            before_unlink,
+        );
         Err(ReplaceError::Refused(io::Error::new(
             io::ErrorKind::Unsupported,
             "append requires Linux/macOS inode xattrs",
@@ -545,8 +567,16 @@ pub fn replace_suffix_with_hook(
 ) -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        unix::replace(archive, offset, suffix, None, false, hook, &mut |_| Ok(()))
-            .map_err(ReplaceError::into_io)
+        unix::replace(
+            archive,
+            offset,
+            suffix,
+            None,
+            false,
+            hook,
+            (&mut || Ok(()), &mut |_| Ok(())),
+        )
+        .map_err(ReplaceError::into_io)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -798,6 +828,8 @@ __inventory_value_0
     struct Attempt {
         /// `(dev, ino)` of the journal file this attempt published.
         published: Option<(u64, u64)>,
+        /// The first locator was installed; later guard errors retain recovery state.
+        prepared: bool,
         /// The `C` locator was installed and synced.
         completed: bool,
         /// This attempt unlinked its journal (after the hook and `D`).
@@ -813,8 +845,9 @@ __inventory_value_0
         original: Option<&fs::Metadata>,
         cleanup: bool,
         hook: &mut dyn FnMut(&'static str) -> io::Result<()>,
-        before_unlink: BeforeUnlink,
+        guards: (BeforeWrite<'_>, BeforeUnlink<'_>),
     ) -> std::result::Result<(), ReplaceError> {
+        let (before_write, before_unlink) = guards;
         // Every checkpoint consults the death seam, then the fault.
         let mut hook = |step: &'static str| -> io::Result<()> {
             hook(step)?;
@@ -850,7 +883,10 @@ __inventory_value_1
                 "archive changed while preparing append; retry with a fresh plan",
             )));
         }
+        before_write().map_err(refused)?;
         let mut attempt = Attempt::default();
+        let guard_refused = std::cell::Cell::new(false);
+        let mut guard = || before_write().inspect_err(|_| guard_refused.set(true));
         let error = match run(
             &mut file,
             &path,
@@ -860,11 +896,16 @@ __inventory_value_1
             &meta,
             &mut attempt,
             &mut hook,
-            &mut *before_unlink,
+            (&mut guard, &mut *before_unlink),
         ) {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
+        if guard_refused.get() && !attempt.prepared {
+            // The guard runs before the first locator write. Refuse without
+            // cleanup: there is no published state belonging to this attempt.
+            return Err(ReplaceError::Refused(error));
+        }
         let unresolved = |e: io::Error| {
             if attempt.completed {
                 ReplaceError::Committed(e)
@@ -879,7 +920,13 @@ __inventory_value_1
         if let Err(x) = fault::check("before cleanup") {
             return Err(unresolved(join(error, x)));
         }
-        match finish_failed(&mut file, &path, &attempt, error, before_unlink) {
+        match finish_failed(
+            &mut file,
+            &path,
+            &attempt,
+            error,
+            (before_write, before_unlink),
+        ) {
             // The stamp a copy fallback compares against, taken under the
             // lock after the last write of the cleanup (the locator xattr).
             Err(ReplaceError::RolledBack(e, _)) => Err(ReplaceError::RolledBack(
@@ -891,7 +938,13 @@ __inventory_value_1
     }
 
     fn join(error: io::Error, other: impl std::fmt::Display) -> io::Error {
-        io::Error::new(error.kind(), format!("{error}; {other}"))
+        io::Error::new(
+            error.kind(),
+            RecoveryIoError {
+                message: format!("{error}; {other}"),
+                cause: error,
+            },
+        )
     }
 
     /// Steps of a replacement after the lock and the staleness check.
@@ -905,8 +958,9 @@ __inventory_value_1
         meta: &fs::Metadata,
         attempt: &mut Attempt,
         hook: &mut dyn FnMut(&'static str) -> io::Result<()>,
-        before_unlink: BeforeUnlink,
+        guards: (BeforeWrite<'_>, BeforeUnlink<'_>),
     ) -> io::Result<()> {
+        let (before_write, before_unlink) = guards;
         if offset > meta.len() {
             return Err(io::Error::other("append offset past archive EOF"));
         }
@@ -943,8 +997,11 @@ __inventory_value_1
         hook("journal tail")?;
         journal.as_file().sync_all()?;
         hook("journal fsync")?;
+        before_write()?;
         marker(file, path, b'P')?;
+        attempt.prepared = true;
         hook("locator prepare")?;
+        before_write()?;
         // On `Err` tempfile deletes the temporary journal: nothing of this
         // attempt is at `path`.
         let published = journal.persist_noclobber(path).map_err(|e| e.error)?;
@@ -954,11 +1011,14 @@ __inventory_value_1
         hook("journal publish")?;
         sync_parent(path)?;
         hook("journal directory fsync")?;
+        before_write()?;
         marker(file, path, b'A')?;
         hook("locator active")?;
+        before_write()?;
         file.set_len(offset)?;
         file.sync_all()?;
         hook("archive truncate")?;
+        before_write()?;
         file.seek(SeekFrom::Start(offset))?;
         suffix.rewind()?;
         let mut buf = [0; 65536];
@@ -972,6 +1032,7 @@ __inventory_value_1
         }
         file.sync_all()?;
         hook("archive fsync")?;
+        before_write()?;
         marker(file, path, b'C')?;
         attempt.completed = true;
         hook("locator complete")?;
@@ -982,14 +1043,19 @@ __inventory_value_1
             mtime_ns(meta),
             new_len,
         )?)?;
+        before_write()?;
         marker(file, path, b'D')?;
         hook("locator done")?;
-        fault::instead("commit unlink", || fs::remove_file(path))?;
+        fault::instead("commit unlink", || {
+            before_write()?;
+            fs::remove_file(path)
+        })?;
         attempt.unlinked = true;
         hook("journal unlink")?;
         fault::instead("commit directory sync", || sync_parent(path))?;
         attempt.synced = true;
         hook("commit directory fsync")?;
+        before_write()?;
         clear_marker(file)?;
         hook("locator clear")?;
         Ok(())
@@ -1003,8 +1069,9 @@ __inventory_value_1
         path: &Path,
         attempt: &Attempt,
         error: io::Error,
-        before_unlink: BeforeUnlink,
+        guards: (BeforeWrite<'_>, BeforeUnlink<'_>),
     ) -> std::result::Result<(), ReplaceError> {
+        let (before_write, before_unlink) = guards;
         let complete = attempt.completed
             || (attempt.published.is_some()
                 && match get_marker(file) {
@@ -1012,6 +1079,13 @@ __inventory_value_1
                     Ok(m) => m.is_some_and(|(s, _)| matches!(s, b'C' | b'D')),
                     Err(x) => return Err(ReplaceError::Pending(join(error, x))),
                 });
+        if let Err(error) = before_write() {
+            return Err(if complete {
+                ReplaceError::Committed(error)
+            } else {
+                ReplaceError::Pending(error)
+            });
+        }
         let Some(ours) = attempt.published else {
             // Nothing of this attempt is at `path`; whatever is there was
             // published for another file and is never read.
@@ -1028,6 +1102,7 @@ __inventory_value_1
                     return Err(ReplaceError::Committed(join(error, x)));
                 }
             }
+            before_write().map_err(ReplaceError::Committed)?;
             if let Err(x) = clear_marker(file) {
                 log::warn!("commit: journal unlinked durably; stale locator left: {x}");
             }
@@ -1063,11 +1138,18 @@ __inventory_value_1
             complete,
             Some(ours),
             &mut authorize,
-            before_unlink,
+            (before_write, before_unlink),
         ) {
             Ok(_) if complete => Ok(()),
             Ok(_) => Err(ReplaceError::RolledBack(error, None)),
-            Err(x) => Err(unresolved(join(error, x))),
+            Err(x) => {
+                let message = format!("{error}; {x}");
+                let cause = x.into_io();
+                Err(unresolved(io::Error::new(
+                    cause.kind(),
+                    RecoveryIoError { message, cause },
+                )))
+            }
         }
     }
 
@@ -1197,7 +1279,7 @@ __inventory_value_1
             }
         };
         let journal_error =
-            |path: &Path, e: io::Error| RecoverError::Journal(recovery_error(path, e));
+            |path: &Path, e: io::Error| RecoverError::Journal(recovery_io_error(path, e));
         let locator = get_marker(&probe).map_err(|e| journal_error(&journal_path(archive), e))?;
         let probed = locator
             .as_ref()
@@ -1245,6 +1327,7 @@ __inventory_value_1
                         sync_parent_if_present(&path)
                     })
                     .map_err(|e| journal_error(&path, e))?;
+                    before_write().map_err(RecoverError::Refused)?;
                     clear_marker(&file).map_err(|e| journal_error(&path, e))?;
                     return Ok(None);
                 }
@@ -1291,12 +1374,12 @@ __inventory_value_1
             matches!(state, Some(b'C' | b'D')),
             None,
             authorize,
-            before_unlink,
+            (before_write, before_unlink),
         )
         .map(Some)
         .map_err(|e| match e {
-            RecoverError::Journal(e) => RecoverError::Journal(recovery_error(&path, e)),
-            RecoverError::Committed(e) => RecoverError::Committed(recovery_error(&path, e)),
+            RecoverError::Journal(e) => RecoverError::Journal(recovery_io_error(&path, e)),
+            RecoverError::Committed(e) => RecoverError::Committed(recovery_io_error(&path, e)),
             refused => refused,
         })
     }
@@ -1549,20 +1632,50 @@ __inventory_value_0
         ))
     }
 
+    #[derive(Debug)]
+    struct RecoveryIoError {
+        message: String,
+        cause: io::Error,
+    }
+
+    impl std::fmt::Display for RecoveryIoError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for RecoveryIoError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.cause)
+        }
+    }
+
+    fn recovery_io_error(path: &Path, cause: io::Error) -> io::Error {
+        io::Error::new(
+            cause.kind(),
+            RecoveryIoError {
+                message: recovery_error(path, &cause).to_string(),
+                cause,
+            },
+        )
+    }
+
     fn rollback(
         path: &Path,
         file: &mut File,
         complete: bool,
         expected: Option<(u64, u64)>,
         authorize: Authorize,
-        before_unlink: BeforeUnlink,
+        guards: (BeforeWrite<'_>, BeforeUnlink<'_>),
     ) -> std::result::Result<Applied, RecoverError> {
+        let (before_write, before_unlink) = guards;
         let (header, mut journal) =
             validate(path, file, complete, expected).map_err(RecoverError::Journal)?;
         // The journal is valid for the locked content; whether it is THIS
         // caller's to apply is decided on the locked descriptor, before any write.
         let locked = file.metadata().map_err(RecoverError::Journal)?;
         authorize(&header.pending, &locked).map_err(RecoverError::Refused)?;
+        before_write().map_err(RecoverError::Refused)?;
         // After the roll-forward decision the archive holds the new bytes: any
         // later failure leaves a pending journal over committed content.
         let late = |e: io::Error| {
@@ -1587,7 +1700,10 @@ __inventory_value_0
             // Persist truncation before rollback writes so another crash leaves
             // a prefix of the old tail, never a mixture of old and new tails.
             let rolled = (|| -> io::Result<()> {
-                fault::instead("rollback truncate", || file.set_len(offset))?;
+                fault::instead("rollback truncate", || {
+                    before_write()?;
+                    file.set_len(offset)
+                })?;
                 file.sync_all()?;
                 file.seek(SeekFrom::Start(offset))?;
                 journal.seek(SeekFrom::Start(HEADER_LEN))?;
@@ -1601,6 +1717,7 @@ __inventory_value_0
                 }
                 .ok_or_else(|| io::Error::other("commit journal mtime overflow"))?;
                 restore_mtime(fault::instead("rollback mtime", || {
+                    before_write()?;
                     file.set_times(fs::FileTimes::new().set_modified(mtime))
                 }))?;
                 file.sync_all()
@@ -1609,17 +1726,24 @@ __inventory_value_0
         }
         // P with no journal means no mutation. The restored old archive is now
         // durable, so this also makes cleanup idempotent after an unlink crash.
+        before_write().map_err(late)?;
         marker(file, path, if complete { b'C' } else { b'P' }).map_err(late)?;
         let applied = applied_of(file, complete, len, pre_mtime_ns, new_len).map_err(late)?;
         before_unlink(&applied).map_err(late)?;
         if complete {
             // The hook returned `Ok`: only the unlink is owed.
+            before_write().map_err(late)?;
             marker(file, path, b'D').map_err(late)?;
         }
-        fault::instead("rollback unlink", || fs::remove_file(path)).map_err(late)?;
+        fault::instead("rollback unlink", || {
+            before_write()?;
+            fs::remove_file(path)
+        })
+        .map_err(late)?;
         fault::instead("rollback directory sync", || sync_parent(path)).map_err(late)?;
         // The unlink is durable: a stale `P`/`D` locator is metadata-only for
         // the next recovery.
+        before_write().map_err(late)?;
         if let Err(e) = clear_marker(file) {
             log::warn!(
                 "commit: journal {} removed; stale locator left: {e}",

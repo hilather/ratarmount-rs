@@ -538,7 +538,7 @@ fn owned_journal(
     CommitBaseRefusal,
 > {
     let refuse = |why: String| {
-        CommitBaseRefusal(format!(
+        CommitBaseRefusal::new(format!(
             "base mismatch: {why}; the commit was not written. Restore the archive, \
              or use --force-base-mismatch to accept the new base"
         ))
@@ -604,7 +604,32 @@ fn names_recorded_base(
 
 /// Why a commit was refused before it wrote anything.
 #[derive(Debug)]
-pub(crate) struct CommitBaseRefusal(pub String);
+pub(crate) struct CommitBaseRefusal(pub String, Option<std::io::Error>);
+
+impl CommitBaseRefusal {
+    fn new(message: String) -> Self {
+        Self(message, None)
+    }
+
+    fn policy(error: std::io::Error) -> Self {
+        Self(error.to_string(), Some(error))
+    }
+
+    pub(crate) fn is_policy(&self) -> bool {
+        self.1.is_some()
+    }
+
+    pub(crate) fn into_overlay_error(self) -> crate::OverlayError {
+        match self.1 {
+            Some(error) => crate::OverlayError::Io(error),
+            None => crate::OverlayError::Msg(self.0),
+        }
+    }
+
+    pub(crate) fn into_io(self) -> std::io::Error {
+        self.1.unwrap_or_else(|| std::io::Error::other(self.0))
+    }
+}
 
 impl std::fmt::Display for CommitBaseRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -667,7 +692,7 @@ pub(crate) fn check_commit_base_with(
     required: bool,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
     let refuse = |why: String| {
-        CommitBaseRefusal(format!(
+        CommitBaseRefusal::new(format!(
             "base mismatch: {why}; the commit was not written. Restore the archive, \
              or use --force-base-mismatch to accept the new base"
         ))
@@ -854,9 +879,10 @@ pub(crate) fn check_commit_base_offline_with(
     )>,
 ) -> std::result::Result<Option<std::fs::Metadata>, CommitBaseRefusal> {
     let db = overlay.join(HIDDEN_DB);
+    crate::overlay_db::validate_overlay_state(&db).map_err(CommitBaseRefusal::policy)?;
     let marked_before = !crate::write_overlay::overlay_markers(overlay)
         .map_err(|e| {
-            CommitBaseRefusal(format!(
+            CommitBaseRefusal::new(format!(
                 "cannot read the markers of {}: {e}",
                 overlay.display()
             ))
@@ -864,16 +890,24 @@ pub(crate) fn check_commit_base_offline_with(
         .is_empty();
     let conn = crate::overlay_db::open_overlay_db_required(
         &db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         crate::DbName::Path,
         marked_before,
     )
-    .map_err(|e| CommitBaseRefusal(format!("cannot open {}: {e}", db.display())))?;
+    .map_err(|e| {
+        if crate::overlay_db::is_overlay_state_error(&e) {
+            CommitBaseRefusal::policy(e.into())
+        } else {
+            CommitBaseRefusal::new(format!("cannot open {}: {e}", db.display()))
+        }
+    })?;
     let marked = marked_before
         || conn.required_record()
         || !crate::write_overlay::overlay_markers(overlay)
             .map_err(|e| {
-                CommitBaseRefusal(format!(
+                CommitBaseRefusal::new(format!(
                     "cannot read the markers of {}: {e}",
                     overlay.display()
                 ))

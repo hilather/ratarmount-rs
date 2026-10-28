@@ -1236,6 +1236,14 @@ impl WriteOverlay {
         // Canonical root so confinement checks use a stable absolute prefix.
         let root = root.canonicalize().map_err(OverlayError::Io)?;
         let db_path = root.join(HIDDEN_DB);
+        crate::overlay_db::validate_overlay_state(&db_path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                crate::overlay_db::OverlayStateError(format!(
+                    "{error}; then retry the writable mount"
+                )),
+            )
+        })?;
         let found_marker = overlay_marker(&root)?;
         let marker = found_marker.is_some();
         let marker_path = found_marker.unwrap_or_else(|| root.join(OVERLAY_MARKER));
@@ -1253,11 +1261,22 @@ impl WriteOverlay {
             crate::DbName::Path,
             marker,
         )
-        .map_err(|error| match error {
-            crate::OverlayDbError::NotRegular(message) => {
-                OverlayError::Msg(format!("{message}; then retry the writable mount"))
+        .map_err(|error| {
+            if crate::overlay_db::is_overlay_state_error(&error) {
+                let error = io::Error::from(error);
+                return OverlayError::Io(io::Error::new(
+                    error.kind(),
+                    crate::overlay_db::OverlayStateError(format!(
+                        "{error}; then retry the writable mount"
+                    )),
+                ));
             }
-            other => other.into(),
+            match error {
+                crate::OverlayDbError::NotRegular(message) => {
+                    OverlayError::Msg(format!("{message}; then retry the writable mount"))
+                }
+                other => other.into(),
+            }
         })?;
         let required = marker || opened.required_record();
         let db_id = opened.id();
@@ -4671,6 +4690,18 @@ impl WriteOverlay {
         self.recover_journal(archive).map(|_| ())
     }
 
+    /// Recover an admitted mount member while retaining every named overlay
+    /// state in the checks under the archive lock, including directory lowers.
+    pub fn recover_member_journal_with_records(
+        &self,
+        archive: &Path,
+        records: &crate::MountRecords,
+    ) -> Result<()> {
+        self.gate_pending_journal(archive)?;
+        self.recover_journal_after_gate_with_records(archive, Some(records))
+            .map(|_| ())
+    }
+
     fn recover_journal(
         &self,
         archive: &Path,
@@ -4696,6 +4727,7 @@ impl WriteOverlay {
     fn recover_journal_raw(
         &self,
         archive: &Path,
+        admitted: Option<&crate::MountRecords>,
     ) -> std::result::Result<
         Option<ratarmount_compress::commit_journal::Applied>,
         ratarmount_compress::commit_journal::RecoverError,
@@ -4715,15 +4747,28 @@ impl WriteOverlay {
             },
             None => Owner::Inode,
         };
-        crate::journal_recovery::recover_journal(archive, self.commit_rows(), owner)
+        crate::journal_recovery::recover_journal_with_records(
+            archive,
+            self.commit_rows(),
+            owner,
+            admitted,
+        )
     }
 
     fn recover_journal_after_gate(
         &self,
         archive: &Path,
     ) -> Result<Option<ratarmount_compress::commit_journal::Applied>> {
+        self.recover_journal_after_gate_with_records(archive, None)
+    }
+
+    fn recover_journal_after_gate_with_records(
+        &self,
+        archive: &Path,
+        admitted: Option<&crate::MountRecords>,
+    ) -> Result<Option<ratarmount_compress::commit_journal::Applied>> {
         use ratarmount_compress::commit_journal::RecoverError;
-        self.recover_journal_raw(archive)
+        self.recover_journal_raw(archive, admitted)
             .map_err(|error| match error {
                 RecoverError::Committed(e) => {
                     self.refuse_base_after_commit_failure();
@@ -4855,7 +4900,12 @@ impl WriteOverlay {
                 Err(failed) => {
                     let from = self.after_failed_replace(failed)?;
                     crate::journal_recovery::splice_replace_over(
-                        archive, from_idx, transform, original, &from,
+                        archive,
+                        from_idx,
+                        transform,
+                        original,
+                        &from,
+                        &self.commit_rows(),
                     )?
                 }
             }
@@ -4866,6 +4916,7 @@ impl WriteOverlay {
                 transform,
                 original,
                 &crate::journal_recovery::CopyFrom::Gate,
+                &self.commit_rows(),
             )?
         };
         Ok((
@@ -5008,10 +5059,13 @@ impl WriteOverlay {
             }
         }
         tmp.as_file().sync_all()?;
-        crate::journal_recovery::publish_over(archive, &source, || {
+        crate::journal_recovery::publish_over(archive, &source, &self.commit_rows(), || {
             tmp.persist(archive).map(drop).map_err(|e| e.error)
         })
         .map_err(|e| {
+            if crate::overlay_db::is_overlay_state_error(&e) {
+                return OverlayError::Io(e);
+            }
             OverlayError::Msg(format!(
                 "Failed to replace '{}' after live TAR commit: {e}",
                 archive.display(),
@@ -6260,7 +6314,7 @@ fn persist_provenance_plan(
                 ) {
                     let copy_from = copy_after_failed_replace(failed, mode)?;
                     crate::journal_recovery::splice_replace_over(
-                        archive, from, transform, original, &copy_from,
+                        archive, from, transform, original, &copy_from, rows,
                     )?;
                 }
             } else {
@@ -6270,6 +6324,7 @@ fn persist_provenance_plan(
                     transform,
                     original,
                     &crate::journal_recovery::CopyFrom::Gate,
+                    rows,
                 )?;
             }
             return Ok(IndexPatchWindow {
@@ -6323,10 +6378,10 @@ fn persist_provenance_plan(
                 src.rewind()?;
                 rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
                 tmp.as_file().sync_all()?;
-                crate::journal_recovery::publish_over(archive, &source, || {
+                crate::journal_recovery::publish_over(archive, &source, rows, || {
                     tmp.persist(archive).map(drop).map_err(|e| e.error)
                 })
-                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                .map_err(OverlayError::Io)?;
                 return Ok(IndexPatchWindow {
                     window_start: 0,
                     from_frame: None,
@@ -6342,10 +6397,10 @@ fn persist_provenance_plan(
             let source = opened;
             rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
             tmp.as_file().sync_all()?;
-            crate::journal_recovery::publish_over(archive, &source, || {
+            crate::journal_recovery::publish_over(archive, &source, rows, || {
                 tmp.persist(archive).map(drop).map_err(|e| e.error)
             })
-            .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            .map_err(OverlayError::Io)?;
             Ok(IndexPatchWindow {
                 window_start: 0,
                 from_frame: None,
@@ -7215,6 +7270,7 @@ pub fn commit_overlay(
 ) -> Result<bool> {
     let write_overlay = write_overlay.as_ref();
     let archive_file = archive_file.as_ref();
+    crate::overlay_db::validate_overlay_state(&write_overlay.join(HIDDEN_DB))?;
     match overlay_db_entry(write_overlay)? {
         DbEntry::Absent => {
             return Err(OverlayError::Msg(format!(
@@ -7227,7 +7283,7 @@ pub fn commit_overlay(
             // A sealed layer is immutable (#234): refuse before the base gate,
             // any journal recovery or the splice touches the archive, with the
             // `-w` refusal's text. `--force-base-mismatch` does not waive it.
-            if crate::OverlayMeta::read_no_recovery_required_followed(write_overlay, marked)?
+            if crate::OverlayMeta::read_no_recovery_required(write_overlay, marked)?
                 .as_ref()
                 .is_some_and(crate::OverlayMeta::layer_sealed)
             {
@@ -7241,8 +7297,8 @@ pub fn commit_overlay(
     if let Err(refusal) =
         crate::overlay_gate::check_commit_base_offline(write_overlay, base, archive_file)
     {
-        if !opts.force_base_mismatch {
-            return Err(OverlayError::Msg(refusal.0));
+        if !opts.force_base_mismatch || refusal.is_policy() {
+            return Err(refusal.into_overlay_error());
         }
         log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
     }
@@ -7269,6 +7325,7 @@ pub fn commit_overlay_raw_dir(
 ) -> Result<RawDirCommit> {
     let write_overlay = write_overlay.as_ref();
     let db = write_overlay.join(HIDDEN_DB);
+    crate::overlay_db::validate_overlay_state(&db)?;
     if let DbEntry::Lost { markers, .. } = overlay_db_entry(write_overlay)? {
         return Err(lost_record_error(write_overlay, &markers));
     }
@@ -7313,6 +7370,7 @@ fn commit_overlay_inner(
     if let Some(hook) = BEFORE_OFFLINE_RECOVERY.with(|hook| hook.borrow_mut().take()) {
         hook();
     }
+    crate::overlay_db::validate_overlay_state(&write_overlay.join(HIDDEN_DB))?;
     {
         use crate::journal_recovery::{Owner, Record};
         // The gate ran before this call (unlocked); the owner re-takes the
@@ -7339,8 +7397,10 @@ fn commit_overlay_inner(
             {
                 Ok(Some(snapshot)) => snapshot,
                 Ok(None) => fs::metadata(archive_file)?,
-                Err(_) if opts.force_base_mismatch => fs::metadata(archive_file)?,
-                Err(refusal) => return Err(OverlayError::Msg(refusal.0)),
+                Err(refusal) if opts.force_base_mismatch && !refusal.is_policy() => {
+                    fs::metadata(archive_file)?
+                }
+                Err(refusal) => return Err(refusal.into_overlay_error()),
             }
         }
         _ => fs::metadata(archive_file)?,
@@ -7376,7 +7436,10 @@ fn commit_overlay_inner(
             &crate::journal_recovery::Rows::path(&db),
             &original,
         )?;
-        crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
+        crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)
+            .map_err(|error| OverlayError::Committed(format!(
+                "{error}; the archive holds the committed bytes but the recorded baseline could not be updated (remount required)"
+            )))?;
         plan.written_hashes = written_hashes;
         let patch_opts = OpenOptions {
             encoding: opts.encoding.clone(),
@@ -7396,7 +7459,10 @@ fn commit_overlay_inner(
         commit_overlay_tar(write_overlay, archive_file, opts, &original)?
     };
     if committed {
-        crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)?;
+        crate::overlay_meta::refresh_committed_base_offline(write_overlay, identity, archive_file)
+            .map_err(|error| OverlayError::Committed(format!(
+                "{error}; the archive holds the committed bytes but the recorded baseline could not be updated (remount required)"
+            )))?;
         if let Some(hashes) = &opts.manifest_hashes {
             write_commit_manifest(archive_file, &plan, &opts.encoding, hashes)?;
         }
@@ -7449,6 +7515,7 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
         .canonicalize()
         .unwrap_or_else(|_| write_overlay.to_path_buf());
     let db_path = canon.join(HIDDEN_DB);
+    crate::overlay_db::validate_overlay_state(&db_path)?;
     let markers = overlay_markers(write_overlay)?;
     let marker = markers.first().cloned();
     // Only a missing entry is "no database" (R7-E2): a dangling symlink in an
@@ -7483,7 +7550,9 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
     let conn = if db_regular {
         let conn = crate::overlay_db::open_overlay_db_required(
             &db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             crate::DbName::Path,
             marker.is_some(),
         )?;
@@ -8168,6 +8237,8 @@ fn rebuild_zip_with_overlay(
     plan: &OverlayCommitPlan,
     original: &fs::Metadata,
 ) -> Result<()> {
+    let db = write_overlay.join(HIDDEN_DB);
+    let rows = crate::journal_recovery::Rows::path(&db);
     // Read the descriptor checked against the gate; publish only over that
     // stamp, under the copy guard (R7-E1).
     let (src, source) = crate::journal_recovery::open_copy_source(
@@ -8277,10 +8348,13 @@ fn rebuild_zip_with_overlay(
     }
     tmp.as_file().sync_all()?;
 
-    crate::journal_recovery::publish_over(zip_file, &source, || {
+    crate::journal_recovery::publish_over(zip_file, &source, &rows, || {
         tmp.persist(zip_file).map(drop).map_err(|e| e.error)
     })
     .map_err(|e| {
+        if crate::overlay_db::is_overlay_state_error(&e) {
+            return OverlayError::Io(e);
+        }
         OverlayError::Msg(format!(
             "Failed to replace '{}' with rebuilt ZIP: {e}",
             zip_file.display(),
@@ -8296,6 +8370,8 @@ fn commit_overlay_tar(
     opts: &CommitOverlayOptions,
     original: &fs::Metadata,
 ) -> Result<bool> {
+    let db = write_overlay.join(HIDDEN_DB);
+    let rows = crate::journal_recovery::Rows::path(&db);
     let format = detect_compression(tar_file).map_err(|e| {
         OverlayError::Msg(format!(
             "Failed to detect compression for '{}': {e}",
@@ -8348,13 +8424,12 @@ fn commit_overlay_tar(
                 return Ok(None);
             }
             invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
-            let db = write_overlay.join(HIDDEN_DB);
             append_uncompressed_tar_plan(
                 tar_file,
                 write_overlay,
                 &plan,
                 &opts.encoding,
-                &crate::journal_recovery::Rows::path(&db),
+                &rows,
                 original,
             )
         })();
@@ -8546,7 +8621,7 @@ fn commit_overlay_tar(
     }
 
     if format != CompressionFormat::None {
-        recompress_replace(&work_tar, tar_file, format, &copy_source)?;
+        recompress_replace(&work_tar, tar_file, format, &copy_source, &rows)?;
         // Keep materialized temp alive until recompress finishes.
         drop(work_holder);
     } else {
@@ -8556,10 +8631,13 @@ fn commit_overlay_tar(
             )
         })?;
         tmp.as_file().sync_all()?;
-        crate::journal_recovery::publish_over(tar_file, &copy_source, || {
+        crate::journal_recovery::publish_over(tar_file, &copy_source, &rows, || {
             tmp.persist(tar_file).map(drop).map_err(|e| e.error)
         })
         .map_err(|e| {
+            if crate::overlay_db::is_overlay_state_error(&e) {
+                return OverlayError::Io(e);
+            }
             OverlayError::Msg(format!(
                 "Failed to replace '{}' after offline TAR commit: {e}",
                 tar_file.display(),
@@ -8584,6 +8662,8 @@ fn commit_overlay_tar_zst(
     opts: &CommitOverlayOptions,
     original: &fs::Metadata,
 ) -> Result<bool> {
+    let db = write_overlay.join(HIDDEN_DB);
+    let rows = crate::journal_recovery::Rows::path(&db);
     let plan = collect_overlay_commit_plan(write_overlay)?;
     if plan.is_empty() {
         if opts.debug >= 1 {
@@ -8681,8 +8761,6 @@ fn commit_overlay_tar_zst(
     };
     invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
     if append {
-        let db = write_overlay.join(HIDDEN_DB);
-        let rows = crate::journal_recovery::Rows::path(&db);
         match crate::journal_recovery::splice_append_committing(
             tar_file, from_idx, transform, original, &rows,
         ) {
@@ -8690,7 +8768,7 @@ fn commit_overlay_tar_zst(
             Err(failed) => {
                 let copy_from = copy_after_failed_replace(failed, opts.mode)?;
                 crate::journal_recovery::splice_replace_over(
-                    tar_file, from_idx, transform, original, &copy_from,
+                    tar_file, from_idx, transform, original, &copy_from, &rows,
                 )?
             }
         }
@@ -8701,6 +8779,7 @@ fn commit_overlay_tar_zst(
             transform,
             original,
             &crate::journal_recovery::CopyFrom::Gate,
+            &rows,
         )?
     };
 
@@ -8734,6 +8813,7 @@ fn recompress_replace(
     dest: &Path,
     format: CompressionFormat,
     source: &fs::Metadata,
+    rows: &crate::journal_recovery::Rows<'_>,
 ) -> Result<()> {
     let parent = dest
         .parent()
@@ -8779,10 +8859,13 @@ fn recompress_replace(
     tmp.as_file().sync_all()?;
 
     // Atomic replace on the same filesystem (parent chosen to match dest).
-    crate::journal_recovery::publish_over(dest, source, || {
+    crate::journal_recovery::publish_over(dest, source, rows, || {
         tmp.persist(dest).map(drop).map_err(|e| e.error)
     })
     .map_err(|e| {
+        if crate::overlay_db::is_overlay_state_error(&e) {
+            return OverlayError::Io(e);
+        }
         OverlayError::Msg(format!(
             "Failed to replace '{}' with recompressed archive: {e}",
             dest.display(),
