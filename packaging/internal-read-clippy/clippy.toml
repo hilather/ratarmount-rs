@@ -212,11 +212,14 @@ disallowed-methods = [
     { path = "ratarmount_compress::commit_journal::authorize_owned", reason = "use ratarmount_compositing::Owner::Inode" },
     { path = "ratarmount_compress::commit_journal::authorize_forced", reason = "use ratarmount_compositing::Owner::Forced (only behind a --force-* flag)" },
     { path = "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with", reason = "use journal_recovery::replace_committing" },
+    { path = "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded", reason = "use journal_recovery::replace_committing" },
     { path = "ratarmount_compress::commit_journal::replace_suffix_with_hook", reason = "the death seam is for tests only" },
     { path = "ratarmount_compress::commit_journal::guard_copy", reason = "use journal_recovery::publish_over" },
     { path = "ratarmount_compress::splice_zstd_last_frames_append", reason = "use journal_recovery::splice_append_committing" },
     { path = "ratarmount_compress::splice_zstd_last_frames_append_with", reason = "use journal_recovery::splice_append_committing" },
+    { path = "ratarmount_compress::splice_zstd_last_frames_append_guarded", reason = "use journal_recovery::splice_append_committing" },
     { path = "ratarmount_compress::splice_zstd_last_frames_replace", reason = "use journal_recovery::splice_replace_over" },
+    { path = "ratarmount_compress::splice_zstd_last_frames_replace_guarded", reason = "use journal_recovery::splice_replace_over" },
 ]
 
 # Builder types catch Default acquisition routes; descriptor retyping is not an inventory event.

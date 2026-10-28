@@ -32,10 +32,11 @@ actual repository crate as a dependency. Isolated configurations separately
 require exact diagnostics for their public spelling and private defining-module
 spelling; two names resolving to one DefId cannot hide an invalid policy entry.
 
-The journal fixture also requires all eleven existing restrictions to emit their
-own method diagnostics, including the recovery/death-seam/convenience helpers
-without native production callers. Together the suites cover 154 external
-methods, four core alias spellings, eleven journal methods and four builder
+The journal fixture also requires all fourteen existing restrictions to emit
+their own method diagnostics, including the recovery/death-seam/convenience
+helpers without native production callers and the three guarded
+replacement/splice APIs added by #239. Together the suites cover 154 external
+methods, four core alias spellings, fourteen journal methods and four builder
 types. The remaining 17 configured repository wrapper paths are observed in the
 selected production passes; 24 native-unavailable method paths have explicit
 review dispositions.

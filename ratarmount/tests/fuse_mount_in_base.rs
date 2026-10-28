@@ -2196,12 +2196,15 @@ fn regression_mount_in_base_no_mount_from_deleted_cwd_has_no_cwd_error() {
     done(env);
 }
 
-// D4: publish-only keeps HEAD's order and never creates the overlay.
+// D4: publish-only never creates the overlay; supplied state is still inspected.
 
+/// Regression: #239 publish-only recovery must refuse an overlay-state
+/// inspection error before publishing, even when it would not open the overlay.
 #[test]
-fn regression_mount_in_base_publish_only_unusable_overlay_path_still_publishes() {
+fn regression_mount_in_base_publish_only_refuses_uninspectable_overlay_state() {
     let mut env = Env::new();
     write_tiny_tar(&env.root.join("x.tar"));
+    let archive_before = fs::read(env.root.join("x.tar")).unwrap();
     fs::write(env.root.join("blocker"), b"file").unwrap();
     let run = env.run(
         "pub1",
@@ -2213,8 +2216,15 @@ fn regression_mount_in_base_publish_only_unusable_overlay_path_still_publishes()
             "x.tar",
         ],
     );
-    assert_eq!(run.code(), Some(0), "{}", run.stderr_text());
-    assert!(env.root.join("out.index.sqlite").exists());
+    assert_eq!(run.code(), Some(1), "{}", run.stderr_text());
+    assert!(
+        run.stderr_text()
+            .contains("cannot inspect overlay database blocker/ov/.ratarmount.overlay.sqlite"),
+        "{}",
+        run.stderr_text()
+    );
+    assert!(!env.root.join("out.index.sqlite").exists());
+    assert_eq!(fs::read(env.root.join("x.tar")).unwrap(), archive_before);
     assert_eq!(fs::read(env.root.join("blocker")).unwrap(), b"file");
     done(env);
 }

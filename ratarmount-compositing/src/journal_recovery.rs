@@ -53,6 +53,9 @@ pub enum Owner<'a> {
     /// factory openers, rolling members, `--lower`-only mounts): the journal
     /// must have been started for the locked inode.
     Inode,
+    /// Mount identity gates already admitted these records; retain their named
+    /// state policy while applying only the locked inode's own journal.
+    AdmittedMount { records: &'a MountRecords },
     /// The user's explicit `--force-*` flag: any journal.
     Forced,
     /// A test authorizer.
@@ -70,7 +73,7 @@ pub enum Record<'a> {
 
 impl Owner<'_> {
     fn authorize(&mut self, header: &PendingJournal, locked: &fs::Metadata) -> io::Result<()> {
-        let refusal = |r: crate::overlay_gate::CommitBaseRefusal| io::Error::other(r.0);
+        let refusal = |r: crate::overlay_gate::CommitBaseRefusal| r.into_io();
         match self {
             Owner::Recorded {
                 base,
@@ -100,7 +103,7 @@ impl Owner<'_> {
             Owner::Mount { records, member } => {
                 authorize_mount_recovery(records, member, header, locked)
             }
-            Owner::Inode => {
+            Owner::Inode | Owner::AdmittedMount { .. } => {
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "Owner::Inode is the reviewed authority for applying the locked inode's own journal"
@@ -161,20 +164,17 @@ fn db_dir(db: &Path) -> &Path {
 
 /// A classification of an overlay directory that is not a usable record, as
 /// the `io::Error` recovery refuses with.
-fn unusable(dir: &Path, entry: &io::Result<DbEntry>) -> Option<io::Error> {
-    match entry {
-        Err(e) => Some(io::Error::new(
-            e.kind(),
-            format!(
-                "the overlay record in {} cannot be classified: {e}; no recovery write was \
-                 made",
-                dir.display()
-            ),
+fn usable_entry(dir: &Path) -> io::Result<DbEntry> {
+    match classify(dir) {
+        Err(error) if crate::overlay_db::is_overlay_state_error(&error) => Err(error),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("the overlay record in {} cannot be classified: {error}; no recovery write was made", dir.display()),
         )),
-        Ok(DbEntry::Lost { markers, .. }) => Some(io::Error::other(
-            crate::write_overlay::lost_record_error(dir, markers).to_string(),
+        Ok(DbEntry::Lost { markers, .. }) => Err(io::Error::other(
+            crate::write_overlay::lost_record_error(dir, &markers).to_string(),
         )),
-        Ok(_) => None,
+        Ok(entry) => Ok(entry),
     }
 }
 
@@ -190,33 +190,49 @@ fn vanished(db: &Path) -> io::Error {
 
 /// A used overlay's database `db` still has its `files` table (read-only).
 fn require_files(db: &Path) -> io::Result<()> {
-    let conn = crate::overlay_db::open_overlay_db_required(
-        db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        crate::DbName::Path,
-        true,
-    )
-    .map_err(|e| io::Error::other(format!("cannot open {}: {e}", db.display())))?;
-    // Under the archive lock: never wait on another holder of the database
-    // (as `read_with`).
-    conn.busy_timeout(Duration::ZERO)
-        .map_err(|e| io::Error::other(format!("cannot read {}: {e}", db.display())))?;
-    match crate::overlay_meta::has_files_table(&conn) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(io::Error::other(format!(
-            "{}: {}; no recovery write was made",
-            db.display(),
-            crate::overlay_meta::NO_FILES_TABLE
-        ))),
-        Err(e) => Err(io::Error::other(format!(
-            "cannot read {}: {e}",
-            db.display()
-        ))),
-    }
+    let result = (|| {
+        let conn = crate::overlay_db::open_overlay_db_required(
+            db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            crate::DbName::Path,
+            true,
+        )
+        .map_err(io::Error::from)?;
+        // Under the archive lock: never wait on another holder of the database
+        // (as `read_with`).
+        conn.busy_timeout(Duration::ZERO)
+            .map_err(|e| io::Error::other(format!("cannot read {}: {e}", db.display())))?;
+        match crate::overlay_meta::has_files_table(&conn) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(io::Error::other(format!(
+                "{}: {}; no recovery write was made",
+                db.display(),
+                crate::overlay_meta::NO_FILES_TABLE
+            ))),
+            Err(error) if crate::overlay_db::is_overlay_state_error(&error) => {
+                Err(io::Error::other(error))
+            }
+            Err(e) => Err(io::Error::other(format!(
+                "cannot read {}: {e}",
+                db.display()
+            ))),
+        }
+    })();
+    result.or_else(|error| {
+        ratarmount_index::checked_open::refuse_symlink(
+            db,
+            rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(io::Error::other)?;
+        Err(error)
+    })
 }
 
-/// [`crate::write_overlay::overlay_db_entry`] as an `io::Result`.
+/// Strict named-state admission before the generic followed classification.
 fn classify(dir: &Path) -> io::Result<DbEntry> {
+    crate::overlay_db::validate_overlay_state(&dir.join(crate::HIDDEN_DB))?;
     crate::write_overlay::overlay_db_entry(dir).map_err(|e| match e {
         OverlayError::Io(e) => e,
         other => io::Error::other(other.to_string()),
@@ -225,12 +241,8 @@ fn classify(dir: &Path) -> io::Result<DbEntry> {
 
 /// A live record (a mount's own database `id` in `dir`) is still that file.
 fn check_live(dir: &Path, id: Option<(u64, u64)>) -> io::Result<()> {
-    let entry = classify(dir);
-    if let Some(e) = unusable(dir, &entry) {
-        return Err(e);
-    }
-    match entry {
-        Ok(DbEntry::Present { metadata, .. }) => {
+    match usable_entry(dir)? {
+        DbEntry::Present { metadata, .. } => {
             if id.is_some() && crate::overlay_db::file_id(&metadata) != id {
                 return Err(io::Error::other(format!(
                     "the overlay database in {} was replaced while the overlay is mounted; \
@@ -290,11 +302,23 @@ impl<'a> Rows<'a> {
         }
     }
 
+    /// Check named state without acquiring a second descriptor or SQLite lock.
+    fn validate_state(&self) -> io::Result<()> {
+        match self {
+            Rows::None => Ok(()),
+            Rows::Shared { dir, .. } => {
+                crate::overlay_db::validate_overlay_state(&dir.join(crate::HIDDEN_DB))
+            }
+            Rows::Path { db, .. } => crate::overlay_db::validate_overlay_state(db),
+        }
+    }
+
     /// The guard half for the rows (under the archive lock, before any
     /// recovery write): the rows' directory must not be a lost or
     /// unclassifiable record, and a mount's own database must still be the
     /// file it opened.
-    fn guard(&self) -> io::Result<()> {
+    pub(crate) fn guard(&self) -> io::Result<()> {
+        self.validate_state()?;
         match self {
             Rows::None => Ok(()),
             Rows::Shared { dir, id, .. } => check_live(dir, *id),
@@ -304,11 +328,7 @@ impl<'a> Rows<'a> {
                 required_files,
             } => {
                 let dir = db_dir(db);
-                let entry = classify(dir);
-                if let Some(e) = unusable(dir, &entry) {
-                    return Err(e);
-                }
-                let entry = entry?;
+                let entry = usable_entry(dir)?;
                 self.observe(&entry);
                 match entry {
                     // Seen before, gone now (database and marker both
@@ -332,59 +352,68 @@ impl<'a> Rows<'a> {
         &self,
         f: impl FnOnce(&Connection, bool) -> io::Result<()>,
     ) -> io::Result<()> {
-        match self {
-            Rows::None => Ok(()),
-            Rows::Shared { db, dir, id } => {
-                check_live(dir, *id)?;
-                f(&db.lock().unwrap_or_else(|e| e.into_inner()), true)
-            }
-            Rows::Path {
-                db,
-                must_exist,
-                required_files,
-            } => {
-                let dir = db_dir(db);
-                let entry = classify(dir);
-                if let Some(e) = unusable(dir, &entry) {
-                    return Err(e);
+        let result = (|| {
+            self.validate_state()?;
+            match self {
+                Rows::None => Ok(()),
+                Rows::Shared { db, dir, id } => {
+                    check_live(dir, *id)?;
+                    f(&db.lock().unwrap_or_else(|e| e.into_inner()), true)
                 }
-                let entry = entry?;
-                self.observe(&entry);
-                if let DbEntry::Absent = entry {
-                    if must_exist.get() || required_files.get() {
-                        return Err(vanished(db));
-                    }
-                    // A raw overlay directory: nothing to restamp.
-                    return Ok(());
-                }
-                // The latch goes into the acquisition (a required record
-                // must be the non-empty file classified) and comes back.
-                #[cfg(test)]
-                {
-                    let hook = BEFORE_INNER_OPEN.with(|h| h.borrow_mut().take());
-                    if let Some(hook) = hook {
-                        hook();
-                    }
-                }
-                let conn = crate::overlay_db::open_overlay_db_required(
+                Rows::Path {
                     db,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                    crate::DbName::Path,
-                    required_files.get(),
-                )
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "cannot open the overlay database {} to restamp the base: {e}",
-                        db.display()
-                    ))
-                })?;
-                if conn.required_record() {
-                    required_files.set(true);
+                    must_exist,
+                    required_files,
+                } => {
+                    let dir = db_dir(db);
+                    let entry = usable_entry(dir)?;
+                    self.observe(&entry);
+                    if let DbEntry::Absent = entry {
+                        if must_exist.get() || required_files.get() {
+                            return Err(vanished(db));
+                        }
+                        // A raw overlay directory: nothing to restamp.
+                        return Ok(());
+                    }
+                    // The latch goes into the acquisition (a required record
+                    // must be the non-empty file classified) and comes back.
+                    #[cfg(test)]
+                    {
+                        let hook = BEFORE_INNER_OPEN.with(|h| h.borrow_mut().take());
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    crate::overlay_db::validate_overlay_state(db)?;
+                    let conn = crate::overlay_db::open_overlay_db_required(
+                        db,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                        crate::DbName::Path,
+                        required_files.get(),
+                    )
+                    .map_err(io::Error::from)?;
+                    if conn.required_record() {
+                        required_files.set(true);
+                    }
+                    f(&conn, required_files.get())
                 }
-                f(&conn, required_files.get())
             }
-        }
+        })();
+        result.or_else(|error| {
+            let db = match self {
+                Rows::None => return Err(error),
+                Rows::Shared { dir, .. } => dir.join(crate::HIDDEN_DB),
+                Rows::Path { db, .. } => db.to_path_buf(),
+            };
+            ratarmount_index::checked_open::refuse_symlink(
+                &db,
+                rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .map_err(io::Error::other)?;
+            Err(error)
+        })
     }
 
     /// The `before_unlink` hook of the commit that wrote the journal
@@ -536,7 +565,7 @@ fn restamp_once(
             ))));
         }
         let meta = OverlayMeta::from_connection(conn)
-            .map_err(|e| RestampError::Other(io::Error::other(e.to_string())))?;
+            .map_err(|e| RestampError::Other(io::Error::other(e)))?;
         // A journal whose target is not the recorded base (a union member, a
         // base that left its recorded place), a kind-only record and a record
         // without a stamp leave the rows alone.
@@ -619,40 +648,67 @@ fn restamp_once(
 pub(crate) fn recover_journal(
     archive: &Path,
     rows: Rows<'_>,
-    mut owner: Owner<'_>,
+    owner: Owner<'_>,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
-    // Every overlay record this recovery answers to, captured before the
-    // closures borrow `owner` (R10-B): none may be lost or unclassifiable
-    // when the first recovery write (the stale-`P` clear included) is made.
-    // `follow`: an offline commit's record is read as its gate opened it,
-    // through a symlink to a regular file (R10-FIX7); a mount's records keep
-    // the mount's strict rule.
-    let records: Vec<(PathBuf, bool)> = match &owner {
-        Owner::Mount { records, .. } => records
+    recover_journal_with_records(archive, rows, owner, None)
+}
+
+/// A live mount also retains the named policy of already-admitted directory
+/// lowers, independently of its held connection and recovery authorization.
+pub(crate) fn recover_journal_with_records(
+    archive: &Path,
+    rows: Rows<'_>,
+    mut owner: Owner<'_>,
+    admitted: Option<&MountRecords>,
+) -> std::result::Result<Option<Applied>, RecoverError> {
+    let mut records: Vec<PathBuf> = match &owner {
+        Owner::Mount { records, .. } | Owner::AdmittedMount { records } => records
             .top
             .iter()
             .chain(records.lowers.iter())
-            .map(|dir| (dir.clone(), false))
+            .cloned()
             .collect(),
         Owner::Recorded {
             record: Record::Offline(dir),
             ..
-        } => vec![(dir.to_path_buf(), true)],
+        } => vec![dir.to_path_buf()],
         _ => Vec::new(),
     };
+    if let Some(admitted) = admitted {
+        records.extend(admitted.lowers.iter().cloned());
+    }
+    // A held connection must never be re-opened through an alias as a probe:
+    // closing that alias could release this process's SQLite POSIX locks.
+    let live_path = match &owner {
+        Owner::Recorded {
+            record: Record::Live(db),
+            ..
+        } => db
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path()
+            .map(PathBuf::from),
+        _ => None,
+    };
+    let validate = || -> io::Result<()> {
+        for dir in &records {
+            crate::overlay_db::validate_overlay_state(&dir.join(crate::HIDDEN_DB))?;
+        }
+        if let Some(path) = &live_path {
+            crate::overlay_db::validate_overlay_state(path)?;
+        }
+        if let Some(top) = admitted.and_then(|records| records.top.as_ref()) {
+            crate::overlay_db::validate_overlay_state(&top.join(crate::HIDDEN_DB))?;
+        }
+        rows.validate_state()
+    };
+    // Even no-journal recovery returns only after every supplied named state
+    // has been checked; force and inode ownership cannot bypass this policy.
+    validate().map_err(RecoverError::Refused)?;
     let mut before_write = || {
-        for (dir, follow) in &records {
-            // A lost, unclassifiable or `files`-less used record (R10-B).
-            read_record(dir, *follow).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "the overlay record in {} cannot be read: {e}; no recovery write \
-                         was made",
-                        dir.display()
-                    ),
-                )
-            })?;
+        validate()?;
+        for dir in &records {
+            read_record(dir)?;
         }
         rows.guard()
     };
@@ -667,6 +723,7 @@ pub(crate) fn recover_journal(
         &mut before_write,
         &mut authorize,
         &mut |applied| {
+            validate()?;
             rows.with(|conn, required| {
                 restamp_rows(conn, archive, applied, Restamp::Recovery, required)
             })
@@ -676,14 +733,17 @@ pub(crate) fn recover_journal(
 }
 
 /// [`recover_journal`] for callers that hold no overlay: the library and mount
-/// openers, offline commits. `overlay_db`, when it exists, is opened read-write
-/// (it is never created) BEFORE recovery starts; a database that cannot be
-/// opened fails the call with the journal untouched.
+/// openers, offline commits. Every supplied database and companion name is
+/// checked before journal classification, including when no journal is pending.
+/// A database is acquired read-write, without creation, only for restamping.
 pub fn recover_journal_at(
     archive: &Path,
     overlay_db: Option<&Path>,
     owner: Owner<'_>,
 ) -> std::result::Result<Option<Applied>, RecoverError> {
+    if let Some(db) = overlay_db {
+        crate::overlay_db::validate_overlay_state(db).map_err(RecoverError::Refused)?;
+    }
     // Opened only when a roll-forward needs to restamp: a mount with no pending
     // journal never touches the overlay database here.
     let rows = overlay_db.map_or(Rows::None, Rows::path);
@@ -798,45 +858,19 @@ pub enum MountJournal {
     },
 }
 
-/// `follow`: a database entry that is a symlink to a regular file is read
-/// through it (an offline commit's record, as its gate opens it); otherwise
-/// it is an unreadable record (a mount's rule).
-fn read_record(dir: &Path, follow: bool) -> io::Result<Option<OverlayMeta>> {
-    // Only an absent database is "no record" (R10-B: a lost record, or one
-    // that cannot be classified, defers). A directory, a symlink or anything
-    // else that is not a regular file is an unreadable record: it must defer,
-    // never abstain.
-    let entry = classify(dir);
-    if let Some(e) = unusable(dir, &entry) {
-        return Err(e);
-    }
-    let marked = match entry {
-        Ok(DbEntry::Absent) => return Ok(None),
-        Ok(DbEntry::Present { marked, .. }) => marked,
+/// Read a record only after its database and every companion passed the
+/// strict named-state policy, including an otherwise unmarked raw directory.
+fn read_record(dir: &Path) -> io::Result<Option<OverlayMeta>> {
+    crate::overlay_db::validate_overlay_state(&dir.join(crate::HIDDEN_DB))?;
+    let marked = match usable_entry(dir)? {
+        DbEntry::Absent => return Ok(None),
+        DbEntry::Present { marked, .. } => marked,
         _ => true,
     };
-    if follow {
-        // `classify` already followed the entry to a regular file.
-        return OverlayMeta::read_no_recovery_required_followed(dir, marked)
-            .map_err(|e| io::Error::other(e.to_string()));
-    }
-    match fs::symlink_metadata(dir.join(crate::HIDDEN_DB)) {
-        Ok(m) if m.is_file() => {}
-        Ok(m) if m.file_type().is_symlink() => {
-            return Err(io::Error::other(
-                "the overlay database is a symlink; move the database file into place \
-                 of the link, then retry the writable mount",
-            ))
-        }
-        Ok(_) => {
-            return Err(io::Error::other(
-                "the overlay database is not a regular file".to_string(),
-            ))
-        }
-        Err(e) => return Err(e),
-    }
-    // A marked record without a `files` table is lost, never unrecorded.
-    OverlayMeta::read_no_recovery_required(dir, marked).map_err(|e| io::Error::other(e.to_string()))
+    OverlayMeta::read_no_recovery_required(dir, marked).map_err(|error| match error {
+        OverlayError::Io(error) => error,
+        other => io::Error::other(other),
+    })
 }
 
 /// The decision table on the journal header and the file's current identity.
@@ -878,16 +912,21 @@ fn decide(
         } else {
             "--force-stack-mismatch"
         };
-        let meta = match read_record(dir, false) {
+        let meta = match read_record(dir) {
             Ok(meta) => meta,
             Err(e) => {
+                // Path policy outranks journal deferral: force cannot turn a
+                // typed acquisition/metadata refusal into recovery authority.
+                if crate::overlay_db::is_overlay_state_error(&e) {
+                    return Err(e);
+                }
                 return Ok(defer(
                     format!(
                         "has an overlay record ({}) that cannot be read: {e}",
                         dir.display()
                     ),
                     flag,
-                ))
+                ));
             }
         };
         let Some(meta) = meta else { continue };
@@ -1014,9 +1053,10 @@ impl From<OverlayError> for FailedReplace {
     /// An error before the replacement started (staging, scanning): nothing
     /// was written.
     fn from(error: OverlayError) -> Self {
+        let may_copy = !crate::overlay_db::is_overlay_state_error(&error);
         Self {
             error,
-            may_copy: true,
+            may_copy,
             rolled_back: None,
             base_unusable: false,
         }
@@ -1037,10 +1077,17 @@ pub(crate) fn failed_replace(error: ReplaceError) -> FailedReplace {
     // final stamp could not be read has no reference: no copy.
     let mut rolled_back = None;
     let (error, may_copy, base_unusable) = match error {
-        ReplaceError::Refused(e) => (OverlayError::Msg(e.to_string()), true, false),
+        ReplaceError::Refused(e) => {
+            let may_copy = !crate::overlay_db::is_overlay_state_error(&e);
+            (OverlayError::Io(e), may_copy, false)
+        }
         ReplaceError::RolledBack(e, Some(stamp)) => {
             rolled_back = Some(stamp);
-            (OverlayError::Io(e), true, false)
+            let may_copy = !crate::overlay_db::is_overlay_state_error(&e);
+            (OverlayError::Io(e), may_copy, false)
+        }
+        ReplaceError::RolledBack(e, None) if crate::overlay_db::is_overlay_state_error(&e) => {
+            (OverlayError::Io(e), false, false)
         }
         ReplaceError::RolledBack(e, None) => (
             OverlayError::Msg(format!(
@@ -1137,6 +1184,11 @@ pub(crate) fn copy_source_changed(archive: &Path) -> io::Error {
 pub(crate) fn failed_splice(error: ratarmount_compress::CompressError) -> FailedReplace {
     match error {
         ratarmount_compress::CompressError::Replace(e) => failed_replace(e),
+        ratarmount_compress::CompressError::Io(error)
+            if crate::overlay_db::is_overlay_state_error(&error) =>
+        {
+            error.into()
+        }
         ratarmount_compress::CompressError::ArchiveMetadata(error) => FailedReplace {
             error: OverlayError::Io(error),
             may_copy: false,
@@ -1159,6 +1211,7 @@ pub(crate) fn replace_committing(
 ) -> std::result::Result<(), FailedReplace> {
     let mut refusal = None;
     let mut checked_write = || {
+        rows.guard()?;
         before_write().map_err(|error| {
             let message = error.to_string();
             refusal = Some(error);
@@ -1169,7 +1222,7 @@ pub(crate) fn replace_committing(
         clippy::disallowed_methods,
         reason = "The compositing replacement wrapper supplies the checked base and commit restamp hook"
     )]
-    let replaced = commit_journal::replace_suffix_if_unchanged_with(
+    let replaced = commit_journal::replace_suffix_if_unchanged_guarded(
         archive,
         offset,
         suffix,
@@ -1202,6 +1255,7 @@ where
 {
     let mut refusal = None;
     let mut checked_write = || {
+        rows.guard()?;
         before_write().map_err(|error| {
             let message = error.to_string();
             refusal = Some(error);
@@ -1212,7 +1266,7 @@ where
         clippy::disallowed_methods,
         reason = "The compositing append wrapper supplies the checked base and commit restamp hook"
     )]
-    let appended = ratarmount_compress::splice_zstd_last_frames_append_with(
+    let appended = ratarmount_compress::splice_zstd_last_frames_append_guarded(
         archive,
         from_idx,
         transform,
@@ -1274,6 +1328,7 @@ pub(crate) fn recheck_copy_source(
 pub(crate) fn publish_over(
     archive: &Path,
     source: &fs::Metadata,
+    rows: &Rows<'_>,
     publish: impl FnOnce() -> io::Result<()>,
     before_write: &mut dyn FnMut() -> Result<()>,
 ) -> std::result::Result<(), FailedReplace> {
@@ -1282,6 +1337,7 @@ pub(crate) fn publish_over(
         reason = "The compositing publisher holds the checked-source guard across the publication callback"
     )]
     let _guard = commit_journal::guard_copy(archive, source)?;
+    rows.guard()?;
     if let Err(error) = before_write() {
         return Err(FailedReplace {
             error,
@@ -1291,6 +1347,15 @@ pub(crate) fn publish_over(
         });
     }
     commit_journal::test_prewrite_hold()?;
+    rows.guard()?;
+    if let Err(error) = before_write() {
+        return Err(FailedReplace {
+            error,
+            may_copy: false,
+            rolled_back: None,
+            base_unusable: false,
+        });
+    }
     publish().map_err(FailedReplace::from)
 }
 
@@ -1302,6 +1367,7 @@ pub(crate) fn splice_replace_over<F>(
     transform: F,
     original: &fs::Metadata,
     from: &CopyFrom,
+    rows: &Rows<'_>,
     before_write: &mut dyn FnMut() -> Result<()>,
 ) -> std::result::Result<ratarmount_compress::SpliceStats, OverlayError>
 where
@@ -1309,6 +1375,7 @@ where
 {
     let mut refusal = None;
     let mut checked_write = || {
+        rows.guard()?;
         before_write().map_err(|error| {
             let message = error.to_string();
             refusal = Some(error);
@@ -1319,7 +1386,7 @@ where
         clippy::disallowed_methods,
         reason = "The compositing copy-splice wrapper provides the previously accepted source stamp"
     )]
-    let replaced = ratarmount_compress::splice_zstd_last_frames_replace(
+    let replaced = ratarmount_compress::splice_zstd_last_frames_replace_guarded(
         archive,
         from_idx,
         transform,
@@ -1329,7 +1396,10 @@ where
     if let Some(error) = refusal {
         return Err(error);
     }
-    replaced.map_err(|e| OverlayError::Msg(e.to_string()))
+    replaced.map_err(|e| match e {
+        ratarmount_compress::CompressError::Io(error) => OverlayError::Io(error),
+        other => OverlayError::Msg(other.to_string()),
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -1365,6 +1435,7 @@ mod tests {
         let error = publish_over(
             &archive,
             &source,
+            &Rows::None,
             || {
                 published.set(true);
                 fs::write(&archive, b"after")
@@ -1467,6 +1538,7 @@ mod tests {
                     transform,
                     &original,
                     &CopyFrom::Gate,
+                    &Rows::None,
                     &mut guard,
                 )
                 .unwrap_err()

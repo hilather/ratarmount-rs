@@ -217,6 +217,51 @@ fn probe_row() -> String {
     format!("{immediate} {getlk}")
 }
 
+/// Regression: #239 a symlink planted after SQLite's pathname check returned
+/// ordinary CANTOPEN, losing the symlink refusal before recovery classified it.
+#[test]
+fn regression_checked_open_after_low_fd_fill_reports_symlink() {
+    for (flags, mode) in [
+        (RO, NameMode::Path),
+        (RW, NameMode::Path),
+        (RO, NameMode::Immutable),
+    ] {
+        let (_tmp, dir) = tempdir();
+        let db = dir.join("overlay.sqlite");
+        let target = dir.join("original.sqlite");
+        make_db(&db, 1);
+        let before = std::fs::read(&db).unwrap();
+        let original_id = id_of(&db);
+        let expect = existing(&db, true);
+        let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let reached = swapped.clone();
+        let (db_at_seam, target_at_seam) = (db.clone(), target.clone());
+        let seams = Seams::set(move |seam| {
+            if seam == Seam::AfterLowFdFill && !reached.replace(true) {
+                std::fs::rename(&db_at_seam, &target_at_seam).unwrap();
+                std::os::unix::fs::symlink(&target_at_seam, &db_at_seam).unwrap();
+            }
+        });
+        let refusal =
+            open_checked(&db, flags | OpenFlags::SQLITE_OPEN_NOFOLLOW, mode, expect).unwrap_err();
+        drop(seams);
+        assert!(swapped.get(), "AfterLowFdFill was reached");
+        assert!(
+            matches!(
+                &refusal.error,
+                AcquireError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                    if error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+            ),
+            "{flags:?} {mode:?}: {refusal}"
+        );
+        assert_eq!(refusal.retained_fd, None);
+        assert!(std::fs::symlink_metadata(&db).unwrap().is_symlink());
+        assert_eq!(std::fs::read_link(&db).unwrap(), target);
+        assert_eq!(id_of(&target), original_id);
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+    }
+}
+
 /// Regression: (r9 T1): SQLite's own descriptor is judged, not the name. The
 /// database name holds another file at the open (another database, an empty
 /// file, a `/dev/null` symlink, a FIFO: AFTER_PRESTAT, done before the call)
@@ -611,6 +656,213 @@ fn regression_checked_open_fstat_failure_retains_fd() {
     assert!(fd_is_open(fd));
     assert_eq!(fd_id(fd), id_of(&a));
     holder.execute_batch("COMMIT").unwrap();
+}
+
+/// Regression: #239 a late companion symlink must retain its policy identity
+/// even when acquisition fails its descriptor check rather than SQLite's open.
+#[test]
+fn regression_checked_open_after_low_fd_fill_companion_fstat_failure() {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        for nofollow in [false, true] {
+            let (_tmp, dir) = tempdir();
+            let db = dir.join("overlay.sqlite");
+            make_db(&db, 1);
+            let before = std::fs::read(&db).unwrap();
+            let target = dir.join("target");
+            std::fs::write(&target, b"companion target unchanged").unwrap();
+            let mut companion = db.as_os_str().to_os_string();
+            companion.push(suffix);
+            let companion = PathBuf::from(companion);
+            let planted = std::rc::Rc::new(std::cell::Cell::new(false));
+            let reached = planted.clone();
+            let (at_seam, target_at_seam) = (companion.clone(), target.clone());
+            let seams = Seams::set(move |seam| {
+                if seam == Seam::AfterLowFdFill && !reached.replace(true) {
+                    std::os::unix::fs::symlink(&target_at_seam, &at_seam).unwrap();
+                }
+            })
+            .fail_fstat(libc::EIO);
+            let flags = if nofollow {
+                RO | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            } else {
+                RO
+            };
+            let refusal = open_checked(&db, flags, NameMode::Path, existing(&db, true))
+                .expect_err("the forced fstat failure refuses acquisition");
+            drop(seams);
+            assert!(planted.get(), "{suffix}: AfterLowFdFill was reached");
+            if nofollow {
+                assert!(
+                    matches!(
+                        &refusal.error,
+                        AcquireError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                            if error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+                    ),
+                    "{suffix}: {refusal}"
+                );
+                let message = refusal.to_string();
+                assert!(
+                    message.contains(&companion.display().to_string()),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("is a symlink; it must be a regular file"),
+                    "{message}"
+                );
+            } else {
+                assert!(matches!(refusal.error, AcquireError::Fstat(libc::EIO)));
+            }
+            let fd = refusal
+                .retained_fd
+                .expect("the unverified descriptor remains retained");
+            assert!(fd_is_open(fd));
+            assert_eq!(fd_id(fd), id_of(&db));
+            assert_eq!(std::fs::read(&db).unwrap(), before);
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                b"companion target unchanged"
+            );
+            assert_eq!(std::fs::read_link(&companion).unwrap(), target);
+        }
+    }
+}
+
+/// Regression: #239 failure rechecks must inspect every literal companion,
+/// including non-UTF-8 names and companions of an absent database.
+#[test]
+fn regression_checked_open_refuse_symlink_scans_all_names() {
+    use std::os::unix::ffi::OsStringExt;
+
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        for non_utf8 in [false, true] {
+            let (_tmp, dir) = tempdir();
+            let db_name = if non_utf8 {
+                std::ffi::OsString::from_vec(b"overlay-\xff.sqlite".to_vec())
+            } else {
+                std::ffi::OsString::from("overlay.sqlite")
+            };
+            let db = dir.join(db_name);
+            let target = dir.join("target");
+            std::fs::write(&target, b"unchanged").unwrap();
+            let mut name = db.as_os_str().to_os_string();
+            name.push(suffix);
+            let name = PathBuf::from(name);
+            match std::os::unix::fs::symlink(&target, &name) {
+                Ok(()) => {}
+                // APFS refuses non-UTF-8 names before the policy can inspect them.
+                Err(e)
+                    if cfg!(target_os = "macos")
+                        && non_utf8
+                        && e.raw_os_error() == Some(libc::EILSEQ) =>
+                {
+                    eprintln!("skip: filesystem rejects non-UTF-8 symlink names");
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            }
+            if !suffix.is_empty() {
+                assert!(!db.exists(), "only the companion exists");
+            }
+            assert!(
+                refuse_symlink(&db, RO).is_ok(),
+                "generic callers retain their policy"
+            );
+            let error = refuse_symlink(&db, RO | OpenFlags::SQLITE_OPEN_NOFOLLOW).unwrap_err();
+            assert_eq!(
+                error.sqlite_error().unwrap().extended_code,
+                rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+            );
+            let message = error.to_string();
+            assert!(message.contains(&name.display().to_string()), "{message}");
+            assert!(
+                message.contains("is a symlink; it must be a regular file"),
+                "{message}"
+            );
+            assert_eq!(std::fs::read_link(&name).unwrap(), target);
+            assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+            std::fs::remove_file(&name).unwrap();
+            assert!(refuse_symlink(&db, RO | OpenFlags::SQLITE_OPEN_NOFOLLOW).is_ok());
+        }
+    }
+}
+
+/// Regression: #239 even an acquisition refused before SQLite opens must
+/// preserve an existing companion symlink's strict policy identity.
+#[test]
+fn regression_checked_open_invalid_request_reports_companion_symlink() {
+    let (_tmp, dir) = tempdir();
+    let db = dir.join("overlay.sqlite");
+    make_db(&db, 1);
+    let before = std::fs::read(&db).unwrap();
+    let target = dir.join("target");
+    std::fs::write(&target, b"unchanged").unwrap();
+    let mut companion = db.as_os_str().to_os_string();
+    companion.push("-journal");
+    let companion = PathBuf::from(companion);
+    std::os::unix::fs::symlink(&target, &companion).unwrap();
+    let flags = RO | OpenFlags::SQLITE_OPEN_MEMORY;
+    let generic = open_checked(&db, flags, NameMode::Path, existing(&db, true)).unwrap_err();
+    assert!(matches!(generic.error, AcquireError::InvalidRequest(_)));
+    let refusal = open_checked(
+        &db,
+        flags | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        NameMode::Path,
+        existing(&db, true),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            &refusal.error,
+            AcquireError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+        ),
+        "{refusal}"
+    );
+    let message = refusal.to_string();
+    assert!(
+        message.contains(&companion.display().to_string()),
+        "{message}"
+    );
+    assert!(
+        message.contains("is a symlink; it must be a regular file"),
+        "{message}"
+    );
+    assert_eq!(refusal.retained_fd, None);
+    assert_eq!(std::fs::read(&db).unwrap(), before);
+    assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+    assert_eq!(std::fs::read_link(&companion).unwrap(), target);
+}
+
+/// Regression: #239 a failure probe may not open and close an alias of a
+/// database: POSIX would release this process's locks on the target inode.
+#[test]
+fn regression_checked_open_refuse_symlink_keeps_target_locks() {
+    let (_tmp, dir) = tempdir();
+    let db = dir.join("overlay.sqlite");
+    make_db(&db, 1);
+    let before = std::fs::read(&db).unwrap();
+    let holder = Connection::open(&db).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(other_process_sees_lock(&db));
+    let mut companion = db.as_os_str().to_os_string();
+    companion.push("-wal");
+    let companion = PathBuf::from(companion);
+    std::os::unix::fs::symlink(&db, &companion).unwrap();
+    let error = refuse_symlink(&db, RO | OpenFlags::SQLITE_OPEN_NOFOLLOW).unwrap_err();
+    assert_eq!(
+        error.sqlite_error().unwrap().extended_code,
+        rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+    );
+    assert_eq!(std::fs::read_link(&companion).unwrap(), db);
+    // The lock probe opens SQLite itself, which refuses the companion alias.
+    // Removing the name cannot release any POSIX lock on the target inode.
+    std::fs::remove_file(&companion).unwrap();
+    assert!(
+        other_process_sees_lock(&db),
+        "the target's lock survived the recheck"
+    );
+    holder.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(std::fs::read(&db).unwrap(), before);
 }
 
 /// Regression: (r9 v1 #3 / Fable N7): arming is per thread. While one thread
