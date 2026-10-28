@@ -285,20 +285,37 @@ fn sealed_guard(dir: &Path, root: &OwnedFd) -> io::Result<crate::write_overlay::
         }
     }
     let _bootstrap = Unlock(root);
+    struct RestoreSealedRoot<'a> {
+        root: &'a OwnedFd,
+        armed: bool,
+    }
+    impl Drop for RestoreSealedRoot<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = host::fchmod(self.root, Mode::from_raw_mode(0o555));
+            }
+        }
+    }
+    // Declare the operation lock first so error unwinding restores the root
+    // before releasing that lock and allowing another unseal to proceed.
+    let guard;
     // Grant bootstrap write access without retaining a mode across the wait.
     host::fchmod(
         root,
         Mode::from_raw_mode(crate::host_stat::fstat(root)?.st_mode) | Mode::WUSR,
     )?;
-    let guard = crate::write_overlay::SealCommitGuard::acquire(dir)?;
+    let mut restore = RestoreSealedRoot { root, armed: true };
+    guard = crate::write_overlay::SealCommitGuard::acquire(dir)?;
     // Unseal may have completed while we waited for the operation lock.
-    // Only restore read-only permissions when the locked metadata is sealed.
-    let mode = Mode::from_raw_mode(crate::host_stat::fstat(root)?.st_mode);
-    let sealed = OverlayMeta::read(dir)
+    // Only positive evidence under that lock permits leaving the root writable;
+    // missing metadata and every error must restore the sealed mode.
+    let unsealed = OverlayMeta::read(dir)
         .map_err(overlay_error)?
-        .is_some_and(|meta| meta.layer_sealed());
-    if sealed {
-        host::fchmod(root, mode & !Mode::WUSR)?;
+        .is_some_and(|meta| !meta.layer_sealed());
+    if unsealed {
+        restore.armed = false;
+    } else {
+        host::fchmod(root, Mode::from_raw_mode(0o555))?;
     }
     Ok(guard)
 }
@@ -1156,6 +1173,50 @@ mod tests {
             "queued re-seal restored the stale sealed root mode"
         );
         assert_ne!(mode & 0o200, 0, "unsealed root must remain owner-writable");
+    }
+
+    /// Regression: a busy database during legacy unseal must not leave the
+    /// still-sealed root owner-writable after bootstrapping its missing lock.
+    #[test]
+    fn regression_240_legacy_unseal_busy_database_restores_sealed_root_mode() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: legacy lock bootstrap requires directory permission enforcement");
+            return;
+        }
+
+        let f = Fixture::new();
+        let sealed = seal(&f.dir, f.base.clone()).unwrap();
+        let sentinel = fs::read(f.dir.join(SENTINEL)).unwrap();
+        let lock = f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK);
+        let db = f.dir.join(HIDDEN_DB);
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(&lock).unwrap();
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+        let blocker = rusqlite::Connection::open(&db).unwrap();
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o555)).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let error = unseal(&f.dir).expect_err("busy legacy unseal must fail");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        assert!(error.to_string().contains("in use"), "{error}");
+        assert!(lock.is_file(), "unseal must have bootstrapped the lock");
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+
+        let meta = OverlayMeta::read(&f.dir).unwrap().unwrap();
+        assert!(meta.layer_sealed());
+        assert_eq!(meta.get("sealed_at"), Some(sealed.sealed_at.as_str()));
+        assert_eq!(meta.get("layer_digest"), Some(sealed.layer_digest.as_str()));
+        assert_eq!(fs::read(f.dir.join(SENTINEL)).unwrap(), sentinel);
+        let mode = fs::metadata(&f.dir).unwrap().permissions().mode() & 0o777;
+        eprintln!(
+            "busy legacy unseal refused; seal metadata and sentinel intact; root mode {mode:04o}"
+        );
+        assert_eq!(
+            mode, 0o555,
+            "failed legacy unseal left a sealed root writable"
+        );
     }
 
     /// Regression: released sealed layers have a read-only root and no

@@ -605,6 +605,12 @@ archive guard. Commit rechecks `layer_sealed` under the overlay lock before its
 first archive write. A seal that starts during commit waits, then either seals
 the completed base or refuses a changed base with a reopen/retry message.
 
+Raw overlay directories (without an overlay database) also need this lock.
+A raw directory with mode `0555` cannot be committed when the lock file is
+absent: creating it requires write access to the overlay directory. Give the
+owner directory write access before committing; the refusal reports the lock
+path and this requirement.
+
 Seal holds the overlay lock through base resolution, digest calculation and
 publication, and never acquires the archive guard. Source opening takes no
 archive flock. The lock belongs to the overlay, so naming different copies of

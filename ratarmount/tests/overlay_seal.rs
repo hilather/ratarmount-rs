@@ -48,6 +48,70 @@ fn fixture(root: &Path) -> (String, String) {
     (base.to_str().unwrap().into(), dir.to_str().unwrap().into())
 }
 
+/// Regression: offline commit must name a sealed overlay as supplied, including `./`.
+#[test]
+fn regression_240_sealed_commit_diagnostic_preserves_supplied_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, dir) = fixture(tmp.path());
+    expect(command(&["overlay", "seal", &dir]), 0);
+    std::os::unix::fs::symlink(&dir, tmp.path().join("ov")).unwrap();
+    for supplied in ["./overlay", "./ov"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+            .current_dir(tmp.path())
+            .args(["--commit-overlay", "--yes", "-w", supplied, "missing.tar"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.trim(),
+            format!(
+                "error: overlay {supplied} is sealed; mount it with --lower, or `overlay unseal`"
+            )
+        );
+        expect(out, 1);
+        assert!(!tmp.path().join("missing.tar").exists());
+    }
+    expect(command(&["overlay", "unseal", &dir, "--i-know"]), 0);
+}
+
+/// Regression: a raw mode-0555 directory needs a clear lock-creation refusal.
+#[test]
+fn regression_240_raw_read_only_overlay_commit_reports_lock_requirement() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skip: euid 0 bypasses directory write permissions");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let overlay = tmp.path().join("ov");
+    fs::create_dir(&overlay).unwrap();
+    fs::write(overlay.join("file"), b"overlay contents").unwrap();
+    let archive = tmp.path().join("base.tar");
+    fs::write(&archive, b"archive must remain untouched").unwrap();
+    fs::set_permissions(&overlay, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ratarmount"))
+        .current_dir(tmp.path())
+        .args(["--commit-overlay", "--yes", "-w", "./ov", "base.tar"])
+        .output()
+        .unwrap();
+    let mode = fs::metadata(&overlay).unwrap().permissions().mode() & 0o777;
+    fs::set_permissions(&overlay, fs::Permissions::from_mode(0o755)).unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot create seal/commit lock ./ov/.ratarmount.overlay.seal-commit.lock: overlay directory must be writable"),
+        "{stderr}"
+    );
+    expect(out, 1);
+    assert_eq!(mode, 0o555);
+    assert!(!overlay
+        .join(".ratarmount.overlay.seal-commit.lock")
+        .exists());
+    assert_eq!(
+        fs::read(&archive).unwrap(),
+        b"archive must remain untouched"
+    );
+    assert_eq!(fs::read(overlay.join("file")).unwrap(), b"overlay contents");
+}
+
 /// Regression: sealing must work through strict diff and the existing -w/--lower mount checks.
 #[test]
 fn regression_cow_seal_cli_strict_diff_and_real_lower() {

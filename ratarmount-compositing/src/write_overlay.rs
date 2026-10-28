@@ -7299,10 +7299,27 @@ pub struct OverlayCommitGuard {
 
 impl OverlayCommitGuard {
     pub fn acquire(write_overlay: impl AsRef<Path>) -> Result<Self> {
-        let dir = write_overlay.as_ref().canonicalize()?;
-        ensure_overlay_unsealed(&dir)?;
-        let lock = SealCommitGuard::acquire(&dir)?;
-        ensure_overlay_unsealed(&dir)?;
+        let write_overlay = write_overlay.as_ref();
+        let dir = write_overlay.canonicalize()?;
+        ensure_overlay_unsealed_display(&dir, write_overlay)?;
+        let lock = match SealCommitGuard::acquire(&dir) {
+            Ok(lock) => lock,
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && !dir.join(SEAL_COMMIT_LOCK).try_exists()? =>
+            {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot create seal/commit lock {}: overlay directory must be writable ({error})",
+                        write_overlay.join(SEAL_COMMIT_LOCK).display()
+                    ),
+                )
+                .into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        ensure_overlay_unsealed_display(&dir, write_overlay)?;
         Ok(Self { dir, _lock: lock })
     }
 
@@ -7339,7 +7356,7 @@ fn commit_overlay_locked(
         }
         DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
         DbEntry::Present { marked, .. } => {
-            ensure_overlay_unsealed_required(write_overlay, marked)?;
+            ensure_overlay_unsealed_required(write_overlay, marked, write_overlay)?;
         }
     }
     if let Err(refusal) =
@@ -7422,24 +7439,32 @@ fn regression_nonunix_commit_guard_accepts_unsealed_overlay() {
 
 /// Refuse a sealed database overlay without recovery or a writable connection.
 /// Each call reads fresh metadata, including when the database is a symlink.
-/// Raw directories retain their existing commit behavior.
+/// Raw directories still need write access to create the seal/commit lock.
 pub fn ensure_overlay_unsealed(write_overlay: &Path) -> Result<()> {
+    ensure_overlay_unsealed_display(write_overlay, write_overlay)
+}
+
+fn ensure_overlay_unsealed_display(write_overlay: &Path, display_path: &Path) -> Result<()> {
     let marked = match overlay_db_entry(write_overlay)? {
         DbEntry::Absent => return Ok(()),
         DbEntry::Lost { markers, .. } => return Err(lost_record_error(write_overlay, &markers)),
         DbEntry::Present { marked, .. } => marked,
     };
-    ensure_overlay_unsealed_required(write_overlay, marked)
+    ensure_overlay_unsealed_required(write_overlay, marked, display_path)
 }
 
-fn ensure_overlay_unsealed_required(write_overlay: &Path, marked: bool) -> Result<()> {
+fn ensure_overlay_unsealed_required(
+    write_overlay: &Path,
+    marked: bool,
+    display_path: &Path,
+) -> Result<()> {
     if crate::OverlayMeta::read_no_recovery_required_followed(write_overlay, marked)?
         .as_ref()
         .is_some_and(crate::OverlayMeta::layer_sealed)
     {
         return Err(OverlayError::Msg(format!(
             "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
-            write_overlay.display()
+            display_path.display()
         )));
     }
     Ok(())
