@@ -217,6 +217,51 @@ fn probe_row() -> String {
     format!("{immediate} {getlk}")
 }
 
+/// Regression: #239 a symlink planted after SQLite's pathname check returned
+/// ordinary CANTOPEN, losing the symlink refusal before recovery classified it.
+#[test]
+fn regression_checked_open_after_low_fd_fill_reports_symlink() {
+    for (flags, mode) in [
+        (RO, NameMode::Path),
+        (RW, NameMode::Path),
+        (RO, NameMode::Immutable),
+    ] {
+        let (_tmp, dir) = tempdir();
+        let db = dir.join("overlay.sqlite");
+        let target = dir.join("original.sqlite");
+        make_db(&db, 1);
+        let before = std::fs::read(&db).unwrap();
+        let original_id = id_of(&db);
+        let expect = existing(&db, true);
+        let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let reached = swapped.clone();
+        let (db_at_seam, target_at_seam) = (db.clone(), target.clone());
+        let seams = Seams::set(move |seam| {
+            if seam == Seam::AfterLowFdFill && !reached.replace(true) {
+                std::fs::rename(&db_at_seam, &target_at_seam).unwrap();
+                std::os::unix::fs::symlink(&target_at_seam, &db_at_seam).unwrap();
+            }
+        });
+        let refusal =
+            open_checked(&db, flags | OpenFlags::SQLITE_OPEN_NOFOLLOW, mode, expect).unwrap_err();
+        drop(seams);
+        assert!(swapped.get(), "AfterLowFdFill was reached");
+        assert!(
+            matches!(
+                &refusal.error,
+                AcquireError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                    if error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+            ),
+            "{flags:?} {mode:?}: {refusal}"
+        );
+        assert_eq!(refusal.retained_fd, None);
+        assert!(std::fs::symlink_metadata(&db).unwrap().is_symlink());
+        assert_eq!(std::fs::read_link(&db).unwrap(), target);
+        assert_eq!(id_of(&target), original_id);
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+    }
+}
+
 /// Regression: (r9 T1): SQLite's own descriptor is judged, not the name. The
 /// database name holds another file at the open (another database, an empty
 /// file, a `/dev/null` symlink, a FIFO: AFTER_PRESTAT, done before the call)

@@ -462,7 +462,6 @@ pub(crate) fn request(
 #[derive(Debug)]
 pub(crate) struct Request {
     /// The absolute path of the database.
-    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) path: PathBuf,
     /// What SQLite gets: `path`, or the immutable URI.
     pub(crate) name: PathBuf,
@@ -482,9 +481,9 @@ pub fn open_checked(
     };
     let request = request(path, flags, mode, expect).map_err(refuse)?;
     #[cfg(windows)]
-    return path_type_only::open(&request, expect);
+    let acquired = path_type_only::open(&request, expect);
     #[cfg(not(windows))]
-    {
+    let acquired = {
         if let Err(status) = super::install::installed() {
             return Err(refuse(AcquireError::Unavailable(status)));
         }
@@ -496,7 +495,21 @@ pub fn open_checked(
             )));
         }
         imp::open(&request.name, request.flags, expect)
-    }
+    };
+    acquired.map_err(|mut refusal| {
+        if let AcquireError::Sqlite(rusqlite::Error::SqliteFailure(error, _)) = &mut refusal.error {
+            // A symlink planted after SQLite's pathname check can make its
+            // O_NOFOLLOW open report plain CANTOPEN. Recheck the final name
+            // with lstat only: opening an alias could release SQLite locks.
+            if request.flags.contains(OpenFlags::SQLITE_OPEN_NOFOLLOW)
+                && error.code == rusqlite::ErrorCode::CannotOpen
+                && std::fs::symlink_metadata(&request.path).is_ok_and(|m| m.is_symlink())
+            {
+                *error = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK);
+            }
+        }
+        refusal
+    })
 }
 
 /// Windows (design §9): no syscall hook, so pathname type checks before and

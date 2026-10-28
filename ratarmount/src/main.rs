@@ -5149,6 +5149,15 @@ fn overlay_recovery_exit_code(error: &(dyn std::error::Error + 'static)) -> i32 
     }
 }
 
+#[cfg(all(
+    test,
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_endian = "little",
+    any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+))]
+mod overlay_recovery_exit_tests;
+
 /// The mount-time journal rule: before any recovery write, compare each
 /// member's journal against every readable overlay record (`-w` top, `--lower`
 /// directories). A journal every record agrees with (or abstains on) is
