@@ -275,6 +275,8 @@ fn sealed_guard(dir: &Path, root: &OwnedFd) -> io::Result<crate::write_overlay::
                     .try_exists()? => {}
         Err(error) => return Err(error),
     }
+    #[cfg(test)]
+    fire_once(&BEFORE_SEALED_BOOTSTRAP_LOCK);
     host::flock(root, host::FlockOperation::LockExclusive)?;
     struct Unlock<'a>(&'a OwnedFd);
     impl Drop for Unlock<'_> {
@@ -283,11 +285,22 @@ fn sealed_guard(dir: &Path, root: &OwnedFd) -> io::Result<crate::write_overlay::
         }
     }
     let _bootstrap = Unlock(root);
+    // Grant bootstrap write access without retaining a mode across the wait.
+    host::fchmod(
+        root,
+        Mode::from_raw_mode(crate::host_stat::fstat(root)?.st_mode) | Mode::WUSR,
+    )?;
+    let guard = crate::write_overlay::SealCommitGuard::acquire(dir)?;
+    // Unseal may have completed while we waited for the operation lock.
+    // Only restore read-only permissions when the locked metadata is sealed.
     let mode = Mode::from_raw_mode(crate::host_stat::fstat(root)?.st_mode);
-    host::fchmod(root, mode | Mode::WUSR)?;
-    let guard = crate::write_overlay::SealCommitGuard::acquire(dir);
-    host::fchmod(root, mode)?;
-    guard
+    let sealed = OverlayMeta::read(dir)
+        .map_err(overlay_error)?
+        .is_some_and(|meta| meta.layer_sealed());
+    if sealed {
+        host::fchmod(root, mode & !Mode::WUSR)?;
+    }
+    Ok(guard)
 }
 
 fn finish_recorded_seal(dir: &Path, root: &OwnedFd, meta: &OverlayMeta) -> io::Result<SealOutcome> {
@@ -656,6 +669,8 @@ thread_local! {
 pub fn unseal(dir: &Path) -> io::Result<()> {
     let root = root(dir)?;
     let _seal_commit = sealed_guard(dir, &root)?;
+    #[cfg(test)]
+    fire_once(&AFTER_UNSEAL_LOCK);
     // Probe before touching permissions, so a mounted overlay is never changed.
     OverlayMeta::read(dir).map_err(overlay_error)?;
     chmod_tree(&root, true)?;
@@ -770,6 +785,8 @@ type OnceHook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_SEALED_BOOTSTRAP_LOCK: OnceHook = const { std::cell::RefCell::new(None) };
+    static AFTER_UNSEAL_LOCK: OnceHook = const { std::cell::RefCell::new(None) };
     static BEFORE_RECORDED_SEAL_LOCK: OnceHook = const { std::cell::RefCell::new(None) };
     static AFTER_INITIAL_READ: OnceHook = const { std::cell::RefCell::new(None) };
     static AFTER_PENDING_RESOLVER: OnceHook = const { std::cell::RefCell::new(None) };
@@ -1038,6 +1055,107 @@ mod tests {
             fs::metadata(&f.dir).unwrap().permissions().mode() & 0o200,
             0
         );
+    }
+
+    /// Regression: a two-process legacy re-seal queued behind unseal must
+    /// refuse the cleared seal without restoring the root's stale 0555 mode.
+    #[test]
+    fn regression_240_queued_legacy_reseal_preserves_unsealed_root_mode() {
+        use std::process::{Child, Command};
+        use std::time::{Duration, Instant};
+
+        const CHILD_DIR: &str = "RATARMOUNT_TEST_LEGACY_RESEAL_DIR";
+        const BOOTSTRAP_READY: &str = "RATARMOUNT_TEST_LEGACY_BOOTSTRAP_READY";
+        fn wait_for(path: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let dir = PathBuf::from(dir);
+            let ready = PathBuf::from(std::env::var_os(BOOTSTRAP_READY).unwrap());
+            let _hook = OnceGuard::set(&BEFORE_SEALED_BOOTSTRAP_LOCK, move || {
+                fs::write(ready, b"bootstrap entered").unwrap();
+            });
+            let record = crate::SealedRecord::read(&dir).unwrap().unwrap();
+            let error = reseal(&record).expect_err("queued re-seal must refuse an unsealed layer");
+            assert!(error.to_string().contains("no longer sealed"), "{error}");
+            return;
+        }
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: legacy lock bootstrap requires directory permission enforcement");
+            return;
+        }
+
+        let f = Fixture::new();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let lock = f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK);
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(&lock).unwrap();
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let bootstrap = root(&f.dir).unwrap();
+        host::flock(&bootstrap, host::FlockOperation::LockExclusive).unwrap();
+
+        let ready = f._tmp.path().join("bootstrap-ready");
+        let contended = f._tmp.path().join("reseal-contended");
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "overlay_seal::tests::regression_240_queued_legacy_reseal_preserves_unsealed_root_mode",
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, &f.dir)
+                .env(BOOTSTRAP_READY, &ready)
+                .env("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)
+                .spawn()
+                .unwrap(),
+        );
+        wait_for(&ready);
+
+        // The child has observed the missing lock and must bootstrap. Publish
+        // the lock as an unseal bootstrap would, then let public unseal take it.
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let _hook = OnceGuard::set(&AFTER_UNSEAL_LOCK, move || {
+            // Hold unseal before its chmod walk, so the queued child sees 0555
+            // before waiting for the operation lock held by this process.
+            host::flock(&bootstrap, host::FlockOperation::Unlock).unwrap();
+            wait_for(&contended);
+        });
+        unseal(&f.dir).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "queued re-seal did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "re-seal child: {status}");
+        let meta = OverlayMeta::read(&f.dir).unwrap().unwrap();
+        assert!(!meta.layer_sealed());
+        assert!(meta.get("sealed_at").is_none());
+        assert!(meta.get("unsealed_at").is_some());
+        assert!(!f.dir.join(SENTINEL).exists());
+        let mode = fs::metadata(&f.dir).unwrap().permissions().mode() & 0o777;
+        eprintln!("unseal succeeded; re-seal refused; metadata unsealed; root mode {mode:04o}");
+        assert_ne!(
+            mode, 0o555,
+            "queued re-seal restored the stale sealed root mode"
+        );
+        assert_ne!(mode & 0o200, 0, "unsealed root must remain owner-writable");
     }
 
     /// Regression: released sealed layers have a read-only root and no

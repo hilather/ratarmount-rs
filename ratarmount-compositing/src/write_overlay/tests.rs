@@ -1624,7 +1624,7 @@ mod archive_metadata_regressions {
                 fs::write(&plain, &expected).unwrap();
                 fs::write(&archive, b"old archive bytes").unwrap();
                 let before = set_mode(&archive, mode);
-                recompress_replace(&plain, &archive, format, &before).unwrap();
+                recompress_replace(&plain, &archive, format, &before, &mut || Ok(())).unwrap();
                 let file = File::open(&archive).unwrap();
                 let mut decoder: Box<dyn Read> = match format {
                     CompressionFormat::Gzip => Box::new(flate2::read::MultiGzDecoder::new(file)),
