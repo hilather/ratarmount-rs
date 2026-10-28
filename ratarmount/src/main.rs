@@ -1784,7 +1784,7 @@ fn main() {
         // R10-B): a dangling symlink, a directory or anything else there takes
         // the database path below; a lost record (marker kept, database gone)
         // or an entry that cannot be classified refuses before any recovery.
-        let has_db = match ratarmount_compositing::overlay_db_entry(overlay) {
+        let classify_overlay = || match ratarmount_compositing::overlay_db_entry(overlay) {
             Ok(ratarmount_compositing::DbEntry::Absent) => false,
             Ok(ratarmount_compositing::DbEntry::Present { .. }) => true,
             Ok(ratarmount_compositing::DbEntry::Lost { markers, .. }) => {
@@ -1799,6 +1799,18 @@ fn main() {
                 std::process::exit(2);
             }
         };
+        // Preserve classification's existing usage-error status, then make
+        // the authoritative decision again under the operation lock.
+        classify_overlay();
+        // Cover creation and recovery too: they may write before publication.
+        let commit_guard = match ratarmount_compositing::OverlayCommitGuard::acquire(overlay) {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+        let has_db = classify_overlay();
         if has_db {
             // Refuse sealed layers before creating or initializing a base (#238).
             if let Err(e) = ratarmount_compositing::ensure_overlay_unsealed(overlay) {
@@ -1859,9 +1871,9 @@ fn main() {
                 &overlay_run_context(args.index_folders.as_deref()),
             )
             .map_err(OverlayError::Msg)
-            .and_then(|base| ratarmount_compositing::commit_overlay(overlay, archive, &base, &opts))
+            .and_then(|base| commit_guard.commit(archive, &base, &opts))
         } else {
-            ratarmount_compositing::commit_overlay_raw_dir(overlay, archive, &opts).map(|done| {
+            commit_guard.commit_raw_dir(archive, &opts).map(|done| {
                 if !done.identity_checked {
                     println!(
                         "note: no base identity was checked (overlay directory has no database)"

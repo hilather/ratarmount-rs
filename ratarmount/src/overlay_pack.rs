@@ -133,6 +133,7 @@ fn omitted(path: &str) -> bool {
         let name = name.to_ascii_lowercase();
         name == ".ratarmount-overlay.used"
             || name == ".ratarmount.overlay.sqlite.used"
+            || name == ".ratarmount.overlay.seal-commit.lock"
             || name.starts_with(".ratarmount.overlay.cow-")
             || name.starts_with(".ratarmount-spool-")
             || (name.starts_with(HIDDEN_DB) && name != HIDDEN_DB)
@@ -2334,7 +2335,8 @@ pub(crate) mod tests {
     }
 
     /// Regression: journal and base index shipping must be visible in a normal
-    /// TAR listing, while in-use markers and spool/COW temps stay out.
+    /// TAR listing, while in-use markers, spool/COW temps and the local #240
+    /// seal/commit coordination lock stay out.
     #[test]
     fn regression_pack_includes_journal_index_and_excludes_temps() {
         let f = Fixture::new(true);
@@ -2381,6 +2383,7 @@ pub(crate) mod tests {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
         for name in [
             ".ratarmount-overlay.used",
+            ".ratarmount.overlay.seal-commit.lock",
             ".ratarmount.overlay.cow-test",
             ".ratarmount-spool-test",
         ] {
@@ -2418,6 +2421,12 @@ pub(crate) mod tests {
         ] {
             assert!(paths.iter().any(|p| p == name), "{paths:?}");
         }
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p == "layer/.ratarmount.overlay.seal-commit.lock"),
+            "the local coordination lock must not be shipped in the bundle: {paths:?}"
+        );
         assert!(!paths.iter().any(|p| omitted(p)));
     }
 

@@ -7,7 +7,8 @@ pub(super) struct ByteFile {
 }
 
 impl ByteFile {
-    pub(super) fn open(path: &Path) -> io::Result<Self> {
+    pub(super) fn open(path: &Path, writable: bool) -> io::Result<Self> {
+        debug_assert!(!writable);
         super::seams::set_path(path);
         super::seams::fire(super::Seam::BeforeOpen)?;
         #[cfg(any(test, feature = "test-hooks"))]

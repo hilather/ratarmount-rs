@@ -9,6 +9,7 @@ fn commit_overlay(
     archive_file: impl AsRef<Path>,
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
+    let _seal_commit = SealCommitGuard::acquire(write_overlay.as_ref())?;
     commit_overlay_inner(write_overlay.as_ref(), archive_file.as_ref(), None, opts)
 }
 
@@ -16,6 +17,114 @@ use ratarmount_compress::{open_seekable_bzip2, open_seekable_xz};
 use std::process::Command as StdCommand;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+#[cfg(unix)]
+fn regression_240_overlay_lock_held(root: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let file = File::open(root.join(SEAL_COMMIT_LOCK)).unwrap();
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) }, 0);
+        false
+    } else {
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+        true
+    }
+}
+
+/// Regression: live and on-exit commits must take the overlay flock before
+/// their archive guard and retain it through publication, reopen and cleanup.
+#[cfg(unix)]
+#[test]
+fn regression_240_live_commit_holds_overlay_lock_through_publication() {
+    use ratarmount_compress::commit_journal::fault;
+
+    for live in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("old", b"original")]);
+        let before = fs::read(&archive).unwrap();
+        let overlay = dir.path().join("overlay");
+        let mut ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        ov.set_commit_mode(CommitMode::Append);
+        fs::write(overlay.join("new"), b"committed").unwrap();
+        let reached_archive = Arc::new(AtomicBool::new(false));
+        let reached = reached_archive.clone();
+        let locked_overlay = overlay.clone();
+        fault::install(move |step| {
+            if matches!(step, "before replace" | "copy publish") {
+                assert!(regression_240_overlay_lock_held(&locked_overlay));
+                reached.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        let result = if live {
+            ov.commit_live(&archive, |path| {
+                assert!(regression_240_overlay_lock_held(&overlay));
+                reopen_tar_zst(path, false)
+            })
+        } else {
+            ov.commit_atomic(&archive)
+        };
+        fault::clear();
+        assert!(result.unwrap(), "live={live}");
+        assert!(reached_archive.load(Ordering::SeqCst), "live={live}");
+        assert_ne!(fs::read(&archive).unwrap(), before, "live={live}");
+        assert_eq!(overlay.join("new").exists(), !live);
+        assert!(!regression_240_overlay_lock_held(&overlay));
+    }
+}
+
+/// Regression: mounted commit/recovery entries must recheck sealing through
+/// their own connection after taking the overlay flock, before archive writes.
+#[cfg(unix)]
+#[test]
+fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
+    for entry in ["atomic", "live", "remote_interval", "recovery"] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(&archive, pack_tar(&[ustar_file("old", b"original")])).unwrap();
+        let before = fs::read(&archive).unwrap();
+        let overlay = dir.path().join("overlay");
+        let ov = Arc::new(overlay_with_base(Arc::new(NullBase), &overlay));
+        fs::write(overlay.join("new"), b"must not be committed").unwrap();
+        drop(SealCommitGuard::acquire(&overlay).unwrap());
+        // Keep the worker between acquiring the file lock and inspecting its
+        // connection. Unlike a timing-only assertion, the flock probe below
+        // proves it reached that operation boundary before the seal is set.
+        let db = ov.db.lock().unwrap();
+        let committing = ov.clone();
+        let target = archive.clone();
+        let operation = std::thread::spawn(move || match entry {
+            "atomic" => committing.commit_atomic(&target),
+            "live" => committing.commit_live(&target, |_| panic!("sealed commit reopened base")),
+            "remote_interval" => committing.commit_remote_interval(Duration::ZERO, |_| {
+                panic!("sealed remote commit reopened base")
+            }),
+            _ => committing.recover_member_journal(&target).map(|_| false),
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut locked = false;
+        while std::time::Instant::now() < deadline {
+            if regression_240_overlay_lock_held(&overlay) {
+                locked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        crate::OverlayMeta::set(&db, "sealed_at", "test seal before commit check").unwrap();
+        drop(db);
+        let error = operation.join().unwrap().unwrap_err();
+        assert!(
+            locked,
+            "{entry} did not acquire the overlay lock before checking its database"
+        );
+        assert!(error.to_string().contains("is sealed"), "{entry}: {error}");
+        assert_eq!(fs::read(&archive).unwrap(), before, "{entry}");
+        assert!(!ratarmount_compress::commit_journal::journal_path(&archive).exists());
+        assert!(!regression_240_overlay_lock_held(&overlay));
+    }
+}
 
 /// Regression: a panicking policy must not poison every subsequent mutation.
 #[test]

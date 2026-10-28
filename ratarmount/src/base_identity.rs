@@ -92,7 +92,6 @@ impl OpenBase for FactoryOpener<'_> {
             sidecar_candidate: served.sidecar_candidate,
             read_only_index: self.options.read_only_index,
             fetched: served.fetched,
-            source_metadata: served.source_metadata,
             keep_alive: bundle.into_keep_alive(),
         })
     }
@@ -183,7 +182,6 @@ impl OpenBase for CommitOpener<'_> {
             sidecar_candidate: served.sidecar_candidate,
             read_only_index: false,
             fetched: false,
-            source_metadata: None,
             keep_alive: Box::new(()),
         })
     }
@@ -380,10 +378,6 @@ pub(crate) mod fixtures {
 
     impl OpenBase for FixtureOpener {
         fn open_base(&mut self) -> Result<Opened, String> {
-            let source_metadata = match &self.location {
-                Some(ServedLocation::Local(path)) => std::fs::metadata(path).ok(),
-                _ => None,
-            };
             Ok(Opened {
                 source: self.source.clone(),
                 kind: self.kind.clone(),
@@ -393,7 +387,6 @@ pub(crate) mod fixtures {
                 sidecar_candidate: None,
                 read_only_index: false,
                 fetched: false,
-                source_metadata,
                 keep_alive: Box::new(()),
             })
         }

@@ -595,32 +595,44 @@ no excludes, and `.git` included. `--json` prints `layer_digest` and `sealed_at`
 plain output is the digest. Repeating seal prints the recorded digest and exits
 0 even if the base is no longer available; use verify to check integrity.
 
-For a single-file local archive, source acquisition takes the same exclusive
-archive flock as commit before reading or building its index. The token retains
-the locked descriptor's acquisition stamp; seal checks it under that archive's
-lock before resolving or hashing, and holds the lock through seal publication.
-Base hashing reads the locked descriptor, and seal checks its stamp and pathname
-again before publishing. A commit between acquisition and sealing therefore
-requires reopening the base. Raw lock descriptors remain alive through sealing
-(and acquisition descriptors through the source's lifetime), because an unrelated
-close on the same inode releases
-this process's SQLite/POSIX locks. This exclusion applies to the selected
-archive inode: byte-identical copies accepted as bases have separate locks.
-Concurrent seal and commit of the same overlay using different copies remains
-unsupported and can invalidate the seal; serialize those operations.
+Seal and archive commits serialize on the persistent lock file
+`OVERLAY/.ratarmount.overlay.seal-commit.lock` (`flock`, `LOCK_EX`). Commit
+holds it through recovery, confirmation, archive publication and baseline
+refresh, then releases it. Live, on-exit, remote interval and member-recovery
+entries take the same lock and inspect sealing through their existing overlay
+connection; live commits retain it through reopen and cleanup. The order is always overlay lock, then the existing
+archive guard. Commit rechecks `layer_sealed` under the overlay lock before its
+first archive write. A seal that starts during commit waits, then either seals
+the completed base or refuses a changed base with a reopen/retry message.
 
-Seal's digest-cache lookup uses the locked descriptor's device, inode, size and
-mtime. Existing cache rows without a device are ignored until rehashed.
+Seal holds the overlay lock through base resolution, digest calculation and
+publication, and never acquires the archive guard. Source opening takes no
+archive flock. The lock belongs to the overlay, so naming different copies of
+an archive does not bypass seal/commit serialization. The lock file stays
+writable bookkeeping after seal and is hidden from mounted content, change
+hashes and archive publication; keep it in place, including after a crash.
+Packed bundles omit it. Repeating seal initializes a missing lock for older or
+unpacked sealed layers and restores the root's original permissions.
+
+Seal uses a SQLite-managed byte reader for its base digest, with pathname,
+inode, size, mtime/ctime and moved-file checks before hashing or cache lookup
+and before publishing the seal. Cache identity includes device and inode;
+legacy cache rows without a device are rehashed. Closing the managed reader
+preserves this SQLite instance's live reader locks. Archive commit guards also
+reserve their inode through SQLite's VFS before opening raw descriptors;
+a live SQLite transaction causes refusal before those descriptors open. This
+commit reservation requires write access even when copy publication could
+otherwise replace a read-only archive using parent-directory permissions.
+Ordinary source opens and seal digest reads do not need that reservation.
 
 Sealing over a split archive is not supported. Join the parts into one archive
-file and seal that. Custom `OpenBase` implementations must report an acquisition
-snapshot in `Opened::source_metadata` to seal a local archive.
+file and seal that.
 
 Before chmod, the same transaction records per-path hashes in `seal_rows`,
 `sealed_at`, `layer_digest`, and each materialized entry's permission bits in
 `overlay_metadata.mode` where no override exists. Thus lookup and directory
 listing modes stay unchanged. Seal removes host write bits recursively from
-files, directories, and the database, with the overlay root last; it skips
+payload files, directories, and the database, with the overlay root last; it skips
 symlinks and never follows them. `.ratarmount-sealed` contains the digest and
 is hidden from mounted listings. Sealed layers are accepted by `--lower` and
 `diff --strict`; writable mounts with `-w` are refused.

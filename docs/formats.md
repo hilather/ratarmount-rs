@@ -224,6 +224,11 @@ disk speeds. Full methodology, CSV and caveats:
 Sealing over a split archive is not supported. Join the parts into one archive
 file and seal that.
 
+Offline archive publication requires write access to the base file, including
+copy mode. Its journal guards refuse active SQLite transactions before opening
+raw archive descriptors; ordinary read-only mounts and seal reads do not take
+that mutation reservation.
+
 The complete status against the Python original is in the
 [parity checklist](parity-todo.md). The practical limits by area:
 

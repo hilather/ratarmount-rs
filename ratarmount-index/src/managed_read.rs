@@ -13,13 +13,18 @@
 //! descriptor in its per-inode bookkeeping and, on close, parks it (instead of
 //! closing it) while any connection of this SQLite instance holds a lock on
 //! that inode. A later managed open of the inode reuses a parked descriptor.
-//! The byte file creates no SQL connection, takes no lock and touches no
+//! The read cursor creates no SQL connection, takes no lock and touches no
 //! `-shm`/`-wal` file; it never reads the bytes as a database.
 //!
 //! The guarantee covers successfully acquired managed readers and this
 //! SQLite instance's main-file lock bookkeeping only: not descriptors of
 //! other code or other SQLite instances, not SQLite's auxiliary files, and
 //! raw managed reads are not transactional snapshots.
+//!
+//! [`ArchiveReservation`] uses the same VFS owner with an exclusive lock to
+//! exclude SQLite transactions before commit/recovery opens any raw archive
+//! descriptors. Its owner closes after those descriptors; it is never used
+//! for ordinary read-only acquisition or overlay sealing.
 //!
 //! Before every Unix byte open the standard descriptors 0-2 are filled with
 //! `/dev/null` when vacant (SQLite's `robust_open` closes a new descriptor
@@ -67,7 +72,7 @@ impl ManagedReadCursor {
             clippy::disallowed_methods,
             reason = r###"internal-read:v1 {"id":"IR-E0067-M01","item":"<ratarmount_index::managed_read::ManagedReadCursor>::open","disposition":"managed-read","category":"managed-reader-backend","reason":"Open the managed cursor through its SQLite-backed ByteFile implementation.","creation":{"policy":"none","basis":"The cursor reads an existing path through the managed backend; no file creation is requested."}}"###
         )]
-        let file = imp::ByteFile::open(path)?;
+        let file = imp::ByteFile::open(path, false)?;
         Ok(Self {
             owner: Arc::new(Owner {
                 file: std::mem::ManuallyDrop::new(Mutex::new(file)),
@@ -126,6 +131,32 @@ impl ManagedReadCursor {
     fn lock(&self) -> std::sync::MutexGuard<'_, imp::ByteFile> {
         // A panic while holding the lock leaves the file usable.
         self.owner.file.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Protect raw archive descriptors from releasing another connection's POSIX
+/// locks when they close. Acquire this before opening those descriptors and
+/// drop it after all of them close. A live SQLite reader causes refusal before
+/// any raw descriptor opens; new readers are excluded while it is held.
+///
+/// This reservation requires write access, including for a copy publication
+/// that could otherwise replace a read-only file using directory permissions.
+/// Ordinary managed readers and seals do not take this reservation.
+#[cfg(unix)]
+pub struct ArchiveReservation {
+    _file: imp::ByteFile,
+}
+
+#[cfg(unix)]
+impl ArchiveReservation {
+    pub fn exclusive(path: &Path) -> io::Result<Self> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-240-V4-RESERVE","item":"<ratarmount_index::managed_read::ArchiveReservation>::exclusive","disposition":"residual","category":"commit-journal-recovery","family":"commit-journal-recovery","issue":"#240","reason":"Reserve the archive through SQLite's VFS before any raw commit descriptor opens, refusing live SQLite readers without a lock-dropping close.","creation":{"policy":"none","basis":"Open an existing archive read-write as a VFS MAIN_DB byte file, with no CREATE flag; the reservation owns no SQL connection and changes no content."}}"###
+        )]
+        let mut file = imp::ByteFile::open(path, true)?;
+        file.lock_exclusive()?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -685,7 +716,7 @@ mod imp {
     pub(super) const SYNC_FLAGS: c_int = ffi::SQLITE_SYNC_FULL;
 
     impl ByteFile {
-        pub(super) fn open(path: &Path) -> io::Result<Self> {
+        pub(super) fn open(path: &Path, writable: bool) -> io::Result<Self> {
             // The VFS opens with O_NOFOLLOW: resolve symlinks first (an
             // absolute, existing path; a missing file is NotFound here).
             let real = std::fs::canonicalize(path)?;
@@ -739,9 +770,16 @@ mod imp {
                     name,
                     open: false,
                 };
-                seams::set_path(&real);
+                // Read lifecycle probes must not inject a reader into the
+                // write reservation itself. Its exclusive acquisition and
+                // disposal have separate journal regression coverage.
+                if !writable {
+                    seams::set_path(&real);
+                }
                 super::ensure_standard_descriptors()?;
-                seams::fire(Seam::BeforeOpen)?;
+                if !writable {
+                    seams::fire(Seam::BeforeOpen)?;
+                }
                 #[cfg(any(test, feature = "test-hooks"))]
                 super::XOPEN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut out_flags: c_int = 0;
@@ -749,7 +787,11 @@ mod imp {
                     vfs,
                     name,
                     file,
-                    ffi::SQLITE_OPEN_READONLY | ffi::SQLITE_OPEN_MAIN_DB,
+                    (if writable {
+                        ffi::SQLITE_OPEN_READWRITE
+                    } else {
+                        ffi::SQLITE_OPEN_READONLY
+                    }) | ffi::SQLITE_OPEN_MAIN_DB,
                     &mut out_flags,
                 );
                 let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -766,7 +808,15 @@ mod imp {
                 if !me.open {
                     return Err(io::Error::other("SQLite xOpen left no methods"));
                 }
-                seams::fire(Seam::AfterOpen)?;
+                if writable && out_flags & ffi::SQLITE_OPEN_READWRITE == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "archive publication requires a writable SQLite VFS reservation",
+                    ));
+                }
+                if !writable {
+                    seams::fire(Seam::AfterOpen)?;
+                }
                 Ok(me)
             }
         }
@@ -851,6 +901,31 @@ mod imp {
             let rc = unsafe { sync(self.file, SYNC_FLAGS) };
             if rc != ffi::SQLITE_OK {
                 return Err(sqlite_err(rc, "fsync", self.last_errno()));
+            }
+            Ok(())
+        }
+
+        pub(super) fn lock_exclusive(&mut self) -> io::Result<()> {
+            let Some(lock) = self.methods().xLock else {
+                return Err(io::Error::other("SQLite VFS has no xLock"));
+            };
+            for level in [
+                ffi::SQLITE_LOCK_SHARED,
+                ffi::SQLITE_LOCK_RESERVED,
+                ffi::SQLITE_LOCK_EXCLUSIVE,
+            ] {
+                // SAFETY: an open MAIN_DB byte file; no pager or SQL connection
+                // uses this object. xClose releases any partial reservation.
+                let rc = unsafe { lock(self.file, level) };
+                if rc == ffi::SQLITE_BUSY || rc == ffi::SQLITE_LOCKED {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "archive is in use by a SQLite transaction; publication was refused",
+                    ));
+                }
+                if rc != ffi::SQLITE_OK {
+                    return Err(sqlite_err(rc, "reserve archive", self.last_errno()));
+                }
             }
             Ok(())
         }

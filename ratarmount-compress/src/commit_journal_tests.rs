@@ -5,28 +5,168 @@
 
 use super::*;
 
-/// Regression: #240 seal hashing borrows the locked inode even if its name is
-/// replaced by another file with the same size and mtime.
+use std::io::{Seek, Write};
+
+/// Regression: #240 copy publication must refuse a read-only archive rather
+/// than bypass the VFS reservation with an unsafe raw-descriptor fallback.
 #[test]
-fn regression_240_seal_reader_uses_locked_inode() {
-    use std::io::Read;
+fn regression_240_copy_requires_writable_reservation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skip: root can open mode-0444 archives read-write");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("archive.tar");
-    let replacement = dir.path().join("replacement.tar");
-    fs::write(&archive, b"original").unwrap();
-    let guard = guard_seal(&archive).unwrap();
-    fs::write(&replacement, b"impostor").unwrap();
-    File::open(&replacement)
-        .unwrap()
-        .set_modified(guard.metadata().modified().unwrap())
-        .unwrap();
-    fs::rename(&replacement, &archive).unwrap();
-    let mut bytes = Vec::new();
-    guard.reader().unwrap().read_to_end(&mut bytes).unwrap();
-    assert_eq!(bytes, b"original");
-    assert!(guard.check_path(&archive).is_err());
+    let path = dir.path().join("archive");
+    fs::write(&path, b"archive bytes").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    let original = fs::metadata(&path).unwrap();
+    let error = guard_copy(&path, &original).err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::read(&path).unwrap(), b"archive bytes");
+    assert!(same_stamp(&original, &fs::metadata(&path).unwrap()));
 }
-use std::io::Write;
+
+/// Regression: #240 archive guard disposal must preserve an independent
+/// SQLite reader's POSIX locks, including refused copy, replace and recovery.
+#[test]
+fn regression_240_commit_guards_preserve_sqlite_reader() {
+    use rusqlite::{Connection, ErrorCode};
+    use std::process::Command;
+
+    const PROBE: &str = "RATARMOUNT_240_COMMIT_SQLITE_PROBE";
+    if let Some(path) = std::env::var_os(PROBE) {
+        let conn = Connection::open(path).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let result = conn.execute_batch("BEGIN EXCLUSIVE");
+        if std::env::var_os("RATARMOUNT_240_COMMIT_SQLITE_FREE").is_some() {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err().sqlite_error_code(),
+                Some(ErrorCode::DatabaseBusy)
+            );
+        }
+        return;
+    }
+    let probe = |path: &Path, free: bool| {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        if free {
+            command.env("RATARMOUNT_240_COMMIT_SQLITE_FREE", "yes");
+        }
+        let output = command
+            .args([
+                "--exact",
+                "commit_journal::tests::regression_240_commit_guards_preserve_sqlite_reader",
+                "--nocapture",
+            ])
+            .env(PROBE, path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "outside BEGIN EXCLUSIVE bypassed the reader: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    for alias in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.sqlite");
+        let other = dir.path().join("alias");
+        let reader = Connection::open(&path).unwrap();
+        reader.busy_timeout(std::time::Duration::ZERO).unwrap();
+        reader
+            .execute_batch(
+                "CREATE TABLE data(value); INSERT INTO data VALUES(1); BEGIN; SELECT * FROM data",
+            )
+            .unwrap();
+        fs::hard_link(&path, &other).unwrap();
+        let selected = if alias { &other } else { &path };
+        let original = fs::metadata(selected).unwrap();
+        probe(&path, false);
+        let copy = guard_copy(selected, &original);
+        let copy_refused = copy.is_err();
+        drop(copy);
+        probe(&path, false);
+        assert!(copy_refused, "copy must refuse a live SQLite reader");
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(b"replacement").unwrap();
+        let replaced = replace_suffix_if_unchanged_with(
+            selected,
+            0,
+            &mut suffix,
+            &original,
+            &mut || panic!("reader must be checked before archive mutation"),
+            &mut |_| Ok(()),
+        );
+        assert!(matches!(replaced, Err(ReplaceError::Refused(_))));
+        probe(&path, false);
+        assert!(!recover(selected).unwrap());
+        probe(&path, false);
+        fs::write(journal_path(selected), b"pending journal").unwrap();
+        assert_eq!(
+            recover(selected).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "recovery reservation must retain its refusal kind with journal context"
+        );
+        probe(&path, false);
+        fs::remove_file(journal_path(selected)).unwrap();
+        assert!(offline_journal_probe(selected).unwrap().0.is_none());
+        probe(&path, false);
+        reader.execute_batch("COMMIT").unwrap();
+        let guard = guard_copy(selected, &fs::metadata(selected).unwrap()).unwrap();
+        // A reader starting after reservation must also be excluded until
+        // every raw descriptor closes. Merely deferring the final close is
+        // insufficient for this overlapping-reader case.
+        let denied = reader
+            .execute_batch("BEGIN; SELECT * FROM data")
+            .unwrap_err();
+        assert_eq!(denied.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(guard);
+        probe(&path, true);
+        let original = fs::metadata(selected).unwrap();
+        let refused = replace_suffix_if_unchanged_with(
+            selected,
+            0,
+            &mut suffix,
+            &original,
+            &mut || {
+                let denied = reader
+                    .execute_batch("BEGIN; SELECT * FROM data")
+                    .unwrap_err();
+                assert_eq!(denied.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+                reader.execute_batch("ROLLBACK").unwrap();
+                Err(io::Error::other("refuse before writing"))
+            },
+            &mut |_| Ok(()),
+        );
+        assert!(matches!(refused, Err(ReplaceError::Refused(_))));
+        probe(&path, true);
+        // Successful no-op replacement and an error after raw guard open both
+        // release their VFS reservation after the raw archive descriptors.
+        suffix.set_len(0).unwrap();
+        suffix.rewind().unwrap();
+        suffix.write_all(&fs::read(selected).unwrap()).unwrap();
+        replace_suffix_if_unchanged_with(
+            selected,
+            0,
+            &mut suffix,
+            &original,
+            &mut || Ok(()),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        probe(&path, true);
+        assert!(
+            guard_copy(selected, &original).is_err(),
+            "stale stamp must refuse"
+        );
+        probe(&path, true);
+    }
+}
 
 /// Regression: ENOSPC must roll back before returning to a live reader.
 #[test]
@@ -1501,98 +1641,4 @@ fn regression_238_prewrite_guard_runs_under_lock() {
     assert_eq!(marker_state(&path), locator);
     assert!(!journal_path(&path).exists());
     assert!(same_stamp(&original, &fs::metadata(&path).unwrap()));
-}
-
-/// Regression: #238 sealing must not close a raw descriptor while a SQLAR
-/// source holds SQLite's process-wide POSIX read lock on the same inode.
-#[test]
-fn regression_238_v3_seal_preserves_posix_locks() {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
-    use std::process::Command;
-
-    const PROBE_PATH: &str = "RATARMOUNT_TEST_238_V3_POSIX_PROBE";
-    const EXPECT_LOCKED: &str = "RATARMOUNT_TEST_238_V3_POSIX_LOCKED";
-    let lock_range = |kind| libc::flock {
-        l_type: kind,
-        l_whence: libc::SEEK_SET as _,
-        // SQLite's SHARED lock range, deliberately independent of flock.
-        l_start: 0x4000_0002,
-        l_len: 510,
-        l_pid: 0,
-    };
-    if let Some(path) = std::env::var_os(PROBE_PATH) {
-        let file = File::open(path).unwrap();
-        let mut query = lock_range(libc::F_WRLCK as _);
-        assert_eq!(
-            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut query) },
-            0
-        );
-        assert_eq!(
-            query.l_type != libc::F_UNLCK as _,
-            std::env::var(EXPECT_LOCKED).unwrap() == "yes",
-            "external process observed the wrong POSIX lock state"
-        );
-        return;
-    }
-    let probe = |path: &Path, locked| {
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "commit_journal::tests::regression_238_v3_seal_preserves_posix_locks",
-                "--nocapture",
-            ])
-            .env(PROBE_PATH, path)
-            .env(EXPECT_LOCKED, if locked { "yes" } else { "no" })
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "lock probe failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    for acquire in [guard_seal, guard_source_open] {
-        for through_alias in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("sqlar.sqlite");
-            let alias = dir.path().join("alias");
-            fs::write(&path, b"archive bytes").unwrap();
-            fs::hard_link(&path, &alias).unwrap();
-            let holder = File::open(&path).unwrap();
-            let shared = lock_range(libc::F_RDLCK as _);
-            assert_eq!(
-                unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLK, &shared) },
-                0
-            );
-            probe(&path, true);
-            let mut guard = acquire(if through_alias { &alias } else { &path }).unwrap();
-            probe(&path, true);
-            guard.release_lock().unwrap();
-            probe(&path, true);
-            drop(guard);
-            // Negative control: closing the raw guard after sealing releases
-            // the POSIX lock even though its original holder remains open.
-            probe(&path, false);
-            // A registered overlay-database inode is refused before source
-            // construction too. The refusal must not close a raw archive fd,
-            // even when the selected pathname is a hardlink alias.
-            assert_eq!(
-                unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLK, &shared) },
-                0
-            );
-            let meta = holder.metadata().unwrap();
-            let registration =
-                ratarmount_core::db_inodes::register_db_inode((meta.dev(), meta.ino()), &path);
-            probe(&path, true);
-            let Err(error) = acquire(if through_alias { &alias } else { &path }) else {
-                panic!("registered database alias must be refused");
-            };
-            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-            probe(&path, true);
-            drop(registration);
-            drop(holder);
-        }
-    }
 }

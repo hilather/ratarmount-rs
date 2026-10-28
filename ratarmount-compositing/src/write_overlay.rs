@@ -58,6 +58,9 @@ pub const OVERLAY_MARKER: &str = ".ratarmount-overlay.used";
 /// Marker name used before the rename; still accepted (never created).
 pub const LEGACY_OVERLAY_MARKER: &str = ".ratarmount.overlay.sqlite.used";
 
+/// Persistent overlay-scoped coordination, never a payload or bundle member.
+pub(crate) const SEAL_COMMIT_LOCK: &str = ".ratarmount.overlay.seal-commit.lock";
+
 /// Copy-on-write staging files. Not the final member name: a crash mid-copy
 /// leaves this prefix, which list, lookup, and commit ignore. ASCII case is
 /// ignored, same as [`HIDDEN_DB`].
@@ -76,6 +79,7 @@ fn is_overlay_internal_name(name: &str) -> bool {
     has_ascii_prefix(name, HIDDEN_DB)
         || has_ascii_prefix(name, COW_STAGING_PREFIX)
         || name.eq_ignore_ascii_case(".ratarmount-sealed")
+        || name.eq_ignore_ascii_case(SEAL_COMMIT_LOCK)
         || name.eq_ignore_ascii_case(OVERLAY_MARKER)
 }
 
@@ -3655,8 +3659,26 @@ impl WriteOverlay {
         live_commit_is_supported(archive)
     }
 
+    /// Join the same overlay-scoped operation as offline commit and seal.
+    /// Read through this mount's connection: opening another connection would
+    /// conflict with its lifetime exclusive SQLite ownership.
+    fn commit_operation(&self) -> Result<SealCommitGuard> {
+        let lock = SealCommitGuard::acquire(&self.root)?;
+        if crate::OverlayMeta::from_connection_required(&self.db.lock().expect("overlay db"), true)?
+            .as_ref()
+            .is_some_and(crate::OverlayMeta::layer_sealed)
+        {
+            return Err(OverlayError::Msg(format!(
+                "overlay {} is sealed; mount it with --lower, or `overlay unseal`",
+                self.root.display()
+            )));
+        }
+        Ok(lock)
+    }
+
     /// Persist only (on-exit). No reopen/reset.
     pub fn commit_atomic(&self, archive: &Path) -> Result<bool> {
+        let _seal_commit = self.commit_operation()?;
         if self.remote_enabled() {
             return self.commit_atomic_remote();
         }
@@ -4242,6 +4264,7 @@ impl WriteOverlay {
         idle_for: Duration,
         reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
     ) -> Result<bool> {
+        let _seal_commit = self.commit_operation()?;
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         if self.interval_disabled() {
             return Err(interval_disabled_err());
@@ -4301,6 +4324,7 @@ impl WriteOverlay {
         idle_for: Option<Duration>,
         reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
     ) -> Result<bool> {
+        let _seal_commit = self.commit_operation()?;
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         let archive_path = self.commit_archive_path(archive);
         let archive = archive_path.as_path();
@@ -4669,6 +4693,7 @@ impl WriteOverlay {
     /// (a member whose journal the mount-time classifier deferred). Runs
     /// through this overlay's own connection: it holds its database exclusively.
     pub fn recover_member_journal(&self, archive: &Path) -> Result<()> {
+        let _seal_commit = self.commit_operation()?;
         self.recover_journal(archive).map(|_| ())
     }
 
@@ -7247,8 +7272,50 @@ pub fn commit_overlay(
     base: &crate::ClassifiedBase,
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
-    let write_overlay = write_overlay.as_ref();
-    let archive_file = archive_file.as_ref();
+    OverlayCommitGuard::acquire(write_overlay)?.commit(archive_file, base, opts)
+}
+
+/// One offline commit operation, including caller-side archive creation or
+/// recovery. Keep this owner alive until publication and baseline refresh end.
+/// It always acquires the overlay lock before any archive guard.
+pub struct OverlayCommitGuard {
+    dir: PathBuf,
+    _lock: SealCommitGuard,
+}
+
+impl OverlayCommitGuard {
+    pub fn acquire(write_overlay: impl AsRef<Path>) -> Result<Self> {
+        let dir = write_overlay.as_ref().canonicalize()?;
+        ensure_overlay_unsealed(&dir)?;
+        let lock = SealCommitGuard::acquire(&dir)?;
+        ensure_overlay_unsealed(&dir)?;
+        Ok(Self { dir, _lock: lock })
+    }
+
+    pub fn commit(
+        self,
+        archive_file: impl AsRef<Path>,
+        base: &crate::ClassifiedBase,
+        opts: &CommitOverlayOptions,
+    ) -> Result<bool> {
+        commit_overlay_locked(&self.dir, archive_file.as_ref(), base, opts)
+    }
+
+    pub fn commit_raw_dir(
+        self,
+        archive_file: impl AsRef<Path>,
+        opts: &CommitOverlayOptions,
+    ) -> Result<RawDirCommit> {
+        commit_overlay_raw_dir_locked(&self.dir, archive_file.as_ref(), opts)
+    }
+}
+
+fn commit_overlay_locked(
+    write_overlay: &Path,
+    archive_file: &Path,
+    base: &crate::ClassifiedBase,
+    opts: &CommitOverlayOptions,
+) -> Result<bool> {
     match overlay_db_entry(write_overlay)? {
         DbEntry::Absent => {
             return Err(OverlayError::Msg(format!(
@@ -7270,6 +7337,65 @@ pub fn commit_overlay(
         log::warn!("{refusal} (--force-base-mismatch: committing anyway)");
     }
     commit_overlay_inner(write_overlay, archive_file, Some(base), opts)
+}
+
+/// Serializes seal and offline commit for one overlay, including when callers
+/// name different copies of its base. Always acquire before an archive guard.
+/// The lock file is persistent bookkeeping: never unlink it on guard disposal.
+pub(crate) struct SealCommitGuard {
+    #[cfg(unix)]
+    _fd: std::os::fd::OwnedFd,
+}
+
+impl SealCommitGuard {
+    pub(crate) fn acquire(dir: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = r###"internal-read:v1 {"id":"IR-V4-SEAL-COMMIT-LOCK","item":"<ratarmount_compositing::write_overlay::SealCommitGuard>::acquire","disposition":"output-owner","category":"overlay-control-record","reason":"Open the persistent overlay-scoped seal/commit lock without opening the archive; registered database aliases are refused before a lock-dropping close.","creation":{"policy":"create-if-missing","basis":"O_RDWR/O_CREAT with mode 0600, CLOEXEC, NONBLOCK and NOFOLLOW; no truncation, and the acquired entry must be regular."}}"###
+            )]
+            let fd = ratarmount_core::db_inodes::open_admitted(
+                &dir.join(SEAL_COMMIT_LOCK),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK,
+                0o600,
+            )?;
+            if rustix::fs::fstat(&fd)?.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return Err(io::Error::other("seal/commit lock must be a regular file"));
+            }
+            loop {
+                // SAFETY: the guard owns fd until the entire operation ends.
+                if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    return Ok(Self { _fd: fd });
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    return Err(error);
+                }
+                #[cfg(any(test, feature = "test-hooks"))]
+                if let Some(marker) = std::env::var_os("RATARMOUNT_TEST_OVERLAY_CONTENDED") {
+                    create_overlay_marker(Path::new(&marker))?;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "seal/commit locking requires Unix flock",
+            ))
+        }
+    }
 }
 
 /// Refuse a sealed database overlay without recovery or a writable connection.
@@ -7315,7 +7441,14 @@ pub fn commit_overlay_raw_dir(
     archive_file: impl AsRef<Path>,
     opts: &CommitOverlayOptions,
 ) -> Result<RawDirCommit> {
-    let write_overlay = write_overlay.as_ref();
+    OverlayCommitGuard::acquire(write_overlay)?.commit_raw_dir(archive_file, opts)
+}
+
+fn commit_overlay_raw_dir_locked(
+    write_overlay: &Path,
+    archive_file: &Path,
+    opts: &CommitOverlayOptions,
+) -> Result<RawDirCommit> {
     let db = write_overlay.join(HIDDEN_DB);
     if let DbEntry::Lost { markers, .. } = overlay_db_entry(write_overlay)? {
         return Err(lost_record_error(write_overlay, &markers));
@@ -7329,10 +7462,10 @@ pub fn commit_overlay_raw_dir(
         )));
     }
     if !opts.force_base_mismatch {
-        crate::overlay_gate::ensure_journal_is_for_archive(archive_file.as_ref())
+        crate::overlay_gate::ensure_journal_is_for_archive(archive_file)
             .map_err(OverlayError::Msg)?;
     }
-    let committed = commit_overlay_inner(write_overlay, archive_file.as_ref(), None, opts)?;
+    let committed = commit_overlay_inner(write_overlay, archive_file, None, opts)?;
     Ok(RawDirCommit {
         committed,
         identity_checked: false,

@@ -968,6 +968,59 @@
       "rule_reason": "inventory-op:ManagedReadCursor::open"
     },
     {
+      "configured_path": "ratarmount_index::managed_read::ManagedReadCursor::open",
+      "item": "<ratarmount_compositing::overlay_meta::SealArchive>::open",
+      "leaf_digest": "10d611c42a29bd809a514583edb0bf5d05477d6b9cfef350e441d07f66be38de",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "managed-read",
+        "creation": {
+          "basis": "Read an existing archive through SQLite VFS without creating it or taking its archive lock.",
+          "policy": "none"
+        },
+        "disposition": "managed-read",
+        "id": "IR-V4-SEAL-READER",
+        "item": "<ratarmount_compositing::overlay_meta::SealArchive>::open",
+        "reason": "Bind seal digest reads to one SQLite-managed byte reader so disposal preserves in-process reader locks.",
+        "regression": "regression_240_reader_transaction_survives_seal_and_commit"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-V4-SEAL-READER\",\"item\":\"<ratarmount_compositing::overlay_meta::SealArchive>::open\",\"disposition\":\"managed-read\",\"category\":\"managed-read\",\"regression\":\"regression_240_reader_transaction_survives_seal_and_commit\",\"reason\":\"Bind seal digest reads to one SQLite-managed byte reader so disposal preserves in-process reader locks.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Read an existing archive through SQLite VFS without creating it or taking its archive lock.\"}}",
+      "resolved": "<ratarmount_index::managed_read::ManagedReadCursor>::open",
+      "rule_reason": "inventory-op:ManagedReadCursor::open"
+    },
+    {
+      "configured_path": "ratarmount_core::db_inodes::open_admitted",
+      "item": "<ratarmount_compositing::write_overlay::SealCommitGuard>::acquire",
+      "leaf_digest": "52a8cba3f6faef1c19b5ae5b8c02f310bcd88b089bbe06db7e0e1b96a29fda38",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "overlay-control-record",
+        "creation": {
+          "basis": "O_RDWR/O_CREAT with mode 0600, CLOEXEC, NONBLOCK and NOFOLLOW; no truncation, and the acquired entry must be regular.",
+          "policy": "create-if-missing"
+        },
+        "disposition": "output-owner",
+        "id": "IR-V4-SEAL-COMMIT-LOCK",
+        "item": "<ratarmount_compositing::write_overlay::SealCommitGuard>::acquire",
+        "reason": "Open the persistent overlay-scoped seal/commit lock without opening the archive; registered database aliases are refused before a lock-dropping close."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-V4-SEAL-COMMIT-LOCK\",\"item\":\"<ratarmount_compositing::write_overlay::SealCommitGuard>::acquire\",\"disposition\":\"output-owner\",\"category\":\"overlay-control-record\",\"reason\":\"Open the persistent overlay-scoped seal/commit lock without opening the archive; registered database aliases are refused before a lock-dropping close.\",\"creation\":{\"policy\":\"create-if-missing\",\"basis\":\"O_RDWR/O_CREAT with mode 0600, CLOEXEC, NONBLOCK and NOFOLLOW; no truncation, and the acquired entry must be regular.\"}}",
+      "resolved": "ratarmount_core::db_inodes::unix::open_admitted",
+      "rule_reason": "inventory-op:open_admitted"
+    },
+    {
       "item": "<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open",
       "leaf_digest": "d9af744960177b31326bf1d0ab17dc67e4b437bd1aa7af0bae93acbcd4ed0b4d",
       "lint": "clippy::disallowed_methods",
@@ -4441,8 +4494,36 @@
     },
     {
       "configured_path": "ratarmount_index::managed_read::imp::ByteFile::open",
+      "item": "<ratarmount_index::managed_read::ArchiveReservation>::exclusive",
+      "leaf_digest": "549d96f10e4ef0842c63a1f03b2c66cbfe01e5e636dd1e5d14e6bc3e56effc82",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "commit-journal-recovery",
+        "creation": {
+          "basis": "Open an existing archive read-write as a VFS MAIN_DB byte file, with no CREATE flag; the reservation owns no SQL connection and changes no content.",
+          "policy": "none"
+        },
+        "disposition": "residual",
+        "family": "commit-journal-recovery",
+        "id": "IR-240-V4-RESERVE",
+        "issue": "#240",
+        "item": "<ratarmount_index::managed_read::ArchiveReservation>::exclusive",
+        "reason": "Reserve the archive through SQLite's VFS before any raw commit descriptor opens, refusing live SQLite readers without a lock-dropping close."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-240-V4-RESERVE\",\"item\":\"<ratarmount_index::managed_read::ArchiveReservation>::exclusive\",\"disposition\":\"residual\",\"category\":\"commit-journal-recovery\",\"family\":\"commit-journal-recovery\",\"issue\":\"#240\",\"reason\":\"Reserve the archive through SQLite's VFS before any raw commit descriptor opens, refusing live SQLite readers without a lock-dropping close.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Open an existing archive read-write as a VFS MAIN_DB byte file, with no CREATE flag; the reservation owns no SQL connection and changes no content.\"}}",
+      "resolved": "<ratarmount_index::managed_read::imp::ByteFile>::open",
+      "rule_reason": "inventory-op:managed-read-wrapper"
+    },
+    {
+      "configured_path": "ratarmount_index::managed_read::imp::ByteFile::open",
       "item": "<ratarmount_index::managed_read::ManagedReadCursor>::open",
-      "leaf_digest": "3bbe14772e459d7701483f1da9fa69da3da0fe56cfff79efb3178d3efea4f10d",
+      "leaf_digest": "9948fc4afbaa59c3e27e3654dac1974c5c8c6884e375b86f0b47f9ad770ec97e",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "managed-reader-backend",
@@ -4468,7 +4549,7 @@
     {
       "configured_path": "ratarmount_index::managed_read::imp::ByteFile::open",
       "item": "<ratarmount_index::managed_read::VfsLockHolder>::shared",
-      "leaf_digest": "863cc8b95bff201e1fd3f73bc8c8ec9b9ca58617792c64730eafc6c1d8bdeeac",
+      "leaf_digest": "54d69d03b5cbe8e668e6b146eb7fb43b915981d0a3122daf4072da8bfe2356e1",
       "lint": "clippy::disallowed_methods",
       "metadata": {
         "category": "feature-test-hook",
@@ -12673,14 +12754,14 @@
         "disposition": "out-of-family",
         "id": "IR-238-V2-M01",
         "item": "ratarmount_compress::commit_journal::test_marker",
-        "reason": "Publish explicit readiness output for archive-lock contention and the prewrite regression hold."
+        "reason": "Publish explicit readiness output for the prewrite regression hold."
       },
       "multiplicity": 1,
       "native_observed": true,
       "profiles": [
         "all-features"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-238-V2-M01\",\"item\":\"ratarmount_compress::commit_journal::test_marker\",\"disposition\":\"out-of-family\",\"category\":\"feature-test-hook\",\"reason\":\"Publish explicit readiness output for archive-lock contention and the prewrite regression hold.\",\"creation\":{\"policy\":\"create-or-truncate\",\"basis\":\"The test-hooks marker is explicit instrumentation output written with fs::write and ordinary umask permissions.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-238-V2-M01\",\"item\":\"ratarmount_compress::commit_journal::test_marker\",\"disposition\":\"out-of-family\",\"category\":\"feature-test-hook\",\"reason\":\"Publish explicit readiness output for the prewrite regression hold.\",\"creation\":{\"policy\":\"create-or-truncate\",\"basis\":\"The test-hooks marker is explicit instrumentation output written with fs::write and ordinary umask permissions.\"}}",
       "resolved": "std::fs::write",
       "rule_reason": "inventory-op:fs::write"
     },
@@ -12692,7 +12773,7 @@
       "metadata": {
         "category": "commit-journal-recovery",
         "creation": {
-          "basis": "Open an existing admitted archive read-only with CLOEXEC for flock and fstat; no creation flags are requested, and registered database aliases are refused without a lock-dropping close.",
+          "basis": "Open an existing admitted archive read-only with CLOEXEC for flock and fstat; no creation flags are requested, and the enclosing VFS reservation protects SQLite inode bookkeeping.",
           "policy": "none"
         },
         "disposition": "residual",
@@ -12700,7 +12781,7 @@
         "id": "IR-B0216-M01",
         "issue": "#196",
         "item": "ratarmount_compress::commit_journal::unix::guard_copy",
-        "reason": "Acquire the archive flock for source construction, sealing and commit publication through admitted open; Regression: refusing a registered database alias must preserve its existing POSIX locks, including source-open error paths."
+        "reason": "Acquire the existing archive flock for commit publication through admitted open, under a SQLite VFS reservation that excludes readers before any raw descriptor opens and outlives all raw descriptor closes."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -12708,7 +12789,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0216-M01\",\"item\":\"ratarmount_compress::commit_journal::unix::guard_copy\",\"disposition\":\"residual\",\"reason\":\"Acquire the archive flock for source construction, sealing and commit publication through admitted open; Regression: refusing a registered database alias must preserve its existing POSIX locks, including source-open error paths.\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Open an existing admitted archive read-only with CLOEXEC for flock and fstat; no creation flags are requested, and registered database aliases are refused without a lock-dropping close.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0216-M01\",\"item\":\"ratarmount_compress::commit_journal::unix::guard_copy\",\"disposition\":\"residual\",\"reason\":\"Acquire the existing archive flock for commit publication through admitted open, under a SQLite VFS reservation that excludes readers before any raw descriptor opens and outlives all raw descriptor closes.\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Open an existing admitted archive read-only with CLOEXEC for flock and fstat; no creation flags are requested, and the enclosing VFS reservation protects SQLite inode bookkeeping.\"}}",
       "resolved": "ratarmount_core::db_inodes::unix::open_admitted",
       "rule_reason": "inventory-op:open_admitted"
     },
@@ -12767,62 +12848,6 @@
       "reason": "internal-read:v1 {\"id\":\"IR-B0220-M01\",\"item\":\"ratarmount_compress::commit_journal::unix::open_journal\",\"disposition\":\"residual\",\"reason\":\"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "ratarmount_core::db_inodes::unix::open_admitted",
       "rule_reason": "inventory-op:open_admitted"
-    },
-    {
-      "configured_path": "std::fs::File::open",
-      "item": "ratarmount_compress::commit_journal::unix::probe",
-      "leaf_digest": "af172d7c4cada4252fcb1cf24ad47a19a139875c2301f6ac85345737446f5a6f",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "commit-journal-recovery",
-        "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
-          "policy": "none"
-        },
-        "disposition": "residual",
-        "family": "commit-journal-recovery",
-        "id": "IR-B0219-M01",
-        "issue": "#196",
-        "item": "ratarmount_compress::commit_journal::unix::probe",
-        "reason": "base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0219-M01\",\"item\":\"ratarmount_compress::commit_journal::unix::probe\",\"disposition\":\"residual\",\"reason\":\"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
-      "resolved": "<std::fs::File>::open",
-      "rule_reason": "inventory-op:File::open"
-    },
-    {
-      "configured_path": "std::fs::File::open",
-      "item": "ratarmount_compress::commit_journal::unix::recover",
-      "leaf_digest": "349188ef73ed72e91e5869a2490a427766d31f63b3c50d5c620d7e838177b148",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "commit-journal-recovery",
-        "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
-          "policy": "none"
-        },
-        "disposition": "residual",
-        "family": "commit-journal-recovery",
-        "id": "IR-B0217-M01",
-        "issue": "#196",
-        "item": "ratarmount_compress::commit_journal::unix::recover",
-        "reason": "base-archive bytes read by journal recovery; recovery and mutation ownership belong to the excluded broader machinery"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0217-M01\",\"item\":\"ratarmount_compress::commit_journal::unix::recover\",\"disposition\":\"residual\",\"reason\":\"base-archive bytes read by journal recovery; recovery and mutation ownership belong to the excluded broader machinery\",\"family\":\"commit-journal-recovery\",\"issue\":\"#196\",\"category\":\"commit-journal-recovery\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
-      "resolved": "<std::fs::File>::open",
-      "rule_reason": "inventory-op:File::open"
     },
     {
       "configured_path": "std::fs::OpenOptions::new",

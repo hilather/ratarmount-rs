@@ -313,7 +313,6 @@ fn regression_remote_base_without_scheme_creates_without_digest_lookup() {
             sidecar_candidate: None,
             read_only_index: false,
             fetched: false,
-            source_metadata: None,
             keep_alive: Box::new(()),
         })
         .unwrap();
@@ -896,7 +895,6 @@ fn regression_repo_stable_over_main_updates_base_url() {
             sidecar_candidate: None,
             read_only_index: false,
             fetched: false,
-            source_metadata: None,
             keep_alive: Box::new(()),
         })
         .unwrap()
@@ -925,7 +923,6 @@ fn regression_repo_stable_over_main_updates_base_url() {
         sidecar_candidate: None,
         read_only_index: false,
         fetched: false,
-        source_metadata: None,
         keep_alive: Box::new(()),
     })
     .unwrap();
@@ -1664,7 +1661,6 @@ fn regression_accepted_archive_move_repoints_base_index_path() {
                 sidecar_candidate: None,
                 read_only_index: false,
                 fetched: false,
-                source_metadata: fs::metadata(archive).ok(),
                 keep_alive: Box::new(()),
             })
             .unwrap()
@@ -2869,8 +2865,8 @@ fn regression_unpublished_attempt_collision_refuses_copy() {
 /// the attempt's own lock. ENOSPC while the archive is written; while the
 /// attempt is about to clean up, another thread tries to recover the archive
 /// and to start its own (complete) replacement: both hit the held lock. The
-/// test seam aborts the replacement's wait so the cleanup can resume. The
-/// attempt then rolls back: the archive is the old bytes, no journal, no
+/// competing mutation is refused before opening raw descriptors, so cleanup
+/// can resume. The attempt then rolls back: the archive is the old bytes, no journal, no
 /// locator, rows unchanged, and the next commit succeeds.
 #[cfg(unix)]
 #[test]
@@ -2900,16 +2896,8 @@ fn regression_failed_attempt_cleanup_holds_the_archive_lock() {
                     let mut suffix = tempfile::tempfile().unwrap();
                     suffix.write_all(&[0u8; 1536]).unwrap();
                     let len = fs::metadata(&archive).unwrap().len();
-                    // Replacement now waits for commits and seals. Prove its
-                    // lock is contended, then abort this test-only wait before
-                    // joining the competitor while the outer lock is held.
-                    fault::install(|step| {
-                        if step == "archive lock contended" {
-                            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
-                        } else {
-                            Ok(())
-                        }
-                    });
+                    // The VFS reservation or nonblocking archive flock must
+                    // refuse this competing mutation while cleanup is active.
                     let started = ratarmount_compress::commit_journal::replace_suffix_with_hook(
                         &archive,
                         len.saturating_sub(1024),
@@ -2922,7 +2910,6 @@ fn regression_failed_attempt_cleanup_holds_the_archive_lock() {
                             }
                         },
                     );
-                    fault::clear();
                     log.lock().unwrap().push(format!("replace: {started:?}"));
                 })
                 .join()
@@ -6338,7 +6325,6 @@ impl PreparedIdentityFixture {
             sidecar_candidate: Some(self.index.clone()),
             read_only_index: strict,
             fetched: false,
-            source_metadata: fs::metadata(&self.archive).ok(),
             keep_alive: Box::new(()),
         })
         .unwrap()

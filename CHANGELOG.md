@@ -4,7 +4,7 @@
 
 ### Fixes
 
-- `--commit-overlay` refuses sealed overlays before creating or initializing a base archive and rechecks sealing under the archive lock after confirmation. Source acquisition and sealing take that archive's exclusive lock; sealing validates the acquisition stamp and holds the lock through base resolution, hashing and seal publication. Lock descriptors stay alive throughout the operation to preserve existing SQLite/POSIX locks. Refusal leaves the archive unchanged (exit 1). Byte-identical bases at different inodes have separate locks; concurrent seal/commit using different copies remains unsupported. (#238, #240)
+- `--commit-overlay` refuses sealed overlays before creating or initializing a base archive. Seal and offline/live/on-exit commits serialize on an overlay-scoped `seal-commit.lock`, with commit taking the overlay lock before its archive guard and checking sealing again before any archive write. Seal holds only the overlay lock through resolution, hashing and publication; ordinary source opens take no archive lock. Repeating seal succeeds even after its base disappears. Managed seal reads preserve live SQLite reader locks, and archive journal guards refuse a live SQLite transaction before opening their raw descriptors. Copy publication now requires write access to the archive for that reservation. Split archives must be joined before sealing. (#238, #240)
 - `--commit-overlay` on a sealed overlay is refused before the archive is touched, with the same message as `-w` (exit 1, also under `--force-base-mismatch`); it used to rewrite the archive, fail on the read-only database and break the seal (#234).
 
 ## 0.1.36

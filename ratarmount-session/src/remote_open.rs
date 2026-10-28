@@ -960,7 +960,6 @@ pub(super) struct RemoteOpened {
     pub index: IndexUsed,
     /// The persistent local artifact selected by a `file://` open.
     pub actual_artifact: Option<PathBuf>,
-    pub source_metadata: Option<std::fs::Metadata>,
 }
 
 impl RemoteOpened {
@@ -972,7 +971,6 @@ impl RemoteOpened {
             local: false,
             fetched: false,
             actual_artifact: None,
-            source_metadata: None,
             index: IndexUsed {
                 location: ratarmount_index::IndexLocation::Memory,
                 discovered_from: None,
@@ -997,7 +995,6 @@ impl RemoteOpened {
             fetched: !local,
             index: opened.index,
             actual_artifact: if local { opened.actual_artifact } else { None },
-            source_metadata: if local { opened.source_metadata } else { None },
         }
     }
 }

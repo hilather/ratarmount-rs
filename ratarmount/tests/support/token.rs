@@ -24,10 +24,6 @@ pub struct FixtureOpener {
 
 impl OpenBase for FixtureOpener {
     fn open_base(&mut self) -> Result<Opened, String> {
-        let source_metadata = match &self.location {
-            Some(ServedLocation::Local(path)) => std::fs::metadata(path).ok(),
-            _ => None,
-        };
         Ok(Opened {
             source: self.source.clone(),
             kind: self.kind.clone(),
@@ -37,7 +33,6 @@ impl OpenBase for FixtureOpener {
             sidecar_candidate: None,
             read_only_index: false,
             fetched: false,
-            source_metadata,
             keep_alive: Box::new(()),
         })
     }

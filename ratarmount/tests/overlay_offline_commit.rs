@@ -1088,10 +1088,10 @@ impl Drop for Regression238Child {
     }
 }
 
-/// Regression: #238 a seal completed after confirmation used to let each
-/// persistence route rewrite the base before failing on the sealed database.
+/// Regression: #238 a seal starting during confirmation must wait for each
+/// persistence route to finish, then seal its new base digest or refuse.
 #[test]
-fn regression_238_seal_after_confirmation_refuses_commit() {
+fn regression_238_seal_after_confirmation_waits_for_commit() {
     let mut errors = Vec::new();
     for (route, mode, yes) in [
         ("tar-append", "append", false),
@@ -1229,7 +1229,13 @@ fn regression_238_seal_after_confirmation_refuses_commit() {
             // File readiness, rather than an elapsed delay, orders the seal.
             std::thread::sleep(Duration::from_millis(10));
         }
-        env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+        let contended = env.path("seal-contended");
+        let mut seal = Regression238Child::spawn(
+            &env,
+            &["overlay", "seal", s(&overlay), s(&archive)],
+            &[("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)],
+        );
+        let blocked = seal.marker_or_exit(&contended);
         fs::write(&release, b"release").unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
@@ -1240,16 +1246,35 @@ fn regression_238_seal_after_confirmation_refuses_commit() {
             std::thread::sleep(Duration::from_millis(10));
         }
         let out = child.0.take().unwrap().wait_with_output().unwrap();
-        errors.extend(
-            regression_238_refusal_errors(&overlay, &out)
-                .into_iter()
-                .map(|e| format!("{route}: {e}")),
-        );
-        if fs::read(&archive).unwrap() != before {
+        let sealed = seal.finish();
+        if !blocked {
             errors.push(format!(
-                "{route}: archive rewritten after confirmation-time seal"
+                "{route}: seal did not wait for commit's overlay lock: {}",
+                text(&sealed)
             ));
         }
+        if !out.status.success() {
+            errors.push(format!("{route}: commit failed: {}", text(&out)));
+        }
+        let after = fs::read(&archive).unwrap();
+        if after == before {
+            errors.push(format!("{route}: commit did not change archive bytes"));
+        }
+        if !sealed.status.success() {
+            assert!(
+                !ratarmount_compositing::OverlayMeta::read(&overlay)
+                    .unwrap()
+                    .unwrap()
+                    .layer_sealed(),
+                "{route}: failed seal published metadata"
+            );
+            env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+        }
+        assert_eq!(
+            regression_238_recorded_archive_digest(&overlay),
+            format!("sha256:{}", ratarmount_index::sha256_hex(&after)),
+            "{route}: seal must bind the completed commit"
+        );
         let verify = env.run(&["overlay", "verify", s(&overlay), s(&archive)]);
         if !verify.status.success() {
             errors.push(format!(
@@ -1279,7 +1304,7 @@ impl Regression238Child {
     }
 
     /// An explicit hook or process exit orders the next action; elapsed time
-    /// never establishes that the other process reached the archive lock.
+    /// never establishes that the other process reached the overlay lock.
     fn marker_or_exit(&mut self, marker: &Path) -> bool {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -1320,11 +1345,11 @@ fn regression_238_recorded_archive_digest(overlay: &Path) -> String {
         .to_owned()
 }
 
-/// Regression: #238 v2 a seal starting after before_write hashed the old
-/// archive while commit owned its lock, leaving a stale sealed base digest.
+/// Regression: #238 a seal starting after before_write hashed the old
+/// archive while commit wrote it, leaving a stale sealed base digest.
 /// Both inode-preserving replacement and copy publication must exclude seal.
 #[test]
-fn regression_238_v2_seal_during_write_waits_for_archive() {
+fn regression_238_seal_during_write_waits_for_overlay_lock() {
     let mut errors = Vec::new();
     for mode in ["append", "copy"] {
         if mode == "copy" && !have_gnu_tar() {
@@ -1371,7 +1396,7 @@ fn regression_238_v2_seal_during_write_waits_for_archive() {
         let mut seal = Regression238Child::spawn(
             &env,
             &["overlay", "seal", s(&overlay), s(&archive)],
-            &[("RATARMOUNT_TEST_ARCHIVE_CONTENDED", &contended)],
+            &[("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)],
         );
         let blocked = seal.marker_or_exit(&contended);
         fs::write(&release, b"release").unwrap();
@@ -1380,7 +1405,7 @@ fn regression_238_v2_seal_during_write_waits_for_archive() {
         let after = fs::read(&archive).unwrap();
         if !blocked {
             errors.push(format!(
-                "{mode}: seal finished while commit held its archive lock: {}",
+                "{mode}: seal finished while commit held its overlay lock: {}",
                 text(&sealed)
             ));
         }
@@ -1426,11 +1451,11 @@ fn regression_238_v2_seal_during_write_waits_for_archive() {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
-/// Regression: #238 v2 a seal's DB reservation did not stop a commit that
-/// had already passed confirmation. Seal must own the archive lock first;
-/// the waiting commit must recheck sealing and preserve every archive byte.
+/// Regression: #238 a seal's DB reservation did not stop a concurrent commit.
+/// Seal owns the overlay lock first; a waiting commit must recheck sealing
+/// after taking that lock and preserve every archive byte.
 #[test]
-fn regression_238_v2_commit_waits_for_seal_then_refuses() {
+fn regression_238_commit_waits_for_seal_then_refuses() {
     let mut errors = Vec::new();
     for mode in ["append", "copy"] {
         if mode == "copy" && !have_gnu_tar() {
@@ -1445,13 +1470,22 @@ fn regression_238_v2_commit_waits_for_seal_then_refuses() {
         let archive = regression_238_tar(&env);
         let overlay = regression_238_overlay(&env, &archive);
         let before = fs::read(&archive).unwrap();
-        let confirm_ready = env.path("confirm-ready");
-        let confirm_release = env.path("confirm-release");
         let seal_ready = env.path("seal-lock-ready");
         let seal_release = env.path("seal-lock-release");
         let contended = env.path("commit-contended");
-        // Pause after recovery and planning, so the contention below is the
-        // mutation lock whose before_write must observe the finished seal.
+        let mut seal = Regression238Child::spawn(
+            &env,
+            &["overlay", "seal", s(&overlay), s(&archive)],
+            &[
+                ("RATARMOUNT_TEST_SEAL_LOCK_READY", &seal_ready),
+                ("RATARMOUNT_TEST_SEAL_LOCK_RELEASE", &seal_release),
+            ],
+        );
+        assert!(
+            seal.marker_or_exit(&seal_ready),
+            "{mode}: seal exited before overlay-lock hook: {}",
+            text(&seal.finish())
+        );
         let mut commit = Regression238Child::spawn(
             &env,
             &[
@@ -1463,38 +1497,15 @@ fn regression_238_v2_commit_waits_for_seal_then_refuses() {
                 mode,
                 "--yes",
             ],
-            &[
-                ("RATARMOUNT_TEST_COMMIT_READY", &confirm_ready),
-                ("RATARMOUNT_TEST_COMMIT_RELEASE", &confirm_release),
-                ("RATARMOUNT_TEST_ARCHIVE_CONTENDED", &contended),
-            ],
+            &[("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)],
         );
-        assert!(
-            commit.marker_or_exit(&confirm_ready),
-            "{mode}: commit exited before confirmation hook: {}",
-            text(&commit.finish())
-        );
-        let mut seal = Regression238Child::spawn(
-            &env,
-            &["overlay", "seal", s(&overlay), s(&archive)],
-            &[
-                ("RATARMOUNT_TEST_SEAL_LOCK_READY", &seal_ready),
-                ("RATARMOUNT_TEST_SEAL_LOCK_RELEASE", &seal_release),
-            ],
-        );
-        assert!(
-            seal.marker_or_exit(&seal_ready),
-            "{mode}: seal exited before archive-lock hook: {}",
-            text(&seal.finish())
-        );
-        fs::write(&confirm_release, b"release").unwrap();
         let blocked = commit.marker_or_exit(&contended);
         fs::write(&seal_release, b"release").unwrap();
         let sealed = seal.finish();
         let committed = commit.finish();
         if !blocked {
             errors.push(format!(
-                "{mode}: commit finished while seal held its archive lock: {}",
+                "{mode}: commit finished while seal held its overlay lock: {}",
                 text(&committed)
             ));
         }
@@ -1508,7 +1519,7 @@ fn regression_238_v2_commit_waits_for_seal_then_refuses() {
         );
         if fs::read(&archive).unwrap() != before {
             errors.push(format!(
-                "{mode}: archive changed while sealing won the archive lock"
+                "{mode}: archive changed while sealing won the overlay lock"
             ));
         }
         if sealed.status.success() {
@@ -1530,4 +1541,92 @@ fn regression_238_v2_commit_waits_for_seal_then_refuses() {
         }
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+/// Regression: #240 CLI archive creation/initialization ran before the overlay
+/// lock. A seal against an accepted second base copy must block that work, then
+/// make the waiting commit refuse without creating or filling its own target.
+#[test]
+fn regression_240_seal_blocks_cli_archive_initialization() {
+    for empty in [false, true] {
+        let env = Env::new();
+        let archive = regression_238_tar(&env);
+        let seal_base = env.path("seal-base.tar");
+        fs::copy(&archive, &seal_base).unwrap();
+        let overlay = env.path("overlay");
+        env.ok(&[
+            "--no-mount",
+            "-w",
+            s(&overlay),
+            "--base-digest",
+            "none",
+            s(&archive),
+        ]);
+        fs::write(overlay.join("new.txt"), b"new\n").unwrap();
+        if empty {
+            fs::write(&archive, b"").unwrap();
+        } else {
+            fs::remove_file(&archive).unwrap();
+        }
+        let state = || match fs::read(&archive) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read target: {error}"),
+        };
+        let before = state();
+        let seal_ready = env.path("seal-ready");
+        let seal_release = env.path("seal-release");
+        let contended = env.path("commit-contended");
+        let mut seal = Regression238Child::spawn(
+            &env,
+            &["overlay", "seal", s(&overlay), s(&seal_base)],
+            &[
+                ("RATARMOUNT_TEST_SEAL_LOCK_READY", &seal_ready),
+                ("RATARMOUNT_TEST_SEAL_LOCK_RELEASE", &seal_release),
+            ],
+        );
+        assert!(
+            seal.marker_or_exit(&seal_ready),
+            "empty={empty}: seal did not reach its overlay lock: {}",
+            text(&seal.finish())
+        );
+        let mut commit = Regression238Child::spawn(
+            &env,
+            &[
+                "--commit-overlay",
+                "-w",
+                s(&overlay),
+                s(&archive),
+                "--force-base-mismatch",
+                "--yes",
+            ],
+            &[("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)],
+        );
+        let blocked = commit.marker_or_exit(&contended);
+        let while_sealing = state();
+        fs::write(&seal_release, b"release").unwrap();
+        let sealed = seal.finish();
+        let committed = commit.finish();
+        assert!(
+            blocked,
+            "empty={empty}: commit did not wait: {}",
+            text(&committed)
+        );
+        assert!(sealed.status.success(), "empty={empty}: {}", text(&sealed));
+        assert_eq!(
+            while_sealing, before,
+            "empty={empty}: target changed before the overlay lock"
+        );
+        assert_eq!(
+            state(),
+            before,
+            "empty={empty}: refused commit changed target"
+        );
+        assert!(
+            regression_238_refusal_errors(&overlay, &committed).is_empty(),
+            "empty={empty}: {}",
+            text(&committed)
+        );
+        env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+    }
 }

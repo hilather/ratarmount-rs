@@ -1,135 +1,138 @@
 use super::*;
 
-/// Regression: #238 a commit between the factory's source acquisition and
-/// token minting paired an old TAR index/descriptor with the new path stamp.
+/// Child-side oracle: a different process must not get an exclusive SQLite
+/// transaction while the parent still owns a read transaction.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[allow(clippy::disallowed_methods)]
-fn regression_238_v3_commit_during_open_cannot_certify_old_source() {
-    use ratarmount_compositing::{BaseDigestRequest, CreateOptions, OverlayMetadata, WriteOverlay};
-    use ratarmount_compress::commit_journal;
-    use std::io::{Read, Seek, SeekFrom};
-
-    struct CommitDuringOpen<'a> {
-        factory: FactoryOpener<'a>,
-        archive: PathBuf,
-        staged: PathBuf,
-        replace: bool,
-    }
-    impl OpenBase for CommitDuringOpen<'_> {
-        fn open_base(&mut self) -> Result<Opened, String> {
-            let opened = self.factory.open_base()?;
-            let original = std::fs::metadata(&self.archive).unwrap();
-            if self.replace {
-                let _guard = commit_journal::guard_copy(&self.archive, &original).unwrap();
-                std::fs::rename(&self.staged, &self.archive).unwrap();
-            } else {
-                let mut suffix = std::fs::File::open(&self.staged).unwrap();
-                commit_journal::replace_suffix_if_unchanged_with(
-                    &self.archive,
-                    0,
-                    &mut suffix,
-                    &original,
-                    &mut || Ok(()),
-                    &mut |_| Ok(()),
-                )
-                .unwrap();
-            }
-            Ok(opened)
-        }
-    }
-
-    for replace in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("base.tar");
-        let staged = dir.path().join("new.tar");
-        write_tar_file(&archive);
-        write_tar_file(&staged);
-        // Keep the same layout; changing the inherited payload exposes a
-        // stale digest even when an in-place source keeps the same offsets.
-        let mut newer = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&staged)
-            .unwrap();
-        newer.seek(SeekFrom::Start(512)).unwrap();
-        std::io::Write::write_all(&mut newer, b"y").unwrap();
-        drop(newer);
-        let initial = fixtures::classify(&archive);
-        let overlay_dir = dir.path().join("overlay");
-        let overlay = WriteOverlay::open(
-            &initial,
-            initial.source(),
-            &overlay_dir,
-            &CreateOptions {
-                base_digest: BaseDigestRequest::None,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        overlay
-            .set_metadata(
-                "/f",
-                &OverlayMetadata {
-                    mode: Some(0o600),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        drop(overlay);
-        drop(initial);
-        let mut options = OpenOptions {
-            index_in_memory: true,
-            write_index: false,
-            ..Default::default()
-        };
-        let factory = FactoryOpener::new(
-            vec![archive.to_string_lossy().into_owned()],
-            vec![archive.clone()],
-            &mut options,
-            false,
-            Default::default(),
-            Default::default(),
-            false,
-        );
-        let token = ClassifiedBase::open(&mut CommitDuringOpen {
-            factory,
-            archive: archive.clone(),
-            staged,
-            replace,
-        })
-        .unwrap();
-        if replace {
-            let source = token.source();
-            let info = source.lookup("/f", 0).unwrap();
-            let mut bytes = Vec::new();
-            source
-                .open(&info, 0)
-                .unwrap()
-                .read_to_end(&mut bytes)
-                .unwrap();
+fn regression_240_external_exclusive_probe() {
+    let Some(path) = std::env::var_os("RATARMOUNT_TEST_SQLITE_LOCK_PATH") else {
+        return;
+    };
+    let blocked = std::env::var_os("RATARMOUNT_TEST_SQLITE_LOCK_BLOCKED").is_some();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+    match conn.execute_batch("BEGIN EXCLUSIVE; ROLLBACK;") {
+        Ok(()) => assert!(
+            !blocked,
+            "outside BEGIN EXCLUSIVE succeeded during the reader transaction"
+        ),
+        Err(error) => {
+            assert!(
+                blocked,
+                "outside BEGIN EXCLUSIVE failed without the reader: {error}"
+            );
             assert_eq!(
-                bytes, b"x",
-                "the fixture must retain the old TAR descriptor"
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy),
+                "{error}"
             );
         }
-        let result =
-            ratarmount_compositing::overlay_seal::seal(&overlay_dir, &token, token.source());
-        // Keep a failing red control removable even if it published a seal.
-        if result.is_ok() {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&overlay_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let error = result.expect_err("commit during open must not certify an obsolete source");
-        assert!(
-            error.to_string().contains("base view was opened"),
-            "{error}"
-        );
-        assert!(!OverlayMeta::read(&overlay_dir)
-            .unwrap()
-            .unwrap()
-            .layer_sealed());
-        assert!(!overlay_dir.join(".ratarmount-sealed").exists());
     }
+}
+
+/// Regression: #240 raw archive descriptors retained by source construction or
+/// opened during seal released an independent SQLAR reader's locks on disposal.
+/// Keep one read transaction live across seal, a real commit and source disposal;
+/// the outside BEGIN EXCLUSIVE oracle must fail at every operation boundary.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn regression_240_reader_transaction_survives_seal_and_commit() {
+    use ratarmount_compositing::{
+        commit_overlay, BaseDigestRequest, CommitMode, CommitOverlayOptions, CreateOptions,
+        WriteOverlay,
+    };
+    use std::io::Read;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sqlar = tmp.path().join("base.sqlar");
+    {
+        let conn = rusqlite::Connection::open(&sqlar).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB);
+             INSERT INTO sqlar VALUES ('base.txt',33188,0,4,X'62617365');",
+        )
+        .unwrap();
+    }
+    // Construct the source before the independent transaction: generic format
+    // probes are a separate reader inventory (#196). The transaction below
+    // must remain live across seal, commit and this source's later disposal.
+    let sqlar_base = fixtures::classify(&sqlar);
+    let reader = rusqlite::Connection::open(&sqlar).unwrap();
+    reader.execute_batch("BEGIN; SELECT * FROM sqlar;").unwrap();
+    let mut failures = Vec::new();
+    let mut probe = |stage: &str, blocked: bool| {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "base_identity::tests::regression_240_external_exclusive_probe",
+                "--nocapture",
+            ])
+            .env("RATARMOUNT_TEST_SQLITE_LOCK_PATH", &sqlar);
+        if blocked {
+            command.env("RATARMOUNT_TEST_SQLITE_LOCK_BLOCKED", "1");
+        }
+        let out = command.output().unwrap();
+        if !out.status.success() || !String::from_utf8_lossy(&out.stdout).contains("running 1 test")
+        {
+            failures.push(format!(
+                "{stage}: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    };
+    probe("before seal setup", true);
+    let overlay = tmp.path().join("sealed-overlay");
+    let create = CreateOptions {
+        base_digest: BaseDigestRequest::None,
+        ..Default::default()
+    };
+    drop(WriteOverlay::open(&sqlar_base, sqlar_base.source(), &overlay, &create).unwrap());
+    std::fs::write(overlay.join("new.txt"), b"overlay").unwrap();
+    probe("before seal", true);
+    ratarmount_compositing::overlay_seal::seal(&overlay, &sqlar_base, sqlar_base.source()).unwrap();
+    probe("after seal", true);
+
+    let tar = tmp.path().join("commit.tar");
+    write_tar_file(&tar);
+    let tar_base = fixtures::classify(&tar);
+    let writable = tmp.path().join("commit-overlay");
+    drop(WriteOverlay::open(&tar_base, tar_base.source(), &writable, &create).unwrap());
+    std::fs::write(writable.join("committed.txt"), b"committed").unwrap();
+    assert!(commit_overlay(
+        &writable,
+        &tar,
+        &tar_base,
+        &CommitOverlayOptions {
+            mode: CommitMode::Append,
+            yes: true,
+            debug: 0,
+            ..Default::default()
+        }
+    )
+    .unwrap());
+    probe("after commit in the same process", true);
+    let reopened = fixtures::classify(&tar);
+    let source = reopened.source();
+    let info = source.lookup("/committed.txt", 0).unwrap();
+    let mut payload = Vec::new();
+    source
+        .open(&info, 0)
+        .unwrap()
+        .read_to_end(&mut payload)
+        .unwrap();
+    assert_eq!(payload, b"committed", "exercise a completed archive commit");
+
+    drop(sqlar_base);
+    probe("after SQLAR source disposal", true);
+    reader.execute_batch("COMMIT;").unwrap();
+    probe("after reader COMMIT (negative control)", false);
+    ratarmount_compositing::overlay_seal::unseal(&overlay).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Regression: classification is the factory open a verb already needs and

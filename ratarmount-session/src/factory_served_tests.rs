@@ -343,7 +343,6 @@ fn regression_served_kind_table_fetched_and_torrent() {
     let opened =
         |path: &str, kind: ServedKind, local: bool, fetched: bool| remote_open::RemoteOpened {
             actual_artifact: None,
-            source_metadata: None,
             path: PathBuf::from(path),
             source: source.clone(),
             kind,
@@ -608,122 +607,39 @@ fn regression_served_without_indexing_symlinks_dangling_and_fifo() {
     assert!(err.contains("neither a file nor a directory"), "{err}");
 }
 
-/// Regression: #238 a commit must not replace or rewrite the archive
-/// while its source is still building an index from the opened inode.
+/// Regression: ordinary archive reads must not acquire an archive flock,
+/// which requires write access for exclusive locks on NFS and can prohibit
+/// backend reads through other descriptors on CIFS.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn regression_238_v3_commit_during_source_open_waits() {
-    use std::sync::{mpsc, Mutex};
+fn regression_240_source_open_does_not_acquire_archive_flock() {
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
     use std::time::Duration;
 
-    for replace in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("base.tar");
-        let make_tar = |fill| {
-            let payload = vec![fill; 9 * 1024 * 1024];
-            let mut bytes = Vec::new();
-            ratarmount_formats_tar::write_ustar_members(
-                &mut bytes,
-                &[
-                    ratarmount_formats_tar::UstarMember {
-                        path: "large",
-                        payload: ratarmount_formats_tar::UstarPayload::File { bytes: &payload },
-                        mode: 0o644,
-                        uid: 0,
-                        gid: 0,
-                        mtime: 0,
-                        xattrs: &[],
-                    },
-                    ratarmount_formats_tar::UstarMember {
-                        path: "last",
-                        payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"last" },
-                        mode: 0o644,
-                        uid: 0,
-                        gid: 0,
-                        mtime: 0,
-                        xattrs: &[],
-                    },
-                ],
-            )
-            .unwrap();
-            ratarmount_formats_tar::write_tar_eof(&mut bytes).unwrap();
-            bytes
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("base.tar");
+    tar(&path);
+    let locked = std::fs::File::open(&path).unwrap();
+    assert_eq!(unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let (done_tx, done_rx) = mpsc::channel();
+    let opening = std::thread::spawn(move || {
+        let options = OpenOptions {
+            recover_journals: false,
+            ..options()
         };
-        std::fs::write(&path, make_tar(b'o')).unwrap();
-        let original = std::fs::metadata(&path).unwrap();
-        let opened_stamp = original.clone();
-        let new_bytes = make_tar(b'n');
-        let (scanning_tx, scanning_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let pause = Mutex::new(Some(release_rx));
-        let opening_path = path.clone();
-        let opening = std::thread::spawn(move || {
-            let options = OpenOptions {
-                index_in_memory: true,
-                recover_journals: false,
-                index_build: ratarmount_core::IndexBuildHooks {
-                    on_progress: Some(Arc::new(move |tick| {
-                        if tick.phase == ratarmount_core::IndexBuildTick::PHASE_WRITE
-                            && tick.bytes_scanned >= 8 * 1024 * 1024
-                        {
-                            if let Some(release) = pause.lock().unwrap().take() {
-                                scanning_tx.send(()).unwrap();
-                                release.recv_timeout(Duration::from_secs(20)).unwrap();
-                            }
-                        }
-                    })),
-                    cancel: None,
-                },
-                ..Default::default()
-            };
-            open_path_impl(&opening_path, &options, false, true, &mut false)
-        });
-        scanning_rx.recv_timeout(Duration::from_secs(20)).unwrap();
-        let (lock_state_tx, lock_state_rx) = mpsc::channel();
-        let writing_path = path.clone();
-        let writing = std::thread::spawn(move || {
-            let contended = lock_state_tx.clone();
-            ratarmount_compress::commit_journal::fault::install(move |step| {
-                if step == "archive lock contended" {
-                    contended.send(true).unwrap();
-                }
-                Ok(())
-            });
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "Regression: contend on the actual archive publication lock while source acquisition scans the TAR"
-            )]
-            let _guard =
-                ratarmount_compress::commit_journal::guard_copy(&writing_path, &original).unwrap();
-            ratarmount_compress::commit_journal::fault::clear();
-            lock_state_tx.send(false).unwrap();
-            if replace {
-                let staged = writing_path.with_extension("staged");
-                std::fs::write(&staged, new_bytes).unwrap();
-                std::fs::rename(staged, writing_path).unwrap();
-            } else {
-                std::fs::write(writing_path, new_bytes).unwrap();
-            }
-        });
-        // Observe actual flock contention, rather than inferring it from a
-        // short scheduling delay. The red control reports acquisition first.
-        let blocked = lock_state_rx.recv_timeout(Duration::from_secs(20)).unwrap();
-        release_tx.send(()).unwrap();
-        let opened = opening.join().unwrap();
-        writing.join().unwrap();
-        assert!(
-            blocked,
-            "commit acquired archive lock during open: replace={replace}"
-        );
-        let opened = opened.unwrap();
-        let captured = opened.source_metadata.as_ref().unwrap();
-        assert!(ratarmount_compress::commit_journal::same_stamp(
-            captured,
-            &opened_stamp,
-        ));
-        assert!(!ratarmount_compress::commit_journal::same_stamp(
-            captured,
-            &std::fs::metadata(&path).unwrap(),
-        ));
-    }
+        let opened = open_path_impl(&path, &options, false, true, &mut false);
+        done_tx
+            .send(opened.map(|opened| opened.source.lookup("/f", 0)))
+            .unwrap();
+    });
+    let result = done_rx.recv_timeout(Duration::from_secs(10));
+    // Release and join on failure too, so the red control leaves no thread
+    // blocked on an archive lock held by its own test process.
+    assert_eq!(unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_UN) }, 0);
+    opening.join().unwrap();
+    assert!(result
+        .expect("factory open waited for the archive flock")
+        .unwrap()
+        .is_some());
 }

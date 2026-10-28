@@ -1226,7 +1226,6 @@ mod tests {
             sidecar_candidate: Some(index),
             read_only_index: false,
             fetched: false,
-            source_metadata: None,
             keep_alive: Box::new(()),
         })
         .unwrap();

@@ -104,8 +104,8 @@ pub use write_overlay::{
     is_overlay_internal_path, live_commit_is_supported, lost_record_error, name_suggests_tar_zst,
     overlay_atime, overlay_db_absent, overlay_db_entry, overlay_only_names,
     patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitMode, CommitOutcome,
-    CommitOverlayOptions, DbEntry, IndexPatchWindow, OverlayError, OverlayMetadata,
-    OverlayMutation, OverlayPolicy, Parked, RawDirCommit, RemoteDownload, RemoteObjectHead,
-    RemotePublishError, RemotePublishRequest, WriteOverlay, HIDDEN_DB, LEGACY_OVERLAY_MARKER,
-    OVERLAY_MARKER,
+    CommitOverlayOptions, DbEntry, IndexPatchWindow, OverlayCommitGuard, OverlayError,
+    OverlayMetadata, OverlayMutation, OverlayPolicy, Parked, RawDirCommit, RemoteDownload,
+    RemoteObjectHead, RemotePublishError, RemotePublishRequest, WriteOverlay, HIDDEN_DB,
+    LEGACY_OVERLAY_MARKER, OVERLAY_MARKER,
 };
