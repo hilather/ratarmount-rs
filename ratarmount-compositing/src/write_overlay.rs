@@ -4723,6 +4723,7 @@ impl WriteOverlay {
         archive: &Path,
         records: &crate::MountRecords,
     ) -> Result<()> {
+        let _seal_commit = self.commit_operation()?;
         self.gate_pending_journal(archive)?;
         self.recover_journal_after_gate_with_records(archive, Some(records))
             .map(|_| ())

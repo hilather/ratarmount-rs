@@ -80,7 +80,13 @@ fn regression_240_live_commit_holds_overlay_lock_through_publication() {
 #[cfg(unix)]
 #[test]
 fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
-    for entry in ["atomic", "live", "remote_interval", "recovery"] {
+    for entry in [
+        "atomic",
+        "live",
+        "remote_interval",
+        "recovery",
+        "recovery_with_records",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("base.tar");
         fs::write(&archive, pack_tar(&[ustar_file("old", b"original")])).unwrap();
@@ -101,6 +107,9 @@ fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
             "remote_interval" => committing.commit_remote_interval(Duration::ZERO, |_| {
                 panic!("sealed remote commit reopened base")
             }),
+            "recovery_with_records" => committing
+                .recover_member_journal_with_records(&target, &crate::MountRecords::default())
+                .map(|_| false),
             _ => committing.recover_member_journal(&target).map(|_| false),
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -123,6 +132,92 @@ fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
         assert_eq!(fs::read(&archive).unwrap(), before, "{entry}");
         assert!(!ratarmount_compress::commit_journal::journal_path(&archive).exists());
         assert!(!regression_240_overlay_lock_held(&overlay));
+    }
+}
+
+/// Regression: forced recovery with admitted records must refuse a sealed
+/// overlay without changing a pending journal or archive, and unsealed replay
+/// must retain the overlay lock through journal cleanup.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_239_recovery_entries_guard_pending_journal() {
+    use ratarmount_compress::commit_journal::{self, fault};
+
+    for with_records in [false, true] {
+        for complete in [false, true] {
+            for sealed in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let archive = dir.path().join("base.tar");
+                let original = pack_tar(&[ustar_file("old", b"original")]);
+                let replacement = pack_tar(&[ustar_file("new", b"replacement")]);
+                fs::write(&archive, &original).unwrap();
+                let overlay = dir.path().join("overlay");
+                let mut ov = overlay_with_base(Arc::new(NullBase), &overlay);
+                ov.force_base_mismatch = true;
+                let suffix_path = dir.path().join("suffix");
+                fs::write(&suffix_path, &replacement).unwrap();
+                let mut suffix = File::open(suffix_path).unwrap();
+                let stop = if complete {
+                    "locator complete"
+                } else {
+                    "archive truncate"
+                };
+                commit_journal::replace_suffix_with_hook(&archive, 0, &mut suffix, &mut |step| {
+                    if step == stop {
+                        Err(io::Error::other("simulated crash"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+                let before = fs::read(&archive).unwrap();
+                let journal = commit_journal::journal_path(&archive);
+                let journal_before = fs::read(&journal).unwrap();
+                assert_eq!(
+                    commit_journal::pending(&archive).unwrap().unwrap().complete,
+                    complete
+                );
+                if sealed {
+                    ov.set_meta("sealed_at", "test seal before recovery")
+                        .unwrap();
+                }
+                let replayed = Arc::new(AtomicBool::new(false));
+                let reached = replayed.clone();
+                let locked_overlay = overlay.clone();
+                fault::install(move |step| {
+                    if matches!(step, "rollback truncate" | "rollback unlink") {
+                        assert!(!sealed, "sealed recovery reached a write");
+                        assert!(regression_240_overlay_lock_held(&locked_overlay));
+                        reached.store(true, Ordering::SeqCst);
+                    }
+                    Ok(())
+                });
+                let result = if with_records {
+                    ov.recover_member_journal_with_records(
+                        &archive,
+                        &crate::MountRecords::default(),
+                    )
+                } else {
+                    ov.recover_member_journal(&archive)
+                };
+                fault::clear();
+                if sealed {
+                    let error = result.unwrap_err();
+                    assert!(error.to_string().contains("is sealed"), "{error}");
+                    assert_eq!(fs::read(&archive).unwrap(), before);
+                    assert_eq!(fs::read(&journal).unwrap(), journal_before);
+                    assert!(!replayed.load(Ordering::SeqCst));
+                } else {
+                    result.unwrap();
+                    assert!(replayed.load(Ordering::SeqCst));
+                    assert_eq!(
+                        fs::read(&archive).unwrap(),
+                        if complete { replacement } else { original }
+                    );
+                    assert!(!journal.exists());
+                }
+            }
+        }
     }
 }
 

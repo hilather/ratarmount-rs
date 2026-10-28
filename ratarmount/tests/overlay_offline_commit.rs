@@ -985,6 +985,61 @@ fn regression_commit_overlay_refuses_sealed_overlay() {
     env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
 }
 
+/// Regression: #239 deferred journal recovery must not override a sealed top
+/// overlay under --force-base-mismatch. Both CLI recovery routes preserve a
+/// pending journal and the archive, whether replacement was torn or complete.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_239_sealed_pending_journal_force_cli_preserves_bytes() {
+    for complete in [false, true] {
+        for offline in [false, true] {
+            let env = Env::new();
+            let archive = regression_238_tar(&env);
+            let overlay = regression_238_overlay(&env, &archive);
+            env.ok(&["overlay", "seal", s(&overlay), s(&archive)]);
+            if complete {
+                interrupt_complete(&archive);
+            } else {
+                interrupt_append(&archive);
+            }
+            let journal = ratarmount_compress::commit_journal::journal_path(&archive);
+            let archive_before = fs::read(&archive).unwrap();
+            let journal_before = fs::read(&journal).unwrap();
+            let mut args = vec![
+                if offline {
+                    "--commit-overlay"
+                } else {
+                    "--no-mount"
+                },
+                "-w",
+                s(&overlay),
+                "--force-base-mismatch",
+                s(&archive),
+            ];
+            if offline {
+                args.push("--yes");
+            }
+            let out = env.run(&args);
+            assert!(!out.status.success(), "{args:?}: {}", text(&out));
+            let error = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                error.contains("is sealed") || error.contains("sealed overlay"),
+                "complete={complete}, offline={offline}: {error}"
+            );
+            assert_eq!(
+                fs::read(&archive).unwrap(),
+                archive_before,
+                "complete={complete}, offline={offline}: archive modified"
+            );
+            assert!(
+                fs::read(&journal).is_ok_and(|bytes| bytes == journal_before),
+                "complete={complete}, offline={offline}: journal modified or removed"
+            );
+            env.ok(&["overlay", "unseal", s(&overlay), "--i-know"]);
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn symlink_policy_fixture() -> (Env, PathBuf, PathBuf) {
     let env = Env::new();
