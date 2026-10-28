@@ -995,32 +995,6 @@
       "rule_reason": "inventory-op:ManagedReadCursor::open"
     },
     {
-      "configured_path": "ratarmount_core::db_inodes::open_admitted",
-      "item": "<ratarmount_compositing::write_overlay::SealCommitGuard>::acquire",
-      "leaf_digest": "52a8cba3f6faef1c19b5ae5b8c02f310bcd88b089bbe06db7e0e1b96a29fda38",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "overlay-control-record",
-        "creation": {
-          "basis": "O_RDWR/O_CREAT with mode 0600, CLOEXEC, NONBLOCK and NOFOLLOW; no truncation, and the acquired entry must be regular.",
-          "policy": "create-if-missing"
-        },
-        "disposition": "output-owner",
-        "id": "IR-V4-SEAL-COMMIT-LOCK",
-        "item": "<ratarmount_compositing::write_overlay::SealCommitGuard>::acquire",
-        "reason": "Open the persistent overlay-scoped seal/commit lock without opening the archive; registered database aliases are refused before a lock-dropping close."
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-V4-SEAL-COMMIT-LOCK\",\"item\":\"<ratarmount_compositing::write_overlay::SealCommitGuard>::acquire\",\"disposition\":\"output-owner\",\"category\":\"overlay-control-record\",\"reason\":\"Open the persistent overlay-scoped seal/commit lock without opening the archive; registered database aliases are refused before a lock-dropping close.\",\"creation\":{\"policy\":\"create-if-missing\",\"basis\":\"O_RDWR/O_CREAT with mode 0600, CLOEXEC, NONBLOCK and NOFOLLOW; no truncation, and the acquired entry must be regular.\"}}",
-      "resolved": "ratarmount_core::db_inodes::unix::open_admitted",
-      "rule_reason": "inventory-op:open_admitted"
-    },
-    {
       "item": "<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open",
       "leaf_digest": "d9af744960177b31326bf1d0ab17dc67e4b437bd1aa7af0bae93acbcd4ed0b4d",
       "lint": "clippy::disallowed_methods",
@@ -11289,32 +11263,6 @@
       "rule_reason": "inventory-op:ManagedReadCursor::open"
     },
     {
-      "configured_path": "rustix::fs::openat",
-      "item": "ratarmount_compositing::overlay_seal::chmod_tree",
-      "leaf_digest": "6d7b3ab422ca4ce49ff65382433882083576f60aa2a5488fbfff252fd6167e2a",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "directory-handle-or-durability",
-        "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
-          "policy": "none"
-        },
-        "disposition": "out-of-family",
-        "id": "IR-B0157-M01",
-        "item": "ratarmount_compositing::overlay_seal::chmod_tree",
-        "reason": "O_DIRECTORY handle for a descriptor-relative walk; no file content read"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0157-M01\",\"item\":\"ratarmount_compositing::overlay_seal::chmod_tree\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
-      "resolved": "rustix::fs::at::openat",
-      "rule_reason": "inventory-op:rustix::openat"
-    },
-    {
       "configured_path": "ratarmount_core::db_inodes::openat_admitted",
       "item": "ratarmount_compositing::overlay_seal::open_sentinel",
       "leaf_digest": "aeea209e3749803f933e5510658618a15ff21b519195b008699422a759a6b658",
@@ -11367,6 +11315,32 @@
       "reason": "internal-read:v1 {\"id\":\"IR-B0156-M01\",\"item\":\"ratarmount_compositing::overlay_seal::root\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "rustix::fs::abs::open",
       "rule_reason": "inventory-op:rustix::open"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount_compositing::overlay_seal::walk_chmod",
+      "leaf_digest": "57067b0d476392f46fbee2d97ae524b6567091bc2dc3503fea643fac4f0e2b42",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "directory-handle-or-durability",
+        "creation": {
+          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-B0157-M01",
+        "item": "ratarmount_compositing::overlay_seal::walk_chmod",
+        "reason": "O_DIRECTORY handle for a descriptor-relative walk; no file content read"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-B0157-M01\",\"item\":\"ratarmount_compositing::overlay_seal::walk_chmod\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
     },
     {
       "configured_path": "tempfile::Builder::tempfile_in",

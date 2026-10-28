@@ -22,7 +22,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 fn regression_240_overlay_lock_held(root: &Path) -> bool {
     use std::os::fd::AsRawFd;
 
-    let file = File::open(root.join(SEAL_COMMIT_LOCK)).unwrap();
+    let file = File::open(root).unwrap();
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) }, 0);
         false
@@ -89,7 +89,7 @@ fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
         let ov = Arc::new(overlay_with_base(Arc::new(NullBase), &overlay));
         fs::write(overlay.join("new"), b"must not be committed").unwrap();
         drop(SealCommitGuard::acquire(&overlay).unwrap());
-        // Keep the worker between acquiring the file lock and inspecting its
+        // Keep the worker between acquiring the directory lock and inspecting its
         // connection. Unlike a timing-only assertion, the flock probe below
         // proves it reached that operation boundary before the seal is set.
         let db = ov.db.lock().unwrap();

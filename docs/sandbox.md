@@ -595,32 +595,33 @@ no excludes, and `.git` included. `--json` prints `layer_digest` and `sealed_at`
 plain output is the digest. Repeating seal prints the recorded digest and exits
 0 even if the base is no longer available; use verify to check integrity.
 
-Seal and archive commits serialize on the persistent lock file
-`OVERLAY/.ratarmount.overlay.seal-commit.lock` (`flock`, `LOCK_EX`). Commit
-holds it through recovery, confirmation, archive publication and baseline
-refresh, then releases it. Live, on-exit, remote interval and member-recovery
-entries take the same lock and inspect sealing through their existing overlay
-connection; live commits retain it through reopen and cleanup. The order is always overlay lock, then the existing
-archive guard. Commit rechecks `layer_sealed` under the overlay lock before its
-first archive write. A seal that starts during commit waits, then either seals
-the completed base or refuses a changed base with a reopen/retry message.
+Seal, unseal and archive commits serialize with an exclusive directory flock
+(`flock`, `LOCK_EX`) on an `O_RDONLY | O_DIRECTORY` descriptor of the overlay
+root itself. Acquiring it needs no directory write permission, creates no file,
+and changes no mode. Commit holds it through recovery, confirmation, archive
+publication and baseline refresh, then releases it. Live, on-exit, remote
+interval and member-recovery entries take the same lock and inspect sealing
+through their existing overlay connection; live commits retain it through
+reopen and cleanup. The order is always overlay lock, then the existing archive
+guard. Commit rechecks `layer_sealed` under the overlay lock before its first
+archive write. A seal that starts during commit waits, then either seals the
+completed base or refuses a changed base with a reopen/retry message.
 
-Raw overlay directories (without an overlay database) also need this lock.
-A raw directory with mode `0555` cannot be committed when the lock file is
-absent: creating it requires write access to the overlay directory. Give the
-owner directory write access before committing; the refusal reports the lock
-path and this requirement.
+Raw overlay directories (without an overlay database) take the same directory
+lock, including roots with mode `0555`. Seal holds the overlay lock through base
+resolution, digest calculation and publication, and never acquires the archive
+guard. Source opening takes no archive flock. The lock belongs to the overlay,
+so naming different copies of an archive does not bypass seal/commit
+serialization. An obsolete `.ratarmount.overlay.seal-commit.lock` file is
+ignored and left in place; it remains hidden from mounted content, change
+hashes, archive publication and packed bundles.
 
-Seal holds the overlay lock through base resolution, digest calculation and
-publication, and never acquires the archive guard. Source opening takes no
-archive flock. The lock belongs to the overlay, so naming different copies of
-an archive does not bypass seal/commit serialization. The lock file stays
-writable bookkeeping after seal and is hidden from mounted content, change
-hashes and archive publication; keep it in place, including after a crash.
-Packed bundles omit it. Repeating seal initializes a missing lock for older or
-unpacked sealed layers and restores the root's original permissions. Unseal
-takes the same overlay lock. Seal is Unix-only; archive commit retains its
-existing non-Unix behavior.
+Seal strips only write bits from the root mode, preserving its other permission
+and special bits; unseal restores write access. Both change modes only for their
+own transition while holding the directory lock. Repeating seal and an unseal
+refused by a busy database leave modes unchanged. Seal and unseal are Unix-only
+and refuse on unsupported platforms; archive commit retains its existing
+non-Unix behavior.
 
 Seal uses a SQLite-managed byte reader for its base digest, with pathname,
 inode, size, mtime/ctime and moved-file checks before hashing or cache lookup

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -53,7 +54,7 @@ fn directory_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
-fn root(dir: &Path) -> io::Result<OwnedFd> {
+pub(crate) fn root(dir: &Path) -> io::Result<OwnedFd> {
     Ok({
         #[expect(
             clippy::disallowed_methods,
@@ -114,16 +115,60 @@ fn walk_modes(fd: &OwnedFd, parent: &str, modes: &mut BTreeMap<String, u32>) -> 
 }
 
 fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
-    let mode = crate::host_stat::fstat(fd)?.st_mode;
-    let change = |mode: host::RawMode| {
-        Mode::from_raw_mode(if writable {
+    with_transition_modes(fd, writable, || Ok(()))
+}
+
+// Record the exact modes, including internal files, as the transition changes
+// them. A failure after the permission walk (such as BEGIN EXCLUSIVE refusing
+// a live reader) must put every mode back while the operation lock is held.
+fn with_transition_modes<T>(
+    fd: &OwnedFd,
+    writable: bool,
+    finish: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let mut original = BTreeMap::new();
+    let result = walk_chmod(fd, Path::new(""), writable, None, &mut |path, mode| {
+        original.insert(path.to_path_buf(), mode);
+        if writable {
             mode | 0o200
         } else {
             mode & !0o222
-        })
-    };
-    if writable {
-        host::fchmod(fd, change(mode))?;
+        }
+    })
+    .and_then(|()| finish());
+    if let Err(error) = result {
+        let visited = original.keys().cloned().collect();
+        walk_chmod(
+            fd,
+            Path::new(""),
+            false,
+            Some(&visited),
+            &mut |path, mode| original.get(path).copied().unwrap_or(mode),
+        )
+        .map_err(|restore| {
+            io::Error::new(
+                error.kind(),
+                format!("{error}; restoring overlay modes failed: {restore}"),
+            )
+        })?;
+        return Err(error);
+    }
+    result
+}
+
+fn walk_chmod(
+    fd: &OwnedFd,
+    parent: &Path,
+    directories_first: bool,
+    visited: Option<&BTreeSet<std::path::PathBuf>>,
+    change: &mut impl FnMut(&Path, host::RawMode) -> host::RawMode,
+) -> io::Result<()> {
+    let mode = crate::host_stat::fstat(fd)?.st_mode;
+    // Snapshot directories before descending, even when their chmod is last:
+    // rollback must still reach children changed before an interrupted walk.
+    let target = change(parent, mode);
+    if directories_first && target != mode {
+        host::fchmod(fd, Mode::from_raw_mode(target))?;
     }
     for entry in Dir::read_from(fd)? {
         let entry = entry?;
@@ -131,12 +176,17 @@ fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
-        // This persistent coordination file stays writable after sealing;
-        // it is neither visible content nor a sealed payload.
+        // Obsolete coordination files are ignored, including their modes.
         if name
             .to_bytes()
             .eq_ignore_ascii_case(crate::write_overlay::SEAL_COMMIT_LOCK.as_bytes())
         {
+            continue;
+        }
+        let path = parent.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        // An unvisited subtree cannot contain changes from this operation.
+        // In particular, do not retry an unreadable directory during rollback.
+        if visited.is_some_and(|paths| !paths.contains(&path)) {
             continue;
         }
         let stat = crate::host_stat::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
@@ -147,20 +197,26 @@ fn chmod_tree(fd: &OwnedFd, writable: bool) -> io::Result<()> {
         if kind == libc::S_IFDIR {
             #[expect(
                 clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-B0157-M01","item":"ratarmount_compositing::overlay_seal::chmod_tree","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+                reason = r###"internal-read:v1 {"id":"IR-B0157-M01","item":"ratarmount_compositing::overlay_seal::walk_chmod","disposition":"out-of-family","category":"directory-handle-or-durability","reason":"O_DIRECTORY handle for a descriptor-relative walk; no file content read","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
             )]
-            chmod_tree(
+            walk_chmod(
                 &host::openat(fd, name, directory_flags(), Mode::empty())?,
-                writable,
+                &path,
+                directories_first,
+                visited,
+                change,
             )?;
         } else {
             // Never a data descriptor: closing one would release this
             // process's locks on the overlay database (#149).
-            crate::host_stat::chmod_entry_at(fd, name, &stat, |mode| change(mode).as_raw_mode())?;
+            let target = change(&path, stat.st_mode);
+            if target != stat.st_mode {
+                crate::host_stat::chmod_entry_at(fd, name, &stat, |_| target)?;
+            }
         }
     }
-    if !writable {
-        host::fchmod(fd, change(mode))?;
+    if !directories_first && target != mode {
+        host::fchmod(fd, Mode::from_raw_mode(target))?;
     }
     Ok(())
 }
@@ -239,7 +295,7 @@ pub fn seal(
 pub fn reseal(record: &crate::SealedRecord) -> io::Result<SealOutcome> {
     let dir = record.dir();
     let root = root(dir)?;
-    let _seal_commit = sealed_guard(dir, &root)?;
+    let _seal_commit = crate::write_overlay::SealCommitGuard::acquire(dir)?;
     let meta = OverlayMeta::read(dir)
         .map_err(overlay_error)?
         .filter(OverlayMeta::layer_sealed)
@@ -260,64 +316,6 @@ pub fn reseal(record: &crate::SealedRecord) -> io::Result<SealOutcome> {
         sealed_at: meta.get("sealed_at").unwrap_or_default().into(),
         already_sealed: true,
     })
-}
-
-/// Released seals and unpacked layers can predate the coordination file.
-/// Bootstrap that file under a directory flock, restoring the sealed root's
-/// mode before returning. The operation itself then holds only the file lock.
-fn sealed_guard(dir: &Path, root: &OwnedFd) -> io::Result<crate::write_overlay::SealCommitGuard> {
-    match crate::write_overlay::SealCommitGuard::acquire(dir) {
-        Ok(guard) => return Ok(guard),
-        Err(error)
-            if error.kind() == io::ErrorKind::PermissionDenied
-                && !dir
-                    .join(crate::write_overlay::SEAL_COMMIT_LOCK)
-                    .try_exists()? => {}
-        Err(error) => return Err(error),
-    }
-    #[cfg(test)]
-    fire_once(&BEFORE_SEALED_BOOTSTRAP_LOCK);
-    host::flock(root, host::FlockOperation::LockExclusive)?;
-    struct Unlock<'a>(&'a OwnedFd);
-    impl Drop for Unlock<'_> {
-        fn drop(&mut self) {
-            let _ = host::flock(self.0, host::FlockOperation::Unlock);
-        }
-    }
-    let _bootstrap = Unlock(root);
-    struct RestoreSealedRoot<'a> {
-        root: &'a OwnedFd,
-        armed: bool,
-    }
-    impl Drop for RestoreSealedRoot<'_> {
-        fn drop(&mut self) {
-            if self.armed {
-                let _ = host::fchmod(self.root, Mode::from_raw_mode(0o555));
-            }
-        }
-    }
-    // Declare the operation lock first so error unwinding restores the root
-    // before releasing that lock and allowing another unseal to proceed.
-    let guard;
-    // Grant bootstrap write access without retaining a mode across the wait.
-    host::fchmod(
-        root,
-        Mode::from_raw_mode(crate::host_stat::fstat(root)?.st_mode) | Mode::WUSR,
-    )?;
-    let mut restore = RestoreSealedRoot { root, armed: true };
-    guard = crate::write_overlay::SealCommitGuard::acquire(dir)?;
-    // Unseal may have completed while we waited for the operation lock.
-    // Only positive evidence under that lock permits leaving the root writable;
-    // missing metadata and every error must restore the sealed mode.
-    let unsealed = OverlayMeta::read(dir)
-        .map_err(overlay_error)?
-        .is_some_and(|meta| !meta.layer_sealed());
-    if unsealed {
-        restore.armed = false;
-    } else {
-        host::fchmod(root, Mode::from_raw_mode(0o555))?;
-    }
-    Ok(guard)
 }
 
 fn finish_recorded_seal(dir: &Path, root: &OwnedFd, meta: &OverlayMeta) -> io::Result<SealOutcome> {
@@ -344,15 +342,7 @@ pub struct SealOperation {
 impl SealOperation {
     pub fn acquire(dir: &Path) -> io::Result<Self> {
         let dir = dir.canonicalize()?;
-        let root = root(&dir)?;
-        let sealed = OverlayMeta::read(&dir)
-            .map_err(overlay_error)?
-            .is_some_and(|meta| meta.layer_sealed());
-        let lock = if sealed {
-            sealed_guard(&dir, &root)?
-        } else {
-            crate::write_overlay::SealCommitGuard::acquire(&dir)?
-        };
+        let lock = crate::write_overlay::SealCommitGuard::acquire(&dir)?;
         Ok(Self { dir, lock })
     }
 
@@ -396,7 +386,7 @@ fn seal_impl_locked(
         fire_once(&BEFORE_RECORDED_SEAL_LOCK);
         let _seal_commit = held
             .is_none()
-            .then(|| sealed_guard(dir, &root))
+            .then(|| crate::write_overlay::SealCommitGuard::acquire(dir))
             .transpose()?;
         let meta = OverlayMeta::read_for_operation(dir, &required)
             .map_err(overlay_error)?
@@ -685,35 +675,39 @@ thread_local! {
 /// This never hashes or resolves the base, so it needs no archive lock.
 pub fn unseal(dir: &Path) -> io::Result<()> {
     let root = root(dir)?;
-    let _seal_commit = sealed_guard(dir, &root)?;
+    let _seal_commit = crate::write_overlay::SealCommitGuard::acquire(dir)?;
     #[cfg(test)]
     fire_once(&AFTER_UNSEAL_LOCK);
     // Probe before touching permissions, so a mounted overlay is never changed.
-    OverlayMeta::read(dir).map_err(overlay_error)?;
-    chmod_tree(&root, true)?;
-    #[cfg(test)]
-    AFTER_UNSEAL_WALK.with(|hook| {
-        if let Some(f) = hook.borrow_mut().as_mut() {
-            f()
-        }
-    });
-    let conn = connection(dir, false)?;
-    conn.execute_batch("BEGIN EXCLUSIVE").map_err(sql_error)?;
-    conn.execute_batch(crate::overlay_meta::META_SCHEMA)
-        .map_err(sql_error)?;
-    conn.execute_batch(SEAL_SCHEMA).map_err(sql_error)?;
-    conn.execute_batch(
-        "DELETE FROM meta WHERE key IN ('sealed_at','layer_digest'); DELETE FROM seal_rows;",
-    )
-    .map_err(sql_error)?;
-    OverlayMeta::set(&conn, "unsealed_at", &chrono::Utc::now().to_rfc3339())
-        .map_err(overlay_error)?;
-    match host::unlinkat(&root, SENTINEL, AtFlags::empty()) {
-        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-        Err(e) => return Err(e.into()),
+    let meta = OverlayMeta::read(dir).map_err(overlay_error)?;
+    if meta.is_none_or(|meta| !meta.layer_sealed()) {
+        return Ok(());
     }
-    conn.execute_batch("COMMIT").map_err(sql_error)?;
-    Ok(())
+    with_transition_modes(&root, true, || {
+        #[cfg(test)]
+        AFTER_UNSEAL_WALK.with(|hook| {
+            if let Some(f) = hook.borrow_mut().as_mut() {
+                f()
+            }
+        });
+        let conn = connection(dir, false)?;
+        conn.execute_batch("BEGIN EXCLUSIVE").map_err(sql_error)?;
+        conn.execute_batch(crate::overlay_meta::META_SCHEMA)
+            .map_err(sql_error)?;
+        conn.execute_batch(SEAL_SCHEMA).map_err(sql_error)?;
+        conn.execute_batch(
+            "DELETE FROM meta WHERE key IN ('sealed_at','layer_digest'); DELETE FROM seal_rows;",
+        )
+        .map_err(sql_error)?;
+        OverlayMeta::set(&conn, "unsealed_at", &chrono::Utc::now().to_rfc3339())
+            .map_err(overlay_error)?;
+        match host::unlinkat(&root, SENTINEL, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(e.into()),
+        }
+        conn.execute_batch("COMMIT").map_err(sql_error)?;
+        Ok(())
+    })
 }
 
 /// Verify without writing or changing permissions, including per-path differences
@@ -802,7 +796,6 @@ type OnceHook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
 
 #[cfg(test)]
 thread_local! {
-    static BEFORE_SEALED_BOOTSTRAP_LOCK: OnceHook = const { std::cell::RefCell::new(None) };
     static AFTER_UNSEAL_LOCK: OnceHook = const { std::cell::RefCell::new(None) };
     static BEFORE_RECORDED_SEAL_LOCK: OnceHook = const { std::cell::RefCell::new(None) };
     static AFTER_INITIAL_READ: OnceHook = const { std::cell::RefCell::new(None) };
@@ -999,14 +992,7 @@ mod tests {
         assert!(repeated.already_sealed);
         assert_eq!(first.layer_digest, repeated.layer_digest);
         assert_eq!(first.sealed_at, repeated.sealed_at);
-        assert_eq!(
-            fs::metadata(f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        assert!(!f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK).exists());
     }
 
     /// Regression: public seal queued behind unseal must not restore a seal
@@ -1035,12 +1021,7 @@ mod tests {
         locked_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
-        let probe = host::open(
-            f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK),
-            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .unwrap();
+        let probe = root(&f.dir).unwrap();
         assert_eq!(
             host::flock(&probe, host::FlockOperation::NonBlockingLockExclusive),
             Err(rustix::io::Errno::WOULDBLOCK),
@@ -1074,15 +1055,16 @@ mod tests {
         );
     }
 
-    /// Regression: a two-process legacy re-seal queued behind unseal must
-    /// refuse the cleared seal without restoring the root's stale 0555 mode.
+    /// Regression: a two-process re-seal queued behind unseal must refuse
+    /// the cleared seal without restoring the root's stale sealed mode.
     #[test]
-    fn regression_240_queued_legacy_reseal_preserves_unsealed_root_mode() {
+    fn regression_240_queued_reseal_preserves_unsealed_root_mode() {
         use std::process::{Child, Command};
         use std::time::{Duration, Instant};
 
-        const CHILD_DIR: &str = "RATARMOUNT_TEST_LEGACY_RESEAL_DIR";
-        const BOOTSTRAP_READY: &str = "RATARMOUNT_TEST_LEGACY_BOOTSTRAP_READY";
+        const CHILD_DIR: &str = "RATARMOUNT_TEST_QUEUED_RESEAL_DIR";
+        const CHILD_READY: &str = "RATARMOUNT_TEST_QUEUED_RESEAL_READY";
+        const CHILD_RELEASE: &str = "RATARMOUNT_TEST_QUEUED_RESEAL_RELEASE";
         fn wait_for(path: &Path) {
             let deadline = Instant::now() + Duration::from_secs(10);
             while !path.exists() {
@@ -1100,55 +1082,41 @@ mod tests {
 
         if let Some(dir) = std::env::var_os(CHILD_DIR) {
             let dir = PathBuf::from(dir);
-            let ready = PathBuf::from(std::env::var_os(BOOTSTRAP_READY).unwrap());
-            let _hook = OnceGuard::set(&BEFORE_SEALED_BOOTSTRAP_LOCK, move || {
-                fs::write(ready, b"bootstrap entered").unwrap();
-            });
+            let ready = PathBuf::from(std::env::var_os(CHILD_READY).unwrap());
+            let release = PathBuf::from(std::env::var_os(CHILD_RELEASE).unwrap());
             let record = crate::SealedRecord::read(&dir).unwrap().unwrap();
+            fs::write(ready, b"seal record read").unwrap();
+            wait_for(&release);
             let error = reseal(&record).expect_err("queued re-seal must refuse an unsealed layer");
             assert!(error.to_string().contains("no longer sealed"), "{error}");
             return;
         }
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skip: legacy lock bootstrap requires directory permission enforcement");
-            return;
-        }
 
         let f = Fixture::new();
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o700)).unwrap();
         seal(&f.dir, f.base.clone()).unwrap();
-        let lock = f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK);
-        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::remove_file(&lock).unwrap();
-        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o555)).unwrap();
-        let bootstrap = root(&f.dir).unwrap();
-        host::flock(&bootstrap, host::FlockOperation::LockExclusive).unwrap();
-
-        let ready = f._tmp.path().join("bootstrap-ready");
+        let ready = f._tmp.path().join("reseal-ready");
+        let release = f._tmp.path().join("reseal-release");
         let contended = f._tmp.path().join("reseal-contended");
         let mut child = ChildGuard(
             Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "overlay_seal::tests::regression_240_queued_legacy_reseal_preserves_unsealed_root_mode",
+                    "overlay_seal::tests::regression_240_queued_reseal_preserves_unsealed_root_mode",
                     "--nocapture",
                 ])
                 .env(CHILD_DIR, &f.dir)
-                .env(BOOTSTRAP_READY, &ready)
+                .env(CHILD_READY, &ready)
+                .env(CHILD_RELEASE, &release)
                 .env("RATARMOUNT_TEST_OVERLAY_CONTENDED", &contended)
                 .spawn()
                 .unwrap(),
         );
         wait_for(&ready);
-
-        // The child has observed the missing lock and must bootstrap. Publish
-        // the lock as an unseal bootstrap would, then let public unseal take it.
-        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(&lock, b"").unwrap();
-        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o555)).unwrap();
         let _hook = OnceGuard::set(&AFTER_UNSEAL_LOCK, move || {
-            // Hold unseal before its chmod walk, so the queued child sees 0555
-            // before waiting for the operation lock held by this process.
-            host::flock(&bootstrap, host::FlockOperation::Unlock).unwrap();
+            // The child retained the sealed record. Make it queue on the same
+            // operation lock while unseal still owns it and metadata is sealed.
+            fs::write(&release, b"try reseal now").unwrap();
             wait_for(&contended);
         });
         unseal(&f.dir).unwrap();
@@ -1166,89 +1134,151 @@ mod tests {
         assert!(meta.get("sealed_at").is_none());
         assert!(meta.get("unsealed_at").is_some());
         assert!(!f.dir.join(SENTINEL).exists());
-        let mode = fs::metadata(&f.dir).unwrap().permissions().mode() & 0o777;
-        eprintln!("unseal succeeded; re-seal refused; metadata unsealed; root mode {mode:04o}");
-        assert_ne!(
-            mode, 0o555,
-            "queued re-seal restored the stale sealed root mode"
+        assert_eq!(
+            fs::metadata(&f.dir).unwrap().permissions().mode() & 0o7777,
+            0o700
         );
-        assert_ne!(mode & 0o200, 0, "unsealed root must remain owner-writable");
     }
 
-    /// Regression: a busy database during legacy unseal must not leave the
-    /// still-sealed root owner-writable after bootstrapping its missing lock.
+    /// Regression: acquiring the shared directory lock never changes private,
+    /// setgid or writable root modes, and never creates a coordination file.
     #[test]
-    fn regression_240_legacy_unseal_busy_database_restores_sealed_root_mode() {
+    fn regression_240_directory_lock_preserves_root_modes() {
+        for mode in [0o500, 0o550, 0o2550, 0o700] {
+            for stale_lock in [false, true] {
+                let f = Fixture::new();
+                let obsolete = f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK);
+                if stale_lock {
+                    fs::write(&obsolete, b"obsolete lock").unwrap();
+                    fs::set_permissions(&obsolete, fs::Permissions::from_mode(0o400)).unwrap();
+                }
+                fs::set_permissions(&f.dir, fs::Permissions::from_mode(mode)).unwrap();
+                let before = rows_and_modes(&f.dir);
+                let guard = crate::write_overlay::SealCommitGuard::acquire(&f.dir).unwrap();
+                let probe = root(&f.dir).unwrap();
+                assert_eq!(
+                    host::flock(&probe, host::FlockOperation::NonBlockingLockExclusive),
+                    Err(rustix::io::Errno::WOULDBLOCK),
+                );
+                drop(guard);
+                host::flock(&probe, host::FlockOperation::NonBlockingLockExclusive).unwrap();
+                assert_eq!(rows_and_modes(&f.dir), before, "lock mode {mode:04o}");
+                if stale_lock {
+                    assert_eq!(fs::read(&obsolete).unwrap(), b"obsolete lock");
+                    assert_eq!(
+                        fs::metadata(&obsolete).unwrap().permissions().mode() & 0o7777,
+                        0o400
+                    );
+                } else {
+                    assert!(!obsolete.exists());
+                }
+            }
+        }
+    }
+
+    /// Regression: directory lock acquisition must preserve private and setgid
+    /// sealed roots during idempotent seal and sealed-commit refusal.
+    #[test]
+    fn regression_240_directory_lock_preserves_sealed_root_modes() {
+        for original_mode in [0o700, 0o750, 0o2750] {
+            let f = Fixture::new();
+            fs::set_permissions(&f.dir, fs::Permissions::from_mode(original_mode)).unwrap();
+            let first = seal(&f.dir, f.base.clone()).unwrap();
+            let sealed_mode = original_mode & !0o222;
+            assert_eq!(
+                fs::metadata(&f.dir).unwrap().permissions().mode() & 0o7777,
+                sealed_mode
+            );
+            let before = rows_and_modes(&f.dir);
+            let repeated = seal(&f.dir, f.base.clone()).unwrap();
+            assert!(repeated.already_sealed);
+            assert_eq!(first.layer_digest, repeated.layer_digest);
+            assert_eq!(first.sealed_at, repeated.sealed_at);
+            assert_eq!(
+                rows_and_modes(&f.dir),
+                before,
+                "reseal mode {sealed_mode:04o}"
+            );
+            let error = match crate::OverlayCommitGuard::acquire(&f.dir) {
+                Ok(_) => panic!("sealed commit must refuse mode {sealed_mode:04o}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("is sealed"), "{error}");
+            assert_eq!(
+                rows_and_modes(&f.dir),
+                before,
+                "commit mode {sealed_mode:04o}"
+            );
+            assert!(!f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK).exists());
+            unseal(&f.dir).unwrap();
+            assert_eq!(
+                fs::metadata(&f.dir).unwrap().permissions().mode() & 0o7777,
+                sealed_mode | 0o200
+            );
+            let unsealed = rows_and_modes(&f.dir);
+            unseal(&f.dir).unwrap();
+            assert_eq!(
+                rows_and_modes(&f.dir),
+                unsealed,
+                "repeated unseal changed a completed transition"
+            );
+        }
+    }
+
+    /// Regression: a busy database during unseal must leave all private and
+    /// setgid sealed modes, seal metadata, and sentinel unchanged.
+    #[test]
+    fn regression_240_unseal_busy_database_preserves_sealed_root_modes() {
+        for original_mode in [0o700, 0o750, 0o2750] {
+            let f = Fixture::new();
+            fs::set_permissions(&f.dir, fs::Permissions::from_mode(original_mode)).unwrap();
+            let sealed = seal(&f.dir, f.base.clone()).unwrap();
+            let sentinel = fs::read(f.dir.join(SENTINEL)).unwrap();
+            let before = rows_and_modes(&f.dir);
+            let db = f.dir.join(HIDDEN_DB);
+            let db_mode = fs::metadata(&db).unwrap().permissions().mode();
+            fs::set_permissions(&db, fs::Permissions::from_mode(db_mode | 0o200)).unwrap();
+            let blocker = rusqlite::Connection::open(&db).unwrap();
+            fs::set_permissions(&db, fs::Permissions::from_mode(db_mode)).unwrap();
+            blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+            let error = unseal(&f.dir).expect_err("busy unseal must fail");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+            assert!(error.to_string().contains("in use"), "{error}");
+            blocker.execute_batch("ROLLBACK").unwrap();
+            drop(blocker);
+
+            let meta = OverlayMeta::read(&f.dir).unwrap().unwrap();
+            assert!(meta.layer_sealed());
+            assert_eq!(meta.get("sealed_at"), Some(sealed.sealed_at.as_str()));
+            assert_eq!(meta.get("layer_digest"), Some(sealed.layer_digest.as_str()));
+            assert_eq!(fs::read(f.dir.join(SENTINEL)).unwrap(), sentinel);
+            assert_eq!(
+                rows_and_modes(&f.dir),
+                before,
+                "busy unseal mode {original_mode:04o}"
+            );
+            assert!(!f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK).exists());
+        }
+    }
+
+    /// Regression: a first seal that cannot create its journal or sentinel in
+    /// a read-only root must refuse without changing any host modes or metadata.
+    #[test]
+    fn regression_240_first_seal_readonly_root_preserves_modes_on_failure() {
         if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skip: legacy lock bootstrap requires directory permission enforcement");
+            eprintln!("skip: read-only root failure requires directory permission enforcement");
             return;
         }
-
-        let f = Fixture::new();
-        let sealed = seal(&f.dir, f.base.clone()).unwrap();
-        let sentinel = fs::read(f.dir.join(SENTINEL)).unwrap();
-        let lock = f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK);
-        let db = f.dir.join(HIDDEN_DB);
-        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::remove_file(&lock).unwrap();
-        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
-        let blocker = rusqlite::Connection::open(&db).unwrap();
-        fs::set_permissions(&db, fs::Permissions::from_mode(0o444)).unwrap();
-        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o555)).unwrap();
-        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
-
-        let error = unseal(&f.dir).expect_err("busy legacy unseal must fail");
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
-        assert!(error.to_string().contains("in use"), "{error}");
-        assert!(lock.is_file(), "unseal must have bootstrapped the lock");
-        blocker.execute_batch("ROLLBACK").unwrap();
-        drop(blocker);
-
-        let meta = OverlayMeta::read(&f.dir).unwrap().unwrap();
-        assert!(meta.layer_sealed());
-        assert_eq!(meta.get("sealed_at"), Some(sealed.sealed_at.as_str()));
-        assert_eq!(meta.get("layer_digest"), Some(sealed.layer_digest.as_str()));
-        assert_eq!(fs::read(f.dir.join(SENTINEL)).unwrap(), sentinel);
-        let mode = fs::metadata(&f.dir).unwrap().permissions().mode() & 0o777;
-        eprintln!(
-            "busy legacy unseal refused; seal metadata and sentinel intact; root mode {mode:04o}"
-        );
-        assert_eq!(
-            mode, 0o555,
-            "failed legacy unseal left a sealed root writable"
-        );
-    }
-
-    /// Regression: released sealed layers have a read-only root and no
-    /// coordination file. Repeating seal must bootstrap it without changing modes.
-    #[test]
-    fn regression_240_legacy_seal_bootstraps_lock_after_base_deleted() {
-        let f = Fixture::new();
-        let archive = f._tmp.path().join("archive.tar");
-        fs::write(&archive, b"archive bytes").unwrap();
-        let base = crate::ClassifiedBase::for_tests(
-            f.base.clone(),
-            crate::ServedKind::Archive,
-            Some(crate::ServedLocation::Local(archive.clone())),
-        );
-        let first = super::seal(&f.dir, &base, f.base.clone()).unwrap();
-        let lock = f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK);
-        let sealed_mode = fs::metadata(&f.dir).unwrap().permissions().mode();
-        fs::set_permissions(&f.dir, fs::Permissions::from_mode(sealed_mode | 0o200)).unwrap();
-        fs::remove_file(&lock).unwrap();
-        fs::set_permissions(&f.dir, fs::Permissions::from_mode(sealed_mode)).unwrap();
-        fs::remove_file(&archive).unwrap();
-        let repeated = super::seal(&f.dir, &base, f.base.clone()).unwrap();
-        assert!(repeated.already_sealed);
-        assert_eq!(repeated.layer_digest, first.layer_digest);
-        assert_eq!(
-            fs::metadata(&f.dir).unwrap().permissions().mode(),
-            sealed_mode
-        );
-        assert_eq!(
-            fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        for mode in [0o500, 0o550, 0o2550] {
+            let f = Fixture::new();
+            fs::set_permissions(&f.dir, fs::Permissions::from_mode(mode)).unwrap();
+            let before = rows_and_modes(&f.dir);
+            assert!(seal(&f.dir, f.base.clone()).is_err());
+            assert_eq!(rows_and_modes(&f.dir), before, "first seal mode {mode:04o}");
+            assert!(!f.dir.join(SENTINEL).exists());
+            assert!(!f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK).exists());
+        }
     }
 
     /// Regression: #240 seal's byte reader must stay bound to the file it
@@ -1869,6 +1899,7 @@ mod tests {
     fn regression_unseal_failure_keeps_shared_db_lock() {
         let f = Fixture::new();
         seal(&f.dir, f.base.clone()).unwrap();
+        let before = rows_and_modes(&f.dir);
         let holder = shared_holder(&f.dir);
         let db = f.dir.join(HIDDEN_DB);
         let seen = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -1898,7 +1929,40 @@ mod tests {
             .execute_batch("SELECT count(*) FROM files; COMMIT;")
             .unwrap();
         drop(holder);
+        assert_eq!(
+            rows_and_modes(&f.dir),
+            before,
+            "failed unseal changed modes or metadata"
+        );
         unseal(&f.dir).unwrap();
+    }
+
+    /// Regression: a permission-walk failure must restore changed entries even
+    /// when the unreadable subtree cannot be revisited during rollback.
+    #[test]
+    fn regression_240_unseal_failed_walk_restores_modes() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: unreadable-directory failure requires permission enforcement");
+            return;
+        }
+        let f = Fixture::new();
+        fs::set_permissions(&f.dir, fs::Permissions::from_mode(0o2700)).unwrap();
+        seal(&f.dir, f.base.clone()).unwrap();
+        let before = rows_and_modes(&f.dir);
+        let sub = f.dir.join("sub");
+        let sub_mode = fs::metadata(&sub).unwrap().permissions().mode();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+        let error = unseal(&f.dir).expect_err("unreadable directory must refuse the transition");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert_eq!(fs::metadata(&sub).unwrap().permissions().mode() & 0o7777, 0);
+        assert_eq!(
+            fs::metadata(&f.dir).unwrap().permissions().mode() & 0o7777,
+            0o2500
+        );
+        // Restore only the fixture's deliberately unreadable directory, then
+        // compare the rest of the exact pre-transition metadata and modes.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(sub_mode)).unwrap();
+        assert_eq!(rows_and_modes(&f.dir), before);
     }
 
     /// Regression: chmod -w changed lookup and readdir modes, and leaked the sentinel.

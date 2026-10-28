@@ -58,7 +58,7 @@ pub const OVERLAY_MARKER: &str = ".ratarmount-overlay.used";
 /// Marker name used before the rename; still accepted (never created).
 pub const LEGACY_OVERLAY_MARKER: &str = ".ratarmount.overlay.sqlite.used";
 
-/// Persistent overlay-scoped coordination, never a payload or bundle member.
+/// Obsolete lock-file name, retained only to hide stale files from content and bundles.
 pub(crate) const SEAL_COMMIT_LOCK: &str = ".ratarmount.overlay.seal-commit.lock";
 
 /// Copy-on-write staging files. Not the final member name: a crash mid-copy
@@ -7302,23 +7302,7 @@ impl OverlayCommitGuard {
         let write_overlay = write_overlay.as_ref();
         let dir = write_overlay.canonicalize()?;
         ensure_overlay_unsealed_display(&dir, write_overlay)?;
-        let lock = match SealCommitGuard::acquire(&dir) {
-            Ok(lock) => lock,
-            Err(error)
-                if error.kind() == io::ErrorKind::PermissionDenied
-                    && !dir.join(SEAL_COMMIT_LOCK).try_exists()? =>
-            {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "cannot create seal/commit lock {}: overlay directory must be writable ({error})",
-                        write_overlay.join(SEAL_COMMIT_LOCK).display()
-                    ),
-                )
-                .into());
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let lock = SealCommitGuard::acquire(&dir)?;
         ensure_overlay_unsealed_display(&dir, write_overlay)?;
         Ok(Self { dir, _lock: lock })
     }
@@ -7372,7 +7356,8 @@ fn commit_overlay_locked(
 
 /// Serializes seal and offline commit for one overlay, including when callers
 /// name different copies of its base. Always acquire before an archive guard.
-/// The lock file is persistent bookkeeping: never unlink it on guard disposal.
+/// An O_RDONLY | O_DIRECTORY handle locks the root itself without changing
+/// permissions or creating bookkeeping. Closing the handle releases the flock.
 pub(crate) struct SealCommitGuard {
     #[cfg(unix)]
     _fd: std::os::fd::OwnedFd,
@@ -7383,22 +7368,7 @@ impl SealCommitGuard {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            #[expect(
-                clippy::disallowed_methods,
-                reason = r###"internal-read:v1 {"id":"IR-V4-SEAL-COMMIT-LOCK","item":"<ratarmount_compositing::write_overlay::SealCommitGuard>::acquire","disposition":"output-owner","category":"overlay-control-record","reason":"Open the persistent overlay-scoped seal/commit lock without opening the archive; registered database aliases are refused before a lock-dropping close.","creation":{"policy":"create-if-missing","basis":"O_RDWR/O_CREAT with mode 0600, CLOEXEC, NONBLOCK and NOFOLLOW; no truncation, and the acquired entry must be regular."}}"###
-            )]
-            let fd = ratarmount_core::db_inodes::open_admitted(
-                &dir.join(SEAL_COMMIT_LOCK),
-                libc::O_RDWR
-                    | libc::O_CREAT
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW
-                    | libc::O_NONBLOCK,
-                0o600,
-            )?;
-            if rustix::fs::fstat(&fd)?.st_mode & libc::S_IFMT != libc::S_IFREG {
-                return Err(io::Error::other("seal/commit lock must be a regular file"));
-            }
+            let fd = crate::overlay_seal::root(dir)?;
             loop {
                 // SAFETY: the guard owns fd until the entire operation ends.
                 if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -7439,7 +7409,7 @@ fn regression_nonunix_commit_guard_accepts_unsealed_overlay() {
 
 /// Refuse a sealed database overlay without recovery or a writable connection.
 /// Each call reads fresh metadata, including when the database is a symlink.
-/// Raw directories still need write access to create the seal/commit lock.
+/// Raw directories take the same directory flock without needing write access.
 pub fn ensure_overlay_unsealed(write_overlay: &Path) -> Result<()> {
     ensure_overlay_unsealed_display(write_overlay, write_overlay)
 }

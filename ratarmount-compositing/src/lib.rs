@@ -31,6 +31,14 @@ pub mod overlay_meta;
 mod overlay_policy;
 #[cfg(unix)]
 pub mod overlay_seal;
+#[cfg(not(unix))]
+#[path = "overlay_seal_unsupported.rs"]
+pub mod overlay_seal;
+// Exercise the fail-closed platform implementation in the ordinary test lane.
+#[cfg(all(test, unix))]
+#[path = "overlay_seal_unsupported.rs"]
+#[allow(dead_code)]
+mod overlay_seal_unsupported_tests;
 mod path_intern;
 mod payload;
 mod prefix;
