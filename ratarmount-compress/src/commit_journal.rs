@@ -666,6 +666,61 @@ impl CopyGuard {
         &self.metadata
     }
 
+    /// Refuse a changed descriptor or a pathname that no longer names the
+    /// exact archive locked by this guard.
+    pub fn check_path(&self, path: &Path) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let current = self._file.metadata()?;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let current = fs::metadata(path)?;
+        if !same_stamp(&self.metadata, &current) || !same_stamp(&current, &fs::metadata(path)?) {
+            return Err(io::Error::other(
+                "archive changed while sealing; reopen it and retry sealing",
+            ));
+        }
+        Ok(())
+    }
+
+    /// An independent cursor borrowing the locked descriptor, with no reopen
+    /// or descriptor close (which could release an SQLAR's POSIX locks).
+    /// `None` on platforms without the archive-lock descriptor.
+    pub fn reader(&self) -> Option<impl io::Read + '_> {
+        struct Cursor<'a> {
+            guard: &'a CopyGuard,
+            offset: u64,
+        }
+        impl io::Read for Cursor<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    use std::os::unix::fs::FileExt;
+                    let n = self.guard._file.read_at(buf, self.offset)?;
+                    self.offset += n as u64;
+                    Ok(n)
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    let _ = (self.guard, self.offset, buf);
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "no archive-lock descriptor",
+                    ))
+                }
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            Some(Cursor {
+                guard: self,
+                offset: 0,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            None::<Cursor<'_>>
+        }
+    }
+
     /// End archive exclusion without closing either descriptor. An opener can
     /// retain this guard alongside the source after indexing: closing a raw
     /// descriptor while its SQLAR connection lives would release that

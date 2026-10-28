@@ -271,8 +271,16 @@ pub(crate) fn seal_impl(
                 _ => None,
             },
         );
-    let _archive_guard = archive
+    let archive_guard = archive
         .map(|(base, path)| {
+            if std::iter::once(path.as_path())
+                .chain(base.actual().typed_named.as_deref())
+                .any(|path| ratarmount_compress::check_for_split_file_in_folder(path).is_some())
+            {
+                return Err(io::Error::other(
+                    "sealing over a split archive is not supported; join the parts into one archive file and seal that",
+                ));
+            }
             let guard = ratarmount_compress::commit_journal::guard_seal(path)?;
             if !base.source_matches_archive(guard.metadata()) {
                 return Err(io::Error::other(
@@ -309,8 +317,13 @@ pub(crate) fn seal_impl(
     required.set(required.get() || conn.required_record());
     // A sealed layer is never `pending`: hash the base first, outside the
     // write transaction (a cache hit is free).
-    crate::overlay_meta::resolve_pending_base_digest_required(&conn, identity, required.get())
-        .map_err(overlay_error)?;
+    crate::overlay_meta::resolve_pending_base_digest_required(
+        &conn,
+        identity,
+        required.get(),
+        archive_guard.as_ref(),
+    )
+    .map_err(overlay_error)?;
     #[cfg(test)]
     fire_once(&AFTER_PENDING_RESOLVER);
     // Readers can still take snapshots for canonical hashing. Competing writers,
@@ -335,11 +348,12 @@ pub(crate) fn seal_impl(
             report.errors()
         )));
     }
-    if let (Some((_, path)), Some(meta)) = (
+    if let (Some((_, path)), Some(guard), Some(meta)) = (
         archive,
+        archive_guard.as_ref(),
         OverlayMeta::from_opened(&conn).map_err(overlay_error)?,
     ) {
-        if let Some(stamp) = check_archive_baseline(&meta, path)? {
+        if let Some(stamp) = check_archive_baseline(&meta, path, guard)? {
             OverlayMeta::set_many(
                 &conn,
                 &[
@@ -401,6 +415,9 @@ pub(crate) fn seal_impl(
         ],
     )
     .map_err(overlay_error)?;
+    if let (Some((_, path)), Some(guard)) = (archive, archive_guard.as_ref()) {
+        guard.check_path(path)?;
+    }
     conn.execute_batch("COMMIT").map_err(sql_error)?;
     // Publish without following an existing sentinel symlink. Keep the DB open
     // until its commit is durable, then close before changing host permissions.
@@ -420,6 +437,7 @@ pub(crate) fn seal_impl(
 fn check_archive_baseline(
     meta: &OverlayMeta,
     archive: &Path,
+    guard: &ratarmount_compress::commit_journal::CopyGuard,
 ) -> io::Result<Option<ratarmount_index::ArchiveDigestStamp>> {
     if meta.base_digest_kind().is_none_or(|kind| kind == "none")
         || meta.get("base_local_path") != archive.to_str()
@@ -427,7 +445,8 @@ fn check_archive_baseline(
         return Ok(None);
     }
     if let Some((size, mtime_ns)) = meta.get("base_size").zip(meta.get("base_mtime_ns")) {
-        let stamp = ratarmount_index::ArchiveDigestStamp::read(archive)?;
+        guard.check_path(archive)?;
+        let stamp = ratarmount_index::ArchiveDigestStamp::from_metadata(guard.metadata())?;
         if size != stamp.size.to_string() || mtime_ns != stamp.mtime_ns.to_string() {
             // A caller may have confirmed a byte-identical, retimestamped base
             // with --base-digest. Preserve that case only after measuring its
@@ -440,7 +459,7 @@ fn check_archive_baseline(
                     size: stamp.size,
                     mtime_ns: stamp.mtime_ns,
                 };
-                let digest = pending.hash(&|| Ok(())).map_err(overlay_error)?;
+                let digest = pending.hash_locked(guard).map_err(overlay_error)?;
                 if meta.base_digest() == Some(digest.as_str()) {
                     return Ok(Some(stamp));
                 }
@@ -943,6 +962,119 @@ mod tests {
             dir,
             base,
         }
+    }
+
+    /// Regression: #240 a same-stamp pathname swap at the hash open could seal
+    /// a different inode's digest after the original name was restored.
+    #[test]
+    fn regression_240_seal_hash_binds_locked_descriptor() {
+        use ratarmount_index::managed_read::{seams, Seam};
+
+        let f = pending_fixture();
+        let index = f._tmp.path().join("archive.sqlite");
+        rusqlite::Connection::open(&index)
+            .unwrap()
+            .execute_batch("CREATE TABLE files (name TEXT)")
+            .unwrap();
+        OverlayMeta::set(
+            &connection(&f.dir, false).unwrap(),
+            "base_index_path",
+            index.to_str().unwrap(),
+        )
+        .unwrap();
+        let archive = f._tmp.path().join("uncached.tar").canonicalize().unwrap();
+        let held = archive.with_extension("held");
+        let replacement = archive.with_extension("replacement");
+        let stamp = fs::metadata(&archive).unwrap();
+        fs::write(&replacement, vec![b'x'; stamp.len() as usize]).unwrap();
+        fs::File::open(&replacement)
+            .unwrap()
+            .set_modified(stamp.modified().unwrap())
+            .unwrap();
+        let base = crate::ClassifiedBase::for_tests(
+            f.base.clone(),
+            crate::ServedKind::Archive,
+            Some(crate::ServedLocation::Local(archive.clone())),
+        );
+        let before = rows_and_modes(&f.dir);
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (path, saved, swapped) = (archive.clone(), held.clone(), fired.clone());
+        let _hash = OnceGuard::set(&crate::overlay_meta::DURING_PENDING_HASH, move || {
+            fs::rename(&path, &saved).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+            swapped.set(true);
+        });
+        let result = seams::with(
+            move |seam| {
+                // Red control: the old pathname reader opens the substitute, then
+                // this restores the original path before its stamp checks.
+                if seam == Seam::AfterOpen
+                    && seams::opened_path().as_ref() == Some(&archive)
+                    && held.exists()
+                {
+                    fs::rename(&held, &archive)?;
+                }
+                Ok(())
+            },
+            || super::seal(&f.dir, &base, f.base.clone()),
+        );
+        assert!(fired.get(), "the archive hash boundary was reached");
+        assert!(
+            result.is_err(),
+            "a substituted hash source must not authorize a seal"
+        );
+        assert_eq!(rows_and_modes(&f.dir), before);
+        assert_eq!(
+            OverlayMeta::read(&f.dir)
+                .unwrap()
+                .unwrap()
+                .base_digest_kind(),
+            Some("pending")
+        );
+        assert!(!f.dir.join(SENTINEL).exists());
+        let cached: u64 = rusqlite::Connection::open(&index)
+            .unwrap()
+            .query_row("SELECT count(*) FROM overlay_base_digests", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            cached, 0,
+            "refused inode substitution must not publish a cached digest"
+        );
+    }
+
+    /// Regression: #240 the archive name can change after the initial
+    /// locked-source check, before seal publication.
+    #[test]
+    fn regression_240_seal_rechecks_inode_before_publication() {
+        let f = Fixture::new();
+        let archive = f._tmp.path().join("archive.tar");
+        fs::write(&archive, b"original archive bytes").unwrap();
+        let replacement = archive.with_extension("replacement");
+        fs::write(&replacement, b"substitute same length").unwrap();
+        let base = crate::ClassifiedBase::for_tests(
+            f.base.clone(),
+            crate::ServedKind::Archive,
+            Some(crate::ServedLocation::Local(archive.clone())),
+        );
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let changed = fired.clone();
+        let before = rows_and_modes(&f.dir);
+        let _resolver = OnceGuard::set(&AFTER_PENDING_RESOLVER, move || {
+            fs::rename(&replacement, &archive).unwrap();
+            changed.set(true);
+        });
+        let result = super::seal(&f.dir, &base, f.base.clone());
+        assert!(fired.get(), "the initial archive check finished");
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("archive changed while sealing"),
+            "{error}"
+        );
+        assert_eq!(rows_and_modes(&f.dir), before);
+        assert!(!OverlayMeta::read(&f.dir).unwrap().unwrap().layer_sealed());
+        assert!(!f.dir.join(SENTINEL).exists());
     }
 
     fn refusal(result: io::Result<SealOutcome>, before: &RecordState, f: &Fixture) {

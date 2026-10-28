@@ -216,6 +216,92 @@ fn regression_seal_of_pending_overlay_computes_and_records_digest() {
     expect(command(&["overlay", "verify", dir]), 0);
 }
 
+/// Regression: split archives must give an actionable refusal and leave the overlay unsealed.
+#[test]
+fn regression_seal_cli_split_archive_refused_and_overlay_unsealed() {
+    for symlinked in [false, true] {
+        for file_url in [false, true] {
+            assert_split_seal_refused(symlinked, file_url);
+        }
+    }
+}
+
+fn assert_split_seal_refused(symlinked: bool, file_url: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let payload = [b'x'; 2048];
+    let mut archive = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_ustar();
+    header.set_size(payload.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, "file", payload.as_slice())
+        .unwrap();
+    let bytes = archive.into_inner().unwrap();
+    let first = tmp.path().join("base.tar.001");
+    let second = tmp.path().join("base.tar.002");
+    if symlinked {
+        let first_target = tmp.path().join("part-one");
+        let second_target = tmp.path().join("part-two");
+        fs::write(&first_target, &bytes[..1024]).unwrap();
+        fs::write(&second_target, &bytes[1024..]).unwrap();
+        std::os::unix::fs::symlink(first_target, &first).unwrap();
+        std::os::unix::fs::symlink(second_target, &second).unwrap();
+    } else {
+        fs::write(&first, &bytes[..1024]).unwrap();
+        fs::write(&second, &bytes[1024..]).unwrap();
+    }
+    let dir = tmp.path().join("overlay");
+    let base = if file_url {
+        format!("file://{}", first.display())
+    } else {
+        first.to_str().unwrap().to_owned()
+    };
+    let (dir_s, first_s) = (dir.to_str().unwrap(), base.as_str());
+    expect(
+        env_command(
+            tmp.path(),
+            &[
+                "--no-mount",
+                "--index-file",
+                ":memory:",
+                "-w",
+                dir_s,
+                first_s,
+            ],
+        ),
+        0,
+    );
+    fs::write(dir.join("file"), b"change\n").unwrap();
+
+    for args in [
+        vec!["overlay", "seal", dir_s, first_s],
+        vec!["overlay", "seal", dir_s],
+    ] {
+        let out = env_command(tmp.path(), &args);
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            error.contains("sealing over a split archive is not supported"),
+            "{error}"
+        );
+        assert!(
+            error.contains("join the parts into one archive file and seal that"),
+            "{error}"
+        );
+        expect(out, 2);
+        let meta = ratarmount_compositing::OverlayMeta::read(&dir)
+            .unwrap()
+            .unwrap();
+        assert!(!meta.layer_sealed());
+        assert_eq!(meta.get("layer_digest"), None);
+        assert!(!dir.join(".ratarmount-sealed").exists());
+        assert_ne!(fs::metadata(&dir).unwrap().permissions().mode() & 0o200, 0);
+        assert_eq!(fs::read(dir.join("file")).unwrap(), b"change\n");
+    }
+    assert_eq!(fs::read(first).unwrap(), bytes[..1024]);
+    assert_eq!(fs::read(second).unwrap(), bytes[1024..]);
+}
+
 // ---- overlay verify compares the base (section D) ----
 
 fn env_command(home: &Path, args: &[&str]) -> Output {

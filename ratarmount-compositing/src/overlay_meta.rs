@@ -953,6 +953,44 @@ let cursor = ratarmount_index::managed_read::ManagedReadCursor::open(path)?;
         }
         Ok(digest)
     }
+
+    /// Resolve a seal's digest from the descriptor its archive guard locked,
+    /// checking the full descriptor/path stamp even when the cache hits.
+    pub(crate) fn hash_locked(
+        &self,
+        guard: &ratarmount_compress::commit_journal::CopyGuard,
+    ) -> Result<String> {
+        guard.check_path(&self.path)?;
+        let Some(mut reader) = guard.reader() else {
+            // Native platforms without an archive flock retain their existing
+            // managed-reader path.
+            let digest = self.hash(&|| Ok(()))?;
+            guard.check_path(&self.path)?;
+            return Ok(digest);
+        };
+        if !self.stamp_matches()? {
+            return Err(OverlayError::Msg(
+                "base changed before hashing locked archive".into(),
+            ));
+        }
+        let stamp = ArchiveDigestStamp::from_metadata(guard.metadata())?;
+        let digest = ratarmount_index::cached_archive_digest_cancellable_for_snapshot(
+            &self.path,
+            self.index.as_deref(),
+            &stamp,
+            &|| Ok(()),
+            |path| {
+                test_hash_seam(path);
+                guard.check_path(path)?;
+                let digest = sha256_hex_stream(&mut reader)?;
+                guard.check_path(path)?;
+                Ok(digest)
+            },
+        )
+        .map_err(|e| OverlayError::Msg(format!("cannot hash base {}: {e}", self.path.display())))?;
+        guard.check_path(&self.path)?;
+        Ok(digest)
+    }
 }
 
 /// Test seam, read only where a full archive hash really starts: append one
@@ -1121,13 +1159,14 @@ pub(crate) fn resolve_pending_base_digest_for(
     conn: &Connection,
     base: Option<&crate::ClassifiedBase>,
 ) -> Result<bool> {
-    resolve_pending_base_digest_required(conn, base, false)
+    resolve_pending_base_digest_required(conn, base, false, None)
 }
 
 pub(crate) fn resolve_pending_base_digest_required(
     conn: &Connection,
     base: Option<&crate::ClassifiedBase>,
     required: bool,
+    archive_guard: Option<&ratarmount_compress::commit_journal::CopyGuard>,
 ) -> Result<bool> {
     let Some(meta) = OverlayMeta::from_connection_required(conn, required)? else {
         return Ok(false);
@@ -1148,7 +1187,10 @@ pub(crate) fn resolve_pending_base_digest_required(
             }
         }
     }
-    let digest = pending.hash(&|| Ok(()))?;
+    let digest = match archive_guard {
+        Some(guard) => pending.hash_locked(guard)?,
+        None => pending.hash(&|| Ok(()))?,
+    };
     record_base_digest_required(conn, &pending, &digest, required)
 }
 

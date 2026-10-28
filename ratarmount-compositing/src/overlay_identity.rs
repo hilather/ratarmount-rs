@@ -156,8 +156,8 @@ pub struct ActualBase {
     /// Device and inode of a local archive when the token was minted (or last
     /// re-pointed): the file a commit may rewrite, whatever name reaches it.
     pub(crate) file_id: Option<FileId>,
-    /// The first typed input with only its parent resolved, so a commit that
-    /// names the mounted base through a symlink is still recognised after
+    /// The first local path (including decoded file:// inputs) with only its
+    /// parent resolved, so a commit that names the mounted base through a symlink is still recognised after
     /// the link is retargeted.
     pub(crate) typed_named: Option<PathBuf>,
 }
@@ -1025,6 +1025,12 @@ impl ClassifiedBase {
             ServedKind::Folder => (BaseKind::Dir, None),
             ServedKind::Archive => (BaseKind::Archive, None),
         };
+        let file_url_named = match &location {
+            Some(ServedLocation::Local(path)) if raw_first.starts_with("file://") => {
+                named_path(path)
+            }
+            _ => None,
+        };
         let location = location.map(|location| match location {
             ServedLocation::Local(path) => BaseLocation::Local(canonical_or_same(&path)),
             ServedLocation::Remote(raw) => BaseLocation::Remote(redacted(&raw)),
@@ -1066,7 +1072,8 @@ impl ClassifiedBase {
         let typed_named = local_archive
             .as_ref()
             .filter(|_| !raw_first.contains("://"))
-            .and_then(|_| named_path(Path::new(raw_first)));
+            .and_then(|_| named_path(Path::new(raw_first)))
+            .or(file_url_named);
         let actual = ActualBase {
             kind: base_kind,
             location,

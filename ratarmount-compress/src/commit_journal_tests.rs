@@ -4,6 +4,28 @@
 )]
 
 use super::*;
+
+/// Regression: #240 seal hashing borrows the locked inode even if its name is
+/// replaced by another file with the same size and mtime.
+#[test]
+fn regression_240_seal_reader_uses_locked_inode() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("archive.tar");
+    let replacement = dir.path().join("replacement.tar");
+    fs::write(&archive, b"original").unwrap();
+    let guard = guard_seal(&archive).unwrap();
+    fs::write(&replacement, b"impostor").unwrap();
+    File::open(&replacement)
+        .unwrap()
+        .set_modified(guard.metadata().modified().unwrap())
+        .unwrap();
+    fs::rename(&replacement, &archive).unwrap();
+    let mut bytes = Vec::new();
+    guard.reader().unwrap().read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"original");
+    assert!(guard.check_path(&archive).is_err());
+}
 use std::io::Write;
 
 /// Regression: ENOSPC must roll back before returning to a live reader.

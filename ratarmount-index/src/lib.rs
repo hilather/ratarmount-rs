@@ -35,8 +35,9 @@ mod search;
 
 pub use digest_cache::{
     archive_digest_cache_available, cached_archive_digest, cached_archive_digest_cancellable,
-    cached_archive_digest_with, peek_archive_digest, peek_archive_digest_for_open,
-    refresh_archive_digest, ArchiveDigestStamp, DIGEST_LOCK_SUFFIX,
+    cached_archive_digest_cancellable_for_snapshot, cached_archive_digest_with,
+    peek_archive_digest, peek_archive_digest_for_open, refresh_archive_digest, ArchiveDigestStamp,
+    DIGEST_LOCK_SUFFIX,
 };
 pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
 pub use hashing::{

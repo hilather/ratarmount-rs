@@ -159,7 +159,7 @@ The stored result has the `sha256:` prefix.
 
 A local archive gets a streaming SHA-256 of all file bytes, but never on the
 mount's critical path. If an existing writable archive index holds the digest
-for the same canonical path, size, nanosecond mtime, and inode, creation
+for the same canonical path, size, nanosecond mtime, device, and inode, creation
 records it as `strong` at once. Otherwise creation records
 `base_digest_kind = pending` (empty `base_digest`, no `stack_digest`, the
 base's size and mtime as usual) and the mount hashes the archive on a
@@ -596,21 +596,25 @@ plain output is the digest. Repeating seal prints the recorded digest and exits
 0 even if the base is no longer available; use verify to check integrity.
 
 For a single-file local archive, source acquisition takes the same exclusive
-archive flock as commit before reading or building its index. The token retains the locked
-descriptor's acquisition stamp; seal checks it under that archive's lock before
-resolving or hashing, and holds the lock through seal publication. A commit
-between acquisition and sealing therefore requires reopening the base. Raw lock
-descriptors remain alive through sealing (and acquisition descriptors through
-the source's lifetime), because an unrelated close on the same inode releases
+archive flock as commit before reading or building its index. The token retains
+the locked descriptor's acquisition stamp; seal checks it under that archive's
+lock before resolving or hashing, and holds the lock through seal publication.
+Base hashing reads the locked descriptor, and seal checks its stamp and pathname
+again before publishing. A commit between acquisition and sealing therefore
+requires reopening the base. Raw lock descriptors remain alive through sealing
+(and acquisition descriptors through the source's lifetime), because an unrelated
+close on the same inode releases
 this process's SQLite/POSIX locks. This exclusion applies to the selected
 archive inode: byte-identical copies accepted as bases have separate locks.
 Concurrent seal and commit of the same overlay using different copies remains
 unsupported and can invalidate the seal; serialize those operations.
 
-Split archives have no single-inode acquisition snapshot and cannot authorize
-a seal; join the parts into one archive first. Custom `OpenBase` implementations
-must report an acquisition snapshot in `Opened::source_metadata` to seal a local
-archive.
+Seal's digest-cache lookup uses the locked descriptor's device, inode, size and
+mtime. Existing cache rows without a device are ignored until rehashed.
+
+Sealing over a split archive is not supported. Join the parts into one archive
+file and seal that. Custom `OpenBase` implementations must report an acquisition
+snapshot in `Opened::source_metadata` to seal a local archive.
 
 Before chmod, the same transaction records per-path hashes in `seal_rows`,
 `sealed_at`, `layer_digest`, and each materialized entry's permission bits in
