@@ -6591,10 +6591,12 @@ fn regression_offline_commit_cleanup_refuses_symlink_swaps() {
 
 /// Regression: #239 same-inode DB links and companion links inserted after
 /// admission must refuse before archive publication, including force/no journal.
+/// Without GNU tar, keep validation and append coverage while skipping copy publication.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn regression_offline_commit_refuses_symlink_swaps() {
     use ratarmount_compress::commit_journal::fault;
+    let gnu_tar_available = have_gnu_tar();
     let mut failures = Vec::new();
     for state in ["db", "-wal", "-journal", "-shm"] {
         for seam in ["classified", "recovery", "publication", "staged"] {
@@ -6604,6 +6606,10 @@ fn regression_offline_commit_refuses_symlink_swaps() {
                 crate::CommitMode::Auto,
             ] {
                 if seam == "staged" && mode == crate::CommitMode::Copy {
+                    continue;
+                }
+                if seam == "publication" && mode == crate::CommitMode::Copy && !gnu_tar_available {
+                    eprintln!("skip: GNU tar unavailable for {state} / {seam} / {mode:?}");
                     continue;
                 }
                 for force in [false, true] {
@@ -6779,28 +6785,101 @@ fn regression_offline_mount_classification_preserves_symlink_policy() {
     assert!(failures.is_empty(), "classification failures: {failures:?}");
 }
 
-/// Regression: #239 an oversized zstd splice's copy-publication policy
-/// refusal must preserve its cause and prohibit an Auto copy retry.
-#[cfg(unix)]
+/// Regression: #239 a real zstd replacement must validate overlay state at
+/// publication, before persisting its fully prepared compressed archive.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn regression_offline_splice_policy_refusal_has_no_copy_fallback() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = tmp.path().join(HIDDEN_DB);
-    std::os::unix::fs::symlink(tmp.path().join("missing"), &db).unwrap();
-    let error = crate::overlay_db::validate_overlay_state(&db).unwrap_err();
-    let failure =
-        crate::journal_recovery::failed_splice(ratarmount_compress::CompressError::Io(error));
-    assert!(
-        !failure.may_copy,
-        "policy refusal cannot authorize another copy attempt"
-    );
-    assert!(
-        crate::overlay_db::is_overlay_state_error(&failure.error),
-        "{}",
-        failure.error
-    );
-    assert!(fs::symlink_metadata(&db).unwrap().is_symlink());
-    assert!(!tmp.path().join("missing").exists());
+fn regression_offline_zstd_replacement_refuses_symlink_swaps() {
+    offline_zstd_publication_refuses_symlink_swaps(false);
+}
+
+/// Regression: #239 an oversized zstd append must validate its copy fallback
+/// before publication and preserve the typed refusal, prohibiting an Auto retry.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_offline_zstd_oversized_append_refuses_symlink_swaps() {
+    offline_zstd_publication_refuses_symlink_swaps(true);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn offline_zstd_publication_refuses_symlink_swaps(oversized: bool) {
+    for state in ["db", "-wal", "-journal", "-shm"] {
+        for force in [false, true] {
+            let place = Place::new(true);
+            let mode = if oversized {
+                crate::CommitMode::Auto
+            } else {
+                crate::CommitMode::Copy
+            };
+            drop(place.open(&place.overlay, Way::Offline, mode));
+            fs::write(place.overlay.join("added"), vec![b'x'; 8192]).unwrap();
+            let token = place.token();
+            let db = place.overlay.join(HIDDEN_DB);
+            let target = place.root.join("swap-target");
+            let mut linked = db.as_os_str().to_os_string();
+            if state != "db" {
+                linked.push(state);
+            }
+            let linked = PathBuf::from(linked);
+            let expected = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let saved = expected.clone();
+            let steps = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = steps.clone();
+            let (s_target, s_link, overlay, archive) = (
+                target.clone(),
+                linked.clone(),
+                place.overlay.clone(),
+                place.archive.clone(),
+            );
+            fault::install(move |step| {
+                seen.borrow_mut().push(step.to_string());
+                if step == "copy publish" && saved.borrow().is_none() {
+                    if state == "db" {
+                        fs::rename(&db, &s_target).unwrap();
+                    } else {
+                        fs::write(&s_target, b"external target must survive").unwrap();
+                    }
+                    std::os::unix::fs::symlink(&s_target, &s_link).unwrap();
+                    *saved.borrow_mut() = Some(overlay_239_snapshot(&archive, &overlay, &s_target));
+                }
+                Ok(())
+            });
+            // Only the test build lowers the format's u32 size boundary. Both
+            // paths still decode, transform, encode and stage real zstd frames.
+            let result = ratarmount_compress::with_splice_frame_size_limit(
+                if oversized { 4096 } else { u32::MAX },
+                || {
+                    crate::commit_overlay(
+                        &place.overlay,
+                        &place.archive,
+                        &token,
+                        &CommitOverlayOptions {
+                            yes: true,
+                            mode,
+                            force_base_mismatch: force,
+                            ..Default::default()
+                        },
+                    )
+                },
+            );
+            fault::clear();
+            let expected = expected.borrow().clone().expect("copy publication reached");
+            let error = result.expect_err("must refuse before zstd publication");
+            assert_239_refusal(&error.to_string(), &linked);
+            assert!(
+                overlay_239_snapshot(&place.archive, &place.overlay, &target) == expected,
+                "archive, target, overlay, journal and locator must survive: {state}, force={force}"
+            );
+            assert!(crate::overlay_db::is_overlay_state_error(&error), "{error}");
+            let steps = steps.borrow();
+            let count = |point| steps.iter().filter(|step| *step == point).count();
+            assert_eq!(count("copy publish"), 1, "no Auto publication retry");
+            assert_eq!(count("before splice scan"), usize::from(oversized));
+            assert_eq!(count("copy source open"), usize::from(!oversized));
+            assert_eq!(count("before replace"), 0, "copy fallback was selected");
+            assert_eq!(count("journal fsync"), 0, "no journal was written");
+        }
+    }
 }
 
 struct PreparedIdentityFixture {

@@ -113,6 +113,8 @@ pub use zstd_seek::{
     open_seekable_zstd_with_zstd_blocks_from_reader, scan_zstd_frames, scan_zstd_frames_path,
     zstd_decode_stats, SeekableZstd, ZstdDecodeStats, ZstdFrameInfo, ZstdFrameMap, ZstdReadOptions,
 };
+#[cfg(any(test, feature = "test-hooks"))]
+pub use zstd_splice::with_splice_frame_size_limit;
 pub use zstd_splice::{
     splice_zstd_last_frames, splice_zstd_last_frames_append,
     splice_zstd_last_frames_append_guarded, splice_zstd_last_frames_append_with,

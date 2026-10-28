@@ -20,6 +20,24 @@ use crate::{CompressError, Result};
 /// Fixed encode level: original frame parameters are unrecoverable (design).
 const SPLICE_ENCODE_LEVEL: i32 = 3;
 
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    static FRAME_SIZE_LIMIT: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+/// Exercise oversized splice publication without writing a 4 GiB test fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn with_splice_frame_size_limit<T>(limit: u32, run: impl FnOnce() -> T) -> T {
+    struct Reset(u32);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FRAME_SIZE_LIMIT.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(FRAME_SIZE_LIMIT.with(|value| value.replace(limit)));
+    run()
+}
+
 /// Bytes copied / written by [`splice_zstd_last_frames`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpliceStats {
@@ -377,6 +395,10 @@ fn maybe_rebuild_seek_table(
     new_plain: u64,
 ) -> Option<Vec<u8>> {
     map.seek_table.as_ref()?;
+    #[cfg(any(test, feature = "test-hooks"))]
+    if FRAME_SIZE_LIMIT.with(|limit| new_comp.max(new_plain) > u64::from(limit.get())) {
+        return None;
+    }
     let mut entries = Vec::with_capacity(from_idx.saturating_add(1));
     for (i, f) in map.frames[..from_idx].iter().enumerate() {
         // cSize from offset deltas so skippable gaps in the copied prefix stay consistent.
