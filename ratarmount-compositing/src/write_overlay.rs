@@ -7390,12 +7390,20 @@ impl SealCommitGuard {
         #[cfg(not(unix))]
         {
             let _ = dir;
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "seal/commit locking requires Unix flock",
-            ))
+            // Sealing is Unix-only. Preserve the existing non-Unix copy-commit
+            // path, which has no seal operation to serialize against.
+            Ok(Self {})
         }
     }
+}
+
+#[cfg(all(test, not(unix)))]
+#[test]
+fn regression_nonunix_commit_guard_accepts_unsealed_overlay() {
+    // Regression: adding the Unix seal/commit lock disabled non-Unix commits
+    // before they could reach the supported copy-publication path.
+    let overlay = tempfile::tempdir().unwrap();
+    let _guard = OverlayCommitGuard::acquire(overlay.path()).unwrap();
 }
 
 /// Refuse a sealed database overlay without recovery or a writable connection.

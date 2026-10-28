@@ -361,12 +361,18 @@ fn seal_impl_locked(
     let root = root(dir)?;
     let required = std::cell::Cell::new(false);
     let meta = OverlayMeta::read_for_operation(dir, &required).map_err(overlay_error)?;
-    if let Some(meta) = meta.as_ref().filter(|meta| meta.layer_sealed()) {
+    if meta.as_ref().is_some_and(|meta| meta.layer_sealed()) {
+        #[cfg(test)]
+        fire_once(&BEFORE_RECORDED_SEAL_LOCK);
         let _seal_commit = held
             .is_none()
             .then(|| sealed_guard(dir, &root))
             .transpose()?;
-        return finish_recorded_seal(dir, &root, meta);
+        let meta = OverlayMeta::read_for_operation(dir, &required)
+            .map_err(overlay_error)?
+            .filter(OverlayMeta::layer_sealed)
+            .ok_or_else(|| io::Error::other("overlay is no longer sealed"))?;
+        return finish_recorded_seal(dir, &root, &meta);
     }
     let archive =
         identity.and_then(
@@ -649,6 +655,7 @@ thread_local! {
 /// This never hashes or resolves the base, so it needs no archive lock.
 pub fn unseal(dir: &Path) -> io::Result<()> {
     let root = root(dir)?;
+    let _seal_commit = sealed_guard(dir, &root)?;
     // Probe before touching permissions, so a mounted overlay is never changed.
     OverlayMeta::read(dir).map_err(overlay_error)?;
     chmod_tree(&root, true)?;
@@ -763,6 +770,7 @@ type OnceHook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_RECORDED_SEAL_LOCK: OnceHook = const { std::cell::RefCell::new(None) };
     static AFTER_INITIAL_READ: OnceHook = const { std::cell::RefCell::new(None) };
     static AFTER_PENDING_RESOLVER: OnceHook = const { std::cell::RefCell::new(None) };
 }
@@ -964,6 +972,71 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    /// Regression: public seal queued behind unseal must not restore a seal
+    /// from metadata read before acquiring the overlay operation lock.
+    #[test]
+    fn regression_240_queued_public_seal_rechecks_unsealed_metadata() {
+        let f = Fixture::new();
+        let base =
+            crate::ClassifiedBase::for_tests(f.base.clone(), crate::ServedKind::Folder, None);
+        super::seal(&f.dir, &base, f.base.clone()).unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (unseal_tx, unseal_rx) = std::sync::mpsc::channel();
+        let unseal_dir = f.dir.clone();
+        let unsealing = std::thread::spawn(move || {
+            // unseal holds the overlay lock, but has not cleared the metadata.
+            AFTER_UNSEAL_WALK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    locked_tx.send(()).unwrap();
+                    unseal_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }));
+            });
+            unseal(&unseal_dir)
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let probe = host::open(
+            f.dir.join(crate::write_overlay::SEAL_COMMIT_LOCK),
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            host::flock(&probe, host::FlockOperation::NonBlockingLockExclusive),
+            Err(rustix::io::Errno::WOULDBLOCK),
+            "public unseal must hold the overlay operation lock"
+        );
+        drop(probe);
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let seal_dir = f.dir.clone();
+        let lower = f.base.clone();
+        let sealing = std::thread::spawn(move || {
+            let _hook = OnceGuard::set(&BEFORE_RECORDED_SEAL_LOCK, move || {
+                read_tx.send(()).unwrap();
+            });
+            super::seal(&seal_dir, &base, lower)
+        });
+        read_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        unseal_tx.send(()).unwrap();
+        unsealing.join().unwrap().unwrap();
+        let result = sealing.join().unwrap();
+        assert!(OverlayMeta::read(&f.dir)
+            .unwrap()
+            .is_some_and(|meta| !meta.layer_sealed()));
+        let error = result.expect_err("queued seal must refuse metadata cleared by unseal");
+        assert!(error.to_string().contains("no longer sealed"), "{error}");
+        assert!(!f.dir.join(SENTINEL).exists());
+        assert_ne!(
+            fs::metadata(&f.dir).unwrap().permissions().mode() & 0o200,
+            0
         );
     }
 

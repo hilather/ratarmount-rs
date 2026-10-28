@@ -141,6 +141,8 @@ impl ManagedReadCursor {
 ///
 /// This reservation requires write access, including for a copy publication
 /// that could otherwise replace a read-only file using directory permissions.
+/// Empty archives are refused before SQLite opens them: on macOS FAT/exFAT,
+/// a writable MAIN_DB open would initialize an empty file with an `S` byte.
 /// Ordinary managed readers and seals do not take this reservation.
 #[cfg(unix)]
 pub struct ArchiveReservation {
@@ -721,8 +723,18 @@ mod imp {
             // absolute, existing path; a missing file is NotFound here).
             let real = std::fs::canonicalize(path)?;
             // Only regular files (a FIFO would block in `open`).
-            if !std::fs::metadata(&real)?.is_file() {
+            let metadata = std::fs::metadata(&real)?;
+            if !metadata.is_file() {
                 return Err(super::not_regular_file(&real));
+            }
+            // SQLite's macOS FAT/exFAT inode workaround writes an `S` byte
+            // during a writable MAIN_DB xOpen, before we can take any lock.
+            // Refuse empty archives during the non-mutating preflight.
+            if writable && metadata.len() == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot reserve an empty archive for publication",
+                ));
             }
             if crate::checked_open::thread_is_acquiring() {
                 return Err(io::Error::new(

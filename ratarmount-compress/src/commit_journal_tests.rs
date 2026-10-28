@@ -7,6 +7,33 @@ use super::*;
 
 use std::io::{Seek, Write};
 
+/// Regression: acquiring a reservation for a refused empty-archive commit
+/// must not let SQLite's macOS FAT/exFAT workaround write an `S` byte.
+#[test]
+fn regression_240_refused_empty_archive_stays_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.tar");
+    fs::write(&path, []).unwrap();
+    let original = fs::metadata(&path).unwrap();
+    let error = guard_copy(&path, &original).err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+
+    let mut suffix = tempfile::tempfile().unwrap();
+    suffix.write_all(b"replacement").unwrap();
+    let result = replace_suffix_if_unchanged_with(
+        &path,
+        0,
+        &mut suffix,
+        &original,
+        &mut || panic!("empty archive must be refused before authorization"),
+        &mut |_| Ok(()),
+    );
+    assert!(matches!(result, Err(ReplaceError::Refused(_))));
+    assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    assert!(!journal_path(&path).exists());
+}
+
 /// Regression: #240 copy publication must refuse a read-only archive rather
 /// than bypass the VFS reservation with an unsafe raw-descriptor fallback.
 #[test]

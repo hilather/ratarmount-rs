@@ -938,6 +938,14 @@ __inventory_value_0
         fault::check("before replace").map_err(refused)?;
         let archive = archive.canonicalize().map_err(refused)?;
         let path = journal_path(&archive);
+        // Check the plan before any writable SQLite acquisition. Keep the
+        // descriptor/path checks under the archive lock below as well.
+        let preflight = fs::metadata(&archive).map_err(refused)?;
+        if original.is_some_and(|old| !same_stamp(old, &preflight)) {
+            return Err(refused(io::Error::other(
+                "archive changed while preparing append; retry with a fresh plan",
+            )));
+        }
         let _reservation = ratarmount_index::managed_read::ArchiveReservation::exclusive(&archive)
             .map_err(refused)?;
         let mut file = {
@@ -1224,6 +1232,11 @@ __inventory_value_1
     pub(super) fn guard_copy(archive: &Path, source: &fs::Metadata) -> io::Result<CopyGuard> {
         fault::check("copy publish")?;
         let archive = archive.canonicalize()?;
+        if !same_stamp(source, &fs::metadata(&archive)?) {
+            return Err(io::Error::other(
+                "archive changed during the copy fallback; retry",
+            ));
+        }
         // This VFS reservation must outlive BOTH raw descriptors, including
         // failures. It refuses a live SQLite reader before any raw fd opens.
         let reservation = ratarmount_index::managed_read::ArchiveReservation::exclusive(&archive)?;

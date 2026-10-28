@@ -11,6 +11,25 @@ use std::sync::atomic::Ordering;
 #[cfg(unix)]
 use super::lock_probe::other_process_sees_lock;
 
+/// Regression: a writable MAIN_DB reservation initialized an empty archive
+/// with an `S` byte on macOS FAT/exFAT before the caller could refuse it.
+#[cfg(unix)]
+#[test]
+fn regression_240_reservation_refuses_empty_archive_before_sqlite_open() {
+    let (_d, dir) = tempdir();
+    assert_eq!(run_child("empty_reservation", &dir), "ok xopen=0 size=0");
+    match std::env::var_os("RATARMOUNT_TEST_FAT_DIR") {
+        Some(fat) if cfg!(target_os = "macos") => {
+            let dir = tempfile::tempdir_in(fat).unwrap();
+            assert_eq!(
+                run_child("empty_reservation", &dir.path().canonicalize().unwrap()),
+                "ok xopen=0 size=0"
+            );
+        }
+        _ => eprintln!("skip: no macOS FAT/exFAT fixture (RATARMOUNT_TEST_FAT_DIR)"),
+    }
+}
+
 /// A canonical temporary directory (macOS `/var` is a symlink).
 fn tempdir() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -350,6 +369,19 @@ fn managed_read_child() {
 
 #[cfg(unix)]
 fn child_row(row: &str, dir: &Path) -> String {
+    if row == "empty_reservation" {
+        let path = dir.join("empty.tar");
+        fs::write(&path, []).unwrap();
+        let before = XOPEN_CALLS.load(Ordering::SeqCst);
+        let error = ArchiveReservation::exclusive(&path).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let after = XOPEN_CALLS.load(Ordering::SeqCst);
+        return format!(
+            "xopen={} size={}",
+            after - before,
+            fs::metadata(&path).unwrap().len()
+        );
+    }
     if let Some(fd) = row.strip_prefix("closed:") {
         let fd: libc::c_int = fd.parse().unwrap();
         let db = dir.join("x.sqlite");
