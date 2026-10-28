@@ -871,6 +871,11 @@
     "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
   },
   {
+    "path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
     "path": "ratarmount_compress::commit_journal::replace_suffix_with_hook",
     "availability": "native-repository-journal",
     "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
@@ -891,7 +896,17 @@
     "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
   },
   {
+    "path": "ratarmount_compress::splice_zstd_last_frames_append_guarded",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
     "path": "ratarmount_compress::splice_zstd_last_frames_replace",
+    "availability": "native-repository-journal",
+    "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
+  },
+  {
+    "path": "ratarmount_compress::splice_zstd_last_frames_replace_guarded",
     "availability": "native-repository-journal",
     "reason": "The journal fixture compiles this actual repository API reference and requires its own exact method diagnostic."
   }
