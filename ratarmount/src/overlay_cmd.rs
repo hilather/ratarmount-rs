@@ -541,6 +541,14 @@ pub fn seal(cmd: &SealCmd, context: &OverlayRunContext) -> Result<(String, i32),
         let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
         ratarmount_compositing::overlay_seal::reseal(&record)
     } else {
+        let operation = ratarmount_compositing::overlay_seal::SealOperation::acquire(&args.directory)
+            .map_err(|e| format!("seal {}: {e}", args.directory.display()))?;
+        if let Some(outcome) = operation.finish_if_sealed()
+            .map_err(|e| format!("seal {}: {e}", args.directory.display()))? {
+            return Ok((if args.json {
+                serde_json::json!({"layer_digest":outcome.layer_digest,"sealed_at":outcome.sealed_at}).to_string()
+            } else { outcome.layer_digest }, 0));
+        }
         let meta = OverlayMeta::read(&args.directory)
             .map_err(|e| super::overlay_open_error(&args.directory, &e))?;
         let _progress = super::diff::ProgressToStderr::new().map_err(|e| e.to_string())?;
@@ -556,7 +564,7 @@ pub fn seal(cmd: &SealCmd, context: &OverlayRunContext) -> Result<(String, i32),
             .map_err(|e| format!("seal {}: {e}", args.directory.display()))?;
         }
         let lower = lower_view(&base, &args.lower, meta.as_ref())?;
-        ratarmount_compositing::overlay_seal::seal(&args.directory, &base, lower)
+        operation.seal(&base, lower)
     }
     .map_err(|e| format!("seal {}: {e}", args.directory.display()))?;
     let output = if args.json {

@@ -968,6 +968,33 @@
       "rule_reason": "inventory-op:ManagedReadCursor::open"
     },
     {
+      "configured_path": "ratarmount_index::managed_read::ManagedReadCursor::open",
+      "item": "<ratarmount_compositing::overlay_meta::SealArchive>::open",
+      "leaf_digest": "10d611c42a29bd809a514583edb0bf5d05477d6b9cfef350e441d07f66be38de",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "managed-read",
+        "creation": {
+          "basis": "Read an existing archive through SQLite VFS without creating it or taking its archive lock.",
+          "policy": "none"
+        },
+        "disposition": "managed-read",
+        "id": "IR-V4-SEAL-READER",
+        "item": "<ratarmount_compositing::overlay_meta::SealArchive>::open",
+        "reason": "Bind seal digest reads to one SQLite-managed byte reader so disposal preserves in-process reader locks.",
+        "regression": "regression_240_reader_transaction_survives_seal_and_commit"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-V4-SEAL-READER\",\"item\":\"<ratarmount_compositing::overlay_meta::SealArchive>::open\",\"disposition\":\"managed-read\",\"category\":\"managed-read\",\"regression\":\"regression_240_reader_transaction_survives_seal_and_commit\",\"reason\":\"Bind seal digest reads to one SQLite-managed byte reader so disposal preserves in-process reader locks.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Read an existing archive through SQLite VFS without creating it or taking its archive lock.\"}}",
+      "resolved": "<ratarmount_index::managed_read::ManagedReadCursor>::open",
+      "rule_reason": "inventory-op:ManagedReadCursor::open"
+    },
+    {
       "item": "<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open",
       "leaf_digest": "d9af744960177b31326bf1d0ab17dc67e4b437bd1aa7af0bae93acbcd4ed0b4d",
       "lint": "clippy::disallowed_methods",
@@ -10882,7 +10909,7 @@
       "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded",
       "item": "ratarmount_compositing::journal_recovery::replace_committing",
       "journal_exemption": true,
-      "leaf_digest": "ebd95a132218c068edec4ee548527caddd18b9085637f7c1bd08e3abad4ce07a",
+      "leaf_digest": "8f1bcf2b5ace804bc9a0185a44c8973212c9f0720b7eed0e35bf1258bddac7c6",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -10898,7 +10925,7 @@
       "configured_path": "ratarmount_compress::splice_zstd_last_frames_append_guarded",
       "item": "ratarmount_compositing::journal_recovery::splice_append_committing",
       "journal_exemption": true,
-      "leaf_digest": "557498374ad55a7fdd2c25f7ad16e1b928c874d4373982e7beeb20b1fff1c9c3",
+      "leaf_digest": "0aa8056ca164687d0e140446e310f101b6f2585e3d9c5529b54e98fa8b698a42",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -10914,7 +10941,7 @@
       "configured_path": "ratarmount_compress::splice_zstd_last_frames_replace_guarded",
       "item": "ratarmount_compositing::journal_recovery::splice_replace_over",
       "journal_exemption": true,
-      "leaf_digest": "b52feac7c6340f6ecedd3e25ce6372ceb3007cfc0daa5c943cc63be191bfe97b",
+      "leaf_digest": "68dbaca19b1befc71296e816e15531f81594f3dd903f97b034196639e43f7a00",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -11236,32 +11263,6 @@
       "rule_reason": "inventory-op:ManagedReadCursor::open"
     },
     {
-      "configured_path": "rustix::fs::openat",
-      "item": "ratarmount_compositing::overlay_seal::chmod_tree",
-      "leaf_digest": "6d7b3ab422ca4ce49ff65382433882083576f60aa2a5488fbfff252fd6167e2a",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "directory-handle-or-durability",
-        "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
-          "policy": "none"
-        },
-        "disposition": "out-of-family",
-        "id": "IR-B0157-M01",
-        "item": "ratarmount_compositing::overlay_seal::chmod_tree",
-        "reason": "O_DIRECTORY handle for a descriptor-relative walk; no file content read"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0157-M01\",\"item\":\"ratarmount_compositing::overlay_seal::chmod_tree\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
-      "resolved": "rustix::fs::at::openat",
-      "rule_reason": "inventory-op:rustix::openat"
-    },
-    {
       "configured_path": "ratarmount_core::db_inodes::openat_admitted",
       "item": "ratarmount_compositing::overlay_seal::open_sentinel",
       "leaf_digest": "aeea209e3749803f933e5510658618a15ff21b519195b008699422a759a6b658",
@@ -11314,6 +11315,32 @@
       "reason": "internal-read:v1 {\"id\":\"IR-B0156-M01\",\"item\":\"ratarmount_compositing::overlay_seal::root\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "rustix::fs::abs::open",
       "rule_reason": "inventory-op:rustix::open"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount_compositing::overlay_seal::walk_chmod",
+      "leaf_digest": "57067b0d476392f46fbee2d97ae524b6567091bc2dc3503fea643fac4f0e2b42",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "directory-handle-or-durability",
+        "creation": {
+          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-B0157-M01",
+        "item": "ratarmount_compositing::overlay_seal::walk_chmod",
+        "reason": "O_DIRECTORY handle for a descriptor-relative walk; no file content read"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-B0157-M01\",\"item\":\"ratarmount_compositing::overlay_seal::walk_chmod\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
     },
     {
       "configured_path": "tempfile::Builder::tempfile_in",
@@ -12083,14 +12110,14 @@
       "metadata": {
         "category": "output-owner",
         "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
+          "basis": "NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.",
+          "policy": "private-named-temporary-file"
         },
         "disposition": "output-owner",
         "id": "IR-B0180-M01",
         "item": "ratarmount_compositing::write_overlay::persist_provenance_plan",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+        "mode_policy": "private-staging-then-source-archive-metadata",
+        "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -12098,7 +12125,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0180-M01\",\"item\":\"ratarmount_compositing::write_overlay::persist_provenance_plan\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0180-M01\",\"item\":\"ratarmount_compositing::write_overlay::persist_provenance_plan\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -12136,14 +12163,14 @@
       "metadata": {
         "category": "output-owner",
         "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
+          "basis": "NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.",
+          "policy": "private-named-temporary-file"
         },
         "disposition": "output-owner",
         "id": "IR-B0192-M01",
         "item": "ratarmount_compositing::write_overlay::rebuild_zip_with_overlay",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+        "mode_policy": "private-staging-then-source-archive-metadata",
+        "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -12151,7 +12178,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0192-M01\",\"item\":\"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0192-M01\",\"item\":\"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -12214,14 +12241,14 @@
       "metadata": {
         "category": "output-owner",
         "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
+          "basis": "NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.",
+          "policy": "private-named-temporary-file"
         },
         "disposition": "output-owner",
         "id": "IR-B0197-M01",
         "item": "ratarmount_compositing::write_overlay::recompress_replace",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+        "mode_policy": "private-staging-then-source-archive-metadata",
+        "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -12229,7 +12256,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0197-M01\",\"item\":\"ratarmount_compositing::write_overlay::recompress_replace\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0197-M01\",\"item\":\"ratarmount_compositing::write_overlay::recompress_replace\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -12663,7 +12690,7 @@
       "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded",
       "item": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
       "journal_exemption": true,
-      "leaf_digest": "d25a5eef682e9cb528e052d81374fe3ebd00a799636db86595d703d50cc92cc4",
+      "leaf_digest": "2c66c37cf9acdcb54fbb7536a4dbe8279955fe958e1b04cb6f202f340c1a0419",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -12671,9 +12698,34 @@
         "all-features",
         "default"
       ],
-      "reason": "The replacement convenience API delegates with an empty pre-write guard",
+      "reason": "The replacement convenience API delegates with the caller pre-write guard",
       "resolved": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_guarded",
       "rule_reason": "use journal_recovery::replace_committing"
+    },
+    {
+      "configured_path": "std::fs::write",
+      "item": "ratarmount_compress::commit_journal::test_marker",
+      "leaf_digest": "d59414e0f6869d7f0de52e951ebd2f337bb7642bb2cb5a6f42cbd4cc9b1b1e0e",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "feature-test-hook",
+        "creation": {
+          "basis": "The test-hooks marker is explicit instrumentation output written with fs::write and ordinary umask permissions.",
+          "policy": "create-or-truncate"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-238-V2-M01",
+        "item": "ratarmount_compress::commit_journal::test_marker",
+        "reason": "Publish explicit readiness output for the prewrite regression hold."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-238-V2-M01\",\"item\":\"ratarmount_compress::commit_journal::test_marker\",\"disposition\":\"out-of-family\",\"category\":\"feature-test-hook\",\"reason\":\"Publish explicit readiness output for the prewrite regression hold.\",\"creation\":{\"policy\":\"create-or-truncate\",\"basis\":\"The test-hooks marker is explicit instrumentation output written with fs::write and ordinary umask permissions.\"}}",
+      "resolved": "std::fs::write",
+      "rule_reason": "inventory-op:fs::write"
     },
     {
       "configured_path": "std::fs::File::open",
@@ -14167,7 +14219,7 @@
       "configured_path": "ratarmount_compress::splice_zstd_last_frames_append_with",
       "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append",
       "journal_exemption": true,
-      "leaf_digest": "2f30d180db13fb8f969ee53046412da9764624f44a92316b39865f19fca49159",
+      "leaf_digest": "b04de324d41fa01b75c293551b9a798e89b5f2528e5a8c71bd7329678de39cbc",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -14274,14 +14326,14 @@
       "metadata": {
         "category": "output-owner",
         "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
+          "basis": "NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.",
+          "policy": "private-named-temporary-file"
         },
         "disposition": "output-owner",
         "id": "IR-B0281-M01",
         "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+        "mode_policy": "private-staging-then-source-archive-metadata",
+        "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -14289,7 +14341,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0281-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0281-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -14297,7 +14349,7 @@
       "configured_path": "ratarmount_compress::splice_zstd_last_frames_append_guarded",
       "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
       "journal_exemption": true,
-      "leaf_digest": "57d29bb055c6fb7e52ff0411a3d21701a12fa732d7aa447fe89100146eee74d8",
+      "leaf_digest": "3cdc35ce92f76edf11d6cadb3b3e41b56a10c973c8237973a04d0799413363ce",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -14305,7 +14357,7 @@
         "all-features",
         "default"
       ],
-      "reason": "The append splice convenience API delegates with an empty pre-write guard",
+      "reason": "The append splice convenience API delegates with the caller pre-write guard",
       "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded",
       "rule_reason": "use journal_recovery::splice_append_committing"
     },
@@ -14313,7 +14365,7 @@
       "configured_path": "ratarmount_compress::splice_zstd_last_frames_replace_guarded",
       "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace",
       "journal_exemption": true,
-      "leaf_digest": "2ba13d249839d827480d804c7a9ec4768e1e53301673d505e429957d1ad809d2",
+      "leaf_digest": "b6ff8af9527c51c5b90c427bf4df61c1fef60971dedc66fd77950818f24353d6",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -14321,7 +14373,7 @@
         "all-features",
         "default"
       ],
-      "reason": "The copy splice convenience API delegates with an empty pre-publication guard",
+      "reason": "The copy splice convenience API delegates with the caller pre-publication guard",
       "resolved": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded",
       "rule_reason": "use journal_recovery::splice_replace_over"
     },
@@ -14349,14 +14401,14 @@
       "metadata": {
         "category": "output-owner",
         "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
+          "basis": "NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.",
+          "policy": "private-named-temporary-file"
         },
         "disposition": "output-owner",
         "id": "IR-B0277-M01",
         "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+        "mode_policy": "private-staging-then-source-archive-metadata",
+        "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -14364,7 +14416,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0277-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0277-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -21198,7 +21250,7 @@
     }
   ],
   "policy": {
-    "configuration": "461cca6142ec1fc41473ef070514e40c0c9a25c88f8e685e2fd93723eb29ecf9",
+    "configuration": "c8563f06a352f6688774b8da506600b74f25554e28bc3cc0689b2071d755305b",
     "profiles": "f04aa50122d4ae1f0504b6411c5b47cacf3a97a9e3080e175166f3b744aa4bd8",
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",

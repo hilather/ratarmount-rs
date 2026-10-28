@@ -115,6 +115,9 @@ pub use zstd_seek::{
 };
 #[cfg(any(test, feature = "test-hooks"))]
 pub use zstd_splice::with_splice_frame_size_limit;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use zstd_splice::zstd_splice_seek_table_limit_for_test;
 pub use zstd_splice::{
     splice_zstd_last_frames, splice_zstd_last_frames_append,
     splice_zstd_last_frames_append_guarded, splice_zstd_last_frames_append_with,
@@ -138,6 +141,9 @@ use xz2::read::XzDecoder;
 pub enum CompressError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    /// Publication must stop when the staged archive cannot inherit metadata.
+    #[error("archive metadata: {0}")]
+    ArchiveMetadata(#[source] io::Error),
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
     #[error("{0}")]

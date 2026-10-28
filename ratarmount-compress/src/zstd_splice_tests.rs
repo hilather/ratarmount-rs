@@ -460,6 +460,7 @@ fn splice_zstd_replace_persists_sibling() {
         from_idx,
         append_extra(extra.clone()),
         &std::fs::metadata(&path).unwrap(),
+        &mut || Ok(()),
     )
     .unwrap();
     assert!(stats.wrote_seek_table);
@@ -489,6 +490,7 @@ fn splice_zstd_replace_persists_sibling() {
         99,
         append_extra(extra),
         &std::fs::metadata(&path).unwrap(),
+        &mut || Ok(()),
     )
     .unwrap_err();
     assert!(err.to_string().contains("from_idx"), "{err}");
@@ -514,7 +516,8 @@ fn splice_zstd_replace_transform_err_leaves_inode() {
             "transform failed after suffix",
         ))
     };
-    let err = splice_zstd_last_frames_replace(&path, 1, transform, &original).unwrap_err();
+    let err = splice_zstd_last_frames_replace(&path, 1, transform, &original, &mut || Ok(()))
+        .unwrap_err();
     assert!(
         err.to_string().contains("transform failed after suffix"),
         "{err}"
@@ -565,4 +568,78 @@ fn splice_zstd_transform_sees_stream_offset() {
     let mut expected = prefix_plain;
     expected.extend_from_slice(&last_plain);
     assert_eq!(all, expected);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_238_splice_prewrite_guard(append: bool) {
+    use std::os::fd::AsRawFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("guarded.zst");
+    let before = pack_frames(&[b"prefix", b"old contents"], true);
+    std::fs::write(&path, &before).unwrap();
+    let original = std::fs::metadata(&path).unwrap();
+    let competing = File::open(&path).unwrap();
+    let mut called = false;
+    let mut guard = || {
+        called = true;
+        assert_eq!(
+            unsafe { libc::flock(competing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1,
+            "splice prewrite guard must run while the archive is locked"
+        );
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+        Err(io::Error::other("sealed splice refusal"))
+    };
+    let result = if append {
+        splice_zstd_last_frames_append_with(
+            &path,
+            1,
+            append_extra(b"new contents".to_vec()),
+            &original,
+            &mut guard,
+            &mut |_| panic!("refused splice cannot restamp its base"),
+        )
+    } else {
+        splice_zstd_last_frames_replace(
+            &path,
+            1,
+            append_extra(b"new contents".to_vec()),
+            &original,
+            &mut guard,
+        )
+    };
+    assert!(called, "splice prewrite guard was skipped");
+    let error = match result.unwrap_err() {
+        CompressError::Io(error)
+        | CompressError::Replace(crate::commit_journal::ReplaceError::Refused(error)) => error,
+        other => panic!("unexpected refusal: {other}"),
+    };
+    assert_eq!(error.to_string(), "sealed splice refusal");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!crate::commit_journal::journal_path(&path).exists());
+    assert_eq!(
+        crate::commit_journal::offline_journal_probe(&path).unwrap(),
+        (None, None)
+    );
+    assert!(crate::commit_journal::same_stamp(
+        &original,
+        &std::fs::metadata(&path).unwrap()
+    ));
+}
+
+/// Regression: #238 a zstd append checks sealing under its archive lock
+/// before journal publication, locator writes, or archive mutation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_238_zstd_append_prewrite_guard_runs_under_lock() {
+    assert_238_splice_prewrite_guard(true);
+}
+
+/// Regression: #238 a zstd copy checks sealing under its archive lock
+/// before publishing the replacement archive.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_238_zstd_copy_prewrite_guard_runs_under_lock() {
+    assert_238_splice_prewrite_guard(false);
 }

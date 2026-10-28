@@ -135,6 +135,45 @@ pub mod fault {
     }
 }
 
+/// Publish an explicit test-hooks readiness marker. Ordinary builds do nothing.
+#[cfg(any(test, feature = "test-hooks"))]
+fn test_marker(variable: &str) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(path) = std::env::var_os(variable) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-238-V2-M01","item":"ratarmount_compress::commit_journal::test_marker","disposition":"out-of-family","category":"feature-test-hook","reason":"Publish explicit readiness output for the prewrite regression hold.","creation":{"policy":"create-or-truncate","basis":"The test-hooks marker is explicit instrumentation output written with fs::write and ordinary umask permissions."}}"###
+        )]
+        fs::write(path, b"ready")?;
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = variable;
+    Ok(())
+}
+
+/// Explicit test-only hold after the sealed check and before archive mutation.
+/// Copy publishers call this while holding their archive guard too.
+#[doc(hidden)]
+pub fn test_prewrite_hold() -> io::Result<()> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let (Some(_), Some(release)) = (
+        std::env::var_os("RATARMOUNT_TEST_PREWRITE_READY"),
+        std::env::var_os("RATARMOUNT_TEST_PREWRITE_RELEASE"),
+    ) {
+        test_marker("RATARMOUNT_TEST_PREWRITE_READY")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !Path::new(&release).is_file() {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "timed out waiting for prewrite test release",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    Ok(())
+}
+
 /// What recovery applied, read from the LOCKED descriptor right before the
 /// journal is unlinked: the only stamp a caller may record for the archive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,8 +242,9 @@ pub type BeforeUnlink<'a> = &'a mut dyn FnMut(&Applied) -> io::Result<()>;
 
 /// Runs under the archive lock, after the locator was re-read there, before
 /// the FIRST write of a recovery: before a stale `P` locator is cleared and
-/// before a journal is rolled back or forward. `Err` refuses the recovery
-/// ([`RecoverError::Refused`]) with nothing written, the locator included.
+/// before a journal is rolled back or forward. It also runs before the first
+/// write of a replacement or publication. `Err` refuses with nothing written,
+/// the locator included.
 pub type BeforeWrite<'a> = &'a mut dyn FnMut() -> io::Result<()>;
 
 /// Ownership only: the journal was started for the very file locked.
@@ -496,23 +536,25 @@ impl From<ReplaceError> for io::Error {
 /// under the archive lock with the final stamp, before the journal is
 /// unlinked; it may run twice (it must be idempotent). A failure is cleaned up
 /// under the same lock from the attempt's own record ([`ReplaceError`]).
+/// `before_write` runs after the lock and stamp checks, before any mutation.
 pub fn replace_suffix_if_unchanged_with(
     archive: &Path,
     offset: u64,
     suffix: &mut File,
     original: &fs::Metadata,
+    before_write: BeforeWrite,
     before_unlink: BeforeUnlink,
 ) -> std::result::Result<(), ReplaceError> {
     #[expect(
         clippy::disallowed_methods,
-        reason = "The replacement convenience API delegates with an empty pre-write guard"
+        reason = "The replacement convenience API delegates with the caller pre-write guard"
     )]
     replace_suffix_if_unchanged_guarded(
         archive,
         offset,
         suffix,
         original,
-        &mut || Ok(()),
+        before_write,
         before_unlink,
     )
 }
@@ -838,6 +880,7 @@ __inventory_value_0
         synced: bool,
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn replace(
         archive: &Path,
         offset: u64,
@@ -884,6 +927,7 @@ __inventory_value_1
             )));
         }
         before_write().map_err(refused)?;
+        test_prewrite_hold().map_err(refused)?;
         let mut attempt = Attempt::default();
         let guard_refused = std::cell::Cell::new(false);
         let mut guard = || before_write().inspect_err(|_| guard_refused.set(true));

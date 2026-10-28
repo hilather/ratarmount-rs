@@ -22,19 +22,30 @@ const SPLICE_ENCODE_LEVEL: i32 = 3;
 
 #[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
-    static FRAME_SIZE_LIMIT: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+    static SEEK_TABLE_SIZE_LIMIT: std::cell::Cell<u64> = const { std::cell::Cell::new(u32::MAX as u64) };
+}
+
+/// Restore the previous per-thread seek-table size limit when dropped.
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct SeekTableLimitGuard(u64);
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for SeekTableLimitGuard {
+    fn drop(&mut self) {
+        SEEK_TABLE_SIZE_LIMIT.with(|limit| limit.set(self.0));
+    }
+}
+
+/// Exercise the oversized-frame publication route with a small fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn zstd_splice_seek_table_limit_for_test(limit: u64) -> SeekTableLimitGuard {
+    SeekTableLimitGuard(SEEK_TABLE_SIZE_LIMIT.with(|slot| slot.replace(limit)))
 }
 
 /// Exercise oversized splice publication without writing a 4 GiB test fixture.
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn with_splice_frame_size_limit<T>(limit: u32, run: impl FnOnce() -> T) -> T {
-    struct Reset(u32);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            FRAME_SIZE_LIMIT.with(|value| value.set(self.0));
-        }
-    }
-    let _reset = Reset(FRAME_SIZE_LIMIT.with(|value| value.replace(limit)));
+    let _reset = zstd_splice_seek_table_limit_for_test(u64::from(limit));
     run()
 }
 
@@ -149,21 +160,23 @@ where
 /// ([`crate::commit_journal::ReplaceError::RolledBack`]). It is published only
 /// while the archive is still exactly that stamp with no journal pending,
 /// under its lock ([`crate::commit_journal::guard_copy`]). On failure before
-/// persist the original inode is untouched.
+/// persist the original inode is untouched. `before_write` runs under that
+/// lock immediately before publication.
 pub fn splice_zstd_last_frames_replace<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
     reference: &std::fs::Metadata,
+    before_write: crate::commit_journal::BeforeWrite,
 ) -> Result<SpliceStats>
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
 {
     #[expect(
         clippy::disallowed_methods,
-        reason = "The copy splice convenience API delegates with an empty pre-publication guard"
+        reason = "The copy splice convenience API delegates with the caller pre-publication guard"
     )]
-    splice_zstd_last_frames_replace_guarded(path, from_idx, transform, reference, &mut || Ok(()))
+    splice_zstd_last_frames_replace_guarded(path, from_idx, transform, reference, before_write)
 }
 
 /// Copy splice with a caller guard under the archive lock immediately before
@@ -184,7 +197,7 @@ where
         .unwrap_or(Path::new("."));
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-B0277-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-B0277-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace_guarded","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
     )]
     let mut tmp = NamedTempFile::new_in(parent)?;
     crate::commit_journal::fault::point("copy source open")?;
@@ -216,12 +229,15 @@ where
     let method = crate::fastcopy::copy_range(&mut src, 0, tmp.as_file_mut(), 0, prefix)?;
     crate::fastcopy::log_commit_copy(prefix, method);
     let stats = write_zstd_splice_suffix(&mut src, &map, from_idx, transform, tmp.as_file_mut())?;
+    crate::fastcopy::preserve_archive_metadata(path, &source, tmp.as_file())?;
     tmp.as_file().sync_all()?;
     #[expect(
         clippy::disallowed_methods,
         reason = "The splice implementation holds the journal copy guard while publishing the staged archive"
     )]
     let _guard = crate::commit_journal::guard_copy(path, &source).map_err(CompressError::Io)?;
+    before_write()?;
+    crate::commit_journal::test_prewrite_hold()?;
     before_write()?;
     tmp.persist(path).map_err(|e| {
         CompressError::Msg(format!(
@@ -247,8 +263,14 @@ where
         clippy::disallowed_methods,
         reason = "The append convenience API delegates to the implementation with an empty unlink hook"
     )]
-    let result =
-        splice_zstd_last_frames_append_with(path, from_idx, transform, original, &mut |_| Ok(()));
+    let result = splice_zstd_last_frames_append_with(
+        path,
+        from_idx,
+        transform,
+        original,
+        &mut || Ok(()),
+        &mut |_| Ok(()),
+    );
     result
 }
 
@@ -257,12 +279,14 @@ where
 /// unlinked. `original` is the caller's snapshot of the archive (the file
 /// its gate judged): the source opened here must still be exactly that file,
 /// and the replacement compares it again under the archive lock. A failure
-/// of the journaled replacement is [`CompressError::Replace`].
+/// of the journaled replacement is [`CompressError::Replace`]. `before_write`
+/// runs under the archive lock before any mutation or copy publication.
 pub fn splice_zstd_last_frames_append_with<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
     original: &std::fs::Metadata,
+    before_write: crate::commit_journal::BeforeWrite,
     before_unlink: crate::commit_journal::BeforeUnlink,
 ) -> Result<SpliceStats>
 where
@@ -270,14 +294,14 @@ where
 {
     #[expect(
         clippy::disallowed_methods,
-        reason = "The append splice convenience API delegates with an empty pre-write guard"
+        reason = "The append splice convenience API delegates with the caller pre-write guard"
     )]
     splice_zstd_last_frames_append_guarded(
         path,
         from_idx,
         transform,
         original,
-        &mut || Ok(()),
+        before_write,
         before_unlink,
     )
 }
@@ -328,7 +352,7 @@ where
         // no-size-refusal rule: publish the staged suffix through copy/rename.
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0281-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-B0281-M01","item":"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_guarded","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
         )]
         let mut tmp = NamedTempFile::new_in(parent)?;
         let method = crate::fastcopy::copy_range(
@@ -341,6 +365,7 @@ where
         crate::fastcopy::log_commit_copy(stats.prefix_compressed_bytes, method);
         tail.as_file_mut().rewind()?;
         io::copy(tail.as_file_mut(), tmp.as_file_mut())?;
+        crate::fastcopy::preserve_archive_metadata(path, &source, tmp.as_file())?;
         tmp.as_file().sync_all()?;
         // Published only over the file the copy was read from, unchanged and
         // with no journal pending, under its lock.
@@ -349,6 +374,8 @@ where
             reason = "The oversized splice fallback holds the journal guard while publishing its staged copy"
         )]
         let _guard = crate::commit_journal::guard_copy(path, &source).map_err(CompressError::Io)?;
+        before_write()?;
+        crate::commit_journal::test_prewrite_hold()?;
         before_write()?;
         tmp.persist(path).map_err(|e| e.error)?;
         return Ok(stats);
@@ -396,7 +423,7 @@ fn maybe_rebuild_seek_table(
 ) -> Option<Vec<u8>> {
     map.seek_table.as_ref()?;
     #[cfg(any(test, feature = "test-hooks"))]
-    if FRAME_SIZE_LIMIT.with(|limit| new_comp.max(new_plain) > u64::from(limit.get())) {
+    if SEEK_TABLE_SIZE_LIMIT.with(|limit| new_comp > limit.get() || new_plain > limit.get()) {
         return None;
     }
     let mut entries = Vec::with_capacity(from_idx.saturating_add(1));
