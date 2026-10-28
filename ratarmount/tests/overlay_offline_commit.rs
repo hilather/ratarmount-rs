@@ -1075,6 +1075,8 @@ fn policy_locator(archive: &Path) -> Vec<u8> {
     match rustix::fs::getxattr(archive, "user.ratarmount.commit-journal", &mut bytes) {
         Ok(n) => bytes[..n].to_vec(),
         Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOENT) => Vec::new(),
+        #[cfg(target_os = "macos")]
+        Err(rustix::io::Errno::NOATTR) => Vec::new(),
         Err(e) => panic!("locator {}: {e}", archive.display()),
     }
 }

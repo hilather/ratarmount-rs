@@ -734,38 +734,55 @@ fn regression_checked_open_refuse_symlink_scans_all_names() {
     use std::os::unix::ffi::OsStringExt;
 
     for suffix in ["", "-journal", "-wal", "-shm"] {
-        let (_tmp, dir) = tempdir();
-        let db = dir.join(std::ffi::OsString::from_vec(
-            b"overlay-\xff.sqlite".to_vec(),
-        ));
-        let target = dir.join("target");
-        std::fs::write(&target, b"unchanged").unwrap();
-        let mut name = db.as_os_str().to_os_string();
-        name.push(suffix);
-        let name = PathBuf::from(name);
-        std::os::unix::fs::symlink(&target, &name).unwrap();
-        if !suffix.is_empty() {
-            assert!(!db.exists(), "only the companion exists");
+        for non_utf8 in [false, true] {
+            let (_tmp, dir) = tempdir();
+            let db_name = if non_utf8 {
+                std::ffi::OsString::from_vec(b"overlay-\xff.sqlite".to_vec())
+            } else {
+                std::ffi::OsString::from("overlay.sqlite")
+            };
+            let db = dir.join(db_name);
+            let target = dir.join("target");
+            std::fs::write(&target, b"unchanged").unwrap();
+            let mut name = db.as_os_str().to_os_string();
+            name.push(suffix);
+            let name = PathBuf::from(name);
+            match std::os::unix::fs::symlink(&target, &name) {
+                Ok(()) => {}
+                // APFS refuses non-UTF-8 names before the policy can inspect them.
+                Err(e)
+                    if cfg!(target_os = "macos")
+                        && non_utf8
+                        && e.raw_os_error() == Some(libc::EILSEQ) =>
+                {
+                    eprintln!("skip: filesystem rejects non-UTF-8 symlink names");
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            }
+            if !suffix.is_empty() {
+                assert!(!db.exists(), "only the companion exists");
+            }
+            assert!(
+                refuse_symlink(&db, RO).is_ok(),
+                "generic callers retain their policy"
+            );
+            let error = refuse_symlink(&db, RO | OpenFlags::SQLITE_OPEN_NOFOLLOW).unwrap_err();
+            assert_eq!(
+                error.sqlite_error().unwrap().extended_code,
+                rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+            );
+            let message = error.to_string();
+            assert!(message.contains(&name.display().to_string()), "{message}");
+            assert!(
+                message.contains("is a symlink; it must be a regular file"),
+                "{message}"
+            );
+            assert_eq!(std::fs::read_link(&name).unwrap(), target);
+            assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+            std::fs::remove_file(&name).unwrap();
+            assert!(refuse_symlink(&db, RO | OpenFlags::SQLITE_OPEN_NOFOLLOW).is_ok());
         }
-        assert!(
-            refuse_symlink(&db, RO).is_ok(),
-            "generic callers retain their policy"
-        );
-        let error = refuse_symlink(&db, RO | OpenFlags::SQLITE_OPEN_NOFOLLOW).unwrap_err();
-        assert_eq!(
-            error.sqlite_error().unwrap().extended_code,
-            rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
-        );
-        let message = error.to_string();
-        assert!(message.contains(&name.display().to_string()), "{message}");
-        assert!(
-            message.contains("is a symlink; it must be a regular file"),
-            "{message}"
-        );
-        assert_eq!(std::fs::read_link(&name).unwrap(), target);
-        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
-        std::fs::remove_file(&name).unwrap();
-        assert!(refuse_symlink(&db, RO | OpenFlags::SQLITE_OPEN_NOFOLLOW).is_ok());
     }
 }
 

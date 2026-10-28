@@ -7484,7 +7484,19 @@ fn regression_late_companion_held_metadata_read_preserves_policy() {
                         .path()
                         .join(std::ffi::OsString::from_vec(b"overlay-\xff".to_vec()));
                 }
-                fs::create_dir(&fx.overlay).unwrap();
+                match fs::create_dir(&fx.overlay) {
+                    Ok(()) => {}
+                    // APFS refuses non-UTF-8 names; keep the UTF-8 case running.
+                    Err(e)
+                        if cfg!(target_os = "macos")
+                            && non_utf8
+                            && e.raw_os_error() == Some(libc::EILSEQ) =>
+                    {
+                        eprintln!("skip: filesystem rejects non-UTF-8 overlay directory names");
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                }
                 let db = fx.overlay.join(HIDDEN_DB);
                 let conn = rusqlite::Connection::open(&db).unwrap();
                 let mode = if suffix == "-journal" {
@@ -7576,7 +7588,15 @@ fn regression_late_companion_non_utf8_metadata_read_preserves_policy() {
             let overlay = tmp
                 .path()
                 .join(std::ffi::OsString::from_vec(b"overlay-\xff".to_vec()));
-            fs::create_dir(&overlay).unwrap();
+            match fs::create_dir(&overlay) {
+                Ok(()) => {}
+                // APFS refuses the fixture before the policy can inspect it.
+                Err(e) if cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::EILSEQ) => {
+                    eprintln!("skip: filesystem rejects non-UTF-8 overlay directory names");
+                    return;
+                }
+                Err(e) => panic!("{e}"),
+            }
             let db = overlay.join(HIDDEN_DB);
             let conn = rusqlite::Connection::open(&db).unwrap();
             let mode = if suffix == "-journal" {
