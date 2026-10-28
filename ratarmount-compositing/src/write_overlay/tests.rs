@@ -1371,6 +1371,364 @@ fn regression_live_commit_refreshes_baseline() {
     }
 }
 
+#[cfg(unix)]
+mod archive_metadata_regressions {
+    use super::*;
+    use std::cell::Cell;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::rc::Rc;
+
+    struct FaultGuard;
+
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            ratarmount_compress::commit_journal::fault::clear();
+        }
+    }
+
+    fn assert_replaced(archive: &Path, before: &fs::Metadata) {
+        let after = File::open(archive).unwrap().metadata().unwrap();
+        assert_ne!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.mode() & 0o777, before.mode() & 0o777);
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+    }
+
+    fn set_mode(archive: &Path, mode: u32) -> fs::Metadata {
+        fs::set_permissions(archive, fs::Permissions::from_mode(mode)).unwrap();
+        File::open(archive).unwrap().metadata().unwrap()
+    }
+
+    fn ordinary_copy(route: &str) {
+        for extension in ["tar", "tar.zst"] {
+            if extension == "tar" {
+                if let Err(error) = ensure_gnu_tar() {
+                    eprintln!("skip: {error}");
+                    continue;
+                }
+            }
+            for mode in [0o644, 0o640] {
+                let dir = tempfile::tempdir().unwrap();
+                let archive = dir.path().join(format!("base.{extension}"));
+                let plain = pack_tar(&[ustar_file("old", b"original")]);
+                fs::write(
+                    &archive,
+                    if extension == "tar" {
+                        plain
+                    } else {
+                        concat_zstd_frames(&[&plain], true)
+                    },
+                )
+                .unwrap();
+                let before = set_mode(&archive, mode);
+                let base = if extension == "tar" {
+                    open_uncompressed_tar_base(&archive, false)
+                } else {
+                    open_tar_zst_base(&archive, false)
+                };
+                let overlay = dir.path().join("overlay");
+                let mut ov = WriteOverlay::new_for_tests(base, &overlay).unwrap();
+                ov.set_commit_mode(CommitMode::Copy);
+                fs::write(overlay.join("new"), b"new payload").unwrap();
+                match route {
+                    "offline" => {
+                        drop(ov);
+                        assert!(commit_overlay(
+                            &overlay,
+                            &archive,
+                            &CommitOverlayOptions {
+                                mode: CommitMode::Copy,
+                                ..yes_commit_opts()
+                            },
+                        )
+                        .unwrap());
+                    }
+                    "idle" => assert!(ov
+                        .commit_live_idle(&archive, Duration::ZERO, |path| {
+                            Ok(if extension == "tar" {
+                                open_uncompressed_tar_base(path, false)
+                            } else {
+                                open_tar_zst_base(path, false)
+                            })
+                        })
+                        .unwrap()),
+                    "atomic" => assert!(ov.commit_atomic(&archive).unwrap()),
+                    _ => unreachable!(),
+                }
+                let reopened = if extension == "tar" {
+                    open_uncompressed_tar_base(&archive, false)
+                } else {
+                    open_tar_zst_base(&archive, false)
+                };
+                assert_eq!(read_member(reopened.as_ref(), "/new"), b"new payload");
+                assert_eq!(read_member(reopened.as_ref(), "/old"), b"original");
+                assert_replaced(&archive, &before);
+            }
+        }
+    }
+
+    /// Regression: offline copy commits replaced 0644/0640 TAR and zstd archives with 0600 files.
+    #[test]
+    fn regression_235_archive_offline_copy_modes() {
+        ordinary_copy("offline");
+    }
+
+    /// Regression: live idle copy publication discarded the TAR/zstd archive's mode.
+    #[test]
+    fn regression_235_archive_live_idle_copy_modes() {
+        ordinary_copy("idle");
+    }
+
+    /// Regression: atomic copy publication discarded the TAR/zstd archive's mode.
+    #[test]
+    fn regression_235_archive_atomic_copy_modes() {
+        ordinary_copy("atomic");
+    }
+
+    /// Regression: provenance direct TAR copy publication discarded the archive's mode.
+    #[test]
+    fn regression_235_archive_provenance_copy_modes() {
+        for mode in [0o644, 0o640] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("base.tar");
+            provenance_fixture(&archive, false);
+            let before = set_mode(&archive, mode);
+            let overlay = dir.path().join("overlay");
+            let ov = WriteOverlay::new_for_tests(
+                Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+                &overlay,
+            )
+            .unwrap();
+            fs::write(overlay.join("new"), b"new payload").unwrap();
+            drop(ov);
+            assert!(commit_overlay(
+                &overlay,
+                &archive,
+                &CommitOverlayOptions {
+                    mode: CommitMode::Copy,
+                    manifest_hashes: Some("new".into()),
+                    ..yes_commit_opts()
+                },
+            )
+            .unwrap());
+            let reopened = provenance_base(&archive, "utf-8").unwrap();
+            assert_eq!(read_member(&reopened, "/new"), b"new payload");
+            assert_eq!(read_member(&reopened, "/trace"), b"training payload");
+            assert_replaced(&archive, &before);
+        }
+    }
+
+    /// Regression: provenance Auto's ENOSPC rollback/copy fallback published a 0600 TAR.
+    #[test]
+    fn regression_235_archive_provenance_auto_rollback_modes() {
+        for mode in [0o644, 0o640] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("base.tar");
+            fs::write(&archive, pack_tar(&[ustar_file("old", b"original")])).unwrap();
+            let before = set_mode(&archive, mode);
+            assert_eq!(before.nlink(), 1);
+            let overlay = dir.path().join("overlay");
+            let ov =
+                WriteOverlay::new_for_tests(open_uncompressed_tar_base(&archive, false), &overlay)
+                    .unwrap();
+            fs::write(overlay.join("new"), b"new payload").unwrap();
+            drop(ov);
+            let injected = Rc::new(Cell::new(false));
+            let rolled_back = Rc::new(Cell::new(false));
+            let (fault_injected, fault_rolled_back) = (injected.clone(), rolled_back.clone());
+            ratarmount_compress::commit_journal::fault::install(move |step| {
+                if step == "archive write" && !fault_injected.replace(true) {
+                    return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+                }
+                if step == "rollback unlink" {
+                    fault_rolled_back.set(true);
+                }
+                Ok(())
+            });
+            let _fault = FaultGuard;
+            assert!(commit_overlay(
+                &overlay,
+                &archive,
+                &CommitOverlayOptions {
+                    mode: CommitMode::Auto,
+                    manifest_hashes: Some("new".into()),
+                    ..yes_commit_opts()
+                },
+            )
+            .unwrap());
+            assert!(
+                injected.get(),
+                "the adds-only Auto route must attempt append"
+            );
+            assert!(
+                rolled_back.get(),
+                "the failed append must roll back before copying"
+            );
+            let reopened = provenance_base(&archive, "utf-8").unwrap();
+            assert_eq!(read_member(&reopened, "/new"), b"new payload");
+            assert_eq!(read_member(&reopened, "/old"), b"original");
+            assert_replaced(&archive, &before);
+        }
+    }
+
+    /// Regression: ZIP rebuilding replaced the archive's 0644/0640 mode with 0600.
+    #[test]
+    fn regression_235_archive_zip_copy_modes() {
+        for mode in [0o644, 0o640] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("base.zip");
+            write_sample_zip(
+                &archive,
+                &[
+                    ("old", b"original", CompressionMethod::Stored),
+                    ("nested/keep", b"keep", CompressionMethod::Deflated),
+                ],
+            );
+            let before = set_mode(&archive, mode);
+            let overlay = dir.path().join("overlay");
+            let ov = WriteOverlay::new_for_tests(Arc::new(NullBase), &overlay).unwrap();
+            fs::write(overlay.join("new"), b"new payload").unwrap();
+            drop(ov);
+            assert!(commit_overlay(&overlay, &archive, &yes_commit_opts()).unwrap());
+            let mut reopened = ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+            for (path, expected) in [
+                ("new", &b"new payload"[..]),
+                ("old", &b"original"[..]),
+                ("nested/keep", &b"keep"[..]),
+            ] {
+                let mut bytes = Vec::new();
+                reopened
+                    .by_name(path)
+                    .unwrap()
+                    .read_to_end(&mut bytes)
+                    .unwrap();
+                assert_eq!(bytes, expected);
+            }
+            assert_replaced(&archive, &before);
+        }
+    }
+
+    /// Regression: gzip/bzip2/xz recompression published private temporary permissions.
+    #[test]
+    fn regression_235_archive_recompress_modes() {
+        for format in [
+            CompressionFormat::Gzip,
+            CompressionFormat::Bzip2,
+            CompressionFormat::Xz,
+        ] {
+            for mode in [0o644, 0o640] {
+                let dir = tempfile::tempdir().unwrap();
+                let archive = dir.path().join("base.compressed");
+                let plain = dir.path().join("new.tar");
+                let expected = pack_tar(&[ustar_file("new", b"new payload")]);
+                fs::write(&plain, &expected).unwrap();
+                fs::write(&archive, b"old archive bytes").unwrap();
+                let before = set_mode(&archive, mode);
+                recompress_replace(&plain, &archive, format, &before).unwrap();
+                let file = File::open(&archive).unwrap();
+                let mut decoder: Box<dyn Read> = match format {
+                    CompressionFormat::Gzip => Box::new(flate2::read::MultiGzDecoder::new(file)),
+                    CompressionFormat::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(file)),
+                    CompressionFormat::Xz => Box::new(xz2::read::XzDecoder::new(file)),
+                    _ => unreachable!(),
+                };
+                let mut decoded = Vec::new();
+                decoder.read_to_end(&mut decoded).unwrap();
+                assert_eq!(decoded, expected);
+                assert_replaced(&archive, &before);
+            }
+        }
+    }
+
+    fn oversized_commit(fail_mode: bool) {
+        for mode in [0o644, 0o640] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("base.tar.zst");
+            let plain = pack_tar(&[ustar_file("old", b"original")]);
+            fs::write(&archive, concat_zstd_frames(&[&plain], true)).unwrap();
+            let before = set_mode(&archive, mode);
+            assert_eq!(before.nlink(), 1);
+            assert!(scan_zstd_frames_path(&archive)
+                .unwrap()
+                .seek_table
+                .is_some());
+            let old_bytes = fs::read(&archive).unwrap();
+            let overlay = dir.path().join("overlay");
+            let ov =
+                WriteOverlay::new_for_tests(open_tar_zst_base(&archive, false), &overlay).unwrap();
+            fs::write(overlay.join("new"), b"new payload").unwrap();
+            drop(ov);
+            let mode_attempted = Rc::new(Cell::new(false));
+            let copy_opens = Rc::new(Cell::new(0));
+            let (fault_mode_attempted, fault_copy_opens) =
+                (mode_attempted.clone(), copy_opens.clone());
+            ratarmount_compress::commit_journal::fault::install(move |step| {
+                if step == "copy source open" {
+                    fault_copy_opens.set(fault_copy_opens.get() + 1);
+                }
+                if step == "archive metadata mode"
+                    && !fault_mode_attempted.replace(true)
+                    && fail_mode
+                {
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                }
+                Ok(())
+            });
+            let _fault = FaultGuard;
+            let _size_limit = ratarmount_compress::zstd_splice_seek_table_limit_for_test(0);
+            let result = commit_overlay(
+                &overlay,
+                &archive,
+                &CommitOverlayOptions {
+                    mode: CommitMode::Auto,
+                    ..yes_commit_opts()
+                },
+            );
+            assert!(
+                mode_attempted.get(),
+                "the oversized publisher must restore mode"
+            );
+            assert_eq!(copy_opens.get(), 0, "Auto must not enter a copy fallback");
+            if fail_mode {
+                assert!(
+                    result.is_err(),
+                    "fchmod failure must abort commit: {result:?}"
+                );
+                let after = File::open(&archive).unwrap().metadata().unwrap();
+                assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+                assert_eq!(after.mode() & 0o777, mode);
+                assert_eq!(fs::read(&archive).unwrap(), old_bytes);
+                assert!(overlay.join("new").exists());
+            } else {
+                assert!(result.unwrap());
+                assert!(
+                    scan_zstd_frames_path(&archive)
+                        .unwrap()
+                        .seek_table
+                        .is_none(),
+                    "forced overflow must drop the footer"
+                );
+                let reopened = open_tar_zst_base(&archive, false);
+                assert_eq!(read_member(reopened.as_ref(), "/new"), b"new payload");
+                assert_eq!(read_member(reopened.as_ref(), "/old"), b"original");
+                assert_replaced(&archive, &before);
+            }
+        }
+    }
+
+    /// Regression: an oversized zstd append copy discarded the original archive's metadata.
+    #[test]
+    fn regression_235_archive_oversized_append_copy_modes() {
+        oversized_commit(false);
+    }
+
+    /// Regression: oversized zstd fchmod errors must abort rather than permit Auto copy fallback.
+    #[test]
+    fn regression_235_archive_oversized_append_mode_failure_no_fallback() {
+        oversized_commit(true);
+    }
+}
+
 /// Re-run test `name` in a child whose cwd is `cwd` and whose `TMPDIR` does
 /// not exist, so any scratch allocation in `$TMPDIR` fails (or, on a real
 /// host, would land on another filesystem). `vars` carry absolute inputs.

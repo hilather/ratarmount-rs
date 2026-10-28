@@ -12136,14 +12136,14 @@
       "metadata": {
         "category": "output-owner",
         "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
+          "basis": "NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.",
+          "policy": "private-named-temporary-file"
         },
         "disposition": "output-owner",
         "id": "IR-B0180-M01",
         "item": "ratarmount_compositing::write_overlay::persist_provenance_plan",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+        "mode_policy": "private-staging-then-source-archive-metadata",
+        "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -12151,7 +12151,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0180-M01\",\"item\":\"ratarmount_compositing::write_overlay::persist_provenance_plan\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0180-M01\",\"item\":\"ratarmount_compositing::write_overlay::persist_provenance_plan\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -12189,14 +12189,14 @@
       "metadata": {
         "category": "output-owner",
         "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
+          "basis": "NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.",
+          "policy": "private-named-temporary-file"
         },
         "disposition": "output-owner",
         "id": "IR-B0192-M01",
         "item": "ratarmount_compositing::write_overlay::rebuild_zip_with_overlay",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+        "mode_policy": "private-staging-then-source-archive-metadata",
+        "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -12204,7 +12204,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0192-M01\",\"item\":\"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0192-M01\",\"item\":\"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -12267,14 +12267,14 @@
       "metadata": {
         "category": "output-owner",
         "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
+          "basis": "NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.",
+          "policy": "private-named-temporary-file"
         },
         "disposition": "output-owner",
         "id": "IR-B0197-M01",
         "item": "ratarmount_compositing::write_overlay::recompress_replace",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+        "mode_policy": "private-staging-then-source-archive-metadata",
+        "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -12282,7 +12282,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0197-M01\",\"item\":\"ratarmount_compositing::write_overlay::recompress_replace\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0197-M01\",\"item\":\"ratarmount_compositing::write_overlay::recompress_replace\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -14336,14 +14336,14 @@
       "metadata": {
         "category": "output-owner",
         "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
+          "basis": "NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.",
+          "policy": "private-named-temporary-file"
         },
         "disposition": "output-owner",
         "id": "IR-B0281-M01",
         "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+        "mode_policy": "private-staging-then-source-archive-metadata",
+        "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -14351,7 +14351,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0281-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0281-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -14379,14 +14379,14 @@
       "metadata": {
         "category": "output-owner",
         "creation": {
-          "basis": "Retain the individually reviewed baseline creation and permission policy at this site.",
-          "policy": "unchanged-from-e6ca64e"
+          "basis": "NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.",
+          "policy": "private-named-temporary-file"
         },
         "disposition": "output-owner",
         "id": "IR-B0277-M01",
         "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace",
-        "mode_policy": "unchanged-from-e6ca64e",
-        "reason": "Preserve this reviewed output acquisition and its existing permissions."
+        "mode_policy": "private-staging-then-source-archive-metadata",
+        "reason": "Stage the replacement privately; restore accepted archive metadata by fd before publication (#235)."
       },
       "multiplicity": 1,
       "native_observed": true,
@@ -14394,7 +14394,7 @@
         "all-features",
         "default"
       ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0277-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace\",\"disposition\":\"output-owner\",\"mode_policy\":\"unchanged-from-e6ca64e\",\"category\":\"output-owner\",\"reason\":\"Preserve this reviewed output acquisition and its existing permissions.\",\"creation\":{\"policy\":\"unchanged-from-e6ca64e\",\"basis\":\"Retain the individually reviewed baseline creation and permission policy at this site.\"}}",
+      "reason": "internal-read:v1 {\"id\":\"IR-B0277-M01\",\"item\":\"ratarmount_compress::zstd_splice::splice_zstd_last_frames_replace\",\"disposition\":\"output-owner\",\"mode_policy\":\"private-staging-then-source-archive-metadata\",\"category\":\"output-owner\",\"reason\":\"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).\",\"creation\":{\"policy\":\"private-named-temporary-file\",\"basis\":\"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename.\"}}",
       "resolved": "<tempfile::file::NamedTempFile<std::fs::File>>::new_in",
       "rule_reason": "inventory-op:tempfile"
     },
@@ -21228,7 +21228,7 @@
     }
   ],
   "policy": {
-    "configuration": "6e2570b5629ec3c8786d5f154ed8e35f944667df4d7419e48daa94f45c430469",
+    "configuration": "32de62fa94448b5db0d3ee85f552d341b5512225c4a11dc8dc8dfb3c4aa540ca",
     "profiles": "f04aa50122d4ae1f0504b6411c5b47cacf3a97a9e3080e175166f3b744aa4bd8",
     "toolchain": {
       "compiler_revision": "88d9e12ae178fab0fb5cc050a94da85685d449ea",

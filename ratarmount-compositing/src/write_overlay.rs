@@ -5041,6 +5041,8 @@ impl WriteOverlay {
                 )));
             }
         }
+        ratarmount_compress::fastcopy::preserve_archive_metadata(archive, &source, tmp.as_file())
+            .map_err(|e| OverlayError::Msg(e.to_string()))?;
         tmp.as_file().sync_all()?;
         crate::journal_recovery::publish_over(
             archive,
@@ -6334,7 +6336,7 @@ fn persist_provenance_plan(
             .unwrap_or(Path::new("."));
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0180-M01","item":"ratarmount_compositing::write_overlay::persist_provenance_plan","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-B0180-M01","item":"ratarmount_compositing::write_overlay::persist_provenance_plan","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
         )]
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
         // The stamp checked against the gate is the one the copy publishes
@@ -6373,6 +6375,12 @@ fn persist_provenance_plan(
                 tmp.as_file_mut().rewind()?;
                 src.rewind()?;
                 rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
+                ratarmount_compress::fastcopy::preserve_archive_metadata(
+                    archive,
+                    &source,
+                    tmp.as_file(),
+                )
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
                 tmp.as_file().sync_all()?;
                 crate::journal_recovery::publish_over(
                     archive,
@@ -6395,6 +6403,12 @@ fn persist_provenance_plan(
         } else {
             let source = opened;
             rewrite_tar_suffix(&mut src, 0, &rewrite, tmp.as_file_mut())?;
+            ratarmount_compress::fastcopy::preserve_archive_metadata(
+                archive,
+                &source,
+                tmp.as_file(),
+            )
+            .map_err(|e| OverlayError::Msg(e.to_string()))?;
             tmp.as_file().sync_all()?;
             crate::journal_recovery::publish_over(
                 archive,
@@ -8416,7 +8430,7 @@ fn rebuild_zip_with_overlay(
         .unwrap_or(Path::new("."));
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-B0192-M01","item":"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-B0192-M01","item":"ratarmount_compositing::write_overlay::rebuild_zip_with_overlay","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
     )]
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
 
@@ -8500,6 +8514,8 @@ fn rebuild_zip_with_overlay(
             ))
         })?;
     }
+    ratarmount_compress::fastcopy::preserve_archive_metadata(zip_file, &source, tmp.as_file())
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
     tmp.as_file().sync_all()?;
 
     crate::journal_recovery::publish_over(
@@ -8790,6 +8806,12 @@ fn commit_overlay_tar(
                 "internal error: missing work temp for uncompressed offline commit".into(),
             )
         })?;
+        ratarmount_compress::fastcopy::preserve_archive_metadata(
+            tar_file,
+            &copy_source,
+            tmp.as_file(),
+        )
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
         tmp.as_file().sync_all()?;
         crate::journal_recovery::publish_over(
             tar_file,
@@ -8995,7 +9017,7 @@ fn recompress_replace(
         .unwrap_or(Path::new("."));
     #[expect(
         clippy::disallowed_methods,
-        reason = r###"internal-read:v1 {"id":"IR-B0197-M01","item":"ratarmount_compositing::write_overlay::recompress_replace","disposition":"output-owner","mode_policy":"unchanged-from-e6ca64e","category":"output-owner","reason":"Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"unchanged-from-e6ca64e","basis":"Retain the individually reviewed baseline creation and permission policy at this site."}}"###
+        reason = r###"internal-read:v1 {"id":"IR-B0197-M01","item":"ratarmount_compositing::write_overlay::recompress_replace","disposition":"output-owner","mode_policy":"private-staging-then-source-archive-metadata","category":"output-owner","reason":"Stage the replacement privately; restore accepted archive metadata by fd before publication (#235).","creation":{"policy":"private-named-temporary-file","basis":"NamedTempFile retains private staging defaults; the finished replacement inherits accepted source permission bits and permitted ownership by fd before rename."}}"###
     )]
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
 
@@ -9030,6 +9052,8 @@ fn recompress_replace(
         }
         out.flush()?;
     }
+    ratarmount_compress::fastcopy::preserve_archive_metadata(dest, source, tmp.as_file())
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
     tmp.as_file().sync_all()?;
 
     // Atomic replace on the same filesystem (parent chosen to match dest).

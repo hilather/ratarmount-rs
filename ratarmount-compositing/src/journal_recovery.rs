@@ -1137,6 +1137,12 @@ pub(crate) fn copy_source_changed(archive: &Path) -> io::Error {
 pub(crate) fn failed_splice(error: ratarmount_compress::CompressError) -> FailedReplace {
     match error {
         ratarmount_compress::CompressError::Replace(e) => failed_replace(e),
+        ratarmount_compress::CompressError::ArchiveMetadata(error) => FailedReplace {
+            error: OverlayError::Io(error),
+            may_copy: false,
+            rolled_back: None,
+            base_unusable: false,
+        },
         other => OverlayError::Msg(other.to_string()).into(),
     }
 }
@@ -1470,6 +1476,22 @@ mod tests {
             assert!(!commit_journal::journal_path(&archive).exists());
             assert!(commit_journal::pending(&archive).unwrap().is_none());
         }
+    }
+
+    /// Regression: archive metadata failures must not trigger Auto's copy fallback
+    /// or disable a live commit's still-unchanged base.
+    #[test]
+    fn regression_235_archive_metadata_failure_forbids_copy() {
+        let failed = failed_splice(ratarmount_compress::CompressError::ArchiveMetadata(
+            io::Error::from_raw_os_error(libc::EIO),
+        ));
+        assert!(!failed.may_copy);
+        assert!(failed.rolled_back.is_none());
+        assert!(!failed.base_unusable);
+        let OverlayError::Io(cause) = failed.error else {
+            panic!("archive metadata failure lost its I/O cause");
+        };
+        assert_eq!(cause.raw_os_error(), Some(libc::EIO));
     }
 
     struct BeforeOpenGuard(Option<Box<dyn FnOnce()>>);
