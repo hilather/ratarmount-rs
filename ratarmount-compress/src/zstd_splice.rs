@@ -153,12 +153,14 @@ where
 /// ([`crate::commit_journal::ReplaceError::RolledBack`]). It is published only
 /// while the archive is still exactly that stamp with no journal pending,
 /// under its lock ([`crate::commit_journal::guard_copy`]). On failure before
-/// persist the original inode is untouched.
+/// persist the original inode is untouched. `before_write` runs under that
+/// lock immediately before publication.
 pub fn splice_zstd_last_frames_replace<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
     reference: &std::fs::Metadata,
+    before_write: crate::commit_journal::BeforeWrite,
 ) -> Result<SpliceStats>
 where
     F: FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()>,
@@ -209,6 +211,8 @@ where
     )]
     let _guard = crate::commit_journal::guard_copy(path, &source)
         .map_err(|e| CompressError::Msg(e.to_string()))?;
+    before_write()?;
+    crate::commit_journal::test_prewrite_hold()?;
     tmp.persist(path).map_err(|e| {
         CompressError::Msg(format!(
             "Failed to replace '{}' after zstd splice: {}",
@@ -233,8 +237,14 @@ where
         clippy::disallowed_methods,
         reason = "The append convenience API delegates to the implementation with an empty unlink hook"
     )]
-    let result =
-        splice_zstd_last_frames_append_with(path, from_idx, transform, original, &mut |_| Ok(()));
+    let result = splice_zstd_last_frames_append_with(
+        path,
+        from_idx,
+        transform,
+        original,
+        &mut || Ok(()),
+        &mut |_| Ok(()),
+    );
     result
 }
 
@@ -243,12 +253,14 @@ where
 /// unlinked. `original` is the caller's snapshot of the archive (the file
 /// its gate judged): the source opened here must still be exactly that file,
 /// and the replacement compares it again under the archive lock. A failure
-/// of the journaled replacement is [`CompressError::Replace`].
+/// of the journaled replacement is [`CompressError::Replace`]. `before_write`
+/// runs under the archive lock before any mutation or copy publication.
 pub fn splice_zstd_last_frames_append_with<F>(
     path: &Path,
     from_idx: usize,
     transform: F,
     original: &std::fs::Metadata,
+    before_write: crate::commit_journal::BeforeWrite,
     before_unlink: crate::commit_journal::BeforeUnlink,
 ) -> Result<SpliceStats>
 where
@@ -310,6 +322,8 @@ where
         )]
         let _guard = crate::commit_journal::guard_copy(path, &source)
             .map_err(|e| CompressError::Msg(e.to_string()))?;
+        before_write()?;
+        crate::commit_journal::test_prewrite_hold()?;
         tmp.persist(path).map_err(|e| e.error)?;
         return Ok(stats);
     }
@@ -322,6 +336,7 @@ where
         stats.prefix_compressed_bytes,
         tail.as_file_mut(),
         original,
+        before_write,
         before_unlink,
     )
     .map_err(CompressError::Replace)?;

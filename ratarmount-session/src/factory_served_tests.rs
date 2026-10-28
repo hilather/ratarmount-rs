@@ -606,3 +606,40 @@ fn regression_served_without_indexing_symlinks_dangling_and_fifo() {
     let err = served_without_indexing(&fifo, &[]).unwrap_err();
     assert!(err.contains("neither a file nor a directory"), "{err}");
 }
+
+/// Regression: ordinary archive reads must not acquire an archive flock,
+/// which requires write access for exclusive locks on NFS and can prohibit
+/// backend reads through other descriptors on CIFS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_240_source_open_does_not_acquire_archive_flock() {
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("base.tar");
+    tar(&path);
+    let locked = std::fs::File::open(&path).unwrap();
+    assert_eq!(unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let (done_tx, done_rx) = mpsc::channel();
+    let opening = std::thread::spawn(move || {
+        let options = OpenOptions {
+            recover_journals: false,
+            ..options()
+        };
+        let opened = open_path_impl(&path, &options, false, true, &mut false);
+        done_tx
+            .send(opened.map(|opened| opened.source.lookup("/f", 0)))
+            .unwrap();
+    });
+    let result = done_rx.recv_timeout(Duration::from_secs(10));
+    // Release and join on failure too, so the red control leaves no thread
+    // blocked on an archive lock held by its own test process.
+    assert_eq!(unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_UN) }, 0);
+    opening.join().unwrap();
+    assert!(result
+        .expect("factory open waited for the archive flock")
+        .unwrap()
+        .is_some());
+}

@@ -31,6 +31,14 @@ pub mod overlay_meta;
 mod overlay_policy;
 #[cfg(unix)]
 pub mod overlay_seal;
+#[cfg(not(unix))]
+#[path = "overlay_seal_unsupported.rs"]
+pub mod overlay_seal;
+// Exercise the fail-closed platform implementation in the ordinary test lane.
+#[cfg(all(test, unix))]
+#[path = "overlay_seal_unsupported.rs"]
+#[allow(dead_code)]
+mod overlay_seal_unsupported_tests;
 mod path_intern;
 mod payload;
 mod prefix;
@@ -100,11 +108,12 @@ pub use union::{UnionMountOptions, UnionMountSource};
 pub use unopened::UnopenedSource;
 pub use versioning::FileVersionLayer;
 pub use write_overlay::{
-    commit_overlay, commit_overlay_raw_dir, is_control_reserved_path, is_overlay_internal_path,
-    live_commit_is_supported, lost_record_error, name_suggests_tar_zst, overlay_atime,
-    overlay_db_absent, overlay_db_entry, overlay_only_names, patch_sidecar_if_present,
-    sidecar_path_for_patch, CommitKind, CommitMode, CommitOutcome, CommitOverlayOptions, DbEntry,
-    IndexPatchWindow, OverlayError, OverlayMetadata, OverlayMutation, OverlayPolicy, Parked,
-    RawDirCommit, RemoteDownload, RemoteObjectHead, RemotePublishError, RemotePublishRequest,
-    WriteOverlay, HIDDEN_DB, LEGACY_OVERLAY_MARKER, OVERLAY_MARKER,
+    commit_overlay, commit_overlay_raw_dir, ensure_overlay_unsealed, is_control_reserved_path,
+    is_overlay_internal_path, live_commit_is_supported, lost_record_error, name_suggests_tar_zst,
+    overlay_atime, overlay_db_absent, overlay_db_entry, overlay_only_names,
+    patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitMode, CommitOutcome,
+    CommitOverlayOptions, DbEntry, IndexPatchWindow, OverlayCommitGuard, OverlayError,
+    OverlayMetadata, OverlayMutation, OverlayPolicy, Parked, RawDirCommit, RemoteDownload,
+    RemoteObjectHead, RemotePublishError, RemotePublishRequest, WriteOverlay, HIDDEN_DB,
+    LEGACY_OVERLAY_MARKER, OVERLAY_MARKER,
 };

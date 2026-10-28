@@ -32,6 +32,7 @@ fn regression_235_archive_owner_errors_and_group_restoration() {
                 output.write_all(b"changed")
             },
             source,
+            &mut || Ok(()),
         )
     }
 

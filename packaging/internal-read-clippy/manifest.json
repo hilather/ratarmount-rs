@@ -968,6 +968,33 @@
       "rule_reason": "inventory-op:ManagedReadCursor::open"
     },
     {
+      "configured_path": "ratarmount_index::managed_read::ManagedReadCursor::open",
+      "item": "<ratarmount_compositing::overlay_meta::SealArchive>::open",
+      "leaf_digest": "10d611c42a29bd809a514583edb0bf5d05477d6b9cfef350e441d07f66be38de",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "managed-read",
+        "creation": {
+          "basis": "Read an existing archive through SQLite VFS without creating it or taking its archive lock.",
+          "policy": "none"
+        },
+        "disposition": "managed-read",
+        "id": "IR-V4-SEAL-READER",
+        "item": "<ratarmount_compositing::overlay_meta::SealArchive>::open",
+        "reason": "Bind seal digest reads to one SQLite-managed byte reader so disposal preserves in-process reader locks.",
+        "regression": "regression_240_reader_transaction_survives_seal_and_commit"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-V4-SEAL-READER\",\"item\":\"<ratarmount_compositing::overlay_meta::SealArchive>::open\",\"disposition\":\"managed-read\",\"category\":\"managed-read\",\"regression\":\"regression_240_reader_transaction_survives_seal_and_commit\",\"reason\":\"Bind seal digest reads to one SQLite-managed byte reader so disposal preserves in-process reader locks.\",\"creation\":{\"policy\":\"none\",\"basis\":\"Read an existing archive through SQLite VFS without creating it or taking its archive lock.\"}}",
+      "resolved": "<ratarmount_index::managed_read::ManagedReadCursor>::open",
+      "rule_reason": "inventory-op:ManagedReadCursor::open"
+    },
+    {
       "item": "<ratarmount_compositing::write_overlay::WriteOverlay as ratarmount_core::MountSource<ratarmount_compositing::write_overlay::WriteOverlay>>::open",
       "leaf_digest": "d9af744960177b31326bf1d0ab17dc67e4b437bd1aa7af0bae93acbcd4ed0b4d",
       "lint": "clippy::disallowed_methods",
@@ -10882,7 +10909,7 @@
       "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
       "item": "ratarmount_compositing::journal_recovery::replace_committing",
       "journal_exemption": true,
-      "leaf_digest": "efcf1d057a73a9144b4d4f047c850886baecceb20cc8dbfe581ec67b54937fa3",
+      "leaf_digest": "f8a7f2e7b35dd7bced4c3e3a94c1bff8da83d78e1c6817298d753198d18bc504",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -10898,7 +10925,7 @@
       "configured_path": "ratarmount_compress::splice_zstd_last_frames_append_with",
       "item": "ratarmount_compositing::journal_recovery::splice_append_committing",
       "journal_exemption": true,
-      "leaf_digest": "fa986198be38709b799b786193b3b42b4bed8fa5d9aad7dabf634677e42524f4",
+      "leaf_digest": "084e4606e7359ce94fd7efa837ae72245a0ba57b55f63896d8e60be77792db5f",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -10914,7 +10941,7 @@
       "configured_path": "ratarmount_compress::splice_zstd_last_frames_replace",
       "item": "ratarmount_compositing::journal_recovery::splice_replace_over",
       "journal_exemption": true,
-      "leaf_digest": "f1c790e05bdc6567c58c47231559a82e96bcf2e0b9f17456c35146996d7fae32",
+      "leaf_digest": "97b8e20208e2d17dca891ce9c1c4fc7e69b08d15cd1cd5e78a21cfa3f15f057a",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -11236,32 +11263,6 @@
       "rule_reason": "inventory-op:ManagedReadCursor::open"
     },
     {
-      "configured_path": "rustix::fs::openat",
-      "item": "ratarmount_compositing::overlay_seal::chmod_tree",
-      "leaf_digest": "6d7b3ab422ca4ce49ff65382433882083576f60aa2a5488fbfff252fd6167e2a",
-      "lint": "clippy::disallowed_methods",
-      "metadata": {
-        "category": "directory-handle-or-durability",
-        "creation": {
-          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
-          "policy": "none"
-        },
-        "disposition": "out-of-family",
-        "id": "IR-B0157-M01",
-        "item": "ratarmount_compositing::overlay_seal::chmod_tree",
-        "reason": "O_DIRECTORY handle for a descriptor-relative walk; no file content read"
-      },
-      "multiplicity": 1,
-      "native_observed": true,
-      "profiles": [
-        "all-features",
-        "default"
-      ],
-      "reason": "internal-read:v1 {\"id\":\"IR-B0157-M01\",\"item\":\"ratarmount_compositing::overlay_seal::chmod_tree\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
-      "resolved": "rustix::fs::at::openat",
-      "rule_reason": "inventory-op:rustix::openat"
-    },
-    {
       "configured_path": "ratarmount_core::db_inodes::openat_admitted",
       "item": "ratarmount_compositing::overlay_seal::open_sentinel",
       "leaf_digest": "aeea209e3749803f933e5510658618a15ff21b519195b008699422a759a6b658",
@@ -11314,6 +11315,32 @@
       "reason": "internal-read:v1 {\"id\":\"IR-B0156-M01\",\"item\":\"ratarmount_compositing::overlay_seal::root\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
       "resolved": "rustix::fs::abs::open",
       "rule_reason": "inventory-op:rustix::open"
+    },
+    {
+      "configured_path": "rustix::fs::openat",
+      "item": "ratarmount_compositing::overlay_seal::walk_chmod",
+      "leaf_digest": "57067b0d476392f46fbee2d97ae524b6567091bc2dc3503fea643fac4f0e2b42",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "directory-handle-or-durability",
+        "creation": {
+          "basis": "Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.",
+          "policy": "none"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-B0157-M01",
+        "item": "ratarmount_compositing::overlay_seal::walk_chmod",
+        "reason": "O_DIRECTORY handle for a descriptor-relative walk; no file content read"
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features",
+        "default"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-B0157-M01\",\"item\":\"ratarmount_compositing::overlay_seal::walk_chmod\",\"disposition\":\"out-of-family\",\"category\":\"directory-handle-or-durability\",\"reason\":\"O_DIRECTORY handle for a descriptor-relative walk; no file content read\",\"creation\":{\"policy\":\"none\",\"basis\":\"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname.\"}}",
+      "resolved": "rustix::fs::at::openat",
+      "rule_reason": "inventory-op:rustix::openat"
     },
     {
       "configured_path": "tempfile::Builder::tempfile_in",
@@ -12658,6 +12685,31 @@
       "reason": "The recovery API delegates to its guarded implementation with an empty extra guard",
       "resolved": "ratarmount_compress::commit_journal::recover_guarded",
       "rule_reason": "recover through ratarmount_compositing::recover_journal_at with an Owner"
+    },
+    {
+      "configured_path": "std::fs::write",
+      "item": "ratarmount_compress::commit_journal::test_marker",
+      "leaf_digest": "d59414e0f6869d7f0de52e951ebd2f337bb7642bb2cb5a6f42cbd4cc9b1b1e0e",
+      "lint": "clippy::disallowed_methods",
+      "metadata": {
+        "category": "feature-test-hook",
+        "creation": {
+          "basis": "The test-hooks marker is explicit instrumentation output written with fs::write and ordinary umask permissions.",
+          "policy": "create-or-truncate"
+        },
+        "disposition": "out-of-family",
+        "id": "IR-238-V2-M01",
+        "item": "ratarmount_compress::commit_journal::test_marker",
+        "reason": "Publish explicit readiness output for the prewrite regression hold."
+      },
+      "multiplicity": 1,
+      "native_observed": true,
+      "profiles": [
+        "all-features"
+      ],
+      "reason": "internal-read:v1 {\"id\":\"IR-238-V2-M01\",\"item\":\"ratarmount_compress::commit_journal::test_marker\",\"disposition\":\"out-of-family\",\"category\":\"feature-test-hook\",\"reason\":\"Publish explicit readiness output for the prewrite regression hold.\",\"creation\":{\"policy\":\"create-or-truncate\",\"basis\":\"The test-hooks marker is explicit instrumentation output written with fs::write and ordinary umask permissions.\"}}",
+      "resolved": "std::fs::write",
+      "rule_reason": "inventory-op:fs::write"
     },
     {
       "configured_path": "std::fs::File::open",
@@ -14151,7 +14203,7 @@
       "configured_path": "ratarmount_compress::splice_zstd_last_frames_append_with",
       "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append",
       "journal_exemption": true,
-      "leaf_digest": "2f30d180db13fb8f969ee53046412da9764624f44a92316b39865f19fca49159",
+      "leaf_digest": "b04de324d41fa01b75c293551b9a798e89b5f2528e5a8c71bd7329678de39cbc",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,
@@ -14167,7 +14219,7 @@
       "configured_path": "ratarmount_compress::commit_journal::replace_suffix_if_unchanged_with",
       "item": "ratarmount_compress::zstd_splice::splice_zstd_last_frames_append_with",
       "journal_exemption": true,
-      "leaf_digest": "69cf8c9780946a48ffecdaa762c2d13adb7734b3920dd669ba2bc52bce6cc964",
+      "leaf_digest": "8dd5b33f12d9b55c5639affc3a4bf95247aab4f0542ac8f2d76d2317e3b699bd",
       "lint": "clippy::disallowed_methods",
       "multiplicity": 1,
       "native_observed": true,

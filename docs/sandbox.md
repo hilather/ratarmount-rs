@@ -159,7 +159,7 @@ The stored result has the `sha256:` prefix.
 
 A local archive gets a streaming SHA-256 of all file bytes, but never on the
 mount's critical path. If an existing writable archive index holds the digest
-for the same canonical path, size, nanosecond mtime, and inode, creation
+for the same canonical path, size, nanosecond mtime, device, and inode, creation
 records it as `strong` at once. Otherwise creation records
 `base_digest_kind = pending` (empty `base_digest`, no `stack_digest`, the
 base's size and mtime as usual) and the mount hashes the archive on a
@@ -595,11 +595,53 @@ no excludes, and `.git` included. `--json` prints `layer_digest` and `sealed_at`
 plain output is the digest. Repeating seal prints the recorded digest and exits
 0 even if the base is no longer available; use verify to check integrity.
 
+Seal, unseal and archive commits serialize with an exclusive directory flock
+(`flock`, `LOCK_EX`) on an `O_RDONLY | O_DIRECTORY` descriptor of the overlay
+root itself. Acquiring it needs no directory write permission, creates no file,
+and changes no mode. Commit holds it through recovery, confirmation, archive
+publication and baseline refresh, then releases it. Live, on-exit, remote
+interval and member-recovery entries take the same lock and inspect sealing
+through their existing overlay connection; live commits retain it through
+reopen and cleanup. The order is always overlay lock, then the existing archive
+guard. Commit rechecks `layer_sealed` under the overlay lock before its first
+archive write. A seal that starts during commit waits, then either seals the
+completed base or refuses a changed base with a reopen/retry message.
+
+Raw overlay directories (without an overlay database) take the same directory
+lock, including roots with mode `0555`. Seal holds the overlay lock through base
+resolution, digest calculation and publication, and never acquires the archive
+guard. Source opening takes no archive flock. The lock belongs to the overlay,
+so naming different copies of an archive does not bypass seal/commit
+serialization. An obsolete `.ratarmount.overlay.seal-commit.lock` file is
+ignored and left in place; it remains hidden from mounted content, change
+hashes, archive publication and packed bundles.
+
+Seal strips only write bits from the root mode, preserving its other permission
+and special bits; unseal restores write access. Both change modes only for their
+own transition while holding the directory lock. Repeating seal and an unseal
+refused by a busy database leave modes unchanged. Seal and unseal are Unix-only
+and refuse on unsupported platforms; archive commit retains its existing
+non-Unix behavior.
+
+Seal uses a SQLite-managed byte reader for its base digest, with pathname,
+inode, size, mtime/ctime and moved-file checks before hashing or cache lookup
+and before publishing the seal. Cache identity includes device and inode;
+legacy cache rows without a device are rehashed. Closing the managed reader
+preserves this SQLite instance's live reader locks.
+
+Commit-journal descriptor handling retains the existing behavior; it does not
+reserve archives through a writable SQLite VFS open. Recovery can reopen a
+zero-length archive after a crash during offset-0 truncation, including the
+first append to an empty TAR, restore the original bytes and clear the journal.
+
+Sealing over a split archive is not supported. Join the parts into one archive
+file and seal that.
+
 Before chmod, the same transaction records per-path hashes in `seal_rows`,
 `sealed_at`, `layer_digest`, and each materialized entry's permission bits in
 `overlay_metadata.mode` where no override exists. Thus lookup and directory
 listing modes stay unchanged. Seal removes host write bits recursively from
-files, directories, and the database, with the overlay root last; it skips
+payload files, directories, and the database, with the overlay root last; it skips
 symlinks and never follows them. `.ratarmount-sealed` contains the digest and
 is hidden from mounted listings. Sealed layers are accepted by `--lower` and
 `diff --strict`; writable mounts with `-w` are refused.

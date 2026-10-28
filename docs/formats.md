@@ -221,6 +221,9 @@ disk speeds. Full methodology, CSV and caveats:
 
 ## Known limits
 
+Sealing over a split archive is not supported. Join the parts into one archive
+file and seal that.
+
 The complete status against the Python original is in the
 [parity checklist](parity-todo.md). The practical limits by area:
 

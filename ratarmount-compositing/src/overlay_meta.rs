@@ -953,6 +953,71 @@ let cursor = ratarmount_index::managed_read::ManagedReadCursor::open(path)?;
         }
         Ok(digest)
     }
+
+    /// Bind seal hashing (including cache hits) to its managed byte reader.
+    pub(crate) fn hash_seal(&self, guard: &SealArchive) -> Result<String> {
+        guard.check_path(&self.path)?;
+        if !self.stamp_matches()? {
+            return Err(OverlayError::Msg("base changed before sealing".into()));
+        }
+        let stamp = ArchiveDigestStamp::from_metadata(guard.metadata())?;
+        let digest = ratarmount_index::cached_archive_digest_cancellable_for_snapshot(
+            &self.path,
+            self.index.as_deref(),
+            &stamp,
+            &|| Ok(()),
+            |path| {
+                test_hash_seam(path);
+                guard.check_path(path)?;
+                let digest = sha256_hex_stream(&mut guard.reader.independent_cursor())?;
+                guard.check_path(path)?;
+                Ok(digest)
+            },
+        )
+        .map_err(|e| OverlayError::Msg(format!("cannot hash base {}: {e}", self.path.display())))?;
+        guard.check_path(&self.path)?;
+        Ok(digest)
+    }
+}
+
+/// A seal's byte source, without an archive lock or a raw descriptor close.
+/// The overlay lock excludes commit; the stamp and VFS moved-file check bind
+/// hashing/cache lookup and publication to this one archive file.
+pub(crate) struct SealArchive {
+    reader: ratarmount_index::managed_read::ManagedReadCursor,
+    metadata: fs::Metadata,
+}
+
+impl SealArchive {
+    pub(crate) fn open(path: &Path, metadata: fs::Metadata) -> std::io::Result<Self> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-V4-SEAL-READER","item":"<ratarmount_compositing::overlay_meta::SealArchive>::open","disposition":"managed-read","category":"managed-read","regression":"regression_240_reader_transaction_survives_seal_and_commit","reason":"Bind seal digest reads to one SQLite-managed byte reader so disposal preserves in-process reader locks.","creation":{"policy":"none","basis":"Read an existing archive through SQLite VFS without creating it or taking its archive lock."}}"###
+        )]
+        let reader = ratarmount_index::managed_read::ManagedReadCursor::open(path)?;
+        let archive = Self { reader, metadata };
+        archive.check_path(path)?;
+        Ok(archive)
+    }
+
+    pub(crate) fn metadata(&self) -> &fs::Metadata {
+        &self.metadata
+    }
+
+    pub(crate) fn check_path(&self, path: &Path) -> std::io::Result<()> {
+        if self.reader.has_moved()?
+            || self.reader.len()? != self.metadata.len()
+            || !ratarmount_compress::commit_journal::same_stamp(
+                &self.metadata,
+                &fs::metadata(path)?,
+            )
+        {
+            return Err(std::io::Error::other(
+                "archive changed while sealing; reopen it and retry sealing",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Test seam, read only where a full archive hash really starts: append one
@@ -1121,13 +1186,14 @@ pub(crate) fn resolve_pending_base_digest_for(
     conn: &Connection,
     base: Option<&crate::ClassifiedBase>,
 ) -> Result<bool> {
-    resolve_pending_base_digest_required(conn, base, false)
+    resolve_pending_base_digest_required(conn, base, false, None)
 }
 
 pub(crate) fn resolve_pending_base_digest_required(
     conn: &Connection,
     base: Option<&crate::ClassifiedBase>,
     required: bool,
+    archive_guard: Option<&SealArchive>,
 ) -> Result<bool> {
     let Some(meta) = OverlayMeta::from_connection_required(conn, required)? else {
         return Ok(false);
@@ -1148,7 +1214,10 @@ pub(crate) fn resolve_pending_base_digest_required(
             }
         }
     }
-    let digest = pending.hash(&|| Ok(()))?;
+    let digest = match archive_guard {
+        Some(guard) => pending.hash_seal(guard)?,
+        None => pending.hash(&|| Ok(()))?,
+    };
     record_base_digest_required(conn, &pending, &digest, required)
 }
 

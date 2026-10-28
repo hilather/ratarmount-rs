@@ -9,6 +9,7 @@ fn commit_overlay(
     archive_file: impl AsRef<Path>,
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
+    let _seal_commit = SealCommitGuard::acquire(write_overlay.as_ref())?;
     commit_overlay_inner(write_overlay.as_ref(), archive_file.as_ref(), None, opts)
 }
 
@@ -16,6 +17,114 @@ use ratarmount_compress::{open_seekable_bzip2, open_seekable_xz};
 use std::process::Command as StdCommand;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+#[cfg(unix)]
+fn regression_240_overlay_lock_held(root: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let file = File::open(root).unwrap();
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) }, 0);
+        false
+    } else {
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+        true
+    }
+}
+
+/// Regression: live and on-exit commits must take the overlay flock before
+/// their archive guard and retain it through publication, reopen and cleanup.
+#[cfg(unix)]
+#[test]
+fn regression_240_live_commit_holds_overlay_lock_through_publication() {
+    use ratarmount_compress::commit_journal::fault;
+
+    for live in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("old", b"original")]);
+        let before = fs::read(&archive).unwrap();
+        let overlay = dir.path().join("overlay");
+        let mut ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        ov.set_commit_mode(CommitMode::Append);
+        fs::write(overlay.join("new"), b"committed").unwrap();
+        let reached_archive = Arc::new(AtomicBool::new(false));
+        let reached = reached_archive.clone();
+        let locked_overlay = overlay.clone();
+        fault::install(move |step| {
+            if matches!(step, "before replace" | "copy publish") {
+                assert!(regression_240_overlay_lock_held(&locked_overlay));
+                reached.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        let result = if live {
+            ov.commit_live(&archive, |path| {
+                assert!(regression_240_overlay_lock_held(&overlay));
+                reopen_tar_zst(path, false)
+            })
+        } else {
+            ov.commit_atomic(&archive)
+        };
+        fault::clear();
+        assert!(result.unwrap(), "live={live}");
+        assert!(reached_archive.load(Ordering::SeqCst), "live={live}");
+        assert_ne!(fs::read(&archive).unwrap(), before, "live={live}");
+        assert_eq!(overlay.join("new").exists(), !live);
+        assert!(!regression_240_overlay_lock_held(&overlay));
+    }
+}
+
+/// Regression: mounted commit/recovery entries must recheck sealing through
+/// their own connection after taking the overlay flock, before archive writes.
+#[cfg(unix)]
+#[test]
+fn regression_240_live_entries_recheck_seal_under_overlay_lock() {
+    for entry in ["atomic", "live", "remote_interval", "recovery"] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("base.tar");
+        fs::write(&archive, pack_tar(&[ustar_file("old", b"original")])).unwrap();
+        let before = fs::read(&archive).unwrap();
+        let overlay = dir.path().join("overlay");
+        let ov = Arc::new(overlay_with_base(Arc::new(NullBase), &overlay));
+        fs::write(overlay.join("new"), b"must not be committed").unwrap();
+        drop(SealCommitGuard::acquire(&overlay).unwrap());
+        // Keep the worker between acquiring the directory lock and inspecting its
+        // connection. Unlike a timing-only assertion, the flock probe below
+        // proves it reached that operation boundary before the seal is set.
+        let db = ov.db.lock().unwrap();
+        let committing = ov.clone();
+        let target = archive.clone();
+        let operation = std::thread::spawn(move || match entry {
+            "atomic" => committing.commit_atomic(&target),
+            "live" => committing.commit_live(&target, |_| panic!("sealed commit reopened base")),
+            "remote_interval" => committing.commit_remote_interval(Duration::ZERO, |_| {
+                panic!("sealed remote commit reopened base")
+            }),
+            _ => committing.recover_member_journal(&target).map(|_| false),
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut locked = false;
+        while std::time::Instant::now() < deadline {
+            if regression_240_overlay_lock_held(&overlay) {
+                locked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        crate::OverlayMeta::set(&db, "sealed_at", "test seal before commit check").unwrap();
+        drop(db);
+        let error = operation.join().unwrap().unwrap_err();
+        assert!(
+            locked,
+            "{entry} did not acquire the overlay lock before checking its database"
+        );
+        assert!(error.to_string().contains("is sealed"), "{entry}: {error}");
+        assert_eq!(fs::read(&archive).unwrap(), before, "{entry}");
+        assert!(!ratarmount_compress::commit_journal::journal_path(&archive).exists());
+        assert!(!regression_240_overlay_lock_held(&overlay));
+    }
+}
 
 /// Regression: a panicking policy must not poison every subsequent mutation.
 #[test]
@@ -1515,7 +1624,7 @@ mod archive_metadata_regressions {
                 fs::write(&plain, &expected).unwrap();
                 fs::write(&archive, b"old archive bytes").unwrap();
                 let before = set_mode(&archive, mode);
-                recompress_replace(&plain, &archive, format, &before).unwrap();
+                recompress_replace(&plain, &archive, format, &before, &mut || Ok(())).unwrap();
                 let file = File::open(&archive).unwrap();
                 let mut decoder: Box<dyn Read> = match format {
                     CompressionFormat::Gzip => Box::new(flate2::read::MultiGzDecoder::new(file)),
@@ -1666,7 +1775,7 @@ fn regression_134_recompress_replace_bare_name_stages_beside_dest() {
             // The replace is gated on the stamp of an existing `dest`.
             fs::write(dest, b"old").unwrap();
             let source = fs::metadata(dest).unwrap();
-            recompress_replace(&plain, Path::new(dest), fmt, &source)
+            recompress_replace(&plain, Path::new(dest), fmt, &source, &mut || Ok(()))
                 .unwrap_or_else(|e| panic!("{dest}: {e}"));
             assert!(fs::metadata(dest).unwrap().len() > 0);
         }
@@ -2544,6 +2653,70 @@ fn commit_overlay_append_auto_requires_seek_table() {
         assert_eq!(
             read_member(open_tar_zst_base(&archive, false).as_ref(), "/new"),
             b"new bytes"
+        );
+    }
+}
+
+/// Regression: the first append to an empty TAR truncates at offset 0; recovery
+/// must still open that zero-length archive, restore its EOF blocks and clear
+/// the journal before the pending overlay can be committed again.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_240_empty_tar_offset_zero_crash_recovers() {
+    use ratarmount_compress::commit_journal::{fault, journal_path, recover};
+
+    for empty_len in [1024, 10240] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("empty.tar");
+        let original = vec![0; empty_len];
+        fs::write(&archive, &original).unwrap();
+        let root = dir.path().join("ov");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("first"), b"first committed member").unwrap();
+        let options = CommitOverlayOptions {
+            mode: CommitMode::Append,
+            ..yes_commit_opts()
+        };
+        let truncated = Arc::new(AtomicBool::new(false));
+        let reached = truncated.clone();
+        let target = archive.clone();
+        fault::install(move |step| match step {
+            "archive truncate" => {
+                assert_eq!(
+                    fs::metadata(&target).unwrap().len(),
+                    0,
+                    "the first empty-TAR commit must rewrite from offset 0"
+                );
+                reached.store(true, Ordering::SeqCst);
+                Err(io::Error::other("crash after offset-0 truncation"))
+            }
+            // Preserve the on-disk crash state instead of rolling back in
+            // the committing process, so recovery must reopen the empty file.
+            "before cleanup" => Err(io::Error::other("process stopped before cleanup")),
+            _ => Ok(()),
+        });
+        let crashed = commit_overlay(&root, &archive, &options);
+        fault::clear();
+        assert!(crashed.is_err(), "{crashed:?}");
+        assert!(truncated.load(Ordering::SeqCst));
+        assert_eq!(fs::metadata(&archive).unwrap().len(), 0);
+        assert!(journal_path(&archive).is_file());
+
+        assert!(recover(&archive).unwrap());
+        assert_eq!(fs::read(&archive).unwrap(), original);
+        assert!(!journal_path(&archive).exists());
+        assert!(
+            !recover(&archive).unwrap(),
+            "recovery must clear the locator"
+        );
+        assert!(root.join("first").exists());
+        assert!(commit_overlay(&root, &archive, &options).unwrap());
+        assert_eq!(
+            read_member(
+                open_uncompressed_tar_base(&archive, false).as_ref(),
+                "/first"
+            ),
+            b"first committed member"
         );
     }
 }
@@ -5852,6 +6025,7 @@ fn regression_provenance_manifest_without_xattrs() {
         Some(&mut hashes),
         &crate::journal_recovery::Rows::None,
         &fs::metadata(&archive).unwrap(),
+        &mut || Ok(()),
     )
     .unwrap();
     let expected = ratarmount_index::sha256_hex_stream(&mut &b"new payload"[..]).unwrap();
