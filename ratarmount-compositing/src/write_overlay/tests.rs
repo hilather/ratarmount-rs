@@ -2299,6 +2299,70 @@ fn commit_overlay_append_auto_requires_seek_table() {
     }
 }
 
+/// Regression: the first append to an empty TAR truncates at offset 0; recovery
+/// must still open that zero-length archive, restore its EOF blocks and clear
+/// the journal before the pending overlay can be committed again.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn regression_240_empty_tar_offset_zero_crash_recovers() {
+    use ratarmount_compress::commit_journal::{fault, journal_path, recover};
+
+    for empty_len in [1024, 10240] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("empty.tar");
+        let original = vec![0; empty_len];
+        fs::write(&archive, &original).unwrap();
+        let root = dir.path().join("ov");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("first"), b"first committed member").unwrap();
+        let options = CommitOverlayOptions {
+            mode: CommitMode::Append,
+            ..yes_commit_opts()
+        };
+        let truncated = Arc::new(AtomicBool::new(false));
+        let reached = truncated.clone();
+        let target = archive.clone();
+        fault::install(move |step| match step {
+            "archive truncate" => {
+                assert_eq!(
+                    fs::metadata(&target).unwrap().len(),
+                    0,
+                    "the first empty-TAR commit must rewrite from offset 0"
+                );
+                reached.store(true, Ordering::SeqCst);
+                Err(io::Error::other("crash after offset-0 truncation"))
+            }
+            // Preserve the on-disk crash state instead of rolling back in
+            // the committing process, so recovery must reopen the empty file.
+            "before cleanup" => Err(io::Error::other("process stopped before cleanup")),
+            _ => Ok(()),
+        });
+        let crashed = commit_overlay(&root, &archive, &options);
+        fault::clear();
+        assert!(crashed.is_err(), "{crashed:?}");
+        assert!(truncated.load(Ordering::SeqCst));
+        assert_eq!(fs::metadata(&archive).unwrap().len(), 0);
+        assert!(journal_path(&archive).is_file());
+
+        assert!(recover(&archive).unwrap());
+        assert_eq!(fs::read(&archive).unwrap(), original);
+        assert!(!journal_path(&archive).exists());
+        assert!(
+            !recover(&archive).unwrap(),
+            "recovery must clear the locator"
+        );
+        assert!(root.join("first").exists());
+        assert!(commit_overlay(&root, &archive, &options).unwrap());
+        assert_eq!(
+            read_member(
+                open_uncompressed_tar_base(&archive, false).as_ref(),
+                "/first"
+            ),
+            b"first committed member"
+        );
+    }
+}
+
 /// Regression: crash during append must recover full contents and matching sidecar.
 #[test]
 fn commit_overlay_append_crash_listing_hashes_and_sidecar() {

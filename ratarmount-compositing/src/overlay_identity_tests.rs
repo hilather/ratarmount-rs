@@ -2864,9 +2864,8 @@ fn regression_unpublished_attempt_collision_refuses_copy() {
 /// Regression (r15 skeptic #2): the cleanup of a failed attempt runs under
 /// the attempt's own lock. ENOSPC while the archive is written; while the
 /// attempt is about to clean up, another thread tries to recover the archive
-/// and to start its own (complete) replacement: both hit the held lock. The
-/// competing mutation is refused before opening raw descriptors, so cleanup
-/// can resume. The attempt then rolls back: the archive is the old bytes, no journal, no
+/// and to start its own (complete) replacement: both fail on the lock. The
+/// attempt then rolls back: the archive is the old bytes, no journal, no
 /// locator, rows unchanged, and the next commit succeeds.
 #[cfg(unix)]
 #[test]
@@ -2896,8 +2895,6 @@ fn regression_failed_attempt_cleanup_holds_the_archive_lock() {
                     let mut suffix = tempfile::tempfile().unwrap();
                     suffix.write_all(&[0u8; 1536]).unwrap();
                     let len = fs::metadata(&archive).unwrap().len();
-                    // The VFS reservation or nonblocking archive flock must
-                    // refuse this competing mutation while cleanup is active.
                     let started = ratarmount_compress::commit_journal::replace_suffix_with_hook(
                         &archive,
                         len.saturating_sub(1024),

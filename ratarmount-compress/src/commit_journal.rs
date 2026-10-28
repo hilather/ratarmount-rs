@@ -651,18 +651,11 @@ pub fn same_stamp(a: &fs::Metadata, b: &fs::Metadata) -> bool {
 pub struct CopyGuard {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     _lock: unix::Lock,
-    // Both raw descriptors must close before the VFS reservation: it excludes
-    // independent SQLite readers before they open, including on error paths.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    _file: File,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    _reservation: ratarmount_index::managed_read::ArchiveReservation,
 }
 
 /// Lock `archive` for a copy fallback that read the file `source` describes.
 /// Refused when the lock is busy, a journal or locator is pending, or the
-/// locked file and current pathname are not exactly `source`
-/// (device, inode, length, mtime, ctime).
+/// locked file is not exactly `source` (device, inode, length, mtime, ctime).
 /// Hold the guard until the copy has been renamed over the archive.
 pub fn guard_copy(archive: &Path, source: &fs::Metadata) -> io::Result<CopyGuard> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -704,15 +697,10 @@ mod unix {
             reason = r###"internal-read:v1 {"id":"IR-B0212-M01","item":"ratarmount_compress::commit_journal::unix::lock","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
         let owned = file.try_clone()?;
-        loop {
-            if unsafe { libc::flock(owned.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(Lock(owned));
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
+        if unsafe { libc::flock(owned.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(io::Error::last_os_error());
         }
+        Ok(Lock(owned))
     }
     fn parent(path: &Path) -> &Path {
         path.parent()
@@ -766,47 +754,6 @@ __inventory_value_0
                 return Ok(None);
             }
             return Err(e);
-        }
-        bytes.truncate(n as usize);
-        decode_marker(&bytes)
-    }
-
-    // The unlocked preflight must not open/close a raw archive descriptor:
-    // an independent SQLite connection may already hold a read transaction.
-    fn get_marker_path(path: &Path) -> io::Result<Option<(u8, PathBuf)>> {
-        let name = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let mut bytes = vec![0u8; 8192];
-        #[cfg(target_os = "linux")]
-        let n = unsafe {
-            libc::getxattr(
-                name.as_ptr(),
-                XATTR.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
-        };
-        #[cfg(target_os = "macos")]
-        let n = unsafe {
-            libc::getxattr(
-                name.as_ptr(),
-                XATTR.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-                0,
-                0,
-            )
-        };
-        if n < 0 {
-            let error = io::Error::last_os_error();
-            #[cfg(target_os = "macos")]
-            let missing = error.raw_os_error() == Some(libc::ENOATTR);
-            #[cfg(not(target_os = "macos"))]
-            let missing = error.raw_os_error() == Some(libc::ENODATA);
-            if missing || error.raw_os_error() == Some(libc::ENOTSUP) {
-                return Ok(None);
-            }
-            return Err(error);
         }
         bytes.truncate(n as usize);
         decode_marker(&bytes)
@@ -938,16 +885,6 @@ __inventory_value_0
         fault::check("before replace").map_err(refused)?;
         let archive = archive.canonicalize().map_err(refused)?;
         let path = journal_path(&archive);
-        // Check the plan before any writable SQLite acquisition. Keep the
-        // descriptor/path checks under the archive lock below as well.
-        let preflight = fs::metadata(&archive).map_err(refused)?;
-        if original.is_some_and(|old| !same_stamp(old, &preflight)) {
-            return Err(refused(io::Error::other(
-                "archive changed while preparing append; retry with a fresh plan",
-            )));
-        }
-        let _reservation = ratarmount_index::managed_read::ArchiveReservation::exclusive(&archive)
-            .map_err(refused)?;
         let mut file = {
 #[expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-B0214-T01","item":"ratarmount_compress::commit_journal::unix::replace","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-type-support","reason":"Builder type support: Preserve this reviewed output acquisition and its existing permissions.","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###)]
 #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0214-M01","item":"ratarmount_compress::commit_journal::unix::replace","disposition":"support","mode_policy":"unchanged-from-e6ca64e","category":"builder-setup","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"output-owner","baseline_reason":"Preserve this reviewed output acquisition and its existing permissions."}"###)]
@@ -969,9 +906,7 @@ __inventory_value_1
             return Err(refused(e));
         }
         let meta = file.metadata().map_err(refused)?;
-        if !same_stamp(&meta, &fs::metadata(&archive).map_err(refused)?)
-            || original.is_some_and(|old| !same_stamp(old, &meta))
-        {
+        if original.is_some_and(|old| !same_stamp(old, &meta)) {
             return Err(refused(io::Error::other(
                 "archive changed while preparing append; retry with a fresh plan",
             )));
@@ -1232,24 +1167,12 @@ __inventory_value_1
     pub(super) fn guard_copy(archive: &Path, source: &fs::Metadata) -> io::Result<CopyGuard> {
         fault::check("copy publish")?;
         let archive = archive.canonicalize()?;
-        if !same_stamp(source, &fs::metadata(&archive)?) {
-            return Err(io::Error::other(
-                "archive changed during the copy fallback; retry",
-            ));
-        }
-        // This VFS reservation must outlive BOTH raw descriptors, including
-        // failures. It refuses a live SQLite reader before any raw fd opens.
-        let reservation = ratarmount_index::managed_read::ArchiveReservation::exclusive(&archive)?;
+        // Read-only: flock needs no write permission.
         #[expect(
             clippy::disallowed_methods,
-            reason = r###"internal-read:v1 {"id":"IR-B0216-M01","item":"ratarmount_compress::commit_journal::unix::guard_copy","disposition":"residual","reason":"Acquire the existing archive flock for commit publication through admitted open, under a SQLite VFS reservation that excludes readers before any raw descriptor opens and outlives all raw descriptor closes.","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Open an existing admitted archive read-only with CLOEXEC for flock and fstat; no creation flags are requested, and the enclosing VFS reservation protects SQLite inode bookkeeping."}}"###
+            reason = r###"internal-read:v1 {"id":"IR-B0216-M01","item":"ratarmount_compress::commit_journal::unix::guard_copy","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
         )]
-        let file = ratarmount_core::db_inodes::open_admitted(
-            &archive,
-            libc::O_RDONLY | libc::O_CLOEXEC,
-            0,
-        )?;
-        let file = File::from(file);
+        let file = File::open(&archive)?;
         let lock = lock(&file).map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -1264,17 +1187,12 @@ __inventory_value_1
         {
             return Err(e);
         }
-        let metadata = file.metadata()?;
-        if !same_stamp(source, &metadata) || !same_stamp(&metadata, &fs::metadata(&archive)?) {
+        if !same_stamp(source, &file.metadata()?) {
             return Err(io::Error::other(
                 "archive changed during the copy fallback; retry",
             ));
         }
-        Ok(CopyGuard {
-            _lock: lock,
-            _file: file,
-            _reservation: reservation,
-        })
+        Ok(CopyGuard { _lock: lock })
     }
 
     fn mtime_ns(meta: &fs::Metadata) -> i128 {
@@ -1315,8 +1233,12 @@ __inventory_value_1
         authorize: Authorize,
         before_unlink: BeforeUnlink,
     ) -> std::result::Result<Option<Applied>, RecoverError> {
-        match fs::metadata(archive) {
-            Ok(meta) if meta.is_file() => {}
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0217-M01","item":"ratarmount_compress::commit_journal::unix::recover","disposition":"residual","reason":"base-archive bytes read by journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let probe = match File::open(archive) {
+            Ok(f) if f.metadata().map_err(RecoverError::Journal)?.is_file() => f,
             Ok(_) => return Ok(None),
             // With no visible journal, leave ordinary open errors to the
             // caller (Session's NotFound/NotWritable/index-policy contract).
@@ -1336,23 +1258,10 @@ __inventory_value_1
                     e,
                 )))
             }
-        }
+        };
         let journal_error =
             |path: &Path, e: io::Error| RecoverError::Journal(recovery_error(path, e));
-        let locator = match get_marker_path(archive) {
-            Ok(locator) => locator,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::NotADirectory
-                        | io::ErrorKind::PermissionDenied
-                ) && fs::symlink_metadata(journal_path(archive)).is_err() =>
-            {
-                return Ok(None)
-            }
-            Err(e) => return Err(journal_error(&journal_path(archive), e)),
-        };
+        let locator = get_marker(&probe).map_err(|e| journal_error(&journal_path(archive), e))?;
         let probed = locator
             .as_ref()
             .map(|(_, p)| p.clone())
@@ -1367,14 +1276,6 @@ __inventory_value_1
                 hook();
             }
         }
-        let _reservation = ratarmount_index::managed_read::ArchiveReservation::exclusive(archive)
-            .map_err(|e| {
-            if e.kind() == io::ErrorKind::WouldBlock {
-                RecoverError::Refused(io::Error::new(e.kind(), recovery_error(&probed, e)))
-            } else {
-                journal_error(&probed, e)
-            }
-        })?;
         let mut file = {
 #[expect(clippy::disallowed_types, reason = r###"internal-read:v1 {"id":"IR-B0218-T01","item":"ratarmount_compress::commit_journal::unix::recover","disposition":"support","reason":"Builder type support: base archive opened read-write by journal recovery to lock it and roll back or forward; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"builder-type-support","creation":{"policy":"none","basis":"This is a type/import reference; it acquires no file or directory."}}"###)]
 #[expect(clippy::disallowed_methods, reason = r###"internal-read:v1 {"id":"IR-B0218-M01","item":"ratarmount_compress::commit_journal::unix::recover","disposition":"support","reason":"Prepare the builder for this item's separately reviewed open/create leaf.","family":"commit-journal-recovery","issue":"#196","category":"builder-setup","creation":{"policy":"none","basis":"Builder construction/setup only; the separate open/create leaf owns pathname acquisition and permissions."},"supports_disposition":"residual","baseline_reason":"base archive opened read-write by journal recovery to lock it and roll back or forward; recovery and mutation ownership belong to the excluded broader machinery"}"###)]
@@ -1393,14 +1294,8 @@ __inventory_value_1
         // the journal path come from the locked descriptor's marker.
         let locator = get_marker(&file).map_err(|e| journal_error(&probed, e))?;
         let state = locator.as_ref().map(|(s, _)| *s);
-        let (path, present) = locate(
-            archive,
-            file.metadata()
-                .map_err(|e| journal_error(&probed, e))?
-                .ino(),
-            locator.map(|(_, p)| p),
-        )
-        .map_err(|e| journal_error(&probed, e))?;
+        let (path, present) = locate(archive, &file, locator.map(|(_, p)| p))
+            .map_err(|e| journal_error(&probed, e))?;
         if !present {
             match state {
                 // A winner cleared it under the lock, or nothing was pending.
@@ -1470,8 +1365,12 @@ __inventory_value_1
     }
 
     pub(super) fn probe(archive: &Path) -> io::Result<JournalProbe> {
-        let metadata = match fs::metadata(archive) {
-            Ok(meta) if meta.is_file() => meta,
+        #[expect(
+            clippy::disallowed_methods,
+            reason = r###"internal-read:v1 {"id":"IR-B0219-M01","item":"ratarmount_compress::commit_journal::unix::probe","disposition":"residual","reason":"base-archive bytes read by commit, splice or journal recovery; recovery and mutation ownership belong to the excluded broader machinery","family":"commit-journal-recovery","issue":"#196","category":"commit-journal-recovery","creation":{"policy":"none","basis":"Existing input, admitted descriptor, or descriptor handoff; this baseline site creates no pathname."}}"###
+        )]
+        let file = match File::open(archive) {
+            Ok(f) if f.metadata()?.is_file() => f,
             Ok(_) => return Ok(JournalProbe::None),
             Err(e)
                 if matches!(
@@ -1485,23 +1384,10 @@ __inventory_value_1
             }
             Err(e) => return Err(e),
         };
-        let marker = match get_marker_path(archive) {
-            Ok(marker) => marker,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::NotADirectory
-                        | io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                return Ok(JournalProbe::None)
-            }
-            Err(e) => return Err(e),
-        };
+        let marker = get_marker(&file)?;
         let phase = marker.as_ref().map(|(state, _)| *state);
         let complete = phase.is_some_and(|state| matches!(state, b'C' | b'D'));
-        let (path, present) = locate(archive, metadata.ino(), marker.map(|(_, p)| p))?;
+        let (path, present) = locate(archive, &file, marker.map(|(_, p)| p))?;
         let missing = |phase: Option<u8>| match phase {
             Some(p) => JournalProbe::Missing(p, path.clone()),
             None => JournalProbe::None,
@@ -1528,7 +1414,11 @@ __inventory_value_1
     /// the sibling [`journal_path`] of `archive` when its header names this
     /// file's inode (the journal moved with a renamed directory); else the
     /// locator's path, absent. Without a locator: the sibling.
-    fn locate(archive: &Path, ino: u64, locator: Option<PathBuf>) -> io::Result<(PathBuf, bool)> {
+    fn locate(
+        archive: &Path,
+        file: &File,
+        locator: Option<PathBuf>,
+    ) -> io::Result<(PathBuf, bool)> {
         let sibling = journal_path(archive);
         let Some(path) = locator else {
             let present = sibling.try_exists()?;
@@ -1537,7 +1427,7 @@ __inventory_value_1
         if path.try_exists()? {
             return Ok((path, true));
         }
-        if sibling != path && header_names(&sibling, ino) {
+        if sibling != path && header_names(&sibling, file.metadata()?.ino()) {
             return Ok((sibling, true));
         }
         Ok((path, false))

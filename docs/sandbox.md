@@ -612,18 +612,20 @@ an archive does not bypass seal/commit serialization. The lock file stays
 writable bookkeeping after seal and is hidden from mounted content, change
 hashes and archive publication; keep it in place, including after a crash.
 Packed bundles omit it. Repeating seal initializes a missing lock for older or
-unpacked sealed layers and restores the root's original permissions.
+unpacked sealed layers and restores the root's original permissions. Unseal
+takes the same overlay lock. Seal is Unix-only; archive commit retains its
+existing non-Unix behavior.
 
 Seal uses a SQLite-managed byte reader for its base digest, with pathname,
 inode, size, mtime/ctime and moved-file checks before hashing or cache lookup
 and before publishing the seal. Cache identity includes device and inode;
 legacy cache rows without a device are rehashed. Closing the managed reader
-preserves this SQLite instance's live reader locks. Archive commit guards also
-reserve their inode through SQLite's VFS before opening raw descriptors;
-a live SQLite transaction causes refusal before those descriptors open. This
-commit reservation requires write access even when copy publication could
-otherwise replace a read-only archive using parent-directory permissions.
-Ordinary source opens and seal digest reads do not need that reservation.
+preserves this SQLite instance's live reader locks.
+
+Commit-journal descriptor handling retains the existing behavior; it does not
+reserve archives through a writable SQLite VFS open. Recovery can reopen a
+zero-length archive after a crash during offset-0 truncation, including the
+first append to an empty TAR, restore the original bytes and clear the journal.
 
 Sealing over a split archive is not supported. Join the parts into one archive
 file and seal that.

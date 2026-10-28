@@ -4979,8 +4979,6 @@ dependencies = [
  "newtua-lzw-z",
  "rapidgzip-core",
  "ratarmount-core",
- "ratarmount-index",
- "rusqlite",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
