@@ -47,6 +47,7 @@ mod tests {
     /// (exit 101) once the reader of stdout/stderr went away.
     #[test]
     fn quiet_print_survives_dead_stdout_and_stderr() {
+        let _processes = ratarmount_index::test_process::spawning();
         if std::env::var_os(CHILD_ENV).is_some() {
             // Live stdio so far (libtest printed its banner). Now widow both.
             let (r1, w1) = std::io::pipe().unwrap();

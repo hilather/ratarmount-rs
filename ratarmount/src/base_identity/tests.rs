@@ -39,6 +39,7 @@ fn regression_240_external_exclusive_probe() {
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn regression_240_reader_transaction_survives_seal_and_commit() {
+    let _processes = ratarmount_index::test_process::spawning();
     use ratarmount_compositing::{
         commit_overlay, BaseDigestRequest, CommitMode, CommitOverlayOptions, CreateOptions,
         WriteOverlay,

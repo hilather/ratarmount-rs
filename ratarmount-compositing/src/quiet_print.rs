@@ -58,6 +58,7 @@ mod tests {
     /// terminal or pipe was gone.
     #[test]
     fn commit_prints_survive_dead_stdout_and_stderr() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         if std::env::var_os(CHILD_ENV).is_some() {
             let dir = tempfile::tempdir().unwrap();
             let archive = dir.path().join("a.tar");

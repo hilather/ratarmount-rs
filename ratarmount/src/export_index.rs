@@ -768,6 +768,7 @@ mod tests {
     /// Regression: factory status banners must not corrupt JSONL/CSV/Parquet stdout.
     #[test]
     fn regression_export_stdout_has_no_index_status_banners() {
+        let _processes = ratarmount_index::test_process::spawning();
         const CHILD: &str = "RATARMOUNT_EXPORT_STDOUT_TEST";
         if std::env::var_os(CHILD).is_some() {
             let mut stdout = cli_stdout().unwrap();

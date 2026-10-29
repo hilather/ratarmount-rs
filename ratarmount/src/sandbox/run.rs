@@ -1486,6 +1486,9 @@ mod tests {
     /// stderr unredacted, so a credentialed URL it echoed reached the terminal.
     #[test]
     fn regression_run_cleanup_warning_is_redacted() {
+        // Exclude children while writing the executable fixture as well as
+        // through Cleanup::drop; a child can inherit the writable fd (#242).
+        let _processes = ratarmount_index::test_process::exclusive();
         let dir = tempfile::tempdir().unwrap();
         let runtime = dir.path().join("runtime.sh");
         fs::write(
@@ -1514,7 +1517,10 @@ mod tests {
             runtime_stopped: false,
         };
         let error = cleanup.stop().unwrap_err();
-        assert!(error.to_string().contains("hunter2"), "stub did not echo");
+        assert!(
+            error.to_string().contains("hunter2"),
+            "stub did not echo: {error}"
+        );
         let warning = cleanup_warning(&error, &pid_file);
         for secret in ["hunter2", "SECRETTOK", "admin"] {
             assert!(!warning.contains(secret), "{warning}");
@@ -1573,6 +1579,7 @@ mod tests {
     /// Regression: stale recovery must stop the old runtime, copy RAM data, and retire its PID record.
     #[test]
     fn regression_run_stale_recovery_copies_ram_and_retires_record() {
+        let _processes = ratarmount_index::test_process::exclusive();
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("runtime");
         fs::write(
@@ -1615,6 +1622,7 @@ mod tests {
     /// Regression: a failed runtime removal must not be mistaken for an already removed container.
     #[test]
     fn regression_run_cleanup_failure_keeps_recovery_record() {
+        let _processes = ratarmount_index::test_process::exclusive();
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("runtime");
         fs::write(
@@ -1648,6 +1656,7 @@ mod tests {
     /// Regression: timeout during container creation must remove a container published after the first rm.
     #[test]
     fn regression_run_timeout_during_runtime_start_removes_late_container() {
+        let _processes = ratarmount_index::test_process::exclusive();
         let temp = tempfile::tempdir().unwrap();
         let runtime = temp.path().join("runtime");
         fs::write(&runtime, b"#!/bin/sh\ncase $1 in\nrun) sleep 0.1; touch \"$0.container\" ;;\nrm) rm -f \"$0.container\" ;;\nesac\n").unwrap();
@@ -1682,6 +1691,7 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for regression_run_child_dies_with_supervisor"]
     fn run_child_death_probe() {
+        let _processes = ratarmount_index::test_process::spawning();
         let Some(marker) = std::env::var_os("RATARMOUNT_RUN_DEATH_PROBE") else {
             return;
         };
@@ -1700,6 +1710,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn regression_run_child_dies_with_supervisor() {
+        let _processes = ratarmount_index::test_process::spawning();
         if !Path::new("/bin/sleep").exists() {
             eprintln!("skip: /bin/sleep unavailable");
             return;

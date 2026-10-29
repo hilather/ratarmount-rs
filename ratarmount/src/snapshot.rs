@@ -945,6 +945,7 @@ mod tests {
     /// Regression: --with-index progress banners must not corrupt snapshot JSON stdout.
     #[test]
     fn regression_snapshot_git_stdout_has_no_index_banners() {
+        let _processes = ratarmount_index::test_process::spawning();
         if let Ok(spec) = std::env::var("RATARMOUNT_SNAPSHOT_STDOUT_FIXTURE") {
             let archive = std::env::var("RATARMOUNT_SNAPSHOT_STDOUT_ARCHIVE").unwrap();
             assert_eq!(
@@ -1190,6 +1191,7 @@ mod tests {
     /// Regression: init is opt-in, and init/backup/list failures must preserve restic exit codes.
     #[test]
     fn regression_snapshot_exit_codes_and_init_opt_in() {
+        let _processes = ratarmount_index::test_process::spawning();
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         let input = temp.path().join("input");
@@ -1287,6 +1289,7 @@ mod tests {
     /// Regression: two near-identical snapshots must deduplicate and round-trip through Session.
     #[test]
     fn regression_snapshot_restic_dedup_roundtrip() {
+        let _processes = ratarmount_index::test_process::spawning();
         if Command::new("restic").arg("version").output().is_err() {
             eprintln!("skip: restic is not on PATH");
             return;

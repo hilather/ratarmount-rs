@@ -73,6 +73,9 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// A concurrently spawned child can keep this lock alive after its guard is dropped
+// until the child execs. O_CLOEXEC limits that window to fork-to-exec: the lock is
+// never released early, and the worst case is a brief spurious "busy" response.
 pub fn lock(path: &Path) -> Result<File> {
     let file = {
         #[expect(

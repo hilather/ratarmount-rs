@@ -8,9 +8,10 @@ rust-version.workspace = true
 description = "SQLite index 0.7.0 read/write for ratarmount-rs"
 
 [features]
-# Thread-local seams inside checked acquisition (`checked_open::test_seams`)
-# for other crates' tests. Enabled only through dev-dependencies (and
-# ratarmount-compositing's own `test-hooks`), never in a normal build.
+# Test seams inside checked acquisition (`checked_open::test_seams`) and
+# child-spawn/lock-probe coordination for other crates' tests. Enabled only
+# through dev-dependencies (and ratarmount-compositing's own `test-hooks`),
+# never in a normal build.
 test-hooks = []
 
 [dependencies]

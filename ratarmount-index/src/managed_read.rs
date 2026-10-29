@@ -930,6 +930,7 @@ pub mod lock_probe {
     use std::path::Path;
 
     pub fn other_process_sees_lock(path: &Path) -> bool {
+        let _spawning = crate::test_process::spawning();
         let c = CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: the child only calls async-signal-safe functions.
         unsafe {

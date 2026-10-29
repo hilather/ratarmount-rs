@@ -499,6 +499,7 @@ fn regression_import_clap_positionals_not_stolen() {
 }
 
 fn git_binary_roundtrip(external: bool) {
+    let _processes = ratarmount_index::test_process::spawning();
     if external
         && std::process::Command::new("git")
             .arg("--version")

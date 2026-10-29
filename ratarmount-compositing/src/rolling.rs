@@ -601,6 +601,7 @@ mod tests {
     /// Regression: discovery must sort numbered generations, tolerate gaps and ignore sidecars.
     #[test]
     fn rolling_remount_gaps_and_plain_base_refused() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("traces.tar");
         let names = SeriesName::new(&base).unwrap();
@@ -645,6 +646,7 @@ mod tests {
     /// Regression: the commit after crossing SIZE creates generation 2 and preserves the union.
     #[test]
     fn rolling_size_next_commit_union_and_append() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         for (extension, mode) in [
             ("tar", CommitMode::Append),
             ("tar.zst", CommitMode::Copy),
@@ -688,6 +690,7 @@ mod tests {
     /// Regression: injected time crosses UTC buckets without sleeps or sensitivity to local timezone.
     #[test]
     fn rolling_time_injected_clock_utc_boundary() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("traces.tar");
         let clock = Arc::new(AtomicU64::new(3599));
@@ -756,6 +759,7 @@ mod tests {
     /// Regression: sealed-file tombstones cannot be forgotten on commit and resurrect data.
     #[test]
     fn rolling_sealed_mutations_erofs_shadow_write_allowed() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("traces.tar.zst");
         let series =
@@ -795,6 +799,7 @@ mod tests {
     /// Regression: deletes queued before a roll must be applied to the archive that owns the name.
     #[test]
     fn rolling_active_delete_defers_roll() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("traces.tar.zst");
         let series =
@@ -816,6 +821,7 @@ mod tests {
     /// Regression: on-exit must persist to the active generation after an earlier interval rolled.
     #[test]
     fn rolling_on_exit_uses_active_generation() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("traces.tar");
         let series =
@@ -837,6 +843,7 @@ mod tests {
     /// Regression: copy-mode TAR replacements must classify offsets in the active file, not a sealed sibling.
     #[test]
     fn rolling_copy_tar_shadow_does_not_rewrite_sealed() {
+        let _process_guard = ratarmount_index::test_process::spawning();
         if !std::process::Command::new("tar")
             .arg("--version")
             .output()
