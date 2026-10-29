@@ -6,7 +6,14 @@
 //! holder and keep it through the final probe; spawning tests take `spawning`
 //! until exec/exit (or for the whole test, including cleanup).
 //!
-//! Guards must not be nested: a queued writer can block a recursive read.
+//! Acquisition order: take any other shared test serialization lock (for
+//! example an environment mutex) before `spawning` or `exclusive`. Release
+//! the process guard before waiting for another such lock; its holder may
+//! need a process guard too. A queued exclusive writer can then turn even
+//! two read acquisitions in opposite orders into a deadlock.
+//!
+//! Process guards must not be nested: a queued writer can block a recursive
+//! read, including an indirect read through a lock-probe helper.
 
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 

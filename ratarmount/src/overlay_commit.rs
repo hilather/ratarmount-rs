@@ -1772,17 +1772,18 @@ mod tests {
     /// Regression: an interval published an archive without its matching index, or kept serving old bytes.
     #[test]
     fn regression_hf_live_atomic_archive_index_pointer_and_repinned_reads() {
-        let _processes = ratarmount_index::test_process::spawning();
         use crate::publish_index::tests::{PublishEnv, PublishServer};
+        let have_tar = {
+            let _processes = ratarmount_index::test_process::spawning();
+            ["gtar", "gnutar", "tar"].iter().any(|name| {
+                std::process::Command::new(name)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("GNU tar"))
+            })
+        };
         for compressed in [false, true] {
-            if !compressed
-                && !["gtar", "gnutar", "tar"].iter().any(|name| {
-                    std::process::Command::new(name)
-                        .arg("--version")
-                        .output()
-                        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("GNU tar"))
-                })
-            {
+            if !compressed && !have_tar {
                 eprintln!("skip: GNU tar unavailable; tar.zst core regression still runs");
                 continue;
             }
@@ -1800,6 +1801,8 @@ mod tests {
                     dir.path().join("trees").to_str().unwrap(),
                 ),
             ]);
+            // Cross-test serialization precedes the process guard (#242).
+            let _processes = ratarmount_index::test_process::spawning();
             let name = if compressed { "a.tar.zst" } else { "a.tar" };
             let url = format!("hf://datasets/org/data@main/{name}");
             let overlay = hf_test_overlay(&url, &dir.path().join("ov"), false);

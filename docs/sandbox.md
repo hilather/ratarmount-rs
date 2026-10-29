@@ -2271,7 +2271,7 @@ root-owned sticky directory such as `/tmp` is also accepted). Lock files remain
 on disk; flock, not file existence, indicates ownership. Use a local filesystem
 for state and locks.
 
-- Known behaviour: a concurrently spawned child can keep a daemon lock alive after its guard is dropped until exec; `O_CLOEXEC` limits this to the fork-to-exec window, so the lock is never released early and the worst case is a brief spurious "busy" response.
+- Known behaviour: a concurrently spawned child can retain a daemon lock after its guard is dropped until the child execs or exits, normally briefly. `O_CLOEXEC` confines this to the fork-to-exec window; the lock is never released early and the worst case is a spurious "busy" response.
 
 ### Protocol version 1
 
